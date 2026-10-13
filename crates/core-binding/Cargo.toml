@@ -91,5 +91,9 @@ required-features = ["ingress"]
 name = "chainspec"
 required-features = ["ingress"]
 
+[[test]]
+name = "replica_disk_store"
+required-features = ["ingress"]
+
 [lints]
 workspace = true
