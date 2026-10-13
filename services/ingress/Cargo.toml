@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0 OR MIT
 [package]
 name = "ingress"
-version = "0.1.0"
+version.workspace = true
 description = "aledgent-ingress (F-009): the one process every command and query reaches aledgent through. The durable received-log, client-key dedup, the forwarder, the synchronous reservation path, the ticker and notification delivery."
 edition.workspace = true
 rust-version.workspace = true

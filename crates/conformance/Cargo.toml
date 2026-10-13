@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0 OR MIT
 [package]
 name = "conformance"
-version = "0.1.0"
+version.workspace = true
 description = "aledgent's conformance suite: the spec catalogue, the case registry and runner, the harnesses, the closure checks, and the assurance declaration (F-015)."
 edition.workspace = true
 rust-version.workspace = true

@@ -1,0 +1,33 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "bootstrap-sha": "9f3efc4e43d709be52f26dcfb016b41be3ec8096",
+  "include-component-in-tag": false,
+  "include-v-in-tag": true,
+  "bump-minor-pre-major": true,
+  "bump-patch-for-minor-pre-major": false,
+  "signoff": "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>",
+  "packages": {
+    ".": {
+      "release-type": "simple",
+      "package-name": "aledgent",
+      "changelog-path": "CHANGELOG.md",
+      "extra-files": [
+        {
+          "type": "toml",
+          "path": "Cargo.toml",
+          "jsonpath": "$.workspace.package.version"
+        },
+        {
+          "type": "toml",
+          "path": "Cargo.lock",
+          "jsonpath": "$.package[?(!@.source && (@.name.value=='aledgent-e2e-driver' || @.name.value=='aledgent-sidecar' || @.name.value=='audit-store' || @.name.value=='authn' || @.name.value=='conformance' || @.name.value=='core-archive' || @.name.value=='guest-heap' || @.name.value=='ingress' || @.name.value=='ops' || @.name.value=='recovery' || @.name.value=='settle' || @.name.value=='signer'))].version"
+        },
+        {
+          "type": "toml",
+          "path": "agents/Cargo.lock",
+          "jsonpath": "$.package[?(!@.source && (@.name.value=='aledgent-e2e-driver' || @.name.value=='aledgent-sidecar' || @.name.value=='audit-store' || @.name.value=='authn' || @.name.value=='conformance' || @.name.value=='core-archive' || @.name.value=='guest-heap' || @.name.value=='ingress' || @.name.value=='ops' || @.name.value=='recovery' || @.name.value=='settle' || @.name.value=='signer'))].version"
+        }
+      ]
+    }
+  }
+}

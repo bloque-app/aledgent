@@ -2,6 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0 OR MIT
 [package]
 name = "core-binding"
+# Fixed, not the workspace's release version: this crate is compiled into the core's guest package
+# (`core.vos`) or the shard's, whose bytes are the installed program's identity (its ProgramId),
+# and Cargo hashes a crate's version into what the compiler builds it with. A release must not
+# change those bytes (tools/release/check-config.py).
 version = "0.1.0"
 description = "The core Agent binding's host-independent half (F-005): the Agent's state layout and budget, the invocation envelope, the witnessed leaf store and the private-input vault the Agent runs the library over, the transition function itself, and (feature std) the driver that builds each invocation from a native run."
 edition.workspace = true

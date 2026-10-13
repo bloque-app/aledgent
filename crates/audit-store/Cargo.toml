@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0 OR MIT
 [package]
 name = "audit-store"
-version = "0.1.0"
+version.workspace = true
 description = "aledgent's audit store for the in-process host: append-only, hash-chained segment files on their own media, written under their own credential, readable by subject, principal, class and time (F-013)."
 edition.workspace = true
 rust-version.workspace = true

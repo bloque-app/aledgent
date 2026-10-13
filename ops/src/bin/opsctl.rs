@@ -36,6 +36,9 @@
 //!                                                 nothing out
 //! opsctl archive status --state <dir>             the core host's archiver status
 //! opsctl exporter --config <exporter.toml>        serve /metrics
+//! opsctl health --config <exporter.toml>          exit 0 when the exporter at the configuration's
+//!                                                 `listen` answers GET /metrics with 200: the
+//!                                                 image's HEALTHCHECK
 //! ```
 //!
 //! An archive is `fs:<dir>` or `s3://<bucket>/<prefix>?region=…` (`core_archive::open`); its
@@ -697,6 +700,21 @@ async fn exporter(args: &[String]) -> Result<(), Error> {
         .map_err(|e| Error::Io(e.to_string()))
 }
 
+/// The image's health check (deploy/docker/services.Dockerfile): the exporter at `listen` answers
+/// `GET /metrics` with 200. A scrape always answers, ingress reachable or not (an unreachable
+/// ingress is itself a signal), so this is the exporter's own readiness. Reads no token.
+fn health(args: &[String]) -> Result<(), Error> {
+    let p = arg(args, "--config")?;
+    let c = ops::exporter::ExporterConfig::parse(&std::fs::read_to_string(&p)?)?;
+    let addr = ingress::probe::address(&c.listen).map_err(Error::Config)?;
+    // Above the scrape's own wait on ingress (`timeout_ms`), so a slow ingress is not a failure.
+    let wait = Duration::from_millis(c.timeout_ms.max(100)) + Duration::from_secs(5);
+    match ingress::probe::status(addr, "/metrics", wait).map_err(Error::Io)? {
+        200 => Ok(()),
+        code => Err(Error::Io(format!("{addr}: GET /metrics answered {code}"))),
+    }
+}
+
 async fn run(args: &[String]) -> Result<(), Error> {
     let words: Vec<&str> = args.iter().take(2).map(String::as_str).collect();
     match words.as_slice() {
@@ -774,8 +792,9 @@ async fn run(args: &[String]) -> Result<(), Error> {
             Ok(())
         }
         ["exporter"] | ["exporter", ..] => exporter(args).await,
+        ["health"] | ["health", ..] => health(args),
         _ => Err(Error::Config(
-            "usage: opsctl backup|restore|exporter …  (see the crate documentation)".into(),
+            "usage: opsctl backup|restore|exporter|health …  (see the crate documentation)".into(),
         )),
     }
 }

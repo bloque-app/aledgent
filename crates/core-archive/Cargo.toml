@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0 OR MIT
 [package]
 name = "core-archive"
-version = "0.1.0"
+version.workspace = true
 description = "The core Agent's off-node archive (F-005, T-005-15 to T-005-18): every committed decision of the core host streamed to an object store (S3 with Object Lock and KMS, or a directory), checkpoints of the Agent's runtime state, and the verified read-back a restore lays out on a fresh node."
 edition.workspace = true
 rust-version.workspace = true

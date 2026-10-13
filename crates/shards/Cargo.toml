@@ -2,6 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0 OR MIT
 [package]
 name = "shards"
+# Fixed, not the workspace's release version: this crate is compiled into the core's guest package
+# (`core.vos`) or the shard's, whose bytes are the installed program's identity (its ProgramId),
+# and Cargo hashes a crate's version into what the compiler builds it with. A release must not
+# change those bytes (tools/release/check-config.py).
 version = "0.1.0"
 description = "F-031 lever 3: the book held in shards of account partitions (DEC-22, amendment 0012): the shards' decisions and the exactly-once credit path, the principals Agent's state, the anchor over every shard's root, pools for hot accounts, the shard Agents' transition (feature agent) and their host (feature host)."
 edition.workspace = true

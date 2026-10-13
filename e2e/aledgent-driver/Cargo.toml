@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0 OR MIT
 [package]
 name = "aledgent-e2e-driver"
-version = "0.1.0"
+version.workspace = true
 description = "The zombienet suite's aledgent driver (T-026-04, T-027-06), and the stress harness (F-032): step 3 and the fault cases through ingress, the in-process core and the settlement adapter's own process (the aledgent-settle binary, its PostgreSQL store, its light client), against the suite's Kreivo."
 edition.workspace = true
 rust-version.workspace = true

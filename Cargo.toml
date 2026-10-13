@@ -36,6 +36,9 @@ members = ["crates/compact-smt", "crates/ledger-kernel", "crates/ledger-core", "
 exclude = ["tools/ci/fixtures", "spikes", "agents", "contracts", "services/settle/kreivo-pin", "e2e/network"]
 
 [workspace.package]
+# The release version (release-please bumps it: release-please-config.json), every member's but
+# those compiled into a guest program, which keep a fixed one (tools/release/check-config.py).
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0 OR MIT"

@@ -2,6 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0 OR MIT
 [package]
 name = "ledger-core"
+# Fixed, not the workspace's release version: this crate is compiled into the core's guest package
+# (`core.vos`) or the shard's, whose bytes are the installed program's identity (its ProgramId),
+# and Cargo hashes a crate's version into what the compiler builds it with. A release must not
+# change those bytes (tools/release/check-config.py).
 version = "0.1.0"
 description = "aledgent's host-independent library: identifiers, the asset registry, identities, ledger accounts, credentials and authority (F-003), and the closed Refusal list (F-015)."
 edition.workspace = true

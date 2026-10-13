@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0 OR MIT
 [package]
 name = "authn"
-version = "0.1.0"
+version.workspace = true
 description = "aledgent's credential schemes at the boundary (F-028, DEC-19): WebAuthn passkey assertions and registrations, Kreivo Pass key import, API keys, and the challenges and session tokens ingress issues."
 edition.workspace = true
 rust-version.workspace = true

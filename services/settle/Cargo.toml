@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0 OR MIT
 [package]
 name = "settle"
-version = "0.1.0"
+version.workspace = true
 description = "aledgent-settle (F-016, F-027): the settlement adapter and executor of the call outbox. The only component that touches the settlement layer; it holds the signing keys, outside the core, executes calls in batches on the settlement contract as the community PASS account, and reports what the layer did as observations."
 edition.workspace = true
 rust-version.workspace = true

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0 OR MIT
 [package]
 name = "signer"
-version = "0.1.0"
+version.workspace = true
 description = "aledgent-signer (F-035): the key boundary. A process of its own that holds no book state and signs for the processes that hold one (the core host, ingress, the settlement adapter) through a narrow API on a Unix socket, authenticated by peer credentials and a token. Keys come from Vault, which the signer reads itself at start under AWS IAM auth (no secret in its environment); AWS KMS is an opt-in backend for secp256k1 lane and anchor keys; a key from a file is for development and tests only."
 edition.workspace = true
 rust-version.workspace = true

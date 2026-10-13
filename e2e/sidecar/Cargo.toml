@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0 OR MIT
 [package]
 name = "aledgent-sidecar"
-version = "0.1.0"
+version.workspace = true
 description = "aledgent as a CI service container (deploy/docker/SIDECAR.md): ingress and the in-process core in one process, book only, in memory, with a fixed test genesis and a test-only operator token. Never a production deployment."
 edition.workspace = true
 rust-version.workspace = true

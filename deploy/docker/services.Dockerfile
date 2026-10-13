@@ -5,17 +5,29 @@
 # aledgent's long-running processes from the root workspace, one image each (targets):
 #
 #   ingress   aledgent-ingress: every command and query; with no `core_endpoint`, the in-process
-#             core runs inside it (services/ingress).               <ecr>/<namespace>/aledgent-ingress
+#             core runs inside it (services/ingress).               ghcr.io/bloque-app/aledgent-ingress
 #   settle    aledgent-settle: the settlement adapter, with its light-client chain specs
-#             baked in (deploy/templates/chain-specs).                 <ecr>/<namespace>/aledgent-settle
+#             baked in (deploy/templates/chain-specs).              ghcr.io/bloque-app/aledgent-settle
 #   ops       opsctl: the signal exporter (`opsctl exporter`) and the file-based backup, restore
-#             and drill commands (F-018).                           <ecr>/<namespace>/aledgent-ops
+#             and drill commands (F-018).                           ghcr.io/bloque-app/aledgent-ops
 #   signer    aledgent-signer: the key boundary (F-035): keys from Vault, AWS KMS opt-in; runs as
-#             its own user (65533).                                <ecr>/<namespace>/aledgent-signer
+#             its own user (65533).                                 ghcr.io/bloque-app/aledgent-signer
 #   sidecar   aledgent-sidecar: ingress and the in-process core, book only, in memory, with TEST
 #             credentials, for other repositories' CI (SIDECAR.md). ghcr.io/bloque-app/aledgent-sidecar
 #
-# <ecr> is the operator's container registry (.github/workflows/images.yml).
+# Published, public, by a release or a pre-release (.github/workflows/release.yml), as
+# `sha-<commit>` and the version.
+#
+# podman auto-update: ingress, settle, ops and signer carry `io.containers.autoupdate=registry`. A
+# container inherits its image's labels, so podman (`podman auto-update`, a systemd unit or a
+# Quadlet) pulls the tag the container was created from when the registry moves it, and restarts
+# the container on the new image. ingress and ops carry a HEALTHCHECK that answers only once the
+# process serves (`aledgent-ingress health`, `opsctl health`: one GET to its own listener, no
+# shell needed), so a unit run with `--sdnotify=healthy` (Quadlet: `Notify=healthy`) fails an
+# update that does not come up, and podman rolls it back. settle and signer serve no HTTP: their
+# unit's start is the signal. The checks read the configuration at the path the default CMD names;
+# a deployment that moves it overrides the check (`--health-cmd`, Quadlet `HealthCmd=`). A one-off
+# container from the ops image (a backup, a restore) runs with `--no-healthcheck`.
 #
 # Built in CI only (.github/workflows/images.yml), for linux/amd64, from the repository root:
 #
@@ -87,6 +99,7 @@ FROM ${RUNTIME_IMAGE} AS ingress
 ARG ROOTS
 LABEL org.opencontainers.image.title="aledgent-ingress" \
       app.aledgent.roots="${ROOTS}" \
+      io.containers.autoupdate="registry" \
       org.opencontainers.image.description="aledgent ingress (F-009), with the in-process core" \
       org.opencontainers.image.source="https://github.com/bloque-app/aledgent" \
       org.opencontainers.image.licenses="Apache-2.0 OR MIT"
@@ -96,6 +109,10 @@ COPY --from=build /out/bin/aledgent-ingress /usr/local/bin/aledgent-ingress
 COPY --from=build --chown=65532:65532 /out/state /var/lib/aledgent
 USER 65532:65532
 EXPOSE 8080
+# Ready once it answers HTTP on `listen`: it binds only after the store, the core and the replica
+# are up. The start period covers the core's start (its journal is replayed before it binds).
+HEALTHCHECK --interval=10s --timeout=10s --start-period=120s --retries=3 \
+  CMD ["/usr/local/bin/aledgent-ingress", "health", "--config", "/etc/aledgent/ingress.json"]
 ENTRYPOINT ["/usr/local/bin/aledgent-ingress"]
 CMD ["serve", "--config", "/etc/aledgent/ingress.json"]
 
@@ -103,6 +120,7 @@ FROM ${RUNTIME_IMAGE} AS settle
 ARG ROOTS
 LABEL org.opencontainers.image.title="aledgent-settle" \
       app.aledgent.roots="${ROOTS}" \
+      io.containers.autoupdate="registry" \
       org.opencontainers.image.description="aledgent settlement adapter (F-016, F-027), with Kreivo and Kusama light-client chain specs" \
       org.opencontainers.image.source="https://github.com/bloque-app/aledgent" \
       org.opencontainers.image.licenses="Apache-2.0 OR MIT"
@@ -120,6 +138,7 @@ FROM ${RUNTIME_IMAGE} AS ops
 ARG ROOTS
 LABEL org.opencontainers.image.title="aledgent-ops" \
       app.aledgent.roots="${ROOTS}" \
+      io.containers.autoupdate="registry" \
       org.opencontainers.image.description="aledgent operations (F-018): the signal exporter and opsctl" \
       org.opencontainers.image.source="https://github.com/bloque-app/aledgent" \
       org.opencontainers.image.licenses="Apache-2.0 OR MIT"
@@ -127,11 +146,16 @@ COPY --from=build /out/bin/opsctl /usr/local/bin/opsctl
 COPY --from=build --chown=65532:65532 /out/state /var/lib/aledgent
 USER 65532:65532
 EXPOSE 9464
+# Ready once the exporter answers GET /metrics with 200. The timeout is above the probe's own wait
+# (the configuration's timeout_ms, 5 s in the templates, plus 5 s).
+HEALTHCHECK --interval=15s --timeout=15s --start-period=30s --retries=3 \
+  CMD ["/usr/local/bin/opsctl", "health", "--config", "/etc/aledgent/exporter.toml"]
 ENTRYPOINT ["/usr/local/bin/opsctl"]
 CMD ["exporter", "--config", "/etc/aledgent/exporter.toml"]
 
 FROM ${RUNTIME_IMAGE} AS signer
 LABEL org.opencontainers.image.title="aledgent-signer" \
+      io.containers.autoupdate="registry" \
       org.opencontainers.image.description="aledgent's key boundary (F-035): signs for the core host and the settlement adapter; keys from Vault, AWS KMS opt-in for lanes" \
       org.opencontainers.image.source="https://github.com/bloque-app/aledgent" \
       org.opencontainers.image.licenses="Apache-2.0 OR MIT"

@@ -21,6 +21,8 @@
 //!                                              exits non-zero on a mismatch
 //! aledgent-ingress migrate --config <file> --apply
 //!                                              apply the pending migrations and exit
+//! aledgent-ingress health --config <file>      exit 0 when the replica at the configuration's
+//!                                              `listen` answers HTTP: the image's HEALTHCHECK
 //! ```
 //!
 //! `serve` applies pending migrations at start unless the configuration's `migrations.on_start`
@@ -118,6 +120,19 @@ async fn migrate(args: &[String]) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// The image's health check (deploy/docker/services.Dockerfile): the replica at `listen` answers
+/// `GET /openapi.json` with anything below 500. It binds its listener only once the store is
+/// connected, the core started and the replica running, so an answer means ready; with no
+/// credential the document is refused (401), which is an answer all the same. Needs no secret.
+fn health(args: &[String]) -> Result<(), String> {
+    let c = config(args)?;
+    let addr = ingress::probe::address(&c.listen)?;
+    match ingress::probe::status(addr, "/openapi.json", std::time::Duration::from_secs(5))? {
+        code if code < 500 => Ok(()),
+        code => Err(format!("{addr}: GET /openapi.json answered {code}")),
+    }
 }
 
 /// How long ingress waits for the core in another process to answer one request. A decision
@@ -318,9 +333,10 @@ async fn main() {
         Some("founded") => founded(&args),
         Some("clerk-public") => clerk_public(),
         Some("account-ref") => account_ref(&args),
+        Some("health") => health(&args),
         _ => Err(
             "usage: aledgent-ingress serve|openapi|recipient|migrate|founded|clerk-public|\
-             account-ref (see the crate docs)"
+             account-ref|health (see the crate docs)"
                 .into(),
         ),
     };
