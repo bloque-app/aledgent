@@ -75,12 +75,12 @@ use ledger_core::call::{Call, Recorded, Summary};
 use ledger_core::delta::{
     ServiceDelta, ServiceKind, library_id, library_key, library_leaf, library_parts,
 };
-use ledger_core::export::canon;
+use ledger_core::export::{AuditHead, canon};
 use ledger_core::id::OperationId;
 use ledger_core::leaves::kind;
 use ledger_core::ledger::{Founded, Genesis};
 use ledger_core::lifecycle::keys::NotificationId;
-use ledger_core::state::{LeafEntry, State};
+use ledger_core::state::{LeafEntry, State, Touched};
 use ledger_kernel::book::Book;
 use ledger_kernel::keys::{Answers, Custody, KeyRequest, KeyRing, Recording, RootKeys};
 use ledger_kernel::store::{BookDelta, KeySet, LeafStore, Loaded, LogRecord, StoreError, SubRoots};
@@ -858,6 +858,49 @@ impl ServiceStore {
             }
         }
         Ok((leaves, whole))
+    }
+
+    /// The value of one leaf of the service store, as the tree holds it (`T-036-17`). The tree
+    /// holds every leaf of the replica's service store, so a leaf the replica no longer keeps in
+    /// memory is read back from here, from disk under [`ReplicaStores::Disk`].
+    pub fn leaf(&self, kind: u8, key: &[u8]) -> Result<Option<Vec<u8>>, DriveError> {
+        match self
+            .view()?
+            .service_leaf_at(&library_key(kind, key))
+            .map_err(rep)?
+        {
+            Some(leaf) => Ok(Some(library_parts(&leaf).map_err(rep)?.1)),
+            None => Ok(None),
+        }
+    }
+
+    /// How many leaves of `kind` the tree holds.
+    pub fn count(&self, kind: u8) -> Result<usize, DriveError> {
+        let kind_of = ServiceKind::from_code(kind).ok_or_else(|| rep("kind 0"))?;
+        Ok(self.view()?.service_leaves_of(kind_of).map_err(rep)?.len())
+    }
+
+    /// A partial service store holding exactly what `touched` names, read from this tree: the
+    /// store the core Agent builds from its witness (`State::partial`, `State::load_leaves`),
+    /// built by the host from its own tree (`T-036-17`, the seam of a replica that does not hold
+    /// its service store whole). A key the tree lacks is loaded as absent; a kind touched whole
+    /// is loaded whole. The Agent's own leaves ([`kind::DELIVERED`]) are not the store's and are
+    /// left out. Reading anything else fails closed ([`State::missed`]), as in the Agent.
+    pub fn partial_state(
+        &self,
+        audit: &AuditHead,
+        touched: &[Touched],
+    ) -> Result<State, DriveError> {
+        let mut t = Touches::default();
+        for r in touched.iter().filter(|r| r.kind != kind::DELIVERED) {
+            let e = t.0.entry(r.kind).or_default();
+            e.0.extend(r.keys.iter().cloned());
+            e.1 |= r.whole;
+        }
+        let (leaves, whole) = self.leaves(&t)?;
+        let mut state = State::partial(audit);
+        state.load_leaves(&leaves, &whole).map_err(rep)?;
+        Ok(state)
     }
 
     /// The witness of `touched` for the Agent (`crate::service`).

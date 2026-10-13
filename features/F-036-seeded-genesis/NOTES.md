@@ -266,3 +266,69 @@ as many records and verifies each in a scratch Agent of its own, in parallel (on
   is not available.
 - *What it does not change.* No root, no chainspec, no package, no report format, no Agent code: the
   founding is the existing `StateGenesis`, the inputs the existing chunk inputs.
+
+
+## 16. `T-036-17`: the replica's service store on disk (design; ruling `a0022-q5`, 2026-10-08)
+
+Ruled: in memory for now, a disk-backed store required before a book of about 3× is served. The owner
+asked for it as soon as possible.
+
+**What is O(n) today.** The replica's `ledger_core::state::State`, held whole by the core host when
+serving and by `build-spec` and every start's genesis rebuild: about 1.3 KB a record (§11), 4–5 GB at 10×.
+Beside it, smaller: the host-kept `Derived` indexes (the journal's `times`, `by_account`, `by_position`,
+`checkpoints`; the operation store's `open_since`), and the chainspec held in the process (about 0.4 KB a
+record). The kernel's leaf store, the openings and the service tree are already on disk under
+`ReplicaStores::Disk` (`T-031-14`; redb through `leaf-store`, an 8 MiB cache a file).
+
+**The store: none new.** The replica's service tree already holds every leaf of the service store, on
+disk, written after every input (`ServiceStore::apply`): its key is the kind and a hash of the canonical
+key, and its content gives back the canonical key and value (`library_parts`). So the tree *is* the
+disk-backed service store, in an embedded KV already in the dependency tree (redb 4). Rejected: a second
+redb table keyed by (kind, canonical key), which doubles every write and is a second source of truth;
+RocksDB or sled, which are not in the tree; a memory-mapped image, which still grows with the book.
+
+**The seam: the Agent's own.** The core Agent already runs every input over a partial store built from a
+witness (`State::partial`, `State::load_leaves`), which fails closed on any leaf it was not given
+(`State::missed`), and records what it touched (`take_touched`). The lean replica uses the same
+interface, with the witness read from its own tree: `ServiceStore::leaf`, `count` and
+`partial_state(audit, touched)` (step 1). Nothing changes in the Agent, and it gains no host call
+(`m-jam-only`): all of it is host-side.
+
+**Execution (steps 2 and 3).** The lean replica holds a partial store. For each input it runs the calls;
+if the run missed a leaf or a kind, the call is taken back whole (the state's undo and the recording
+store's `revert`, as `apply_spec_chunk` already takes back a refused chunk), the touched set (which
+recording keeps for missed keys too) is loaded from the tree, and the call runs again. Each retry loads
+strictly more, so it ends; dependent reads make it one to three rounds. The changed leaves go to the tree
+as today, and the partial store is then dropped, but for a small cache of singletons (registry, roles,
+settlement configuration, the audit head). The genesis build does the same chunk by chunk, writing each
+chunk's leaves to the tree.
+
+**Queries (step 4).** Queries read the replica (`DEC-4`). By-key reads load what they need into a fresh
+partial store; listings go through the leaf indexes that already exist (`by_owner`, `by_principal`,
+`by_subject`). The `Derived` indexes move to redb tables of their own in the replica's directory, rebuilt
+with it.
+
+**Crash and rebuild.** Unchanged, and modest: the replica is a projection rebuilt from the chainspec
+(ruling `a0022-q3`) and the host's log on every start; `ReplicaStores::Disk` wipes its directory at every
+build and does not sync its commits (`Durability::Visible`). A crash loses nothing that is not rebuilt.
+The disk needs only room (the service tree is 649 MB at 1×, about 1.2 GB at 2×, so about 6.5 GB at 10×)
+and read rate.
+
+**Memory bounds.** Three redb caches at `REPLICA_CACHE_BYTES` (24 MiB in all), one input's partial store
+(its witness: kilobytes), the singleton cache, and the audit outbox (unshipped records only). The
+chainspec in the process stays O(n) until it is read chunk by chunk from its file (step 5). Target: peak
+RSS of `build-spec` and `serve` independent of the book's size, measured on x86 at 1× and 3×.
+
+**Steps.**
+
+1. *Done here:* the seam (`ServiceStore::leaf`, `count`, `partial_state`) and the tests on one chainspec
+   (`core-binding/tests/replica_disk_store.rs`): the in-memory and disk stores build the same genesis, roots
+   and hot state; the disk tree holds exactly the in-memory store's leaves, and a store rebuilt from it
+   alone holds them again; commands decided over either store reach the same roots.
+2. A call taken back on a miss (`Ledger`, host-only use), with tests that a taken-back call leaves the
+   state, the kernel store and the vault as they were.
+3. The lean replica in the driver (`ReplicaStores::Disk` with a lean flag), the genesis built chunk by
+   chunk into the tree; the same-roots tests over a chainspec and the stress suite's soak.
+4. Queries and the `Derived` indexes on disk.
+5. `build-spec` and `serve` wired, the chainspec read from its file, `--max-memory` revised, and peak RSS
+   measured on x86 at 1× and 3×.
