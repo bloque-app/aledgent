@@ -18,15 +18,19 @@
 # Published, public, by a release or a pre-release (.github/workflows/release.yml), as
 # `sha-<commit>` and the version.
 #
-# podman auto-update: ingress, settle, ops and signer carry `io.containers.autoupdate=registry`. A
+# podman auto-update: ingress, ops and signer carry `io.containers.autoupdate=registry`. A
 # container inherits its image's labels, so podman (`podman auto-update`, a systemd unit or a
 # Quadlet) pulls the tag the container was created from when the registry moves it, and restarts
 # the container on the new image. ingress and ops carry a HEALTHCHECK that answers only once the
 # process serves (`aledgent-ingress health`, `opsctl health`: one GET to its own listener, no
 # shell needed), so a unit run with `--sdnotify=healthy` (Quadlet: `Notify=healthy`) fails an
-# update that does not come up, and podman rolls it back. settle and signer serve no HTTP: their
-# unit's start is the signal. The checks read the configuration at the path the default CMD names;
-# a deployment that moves it overrides the check (`--health-cmd`, Quadlet `HealthCmd=`). A one-off
+# update that does not come up, and podman rolls it back. The signer serves no HTTP and has no
+# check, so podman cannot roll a bad update of it back: it carries the label deliberately, because
+# the owner ruled that the test deployment's signer follows releases (a trial); a deployment that
+# does not want that leaves the container's own `AutoUpdate=` unset. settle carries no label: it
+# has no readiness signal either, and it executes calls on the settlement layer, so it is updated
+# by hand. The checks read the configuration at the path the default CMD names; a deployment that
+# moves it overrides the check (`--health-cmd`, Quadlet `HealthCmd=`). A one-off
 # container from the ops image (a backup, a restore) runs with `--no-healthcheck`.
 #
 # Built in CI only (.github/workflows/images.yml), for linux/amd64, from the repository root:
@@ -120,7 +124,6 @@ FROM ${RUNTIME_IMAGE} AS settle
 ARG ROOTS
 LABEL org.opencontainers.image.title="aledgent-settle" \
       app.aledgent.roots="${ROOTS}" \
-      io.containers.autoupdate="registry" \
       org.opencontainers.image.description="aledgent settlement adapter (F-016, F-027), with Kreivo and Kusama light-client chain specs" \
       org.opencontainers.image.source="https://github.com/bloque-app/aledgent" \
       org.opencontainers.image.licenses="Apache-2.0 OR MIT"

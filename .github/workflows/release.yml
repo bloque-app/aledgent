@@ -29,10 +29,13 @@ name: Release
 #
 # Then bloque-app/bloque-ledgent, the private deployment repository, gets a `repository_dispatch`
 # (`aledgent-release` or `aledgent-prerelease`) whose payload is the tag, the commit and the SHA-256
-# of images.json (`client_payload`: `version`, `commit`, `images_json_sha256`), under a token of the GitHub App `aledgent-release` (installed on that
-# repository only), from the secrets ALEDGENT_RELEASE_APP_ID and ALEDGENT_RELEASE_APP_KEY of the
-# environment `release` (branches main and develop, tags v*). Without them, the dispatch is skipped
-# with a notice; the release stands.
+# of images.json (`client_payload`: `version`, `commit`, `images_json_sha256`), under a token of the
+# GitHub App `aledgent-release` (installed on that repository only), from the secrets
+# ALEDGENT_RELEASE_APP_ID and ALEDGENT_RELEASE_APP_KEY of the environment `release`. Only main and
+# develop may use that environment: nothing here runs on a tag, and a tag that anyone with write
+# access can push must not reach the App's key (tools/release/protect-branches.sh removes the
+# environment's `v*` tag policy). Without the secrets, the dispatch is skipped with a notice; the
+# release stands.
 #
 # Never in a fork, and never on a pull request: this runs on pushes to main and develop only.
 
@@ -42,9 +45,12 @@ on:
 
 permissions: {}
 
-# One run per branch at a time, never cancelled: a release half-published is worse than a late one.
+# main: one run at a time, never cancelled (a release half-published is worse than a late one). A
+# group keeps one pending run, so a queued run can be replaced by a newer one; release-please then
+# creates the release in the newer run, and the images are built at the release's own commit (its
+# `sha`), not at that run's. develop: one group per commit, so no push loses its pre-release.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.ref }}${{ github.ref == 'refs/heads/develop' && format('-{0}', github.sha) || '' }}
   cancel-in-progress: false
 
 jobs:
@@ -62,6 +68,8 @@ jobs:
       created: ${{ steps.rp.outputs.release_created }}
       version: ${{ steps.rp.outputs.version }}
       tag: ${{ steps.rp.outputs.tag_name }}
+      # The released commit: a run queued behind another may run at a later head of main.
+      sha: ${{ steps.rp.outputs.sha }}
     steps:
       - id: rp
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
@@ -107,6 +115,7 @@ jobs:
     uses: ./.github/workflows/images.yml
     with:
       version: ${{ needs.release-please.outputs.version || needs.prerelease.outputs.version }}
+      commit: ${{ needs.release-please.outputs.sha || github.sha }}
 
   publish:
     name: images.json and dispatch
@@ -124,6 +133,7 @@ jobs:
       PRERELEASE: ${{ needs.prerelease.outputs.version != '' }}
       VERSION: ${{ needs.release-please.outputs.version || needs.prerelease.outputs.version }}
       TAG: ${{ needs.release-please.outputs.tag || needs.prerelease.outputs.tag }}
+      COMMIT: ${{ needs.release-please.outputs.sha || github.sha }}
       HAS_APP: ${{ secrets.ALEDGENT_RELEASE_APP_ID != '' && secrets.ALEDGENT_RELEASE_APP_KEY != '' }}
     steps:
       - name: images.json
@@ -142,7 +152,7 @@ jobs:
             grep -Eq "^ghcr\.io/bloque-app/aledgent-${n,,}@sha256:[0-9a-f]{64}$" <<<"$ref" \
               || { echo "::error::no digest for ${n,,}: '$ref'"; exit 1; }
           done
-          jq -n --arg version "$TAG" --arg commit "$GITHUB_SHA" \
+          jq -n --arg version "$TAG" --arg commit "$COMMIT" \
                 --arg ingress "$INGRESS" --arg settle "$SETTLE" --arg ops "$OPS" \
                 --arg signer "$SIGNER" --arg core "$CORE" --arg sidecar "$SIDECAR" \
             '{version: $version, commit: $commit,
@@ -157,11 +167,16 @@ jobs:
         run: |
           set -euo pipefail
           {
-            echo "Pre-release of \`$GITHUB_SHA\` from \`develop\`, towards ${VERSION%%-*}. Not a release:"
+            echo "Pre-release of \`$COMMIT\` from \`develop\`, towards ${VERSION%%-*}. Not a release:"
             echo "its images are for test deployments. They are listed, by digest, in images.json."
           } > notes.md
-          gh release create "$TAG" --target "$GITHUB_SHA" --prerelease --latest=false \
-            --title "$TAG" --notes-file notes.md
+          # A re-run (after making a package public, say) finds it made already.
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release edit "$TAG" --prerelease --latest=false --notes-file notes.md
+          else
+            gh release create "$TAG" --target "$COMMIT" --prerelease --latest=false \
+              --title "$TAG" --notes-file notes.md
+          fi
 
       - name: Attach images.json
         id: asset
@@ -231,7 +246,7 @@ jobs:
           if [ "$PRERELEASE" = true ]; then event=aledgent-prerelease; else event=aledgent-release; fi
           # bloque-ledgent's contract (.github/workflows/release-intake.yml there): the tag, the
           # SHA-256 of images.json, which it fetches from the release by that tag, and the commit.
-          jq -n --arg event "$event" --arg version "$TAG" --arg commit "$GITHUB_SHA" \
+          jq -n --arg event "$event" --arg version "$TAG" --arg commit "$COMMIT" \
                 --arg sha256 "$IMAGES_SHA256" \
             '{event_type: $event,
               client_payload: {version: $version, images_json_sha256: $sha256, commit: $commit}}' \

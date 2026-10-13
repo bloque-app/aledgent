@@ -12,7 +12,10 @@
 #      review with code owners, signed commits, no force push, no deletion;
 #   4. a squash merge's subject is always the pull request's title (`squash_merge_commit_title:
 #      PR_TITLE`; GitHub's default uses a one-commit PR's commit subject instead), the title the
-#      check validates and release-please reads.
+#      check validates and release-please reads;
+#   5. the environment `release`, which holds the App key of the bloque-ledgent dispatch, is usable
+#      from `main` and `develop` only: its `v*` tag policy is removed, since no release job runs on a
+#      tag and anyone with write access can push one.
 #
 #   tools/release/protect-branches.sh            # print what it would send
 #   tools/release/protect-branches.sh --apply    # send it (a repository administrator's gh login)
@@ -56,6 +59,8 @@ jq . <<<"$protection"
 if [ "$apply" = 0 ]; then
   gh api "repos/$repo/branches/develop" > /dev/null 2>&1 \
     && echo "develop exists" || echo "develop would be cut from main at $(gh api "repos/$repo/commits/main" --jq .sha)"
+  gh api "repos/$repo/environments/release/deployment-branch-policies" \
+    --jq '.branch_policies[] | select(.type == "tag") | "environment release: tag policy \(.name) would be removed"'
   echo "(dry run: --apply sends it)"
   exit 0
 fi
@@ -74,3 +79,9 @@ for b in main develop; do
   gh api --method POST "repos/$repo/branches/$b/protection/required_signatures" > /dev/null
   echo "$b protected"
 done
+gh api "repos/$repo/environments/release/deployment-branch-policies" \
+  --jq '.branch_policies[] | select(.type == "tag") | "\(.id) \(.name)"' |
+  while read -r id name; do
+    gh api --method DELETE "repos/$repo/environments/release/deployment-branch-policies/$id"
+    echo "environment release: tag policy $name removed"
+  done
