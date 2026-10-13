@@ -19,7 +19,8 @@ It fails when:
   guest member does (it must name its own);
 - a lock file's filter does not name exactly the released members;
 - a lock file holds a released member and the configuration does not update it;
-- .release-please-manifest.json and Cargo.toml disagree on the current version.
+- .release-please-manifest.json and Cargo.toml disagree on the current version;
+- a committed file generated with the version (the OpenAPI document) is not bumped with it.
 """
 from __future__ import annotations
 
@@ -34,6 +35,9 @@ ROOT = Path(__file__).resolve().parents[2]
 CONFIG = ROOT / "release-please-config.json"
 # The guest programs' own workspaces: what their lock files hold by path is in their packages.
 GUEST_LOCKS = ["agents/core/Cargo.lock", "agents/shard/Cargo.lock"]
+# Committed files generated with a released crate's version (`env!("CARGO_PKG_VERSION")`), which a
+# test compares with what the code generates: the release must bump them with the crates.
+GENERATED = {"services/ingress/openapi.json": ("$.info.version", ("info", "version"))}
 
 
 def path_packages(rel: str) -> set[str]:
@@ -110,6 +114,14 @@ def main() -> int:
                 f"{sorted(named - set(released))}, missing: {sorted(set(released) - named)}); "
                 "run tools/release/check-config.py --fix"
             )
+    for path, (jp, keys) in GENERATED.items():
+        if not any(e["path"] == path and e.get("jsonpath") == jp for e in package.get("extra-files", [])):
+            errors.append(f"extra-files: {path} ({jp}) is missing; the release must bump it")
+        value = json.loads((ROOT / path).read_text())
+        for k in keys:
+            value = value[k]
+        if value != version:
+            errors.append(f"{path}: {jp} is {value}, Cargo.toml says {version}")
     if not has_root:
         errors.append("extra-files: Cargo.toml ($.workspace.package.version) is missing")
     for rel in holding:

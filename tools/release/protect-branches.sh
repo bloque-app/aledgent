@@ -9,7 +9,10 @@
 #   2. `main` requires the check `conventional PR title` (.github/workflows/release-checks.yml) on
 #      top of the checks it requires already;
 #   3. `develop` gets `main`'s protection as it then is: the same required checks, one approving
-#      review with code owners, signed commits, no force push, no deletion.
+#      review with code owners, signed commits, no force push, no deletion;
+#   4. a squash merge's subject is always the pull request's title (`squash_merge_commit_title:
+#      PR_TITLE`; GitHub's default uses a one-commit PR's commit subject instead), the title the
+#      check validates and release-please reads.
 #
 #   tools/release/protect-branches.sh            # print what it would send
 #   tools/release/protect-branches.sh --apply    # send it (a repository administrator's gh login)
@@ -47,6 +50,7 @@ protection="$(jq --arg check "$title_check" '{
   allow_fork_syncing: .allow_fork_syncing.enabled
 }' <<<"$current")"
 
+echo "repository: squash_merge_commit_title=PR_TITLE, squash_merge_commit_message=COMMIT_MESSAGES"
 echo "protection for main and develop:"
 jq . <<<"$protection"
 if [ "$apply" = 0 ]; then
@@ -56,6 +60,9 @@ if [ "$apply" = 0 ]; then
   exit 0
 fi
 
+gh api --method PATCH "repos/$repo" -f squash_merge_commit_title=PR_TITLE \
+  -f squash_merge_commit_message=COMMIT_MESSAGES > /dev/null
+echo "squash merges take the pull request's title"
 if ! gh api "repos/$repo/branches/develop" > /dev/null 2>&1; then
   sha="$(gh api "repos/$repo/commits/main" --jq .sha)"
   gh api --method POST "repos/$repo/git/refs" -f ref=refs/heads/develop -f sha="$sha" > /dev/null

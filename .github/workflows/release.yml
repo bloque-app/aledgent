@@ -56,6 +56,8 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      # The release pull request's labels (`autorelease: pending`, `autorelease: tagged`).
+      issues: write
     outputs:
       created: ${{ steps.rp.outputs.release_created }}
       version: ${{ steps.rp.outputs.version }}
@@ -180,6 +182,30 @@ jobs:
             cat images.json
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # The images are public: anyone, bloque-ledgent included, pulls each digest with no
+      # credential. A package GHCR created private (an org's default) stops the release here, before
+      # a deployment is told of images it cannot pull: make the package public (its settings,
+      # "Change visibility") and re-run this job.
+      - name: Every image pulls anonymously
+        run: |
+          set -euo pipefail
+          status=0
+          for ref in $(jq -r '.images[]' images.json); do
+            name="${ref#ghcr.io/}"; name="${name%@*}"; digest="${ref##*@}"
+            # An anonymous token: GHCR refuses one for a private package, and the pull then fails.
+            token="$(curl -sS "https://ghcr.io/token?scope=repository:$name:pull" | jq -r '.token // empty')"
+            code="$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+              "https://ghcr.io/v2/$name/manifests/$digest")"
+            if [ "$code" = 200 ]; then
+              echo "public: $ref"
+            else
+              echo "::error::$ref does not pull anonymously (HTTP $code): set ghcr.io/$name public"
+              status=1
+            fi
+          done
+          exit $status
 
       - name: No dispatch without the App
         if: env.HAS_APP != 'true'
