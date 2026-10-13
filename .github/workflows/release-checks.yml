@@ -1,0 +1,104 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+name: Release checks
+
+# What a release needs from every pull request (.github/workflows/release.yml, CONTRIBUTING.md
+# "Releases"):
+#
+# - conventional PR title: the title is a Conventional Commits subject, `type(scope)!: summary`. A
+#   squash merge's subject is the title, and release-please reads the subjects to choose the next
+#   version and write the changelog. A required check.
+# - release configuration: release-please-config.json still updates every released crate's version
+#   in every lock file, and the guest programs' crates keep their fixed one
+#   (tools/release/check-config.py).
+# - semver (public API): cargo-semver-checks against the last release, for the crates whose API is
+#   used from outside this workspace's own build: `verify` (a recipient's offline check of an anchor
+#   and a disclosure, a library for third parties), `compact-smt` (the state commitment and its proofs,
+#   which a verifier recomputes) and `ledger-core` (the identifiers, the asset registry and the closed
+#   Refusal list every integration names). The services, the binaries, the test harnesses and the
+#   crates only aledgent's own processes link are left out: their API is internal. The release type
+#   checked is the one the release would have with this pull request merged (its title counted), as
+#   tools/release/next-version.sh computes it, so a breaking change passes only under a title that
+#   says so (`feat!:`, or a `BREAKING CHANGE:` footer in a commit already merged), or a `feat` before
+#   1.0.0.
+#
+# It reads the title, the code and the history; it holds no secret and writes nothing, so it runs
+# on pull requests from forks as on any other.
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-checks-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  title:
+    name: conventional PR title
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: The title is a Conventional Commits subject
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          types='feat|fix|perf|refactor|revert|docs|test|build|ci|chore|style|deps'
+          if grep -Eq "^($types)(\([a-z0-9][a-z0-9._/-]*\))?!?: [^ ](.*[^ ])?$" <<<"$TITLE"; then
+            echo "conventional: $TITLE"
+          else
+            echo "::error::The title is the squash merge's subject, and release-please reads it: write it as 'type(scope)!: summary', with a type among ${types//|/, }, an optional lower-case scope, '!' for a breaking change (for example 'fix(ingress): refuse an empty client key'). It is: $TITLE"
+            exit 1
+          fi
+
+  config:
+    name: release configuration
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - run: python3 tools/release/check-config.py
+
+  semver:
+    name: semver (public API)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # The last release's tag and the subjects since: the whole history.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: semver
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: cargo-semver-checks@0.51.0
+      - name: The release this pull request leads to
+        id: release
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          baseline="$(tools/release/next-version.sh --print baseline "$BASE")"
+          type="$(tools/release/next-version.sh --print release-type --title "$TITLE" "$BASE")"
+          next="$(tools/release/next-version.sh --title "$TITLE" "$BASE")"
+          echo "baseline=$baseline" >> "$GITHUB_OUTPUT"
+          echo "type=$type" >> "$GITHUB_OUTPUT"
+          echo "Checked against \`$baseline\` as a \`$type\` release (the next release: $next)" >> "$GITHUB_STEP_SUMMARY"
+      - name: cargo semver-checks
+        env:
+          BASELINE: ${{ steps.release.outputs.baseline }}
+          TYPE: ${{ steps.release.outputs.type }}
+        run: >-
+          cargo semver-checks check-release
+          --package verify --package compact-smt --package ledger-core
+          --baseline-rev "$BASELINE" --release-type "$TYPE" --default-features

@@ -19,14 +19,15 @@ deployment: never run this image anywhere that holds value. The production image
 ## Tags
 
 Built and pushed by `.github/workflows/images.yml`, job `sidecar` (GitHub-hosted runners,
-`linux/amd64`). It is on GHCR, unlike the deployment images (Amazon ECR in the test account), so
-that another repository's Actions job can pull it with its own `GITHUB_TOKEN`:
+`linux/amd64`), public on GHCR with the other images, so that another repository's Actions job can
+pull it with its own `GITHUB_TOKEN`:
 
 | Tag | What |
 |---|---|
 | `edge` | the latest push to `main` (every merge) |
-| `sha-<commit>` | that commit of `main`, or of a `v*` tag or a dispatch; pin this in CI |
-| `v*` | a release tag |
+| `sha-<commit>` | that commit of `main`, a release, a pre-release or a dispatch; pin this in CI |
+| `vX.Y.Z` | a release (`.github/workflows/release.yml`) |
+| `vX.Y.Z-dev_<sha7>` | a pre-release from `develop` (its version is `X.Y.Z-dev+<sha7>`; a tag has no `+`) |
 
 Pull requests build and test the image but push nothing.
 

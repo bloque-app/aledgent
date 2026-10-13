@@ -99,12 +99,15 @@ mod tests {
     fn an_unspecified_host_is_probed_on_loopback() {
         assert_eq!(
             address("0.0.0.0:8080").unwrap(),
-            "127.0.0.1:8080".parse().unwrap()
+            "127.0.0.1:8080".parse::<SocketAddr>().unwrap()
         );
-        assert_eq!(address("[::]:9464").unwrap(), "[::1]:9464".parse().unwrap());
+        assert_eq!(
+            address("[::]:9464").unwrap(),
+            "[::1]:9464".parse::<SocketAddr>().unwrap()
+        );
         assert_eq!(
             address("127.0.0.1:1").unwrap(),
-            "127.0.0.1:1".parse().unwrap()
+            "127.0.0.1:1".parse::<SocketAddr>().unwrap()
         );
     }
 }
