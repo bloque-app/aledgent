@@ -21,13 +21,15 @@ name: Release
 # sidecar) is built and pushed to ghcr.io/bloque-app/aledgent-<name> as `sha-<commit>` and
 # `v<version>` (`+` made `_`), and the release gets images.json:
 #
-#   {"version": "0.2.0", "tag": "v0.2.0", "commit": "<sha>", "prerelease": false,
+#   {"version": "v0.2.0", "commit": "<40 hex>",
 #    "images": {"ingress": "ghcr.io/bloque-app/aledgent-ingress@sha256:…", …}}
 #
+# `version` is the release's tag, as the dispatch names it (bloque-ledgent's deploy/bin/intake.sh
+# fetches images.json from the release by that tag and checks that both agree).
+#
 # Then bloque-app/bloque-ledgent, the private deployment repository, gets a `repository_dispatch`
-# (`aledgent-release` or `aledgent-prerelease`) whose payload is the version, the commit, the URL of
-# images.json and its SHA-256 (`client_payload`: `version`, `commit`, `images_json_url`,
-# `images_json_sha256`), under a token of the GitHub App `aledgent-release` (installed on that
+# (`aledgent-release` or `aledgent-prerelease`) whose payload is the tag, the commit and the SHA-256
+# of images.json (`client_payload`: `version`, `commit`, `images_json_sha256`), under a token of the GitHub App `aledgent-release` (installed on that
 # repository only), from the secrets ALEDGENT_RELEASE_APP_ID and ALEDGENT_RELEASE_APP_KEY of the
 # environment `release` (branches main and develop, tags v*). Without them, the dispatch is skipped
 # with a notice; the release stands.
@@ -138,11 +140,10 @@ jobs:
             grep -Eq "^ghcr\.io/bloque-app/aledgent-${n,,}@sha256:[0-9a-f]{64}$" <<<"$ref" \
               || { echo "::error::no digest for ${n,,}: '$ref'"; exit 1; }
           done
-          jq -n --arg version "$VERSION" --arg tag "$TAG" --arg commit "$GITHUB_SHA" \
-                --argjson prerelease "$PRERELEASE" \
+          jq -n --arg version "$TAG" --arg commit "$GITHUB_SHA" \
                 --arg ingress "$INGRESS" --arg settle "$SETTLE" --arg ops "$OPS" \
                 --arg signer "$SIGNER" --arg core "$CORE" --arg sidecar "$SIDECAR" \
-            '{version: $version, tag: $tag, commit: $commit, prerelease: $prerelease,
+            '{version: $version, commit: $commit,
               images: {ingress: $ingress, settle: $settle, ops: $ops, signer: $signer,
                        core: $core, sidecar: $sidecar}}' > images.json
           cat images.json
@@ -198,15 +199,15 @@ jobs:
         if: env.HAS_APP == 'true'
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
-          IMAGES_URL: ${{ steps.asset.outputs.url }}
           IMAGES_SHA256: ${{ steps.asset.outputs.sha256 }}
         run: |
           set -euo pipefail
           if [ "$PRERELEASE" = true ]; then event=aledgent-prerelease; else event=aledgent-release; fi
-          jq -n --arg event "$event" --arg version "$VERSION" --arg commit "$GITHUB_SHA" \
-                --arg url "$IMAGES_URL" --arg sha256 "$IMAGES_SHA256" \
+          # bloque-ledgent's contract (.github/workflows/release-intake.yml there): the tag, the
+          # SHA-256 of images.json, which it fetches from the release by that tag, and the commit.
+          jq -n --arg event "$event" --arg version "$TAG" --arg commit "$GITHUB_SHA" \
+                --arg sha256 "$IMAGES_SHA256" \
             '{event_type: $event,
-              client_payload: {version: $version, commit: $commit,
-                               images_json_url: $url, images_json_sha256: $sha256}}' \
+              client_payload: {version: $version, images_json_sha256: $sha256, commit: $commit}}' \
             | gh api --method POST repos/bloque-app/bloque-ledgent/dispatches --input -
-          echo "Dispatched \`$event\` ($VERSION) to bloque-app/bloque-ledgent" >> "$GITHUB_STEP_SUMMARY"
+          echo "Dispatched \`$event\` ($TAG) to bloque-app/bloque-ledgent" >> "$GITHUB_STEP_SUMMARY"
