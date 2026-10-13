@@ -983,7 +983,7 @@ the first upgrade is taken. Traces: `REQ-RT-3`, `REQ-RT-15`–`REQ-RT-18`, `REQ-
 | ID | Question | Planned meanwhile | Blocks |
 |---|---|---|---|
 | `DEP-1` | To VOS's maintainers: will VOS state stay capped and sent whole, or is a state model outside the image planned? | `DEC-4` (roots in, leaves out); measured in `F-002`. *2026-09-23:* an experimental state-block path exists on `saga`; touched-state transport is now `F-025` work | The shape of `F-006`. Nothing before it |
-| `DEP-2` | To VOS's maintainers: durable, self-firing timers on the standard runtime, or a custom AgentRuntime? | `DEC-6` external ticker. *2026-10-03:* `DEC-23` answers with our own runtime: deadline-driven ticks (`T-033-08`), the ticker a heartbeat | `F-009` finalisation only |
+| `DEP-2` | To VOS's maintainers: durable, self-firing timers on the standard runtime, or a custom AgentRuntime? | `DEC-6` external ticker. *2026-10-03:* `DEC-23` answers with our own runtime: deadline-driven ticks ([`T-033-08`](features/F-033-aledgent-runtime/tasks.md)), the ticker a heartbeat | `F-009` finalisation only |
 | `DEP-3` | To VOS's maintainers: timeline for a production-qualified Shared Agent; locality seal | `DEC-10` Local + backups | `M-4` |
 | `DEP-4` | To CipherClerk's maintainers: a CipherClerk primitive for moves between layers inside one account, or for reservations | `DEC-2` holding positions | Nothing. A later simplification |
 | `DEP-5` | *Resolved 2026-09-23:* @olanod confirmed `saga/agents` as the target | — | — |
@@ -1146,7 +1146,7 @@ guest levers on, VOS-native at opt-level `s` and JAM-native at opt 3, on the fle
 - **Faults:** none lost, drained in 4 s.
 - **Burst: fails.**
   - One core decides about 35 a second, far below the burst's rate.
-  - The stall after the backlog (F18) is fixed (`T-032-17`): the backlog drains 409 s after the load
+  - The stall after the backlog (F18) is fixed ([`T-032-17`](features/F-032-stress/tasks.md)): the backlog drains 409 s after the load
     stops, with nothing lost.
   - *Ruled 2026-10-04:* the burst is judged against the sharded capacity under test, many
     small nodes across several hosts, not one core. One core's 35 a second is reported, not gated.
@@ -1161,7 +1161,7 @@ guest levers on, VOS-native at opt-level `s` and JAM-native at opt 3, on the fle
   - *Ruled 2026-10-04 (amendment 0018):* completion ends at the leg's inclusion;
     finality is reported apart. The recorded phases put inclusion about 12.5 s after the request at p50
     (the sum of the phases' medians in `features/F-032-stress/NOTES-withdrawals.md`, not a measured
-    p99). The item is judged again on the next run, to `Observed` (`T-032-21`).
+    p99). The item is judged again on the next run, to `Observed` ([`T-032-21`](features/F-032-stress/tasks.md)).
 - Of the four owner questions the run raised, completion at inclusion and the burst's measure are ruled
   (above); a 2 h soak standing for the 4 h, and memory that grows with the book, are still open.
 
