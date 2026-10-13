@@ -49,6 +49,14 @@ export default defineConfig({
 				replacesTitle: true,
 			},
 			favicon: '/favicon.svg',
+			// Link previews (Slack, social): one card for every page, served from site/public/og.png.
+			head: [
+				{ tag: 'meta', attrs: { property: 'og:image', content: `${site}${base}og.png` } },
+				{ tag: 'meta', attrs: { property: 'og:image:width', content: '1200' } },
+				{ tag: 'meta', attrs: { property: 'og:image:height', content: '630' } },
+				{ tag: 'meta', attrs: { name: 'twitter:card', content: 'summary_large_image' } },
+				{ tag: 'meta', attrs: { name: 'twitter:image', content: `${site}${base}og.png` } },
+			],
 			social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/bloque-app/aledgent' }],
 			editLink: { baseUrl: 'https://github.com/bloque-app/aledgent/edit/main/site/' },
 			// English only for now. Adding a language is `locales` here plus a folder under

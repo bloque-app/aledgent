@@ -101,3 +101,10 @@ path = ["SPEC.md", "PLAN.md", "OVERVIEW.md"]
 precedence = "override"
 SPDX-FileCopyrightText = "Copyright (c) 2026 Pagos Cube LLC"
 SPDX-License-Identifier = "CC-BY-4.0"
+
+# The docs site's link-preview card: it shows the aledgent mark, so it is licensed like the marks.
+[[annotations]]
+path = "site/public/og.png"
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright (c) 2026 Pagos Cube LLC"
+SPDX-License-Identifier = "LicenseRef-Trademark-Marks"
