@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0 OR MIT
 [package]
 name = "guest-heap"
-version = "0.1.0"
+version.workspace = true
 description = "A model of the core guest's heap for native tests (REQ-RT-1): a global allocator that serves from the system and replays every allocation of a window through the guest allocator's placement rules, so a test reads the arena the guest would need. Test-only: never linked by a guest or a host."
 edition.workspace = true
 rust-version.workspace = true

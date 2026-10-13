@@ -28,6 +28,7 @@
 //! - [`auth`]: deny-by-default transport authentication; credentials never logged.
 //! - [`boundary`]: the ingress-to-core trait and the values that cross it.
 //! - [`inprocess`]: the in-process core behind a write-ahead journal.
+//! - [`probe`]: the image's health check, one `GET` to the process's own listener (no shell).
 //! - [`remote`]: the core in another process (`F-005`): the client ingress uses to reach the
 //!   core Agent's host, and the server the host answers with.
 //! - [`store`]: the received-log, delivery attempts, recipients and leadership; in memory and in
@@ -61,6 +62,7 @@ pub mod metrics;
 pub mod openapi;
 pub mod operator;
 pub mod pass_through;
+pub mod probe;
 pub mod query;
 pub mod remote;
 pub mod service;

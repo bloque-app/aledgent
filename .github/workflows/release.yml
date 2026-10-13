@@ -1,0 +1,254 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+name: Release
+
+# Releases and pre-releases (CONTRIBUTING.md, "Releases").
+#
+# main, releases (semver). release-please keeps one release pull request open against main
+# (release-please-config.json): it bumps `[workspace.package] version` in Cargo.toml, the released
+# members' entries in the lock files, and CHANGELOG.md, from the conventional-commit subjects merged
+# since the last release (a squash merge's subject is its pull request's title, which
+# .github/workflows/release-checks.yml requires to be conventional). Merging it tags `vX.Y.Z` and
+# creates the GitHub release, marked latest. GitHub starts no workflow for a pull request that
+# GITHUB_TOKEN opened or updated, so a maintainer closes and reopens the release pull request to run
+# its checks before merging it.
+#
+# develop, pre-releases. Every push tags `vX.Y.Z-dev+<sha7>` and creates a GitHub pre-release, never
+# latest. X.Y.Z is the version the next release would have, computed as release-please computes it
+# (tools/release/next-version.sh): a pre-release names the release it leads to.
+#
+# Either way, every image (.github/workflows/images.yml: ingress, settle, ops, signer, core,
+# sidecar) is built and pushed to ghcr.io/bloque-app/aledgent-<name> as `sha-<commit>` and
+# `v<version>` (`+` made `_`), and the release gets images.json:
+#
+#   {"version": "v0.2.0", "commit": "<40 hex>",
+#    "images": {"ingress": "ghcr.io/bloque-app/aledgent-ingress@sha256:…", …}}
+#
+# `version` is the release's tag, as the dispatch names it (bloque-ledgent's deploy/bin/intake.sh
+# fetches images.json from the release by that tag and checks that both agree).
+#
+# Then bloque-app/bloque-ledgent, the private deployment repository, gets a `repository_dispatch`
+# (`aledgent-release` or `aledgent-prerelease`) whose payload is the tag, the commit and the SHA-256
+# of images.json (`client_payload`: `version`, `commit`, `images_json_sha256`), under a token of the
+# GitHub App `aledgent-release` (installed on that repository only), from the secrets
+# ALEDGENT_RELEASE_APP_ID and ALEDGENT_RELEASE_APP_KEY of the environment `release`. Only main and
+# develop may use that environment: nothing here runs on a tag, and a tag that anyone with write
+# access can push must not reach the App's key (tools/release/protect-branches.sh removes the
+# environment's `v*` tag policy). Without the secrets, the dispatch is skipped with a notice; the
+# release stands.
+#
+# Never in a fork, and never on a pull request: this runs on pushes to main and develop only.
+
+on:
+  push:
+    branches: [main, develop]
+
+permissions: {}
+
+# main: one run at a time, never cancelled (a release half-published is worse than a late one). A
+# group keeps one pending run, so a queued run can be replaced by a newer one; release-please then
+# creates the release in the newer run, and the images are built at the release's own commit (its
+# `sha`), not at that run's. develop: one group per commit, so no push loses its pre-release.
+concurrency:
+  group: release-${{ github.ref }}${{ github.ref == 'refs/heads/develop' && format('-{0}', github.sha) || '' }}
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    name: release pull request (main)
+    if: github.repository == 'bloque-app/aledgent' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      # The release pull request's labels (`autorelease: pending`, `autorelease: tagged`).
+      issues: write
+    outputs:
+      created: ${{ steps.rp.outputs.release_created }}
+      version: ${{ steps.rp.outputs.version }}
+      tag: ${{ steps.rp.outputs.tag_name }}
+      # The released commit: a run queued behind another may run at a later head of main.
+      sha: ${{ steps.rp.outputs.sha }}
+    steps:
+      - id: rp
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  prerelease:
+    name: pre-release version (develop)
+    if: github.repository == 'bloque-app/aledgent' && github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Every commit and tag: the last release and the subjects after it.
+          fetch-depth: 0
+          persist-credentials: false
+      - id: v
+        run: |
+          set -euo pipefail
+          next="$(tools/release/next-version.sh "$GITHUB_SHA")"
+          version="$next-dev+${GITHUB_SHA::7}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "Pre-release \`v$version\` (the next release: $next)" >> "$GITHUB_STEP_SUMMARY"
+
+  images:
+    name: images
+    needs: [release-please, prerelease]
+    if: >-
+      !cancelled() && !failure()
+      && (needs.release-please.outputs.created == 'true' || needs.prerelease.outputs.version != '')
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/images.yml
+    with:
+      version: ${{ needs.release-please.outputs.version || needs.prerelease.outputs.version }}
+      commit: ${{ needs.release-please.outputs.sha || github.sha }}
+
+  publish:
+    name: images.json and dispatch
+    needs: [release-please, prerelease, images]
+    if: >-
+      !cancelled() && !failure() && needs.images.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      PRERELEASE: ${{ needs.prerelease.outputs.version != '' }}
+      VERSION: ${{ needs.release-please.outputs.version || needs.prerelease.outputs.version }}
+      TAG: ${{ needs.release-please.outputs.tag || needs.prerelease.outputs.tag }}
+      COMMIT: ${{ needs.release-please.outputs.sha || github.sha }}
+      HAS_APP: ${{ secrets.ALEDGENT_RELEASE_APP_ID != '' && secrets.ALEDGENT_RELEASE_APP_KEY != '' }}
+    steps:
+      - name: images.json
+        env:
+          INGRESS: ${{ needs.images.outputs.ingress }}
+          SETTLE: ${{ needs.images.outputs.settle }}
+          OPS: ${{ needs.images.outputs.ops }}
+          SIGNER: ${{ needs.images.outputs.signer }}
+          CORE: ${{ needs.images.outputs.core }}
+          SIDECAR: ${{ needs.images.outputs.sidecar }}
+        run: |
+          set -euo pipefail
+          for n in INGRESS SETTLE OPS SIGNER CORE SIDECAR; do
+            ref="${!n}"
+            # Every image, by digest, on the public registry.
+            grep -Eq "^ghcr\.io/bloque-app/aledgent-${n,,}@sha256:[0-9a-f]{64}$" <<<"$ref" \
+              || { echo "::error::no digest for ${n,,}: '$ref'"; exit 1; }
+          done
+          jq -n --arg version "$TAG" --arg commit "$COMMIT" \
+                --arg ingress "$INGRESS" --arg settle "$SETTLE" --arg ops "$OPS" \
+                --arg signer "$SIGNER" --arg core "$CORE" --arg sidecar "$SIDECAR" \
+            '{version: $version, commit: $commit,
+              images: {ingress: $ingress, settle: $settle, ops: $ops, signer: $signer,
+                       core: $core, sidecar: $sidecar}}' > images.json
+          cat images.json
+
+      # A release exists already (release-please made it); a pre-release is made here, at the commit
+      # its images were built from.
+      - name: The pre-release
+        if: env.PRERELEASE == 'true'
+        run: |
+          set -euo pipefail
+          {
+            echo "Pre-release of \`$COMMIT\` from \`develop\`, towards ${VERSION%%-*}. Not a release:"
+            echo "its images are for test deployments. They are listed, by digest, in images.json."
+          } > notes.md
+          # A re-run (after making a package public, say) finds it made already.
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release edit "$TAG" --prerelease --latest=false --notes-file notes.md
+          else
+            gh release create "$TAG" --target "$COMMIT" --prerelease --latest=false \
+              --title "$TAG" --notes-file notes.md
+          fi
+
+      - name: Attach images.json
+        id: asset
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" images.json --clobber
+          url="$(gh release view "$TAG" --json assets --jq '.assets[] | select(.name == "images.json") | .url')"
+          test -n "$url"
+          sha256="$(sha256sum images.json | cut -d' ' -f1)"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
+          {
+            echo "### $TAG"
+            echo
+            echo "images.json: $url (sha-256 \`$sha256\`)"
+            echo
+            echo '```json'
+            cat images.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The images are public: anyone, bloque-ledgent included, pulls each digest with no
+      # credential. A package GHCR created private (an org's default) stops the release here, before
+      # a deployment is told of images it cannot pull: make the package public (its settings,
+      # "Change visibility") and re-run this job.
+      - name: Every image pulls anonymously
+        run: |
+          set -euo pipefail
+          status=0
+          for ref in $(jq -r '.images[]' images.json); do
+            name="${ref#ghcr.io/}"; name="${name%@*}"; digest="${ref##*@}"
+            # An anonymous token: GHCR refuses one for a private package, and the pull then fails.
+            token="$(curl -sS "https://ghcr.io/token?scope=repository:$name:pull" | jq -r '.token // empty')"
+            code="$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+              "https://ghcr.io/v2/$name/manifests/$digest")"
+            if [ "$code" = 200 ]; then
+              echo "public: $ref"
+            else
+              echo "::error::$ref does not pull anonymously (HTTP $code): set ghcr.io/$name public"
+              status=1
+            fi
+          done
+          exit $status
+
+      - name: No dispatch without the App
+        if: env.HAS_APP != 'true'
+        run: |
+          echo "::notice::ALEDGENT_RELEASE_APP_ID or ALEDGENT_RELEASE_APP_KEY is not set in the environment 'release': bloque-app/bloque-ledgent is not notified of $TAG."
+      - name: A token for bloque-ledgent
+        id: app
+        if: env.HAS_APP == 'true'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.ALEDGENT_RELEASE_APP_ID }}
+          private-key: ${{ secrets.ALEDGENT_RELEASE_APP_KEY }}
+          owner: bloque-app
+          repositories: bloque-ledgent
+          permission-contents: write
+      - name: Dispatch to bloque-ledgent
+        if: env.HAS_APP == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          IMAGES_SHA256: ${{ steps.asset.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          if [ "$PRERELEASE" = true ]; then event=aledgent-prerelease; else event=aledgent-release; fi
+          # bloque-ledgent's contract (.github/workflows/release-intake.yml there): the tag, the
+          # SHA-256 of images.json, which it fetches from the release by that tag, and the commit.
+          jq -n --arg event "$event" --arg version "$TAG" --arg commit "$COMMIT" \
+                --arg sha256 "$IMAGES_SHA256" \
+            '{event_type: $event,
+              client_payload: {version: $version, images_json_sha256: $sha256, commit: $commit}}' \
+            | gh api --method POST repos/bloque-app/bloque-ledgent/dispatches --input -
+          echo "Dispatched \`$event\` ($TAG) to bloque-app/bloque-ledgent" >> "$GITHUB_STEP_SUMMARY"

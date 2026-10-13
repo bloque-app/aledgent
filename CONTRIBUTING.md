@@ -82,10 +82,39 @@ A pull request:
 - puts an SPDX header on every new file (`docs/oss/LICENSING.md`). Code under `agents/` is
   AGPL-3.0-or-later; other code is Apache-2.0 OR MIT; documents are CC-BY-4.0. No crate outside
   `agents/` may depend on VOS;
-- is signed off (below).
+- is signed off (below);
+- has a [Conventional Commits](https://www.conventionalcommits.org/) title, `type(scope)!: summary`
+  (`fix(ingress): refuse an empty client key`). Pull requests are squash-merged, the title becomes
+  the commit's subject, and the release is cut from those subjects (below). The `conventional PR
+  title` check enforces it.
 
 A maintainer reviews it. `CODEOWNERS` routes reviews: changes to `SPEC.md` and `amendments/` need the
 spec owner's approval.
+
+## Releases
+
+Two long-lived branches: `develop`, where pull requests land, and `main`, which holds releases. Both
+are protected alike (one approving review, code owners, the required checks, signed commits).
+
+- **Pre-releases.** Every push to `develop` publishes `vX.Y.Z-dev+<sha7>`, a GitHub pre-release,
+  where `X.Y.Z` is the version the next release would have (`tools/release/next-version.sh`).
+- **Releases.** `develop` is promoted to `main` by a pull request merged with a merge commit, never
+  squashed, so that `main` keeps the subjects. release-please (`release-please-config.json`) keeps a
+  release pull request open against `main` that bumps the workspace version and `CHANGELOG.md`: a
+  `feat` is a minor release, a `fix` or anything else a patch, a breaking change (`feat!:`, or a
+  `BREAKING CHANGE:` footer) a major one, or a minor one before 1.0.0. Merging it tags `vX.Y.Z` and
+  publishes the release. GitHub does not run checks on a pull request opened by its own Actions
+  token: close and reopen the release pull request to run them. After a release, merge `main` back
+  into `develop`.
+- **Images.** A release or a pre-release publishes every image to `ghcr.io/bloque-app/aledgent-<name>`
+  (ingress, settle, ops, signer, core, sidecar) as `sha-<commit>` and `v<version>` (`+` becomes `_`
+  in an image tag), and attaches `images.json`, each image by digest (`.github/workflows/release.yml`).
+- **Versions.** The workspace's crates take their version from `[workspace.package]`, except those
+  compiled into a guest program (`core.vos`, the shard's), which keep a fixed one: a crate's version
+  reaches the compiled program, whose bytes are its identity, and a release must not change the core
+  it ships when no line of the core changed. `tools/release/check-config.py` checks it.
+- **Public API.** `cargo semver-checks` compares `verify`, `compact-smt` and `ledger-core` with the
+  last release, at the release type the title implies: a breaking change needs a title that says so.
 
 ## Sign-off: the Developer Certificate of Origin
 

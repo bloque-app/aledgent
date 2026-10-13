@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0 OR MIT
 [package]
 name = "recovery"
-version = "0.1.0"
+version.workspace = true
 description = "The recovery-authority service of DEC-13: it holds the recovery key, apart from the core, and does one thing, approving a recovery (F-012, REQ-AU-15)."
 edition.workspace = true
 rust-version.workspace = true

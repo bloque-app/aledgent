@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0 OR MIT
 [package]
 name = "ops"
-version = "0.1.0"
+version.workspace = true
 description = "aledgent operations (F-018): backup jobs, the restore procedure and its drill, the signal exporter, alert rules and their evaluation, and the daily reconciliation of NFR-9."
 edition.workspace = true
 rust-version.workspace = true
