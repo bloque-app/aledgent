@@ -108,8 +108,7 @@ export default defineConfig({
 						{ file: 'OVERVIEW.md', slug: 'overview', title: 'Overview', defines: false },
 					],
 					ids: { prefixes: ['REQ', 'INV', 'NFR', 'OQ', 'DEF', 'DEC', 'ERR', 'US', 'AC', 'CTR', 'CND', 'T', 'F', 'M', 'RISK', 'DEP'] },
-					// 'warn' until aledgent's 17 undefined references and the duplicate milestone tables are fixed.
-					check: 'warn',
+					check: 'error',
 					sidebar: { label: 'Specification' },
 				}),
 			],
