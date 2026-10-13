@@ -1,0 +1,5 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: AGPL-3.0-or-later
+[toolchain]
+channel = "nightly-2026-03-20"
+components = ["rust-src"]

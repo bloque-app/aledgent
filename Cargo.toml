@@ -1,0 +1,91 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# aledgent — one Rust workspace, one layout (PLAN.md `DEC-15`).
+#
+# Members are added as their features land. The full layout is:
+#   crates/ledger-kernel   F-001   the CipherClerk binding and the storage trait
+#   crates/ledger-core     F-003…  the host-independent library
+#   crates/conformance     F-015   the conformance suite
+#   crates/leaf-store      F-006   the host-side leaf store
+#   crates/audit-store     F-013   the audit store for the in-process host
+#   crates/verify          F-017   the anchor and disclosure verifier
+#   crates/core-binding    F-005   the Agent binding's host-independent half (no VOS)
+#   crates/core-archive    F-005   the core Agent's off-node archive: continuous backup, restore (no VOS)
+#   crates/authn           F-028   credential schemes at the boundary: passkeys, API keys, sessions
+#   crates/shards          F-031   a prototype of the book in shards of partitions, with the credit path
+#   agents/core            F-005   the VOS Agent binding (its own workspace: AGPL, links VOS)
+#   services/ingress       F-009
+#   services/settle        F-016
+#   services/recovery      F-012
+#   ops                    F-018   backups, restore and drill, signals, alerts, reconciliation
+#   e2e/sidecar                    aledgent as a CI service container: book only, test credentials
+#   spikes/                F-002   measurement code, never shipped
+#
+# Excluded: contracts/ (F-026) holds ink! contracts, each a workspace of its own, built with
+# `cargo contract` by `.github/workflows/contracts.yml`.
+# Excluded: services/settle/kreivo-pin (F-027) pins the settlement executor's Kreivo transaction to
+# Kreivo's own Polkadot SDK and Virto crates, a workspace of its own so that its dependency tree does
+# not slow every run of this one.
+# Excluded: e2e/network holds the zombienet end-to-end suite's network crate (zombienet-sdk), a workspace of
+# its own built only by `.github/workflows/e2e-zombienet.yml` on a self-hosted `zombienet` runner.
+[workspace]
+resolver = "2"
+members = ["crates/compact-smt", "crates/ledger-kernel", "crates/ledger-core", "crates/core-binding", "crates/guest-heap", "crates/core-archive", "crates/verify", "crates/leaf-store", "crates/conformance", "crates/audit-store", "crates/authn", "crates/shards", "services/ingress", "services/recovery", "services/settle", "services/signer", "ops", "e2e/aledgent-driver", "e2e/sidecar"]
+# CI fixtures are standalone workspaces that the feature checks must reject.
+# `spikes/` (F-002) is its own workspace: measurement code, never shipped.
+exclude = ["tools/ci/fixtures", "spikes", "agents", "contracts", "services/settle/kreivo-pin", "e2e/network"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/bloque-app/aledgent"
+publish = false
+
+[workspace.dependencies]
+# The kernel, pinned by commit (F-001 §1, RISK-3): the rev both VOS branches pin.
+# Default features stay off, as in the VOS clerk actors. `fmd-experimental`,
+# `stealth-experimental` and `notes` must never be enabled (DEC-11, DEF-4);
+# `tools/ci/check-kernel-features.sh` fails the build if any crate does.
+cipher-clerk = { git = "https://codeberg.org/Virto/CipherClerk.git", rev = "e9a7b0851f183c14dbd1635dbf0437c86682ad6f", default-features = false }
+
+# smoldot and smoldot-light (the adapter's light client, `chain/light.rs`) from a fork, pinned by
+# commit: upstream `main` at b7f587e4 (smoldot 4.0.0 and smoldot-light 2.1.0 as released, plus the
+# seven commits merged since) and one change, `runtime_call::Config::
+# calculate_child_tries_roots_on_finish`, which the light client sets to false. Without it smoldot
+# recalculates, once a runtime call has finished, the root of every child trie the call wrote,
+# which needs trie data the node's call proof does not hold, and a dry run of a batch of several
+# calls to the contract's `execute` fails over the light client (F-027 NOTES, decisions 42 and 43).
+# Proposed upstream as paritytech/smoldot#3395; drop this section once a
+# release carries it. smoldot 0.19.4 (subxt's own light client, under
+# `settle/probe-subxt-lightclient` only) is not patched.
+[patch.crates-io]
+smoldot = { git = "https://github.com/bloque-app/smoldot", rev = "67ad6c379d271be27b5cdd841dcf0d321668d30d" }
+smoldot-light = { git = "https://github.com/bloque-app/smoldot", rev = "67ad6c379d271be27b5cdd841dcf0d321668d30d" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "deny"
+
+[workspace.lints.clippy]
+# INV-7, REQ-KER-7: floating point must not touch a monetary value. Nothing in
+# this workspace needs it, so it is denied everywhere.
+float_arithmetic = "deny"
+float_cmp = "deny"
+lossy_float_literal = "deny"
+
+# Curve arithmetic dominates the test suite. Dependencies are optimised even in
+# debug and test builds; our own code keeps debug assertions and overflow checks.
+[profile.dev.package."*"]
+opt-level = 3
+
+# smoldot's debug assertions are not all true: `trie::proof_decode::next_key` asserts that a branch
+# node with no child after the key it looks past has a value, which a node with children only
+# before that key need not have, and a debug build of the light client then panics on a dry run of
+# the settlement contract's `execute` (F-027 NOTES, decision 42). A release build has no such assertion; debug and test builds of the light client
+# must not have it either.
+[profile.dev.package.smoldot]
+debug-assertions = false
+
+[profile.dev.package.smoldot-light]
+debug-assertions = false

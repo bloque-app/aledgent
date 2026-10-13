@@ -1,0 +1,64 @@
+---
+// One of the landing page's four concept cards: a numbered kicker, a title, a short blurb and an
+// optional link. Starlight's <Card> has no kicker slot, so this sits in its <CardGrid> instead and
+// reuses the same card styling (theme.css, `.card`).
+import { withBase } from '../lib/url';
+
+interface Props {
+	n: string;
+	label: string;
+	title: string;
+	href?: string;
+	linkText?: string;
+}
+const { n, label, title, href, linkText } = Astro.props;
+---
+
+<article class="card bq-concept">
+	<p class="kicker">{n} · {label}</p>
+	<h3>{title}</h3>
+	<div class="body"><slot /></div>
+	{href && linkText && <a class="more" href={withBase(href)}>{linkText} →</a>}
+</article>
+
+<style>
+	.bq-concept {
+		display: flex;
+		flex-direction: column;
+		gap: 0.6rem;
+	}
+	.kicker {
+		margin: 0;
+		font-family: var(--__sl-font-mono);
+		font-size: var(--sl-text-xs);
+		color: var(--sl-color-text-accent);
+	}
+	h3 {
+		margin: 0;
+		font-family: var(--bq-font-display);
+		font-weight: 700;
+		font-size: var(--sl-text-2xl);
+		line-height: 1.15;
+		letter-spacing: -0.03em;
+		color: var(--sl-color-white);
+	}
+	.body {
+		color: var(--sl-color-gray-2);
+		font-size: var(--sl-text-base);
+		line-height: 1.6;
+	}
+	.body :global(p) {
+		margin: 0;
+	}
+	.more {
+		margin-top: auto;
+		padding-top: 0.5rem;
+		font-weight: 500;
+		color: var(--sl-color-text-accent);
+		text-decoration: none;
+	}
+	.more:hover {
+		text-decoration: underline;
+		text-underline-offset: 0.18em;
+	}
+</style>

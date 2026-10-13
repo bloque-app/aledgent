@@ -1,0 +1,604 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+name: Images
+
+# aledgent's container images (deploy/docker/), built here and nowhere else: never on a developer's
+# machine, and never on a self-hosted runner. GitHub-hosted runners, linux/amd64.
+#
+# The deployment images go to the operator's Amazon ECR, named by repository variables
+# (`AWS_ECR_ROLE_ARN`, `AWS_REGION`, `ECR_NAMESPACE`):
+#
+#   <registry>/<namespace>/aledgent-ingress   aledgent-ingress, with the in-process core
+#   <registry>/<namespace>/aledgent-settle    the settlement adapter, with its chain specs
+#   <registry>/<namespace>/aledgent-ops       opsctl: the signal exporter
+#   <registry>/<namespace>/aledgent-signer    aledgent-signer: the key boundary (F-035)
+#   <registry>/<namespace>/aledgent-core      the core as a VOS Agent (aledgent-core-host), AGPL-3.0-or-later
+#
+# A pull request builds every image, runs each binary once inside it (a distroless image has no
+# shell, so a binary that does not link fails here), checks the baked chain specs, and reports the
+# sizes; it pushes nothing and gets no AWS credentials. A `v*` tag or a manual dispatch does the
+# same and then pushes, through GitHub OIDC and the role in the repository variable `AWS_ECR_ROLE_ARN`. Tags are immutable there: `sha-<commit>` always, and the
+# `v*` tag for a release; never `latest` (a deployment may watch it), nor a branch name. An image whose `sha-<commit>` is already in
+# ECR is not pushed again; a release tag on such a commit is added to the image already there. Each
+# job ends by reading every image's `sha-<commit>` back from ECR and recording its digest in the run's
+# summary (`<repository>:sha-<commit>@sha256:<digest>`).
+#
+# One image goes elsewhere: ghcr.io/bloque-app/aledgent-sidecar (the `sidecar` job), aledgent for
+# other repositories' CI service containers, book only, in memory, with TEST credentials
+# (deploy/docker/SIDECAR.md). It is not a deployment, so it is not in ECR: it is on GHCR, where
+# another repository's Actions job pulls it with its own GITHUB_TOKEN. A pull request builds and
+# exercises it and pushes nothing; every push to `main` (a merge) pushes it as `sha-<commit>` and
+# `edge`; a `v*` tag as `sha-<commit>` and the tag. The ECR jobs do not run on a push to `main`.
+#
+# The book's roots (DEC-25, owner ruling cs-q04): every image is built with v2 roots (compact trees),
+# the default, unless a manual dispatch asks for `roots: v1` (CipherClerk's full-depth trees, a
+# supported opt-in, chosen for a whole deployment at genesis). Then ingress, settle, ops and core are
+# built with v1 (the Dockerfiles' ROOTS) and pushed as `sha-<commit>-roots-v1`, so a v1 image never
+# takes a v2 image's tag; each image carries its roots as the label `app.aledgent.roots`. The sidecar
+# is always v2.
+
+on:
+  pull_request:
+    paths:
+      - "crates/**"
+      - "services/**"
+      - "ops/**"
+      - "agents/**"
+      - "e2e/aledgent-driver/**"
+      - "e2e/sidecar/**"
+      - "deploy/**"
+      - "tools/cipherclerk-patched.sh"
+      - "proposals/cipherclerk/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".dockerignore"
+      - ".github/workflows/images.yml"
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      roots:
+        description: "The book's roots (DEC-25): v2 (the default) or v1 (a supported opt-in, cs-q04)"
+        type: choice
+        options: [v2, v1]
+        default: v2
+
+permissions:
+  contents: read
+
+# One group per event and ref: a pending dispatch on main is never replaced by a merge's push run
+# (a group keeps one pending run, the newest), and pushes to main still queue behind each other.
+concurrency:
+  group: images-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_NAMESPACE: ${{ vars.ECR_NAMESPACE }}
+  PUSH: ${{ github.event_name != 'pull_request' }}
+  # The roots of ingress, settle, ops and core, and their tags' suffix (cs-q04).
+  ROOTS: ${{ inputs.roots == 'v1' && 'v1' || 'v2' }}
+  ROOTS_TAG: ${{ inputs.roots == 'v1' && '-roots-v1' || '' }}
+
+jobs:
+  services:
+    name: ingress, settle, ops, signer
+    # ECR: pull requests, tags and dispatches; never a push to main (only the sidecar's).
+    if: github.event_name != 'push' || github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: The ECR role is set
+        if: env.PUSH == 'true' && vars.AWS_ECR_ROLE_ARN == ''
+        run: |
+          echo "::error::Set the repository variables AWS_ECR_ROLE_ARN, AWS_REGION and ECR_NAMESPACE to push to ECR."
+          exit 1
+      - name: AWS credentials (OIDC)
+        if: env.PUSH == 'true'
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ECR_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Log in to ECR
+        id: ecr
+        if: env.PUSH == 'true'
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # One builder for the four targets: the Rust build stage is shared, so the workspace
+      # compiles once. build-push-action hands the builder the Actions cache's credentials.
+      - name: Build ingress
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/services.Dockerfile
+          target: ingress
+          platforms: linux/amd64
+          labels: org.opencontainers.image.revision=${{ github.sha }}
+          build-args: ROOTS=${{ env.ROOTS }}
+          cache-from: type=gha,scope=services${{ env.ROOTS_TAG }}
+          cache-to: type=gha,scope=services${{ env.ROOTS_TAG }},mode=max
+          load: true
+          tags: aledgent-ingress:ci
+      - name: Build settle
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/services.Dockerfile
+          target: settle
+          platforms: linux/amd64
+          labels: org.opencontainers.image.revision=${{ github.sha }}
+          build-args: ROOTS=${{ env.ROOTS }}
+          cache-from: type=gha,scope=services${{ env.ROOTS_TAG }}
+          load: true
+          tags: aledgent-settle:ci
+      - name: Build ops
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/services.Dockerfile
+          target: ops
+          platforms: linux/amd64
+          labels: org.opencontainers.image.revision=${{ github.sha }}
+          build-args: ROOTS=${{ env.ROOTS }}
+          cache-from: type=gha,scope=services${{ env.ROOTS_TAG }}
+          load: true
+          tags: aledgent-ops:ci
+      # F-035: the key boundary.
+      - name: Build signer
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/services.Dockerfile
+          target: signer
+          platforms: linux/amd64
+          labels: org.opencontainers.image.revision=${{ github.sha }}
+          build-args: ROOTS=${{ env.ROOTS }}
+          cache-from: type=gha,scope=services${{ env.ROOTS_TAG }}
+          load: true
+          tags: aledgent-signer:ci
+
+      - name: Run each binary in its image
+        run: |
+          set -euo pipefail
+          # ingress: the OpenAPI document needs no configuration.
+          out=$(docker run --rm aledgent-ingress:ci openapi)
+          grep -q '"openapi"' <<<"$out"
+          # settle and opsctl: a missing configuration is refused by the binary itself.
+          out=$(docker run --rm -e RUST_LOG=info aledgent-settle:ci /nonexistent/settle.json 2>&1 || true)
+          echo "$out"
+          grep -q '/nonexistent/settle.json' <<<"$out"
+          out=$(docker run --rm aledgent-ops:ci no-such-command 2>&1 || true)
+          echo "$out"
+          grep -q 'usage: opsctl' <<<"$out"
+          # signer: a missing configuration is refused, and it runs as its own user (F-035).
+          out=$(docker run --rm aledgent-signer:ci serve /nonexistent/signer.json 2>&1 || true)
+          echo "$out"
+          grep -q '/nonexistent/signer.json' <<<"$out"
+          test "$(docker image inspect -f '{{.Config.User}}' aledgent-signer:ci)" = "65533:65533"
+          # Every image runs as the distroless nonroot user.
+          for t in ingress settle ops; do
+            test "$(docker image inspect -f '{{.Config.User}}' "aledgent-$t:ci")" = "65532:65532"
+            # The roots it was built with (cs-q04).
+            test "$(docker image inspect -f '{{index .Config.Labels "app.aledgent.roots"}}' "aledgent-$t:ci")" = "$ROOTS"
+          done
+
+      - name: The chain specs baked into aledgent-settle
+        run: |
+          set -euo pipefail
+          id=$(docker create aledgent-settle:ci)
+          docker cp "$id:/usr/share/aledgent/chain-specs" "$RUNNER_TEMP/specs"
+          docker rm "$id" > /dev/null
+          python3 - "$RUNNER_TEMP/specs" <<'EOF'
+          import json, sys
+          d = sys.argv[1]
+          kreivo = json.load(open(f"{d}/kreivo.json"))
+          kusama = json.load(open(f"{d}/kusama.json"))
+          assert kreivo["para_id"] == 2281 and kreivo["relay_chain"] == kusama["id"] == "ksmcc3"
+          # Kreivo's spec is kreivo-node's verified light spec, 12 boot nodes (item 24's single boot
+          # node is lifted); Kusama's is still cut to one.
+          assert len(kreivo["bootNodes"]) == 12 and len(kusama["bootNodes"]) == 1, "boot nodes"
+          assert "lightSyncState" in kusama, "a checkpoint"
+          print("kreivo:", kreivo["bootNodes"][0])
+          print("kusama:", kusama["bootNodes"][0])
+          EOF
+
+      - name: Sizes
+        run: |
+          {
+            echo "### Images (linux/amd64)"
+            echo
+            echo "| Image | Size |"
+            echo "|---|---:|"
+            for t in ingress settle ops signer; do
+              size=$(docker image inspect -f '{{.Size}}' "aledgent-$t:ci")
+              echo "| \`aledgent-$t\` | $((size / 1024 / 1024)) MiB ($size B) |"
+            done
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Tags
+        id: meta
+        if: env.PUSH == 'true'
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          set -euo pipefail
+          # tags <image>: what to push for aledgent-<image>, or nothing when sha-<commit> is in ECR
+          # already (the release tag, if any, is then added to that image).
+          tags() {
+            local name="$ECR_NAMESPACE/aledgent-$1" repo sha="sha-$GITHUB_SHA$ROOTS_TAG" rel=""
+            repo="$REGISTRY/$name"
+            if [ "$GITHUB_REF_TYPE" = tag ]; then rel="${GITHUB_REF_NAME//\//-}$ROOTS_TAG"; fi
+            in_ecr() { aws ecr describe-images --repository-name "$name" --image-ids "imageTag=$1" > /dev/null 2>&1; }
+            if in_ecr "$sha"; then
+              if [ -n "$rel" ] && ! in_ecr "$rel"; then
+                docker buildx imagetools create -t "$repo:$rel" "$repo:$sha" >&2
+              fi
+              echo "- \`$repo:$sha\` was already in ECR: not pushed again" >> "$GITHUB_STEP_SUMMARY"
+              echo "$1="
+            elif [ -n "$rel" ]; then
+              echo "$1=$repo:$sha,$repo:$rel"
+            else
+              echo "$1=$repo:$sha"
+            fi
+          }
+          for t in ingress settle ops signer; do
+            tags "$t" >> "$GITHUB_OUTPUT"
+          done
+
+      # The same builds again, from the builder's cache, pushed.
+      - name: Push ingress
+        if: env.PUSH == 'true' && steps.meta.outputs.ingress != ''
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/services.Dockerfile
+          target: ingress
+          platforms: linux/amd64
+          labels: org.opencontainers.image.revision=${{ github.sha }}
+          build-args: ROOTS=${{ env.ROOTS }}
+          cache-from: type=gha,scope=services${{ env.ROOTS_TAG }}
+          push: true
+          tags: ${{ steps.meta.outputs.ingress }}
+      - name: Push settle
+        if: env.PUSH == 'true' && steps.meta.outputs.settle != ''
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/services.Dockerfile
+          target: settle
+          platforms: linux/amd64
+          labels: org.opencontainers.image.revision=${{ github.sha }}
+          build-args: ROOTS=${{ env.ROOTS }}
+          cache-from: type=gha,scope=services${{ env.ROOTS_TAG }}
+          push: true
+          tags: ${{ steps.meta.outputs.settle }}
+      - name: Push ops
+        if: env.PUSH == 'true' && steps.meta.outputs.ops != ''
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/services.Dockerfile
+          target: ops
+          platforms: linux/amd64
+          labels: org.opencontainers.image.revision=${{ github.sha }}
+          build-args: ROOTS=${{ env.ROOTS }}
+          cache-from: type=gha,scope=services${{ env.ROOTS_TAG }}
+          push: true
+          tags: ${{ steps.meta.outputs.ops }}
+      - name: Push signer
+        if: env.PUSH == 'true' && steps.meta.outputs.signer != ''
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/services.Dockerfile
+          target: signer
+          platforms: linux/amd64
+          labels: org.opencontainers.image.revision=${{ github.sha }}
+          build-args: ROOTS=${{ env.ROOTS }}
+          cache-from: type=gha,scope=services${{ env.ROOTS_TAG }}
+          push: true
+          tags: ${{ steps.meta.outputs.signer }}
+      - name: Pushed
+        if: env.PUSH == 'true'
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          PUSHED: ${{ steps.meta.outputs.ingress }},${{ steps.meta.outputs.settle }},${{ steps.meta.outputs.ops }},${{ steps.meta.outputs.signer }}
+        run: |
+          set -euo pipefail
+          {
+            echo "Pushed:"
+            tr ',' '\n' <<<"$PUSHED" | sed '/^$/d; s/^/- /'
+            echo "In ECR:"
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Every image's sha-<commit>, read back from ECR with its digest (pushed now or before).
+          for t in ingress settle ops signer; do
+            name="$ECR_NAMESPACE/aledgent-$t"
+            digest=$(aws ecr describe-images --repository-name "$name" --image-ids "imageTag=sha-$GITHUB_SHA$ROOTS_TAG" \
+                       --query 'imageDetails[0].imageDigest' --output text)
+            line="$REGISTRY/$name:sha-$GITHUB_SHA$ROOTS_TAG@$digest"
+            echo "$line"
+            echo "- \`$line\`" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+  core:
+    name: core (VOS Agent)
+    if: github.event_name != 'push' || github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      # VOS's host crates and three Rust builds: the runner's preinstalled toolchains make room.
+      - name: Free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          docker system prune -af > /dev/null
+          df -h /
+      - uses: docker/setup-buildx-action@v3
+      - name: The ECR role is set
+        if: env.PUSH == 'true' && vars.AWS_ECR_ROLE_ARN == ''
+        run: |
+          echo "::error::Set the repository variables AWS_ECR_ROLE_ARN, AWS_REGION and ECR_NAMESPACE to push to ECR."
+          exit 1
+      - name: AWS credentials (OIDC)
+        if: env.PUSH == 'true'
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ECR_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Log in to ECR
+        id: ecr
+        if: env.PUSH == 'true'
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/core.Dockerfile
+          platforms: linux/amd64
+          labels: org.opencontainers.image.revision=${{ github.sha }}
+          build-args: ROOTS=${{ env.ROOTS }}
+          cache-from: type=gha,scope=core${{ env.ROOTS_TAG }}
+          cache-to: type=gha,scope=core${{ env.ROOTS_TAG }},mode=max
+          load: true
+          tags: aledgent-core:ci
+
+      - name: Run the binary in its image, and the programs it serves
+        run: |
+          set -euo pipefail
+          out=$(docker run --rm aledgent-core:ci no-such-command 2>&1 || true)
+          echo "$out"
+          grep -q 'aledgent-core-host serve' <<<"$out"
+          test "$(docker image inspect -f '{{.Config.User}}' aledgent-core:ci)" = "65532:65532"
+          test "$(docker image inspect -f '{{index .Config.Labels "app.aledgent.roots"}}' aledgent-core:ci)" = "$ROOTS"
+          id=$(docker create aledgent-core:ci)
+          docker cp "$id:/usr/share/aledgent" "$RUNNER_TEMP/core"
+          docker rm "$id" > /dev/null
+          ls -l "$RUNNER_TEMP/core"
+          test -s "$RUNNER_TEMP/core/agent_runtime.pvm"
+          test -s "$RUNNER_TEMP/core/core.vos"
+
+      - name: Size
+        run: |
+          size=$(docker image inspect -f '{{.Size}}' aledgent-core:ci)
+          {
+            echo "### Image (linux/amd64)"
+            echo
+            echo "| Image | Size |"
+            echo "|---|---:|"
+            echo "| \`aledgent-core\` | $((size / 1024 / 1024)) MiB ($size B) |"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Tags
+        id: meta
+        if: env.PUSH == 'true'
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          set -euo pipefail
+          # tags <image>: what to push for aledgent-<image>, or nothing when sha-<commit> is in ECR
+          # already (the release tag, if any, is then added to that image).
+          tags() {
+            local name="$ECR_NAMESPACE/aledgent-$1" repo sha="sha-$GITHUB_SHA$ROOTS_TAG" rel=""
+            repo="$REGISTRY/$name"
+            if [ "$GITHUB_REF_TYPE" = tag ]; then rel="${GITHUB_REF_NAME//\//-}$ROOTS_TAG"; fi
+            in_ecr() { aws ecr describe-images --repository-name "$name" --image-ids "imageTag=$1" > /dev/null 2>&1; }
+            if in_ecr "$sha"; then
+              if [ -n "$rel" ] && ! in_ecr "$rel"; then
+                docker buildx imagetools create -t "$repo:$rel" "$repo:$sha" >&2
+              fi
+              echo "- \`$repo:$sha\` was already in ECR: not pushed again" >> "$GITHUB_STEP_SUMMARY"
+              echo "$1="
+            elif [ -n "$rel" ]; then
+              echo "$1=$repo:$sha,$repo:$rel"
+            else
+              echo "$1=$repo:$sha"
+            fi
+          }
+          tags core >> "$GITHUB_OUTPUT"
+      - name: Push
+        if: env.PUSH == 'true' && steps.meta.outputs.core != ''
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/core.Dockerfile
+          platforms: linux/amd64
+          labels: org.opencontainers.image.revision=${{ github.sha }}
+          build-args: ROOTS=${{ env.ROOTS }}
+          cache-from: type=gha,scope=core${{ env.ROOTS_TAG }}
+          push: true
+          tags: ${{ steps.meta.outputs.core }}
+      - name: Pushed
+        if: env.PUSH == 'true'
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          PUSHED: ${{ steps.meta.outputs.core }}
+        run: |
+          set -euo pipefail
+          {
+            echo "Pushed:"
+            tr ',' '\n' <<<"$PUSHED" | sed '/^$/d; s/^/- /'
+            echo "In ECR:"
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Every image's sha-<commit>, read back from ECR with its digest (pushed now or before).
+          for t in core; do
+            name="$ECR_NAMESPACE/aledgent-$t"
+            digest=$(aws ecr describe-images --repository-name "$name" --image-ids "imageTag=sha-$GITHUB_SHA$ROOTS_TAG" \
+                       --query 'imageDetails[0].imageDigest' --output text)
+            line="$REGISTRY/$name:sha-$GITHUB_SHA$ROOTS_TAG@$digest"
+            echo "$line"
+            echo "- \`$line\`" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+  sidecar:
+    name: sidecar (GHCR)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: env.PUSH == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/services.Dockerfile
+          target: sidecar
+          platforms: linux/amd64
+          labels: org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: |
+            type=gha,scope=sidecar
+            type=gha,scope=services
+          cache-to: type=gha,scope=sidecar,mode=max
+          load: true
+          tags: aledgent-sidecar:ci
+
+      # As a CI job runs it (deploy/docker/SIDECAR.md): healthy through the image's own health
+      # check, and through a `--health-cmd` (shell form); then a party, its account, an issuance in
+      # each seeded asset, and its balance, over HTTP.
+      - name: The sidecar as a service container
+        run: |
+          set -euo pipefail
+          test "$(docker image inspect -f '{{.Config.User}}' aledgent-sidecar:ci)" = "65532:65532"
+          docker run -d --name sidecar-image -p 18080:8080 aledgent-sidecar:ci
+          docker run -d --name sidecar-cmd -p 18081:8080 \
+            --health-cmd "aledgent-sidecar health" --health-interval 1s --health-retries 30 \
+            aledgent-sidecar:ci
+          for c in sidecar-image sidecar-cmd; do
+            for i in $(seq 1 60); do
+              h=$(docker inspect -f '{{.State.Health.Status}}' "$c")
+              [ "$h" = healthy ] && break
+              [ "$i" = 60 ] && { docker logs "$c"; docker inspect -f '{{json .State.Health}}' "$c"; exit 1; }
+              sleep 1
+            done
+            echo "$c: $h"
+          done
+          docker logs sidecar-image
+          B=http://127.0.0.1:18080
+          T="Authorization: Bearer aledgent-sidecar-test-operator-token"
+          J="Content-Type: application/json"
+          test "$(curl -s -o /dev/null -w '%{http_code}' $B/metrics)" = 401
+          curl -sf $B/sidecar | jq -e '.assets == ["COPM/2","TSTA/2","TSTB/2","TSTC/6"]'
+          # The sample configuration's service principals, each under its public test token, each
+          # its own principal and never the operator.
+          op=$(curl -sf $B/sidecar | jq -er .operator)
+          curl -sf $B/sidecar | jq -e '.service_principals | keys == ["custodian","issuer","onboarding"]'
+          for n in issuer custodian onboarding; do
+            me=$(curl -sf -H "Authorization: Bearer aledgent-sidecar-test-$n-token" \
+                   $B/v1/principals/self/answering | jq -er .principal)
+            test "$me" = "$(curl -sf $B/sidecar | jq -er --arg n "$n" '.service_principals[$n].principal')"
+            test "$me" != "$op"
+          done
+          # A configuration of the job's own, as an integrating party passes it: inline JSON, each
+          # token from a variable of the container. A blank one, or the retired spelling, fails the
+          # start (the container exits).
+          docker run -d --name sidecar-config -p 18082:8080 \
+            -e DESK_TOKEN=ci-desk-token -e KYC_TOKEN=ci-kyc-token \
+            -e ALEDGENT_SIDECAR_SERVICE_PRINCIPALS='{"principals": [
+              {"name": "desk", "role": "issuance_authority", "token_env": "DESK_TOKEN", "assets": ["TSTC"]},
+              {"name": "kyc", "role": "identities_principal", "token_env": "KYC_TOKEN"}]}' \
+            -e ALEDGENT_SIDECAR_SYSTEM_ACCOUNTS=desk/fee=desk \
+            aledgent-sidecar:ci
+          C=http://127.0.0.1:18082
+          for i in $(seq 1 30); do curl -sf $C/sidecar > /dev/null && break; sleep 1; done
+          docker logs sidecar-config
+          S=$(curl -sf $C/sidecar)
+          jq -e '.service_principals | keys == ["desk","kyc"]' <<<"$S"
+          jq -e '[.service_principals.desk.grants[] | select(.kind=="issuance") | .subject.asset] == ["TSTC"]' <<<"$S"
+          jq -e '.system_accounts[0].service == "desk"' <<<"$S"
+          for p in desk:ci-desk-token kyc:ci-kyc-token; do
+            me=$(curl -sf -H "Authorization: Bearer ${p#*:}" $C/v1/principals/self/answering | jq -er .principal)
+            test "$me" = "$(jq -er --arg n "${p%%:*}" '.service_principals[$n].principal' <<<"$S")"
+            test "$me" != "$(jq -er .operator <<<"$S")"
+          done
+          for bad in "" "issuer=ISSUER_TOKEN"; do
+            if docker run --rm -e ALEDGENT_SIDECAR_SERVICE_PRINCIPALS="$bad" aledgent-sidecar:ci describe; then
+              echo "started with ALEDGENT_SIDECAR_SERVICE_PRINCIPALS='$bad'" >&2; exit 1
+            fi
+          done
+          id=$(curl -sf -H "$T" -H "$J" -H 'client-key: ci-identity' $B/v1/identities \
+                 -d '{"kind":"person","verifier":"0a"}' | jq -r .result.identity)
+          acct=$(curl -sf -H "$T" -H "$J" -H 'client-key: ci-account' $B/v1/accounts \
+                 -d "{\"owner\":\"$id\",\"kind\":\"customer\",\"custody\":\"delegated\"}" | jq -r .result.account)
+          for a in COPM:12345 TSTA:100 TSTB:7 TSTC:1000000; do
+            curl -sf -H "$T" -H "$J" -H "client-key: ci-issue-${a%%:*}" $B/v1/issuances \
+              -d "{\"asset\":\"${a%%:*}\",\"destination\":\"$acct\",\"amount\":\"${a##*:}\"}" > /dev/null
+            got=$(curl -sf -H "$T" "$B/v1/balances?account=$acct&asset=${a%%:*}" | jq -r '.rows[0].available')
+            echo "${a%%:*}: $got"
+            test "$got" = "${a##*:}"
+          done
+          docker rm -f sidecar-image sidecar-cmd sidecar-config > /dev/null
+          size=$(docker image inspect -f '{{.Size}}' aledgent-sidecar:ci)
+          echo "aledgent-sidecar (linux/amd64): $((size / 1024 / 1024)) MiB ($size B)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Tags
+        id: meta
+        if: env.PUSH == 'true'
+        run: |
+          set -euo pipefail
+          repo=ghcr.io/bloque-app/aledgent-sidecar
+          if [ "$GITHUB_REF" = refs/heads/main ]; then ref=edge; else ref="${GITHUB_REF_NAME//\//-}"; fi
+          echo "tags=$repo:sha-$GITHUB_SHA,$repo:$ref" >> "$GITHUB_OUTPUT"
+      - name: Push
+        if: env.PUSH == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/services.Dockerfile
+          target: sidecar
+          platforms: linux/amd64
+          labels: org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=sidecar
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+      - name: Pushed
+        if: env.PUSH == 'true'
+        env:
+          PUSHED: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          # Each tag, read back from the registry (whole: a `head` would end it in SIGPIPE).
+          for t in $(tr ',' ' ' <<<"$PUSHED"); do
+            docker buildx imagetools inspect "$t"
+          done
+          echo "Pushed:" >> "$GITHUB_STEP_SUMMARY"
+          tr ',' '\n' <<<"$PUSHED" | sed '/^$/d; s/^/- /' >> "$GITHUB_STEP_SUMMARY"

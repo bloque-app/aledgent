@@ -1,0 +1,23 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# The guest build: the scaffolding `vosx actor new` writes at the pinned VOS
+# (vosx/src/commands/new_project.rs, ACTOR_CONFIG), unchanged.
+[target.riscv64em-vos]
+rustflags = [
+    "-Zunstable-options",
+    "-Zcrate-attr=no_std",
+    "-Zcrate-attr=no_main",
+    "-Zremap-cwd-prefix=.",
+    "-Aduplicate-macro-attributes",
+    "-Aunused-attributes",
+    "-Clink-arg=-Tpvm.ld",
+    "-Zfmt-debug=none",
+    "-Zlocation-detail=none",
+    "-Cpanic=immediate-abort",
+]
+
+[alias]
+actor = "rustc --lib --crate-type bin -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem --release --target riscv64em-vos.json"
+
+[unstable]
+json-target-spec = true

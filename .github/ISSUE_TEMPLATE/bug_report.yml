@@ -1,0 +1,37 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+name: Bug report
+description: The code does not do what SPEC.md says.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A bug is a difference between the code and `SPEC.md`. If the spec itself is wrong, open an
+        **amendment proposal** instead. Security problems go to SECURITY.md, never here.
+  - type: input
+    id: requirement
+    attributes:
+      label: Requirement
+      description: The REQ-*, INV-*, AC-*, ERR-* or NFR-* the code breaks.
+      placeholder: e.g. INV-14, AC-C2.3
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happens, and what the spec says should happen
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: A failing test, a conformance case, or a sequence of commands. Commit or release.
+    validations:
+      required: true
+  - type: input
+    id: component
+    attributes:
+      label: Component
+      placeholder: e.g. crates/ledger-core, services/settle, contracts/settlement

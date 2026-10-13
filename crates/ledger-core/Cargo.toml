@@ -1,0 +1,65 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+[package]
+name = "ledger-core"
+version = "0.1.0"
+description = "aledgent's host-independent library: identifiers, the asset registry, identities, ledger accounts, credentials and authority (F-003), and the closed Refusal list (F-015)."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# The serialised shape of a refusal: { "error": "ERR-*", "description": "…" }.
+serde = ["dep:serde", "ledger-kernel/serde", "verify/serde"]
+# Forged records for the conformance suite's store cases (F-015): a record whose identifier is
+# not its minting, which only a raw store write could attempt. Arbitrary state mutation is what
+# the command surface must never offer (REQ-CS-5): no production crate may enable this, and
+# tools/ci/check-conformance-ports.sh fails the build if one does.
+conformance-ports = []
+# The simulated settlement layer and a driver that plays the settlement adapter (F-010 §1,
+# DEC-9): deterministic and seeded. Accepted proposal: a feature of this crate, not a crate of
+# its own (DEC-15).
+sim = []
+# v1 roots (CipherClerk's full-depth tree): a supported opt-in beside the default v2 (DEC-25,
+# owner ruling cs-q04). Host and guests must agree: build both with it or neither.
+smt-v1 = ["ledger-kernel/smt-v1"]
+
+[dependencies]
+# The kernel binding (F-001). no_std: the library runs inside the core's guest (F-005).
+ledger-kernel = { path = "../ledger-kernel", default-features = false }
+# blake2b for identifier minting and the registry digest; `disclosure` for the claims' wire form
+# (F-017). Not `signing`: it draws from OsRng, and the core draws no randomness.
+cipher-clerk = { workspace = true, features = ["disclosure"] }
+# Point arithmetic for the trial balance on commitments, in the store (F-011 §8, INV-5): the
+# version cipher-clerk already links. The clerk key's scalar arithmetic (F-017).
+curve25519-dalek = { version = "4.1", default-features = false, features = ["alloc", "zeroize"] }
+# The anchor commitment and the disclosure envelope, defined once, in the verifier a recipient
+# runs (F-017, DEC-15). no_std, like this crate.
+verify = { path = "../verify", default-features = false }
+# The clerk key's secret is zeroised when dropped (F-017, NFR-8).
+zeroize = { version = "1", default-features = false }
+serde = { version = "1", default-features = false, features = ["derive", "alloc"], optional = true }
+
+# A spin lock for the service store's read recording (`leaves`), so a whole store stays `Sync` on
+# the host. The core's guest has no atomics and uses cells instead (F-005).
+[target.'cfg(target_has_atomic = "8")'.dependencies]
+spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
+
+[dev-dependencies]
+# `helpers` gives `MemLedger` / `MemOracle`, the kernel's own reference backend: the raw-kernel
+# regression tests of `notes/FIT-VOS-CIPHERCLERK.md` (F-004 T-004-01). Never a normal dependency.
+cipher-clerk = { workspace = true, features = ["helpers", "signing"] }
+# The shared test tools (ShadowBook, the delta log) for the randomised concurrency test (F-004
+# T-004-07). A dev edge only: tools/ci/check-conformance-ports.sh allows it (F-015 NOTES 24).
+conformance = { path = "../conformance" }
+# The file-backed store for the same test on both stores.
+ledger-kernel = { path = "../ledger-kernel", features = ["std"] }
+serde_json = "1"
+tempfile = "3"
+proptest = { version = "1", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true

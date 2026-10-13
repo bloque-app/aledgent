@@ -1,0 +1,7 @@
+    Finished `release` profile [optimized] target(s) in 2.58s
+s2 s2-transfer-b1: input 1612 B, message 1657 B (limit 16384 B)
+  kernel failed: Completed(Ok(InvocationReply { invocation: InvocationId(00000000…), actor: ActorId(f191cde9…), incarnation: Hash(d7c507af…), deployment: DeploymentId(dac757bf…), mode: Linear, lane: Some(Linear), status: Panicked, reply: [], gas_remaining: 988536475, observation: InvocationObservation { linear_revision: None, merge_frontier: None, local_revision: None } }))
+  s2-transfer-b1: not measured (see failure above)
+s2 s2-reserve-new-holding-b1: input 1676 B, message 1721 B (limit 16384 B)
+  kernel failed: Completed(Ok(InvocationReply { invocation: InvocationId(00000000…), actor: ActorId(f191cde9…), incarnation: Hash(d7c507af…), deployment: DeploymentId(dac757bf…), mode: Linear, lane: Some(Linear), status: Panicked, reply: [], gas_remaining: 999393153, observation: InvocationObservation { linear_revision: None, merge_frontier: None, local_revision: None } }))
+  s2-reserve-new-holding-b1: not measured (see failure above)

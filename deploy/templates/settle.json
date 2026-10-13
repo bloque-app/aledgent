@@ -1,0 +1,48 @@
+{
+  "profile": "production",
+  "adapter": {
+    "holder": "settle-canary-0",
+    "genesis": "c710a5f16adc17bcd212cff0aedcbf1c1212a043cdc0fb2dcba861efe5305b01",
+    "spec_versions": [133],
+    "instance": 1,
+    "assets": [
+      { "asset": "COPM", "chain": "Here(100)" },
+      { "asset": "TSTA", "chain": "Here(101)" },
+      { "asset": "TSTB", "chain": "Here(102)" },
+      { "asset": "TSTC", "chain": "Here(103)" }
+    ],
+    "keys": [
+      {
+        "user": "<FILL the lane's PASS account: its hashed user id, 32 bytes of hex>",
+        "device": { "env": "ALEDGENT_SETTLE_LANE_0_KEY" }
+      }
+    ],
+    "anchor_key": {
+      "user": "<FILL the anchor PASS account: its hashed user id, 32 bytes of hex>",
+      "device": { "env": "ALEDGENT_SETTLE_ANCHOR_KEY" }
+    },
+    "fee_floor": 100000000000,
+    "lease_ttl": 30000,
+    "status_lease": 120000,
+    "page": 32,
+    "max_era": 64,
+    "challenge_window": 256,
+    "rescan_every": 100,
+    "rescan_window": 1024,
+    "batch_gas_margin_percent": 150
+  },
+  "connection": "light-client",
+  "chain_spec": "/usr/share/aledgent/chain-specs/kreivo.json",
+  "relay_chain_spec": "/usr/share/aledgent/chain-specs/kusama.json",
+  "deployments": [
+    { "instance": 1, "contract": "<FILL the contract's account, 32 bytes of hex (deployment.json)>" }
+  ],
+  "contracts_pallet": "Contracts",
+  "assets_pallet": "Assets",
+  "ingress": "<FILL ingress's base URL, e.g. http://10.0.0.10:8080>",
+  "ingress_token_env": "ALEDGENT_SETTLE_INGRESS_TOKEN",
+  "database_env": "ALEDGENT_SETTLE_DATABASE_URL",
+  "interval": 2000,
+  "signals_file": "/var/lib/aledgent/settle-signals.json",
+  "development_keys": true
+}

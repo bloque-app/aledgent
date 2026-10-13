@@ -1,0 +1,74 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+[package]
+name = "signer"
+version = "0.1.0"
+description = "aledgent-signer (F-035): the key boundary. A process of its own that holds no book state and signs for the processes that hold one (the core host, ingress, the settlement adapter) through a narrow API on a Unix socket, authenticated by peer credentials and a token. Keys come from Vault, which the signer reads itself at start under AWS IAM auth (no secret in its environment); AWS KMS is an opt-in backend for secp256k1 lane and anchor keys; a key from a file is for development and tests only."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "aledgent-signer"
+path = "src/main.rs"
+required-features = ["server"]
+
+[features]
+default = ["server", "vault", "kms"]
+# The service itself: the listener, the backends and the configuration. Clients (the core host,
+# ingress, the adapter) depend on this crate without it: they link the protocol and the client only.
+server = ["dep:tokio", "dep:tracing", "dep:tracing-subscriber", "dep:serde_json", "dep:sha2", "dep:subtle", "dep:hex"]
+# Vault (the default key source, owner ruling `key-custody-opt-in-kms`): a KV v1 read after a login
+# under AWS IAM auth, signed with the instance's or task's role. Without it, a `vault` key source
+# fails the start.
+vault = ["server", "dep:aws-config", "dep:aws-credential-types", "dep:aws-sigv4", "dep:aws-smithy-runtime-api", "dep:reqwest", "dep:base64"]
+# AWS KMS, opt-in per key, for secp256k1 lane and anchor keys only. Without it, a `kms` key source
+# fails the start.
+kms = ["server", "dep:aws-config", "dep:aws-sdk-kms"]
+# An in-memory KMS (`kms::testing`), for this crate's and its callers' tests. Never in production.
+testing = ["server"]
+
+[dependencies]
+# The key custody's questions and answers (ledger_kernel::keys), and the root's derivations.
+ledger-kernel = { path = "../../crates/ledger-kernel" }
+# The clerk's signer trait and its Schnorr over Ristretto (F-017).
+ledger-core = { path = "../../crates/ledger-core" }
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+zeroize = { version = "1", features = ["std"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"] }
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "fs"], optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "std"], optional = true }
+serde_json = { version = "1", optional = true }
+sha2 = { version = "0.10", optional = true }
+subtle = { version = "2", optional = true }
+hex = { version = "0.4", optional = true }
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client", "credentials-process"], optional = true }
+aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"], optional = true }
+aws-credential-types = { version = "1", optional = true }
+aws-sigv4 = { version = "1", default-features = false, features = ["sign-http"], optional = true }
+aws-smithy-runtime-api = { version = "1", default-features = false, features = ["client"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
+base64 = { version = "0.22", optional = true }
+
+[dev-dependencies]
+signer = { path = ".", features = ["testing"] }
+tempfile = "3"
+hex = "0.4"
+serde_json = "1"
+sha2 = "0.10"
+# tests/key_absent.rs: the book over the core Agent, its keys in the signer's process.
+core-binding = { path = "../../crates/core-binding", features = ["ingress"] }
+ingress = { path = "../ingress", default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# A Vault in the test process (tests/signer.rs).
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+aws-credential-types = "1"
+base64 = "0.22"
+
+[lints]
+workspace = true

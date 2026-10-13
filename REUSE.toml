@@ -1,0 +1,103 @@
+# Licence information for files that cannot carry a comment header (REUSE specification 3.2).
+# Every other file carries an SPDX header (tools/oss/spdx.py). docs/oss/LICENSING.md says why each
+# part has the licence it has. When several annotations match a file, the last one wins.
+version = 1
+
+# Data, lock files, manifests and generated files of the permissive part of the tree.
+[[annotations]]
+path = [
+  "**/*.json",
+  "**/*.lock",
+  "**/Cargo.lock",
+  "**/package-lock.json",
+  "tools/pass-import/bun.lock",
+  "tools/ci/fixtures/**",
+  "services/ingress/migrations/*.sql",
+  "**/*.txt",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "Copyright (c) 2026 Pagos Cube LLC"
+SPDX-License-Identifier = "Apache-2.0 OR MIT"
+
+# Everything that links VOS, and patches to VOS-linked code: AGPL-3.0-or-later.
+[[annotations]]
+path = [
+  "agents/**",
+  "spikes/guest/**",
+  "spikes/vos-host/**",
+  "spikes/vos-external/**",
+  ".github/x86-bench/core-host-backends.patch",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "Copyright (c) 2026 Pagos Cube LLC"
+SPDX-License-Identifier = "AGPL-3.0-or-later"
+
+# Measurement data and logs (F-002, F-005, F-025, F-031): data, not code.
+[[annotations]]
+path = "spikes/results/**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "Copyright (c) 2026 Pagos Cube LLC"
+SPDX-License-Identifier = "CC-BY-4.0"
+
+# Patches proposed to CipherClerk: they carry CipherClerk's licence.
+[[annotations]]
+path = "proposals/cipherclerk/*.patch"
+precedence = "aggregate"
+SPDX-FileCopyrightText = ["Copyright (c) 2025 Daniel Olano", "Copyright (c) 2026 Pagos Cube LLC"]
+SPDX-License-Identifier = "Apache-2.0 OR MIT"
+
+# Kreivo's chain specification, as published by Kreivo.
+[[annotations]]
+path = "deploy/templates/chain-specs/kreivo.json"
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright (c) Virto Network"
+SPDX-License-Identifier = "GPL-3.0-only"
+
+# Amazon RDS's public certificate-authority bundle, redistributed unmodified.
+[[annotations]]
+path = "services/ingress/certs/rds-global-bundle.pem"
+precedence = "override"
+SPDX-FileCopyrightText = "Amazon Web Services, Inc."
+SPDX-License-Identifier = "LicenseRef-Public-CA-Certificates"
+
+# Generated from SPEC.md by `cargo xtask spec-ids`: the specification's own text, so its licence.
+[[annotations]]
+path = "crates/conformance/spec/catalogue.toml"
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright (c) 2026 Pagos Cube LLC"
+SPDX-License-Identifier = "CC-BY-4.0"
+
+# aledgent's marks: Pagos Cube LLC's, not licensed with the code (docs/brand/README.md).
+[[annotations]]
+path = ["docs/brand/*.svg", "site/src/assets/*.svg", "site/public/favicon.svg"]
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright (c) 2026 Pagos Cube LLC"
+SPDX-License-Identifier = "LicenseRef-Trademark-Marks"
+
+# The docs site's pages (prose: CC-BY-4.0), its Astro components (code), and its screenshots
+# (captures of the site, for review: CC-BY-4.0). Their formats take no header the build keeps.
+[[annotations]]
+path = "site/src/content/**/*.mdx"
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright (c) 2026 Pagos Cube LLC"
+SPDX-License-Identifier = "CC-BY-4.0"
+
+[[annotations]]
+path = "site/src/components/*.astro"
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright (c) 2026 Pagos Cube LLC"
+SPDX-License-Identifier = "Apache-2.0 OR MIT"
+
+[[annotations]]
+path = "site/screenshots/*.png"
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright (c) 2026 Pagos Cube LLC"
+SPDX-License-Identifier = "CC-BY-4.0"
+
+# The specification, the plan and the overview: their YAML front matter opens the file, since the
+# docs site renders them from it, so they carry no header.
+[[annotations]]
+path = ["SPEC.md", "PLAN.md", "OVERVIEW.md"]
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright (c) 2026 Pagos Cube LLC"
+SPDX-License-Identifier = "CC-BY-4.0"

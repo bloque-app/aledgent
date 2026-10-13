@@ -1,0 +1,36 @@
+---
+title: Overview
+description: What an operator of aledgent watches, and how an operation that needs a human is resolved.
+sidebar:
+  order: 1
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+<Aside type="caution" title="Prototype">
+A stub. The operator guide (deployment, runbooks, reconciliation) is not written yet.
+</Aside>
+
+The operator surface lives under `/v1/ops/` on ingress. Every operator command is answered with its
+decision and attributed; an operator action without a justification is refused
+(`ERR-JustificationRequired`). There is no administrative
+path that moves value outside the command surface.
+
+## What is watched
+
+These are continuously observable:
+
+- the age of the oldest non-terminal operation;
+- observation completeness;
+- the count and age of undelivered notifications;
+- anchor lag;
+- the reconciliation outcome on each axis;
+- the liquidity of every position that funds settlement-layer costs.
+
+## When an operation needs a human
+
+An operation past its deadline whose outcome is neither established nor provably impossible moves to
+`Needs-Review`. It is resolved in up to three steps: on the settlement adapter's proof alone; on
+evidence one authority submits and the adapter verifies; or, only when the adapter finds no proof, a
+release that two distinct principals agree on, which raises an incident. Settling an external leg
+always needs the proof.

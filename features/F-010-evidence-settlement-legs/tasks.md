@@ -1,0 +1,21 @@
+<!--
+Copyright (c) 2026 Pagos Cube LLC
+SPDX-License-Identifier: CC-BY-4.0
+-->
+
+# F-010 — tasks
+
+| ID | Task | Traces | Done when |
+|---|---|---|---|
+| T-010-01 | Build the simulated settlement layer behind the `sim` feature: sequenced inbox, native coordinates, best and finalised heads, forks, expiry positions, a history window, seeded replay | `DEC-9`, `REQ-SL-3`, `REQ-SL-4`, `REQ-SL-8`, `REQ-SL-9` | The simulator's own tests cover fork, prune and expiry. A seed replays a run byte for byte |
+| T-010-02 | Define the `CTR-SET` types: `Observation`, `CanonicalCheck`, `OutboundInstruction`, the support declaration and the verdicts. No outcome field anywhere | `REQ-SI-1`, `REQ-SI-5`, `REQ-SO-5`, `INV-11` | The types compile with no status or verdict field on any input. `AC-D3.1` passes |
+| T-010-03 | Build ingest: authoritative source, unique coordinate set in the store, association by operation reference then account reference, verdicts, kernel `external_id` from the coordinate | `REQ-IN-1`, `REQ-IN-6`, `REQ-SI-2`–`SI-4`, `INV-12`, `AC-D3.2`, `AC-D3.3`, `ERR-ObservationDuplicate`, `ERR-ObservationUnassociated` | `AC-D3.2` and `AC-D3.3` pass. A duplicate is refused by both the store and the kernel |
+| T-010-04 | Build two-fact finality, per-cycle re-verification and orphaning. Only `Observed → Final` may build `FinalityWitness` | `REQ-IN-3`, `REQ-IN-4`, `REQ-SL-3`, `INV-10`, `AC-D1.1`, `AC-D1.3` | `AC-D1.1` and `AC-D1.3` pass. The compile-fail test for the witness passes |
+| T-010-05 | Build inbound settling: `Issue` at `Final → Settled`, `Orphaned → Released` with no posting, and a kernel refusal that leaves the record open | `REQ-OP-1`, `AC-D1.2`, `AC-D1.4`, `INV-23` | `AC-D1.2`, `AC-D1.4` and the `INV-23` test pass |
+| T-010-06 | Build outbound: support check at acceptance, `OutboundInstruction::new(&ReservationHandle)`, instruction assembly with expiry, outbox append, `Reserved → Submitted` on durable acknowledgement, replay after restart | `REQ-SO-1`, `REQ-SO-2`, `REQ-SO-6`, `REQ-SO-7`, `REQ-SA-1`, `INV-13`, `AC-E1.1`, `ERR-UnsupportedLeg` | `AC-E1.1` passes. The compile-fail test shows that no instruction can be built without a reservation |
+| T-010-07 | Map the three dispositions: executed to `Redeem` at finality; proven non-inclusion to `Expired → Released`; a gap to `Expired → Needs-Review`; unknown to no release | `REQ-SA-4`, `REQ-SO-4`, `REQ-OP-9`, `AC-E1.2`, `AC-E1.4`, `AC-E1.5`, `ERR-ReleaseUnsafe` | `AC-E1.2`, `AC-E1.4` and `AC-E1.5` pass, including the gap case |
+| T-010-08 | Build amount-mismatch handling as proposed: named condition, incident, difference posted in the settling chain | `REQ-OP-2`, `AC-E1.3`, `ERR-AmountMismatch` | `AC-E1.3` passes for +1 and −1 minor unit, and the trial balance stays zero |
+| T-010-09 | Build completeness accounting: ingested range set, explicit gaps, rescan diff, unassociated bucket, incidents | `REQ-IN-5`, `REQ-SA-7` | A pruned range is recorded as a gap, and a missing record is reported by coordinate |
+| T-010-10 | Write the seeded property run with forks, delays, drops, duplicates and gaps. Register all tests in the `F-015` suite | `INV-10`–`INV-13`, `INV-23`, `NFR-14` | 10k seeded runs pass. Every `AC-D1.*`, `AC-D3.*` and `AC-E1.*` test is in the suite |
+| T-010-11 | Release on non-inclusion only if the signing key's nonce agrees (owner ruling, 2026-09-24, #88): the instruction keeps its transaction's key, nonce and last valid height; each finalised head decides the nonce once; a consumed nonce with no inbox record goes to `Needs-Review` with an incident. No balance-based condition | `REQ-SL-4`, `REQ-OP-9`, `REQ-SA-4`, `INV-11`, `INV-13` | An unconsumed nonce releases; an unreported one releases nothing; one consumed by the deployment's own transaction is never released; the never-acknowledged path cannot cover a signed transaction |
+| T-010-12 | A proved rejection releases at once (amendment 0006 item 3): a final `WithdrawRefused` record with its transaction's nonce consumed, and no record of execution, releases from `Reserved`, `Submitted`, `Observed`, `Orphaned` or `Expired` | `REQ-OP-9`, `REQ-SA-4`, `AC-E1.4`, `INV-11`, `INV-23` | Released on both facts, in either order; nothing released on a provisional refusal or an unconsumed nonce |

@@ -1,0 +1,108 @@
+---
+title: The operation lifecycle
+description: The states a caller sees, how a client key makes a retry the same operation, and how a refusal is named.
+sidebar:
+  order: 1
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Every command that aledgent takes in becomes an **operation** with a **reference** that aledgent
+derives and that never changes. A command returns at once, with that reference and the operation's
+state at that moment. It never waits on the settlement layer.
+
+## Two ways a command is answered
+
+| | Which commands | The reply | Bound, at p99 |
+| --- | --- | --- | --- |
+| **Acknowledged at `Received`** | `transfer`, `reserve`, and a withdrawal (a reservation carrying its outbound leg) | `202`, state `Received`, `terminal: false`. The decision follows by notification and by query | 50 ms (`NFR-1`) |
+| **Answered with its decision** | Every other command: `capture`, `release`, `issue`, `redeem`, and all account and security commands | The state the command reached, or its refusal named. Never `Received` | 1 s (`NFR-16`) |
+
+A principal may ask for its own transfers and reservations to be **answered with their decision**
+instead: that is its *answering setting* (`POST /v1/principals/self/answering`). The default is
+acknowledged at `Received`. The setting covers `transfer` and `reserve` only; a withdrawal stays
+acknowledged. Past the setting's wait, the reply is `ERR-DecisionUnavailable`; the command is kept,
+and a retry with the same client key returns its decision.
+
+Either way, every command completes within **30 s** at p99 (`NFR-15`): it reaches the state it asks
+for, or is refused. For a command with an external leg, completion ends at the leg's inclusion on
+the settlement layer; finality follows and is reported, not bounded.
+
+## The three states a caller acts on
+
+An operation can pass through more states than these, and every one is visible by query and pushed
+by notification. These three are the ones a caller is expected to act on.
+
+| State | What has happened, and what has not | What you are expected to do |
+| --- | --- | --- |
+| **`Received`** | The command is durably held. Nothing is decided, and no balance has changed | Wait for the decision. Do not capture, release or submit on it. A retry under the same client key is safe and changes nothing |
+| **`Reserved`** | The value is held for this operation and is no longer available to spend. Nothing has reached its destination | Proceed: capture or release it, or hand off its external leg. Do not treat it as a payment made |
+| **`Final`** | The settlement layer's finality has passed the external leg's observation, and the record still matches: the leg can no longer be revised. The settling posting is not yet appended | Treat the external leg as executed and irreversible. Do not release it or submit again on it. Wait for `Settled`, which follows |
+
+`Settled`, `Released` and `Rejected` are terminal: a terminal operation never changes again. An
+internal transfer has no external leg and needs no reservation, so it is final on acceptance: it goes on
+to `Settled`, or to `Rejected` with its refusal named.
+
+<Aside type="note" title="Needs-Review is an answer, not a failure">
+aledgent never fails, releases or retries an operation on silence alone. An operation whose outcome
+cannot be established past its deadline moves to `Needs-Review`: non-terminal, non-refunding, with an
+owner and a service level. Its value stays reserved until it is resolved.
+</Aside>
+
+## Client keys make a retry the same operation
+
+Two keys, never conflated:
+
+- The **client key** is yours. Send it in the `client-key` header. It is unique within your
+  integrating party, never expires, and is stored with the reply. A retry with the same key and the
+  same request gets the same reply, for the same operation. The same key with a *different* request
+  is refused with `ERR-ClientKeyReused`.
+- The **operation reference** is aledgent's. You never supply it, and nothing should parse it.
+
+The `reference` field a command may carry is neither: it is **pass-through data**, one JSON value of
+at most 1 KiB that aledgent never reads and echoes wherever the operation is read, to principals of
+your integrating party. It is part of the request, so the same client key with a different
+`reference` is `ERR-ClientKeyReused`.
+
+Idempotency is mandatory on every value-moving submission. If you send no client key, ingress derives
+one from the request's content and returns it, with `client_key_derived: true`. A derived key is a
+digest of the request alone, so two identical requests sent without a key are **one** operation: to
+make the same payment twice on purpose, send two client keys. Do not put a timestamp, or anything
+else that changes between retries, in a key of your own.
+
+## Refusals come from a closed list
+
+A refusal names one condition from a closed list, with its fixed description, and is never a success
+body carrying an error. Where it reaches you depends on how the command was answered:
+
+- **A command answered with its decision** is refused in its reply: a `4xx` (or `500`, `503`).
+- **A transfer or reservation acknowledged at `Received`** was taken in before it was decided, so its
+  reply is the `202`. If the decision is a refusal, the operation reaches `Rejected`, and the
+  condition is on the operation (`GET /v1/operations/{reference}`, field `error`) and in its
+  notification. A retry under the same client key gets the refusal.
+
+The condition has the same shape either way:
+
+```json
+{
+  "error": "ERR-InsufficientAvailable",
+  "description": "The available balance does not cover the operation (`INV-3`)"
+}
+```
+
+No condition outside the list is ever returned. A few you will meet first:
+
+| Condition | Status | When |
+| --- | --- | --- |
+| `ERR-MalformedCommand` | 400 | The request's shape is not one aledgent accepts. The refusal names no field and quotes nothing you sent |
+| `ERR-CredentialInvalid` | 401 | The credential is invalid, expired or of the wrong kind |
+| `ERR-NotAuthorised` | 403 | No authority you hold covers this operation, account, asset or bound |
+| `ERR-UnknownAccount` | 404 | No such ledger account, or you cannot reach it |
+| `ERR-ClientKeyReused` | 409 | The same client key arrived with a different request |
+| `ERR-InsufficientAvailable` | 422 | The available balance does not cover the operation |
+| `ERR-PrecisionExceeded` | 422 | The amount has more precision than the asset. It is refused, never rounded |
+| `ERR-DecisionUnavailable` | 503 | The command cannot be decided now. It is kept; a retry with the same client key is safe |
+| `ERR-Internal` | 500 | A fault inside aledgent. No detail is returned, and an incident is raised |
+
+The full list, with each condition's status, is the `Refusal` schema in the
+[API reference](../../api/).

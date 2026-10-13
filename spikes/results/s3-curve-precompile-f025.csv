@@ -1,0 +1,4 @@
+spike,case,variant,size,sample,metric,value,unit
+s3,transfer-1000000,message,5712,0,message_bytes,5841,bytes
+s3,reserve-pooled-1000000,message,5408,0,message_bytes,5537,bytes
+s3,reserve-new-holding-1000000,message,5496,0,message_bytes,5625,bytes

@@ -1,0 +1,128 @@
+0 rc=0 "delivery_retired":true 17930 ms
+1 rc=0 "delivery_retired":true 18606 ms
+2 rc=0 "delivery_retired":true 21495 ms
+3 rc=0 "delivery_retired":true 20905 ms
+4 rc=0 "delivery_retired":true 27649 ms
+5 rc=0 "delivery_retired":true 25284 ms
+6 rc=0 "delivery_retired":true 23272 ms
+7 rc=0 "delivery_retired":true 36800 ms
+8 rc=0 "delivery_retired":true 28113 ms
+9 rc=0 "delivery_retired":true 22548 ms
+10 rc=0 "delivery_retired":true 23302 ms
+11 rc=0 "delivery_retired":true 22445 ms
+12 rc=1  22219 ms
+error: http://127.0.0.1:8080/__agents/authorize: status code 503; exact authorization request retained, outcome may be unknown
+13 rc=1  74 ms
+error: clean store rejected physical state: RequestConflict
+14 rc=1  80 ms
+error: clean store rejected physical state: RequestConflict
+15 rc=1  58 ms
+error: clean store rejected physical state: RequestConflict
+16 rc=1  66 ms
+error: clean store rejected physical state: RequestConflict
+17 rc=1  65 ms
+error: clean store rejected physical state: RequestConflict
+18 rc=1  88 ms
+error: clean store rejected physical state: RequestConflict
+19 rc=1  62 ms
+error: clean store rejected physical state: RequestConflict
+20 rc=1  55 ms
+error: clean store rejected physical state: RequestConflict
+21 rc=1  55 ms
+error: clean store rejected physical state: RequestConflict
+22 rc=1  55 ms
+error: clean store rejected physical state: RequestConflict
+23 rc=1  53 ms
+error: clean store rejected physical state: RequestConflict
+24 rc=1  69 ms
+error: clean store rejected physical state: RequestConflict
+25 rc=1  53 ms
+error: clean store rejected physical state: RequestConflict
+26 rc=1  58 ms
+error: clean store rejected physical state: RequestConflict
+27 rc=1  69 ms
+error: clean store rejected physical state: RequestConflict
+28 rc=1  71 ms
+error: clean store rejected physical state: RequestConflict
+29 rc=1  53 ms
+error: clean store rejected physical state: RequestConflict
+30 rc=1  65 ms
+error: clean store rejected physical state: RequestConflict
+31 rc=1  56 ms
+error: clean store rejected physical state: RequestConflict
+32 rc=1  55 ms
+error: clean store rejected physical state: RequestConflict
+33 rc=1  54 ms
+error: clean store rejected physical state: RequestConflict
+34 rc=1  57 ms
+error: clean store rejected physical state: RequestConflict
+35 rc=1  57 ms
+error: clean store rejected physical state: RequestConflict
+36 rc=1  59 ms
+error: clean store rejected physical state: RequestConflict
+37 rc=1  53 ms
+error: clean store rejected physical state: RequestConflict
+38 rc=1  53 ms
+error: clean store rejected physical state: RequestConflict
+39 rc=1  53 ms
+error: clean store rejected physical state: RequestConflict
+40 rc=1  60 ms
+error: clean store rejected physical state: RequestConflict
+41 rc=1  53 ms
+error: clean store rejected physical state: RequestConflict
+42 rc=1  53 ms
+error: clean store rejected physical state: RequestConflict
+43 rc=1  59 ms
+error: clean store rejected physical state: RequestConflict
+44 rc=1  54 ms
+error: clean store rejected physical state: RequestConflict
+45 rc=1  54 ms
+error: clean store rejected physical state: RequestConflict
+46 rc=1  53 ms
+error: clean store rejected physical state: RequestConflict
+47 rc=1  57 ms
+error: clean store rejected physical state: RequestConflict
+48 rc=1  55 ms
+error: clean store rejected physical state: RequestConflict
+49 rc=1  54 ms
+error: clean store rejected physical state: RequestConflict
+50 rc=1  55 ms
+error: clean store rejected physical state: RequestConflict
+51 rc=1  55 ms
+error: clean store rejected physical state: RequestConflict
+52 rc=1  56 ms
+error: clean store rejected physical state: RequestConflict
+53 rc=1  53 ms
+error: clean store rejected physical state: RequestConflict
+54 rc=1  57 ms
+error: clean store rejected physical state: RequestConflict
+55 rc=1  61 ms
+error: clean store rejected physical state: RequestConflict
+56 rc=1  63 ms
+error: clean store rejected physical state: RequestConflict
+57 rc=1  55 ms
+error: clean store rejected physical state: RequestConflict
+58 rc=1  61 ms
+error: clean store rejected physical state: RequestConflict
+59 rc=1  55 ms
+error: clean store rejected physical state: RequestConflict
+60 rc=1  55 ms
+error: clean store rejected physical state: RequestConflict
+61 rc=1  54 ms
+error: clean store rejected physical state: RequestConflict
+62 rc=1  56 ms
+error: clean store rejected physical state: RequestConflict
+63 rc=1  52 ms
+error: clean store rejected physical state: RequestConflict
+64 rc=1  53 ms
+error: clean store rejected physical state: RequestConflict
+65 rc=1  54 ms
+error: clean store rejected physical state: RequestConflict
+66 rc=1  54 ms
+error: clean store rejected physical state: RequestConflict
+67 rc=1  57 ms
+error: clean store rejected physical state: RequestConflict
+68 rc=1  52 ms
+error: clean store rejected physical state: RequestConflict
+69 rc=1  53 ms
+error: clean store rejected physical state: RequestConflict

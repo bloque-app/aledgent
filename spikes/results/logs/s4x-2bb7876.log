@@ -1,0 +1,38 @@
+running 1 test
+test agent::state_block_pvm::lifecycle_tests::f002_external_state_invocation_cost ... s4x size 65536: 0 unacknowledged results retained
+s4x size 65536: 2/2 rows (65536 B of rows) in 1 fills (1 acknowledged), window 31; runtime state passed in the work: control 4396 B, lanes 606 B
+== s4x rows 65536 B ==
+  caller us (invoke + ack, excl. staging): n=1000 p50=440468 p95=460414 p99=493185 max=623978
+  invoke elapsed_us: n=1000 p50=328217 p95=341693 p99=375769 max=508390
+  ack elapsed_us: n=1000 p50=111608 p95=118098 p99=129193 max=155615
+  invoke gas: n=1000 p50=166654546 p95=170423204 p99=171227490 max=171839554
+  ack gas: n=1000 p50=39153179 p95=41626297 p99=41861916 max=41936444
+  invoke input bytes: n=1000 p50=74191 p95=74191 p99=74191 max=74191
+s4x size 1048576: 0 unacknowledged results retained
+s4x size 1048576: 32/32 rows (1048576 B of rows) in 16 fills (16 acknowledged), window 16; runtime state passed in the work: control 4396 B, lanes 606 B
+== s4x rows 1048576 B ==
+  caller us (invoke + ack, excl. staging): n=1000 p50=449796 p95=465488 p99=492300 max=594930
+  invoke elapsed_us: n=1000 p50=333616 p95=344997 p99=372385 max=454293
+  ack elapsed_us: n=1000 p50=115464 p95=121195 p99=128092 max=156047
+  invoke gas: n=1000 p50=172596957 p95=175071387 p99=175819766 max=176514130
+  ack gas: n=1000 p50=42404208 p95=43586660 p99=43729986 max=43790307
+  invoke input bytes: n=1000 p50=74191 p95=74191 p99=74191 max=74191
+s4x size 2097152: 31 unacknowledged results retained
+s4x size 2097152: 64/64 rows (2097152 B of rows) in 32 fills (1 acknowledged), window 31; runtime state passed in the work: control 4396 B, lanes 606 B
+== s4x rows 2097152 B ==
+  caller us (invoke + ack, excl. staging): n=1000 p50=976373 p95=1010880 p99=1048999 max=1284232
+  invoke elapsed_us: n=1000 p50=612422 p95=638477 p99=664810 max=879376
+  ack elapsed_us: n=1000 p50=362376 p95=375692 p99=396898 max=444602
+  invoke gas: n=1000 p50=390743717 p95=394457269 p99=395312700 max=396234426
+  ack gas: n=1000 p50=223535294 p95=225984261 p99=226227037 max=226330781
+  invoke input bytes: n=1000 p50=74191 p95=74191 p99=74191 max=74191
+s4x size 4063232: 31 unacknowledged results retained
+s4x size 4063232: 124/124 rows (4063232 B of rows) in 62 fills (31 acknowledged), window 1; runtime state passed in the work: control 4396 B, lanes 606 B
+== s4x rows 4063232 B ==
+  caller us (invoke + ack, excl. staging): n=1000 p50=986719 p95=1016817 p99=1038042 max=1159815
+  invoke elapsed_us: n=1000 p50=618691 p95=639556 p99=661483 max=731381
+  ack elapsed_us: n=1000 p50=366845 p95=379761 p99=399529 max=507145
+  invoke gas: n=1000 p50=396167803 p95=397675874 p99=398383732 max=399029427
+  ack gas: n=1000 p50=227159455 p95=227265249 p99=227295673 max=227344967
+  invoke input bytes: n=1000 p50=74191 p95=74191 p99=74191 max=74191
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1852 filtered out; finished in 2997.40s

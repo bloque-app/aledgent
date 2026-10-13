@@ -1,0 +1,19 @@
+    Finished `release` profile [optimized] target(s) in 2.64s
+s3 transfer-1000000: input 5712 B, message 5841 B (limit 16384 B)
+  reply bytes [01, 64, ea, 04, 00, 00, 00, 00, 00, 41, 22, 42, 05, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 09, 00, 00, 00, e4, ff, ff, ff, 11, 00, 00, 00, 00, 00, 00, 00]
+== s3 transfer-1000000 kernel ==
+  caller e2e us (invoke + ack): n=1000 p50=564193 p95=590013 p99=619497 max=675100
+  invoke elapsed_us: n=1000 p50=533545 p95=557331 p99=582021 max=638445
+  actor gas: n=1000 p50=88858421 p95=88858619 p99=88858619 max=88858619
+s3 reserve-pooled-1000000: input 5408 B, message 5537 B (limit 16384 B)
+  reply bytes [01, 9d, a3, 04, 00, 00, 00, 00, 00, 24, 06, 3c, 05, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 09, 00, 00, 00, e4, ff, ff, ff, 11, 00, 00, 00, 00, 00, 00, 00]
+== s3 reserve-pooled-1000000 kernel ==
+  caller e2e us (invoke + ack): n=1000 p50=561285 p95=587141 p99=616753 max=664804
+  invoke elapsed_us: n=1000 p50=531294 p95=551655 p99=584355 max=610729
+  actor gas: n=1000 p50=88433163 p95=88433163 p99=88433163 max=88433163
+s3 reserve-new-holding-1000000: input 5496 B, message 5625 B (limit 16384 B)
+  reply bytes [01, 9c, c3, 04, 00, 00, 00, 00, 00, 21, 9e, 9a, 05, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 09, 00, 00, 00, e4, ff, ff, ff, 11, 00, 00, 00, 00, 00, 00, 00]
+== s3 reserve-new-holding-1000000 kernel ==
+  caller e2e us (invoke + ack): n=1000 p50=570091 p95=594911 p99=624577 max=843774
+  invoke elapsed_us: n=1000 p50=540200 p95=558329 p99=590705 max=794107
+  actor gas: n=1000 p50=94642529 p95=94642529 p99=94642529 max=94642529

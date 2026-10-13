@@ -1,0 +1,707 @@
+// Copyright (c) 2026 Pagos Cube LLC
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+//! The wire form of the query surface (`CTR-QRY`, SPEC §8.2): `F-011`'s requests, replies and
+//! cursor (`F-011` NOTES, "F-009: the wire form").
+//!
+//! Queries are not core inputs: they never enter the received-log and change nothing
+//! (`REQ-QR-3`). Ingress authenticates them, names the principal and the request id in its access
+//! log (`REQ-PV-5`), and routes them to `F-011`'s entry points, which decide what the principal may
+//! see (`INV-16`) and refuse an unbounded query (`ERR-QueryUnbounded`, `REQ-CS-5`).
+//!
+//! Balances are signed decimal-integer strings of minor units: a Treasury account may be below
+//! zero. A cursor is opaque hex; a caller passes it back unchanged (`REQ-QR-5`).
+
+use ledger_core::Refusal;
+use ledger_core::account::Time;
+use ledger_core::asset::{Asset, AssetBinding, AssetId, AssetKind, AssetStatus, Minor};
+use ledger_core::authority::AuthorityUsed;
+use ledger_core::id::{AccountId, IdentityId, OperationId};
+use ledger_core::query::journal::{BalanceKind, Direction, Sums};
+use ledger_core::query::movement::{Movement, MovementStatus};
+use ledger_core::query::{
+    Balances, Cursor, MovementFilter, MovementsRequest, OperationView, Page, Statement,
+    StatementRequest, Subject, TimeRange, TrialBalance,
+};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+use crate::wire::{OperationReply, ShownBody};
+
+/// The query string of `balances` and `movements`: exactly one of `account` and `identity`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BalancesParams {
+    /// One account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// Every account of one identity the caller reaches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+    /// One asset; every asset held if absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset: Option<String>,
+}
+
+/// The query string of `movements`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MovementsParams {
+    /// The subject: one account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// The subject: one identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+    /// Only movements on this account (within an identity's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_account: Option<String>,
+    /// Only this asset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset: Option<String>,
+    /// Only `debit` or `credit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
+    /// Only against this counterparty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counterparty: Option<String>,
+    /// From this time, inclusive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<Time>,
+    /// To this time, inclusive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<Time>,
+    /// The page size. Required: an unbounded page is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// The previous page's cursor, hex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+/// The query string of `statement`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StatementParams {
+    /// The account.
+    pub account: String,
+    /// The asset.
+    pub asset: String,
+    /// The period's start. Required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<Time>,
+    /// The period's end. Required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<Time>,
+    /// Read at this view (a posting sequence number), for a statement that must not move.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub as_of: Option<u64>,
+}
+
+/// The query string of `trial_balance` and `can_spend`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AssetParams {
+    /// The asset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset: Option<String>,
+    /// For `can_spend`: the amount, in minor units.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amount: Option<String>,
+}
+
+/// One balance row: each balance kind labelled, and their total (`REQ-BA-2`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct BalanceRowBody {
+    /// The account.
+    pub account: String,
+    /// The asset.
+    pub asset: String,
+    /// Available, minor units.
+    pub available: String,
+    /// Reserved, minor units.
+    pub reserved: String,
+    /// Encumbered, minor units (zero in V0).
+    pub encumbered: String,
+    /// Their sum.
+    pub total: String,
+}
+
+/// `balances` (SPEC §8.2).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct BalancesBody {
+    /// The view it was read at: the posting sequence number (`REQ-QR-2`).
+    pub view: u64,
+    /// The rows.
+    pub rows: Vec<BalanceRowBody>,
+}
+
+/// An authority a posting relied on, and who used it (`REQ-AU-7`, `INV-20`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AuthorityBody {
+    /// `owner`, `delegated`, `operator`, `issuance` or `recovery`.
+    pub kind: String,
+    /// The grant, where one was used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant: Option<String>,
+    /// The principal that used it.
+    pub principal: String,
+    /// The credential it presented.
+    pub credential: String,
+    /// Whom it acted for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_behalf_of: Option<String>,
+}
+
+/// One movement: one entry against one account.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct MovementBody {
+    /// The posting's sequence number.
+    pub seq: u64,
+    /// The posting's time.
+    pub at: Time,
+    /// The posting's kind.
+    pub kind: String,
+    /// `held`, `completed`, `returned`, `reversed` or `opening`.
+    pub status: String,
+    /// The operation.
+    pub operation: String,
+    /// The account.
+    pub account: String,
+    /// `available`, `reserved` or `encumbered`.
+    pub balance: String,
+    /// The asset.
+    pub asset: String,
+    /// `debit` or `credit`.
+    pub direction: String,
+    /// Minor units.
+    pub amount: String,
+    /// The ledger account on the other side, where there is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counterparty: Option<String>,
+    /// The authorities that caused it.
+    pub authorities: Vec<AuthorityBody>,
+    /// The pass-through data its operation was submitted with (`REQ-PO-5`), exactly as sent.
+    /// Shown only to principals of the submitting principal's integrating party: another party
+    /// reading the same movement never sees it (`AC-M8.4`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<crate::wire::PassThrough>,
+}
+
+/// A page of movements (`REQ-QR-5`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PageBody {
+    /// The view it was read at.
+    pub view: u64,
+    /// The movements.
+    pub movements: Vec<MovementBody>,
+    /// The cursor of the next page, hex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+}
+
+/// Balances by kind, minor units.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SumsBody {
+    /// Available.
+    pub available: String,
+    /// Reserved.
+    pub reserved: String,
+    /// Encumbered.
+    pub encumbered: String,
+}
+
+/// `statement` (SPEC §8.2).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct StatementBody {
+    /// The account.
+    pub account: String,
+    /// The asset.
+    pub asset: String,
+    /// The period's start.
+    pub from: Time,
+    /// The period's end.
+    pub to: Time,
+    /// The first posting of the period.
+    pub from_seq: u64,
+    /// The last.
+    pub to_seq: u64,
+    /// Whether the period is closed: no posting can still enter it.
+    pub closed: bool,
+    /// The opening balances.
+    pub opening: SumsBody,
+    /// The movements.
+    pub movements: Vec<MovementBody>,
+    /// The closing balances.
+    pub closing: SumsBody,
+}
+
+/// One asset of the registry (`REQ-AS-1`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AssetBody {
+    /// Its symbol.
+    pub id: String,
+    /// Its location on the settlement layer, once a binding was asked for (`REQ-AS-8`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+    /// `book_only`, `binding` or `bound` (amendment 0011, `REQ-AS-7`, `REQ-AS-8`).
+    pub binding: String,
+    /// Its one precision (`INV-24`).
+    pub precision: u8,
+    /// `fiat`, `stable`, `native` or `other`.
+    pub kind: String,
+    /// `active` or `deprecated`.
+    pub status: String,
+}
+
+/// One unbalanced (currency, layer) of the commitment check.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct UnbalancedBody {
+    /// The kernel currency tag.
+    pub currency: u32,
+    /// The balance layer.
+    pub layer: u64,
+}
+
+/// One asset's trial balance on openings.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TrialRowBody {
+    /// The asset.
+    pub asset: String,
+    /// The signed sum of openings, minor units: zero when it balances.
+    pub openings: String,
+}
+
+/// `trial_balance` (SPEC §8.2, `INV-5`): the operator's.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TrialBalanceBody {
+    /// The view it was read at.
+    pub view: u64,
+    /// How many kernel accounts the commitment check summed.
+    pub accounts: u64,
+    /// Every (currency, layer) that does not sum to zero. Empty when the book balances.
+    pub unbalanced: Vec<UnbalancedBody>,
+    /// The check on openings, per asset.
+    pub rows: Vec<TrialRowBody>,
+}
+
+/// Incidents of one kind on the operator channel (`F-013`), for `F-018`'s signals.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct IncidentCountBody {
+    /// The kind.
+    pub kind: String,
+    /// How many were raised.
+    pub count: u64,
+    /// When the latest was raised, in milliseconds.
+    pub latest: u64,
+}
+
+/// The audit trail's shipping to the audit store (`T-013-13`, `REQ-AT-2`, `NFR-6`), as the core
+/// reports it: counts, ages and flags, never a record.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AuditShipBody {
+    /// Records in the core's audit outbox, not yet confirmed by the store.
+    pub unshipped: u64,
+    /// The age of the oldest of them, by its time input; absent when none waits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_unshipped_age: Option<u64>,
+    /// Records the store holds.
+    pub shipped: u64,
+    /// Whether the last round reached the store.
+    pub store_up: bool,
+    /// Whether the store refused a record under its rules, or holds another record than the
+    /// core's at its head: shipping has stopped.
+    pub refused: bool,
+    /// Whether the core refuses new inputs because its outbox is at its bound.
+    pub backpressure: bool,
+    /// That bound.
+    pub max_unshipped: u64,
+}
+
+/// The operational signals (`F-018`, `NFR-11`): counts, ages and times, never a ledger fact.
+/// The operator's, with the `read_signals` operator kind. Ages are in milliseconds at the time
+/// of the read.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SignalsBody {
+    /// When the signals were read.
+    pub now: u64,
+    /// Non-terminal operations.
+    pub open: u64,
+    /// The age of the oldest non-terminal operation (`REQ-OP-8`); absent when none is open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_open_age: Option<u64>,
+    /// Operations in `Received` in the core.
+    pub received: u64,
+    /// The review queue's length (`REQ-OP-6`).
+    pub review: u64,
+    /// Of which in `Needs-Review`.
+    pub needs_review: u64,
+    /// Of which past their service level.
+    pub review_overdue: u64,
+    /// How far past its service level the most overdue entry is.
+    pub review_most_overdue: u64,
+    /// The review queue's service level.
+    pub review_service_level: u64,
+    /// Undelivered notifications (`REQ-EV-6`).
+    pub undelivered: u64,
+    /// The age of the oldest undelivered notification; absent when none is owed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_undelivered_age: Option<u64>,
+    /// The age of the last tick the core applied (`DEC-6`, `RISK-7`); absent before the first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tick_age: Option<u64>,
+    /// The age of the oldest row ingress holds undecided — logged, not yet decided by the core
+    /// (`REQ-CS-7`); absent when every row is decided. Ingress's own, added by the surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_undecided_age: Option<u64>,
+    /// Incidents on the operator channel, per kind.
+    pub incidents: Vec<IncidentCountBody>,
+    /// Anchor lag (`F-017`): time since the newest `Final` checkpoint was created; before the
+    /// first is final, the age of the oldest checkpoint; absent while there is none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_lag: Option<u64>,
+    /// How long the checkpoint in flight has waited for finality, if one is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_in_flight_age: Option<u64>,
+    /// Anchoring's incidents, per kind (`commitment_mismatch`, `unknown_anchor`,
+    /// `position_difference`); `latest` is not known for them and is zero.
+    #[serde(default)]
+    pub anchor_incidents: Vec<IncidentCountBody>,
+    /// Assets whose latest settlement comparison differs (`REQ-PR-5`).
+    #[serde(default)]
+    pub settlement_differing: u64,
+    /// The age of the latest settlement comparison.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement_comparison_age: Option<u64>,
+    /// Completion of commands at p50 and p99, in milliseconds, over ingress's latest samples
+    /// (`NFR-15`, amendment 0007); absent before the first. Ingress's own, added by the surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_p50: Option<u64>,
+    /// See `completion_p50`. `F-018` pages when it passes the 30 s ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_p99: Option<u64>,
+    /// Whether the core has stopped deciding: halted on an input the Agent cannot apply (finding
+    /// F18 of `F-032`), or stopped on an incident. Reads go on; every input waits `Received`.
+    #[serde(default)]
+    pub core_halted: bool,
+    /// The audit trail's shipping (`T-013-13`); absent when the core ships to no audit store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit: Option<AuditShipBody>,
+    /// The core Agent's runtime: Authority decisions (receipts) issued whose invocation is not
+    /// acknowledged yet. The runtime refuses more past 256. Absent for the in-process core.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vos_unacknowledged: Option<u64>,
+    /// The book's size (`T-018-11`): what `T-036-17`'s disk-backed store is required by. Absent
+    /// from a core that does not count it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub book: Option<BookSizeBody>,
+}
+
+/// The book's size, as the signals carry it: counts only, each kept by the collection that holds
+/// what it counts, so the read visits no record (`T-018-11`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct BookSizeBody {
+    /// The book's records, in a chainspec's unit (`F-036`): one for each identity, ledger
+    /// account, grant, alias and operation the book holds, and one for each of its seed's opening
+    /// rows and credential imports. At genesis, the chainspec's records and the few rows genesis
+    /// itself writes; later, one more for each operation, identity, account, grant or alias.
+    pub records: u64,
+    /// The leaves of the core's service store: what the core host's replica holds in memory.
+    pub leaves: u64,
+    /// The records of the chainspec the book was founded on; absent for a book founded without
+    /// one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub genesis_records: Option<u64>,
+}
+
+/// `can_spend` (SPEC §8.2): yes, or a refusal naming why not.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CanSpendBody {
+    /// Always `true`: a "no" is a refusal with its reason.
+    pub ok: bool,
+}
+
+fn snake(debug: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in debug.chars().enumerate() {
+        if c.is_ascii_uppercase() {
+            if i > 0 {
+                out.push('_');
+            }
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn authority(a: &AuthorityUsed) -> AuthorityBody {
+    AuthorityBody {
+        kind: snake(&format!("{:?}", a.kind)),
+        grant: a.grant.map(|g| g.to_did()),
+        principal: a.principal.to_did(),
+        credential: a.credential.to_did(),
+        on_behalf_of: a.on_behalf_of.map(|i| i.to_did()),
+    }
+}
+
+/// A movement on the wire.
+pub fn movement(m: &Movement) -> MovementBody {
+    MovementBody {
+        seq: m.seq,
+        at: m.at,
+        kind: snake(&format!("{:?}", m.kind)),
+        status: match m.status {
+            MovementStatus::Held => "held",
+            MovementStatus::Completed => "completed",
+            MovementStatus::Returned => "returned",
+            MovementStatus::Reversed => "reversed",
+            MovementStatus::Opening => "opening",
+        }
+        .to_owned(),
+        operation: m.operation.to_did(),
+        account: m.account.to_did(),
+        balance: match m.balance {
+            BalanceKind::Available => "available",
+            BalanceKind::Reserved => "reserved",
+            BalanceKind::Encumbered => "encumbered",
+        }
+        .to_owned(),
+        asset: m.asset.as_str().to_owned(),
+        direction: match m.direction {
+            Direction::Debit => "debit",
+            Direction::Credit => "credit",
+        }
+        .to_owned(),
+        amount: m.amount.get().to_string(),
+        counterparty: m.counterparty.map(|c| c.to_did()),
+        authorities: m.authorities.iter().map(authority).collect(),
+        // Ingress adds it, for the reader it may be shown to (`REQ-PO-5`): the core never
+        // holds it.
+        reference: None,
+    }
+}
+
+fn sums(s: &Sums) -> SumsBody {
+    SumsBody {
+        available: s.available.to_string(),
+        reserved: s.reserved.to_string(),
+        encumbered: s.encumbered.to_string(),
+    }
+}
+
+/// Balances on the wire.
+pub fn balances(b: &Balances) -> BalancesBody {
+    BalancesBody {
+        view: b.view,
+        rows: b
+            .rows
+            .iter()
+            .map(|r| BalanceRowBody {
+                account: r.account.to_did(),
+                asset: r.asset.as_str().to_owned(),
+                available: r.available.to_string(),
+                reserved: r.reserved.to_string(),
+                encumbered: r.encumbered.to_string(),
+                total: r.total.to_string(),
+            })
+            .collect(),
+    }
+}
+
+/// A page on the wire.
+pub fn page(p: &Page) -> PageBody {
+    PageBody {
+        view: p.view,
+        movements: p.movements.iter().map(movement).collect(),
+        next: p.next.as_ref().map(|c| hex::encode(c.as_bytes())),
+    }
+}
+
+/// A statement on the wire.
+pub fn statement(s: &Statement) -> StatementBody {
+    StatementBody {
+        account: s.account.to_did(),
+        asset: s.asset.as_str().to_owned(),
+        from: s.period.from,
+        to: s.period.to,
+        from_seq: s.from_seq,
+        to_seq: s.to_seq,
+        closed: s.closed,
+        opening: sums(&s.opening),
+        movements: s.movements.iter().map(movement).collect(),
+        closing: sums(&s.closing),
+    }
+}
+
+/// An asset on the wire.
+pub fn asset(a: &Asset) -> AssetBody {
+    AssetBody {
+        id: a.id().as_str().to_owned(),
+        location: a.binding().location().map(|l| l.as_str().to_owned()),
+        binding: match a.binding() {
+            AssetBinding::BookOnly => "book_only",
+            AssetBinding::Binding(_) => "binding",
+            AssetBinding::Bound(_) => "bound",
+        }
+        .to_owned(),
+        precision: a.precision(),
+        kind: match a.kind() {
+            AssetKind::Fiat => "fiat",
+            AssetKind::Stable => "stable",
+            AssetKind::Native => "native",
+            AssetKind::Other => "other",
+        }
+        .to_owned(),
+        status: match a.status() {
+            AssetStatus::Active => "active",
+            AssetStatus::Deprecated => "deprecated",
+        }
+        .to_owned(),
+    }
+}
+
+/// A trial balance on the wire.
+pub fn trial(t: &TrialBalance) -> TrialBalanceBody {
+    TrialBalanceBody {
+        view: t.view,
+        accounts: t.commitments.accounts as u64,
+        unbalanced: t
+            .commitments
+            .unbalanced
+            .iter()
+            .map(|(currency, layer)| UnbalancedBody {
+                currency: *currency,
+                layer: *layer as u64,
+            })
+            .collect(),
+        rows: t
+            .rows
+            .iter()
+            .map(|r| TrialRowBody {
+                asset: r.asset.as_str().to_owned(),
+                openings: r.openings.to_string(),
+            })
+            .collect(),
+    }
+}
+
+/// An operation on the wire.
+pub fn operation(v: &OperationView) -> OperationReply {
+    let shown = v.status.map(ShownBody::from);
+    OperationReply {
+        operation_reference: v.reference.to_did(),
+        command: v.command.map(|c| snake(&format!("{c:?}"))),
+        kind: v.kind.map(|k| snake(&format!("{k:?}"))),
+        state: shown.as_ref().map(|s| s.state.clone()),
+        class: shown.as_ref().map(|s| s.class),
+        terminal: shown.as_ref().is_none_or(|s| s.terminal),
+        deadline: v.deadline,
+        closed_at: v.closed_at,
+        outcome: v.outcome.map(|s| s.name().to_owned()),
+        error: v.refusal,
+        evidence: v.evidence.iter().map(|e| hex::encode(e.0)).collect(),
+        postings: v.postings.clone(),
+        // Ingress adds it (`REQ-PO-5`): the core never holds it.
+        reference: None,
+    }
+}
+
+fn account(s: &str) -> Result<AccountId, Refusal> {
+    AccountId::parse(s).map_err(|_| Refusal::UnknownAccount)
+}
+
+/// The subject of a query: exactly one of an account and an identity, else unbounded.
+pub fn subject(account_: Option<&str>, identity: Option<&str>) -> Result<Subject, Refusal> {
+    match (account_, identity) {
+        (Some(a), None) => Ok(Subject::Account(account(a)?)),
+        (None, Some(i)) => Ok(Subject::Identity(
+            IdentityId::parse(i).map_err(|_| Refusal::NotAuthorised)?,
+        )),
+        _ => Err(Refusal::QueryUnbounded),
+    }
+}
+
+/// An optional asset.
+pub fn asset_id(s: Option<&str>) -> Result<Option<AssetId>, Refusal> {
+    s.map(AssetId::parse).transpose()
+}
+
+/// An amount in minor units.
+pub fn minor(s: &str) -> Result<Minor, Refusal> {
+    if s.is_empty() || !s.bytes().all(|c| c.is_ascii_digit()) {
+        return Err(Refusal::PrecisionExceeded);
+    }
+    s.parse::<u64>()
+        .map(Minor::new)
+        .map_err(|_| Refusal::PrecisionExceeded)
+}
+
+/// `movements`' request.
+pub fn movements_request(p: &MovementsParams) -> Result<MovementsRequest, Refusal> {
+    let time = match (p.from, p.to) {
+        (None, None) => None,
+        (Some(from), Some(to)) => Some(TimeRange { from, to }),
+        _ => return Err(Refusal::QueryUnbounded),
+    };
+    Ok(MovementsRequest {
+        subject: subject(p.account.as_deref(), p.identity.as_deref())?,
+        filter: MovementFilter {
+            account: p.on_account.as_deref().map(account).transpose()?,
+            asset: asset_id(p.asset.as_deref())?,
+            direction: match p.direction.as_deref() {
+                None => None,
+                Some("debit") => Some(Direction::Debit),
+                Some("credit") => Some(Direction::Credit),
+                Some(_) => return Err(Refusal::NotAuthorised),
+            },
+            counterparty: p.counterparty.as_deref().map(account).transpose()?,
+            time,
+        },
+        limit: p.limit,
+        cursor: match &p.cursor {
+            None => None,
+            Some(c) => Some(Cursor::from_bytes(
+                hex::decode(c).map_err(|_| Refusal::QueryUnbounded)?,
+            )),
+        },
+    })
+}
+
+/// `statement`'s request.
+pub fn statement_request(p: &StatementParams) -> Result<StatementRequest, Refusal> {
+    Ok(StatementRequest {
+        account: account(&p.account)?,
+        asset: AssetId::parse(&p.asset)?,
+        from: p.from,
+        to: p.to,
+        as_of: p.as_of,
+    })
+}
+
+/// An operation reference.
+pub fn reference(s: &str) -> Result<OperationId, Refusal> {
+    OperationId::parse(s).map_err(|_| Refusal::UnknownOperation)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_are_snake_case() {
+        assert_eq!(snake("CloseAccount"), "close_account");
+        assert_eq!(snake("Reserve"), "reserve");
+    }
+
+    #[test]
+    fn a_query_needs_exactly_one_subject() {
+        assert_eq!(subject(None, None), Err(Refusal::QueryUnbounded));
+        assert_eq!(subject(Some("x"), Some("y")), Err(Refusal::QueryUnbounded));
+        let half = MovementsParams {
+            from: Some(1),
+            ..MovementsParams::default()
+        };
+        assert_eq!(movements_request(&half), Err(Refusal::QueryUnbounded));
+    }
+}

@@ -1,0 +1,28 @@
+{
+  "name": "aledgent-site",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "description": "aledgent's public documentation site (Starlight).",
+  "license": "(Apache-2.0 OR MIT) AND CC-BY-4.0",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview",
+    "astro": "astro"
+  },
+  "dependencies": {
+    "@astrojs/markdown-satteri": "0.4.2",
+    "@astrojs/starlight": "0.42.4",
+    "@fontsource/familjen-grotesk": "5.3.0",
+    "@fontsource/geist": "5.3.0",
+    "@fontsource/geist-mono": "5.3.0",
+    "astro": "7.3.5",
+    "sharp": "0.35.5",
+    "specsite": "github:swimmingoncode/specsite#579e8ef",
+    "starlight-openapi": "0.26.2"
+  }
+}

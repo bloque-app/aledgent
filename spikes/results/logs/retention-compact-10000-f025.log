@@ -1,0 +1,12 @@
+runtime /out/agent_runtime-compact.pvm (1081973 B)
+retention: 1000 invocations acknowledged, Agent state 12015 B, 150.9 s
+retention: 2000 invocations acknowledged, Agent state 12015 B, 307.0 s
+retention: 3000 invocations acknowledged, Agent state 12015 B, 460.8 s
+retention: 4000 invocations acknowledged, Agent state 12015 B, 610.2 s
+retention: 5000 invocations acknowledged, Agent state 12015 B, 758.6 s
+retention: 6000 invocations acknowledged, Agent state 12015 B, 900.3 s
+retention: 7000 invocations acknowledged, Agent state 12015 B, 1042.5 s
+retention: 8000 invocations acknowledged, Agent state 12015 B, 1184.8 s
+retention: 9000 invocations acknowledged, Agent state 12015 B, 1326.9 s
+retention: 10000 invocations acknowledged, Agent state 12015 B, 1469.2 s
+retention: 10000 invocations accepted, first refused ack None

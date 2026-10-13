@@ -1,0 +1,49 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# F-026: the settlement contract (ink!) for V0 (PLAN.md `DEC-17`).
+#
+# A Cargo workspace of its own, excluded from the root one like `spikes/`: ink! and
+# its WASM build have nothing to do with the service's dependency tree. `.github/workflows/contracts.yml`
+# builds it with `cargo contract build` and runs its unit tests, only when `contracts/**` changes.
+#
+# Versions are the ones Kreivo builds against at `4aef055` (spec 133): `pallet-contracts` 49.0.0 on
+# the runtime side and ink! 5.1.1 for its contract-side bindings (`kreivo-apis`). `cargo-contract`
+# 5.0.3 builds ink! 5 contracts.
+[workspace]
+
+[package]
+name = "aledgent-settlement-contract"
+version = "0.1.0"
+authors = ["Bloque <engineering@bloque.team>"]
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/bloque-app/aledgent"
+description = "aledgent's settlement contract for Kreivo: one position per deployment, deposits by account reference, batched calls by operation reference with one recorded outcome each, anchors, and an ordered inbox."
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+ink = { version = "=5.1.1", default-features = false }
+# The host functions ink! 5.1.1 is built on, at the version it uses. The contract calls one of them
+# directly: `gas_left_v1` (`seal1::gas_left`), the weight left with its proof size, which ink!'s own
+# `gas_left` does not return (F-026 NOTES, decision 23).
+pallet-contracts-uapi = { version = "=9.0.0", default-features = false }
+scale = { package = "parity-scale-codec", version = "3.6.12", default-features = false, features = ["derive"] }
+scale-info = { version = "2.11", default-features = false, features = ["derive"], optional = true }
+
+[dev-dependencies]
+# Kreivo's own asset id, at the commit this contract is written against. Used only to prove that the
+# contract's mirror of it encodes byte for byte the same (`AssetId`, `src/types.rs`).
+virto-common = { git = "https://github.com/virto-network/kreivo.git", rev = "4aef055579e875cbd39c1ea7ff6d44d1fe77caa2", default-features = false, features = ["scale"] }
+# Kreivo's chain-extension API types, at the same commit, without its runtime or contract parts. Used
+# only to prove that the contract reads the extension's status codes as Kreivo writes them
+# (`KreivoApiError`, `src/kreivo.rs`). It is not a dependency of the contract itself: see
+# `features/F-026-settlement-contract/NOTES.md`, decision 3.
+kreivo-apis = { git = "https://github.com/virto-network/kreivo.git", rev = "4aef055579e875cbd39c1ea7ff6d44d1fe77caa2", default-features = false, features = ["std"] }
+
+[features]
+default = ["std"]
+std = ["ink/std", "scale/std", "scale-info/std"]
+ink-as-dependency = []

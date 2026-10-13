@@ -1,0 +1,33 @@
+    Finished `release` profile [optimized] target(s) in 3.31s
+s4 size 65536: 1 fill invocations (1 acknowledged); reset window 31
+s4 size 65536: 2/2 rows, Agent state 70557 B
+== s4 state 70557 B ==
+  caller e2e us (invoke + ack, in-process): n=1000 p50=189964 p95=227072 p99=260808 max=327392
+  invoke elapsed_us: n=1000 p50=139736 p95=168935 p99=201103 max=259243
+  ack elapsed_us: n=1000 p50=49185 p95=58653 p99=73076 max=141582
+  invoke input_bytes: n=1000 p50=141514 p95=144216 p99=144409 max=144409
+  invoke gas_used: n=1000 p50=99486189 p95=100928412 p99=101120510 max=101234918
+s4 size 1048576: 16 fill invocations (16 acknowledged); reset window 16
+s4 size 1048576: 32/32 rows, Agent state 1057302 B
+== s4 state 1057302 B ==
+  caller e2e us (invoke + ack, in-process): n=1000 p50=932899 p95=1006859 p99=1095484 max=1396748
+  invoke elapsed_us: n=1000 p50=520741 p95=570787 p99=620998 max=792831
+  ack elapsed_us: n=1000 p50=409100 p95=445671 p99=482102 max=709122
+  invoke input_bytes: n=1000 p50=1126908 p95=1128259 p99=1128259 max=1128259
+  invoke gas_used: n=1000 p50=346578710 p95=347350269 p99=347461959 max=347513395
+s4 size 2097152: 32 fill invocations (1 acknowledged); reset window 31
+s4 size 2097152: 64/64 rows, Agent state 2147805 B
+== s4 state 2147805 B ==
+  caller e2e us (invoke + ack, in-process): n=1000 p50=2178862 p95=2463946 p99=2652443 max=2795986
+  invoke elapsed_us: n=1000 p50=1158766 p95=1303064 p99=1402858 max=1555734
+  ack elapsed_us: n=1000 p50=1015172 p95=1130279 p99=1229364 max=1325274
+  invoke input_bytes: n=1000 p50=2218762 p95=2221464 p99=2221657 max=2221657
+  invoke gas_used: n=1000 p50=822967754 p95=824443087 p99=824629008 max=824707631
+s4 size 4063232: 62 fill invocations (31 acknowledged); reset window 1
+s4 size 4063232: 124/124 rows, Agent state 4121295 B
+== s4 state 4121295 B ==
+  caller e2e us (invoke + ack, in-process): n=1000 p50=3620369 p95=4620785 p99=4984039 max=6559219
+  invoke elapsed_us: n=1000 p50=1898316 p95=2422045 p99=2678554 max=3336900
+  ack elapsed_us: n=1000 p50=1711805 p95=2154504 p99=2402896 max=3141812
+  invoke input_bytes: n=1000 p50=4189357 p95=4189357 p99=4189357 max=4189357
+  invoke gas_used: n=1000 p50=1282761671 p95=1282903730 p99=1282967516 max=1283043616

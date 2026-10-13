@@ -1,0 +1,41 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+[package]
+name = "authn"
+version = "0.1.0"
+description = "aledgent's credential schemes at the boundary (F-028, DEC-19): WebAuthn passkey assertions and registrations, Kreivo Pass key import, API keys, and the challenges and session tokens ingress issues."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+# A software authenticator for other crates' tests (`webauthn::testing`). Never in production.
+testing = []
+
+[dependencies]
+# The scheme model and a passkey's public material (DEC-19).
+ledger-core = { path = "../ledger-core" }
+# ECDSA P-256 verification (ES256) and SEC1 points: RustCrypto, the crate Kreivo's own WebAuthn
+# verifier uses. Pinned (F-028 plan §7).
+p256 = { version = "=0.13.2", default-features = false, features = ["ecdsa", "std"] }
+# COSE keys in a WebAuthn attestation, over ciborium. Google's; pass-authenticators parses with it
+# too. Pinned (F-028 plan §7).
+coset = { version = "=0.3.8", default-features = false, features = ["std"] }
+sha2 = "0.10"
+hmac = "0.12"
+# blake2_256(rawId): Kreivo Pass's DeviceId, a passkey's handle.
+blake2 = "0.10.6"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+subtle = "2"
+getrandom = "0.3"
+hex = "0.4"
+
+[dev-dependencies]
+ledger-kernel = { path = "../ledger-kernel", default-features = false }
+
+[lints]
+workspace = true

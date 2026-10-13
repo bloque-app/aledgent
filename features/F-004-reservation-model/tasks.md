@@ -1,0 +1,18 @@
+<!--
+Copyright (c) 2026 Pagos Cube LLC
+SPDX-License-Identifier: CC-BY-4.0
+-->
+
+# F-004 — tasks
+
+| ID | Task | Traces | Done when |
+|---|---|---|---|
+| T-004-01 | Pin the three kernel facts of the plan's §1 as regression tests on raw kernel transfers: a move between layers of one account fails zero-sum; a `PENDING` debit on a flagged credit-normal account fails; the `Settled` check ignores an outstanding `Pending` debit | `REQ-KER-3`, `REQ-KER-4`, `DEP-4`, `RISK-3` | The three tests pass on `e9a7b08`. Each names the kernel source line it pins |
+| T-004-02 | The `ReservationBook` trait and Option A: a derived holding-account id, a flagged holding account created in the reserve step, and `CLOSING_DEBIT` on the emptying posting | `DEC-2`, `REQ-KER-3`, `REQ-BA-1`, `INV-14` | A second capture or release of the same operation is refused by the kernel. Every closed holding has a zero net |
+| T-004-03 | `reserve`: one kernel transfer with no pre-check. Refusals classified to `ERR-InsufficientAvailable` or `ERR-NotAuthorised`. The index is updated in the same apply unit | `REQ-BA-4`, `INV-3`, `REQ-AU-1`, `AC-B2.2`, `AC-C1.1`, `AC-C1.3` | Those cases pass. A refused reserve leaves the store and the index unchanged, byte for byte |
+| T-004-04 | `capture` (full, and for less as one three-entry posting), `release` with no amount parameter, and the `settle_outbound` posting shape for `F-010`. The remainder comes from the index. Over-capture gives `ERR-AmountMismatch` | `REQ-OP-2`, `INV-14`, `AC-C2.1`, `AC-C2.2`, `AC-C3.1` | Those cases pass. A compile-fail test shows that `release` cannot take an amount |
+| T-004-05 | The open-reservation index in hot state, and `BalanceView` (`available`, `reserved`, `encumbered` = 0, `total`) read from one committed version. Holding-sum check against kernel balances | `REQ-BA-2`, `REQ-BA-3`, `REQ-BA-5`, `REQ-BA-6`, `INV-6`, `AC-C1.2` | The `AC-C1.2` case passes. The holding-sum check passes after every unit of the concurrency test |
+| T-004-06 | Option B (pooled holding per asset) behind the same trait. Run both through `F-002` S1–S3, and record the proposed choice for the owner | `DEC-2`, `NFR-1`, `NFR-2` | Both options pass T-004-03 to T-004-05. The decision note cites the `F-002` figures. The owner's ruling is recorded |
+| T-004-07 | The randomised concurrency test: random command sets, shuffled and split into units and chains, checked against `ShadowBook`. Add the kernel-layer overdraw case | `AC-B2.1`, `INV-3`, `INV-5`, `REQ-KER-4` | 10 000 cases pass on both stores in CI. No Customer `available` is ever negative |
+| T-004-08 | Register the `F-015` cases: `INV-3` (kernel), `INV-14` (service), `ERR-InsufficientAvailable`, `ERR-AmountMismatch`, and the no-`Pending`/`Encumbrance` layer check. Wire the "repeat returns the original outcome" half of `AC-C2.1` once `F-007` lands | `NFR-14`, `INV-3`, `INV-14`, `AC-C2.1` | This feature's cases are green in the `m1` profile |
+| T-004-09 | `open_reservations(subject, [asset], [before], cursor)` (amendment 0013 R2, `prq-02` as ruled on 2026-10-03): from the open-reservation index, one consistent view, per (account, asset) the count, sum and earliest and latest deadline, and each open reservation itemised by cursor with its reference, amount, deadline, reserving principal and, for that principal, its client key; the view's position named; only what the caller made or holds authority over; the query and route through ingress (`T-009-09`). The index keeps the reserving principal and the deadline, or the query reads them from the operation | `REQ-QR-7`, `REQ-QR-2`, `REQ-QR-4`, `REQ-QR-5`, `AC-C6.1`–`AC-C6.3` | `AC-C6.1`–`AC-C6.3` pass; a read of an account with 100 000 closed reservations and 10 open ones touches the open ones only |

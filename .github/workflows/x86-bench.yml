@@ -1,0 +1,213 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+name: x86-64 bench (manual)
+
+# Timing for F-025 (#66) needs a real x86-64 Linux host: VOS's recompiler only
+# exists there, and emulation on the ARM development machines gives no usable
+# wall time. It runs on a GitHub-hosted runner by default (`runner`), several at
+# once; `zombienet` selects a self-hosted runner, one run at a time. Manual only and
+# bounded in time. Never add a push or pull_request trigger here.
+#
+# Modes:
+# - probe: host facts only (30 min).
+# - vos-suites: VOS's own suites at vos_url/vos_ref on both engines where the
+#   branch has them: vos-pvm (the PVM runtime and the Gray Paper v0.8.0
+#   instruction and block-gas vectors), vos --lib, vos agent_runtime_pvm (30 min;
+#   about 6 min on a fresh runner).
+# - reservation-timing: aledgent's core Agent (F-005) on vos_ref with vos_picks,
+#   one reservation timed on the interpreter and on the recompiler, plus a
+#   lockstep run that checks both engines agree on every execution, then the
+#   recompiler again with `batches` inputs per invocation (F-031 Lever 1) (45 min;
+#   about 9 min on a fresh runner before the batched runs).
+# - batch-curve: aledgent's core Agent on the recompiler with every per-invocation
+#   bound raised, one invocation carrying 1, 8, 32, 128, 512 and 2048 commands
+#   (F-032, T-032-07; 120 min).
+#
+# Builds run in a `rust:1-bookworm` container. Everything they write (clones,
+# cargo caches, targets, results) lives in one job-local directory, deleted at the
+# end whatever the outcome. Results are the job summary and an artifact.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "probe: host facts · vos-suites: VOS's suites on both engines · reservation-timing: the core's reservation, interpreter against recompiler · batch-curve: commands per invocation"
+        type: choice
+        options: [probe, vos-suites, reservation-timing, mapped-timing, batch-curve, compare, conformance, chainspec-genesis]
+        default: probe
+      vos_url:
+        description: "VOS repository"
+        type: string
+        default: https://codeberg.org/pandres95/VOS.git
+      vos_ref:
+        description: "VOS branch, tag or commit"
+        type: string
+        # 3140c3d: the recompiled-execution commit F-025 measured (notes/MEASUREMENTS-F005.md §9).
+        # The branch was rewritten on 2026-09-29 and no longer has RefineBackend.
+        default: 3140c3d57169316675c4231f742002d095571b4c
+      batch_sizes:
+        description: "batch-curve only: commands per invocation, space-separated"
+        type: string
+        default: "1 8 32 128 512 2048"
+      vos_picks:
+        description: "reservation-timing only: commits of vos_url cherry-picked onto vos_ref (space-separated; none for no picks). Default: T-025-01, sequenced identities, which the core host needs"
+        type: string
+        default: de0f12f82dc04d680abea8917d00e35220eedd2a
+      batches:
+        description: "reservation-timing only: inputs per invocation of the batched recompiler runs (space-separated; F-031 T-031-05)"
+        type: string
+        default: "1 8 32 128"
+      batch_gas:
+        description: "reservation-timing only: VOS's actor gas per invocation (MAX_EXECUTION_GAS) for a second set of batched runs, raised in the checkout; empty for none"
+        type: string
+        default: "8000000000"
+      compare_engines:
+        description: "reservation-timing only: also time the interpreter and run the lockstep check before the batched runs"
+        type: boolean
+        default: false
+      variants:
+        description: "compare and conformance: space-separated label=ref[+features][@lookup][!aledgent][~isolated|~atomic][/guest], each a runtime (VOS's, or aledgent's with !aledgent; batches as composites with ~) measured on this one machine (vos_ref builds the host and the core)"
+        type: string
+        default: ""
+      guests:
+        description: "compare only: space-separated name=patches:features:opt, core guests built with those proposals/cipherclerk patches, cipher-clerk features and opt-level; `sets` picks standard and/or raised bounds"
+        type: string
+        default: ""
+      runtime_features:
+        description: "reservation-timing: cargo features of VOS's services/agent-runtime build; empty is JAM-compatible (vos-native, blake2b-precompile, native-curve are outside JAM); vos-suites: extra features for vos --lib"
+        type: string
+        default: ""
+      program_lookup:
+        description: "reservation-timing only: the runtime is VOS's program-lookup profile; the core host serves actor programs through historical_lookup (F025_PROGRAM_LOOKUP=1)"
+        type: boolean
+        default: false
+      conf_batch:
+        description: "conformance only: changes per invocation (CONFORMANCE_AGENT_BATCH)"
+        type: string
+        default: "1"
+      runner:
+        description: "ubuntu-latest (GitHub-hosted, the default) or zombienet (the self-hosted fleet, one run at a time)"
+        type: choice
+        options: [ubuntu-latest, zombienet]
+        default: ubuntu-latest
+      grown:
+        description: "chainspec-genesis only (F-036): the synthetic chainspec, in multiples of the synthetic reference book (1: 100,000 identities and as many accounts; 10: 2 M). Needs the operator's migration tool, not in this repository"
+        type: string
+        default: "1"
+      verify_full:
+        description: "chainspec-genesis only (F-036, ruling a0022-q2): run `verify-genesis` on the GROWN chainspec itself instead of the small one (about 22 minutes at 1x, opt-level s)"
+        type: boolean
+        default: false
+      label:
+        description: "a name for this run in the summary (e.g. the VOS variant)"
+        type: string
+        default: ""
+
+concurrency:
+  # The self-hosted fleet runs one bench at a time; hosted runners run in parallel.
+  group: ${{ inputs.runner == 'zombienet' && 'x86-bench' || format('x86-bench-{0}', github.run_id) }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: x86-64 bench (${{ inputs.mode }}${{ inputs.label != '' && format(', {0}', inputs.label) || '' }})
+    runs-on: ${{ inputs.runner }}
+    # Only as long as each mode needs, with room for slow Codeberg clones; never above 120 on the
+    # fleet. A 4-vCPU hosted runner builds VOS several times slower and gets 300.
+    timeout-minutes: ${{ inputs.runner != 'zombienet' && 345 || (inputs.mode == 'batch-curve' && 120 || ((inputs.mode == 'reservation-timing' || inputs.mode == 'mapped-timing') && 45 || 30)) }}
+    env:
+      IMAGE: rust:1-bookworm
+      CONTAINER: x86-bench-${{ github.run_id }}
+    steps:
+      - name: free runner disk
+        if: inputs.runner != 'zombienet'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: host facts
+        run: |
+          set -eu
+          uname -a
+          echo "arch: $(uname -m)"
+          echo "cpus: $(nproc)"
+          grep -m1 'model name' /proc/cpuinfo || true
+          grep -m1 -o -w -E 'avx2|avx512f' /proc/cpuinfo | sort -u || true
+          free -h || true
+          df -h . || true
+          id
+          if command -v docker >/dev/null; then docker --version; fi
+          if command -v cargo >/dev/null; then cargo --version; fi
+
+      - uses: actions/checkout@v4
+        if: inputs.mode != 'probe'
+
+      - name: job-local work directory
+        if: inputs.mode != 'probe'
+        run: |
+          set -eu
+          WORK=$RUNNER_TEMP/x86-bench-$GITHUB_RUN_ID
+          echo "WORK=$WORK" >> "$GITHUB_ENV"
+          mkdir -p "$WORK/aledgent" "$WORK/out" "$WORK/target" "$WORK/cargo-registry" "$WORK/cargo-git"
+          # A copy of this commit: the container never writes into the runner's checkout.
+          git archive HEAD | tar -x -C "$WORK/aledgent"
+          # Whether this job pulls the image, so that cleanup removes only what it added.
+          if docker image inspect "$IMAGE" >/dev/null 2>&1; then echo "PULLED_IMAGE=no" >> "$GITHUB_ENV"; else echo "PULLED_IMAGE=yes" >> "$GITHUB_ENV"; fi
+          for i in 1 2 3 4 5; do docker pull -q "$IMAGE" && break; sleep $((i * 15)); done
+          docker image inspect "$IMAGE" --format '{{.Id}}'
+
+      - name: ${{ inputs.mode }}
+        if: inputs.mode != 'probe'
+        env:
+          VOS_URL: ${{ inputs.vos_url }}
+          VOS_REF: ${{ inputs.vos_ref }}
+          VOS_PICKS: ${{ inputs.vos_picks }}
+          BATCH_SIZES: ${{ inputs.batch_sizes }}
+          BATCHES: ${{ inputs.batches }}
+          BATCH_GAS: ${{ inputs.batch_gas }}
+          COMPARE_ENGINES: ${{ inputs.compare_engines && '1' || '0' }}
+          VOS_LIB_FEATURES: ${{ inputs.mode == 'vos-suites' && inputs.runtime_features || '' }}
+          RUNTIME_FEATURES: ${{ inputs.runtime_features }}
+          VARIANTS: ${{ inputs.variants }}
+          GUESTS: ${{ inputs.guests }}
+          COMPARE_GAS: ${{ inputs.batch_gas }}
+          F025_PROGRAM_LOOKUP: ${{ inputs.program_lookup && '1' || '0' }}
+          LABEL: ${{ inputs.label }}
+          CONF_BATCH: ${{ inputs.conf_batch }}
+          MODE: ${{ inputs.mode }}
+          GROWN: ${{ inputs.grown }}
+          VERIFY_FULL: ${{ inputs.verify_full && '1' || '0' }}
+        run: |
+          docker run --rm --init --name "$CONTAINER" \
+            -e VOS_URL -e VOS_REF -e VOS_PICKS -e BATCH_SIZES -e BATCHES -e BATCH_GAS -e COMPARE_ENGINES -e LABEL -e RUNTIME_FEATURES -e F025_PROGRAM_LOOKUP -e VARIANTS -e GUESTS -e COMPARE_GAS -e COMPARE_SETS -e VOS_LIB_FEATURES -e CONF_BATCH -e GROWN -e VERIFY_FULL -e GITHUB_SHA \
+            -v "$WORK":/w \
+            -v "$WORK/cargo-registry":/usr/local/cargo/registry \
+            -v "$WORK/cargo-git":/usr/local/cargo/git \
+            -w /w "$IMAGE" bash /w/aledgent/.github/x86-bench/run.sh "$MODE"
+
+      - name: summary
+        if: always() && inputs.mode != 'probe'
+        run: |
+          if [ -f "$WORK/out/summary.md" ]; then cat "$WORK/out/summary.md" >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - uses: actions/upload-artifact@v4
+        if: always() && inputs.mode != 'probe'
+        with:
+          name: x86-bench-${{ inputs.mode }}-${{ github.run_id }}${{ inputs.label != '' && format('-{0}', inputs.label) || '' }}
+          path: ${{ env.WORK }}/out
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: clean up
+        if: always() && inputs.mode != 'probe'
+        run: |
+          docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+          if [ -n "${WORK:-}" ] && [ -d "$WORK" ]; then
+            # The container wrote as root: delete from inside one.
+            docker run --rm -v "$WORK":/w "$IMAGE" find /w -mindepth 1 -delete || true
+            rmdir "$WORK" || rm -rf "$WORK" || true
+          fi
+          if [ "${PULLED_IMAGE:-no}" = yes ]; then docker image rm "$IMAGE" >/dev/null || true; fi
+          df -h "$RUNNER_TEMP" || true

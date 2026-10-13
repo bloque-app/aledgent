@@ -1,0 +1,91 @@
+{
+  "listen": "0.0.0.0:8080",
+  "replica": "ingress-canary-0",
+  "profile": "production",
+  "require_sync_standby": false,
+  "tokens": [
+    {
+      "token_sha256": "<FILL sha256 of the operator's token, hex>",
+      "principal": "<FILL operator, from `aledgent-ingress founded`>",
+      "credential": "<FILL operator_credential, from `aledgent-ingress founded`>",
+      "kind": "service"
+    },
+    {
+      "token_sha256": "<FILL sha256 of the adapter's token, hex>",
+      "principal": "<FILL the adapter's identity (runbook step 5)>",
+      "credential": "<FILL the adapter's credential (runbook step 5)>",
+      "kind": "service"
+    },
+    {
+      "token_sha256": "<FILL sha256 of the operations principal's token, hex>",
+      "principal": "<FILL the operations principal's identity (runbook step 5)>",
+      "credential": "<FILL the operations principal's credential (runbook step 5)>",
+      "kind": "service"
+    },
+    {
+      "token_sha256": "<FILL sha256 of the smoke-test party's token, hex>",
+      "principal": "<FILL the smoke-test party's identity (runbook step 5)>",
+      "credential": "<FILL the smoke-test party's credential (runbook step 5)>",
+      "kind": "service"
+    }
+  ],
+  "allow_holder_credentials": true,
+  "passkeys": {
+    "relying_parties": [
+      {
+        "rp_id": "example.com",
+        "origins": ["https://auth.example.com", "https://api.example.com"],
+        "registrations": true
+      },
+      {
+        "rp_id": "api.example.com",
+        "origins": ["https://api.example.com"],
+        "registrations": false
+      }
+    ],
+    "require_user_verification": true,
+    "challenge_ttl_ms": 120000,
+    "session_ttl_ms": 900000
+  },
+  "tick_interval_ms": 1000,
+  "decision_bound_ms": 60000,
+  "core_journal": "/var/lib/aledgent/core.journal",
+  "genesis": {
+    "assets": [
+      { "id": "COPM", "precision": 2, "kind": "stable" },
+      { "id": "TSTA", "precision": 2, "kind": "stable" },
+      { "id": "TSTB", "precision": 2, "kind": "stable" },
+      { "id": "TSTC", "precision": 6, "kind": "stable" }
+    ],
+    "operator_verifier": "<FILL the operator's verifier, hex (public)>",
+    "deployment": "<FILL 16 random bytes, hex, chosen once (public)>",
+    "decision_bound_ms": 60000,
+    "review_service_level_ms": 3600000,
+    "default_deadlines_ms": {
+      "reserve": 600000,
+      "transfer": 600000,
+      "redeem": 600000
+    },
+    "genesis_op": "<FILL 16 random bytes, hex, chosen once (public)>",
+    "genesis_at": "<FILL-NUMBER genesis time, milliseconds since the Unix epoch, chosen once>",
+    "anchoring": {
+      "interval_ms": 3600000
+    }
+  },
+  "core_endpoint": "unix:/run/aledgent/core.sock",
+  "core_link": {
+    "token_sha256": ["<FILL the SHA-256 of ALEDGENT_CORE_LINK_TOKEN, hex>"],
+    "peer_uids": ["<FILL-NUMBER the user id ingress's container runs as>"]
+  },
+  "core_keys": {
+    "signer": {
+      "socket": "/run/aledgent-signer/signer.sock",
+      "client": "core",
+      "token_file": "/etc/aledgent/core-signer.token"
+    },
+    "key_ring": "keyring",
+    "clerk": "clerk",
+    "agent_authority": "agent-authority",
+    "agent_package": "agent-package"
+  }
+}

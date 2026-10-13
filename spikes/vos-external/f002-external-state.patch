@@ -1,0 +1,508 @@
+diff --git a/vos/src/agent/state_block_pvm.rs b/vos/src/agent/state_block_pvm.rs
+index 428dd129..23849d85 100644
+--- a/vos/src/agent/state_block_pvm.rs
++++ b/vos/src/agent/state_block_pvm.rs
+@@ -357,6 +357,23 @@ impl<R: BlockReader + ?Sized> StateBlockHost<'_, R> {
+     }
+ }
+ 
++/// F-002 re-check instrumentation (test builds only).
++#[cfg(test)]
++#[derive(Clone, Copy, Debug, Default)]
++pub(crate) struct F002RunStats {
++    pub gas_used: u64,
++    pub load_us: u64,
++    pub run_us: u64,
++    pub input_bytes: u64,
++    pub fetches: u64,
++}
++
++#[cfg(test)]
++std::thread_local! {
++    pub(crate) static F002_LAST_RUN: core::cell::Cell<F002RunStats> =
++        core::cell::Cell::new(F002RunStats::default());
++}
++
+ fn run_block_program(
+     program: &[u8],
+     input: &[u8],
+@@ -365,15 +382,36 @@ fn run_block_program(
+     mut fetch: impl FnMut(u64, &mut Machine) -> Result<(), BlockPvmError>,
+ ) -> Result<Vec<u8>, BlockPvmError> {
+     let mut failure = None;
+-    let invocation = RefineContext::load(program, input, gas)
+-        .map_err(|_| BlockPvmError::Load)?
+-        .run_with_host(|id, machine| match fetch(id, machine) {
++    #[cfg(test)]
++    let started = std::time::Instant::now();
++    let loaded = RefineContext::load(program, input, gas).map_err(|_| BlockPvmError::Load)?;
++    #[cfg(test)]
++    let load_us = started.elapsed().as_micros() as u64;
++    #[cfg(test)]
++    let fetches = core::cell::Cell::new(0u64);
++    let invocation = loaded.run_with_host(|id, machine| {
++        #[cfg(test)]
++        fetches.set(fetches.get() + 1);
++        match fetch(id, machine) {
+             Ok(()) => Ok(()),
+             Err(error) => {
+                 failure = Some(error);
+                 Err(ExitReason::Panic)
+             }
+-        });
++        }
++    });
++    // F-002 re-check instrumentation (test builds only): what the Local host's
++    // driver logs for the image path, for this physical external-state run.
++    #[cfg(test)]
++    F002_LAST_RUN.with(|cell| {
++        cell.set(F002RunStats {
++            gas_used: invocation.gas_used,
++            load_us,
++            run_us: started.elapsed().as_micros() as u64 - load_us,
++            input_bytes: input.len() as u64,
++            fetches: fetches.get(),
++        })
++    });
+     if let Some(error) = failure {
+         return Err(error);
+     }
+diff --git a/vos/src/agent/state_block_pvm_lifecycle_tests.rs b/vos/src/agent/state_block_pvm_lifecycle_tests.rs
+index f7e5f82a..2ae19013 100644
+--- a/vos/src/agent/state_block_pvm_lifecycle_tests.rs
++++ b/vos/src/agent/state_block_pvm_lifecycle_tests.rs
+@@ -604,3 +604,434 @@ fn compiled_create_install_constructor_invoke_retry_and_ack() {
+         ));
+     }
+ }
++
++/// F-002 re-check (aledgent `notes/MEASUREMENTS-F002.md` §11): the S2/S3/S4
++/// guest series of `spikes/vos-host`, driven through this physical
++/// external-state standard runtime instead of the bundled r19 image runtime.
++/// Measurement only; not a VOS test. Environment:
++///
++///   F002_MODE=s4      F002_PACKAGE=state-blob.vos  F002_SIZES=65536,...  F002_N=1000
++///   F002_MODE=s2|s3   F002_PACKAGE=kernel-probe.vos F002_N=.. F002_N_NOOP=.. F002_INPUTS=a.bin,b.bin
++///   F002_OUT=<csv>
++#[test]
++#[ignore = "F-002 re-check measurement; needs the external-state standard guest and signed actor packages"]
++fn f002_external_state_invocation_cost() {
++    use std::io::Write as _;
++    use std::time::Instant;
++    let env = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name}"));
++    let mode = env("F002_MODE");
++    let n: usize = env("F002_N").parse().unwrap();
++    let mut csv = std::io::BufWriter::new(std::fs::File::create(env("F002_OUT")).unwrap());
++    writeln!(csv, "spike,case,variant,size,sample,metric,value,unit").unwrap();
++    let package_bytes = std::fs::read(env("F002_PACKAGE")).unwrap();
++    let package = crate::agent::package_admission::admit_actor_package(&package_bytes).unwrap();
++    let signing = SigningKey::from_bytes(&[0x31; 32]);
++
++    struct Agent {
++        fixture: Fixture,
++        record: sdk::ActorDirectoryRecord,
++        availability: Vec<sdk::RuntimeBlob>,
++        receipt: sdk::authority::AuthorityReceipt,
++        slot: u64,
++        next: u64,
++    }
++    #[derive(Clone, Copy, Default)]
++    struct Exec {
++        elapsed_us: u64,
++        stage_us: u64,
++        stats: super::F002RunStats,
++    }
++    let exec = |fixture: &mut Fixture, inner: sdk::RuntimeWork| -> (StateExecutionOutput, Exec) {
++        let mut inner = inner;
++        match &mut inner {
++            sdk::RuntimeWork::Manage { state, .. }
++            | sdk::RuntimeWork::Invoke { state, .. }
++            | sdk::RuntimeWork::Acknowledge { state, .. } => *state = fixture.state.clone(),
++            _ => unreachable!(),
++        }
++        let read_only = matches!(&inner, sdk::RuntimeWork::Manage { request, .. } if !matches!(request.as_ref(), sdk::ManagementRequest::Install(_)));
++        fixture.revision += 1;
++        let revision = fixture.revision;
++        let lanes = fixture
++            .roots
++            .iter()
++            .map(|base| ExternalLaneWork {
++                base: *base,
++                next: if read_only {
++                    base.context()
++                } else {
++                    RootContext::new(
++                        base.context().scope(),
++                        sdk::Hash([0x81; 32]),
++                        sdk::Hash::digest(b"f002/revision", &[&revision.to_le_bytes()]),
++                    )
++                    .unwrap()
++                },
++            })
++            .collect();
++        let work =
++            StateExecutionWork::new(inner, lanes, fixture.runtime.external_state_limits()).unwrap();
++        let started = Instant::now();
++        let output = MultiLaneStateBlockHost {
++            store: &fixture.store,
++            budget: &mut ReadBudget::new(100_000, 1 << 30),
++        }
++        .execute_admitted_work(&fixture.runtime, &work, 10_000_000_000)
++        .unwrap();
++        let elapsed_us = started.elapsed().as_micros() as u64;
++        let stats = super::F002_LAST_RUN.with(|cell| cell.get());
++        let staged = Instant::now();
++        // Host-side candidate staging (block audit + write), timed apart.
++        for change in output.changes() {
++            let index = fixture
++                .roots
++                .iter()
++                .position(|root| root.context().scope().lane() == change.next().context().scope().lane())
++                .unwrap();
++            let base = fixture.roots[index];
++            let selected = work.lanes().iter().find(|lane| lane.base == base).unwrap();
++            let mut staging = crate::agent::state_block_store::StateBlockStaging::audit_base(
++                &mut fixture.store,
++                base,
++                base.context(),
++                base.commitment(),
++                &mut ReadBudget::new(1_000_000, 1 << 32),
++            )
++            .unwrap();
++            staging
++                .stage_next(change, selected.next, &mut ReadBudget::new(1_000_000, 1 << 32))
++                .unwrap();
++            fixture.roots[index] = change.next();
++        }
++        fixture.state = output.transition().state.clone();
++        let stage_us = staged.elapsed().as_micros() as u64;
++        (output, Exec { elapsed_us, stage_us, stats })
++    };
++    let row = |csv: &mut std::io::BufWriter<std::fs::File>, spike: &str, case: &str, variant: &str, size: u64, k: usize, metric: &str, value: u64, unit: &str| {
++        writeln!(csv, "{spike},{case},{variant},{size},{k},{metric},{value},{unit}").unwrap();
++    };
++    let rows = |csv: &mut std::io::BufWriter<std::fs::File>, spike: &str, case: &str, variant: &str, size: u64, k: usize, x: &Exec| {
++        row(csv, spike, case, variant, size, k, "elapsed_us", x.elapsed_us, "us");
++        row(csv, spike, case, variant, size, k, "preparation_us", x.stats.load_us, "us");
++        row(csv, spike, case, variant, size, k, "execution_us", x.stats.run_us, "us");
++        row(csv, spike, case, variant, size, k, "stage_us", x.stage_us, "us");
++        row(csv, spike, case, variant, size, k, "input_bytes", x.stats.input_bytes, "bytes");
++        row(csv, spike, case, variant, size, k, "gas_used", x.stats.gas_used, "gas");
++        row(csv, spike, case, variant, size, k, "block_fetches", x.stats.fetches, "count");
++    };
++    let new_agent = |name: &str| -> Agent {
++        let mut fixture = Fixture::create();
++        let schema = sdk::schema::decode(package.state_lane_schema_bytes()).unwrap();
++        let actor = sdk::ActorId::top_level(fixture.descriptor.identity.agent, name);
++        let entry = sdk::ActorEntry {
++            actor,
++            name: name.into(),
++            parent: None,
++            deployment: package.deployment(),
++            program: package.program(),
++            package: package.package_ref().clone(),
++            agent_schema: package.manifest().state_lane_schema.clone(),
++            method_policy: package.manifest().method_policy.clone(),
++            constructor_abi: schema.constructor_abi().unwrap(),
++            installation_data: None,
++            state_layout: schema.state_layout_hash().unwrap(),
++            lanes: package.requirements().lanes,
++            suspended: false,
++        };
++        let request = sdk::ManagementRequest::Install(Box::new(sdk::InstallActor {
++            installation_id: sdk::InstallationId([0x91; 32]),
++            registry_reservation: sdk::Hash([0x92; 32]),
++            entry,
++            producer: package.producer(),
++            package: package.package_ref().clone(),
++            agent_schema: package.manifest().state_lane_schema.clone(),
++            method_policy: package.manifest().method_policy.clone(),
++            constructor_abi: schema.constructor_abi().unwrap(),
++            installation_data: None,
++            state_layout: schema.state_layout_hash().unwrap(),
++            contract: package.manifest().contract,
++            requirements: package.requirements(),
++        }));
++        let authority = crate::agent::replay::tests::signed_opaque_clean_receipt(
++            &fixture.descriptor,
++            &request,
++            fixture.runtime.deployment(),
++            2,
++            &signing,
++        );
++        let install = sdk::RuntimeWork::Manage {
++            context: sdk::RuntimeExecutionContext::Direct,
++            space: fixture.descriptor.identity.space,
++            agent: fixture.descriptor.identity.agent,
++            runtime_deployment: fixture.runtime.deployment(),
++            state: sdk::RuntimeState::default(),
++            request: Box::new(request),
++            authority: Some(Box::new(authority.clone())),
++            observed_slot: 11,
++        };
++        let (installed, _) = exec(&mut fixture, install);
++        assert!(matches!(
++            installed.transition().outcome,
++            sdk::RuntimeOutcome::Management(Ok(sdk::ManagementReply::Installed(_)))
++        ), "install: {:?}", installed.transition().outcome);
++        let inspect = sdk::RuntimeWork::Manage {
++            context: sdk::RuntimeExecutionContext::Direct,
++            space: fixture.descriptor.identity.space,
++            agent: fixture.descriptor.identity.agent,
++            runtime_deployment: fixture.runtime.deployment(),
++            state: sdk::RuntimeState::default(),
++            request: Box::new(sdk::ManagementRequest::InspectActors { after: None, limit: 4 }),
++            authority: None,
++            observed_slot: 11,
++        };
++        let (directory, _) = exec(&mut fixture, inspect);
++        let sdk::RuntimeOutcome::Management(Ok(sdk::ManagementReply::Actors(page))) =
++            &directory.transition().outcome
++        else {
++            panic!("inspect: {:?}", directory.transition().outcome)
++        };
++        let record = page.entries[0].clone();
++        let mut availability: Vec<_> = [
++            package.program_bytes().to_vec(),
++            package.state_lane_schema_bytes().to_vec(),
++            package.method_policy_bytes().to_vec(),
++        ]
++        .into_iter()
++        .map(|bytes| sdk::RuntimeBlob { reference: sdk::BlobRef::of_bytes(&bytes), bytes })
++        .collect();
++        availability.sort_by(|a, b| a.reference.cmp(&b.reference));
++        Agent { fixture, record, availability, receipt: authority, slot: 20, next: 1 }
++    };
++    // One invocation: Invoke, then (optionally) Acknowledge, as vos-host does.
++    let invoke = |agent: &mut Agent, message: Vec<u8>, ack: bool| -> Result<(Vec<u8>, u64, Exec, Exec), String> {
++        agent.slot += 1;
++        let id = agent.next;
++        agent.next += 1;
++        let mut invocation_id = [0u8; 32];
++        invocation_id[..8].copy_from_slice(&id.to_be_bytes());
++        invocation_id[31] = 0x5a;
++        let invocation = sdk::InvocationWork {
++            space: agent.fixture.descriptor.identity.space,
++            agent: agent.fixture.descriptor.identity.agent,
++            runtime_deployment: agent.fixture.runtime.deployment(),
++            invocation: sdk::InvocationId(invocation_id),
++            actor: agent.record.entry.actor,
++            incarnation: agent.record.incarnation,
++            deployment: agent.record.entry.deployment,
++            program: agent.record.entry.program,
++            mode: sdk::MethodMode::Linear,
++            origin: sdk::InvocationOrigin::anonymous(),
++            roles: sdk::InvocationRoleClaims::none(),
++            message,
++            installation_data: None,
++            availability: agent.availability.clone(),
++            gas: crate::agent::execution::MAX_EXECUTION_GAS,
++            recovery_only: false,
++        };
++        let mut receipt = agent.receipt.clone();
++        receipt.selector.operation = sdk::authority::AuthorityOperationKind::InvokeActor;
++        receipt.selector.actor = Some(invocation.actor);
++        receipt.selector.actor_deployment = Some(invocation.deployment);
++        receipt.selector.request = invocation.commitment();
++        receipt.selector.decision_sequence = 0;
++        receipt.selector.valid_from = agent.slot;
++        receipt.selector.expires_at = agent.slot;
++        receipt.signature = signing.sign(&receipt.signing_bytes()).to_bytes();
++        let authorization = sdk::InvocationAuthorization::AuthorityReceipt(receipt);
++        let (output, a) = exec(
++            &mut agent.fixture,
++            sdk::RuntimeWork::Invoke {
++                context: sdk::RuntimeExecutionContext::Direct,
++                state: sdk::RuntimeState::default(),
++                invocation: Box::new(invocation.clone()),
++                authorization: Box::new(authorization.clone()),
++                observed_slot: agent.slot,
++            },
++        );
++        let (reply, gas) = match &output.transition().outcome {
++            sdk::RuntimeOutcome::Completed(Ok(reply)) if reply.status == sdk::InvocationStatus::Done => (
++                reply.reply.clone(),
++                crate::agent::execution::MAX_EXECUTION_GAS.saturating_sub(reply.gas_remaining),
++            ),
++            other => return Err(format!("{other:?}")),
++        };
++        if !ack {
++            return Ok((reply, gas, a, Exec::default()));
++        }
++        let (acked, b) = exec(
++            &mut agent.fixture,
++            sdk::RuntimeWork::Acknowledge {
++                context: sdk::RuntimeExecutionContext::Direct,
++                state: sdk::RuntimeState::default(),
++                invocation: Box::new(sdk::InvocationRetirement::from_work(&invocation)),
++                authorization: Box::new(authorization),
++            },
++        );
++        if !matches!(acked.transition().outcome, sdk::RuntimeOutcome::Acknowledged(Ok(_))) {
++            return Err(format!("ack: {:?}", acked.transition().outcome));
++        }
++        Ok((reply, gas, a, b))
++    };
++    let msg = |call: Msg| -> Vec<u8> {
++        let mut m = vec![TAG_DYNAMIC];
++        m.extend(call.encode());
++        m
++    };
++    let pct = |v: &[u64], p: usize| -> u64 {
++        let mut s = v.to_vec();
++        s.sort_unstable();
++        s[(p * s.len()).div_ceil(100).max(1) - 1]
++    };
++    let summary = |label: &str, v: &[u64]| {
++        println!("{label}: n={} p50={} p95={} p99={} max={}", v.len(), pct(v, 50), pct(v, 95), pct(v, 99), v.iter().max().unwrap());
++    };
++    // Snapshot and restore of the Agent between measuring windows (the
++    // 32-acknowledgement cap, `standard.rs:23-29`). Blocks stay in the store.
++    let snapshot = |agent: &Agent| (agent.fixture.state.clone(), agent.fixture.roots.clone());
++    let restore = |agent: &mut Agent, s: &(sdk::RuntimeState, Vec<StateRootDescriptor>)| {
++        agent.fixture.state = s.0.clone();
++        agent.fixture.roots = s.1.clone();
++    };
++    const WINDOW: usize = 30;
++
++    if mode == "s4" {
++        const ROW: u32 = 32 * 1024;
++        let fill_rows: u32 = std::env::var("FILL_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
++        for size in env("F002_SIZES").split(',').map(|s| s.parse::<u64>().unwrap()) {
++            let mut agent = new_agent("state-blob");
++            let rows_wanted = (size / u64::from(ROW)).max(1) as u32;
++            let fills_needed = rows_wanted.div_ceil(fill_rows) as usize;
++            let acked = fills_needed.saturating_sub(31);
++            let (mut filled, mut fills) = (0u32, 0usize);
++            while filled < rows_wanted {
++                let count = fill_rows.min(rows_wanted - filled);
++                let ack = fills < acked || fills_needed <= 31;
++                let m = msg(Msg::new("fill_many").with("first", filled).with("count", count).with("len", ROW));
++                match invoke(&mut agent, m, ack) {
++                    Ok(_) => {
++                        filled += count;
++                        fills += 1;
++                    }
++                    Err(err) => {
++                        println!("s4x size {size}: fill stopped at row {filled}: {err}");
++                        break;
++                    }
++                }
++            }
++            let mut acks_used = if fills_needed <= 31 { fills } else { acked };
++            // Control (F002_RETAIN=k): leave k more unacknowledged results in
++            // the runtime metadata before measuring, without adding rows.
++            let retain: usize = std::env::var("F002_RETAIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
++            let retained_before = fills - acks_used;
++            for _ in 0..retain.min(31usize.saturating_sub(retained_before)) {
++                let m = msg(Msg::new("touch").with("row", 0u32).with("at", 0u32));
++                invoke(&mut agent, m, false).expect("retain");
++            }
++            let retained = retained_before + retain.min(31usize.saturating_sub(retained_before));
++            println!("s4x size {size}: {retained} unacknowledged results retained");
++            row(&mut csv, "s4x", "state", "filled", size, 0, "retained_results", retained as u64, "count");
++            acks_used = acks_used.max(0);
++            let window = 32usize.saturating_sub(acks_used).max(1);
++            let control = agent.fixture.state.control.len() as u64;
++            let lanes = (agent.fixture.state.linear.len() + agent.fixture.state.merge.len() + agent.fixture.state.local.len()) as u64;
++            let row_bytes = u64::from(filled) * u64::from(ROW);
++            println!("s4x size {size}: {filled}/{rows_wanted} rows ({row_bytes} B of rows) in {fills} fills ({acks_used} acknowledged), window {window}; runtime state passed in the work: control {control} B, lanes {lanes} B");
++            row(&mut csv, "s4x", "state", "filled", size, 0, "row_bytes", row_bytes, "bytes");
++            row(&mut csv, "s4x", "state", "filled", size, 0, "work_state_control_bytes", control, "bytes");
++            row(&mut csv, "s4x", "state", "filled", size, 0, "work_state_lane_bytes", lanes, "bytes");
++            let snap = snapshot(&agent);
++            let (mut e2e, mut inv, mut ack, mut gas, mut ackgas, mut input) = (vec![], vec![], vec![], vec![], vec![], vec![]);
++            for i in 0..(n + 10) {
++                if i % window == 0 {
++                    restore(&mut agent, &snap);
++                }
++                let m = msg(Msg::new("touch").with("row", (i as u32) % filled.max(1)).with("at", ((i as u32) * 64) % ROW));
++                let t = Instant::now();
++                let (_, _, a, b) = invoke(&mut agent, m, true).expect("touch");
++                let total = t.elapsed().as_micros() as u64 - a.stage_us - b.stage_us;
++                if i >= 10 {
++                    let k = i - 10;
++                    row(&mut csv, "s4x", "touch", "caller", row_bytes, k, "e2e_us", total, "us");
++                    rows(&mut csv, "s4x", "touch", "invoke", row_bytes, k, &a);
++                    rows(&mut csv, "s4x", "touch", "acknowledge", row_bytes, k, &b);
++                    e2e.push(total);
++                    inv.push(a.elapsed_us);
++                    ack.push(b.elapsed_us);
++                    gas.push(a.stats.gas_used);
++                    ackgas.push(b.stats.gas_used);
++                    input.push(a.stats.input_bytes);
++                }
++            }
++            println!("== s4x rows {row_bytes} B ==");
++            summary("  caller us (invoke + ack, excl. staging)", &e2e);
++            summary("  invoke elapsed_us", &inv);
++            summary("  ack elapsed_us", &ack);
++            summary("  invoke gas", &gas);
++            summary("  ack gas", &ackgas);
++            summary("  invoke input bytes", &input);
++        }
++    } else {
++        let spike = mode.as_str();
++        let n_noop: usize = env("F002_N_NOOP").parse().unwrap();
++        let mut agent = new_agent("kernel-probe");
++        let snap = snapshot(&agent);
++        for path in env("F002_INPUTS").split(',') {
++            let bytes = std::fs::read(path).unwrap();
++            let case = std::path::Path::new(path).file_stem().unwrap().to_str().unwrap().to_string();
++            let m = if spike == "s2" {
++                msg(Msg::new("apply").with("case", bytes.clone()))
++            } else {
++                let text = std::fs::read_to_string(path.replace(".bin", ".roots")).unwrap();
++                let mut roots = Vec::new();
++                for line in text.lines().take(2) {
++                    for i in 0..32 {
++                        roots.push(u8::from_str_radix(&line[2 * i..2 * i + 2], 16).unwrap());
++                    }
++                }
++                msg(Msg::new("verify").with("witness", bytes.clone()).with("roots", roots))
++            };
++            let noop = msg(Msg::new("noop").with("payload", vec![0u8; bytes.len()]));
++            println!("{spike}x {case}: input {} B, message {} B", bytes.len(), m.len());
++            for (variant, message, count) in [("kernel", m, n), ("noop", noop, n_noop)] {
++                if count == 0 {
++                    continue;
++                }
++                let (mut e2e, mut exec_us, mut actor_gas, mut gas) = (vec![], vec![], vec![], vec![]);
++                for i in 0..(count + 5) {
++                    if i % WINDOW == 0 {
++                        restore(&mut agent, &snap);
++                    }
++                    let t = Instant::now();
++                    match invoke(&mut agent, message.clone(), true) {
++                        Ok((_, g, a, b)) => {
++                            let total = t.elapsed().as_micros() as u64 - a.stage_us - b.stage_us;
++                            if i >= 5 {
++                                let k = i - 5;
++                                row(&mut csv, &format!("{spike}x"), &case, variant, bytes.len() as u64, k, "e2e_us", total, "us");
++                                row(&mut csv, &format!("{spike}x"), &case, variant, bytes.len() as u64, k, "actor_gas", g, "gas");
++                                rows(&mut csv, &format!("{spike}x"), &case, &format!("{variant}/invoke"), bytes.len() as u64, k, &a);
++                                rows(&mut csv, &format!("{spike}x"), &case, &format!("{variant}/acknowledge"), bytes.len() as u64, k, &b);
++                                e2e.push(total);
++                                exec_us.push(a.elapsed_us);
++                                actor_gas.push(g);
++                                gas.push(a.stats.gas_used);
++                            }
++                        }
++                        Err(err) => {
++                            println!("  {variant} failed: {err}");
++                            break;
++                        }
++                    }
++                }
++                if !e2e.is_empty() {
++                    println!("== {spike}x {case} {variant} ==");
++                    summary("  caller us (invoke + ack, excl. staging)", &e2e);
++                    summary("  invoke elapsed_us", &exec_us);
++                    summary("  invoke runtime gas", &gas);
++                    summary("  actor gas", &actor_gas);
++                }
++            }
++        }
++    }
++    csv.flush().unwrap();
++}

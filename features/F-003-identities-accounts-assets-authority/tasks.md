@@ -1,0 +1,19 @@
+<!--
+Copyright (c) 2026 Pagos Cube LLC
+SPDX-License-Identifier: CC-BY-4.0
+-->
+
+# F-003 — tasks
+
+| ID | Task | Traces | Done when |
+|---|---|---|---|
+| T-003-01 | Identifier module: closed kind enum, typed newtypes, deterministic minting from the operation reference, validating `parse`, and the `did:` rendering. Add the compile-fail test that no external-name derivation accepts an `IdentityId` | `REQ-ID-1`, `REQ-ID-2`, `REQ-ID-5`, `INV-17` | Round-trip and malformed-id property tests pass. The compile-fail test passes |
+| T-003-02 | Asset registry: normalisation, kernel tag assignment, precision held only here, `Minor` and `NonZeroMinor`, `Minor::from_decimal` as the one boundary, and the registry digest | `REQ-AS-1`–`REQ-AS-4`, `INV-7`, `INV-24`, `AC-F1.2`, `AC-F3.1` | `ERR-UnknownAsset`, `ERR-AssetDeprecated`, `ERR-PrecisionExceeded` and `ERR-ZeroAmount` cases pass. The no-rounding property test passes |
+| T-003-03 | Identities and ledger accounts: kinds, status, `acts_for`, the mapping from account kind to kernel flag, the Treasury limit check, lazy kernel sub-accounts, `open_identity`, `open_account` and `close_account` | `REQ-LA-1`–`REQ-LA-5`, `REQ-AG-1`, `INV-9`, `AC-A1.1`, `AC-A1.4`, `AC-A2.1`, `AC-G2.1` | Those cases pass, as do `ERR-AccountNotEmpty`, `ERR-AccountClosed` and `ERR-IdentityRestricted` |
+| T-003-04 | Principal resolution: the `Caller` type, the credential-set model with account scope, and secret-free types with no `Debug`, `Display` or `Serialize` | `REQ-PN-1`, `REQ-AU-8`, `REQ-AU-20` (model only) | `ERR-CredentialInvalid` passes. A scoped credential cannot act on an account outside its scope |
+| T-003-05 | Grants: `Grant`, a `Bounds` with no empty value, child grants, effective scope as the meet of the chain, expiry, and revocation read on every use | `REQ-AU-2`–`REQ-AU-4`, `REQ-AU-10`, `INV-22`, `AC-G1.1`, `AC-G2.2`, `AC-G3.1` | `ERR-UnboundedGrant` and `ERR-AuthorityRevoked` pass. The no-widening and revocation property tests pass |
+| T-003-06 | The evaluator: fixed order, fail closed, operator bound by kind and delegated custody, bounds checked and window counters charged in the apply unit, and `AuthorityUsed` returned for the operation record | `REQ-AU-1`, `REQ-AU-5`–`REQ-AU-7`, `REQ-AG-2`, `REQ-LA-6`, `AC-A4.1`, `AC-A4.2`, `AC-G1.2`, `AC-G1.3` | `ERR-NotAuthorised`, `ERR-BoundExceeded` and `ERR-UnknownAccount` pass. An operator grant on an owned account is refused |
+| T-003-07 | `issue` and `redeem` against the issuance counterparty, under issuance grants | `REQ-AS-6`, `REQ-AU-10`, `INV-5`, `AC-F4.1`–`AC-F4.3` | Those cases pass. The trial balance stays zero across random issue and redeem schedules |
+| T-003-08 | `reach(caller, subject)` for reads, with its service-layer cases | `INV-16`, `INV-20`, `REQ-PV-2` | The `INV-16` service case passes. A grant never reaches the grantor's other accounts |
+| T-003-09 | Register this feature's `F-015` cases (its acceptance criteria, 13 errors and invariants), and run the `AC-A1.3`, `AC-A2.2` and `AC-G3.2` cases once `F-007`, `F-008` and `F-004` land | `NFR-14` | The `m1` profile shows all of this feature's cases green |
+| T-003-10 | A binding fault is `ERR-Internal`, counted as an incident, never a condition about the caller; `OperationKind::Reversal` is never grantable (amendment 0006 items 1, 8) | `REQ-ER-2`, `ERR-Internal`, `REQ-OS-1`, `REQ-AU-5` | The kernel status mapper and every fault path answer `ERR-Internal`; a grant naming `Reversal` is `ERR-NotAuthorised` |

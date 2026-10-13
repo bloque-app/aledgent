@@ -1,0 +1,86 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+[package]
+name = "ingress"
+version = "0.1.0"
+description = "aledgent-ingress (F-009): the one process every command and query reaches aledgent through. The durable received-log, client-key dedup, the forwarder, the synchronous reservation path, the ticker and notification delivery."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "aledgent-ingress"
+path = "src/main.rs"
+required-features = ["postgres", "http"]
+
+[features]
+default = ["postgres", "http"]
+# The PostgreSQL received-log (accepted proposal of F-009): several replicas share one log and
+# one uniqueness constraint.
+postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:tokio-postgres-rustls", "dep:rustls", "dep:webpki-roots"]
+# Notification delivery over HTTPS to configured endpoints.
+http = ["dep:reqwest"]
+# v1 roots (CipherClerk's full-depth tree): a supported opt-in beside the default v2 (DEC-25,
+# owner ruling cs-q04). A deployment chooses its roots at genesis and builds every binary of it,
+# the core host and the core's guest included, with the same choice (deploy/docker: ROOTS=v1).
+smt-v1 = ["ledger-kernel/smt-v1", "ledger-core/smt-v1"]
+
+[dependencies]
+# The shared library: identifiers, amounts, the closed refusal list and its serialised shape,
+# the key derivations, and the in-process core's decisions. Never with `conformance-ports`
+# (REQ-CS-5; tools/ci/check-conformance-ports.sh).
+ledger-core = { path = "../../crates/ledger-core", features = ["serde"] }
+# `std` for FileStore: the in-process core's leaves on disk (`T-031-14`).
+ledger-kernel = { path = "../../crates/ledger-kernel", default-features = false, features = ["std"] }
+# Credential schemes at the boundary: passkeys, API keys, sessions (F-028, DEC-19).
+authn = { path = "../../crates/authn" }
+# The audit store's writer: the core ships its audit trail there (T-013-13, REQ-AT-2).
+audit-store = { path = "../../crates/audit-store" }
+# The key boundary (F-035): the signer service's client and endpoint, for the core's keys.
+signer = { path = "../signer", default-features = false }
+base64 = "0.22"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
+chacha20poly1305 = "0.10"
+getrandom = "0.3"
+hex = "0.4"
+hmac = "0.12"
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+serde_urlencoded = "0.7"
+sha2 = "0.10"
+# F-035: the core link's token, compared in constant time and wiped after use.
+subtle = "2"
+zeroize = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal", "fs", "io-util"] }
+tower = { version = "0.5", features = ["util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "std"] }
+tokio-postgres = { version = "0.7", optional = true }
+deadpool-postgres = { version = "0.14", optional = true }
+# TLS to PostgreSQL, as the connection string's `sslmode` asks (store/pg.rs, `tls`): rustls on ring,
+# the provider the rest of the workspace already builds, so no C toolchain beyond ring's.
+tokio-postgres-rustls = { version = "0.14", default-features = false, features = ["ring"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
+webpki-roots = { version = "1", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+
+[dev-dependencies]
+http-body-util = "0.1"
+# F-028's tests through ingress: a software passkey.
+authn = { path = "../../crates/authn", features = ["testing"] }
+# F-012's test through ingress: holders sign reclaim proofs; the recovery authority approves.
+cipher-clerk = { workspace = true, features = ["signing"] }
+recovery = { path = "../recovery" }
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
+# T-013-13: the audit store on disk, in a directory of its own.
+tempfile = "3"
+
+[[test]]
+name = "postgres"
+required-features = ["postgres"]
+
+[lints]
+workspace = true

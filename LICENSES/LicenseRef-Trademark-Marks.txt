@@ -1,0 +1,8 @@
+The aledgent name and marks (the files this licence identifier covers: docs/brand/ and the docs
+site's copies of the marks) are
+trademarks of Pagos Cube LLC. All rights reserved.
+
+They are not licensed under the licences that cover the code, the documents or the data of this
+repository. You may use them unmodified to refer to the aledgent project, as nominative use allows,
+and as docs/brand/README.md describes. Any other use, including in the name or branding of another
+product or service, needs the written permission of Pagos Cube LLC.

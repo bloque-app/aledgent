@@ -1,0 +1,8 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# One toolchain for everything under agents/: the canonical guest toolchain of the pinned VOS
+# (`vosx/src/commands/build.rs`, CANONICAL_GUEST_TOOLCHAIN), which the guest must use and which
+# also builds VOS's host crates. VOS's own workspace pins nightly-2025-05-09, but the host links
+# F-006's leaf store, whose redb 4 needs rustc 1.90 (features/F-005-core-agent-binding/NOTES.md).
+[toolchain]
+channel = "nightly-2026-03-20"

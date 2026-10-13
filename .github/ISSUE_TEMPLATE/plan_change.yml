@@ -1,0 +1,24 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+name: Plan or feature change
+description: Change how something is built (PLAN.md, a DEC-*, a feature's plan or tasks).
+labels: ["plan"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What to change, and where
+      description: The DEC-*, F-*, T-* or file it touches.
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why
+      description: Evidence and the requirement it serves. A plan change must not contradict SPEC.md; if it would, propose an amendment instead.
+    validations:
+      required: true
+  - type: textarea
+    id: tradeoff
+    attributes:
+      label: Trade-off, stated plainly

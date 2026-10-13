@@ -1,0 +1,73 @@
+# VOS 0003: the runtime's arena at the state ceiling (MEASUREMENTS-F002 §13.4).
+# state-blob padded with `vos-host pad-package`, `vos-host s4 <pkg> 65536,4063232 5`.
+# "declared" = 2bb7876 + agent/actor-declared-limits with the constant under test raised;
+# "both" = + agent/prepared-actor-cache as well. The first three runs are from the first
+# probe script (its log was overwritten by the rerun and is restored here from its output).
+== declared-2560 runtime=declared program=2621440
+pad-package: program 66469 B -> 2621440 B, package 2623095 B
+== s4 state 70557 B ==
+  caller e2e us (invoke + ack, in-process): n=20 p50=3582989 p95=4009560 p99=4134326 max=4134326
+  invoke gas_used: n=20 p50=1902907271 p95=1903823749 p99=1903988741 max=1903988741
+assertion `left == right` failed: runtime exit at pc 0 after 2082431588 gas, input 6476336 B, Agent state 3853263 B
+  left: Panic
+== both-2560 runtime=both program=2621440
+pad-package: program 66469 B -> 2621440 B, package 2623095 B
+== s4 state 70557 B ==
+  caller e2e us (invoke + ack, in-process): n=5 p50=2960803 p95=3020951 p99=3020951 max=3020951
+  invoke gas_used: n=5 p50=1254974194 p95=1255231701 p99=1255231701 max=1255231701
+s4 size 4063232: 62 fill invocations (31 acknowledged); reset window 1
+s4 size 4063232: 31 unacknowledged results retained
+s4 size 4063232: 124/124 rows, Agent state 4121295 B
+== s4 state 4121295 B ==
+  caller e2e us (invoke + ack, in-process): n=5 p50=6469660 p95=6500278 p99=6500278 max=6500278
+  invoke gas_used: n=5 p50=2438747707 p95=2438844012 p99=2438844012 max=2438844012
+== declared-2048 runtime=declared program=2097152
+pad-package: program 66469 B -> 2097152 B, package 2098807 B
+== s4 state 70557 B ==
+  caller e2e us (invoke + ack, in-process): n=5 p50=2684833 p95=2726677 p99=2726677 max=2726677
+  invoke gas_used: n=5 p50=1532286693 p95=1532534913 p99=1532534913 max=1532534913
+assertion `left == right` failed: runtime exit at pc 0 after 1776739650 gas, input 6153072 B, Agent state 4054287 B
+  left: Panic
+== declared-1792 runtime=declared program=1835008 11:15:27
+pad-package: program 66469 B -> 1835009 B, package 1836664 B
+s4 size 65536: 1 fill invocations (1 acknowledged); reset window 31
+s4 size 65536: 0 unacknowledged results retained
+s4 size 65536: 2/2 rows, Agent state 70557 B
+== s4 state 70557 B ==
+  caller e2e us (invoke + ack, in-process): n=5 p50=2296162 p95=2333032 p99=2333032 max=2333032
+  invoke gas_used: n=5 p50=1347229178 p95=1347496590 p99=1347496590 max=1347496590
+s4 size 4063232: 62 fill invocations (31 acknowledged); reset window 1
+s4 size 4063232: 31 unacknowledged results retained
+s4 size 4063232: 124/124 rows, Agent state 4121295 B
+== s4 state 4121295 B ==
+  caller e2e us (invoke + ack, in-process): n=5 p50=5811185 p95=5866765 p99=5866765 max=5866765
+  invoke gas_used: n=5 p50=2531031991 p95=2531100728 p99=2531100728 max=2531100728
+== declared-1920 runtime=declared program=1966080 11:21:10
+pad-package: program 66469 B -> 1966080 B, package 1967735 B
+s4 size 65536: 1 fill invocations (1 acknowledged); reset window 31
+s4 size 65536: 0 unacknowledged results retained
+s4 size 65536: 2/2 rows, Agent state 70557 B
+== s4 state 70557 B ==
+  caller e2e us (invoke + ack, in-process): n=5 p50=2489735 p95=2974773 p99=2974773 max=2974773
+  invoke gas_used: n=5 p50=1439807354 p95=1440074690 p99=1440074690 max=1440074690
+s4 size 4063232: 62 fill invocations (31 acknowledged); reset window 1
+s4 size 4063232: 31 unacknowledged results retained
+s4 size 4063232: 124/124 rows, Agent state 4121295 B
+== s4 state 4121295 B ==
+  caller e2e us (invoke + ack, in-process): n=5 p50=6512812 p95=7590686 p99=7590686 max=7590686
+  invoke gas_used: n=5 p50=2623122859 p95=2623297250 p99=2623297250 max=2623297250
+== declared-1536 runtime=declared program=1572864 11:28:28
+pad-package: program 66469 B -> 1572864 B, package 1574519 B
+s4 size 65536: 1 fill invocations (1 acknowledged); reset window 31
+s4 size 65536: 0 unacknowledged results retained
+s4 size 65536: 2/2 rows, Agent state 70557 B
+== s4 state 70557 B ==
+  caller e2e us (invoke + ack, in-process): n=5 p50=2100378 p95=2262389 p99=2262389 max=2262389
+  invoke gas_used: n=5 p50=1162404717 p95=1162598283 p99=1162598283 max=1162598283
+s4 size 4063232: 62 fill invocations (31 acknowledged); reset window 1
+s4 size 4063232: 31 unacknowledged results retained
+s4 size 4063232: 124/124 rows, Agent state 4121295 B
+== s4 state 4121295 B ==
+  caller e2e us (invoke + ack, in-process): n=5 p50=5661930 p95=5749851 p99=5749851 max=5749851
+  invoke gas_used: n=5 p50=2345924139 p95=2345972096 p99=2345972096 max=2345972096
+ALL DONE 11:33:54

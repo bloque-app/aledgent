@@ -1,0 +1,18 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# `opsctl exporter --config <this file>` (F-018, T-018-04). An example: every path and host is the
+# deployment's to choose. The operations principal's token is read from `token_file` (or from the
+# environment variable `token_env` names, exactly one of the two), never from an argument; it needs
+# the `read_signals` operator kind and nothing else.
+listen = "0.0.0.0:9464"
+ingress = "http://aledgent-ingress:8080"
+token_file = "/run/secrets/aledgent-ops-token"
+# Written by `aledgent-settle` after every step (its `signals_file`).
+adapter_signals = "/var/lib/aledgent/settle-signals.json"
+review_owner = "settlement-operations"
+timeout_ms = 5000
+
+[records]
+reconciliation = "/var/lib/aledgent/reconciliation"
+backups = "/var/backups/aledgent"
+drills = "/var/lib/aledgent/drills"

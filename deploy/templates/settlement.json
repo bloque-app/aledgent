@@ -1,0 +1,8 @@
+{
+  "adapter": "<FILL the adapter's identity (runbook step 5)>",
+  "instance": 1,
+  "inbound_deadline": 600000,
+  "expiry_window": 150,
+  "block_time": 2000,
+  "finality_margin": 120000
+}

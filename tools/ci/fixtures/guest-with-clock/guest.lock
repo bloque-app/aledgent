@@ -1,0 +1,16 @@
+# Fixture for tools/ci/check-guest-deps.sh: a guest lock file whose graph reaches OS randomness
+# (named guest.lock: fixture Cargo.lock files are gitignored). The check
+# must reject it with exit 1.
+version = 4
+
+[[package]]
+name = "aledgent-core"
+version = "0.1.0"
+dependencies = [
+ "getrandom",
+]
+
+[[package]]
+name = "getrandom"
+version = "0.2.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,1572 @@
+From 0e2891432028f7f4daf6f25a5ecaff008cba75a9 Mon Sep 17 00:00:00 2001
+From: Pablo Dorado <pablo@bloque.team>
+Date: Wed, 23 Sep 2026 13:52:18 -0500
+Subject: [PATCH 1/2] feat(signing): take randomness as a parameter, move OsRng
+ to `os-rng`
+
+`signing = ["dep:rand_core", "rand_core/getrandom"]` pulled getrandom
+0.2 into every consumer that signs, and getrandom refuses to compile
+for targets it does not know. A VOS guest (`riscv64em-vos`) that signs
+kernel transfers could not build the crate at all.
+
+`signing` now enables `rand_core` alone. Every function that needs
+randomness has a variant that takes the caller's
+`R: RngCore + CryptoRng` and is always available with `signing`. The
+`OsRng` convenience wrappers keep their names and behaviour behind a
+new opt-in feature, `os-rng = ["signing", "rand_core/getrandom"]`;
+`helpers` implies it, so its users see no change.
+
+New `*_with_rng` variants: id `random_with_rng`,
+`Account::{open,asset,liability}_with_rng`,
+`Transfer::builder_with_rng`, `TransferBuilder::new_with_rng`,
+`TransferBuilder::{signed_by_with, signed_with_rng,
+try_signed_with_rng}`, `proof::signature::sign_with_rng`,
+`{SettlementClaim,Voucher,ShieldedVoucher}::sign_with_rng`,
+`disclosure::prove_*_with_rng`, `SpendKey::generate_with_rng`,
+`EncryptedEnvelope::seal_with_rng`,
+`EncryptedNoteEnvelope::{seal_note,seal_note_to_address}_with_rng`.
+Existing `Keypair::generate_with`, `CreateAccount::signed_with` and
+`Transfer::signed_by_with` already took an RNG and are unchanged.
+
+`TransferBuilder` draws its randomness once, at construction: the
+transfer id and a 32-byte seed. Entry ids derive from the seed and the
+entry's index, so `debit` / `credit` need no RNG.
+
+Tests that use the `OsRng` wrappers are gated on `os-rng`; the new
+`tests/rng_parameter.rs` runs on `signing` alone and drives the kernel
+end to end with a seeded RNG.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CHANGELOG.md                          |  36 ++++++
+ Cargo.toml                            |  18 ++-
+ docs/architecture/zkvm-integration.md |  13 ++-
+ src/crypto/sig.rs                     |   4 +
+ src/disclosure/mod.rs                 |  91 +++++++++++++--
+ src/fmd/voucher.rs                    |   2 +-
+ src/ids.rs                            |  17 ++-
+ src/kernel/create_account.rs          |   3 +-
+ src/notes/mod.rs                      |   2 +-
+ src/notes/proof.rs                    |   2 +-
+ src/proof.rs                          |  17 ++-
+ src/settlement/mod.rs                 |  32 +++++-
+ src/settlement/proof.rs               |   2 +-
+ src/state_root.rs                     |   2 +-
+ src/stealth.rs                        |   2 +-
+ src/types/account.rs                  |  69 ++++++++++--
+ src/types/transfer.rs                 | 112 +++++++++++++++++--
+ src/viewing_keys.rs                   | 106 +++++++++++++++---
+ src/voucher/mod.rs                    |  61 +++++++++-
+ src/voucher/proof.rs                  |   2 +-
+ tests/audit_edge_cases.rs             |   2 +-
+ tests/audit_replay.rs                 |   2 +-
+ tests/kernel_chains.rs                |   2 +-
+ tests/kernel_cross_feature.rs         |   2 +-
+ tests/kernel_flags.rs                 |   2 +-
+ tests/kernel_genesis.rs               |   2 +-
+ tests/kernel_happy_path.rs            |   2 +-
+ tests/kernel_multi_entry.rs           |   2 +-
+ tests/kernel_voiding.rs               |   2 +-
+ tests/proof_signature_flow.rs         |   2 +-
+ tests/proptest_chains.rs              |   2 +-
+ tests/proptest_determinism.rs         |   2 +-
+ tests/proptest_shadow.rs              |   2 +-
+ tests/rng_parameter.rs                | 154 ++++++++++++++++++++++++++
+ 34 files changed, 681 insertions(+), 92 deletions(-)
+ create mode 100644 tests/rng_parameter.rs
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 3eb835a..119dd2b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,42 @@ versions follow [SemVer](https://semver.org/) once we hit 1.0.
+ 
+ ## Unreleased — v0.1.x track
+ 
++### Changed — randomness is a parameter; `OsRng` moves to `os-rng`
++
++`signing` no longer enables `rand_core/getrandom`, so it builds for
++targets `getrandom` does not support (the VOS guest,
++`riscv64em-vos`; PVM / zkVM guests in general). Every function that
++needs randomness now has a variant that takes the caller's
++`R: RngCore + CryptoRng`, always available with `signing`. The
++`OsRng` convenience wrappers keep their names and behaviour behind a
++new opt-in feature, `os-rng = ["signing", "rand_core/getrandom"]`;
++`helpers` implies it.
++
++| `os-rng` (unchanged name) | Always available with `signing` |
++|---|---|
++| `Keypair::generate` | `Keypair::generate_with` (existing) |
++| `AccountId::random` and every id newtype's `random` | `random_with_rng` |
++| `Account::open` / `asset` / `liability` | `open_with_rng` / `asset_with_rng` / `liability_with_rng` |
++| `CreateAccount::signed` | `CreateAccount::signed_with` (existing) |
++| `Transfer::signed_by` | `Transfer::signed_by_with` (existing) |
++| `Transfer::builder`, `TransferBuilder::new` | `Transfer::builder_with_rng`, `TransferBuilder::new_with_rng` |
++| `TransferBuilder::signed_by` / `signed_with` / `try_signed_with` | `signed_by_with` / `signed_with_rng` / `try_signed_with_rng` |
++| `proof::signature::sign` | `proof::signature::sign_with_rng` |
++| `SettlementClaim::sign`, `Voucher::sign`, `ShieldedVoucher::sign` | `sign_with_rng` |
++| `disclosure::prove_*` | `disclosure::prove_*_with_rng` |
++| `SpendKey::generate` | `SpendKey::generate_with_rng` |
++| `EncryptedEnvelope::seal`, `EncryptedNoteEnvelope::seal_note` / `seal_note_to_address` | `seal_with_rng`, `seal_note_with_rng` / `seal_note_to_address_with_rng` |
++
++`TransferBuilder` now draws its randomness once, at construction: the
++transfer id and a 32-byte seed from which each entry id is derived
++(`blake2b_256("cipher-clerk/transfer-builder/entry-id/v1", seed ||
++index)`, first 16 bytes). Entry ids are still unpredictable and
++unique; `debit` / `credit` no longer need an RNG.
++
++Migration: a consumer that enables `signing` and calls one of the
++`OsRng` wrappers adds `os-rng` to its features. Consumers of
++`helpers` need no change.
++
+ ### Changed — `fmd::MAX_PRECISION` 14 → 24
+ 
+ Bumps γ_max to match Penumbra's `decaf377-fmd2::MAX_PRECISION = 24`.
+diff --git a/Cargo.toml b/Cargo.toml
+index ff8c752..f52388b 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -16,11 +16,21 @@ members = ["cli"]
+ 
+ [features]
+ default = []
+-# Off-VM helpers: signing, commitment generation, hash-to-curve. Pulls in rand.
+-signing = ["dep:rand_core", "rand_core/getrandom"]
++# Signing, key generation, commitment blindings and envelope sealing.
++# Every function that needs randomness takes the caller's
++# `R: RngCore + CryptoRng`; nothing here reaches for the operating
++# system, so `signing` builds for targets `getrandom` does not support
++# (PVM / zkVM guests). Pulls in `rand_core` without `getrandom`.
++signing = ["dep:rand_core"]
++# Convenience wrappers that draw from the operating system (`OsRng`):
++# `Keypair::generate`, `AccountId::random`, `Transfer::signed_by`,
++# `CreateAccount::signed`, `EncryptedEnvelope::seal`, ... Each one is a
++# thin shim over an always-available `*_with_rng` / `*_with` variant.
++# Off-VM only. Implies signing.
++os-rng = ["signing", "rand_core/getrandom"]
+ # Off-VM convenience: in-memory LedgerState + Oracle, ergonomic commit
+-# helpers, ID random generators. Implies signing.
+-helpers = ["signing"]
++# helpers, ID random generators. Implies signing and os-rng.
++helpers = ["signing", "os-rng"]
+ # Test-only shadow oracle: lets property tests track plaintext alongside commitments.
+ shadow = []
+ 
+diff --git a/docs/architecture/zkvm-integration.md b/docs/architecture/zkvm-integration.md
+index 523bf5d..aaf9e72 100644
+--- a/docs/architecture/zkvm-integration.md
++++ b/docs/architecture/zkvm-integration.md
+@@ -299,9 +299,12 @@ order:
+ ## Constraints the actor must respect
+ 
+ - **`cipher-clerk` with `default-features = false`** in the actor
+-  Cargo.toml. The `signing` feature pulls in `getrandom` (std-only);
+-  the `helpers` feature pulls in `MemLedger`/`MemOracle` (irrelevant
+-  inside the PVM).
++  Cargo.toml. `signing` is fine inside the actor: it takes every
++  random input from a caller-supplied `R: RngCore + CryptoRng` and
++  does not depend on `getrandom`. The `os-rng` feature (the `OsRng`
++  convenience wrappers) pulls in `getrandom` (std-only) and must stay
++  off; the `helpers` feature implies it and pulls in
++  `MemLedger`/`MemOracle` (irrelevant inside the PVM).
+ - **Determinism**: the actor's `LedgerState` impl must be
+   deterministic across re-execution (same reads → same returned
+   bytes). Storage backed by VOS persistent KV satisfies this.
+@@ -312,7 +315,9 @@ order:
+   message payload. Anything that strips or reorders bytes between
+   off-chain signing and on-chain verification will break the
+   signature check.
+-- **No `OsRng` inside the actor**. Blindings either come from the
++- **No `OsRng` inside the actor**. Signing nonces, ids and envelope
++  ephemerals take an RNG the actor supplies (`*_with_rng` /
++  `*_with` variants). Blindings either come from the
+   pre-supplied oracle data or aren't needed in the kernel path
+   (`Oracle::next_blinding` is currently called by the kernel only in
+   paths the actor doesn't exercise).
+diff --git a/src/crypto/sig.rs b/src/crypto/sig.rs
+index 47f151d..8f63ed3 100644
+--- a/src/crypto/sig.rs
++++ b/src/crypto/sig.rs
+@@ -246,10 +246,14 @@ pub struct Keypair {
+ #[cfg(feature = "signing")]
+ impl Keypair {
+     /// Generate using `OsRng`. Equivalent to `Keypair::generate_with(&mut OsRng)`.
++    /// Requires the `os-rng` feature.
++    #[cfg(feature = "os-rng")]
+     pub fn generate() -> Self {
+         Self::generate_with(&mut rand_core::OsRng)
+     }
+ 
++    /// Generate from a caller-supplied CSPRNG. Always available with
++    /// `signing`.
+     pub fn generate_with<R: rand_core::RngCore + rand_core::CryptoRng>(rng: &mut R) -> Self {
+         let secret = SecretKey::generate(rng);
+         let public = secret.public_key();
+diff --git a/src/disclosure/mod.rs b/src/disclosure/mod.rs
+index c68d450..678a5a5 100644
+--- a/src/disclosure/mod.rs
++++ b/src/disclosure/mod.rs
+@@ -51,13 +51,33 @@ pub struct DisclosureProof {
+ /// secret key that the claim holds at `state_root`. Plug in an
+ /// external runtime by replacing the signature with a proof bound
+ /// to [`proof::balance_at_least::public_bytes`].
+-#[cfg(feature = "signing")]
++#[cfg(feature = "os-rng")]
+ pub fn prove_balance_at_least(
+     account: AccountId,
+     layer: Layer,
+     threshold: u64,
+     state_root: [u8; 32],
+     clerk_secret: &crate::crypto::SecretKey,
++) -> DisclosureProof {
++    prove_balance_at_least_with_rng(
++        account,
++        layer,
++        threshold,
++        state_root,
++        clerk_secret,
++        &mut rand_core::OsRng,
++    )
++}
++
++/// [`prove_balance_at_least`] with a caller-supplied CSPRNG for the signature nonce.
++#[cfg(feature = "signing")]
++pub fn prove_balance_at_least_with_rng<R: rand_core::RngCore + rand_core::CryptoRng>(
++    account: AccountId,
++    layer: Layer,
++    threshold: u64,
++    state_root: [u8; 32],
++    clerk_secret: &crate::crypto::SecretKey,
++    rng: &mut R,
+ ) -> DisclosureProof {
+     let header = proof::balance_at_least::public_bytes(&proof::balance_at_least::Public {
+         account,
+@@ -65,7 +85,7 @@ pub fn prove_balance_at_least(
+         threshold,
+         state_root,
+     });
+-    let sig = clerk_secret.sign(&header, &mut rand_core::OsRng);
++    let sig = clerk_secret.sign(&header, rng);
+     let mut bytes = header;
+     bytes.extend_from_slice(&sig.r);
+     bytes.extend_from_slice(&sig.s);
+@@ -108,17 +128,28 @@ fn parse_signature(wire: &[u8], expected_header: &[u8]) -> Option<Signature> {
+ }
+ 
+ /// Prove a transfer with a given id exists at a given state root.
+-#[cfg(feature = "signing")]
++#[cfg(feature = "os-rng")]
+ pub fn prove_transfer_existed(
+     transfer_id: TransferId,
+     state_root: [u8; 32],
+     clerk_secret: &crate::crypto::SecretKey,
++) -> DisclosureProof {
++    prove_transfer_existed_with_rng(transfer_id, state_root, clerk_secret, &mut rand_core::OsRng)
++}
++
++/// [`prove_transfer_existed`] with a caller-supplied CSPRNG for the signature nonce.
++#[cfg(feature = "signing")]
++pub fn prove_transfer_existed_with_rng<R: rand_core::RngCore + rand_core::CryptoRng>(
++    transfer_id: TransferId,
++    state_root: [u8; 32],
++    clerk_secret: &crate::crypto::SecretKey,
++    rng: &mut R,
+ ) -> DisclosureProof {
+     let header = proof::transfer_existed::public_bytes(&proof::transfer_existed::Public {
+         transfer_id,
+         state_root,
+     });
+-    let sig = clerk_secret.sign(&header, &mut rand_core::OsRng);
++    let sig = clerk_secret.sign(&header, rng);
+     let mut bytes = header;
+     bytes.extend_from_slice(&sig.r);
+     bytes.extend_from_slice(&sig.s);
+@@ -147,13 +178,33 @@ pub fn verify_transfer_existed(
+ /// Public bytes include the on-chain `amount_commit` Pedersen point
+ /// so the verifier can check the `Pedersen(value, blinding) ==
+ /// amount_commit` binding without chain-state lookups.
+-#[cfg(feature = "signing")]
++#[cfg(feature = "os-rng")]
+ pub fn prove_transfer_amount_equals(
+     transfer_id: TransferId,
+     value: u64,
+     amount_commit: Amount,
+     state_root: [u8; 32],
+     clerk_secret: &crate::crypto::SecretKey,
++) -> DisclosureProof {
++    prove_transfer_amount_equals_with_rng(
++        transfer_id,
++        value,
++        amount_commit,
++        state_root,
++        clerk_secret,
++        &mut rand_core::OsRng,
++    )
++}
++
++/// [`prove_transfer_amount_equals`] with a caller-supplied CSPRNG for the signature nonce.
++#[cfg(feature = "signing")]
++pub fn prove_transfer_amount_equals_with_rng<R: rand_core::RngCore + rand_core::CryptoRng>(
++    transfer_id: TransferId,
++    value: u64,
++    amount_commit: Amount,
++    state_root: [u8; 32],
++    clerk_secret: &crate::crypto::SecretKey,
++    rng: &mut R,
+ ) -> DisclosureProof {
+     let header =
+         proof::transfer_amount_equals::public_bytes(&proof::transfer_amount_equals::Public {
+@@ -162,7 +213,7 @@ pub fn prove_transfer_amount_equals(
+             amount_commit,
+             state_root,
+         });
+-    let sig = clerk_secret.sign(&header, &mut rand_core::OsRng);
++    let sig = clerk_secret.sign(&header, rng);
+     let mut bytes = header;
+     bytes.extend_from_slice(&sig.r);
+     bytes.extend_from_slice(&sig.s);
+@@ -190,7 +241,7 @@ pub fn verify_transfer_amount_equals(
+ }
+ 
+ /// Prove an aggregate claim over transfers in a time window.
+-#[cfg(feature = "signing")]
++#[cfg(feature = "os-rng")]
+ pub fn prove_aggregate_in_window(
+     filter: AggregateFilter,
+     t_lo: u64,
+@@ -198,6 +249,28 @@ pub fn prove_aggregate_in_window(
+     claim: AggregateClaim,
+     state_root: [u8; 32],
+     clerk_secret: &crate::crypto::SecretKey,
++) -> DisclosureProof {
++    prove_aggregate_in_window_with_rng(
++        filter,
++        t_lo,
++        t_hi,
++        claim,
++        state_root,
++        clerk_secret,
++        &mut rand_core::OsRng,
++    )
++}
++
++/// [`prove_aggregate_in_window`] with a caller-supplied CSPRNG for the signature nonce.
++#[cfg(feature = "signing")]
++pub fn prove_aggregate_in_window_with_rng<R: rand_core::RngCore + rand_core::CryptoRng>(
++    filter: AggregateFilter,
++    t_lo: u64,
++    t_hi: u64,
++    claim: AggregateClaim,
++    state_root: [u8; 32],
++    clerk_secret: &crate::crypto::SecretKey,
++    rng: &mut R,
+ ) -> DisclosureProof {
+     let header = proof::aggregate_in_window::public_bytes(&proof::aggregate_in_window::Public {
+         filter,
+@@ -206,7 +279,7 @@ pub fn prove_aggregate_in_window(
+         claim,
+         state_root,
+     });
+-    let sig = clerk_secret.sign(&header, &mut rand_core::OsRng);
++    let sig = clerk_secret.sign(&header, rng);
+     let mut bytes = header;
+     bytes.extend_from_slice(&sig.r);
+     bytes.extend_from_slice(&sig.s);
+@@ -402,7 +475,7 @@ pub(crate) fn serialize_claim(out: &mut Vec<u8>, c: &AggregateClaim) {
+     }
+ }
+ 
+-#[cfg(all(test, feature = "signing"))]
++#[cfg(all(test, feature = "os-rng"))]
+ mod tests {
+     use super::*;
+     use crate::crypto::{Blinding, Keypair};
+diff --git a/src/fmd/voucher.rs b/src/fmd/voucher.rs
+index ef5a07f..edcdc8d 100644
+--- a/src/fmd/voucher.rs
++++ b/src/fmd/voucher.rs
+@@ -193,7 +193,7 @@ impl FlaggedShieldedVoucher {
+ }
+ 
+ #[cfg(test)]
+-#[cfg(feature = "signing")]
++#[cfg(feature = "os-rng")]
+ mod tests {
+     use super::*;
+     use crate::crypto::{Amount, Blinding, Keypair};
+diff --git a/src/ids.rs b/src/ids.rs
+index ed5cf77..a934280 100644
+--- a/src/ids.rs
++++ b/src/ids.rs
+@@ -31,12 +31,21 @@ macro_rules! id_newtype {
+             }
+ 
+             /// Generate a random ID using `OsRng`. Available with the
+-            /// `signing` feature (which is implied by `helpers`).
+-            #[cfg(feature = "signing")]
++            /// `os-rng` feature (which is implied by `helpers`).
++            /// Equivalent to `Self::random_with_rng(&mut OsRng)`.
++            #[cfg(feature = "os-rng")]
+             pub fn random() -> Self {
+-                use rand_core::RngCore;
++                Self::random_with_rng(&mut rand_core::OsRng)
++            }
++
++            /// Generate a random ID from a caller-supplied CSPRNG.
++            /// Available with the `signing` feature.
++            #[cfg(feature = "signing")]
++            pub fn random_with_rng<R: rand_core::RngCore + rand_core::CryptoRng>(
++                rng: &mut R,
++            ) -> Self {
+                 let mut buf = [0u8; $size];
+-                rand_core::OsRng.fill_bytes(&mut buf);
++                rng.fill_bytes(&mut buf);
+                 Self(buf)
+             }
+         }
+diff --git a/src/kernel/create_account.rs b/src/kernel/create_account.rs
+index c1afec2..e7d4e3f 100644
+--- a/src/kernel/create_account.rs
++++ b/src/kernel/create_account.rs
+@@ -32,7 +32,8 @@ pub struct CreateAccount {
+ impl CreateAccount {
+     /// Compute the registrar's signing payload, sign it, and bundle it
+     /// with the account into a `CreateAccount` event ready to submit.
+-    /// Uses `OsRng` for nonces.
++    /// Uses `OsRng` for nonces; requires the `os-rng` feature.
++    #[cfg(feature = "os-rng")]
+     pub fn signed(account: Account, registrar_sk: &crate::crypto::SecretKey) -> Self {
+         Self::signed_with(account, registrar_sk, &mut rand_core::OsRng)
+     }
+diff --git a/src/notes/mod.rs b/src/notes/mod.rs
+index 3991375..6abd3d9 100644
+--- a/src/notes/mod.rs
++++ b/src/notes/mod.rs
+@@ -468,7 +468,7 @@ pub fn open(
+     })
+ }
+ 
+-#[cfg(all(test, feature = "signing"))]
++#[cfg(all(test, feature = "os-rng"))]
+ mod tests {
+     use super::*;
+     use crate::crypto::Keypair;
+diff --git a/src/notes/proof.rs b/src/notes/proof.rs
+index 57210cd..5ee8619 100644
+--- a/src/notes/proof.rs
++++ b/src/notes/proof.rs
+@@ -168,7 +168,7 @@ pub fn public_bytes(public: &Public) -> Vec<u8> {
+ }
+ 
+ #[cfg(test)]
+-#[cfg(feature = "signing")]
++#[cfg(feature = "os-rng")]
+ mod tests {
+     use super::*;
+     use crate::crypto::Blinding;
+diff --git a/src/proof.rs b/src/proof.rs
+index f716b72..e7266c5 100644
+--- a/src/proof.rs
++++ b/src/proof.rs
+@@ -101,9 +101,20 @@ pub mod signature {
+     use alloc::vec::Vec;
+ 
+     /// Sign `public_bytes` with `signer`. Returns a [`Mode::Signature`]
+-    /// proof carrying the 64-byte signature (`r || s`).
++    /// proof carrying the 64-byte signature (`r || s`). Uses `OsRng`
++    /// for the nonce; requires the `os-rng` feature.
++    #[cfg(feature = "os-rng")]
+     pub fn sign(public_bytes: &[u8], signer: &SecretKey) -> Proof {
+-        let sig = signer.sign(public_bytes, &mut rand_core::OsRng);
++        sign_with_rng(public_bytes, signer, &mut rand_core::OsRng)
++    }
++
++    /// [`sign`] with a caller-supplied CSPRNG for the nonce.
++    pub fn sign_with_rng<R: rand_core::RngCore + rand_core::CryptoRng>(
++        public_bytes: &[u8],
++        signer: &SecretKey,
++        rng: &mut R,
++    ) -> Proof {
++        let sig = signer.sign(public_bytes, rng);
+         let mut bytes = Vec::with_capacity(64);
+         bytes.extend_from_slice(&sig.r);
+         bytes.extend_from_slice(&sig.s);
+@@ -148,7 +159,7 @@ mod tests {
+         assert!(Mode::from_tag(255).is_none());
+     }
+ 
+-    #[cfg(feature = "signing")]
++    #[cfg(feature = "os-rng")]
+     mod sig_tests {
+         use super::super::*;
+         use crate::crypto::Keypair;
+diff --git a/src/settlement/mod.rs b/src/settlement/mod.rs
+index 55d6d9a..5e6bfbe 100644
+--- a/src/settlement/mod.rs
++++ b/src/settlement/mod.rs
+@@ -84,7 +84,8 @@ impl SettlementClaim {
+     }
+ 
+     /// Build and sign a settlement claim with the claimant's secret key.
+-    #[cfg(feature = "signing")]
++    /// Uses `OsRng` for the nonce; requires the `os-rng` feature.
++    #[cfg(feature = "os-rng")]
+     pub fn sign(
+         claimant_clerk: AuthKey,
+         peer_clerk: AuthKey,
+@@ -93,6 +94,31 @@ impl SettlementClaim {
+         window_end: u64,
+         net_flow: Amount,
+         claimant_secret: &crate::crypto::SecretKey,
++    ) -> Self {
++        Self::sign_with_rng(
++            claimant_clerk,
++            peer_clerk,
++            currency,
++            window_start,
++            window_end,
++            net_flow,
++            claimant_secret,
++            &mut rand_core::OsRng,
++        )
++    }
++
++    /// [`Self::sign`] with a caller-supplied CSPRNG for the nonce.
++    #[cfg(feature = "signing")]
++    #[allow(clippy::too_many_arguments)]
++    pub fn sign_with_rng<R: rand_core::RngCore + rand_core::CryptoRng>(
++        claimant_clerk: AuthKey,
++        peer_clerk: AuthKey,
++        currency: u32,
++        window_start: u64,
++        window_end: u64,
++        net_flow: Amount,
++        claimant_secret: &crate::crypto::SecretKey,
++        rng: &mut R,
+     ) -> Self {
+         let mut c = Self {
+             claimant_clerk,
+@@ -104,7 +130,7 @@ impl SettlementClaim {
+             signature: Signature::ZERO,
+         };
+         let payload = c.signing_payload();
+-        c.signature = claimant_secret.sign(&payload, &mut rand_core::OsRng);
++        c.signature = claimant_secret.sign(&payload, rng);
+         c
+     }
+ 
+@@ -294,7 +320,7 @@ pub fn reconcile_multi_peer<'a>(
+         .collect())
+ }
+ 
+-#[cfg(all(test, feature = "signing"))]
++#[cfg(all(test, feature = "os-rng"))]
+ mod tests {
+     use super::*;
+     use crate::crypto::{Blinding, Keypair};
+diff --git a/src/settlement/proof.rs b/src/settlement/proof.rs
+index c56effb..3fe2432 100644
+--- a/src/settlement/proof.rs
++++ b/src/settlement/proof.rs
+@@ -100,7 +100,7 @@ pub(crate) fn write_body(out: &mut Vec<u8>, public: &Public) {
+     out.extend_from_slice(&public.net_flow_commit.0);
+ }
+ 
+-#[cfg(test)]
++#[cfg(all(test, feature = "os-rng"))]
+ mod tests {
+     use super::*;
+     use crate::crypto::Keypair;
+diff --git a/src/state_root.rs b/src/state_root.rs
+index 67f0ace..6b0910e 100644
+--- a/src/state_root.rs
++++ b/src/state_root.rs
+@@ -7,7 +7,7 @@
+ //! [`crate::helpers::MemLedger::root`]. It produces a BYTE-IDENTICAL
+ //! root via the same composite shape — see
+ //! [`composite_root_from_subroots`] — but without the `helpers` feature
+-//! (and therefore without `signing` → `rand_core/getrandom`), so it
++//! (and therefore without `os-rng` → `rand_core/getrandom`), so it
+ //! builds for `no_std` PVM/zkVM targets.
+ //!
+ //! Six sub-SMTs are committed: the three record kinds (accounts,
+diff --git a/src/stealth.rs b/src/stealth.rs
+index e489487..1b8f7a3 100644
+--- a/src/stealth.rs
++++ b/src/stealth.rs
+@@ -295,7 +295,7 @@ pub fn sender_ecdh<R: RngCore>(address: &Address, rng: &mut R) -> Option<([u8; 3
+     Some((epk, shared))
+ }
+ 
+-#[cfg(test)]
++#[cfg(all(test, feature = "os-rng"))]
+ mod tests {
+     use super::*;
+     use crate::viewing_keys::SpendKey;
+diff --git a/src/types/account.rs b/src/types/account.rs
+index 4ea32bd..57acf36 100644
+--- a/src/types/account.rs
++++ b/src/types/account.rs
+@@ -119,18 +119,39 @@ impl Account {
+     /// Open a fresh account from an [`AccountKind`]. The kind picks
+     /// the kernel-level `normal_balance` direction; typed `Currency`
+     /// and `AccountCode` arguments give you human-readable currencies
+-    /// and account codes. Available with the `signing` feature so
+-    /// `AccountId::random()` can draw from OsRng.
+-    #[cfg(feature = "signing")]
++    /// and account codes. The id is drawn from `OsRng`; requires the
++    /// `os-rng` feature. See [`Self::open_with_rng`].
++    #[cfg(feature = "os-rng")]
+     pub fn open(
+         kind: AccountKind,
+         journal_id: JournalId,
+         auth_key: AuthKey,
+         ledger: impl Currency,
+         code: impl AccountCode,
++    ) -> Self {
++        Self::open_with_rng(
++            kind,
++            journal_id,
++            auth_key,
++            ledger,
++            code,
++            &mut rand_core::OsRng,
++        )
++    }
++
++    /// [`Self::open`] with the id drawn from a caller-supplied CSPRNG.
++    /// Available with the `signing` feature.
++    #[cfg(feature = "signing")]
++    pub fn open_with_rng<R: rand_core::RngCore + rand_core::CryptoRng>(
++        kind: AccountKind,
++        journal_id: JournalId,
++        auth_key: AuthKey,
++        ledger: impl Currency,
++        code: impl AccountCode,
++        rng: &mut R,
+     ) -> Self {
+         Self::new(
+-            crate::ids::AccountId::random(),
++            crate::ids::AccountId::random_with_rng(rng),
+             journal_id,
+             auth_key,
+             ledger,
+@@ -140,17 +161,29 @@ impl Account {
+     }
+ 
+     /// Convenience: an asset account (debit-normal). Equivalent to
+-    /// `Account::open(AccountKind::Asset, ...)`. Available with the
+-    /// `signing` feature so the auto-generated `id` can use OsRng.
+-    #[cfg(feature = "signing")]
++    /// `Account::open(AccountKind::Asset, ...)`. The id is drawn from
++    /// `OsRng`; requires the `os-rng` feature.
++    #[cfg(feature = "os-rng")]
+     pub fn asset(
+         journal_id: JournalId,
+         auth_key: AuthKey,
+         ledger: impl Currency,
+         code: impl AccountCode,
++    ) -> Self {
++        Self::asset_with_rng(journal_id, auth_key, ledger, code, &mut rand_core::OsRng)
++    }
++
++    /// [`Self::asset`] with the id drawn from a caller-supplied CSPRNG.
++    #[cfg(feature = "signing")]
++    pub fn asset_with_rng<R: rand_core::RngCore + rand_core::CryptoRng>(
++        journal_id: JournalId,
++        auth_key: AuthKey,
++        ledger: impl Currency,
++        code: impl AccountCode,
++        rng: &mut R,
+     ) -> Self {
+         Self::new(
+-            crate::ids::AccountId::random(),
++            crate::ids::AccountId::random_with_rng(rng),
+             journal_id,
+             auth_key,
+             ledger,
+@@ -159,16 +192,30 @@ impl Account {
+         )
+     }
+ 
+-    /// Convenience: a liability or equity account (credit-normal).
+-    #[cfg(feature = "signing")]
++    /// Convenience: a liability or equity account (credit-normal). The
++    /// id is drawn from `OsRng`; requires the `os-rng` feature.
++    #[cfg(feature = "os-rng")]
+     pub fn liability(
+         journal_id: JournalId,
+         auth_key: AuthKey,
+         ledger: impl Currency,
+         code: impl AccountCode,
++    ) -> Self {
++        Self::liability_with_rng(journal_id, auth_key, ledger, code, &mut rand_core::OsRng)
++    }
++
++    /// [`Self::liability`] with the id drawn from a caller-supplied
++    /// CSPRNG.
++    #[cfg(feature = "signing")]
++    pub fn liability_with_rng<R: rand_core::RngCore + rand_core::CryptoRng>(
++        journal_id: JournalId,
++        auth_key: AuthKey,
++        ledger: impl Currency,
++        code: impl AccountCode,
++        rng: &mut R,
+     ) -> Self {
+         Self::new(
+-            crate::ids::AccountId::random(),
++            crate::ids::AccountId::random_with_rng(rng),
+             journal_id,
+             auth_key,
+             ledger,
+diff --git a/src/types/transfer.rs b/src/types/transfer.rs
+index d34297a..0cdf305 100644
+--- a/src/types/transfer.rs
++++ b/src/types/transfer.rs
+@@ -149,11 +149,24 @@ impl Transfer {
+     /// transfer: pulls journal/ledger/code from the accounts you debit
+     /// and credit, generates IDs as needed, and auto-orders signatures
+     /// by first-appearance of debited account.
+-    #[cfg(feature = "signing")]
++    ///
++    /// Draws the transfer id and the entry-id seed from `OsRng`;
++    /// requires the `os-rng` feature. See [`Self::builder_with_rng`].
++    #[cfg(feature = "os-rng")]
+     pub fn builder(journal_id: JournalId) -> TransferBuilder {
+         TransferBuilder::new(journal_id)
+     }
+ 
++    /// [`Self::builder`] with a caller-supplied CSPRNG for the transfer
++    /// id and the entry-id seed. Available with `signing`.
++    #[cfg(feature = "signing")]
++    pub fn builder_with_rng<R: rand_core::RngCore + rand_core::CryptoRng>(
++        journal_id: JournalId,
++        rng: &mut R,
++    ) -> TransferBuilder {
++        TransferBuilder::new_with_rng(journal_id, rng)
++    }
++
+     /// Bytes covered by each spend signature: the rkyv archive of the
+     /// transfer's structural fields, with `signatures` and the
+     /// kernel-stamped timestamps deliberately excluded. This is what
+@@ -184,8 +197,9 @@ impl Transfer {
+ 
+     /// Compute the signing payload, sign it once per provided
+     /// `SecretKey` (in order, one per distinct debited account), and
+-    /// attach the signatures. Uses `OsRng` for nonces.
+-    #[cfg(feature = "signing")]
++    /// attach the signatures. Uses `OsRng` for nonces; requires the
++    /// `os-rng` feature.
++    #[cfg(feature = "os-rng")]
+     pub fn signed_by(self, keys: &[&crate::crypto::SecretKey]) -> Self {
+         self.signed_by_with(keys, &mut rand_core::OsRng)
+     }
+@@ -231,11 +245,18 @@ struct TransferSigningView {
+ /// Per-entry boilerplate (`transfer_id`, `journal_id`, `ledger`,
+ /// `code`, `EntryId`) is pulled from the builder and the touched
+ /// `Account`. The transfer's `id` defaults to a random
+-/// `TransferId::random()`; override with `.id(...)`.
++/// `TransferId` drawn from the builder's RNG; override with `.id(...)`.
++///
++/// The RNG is only used at construction ([`TransferBuilder::new`] draws
++/// from `OsRng`, [`TransferBuilder::new_with_rng`] from the caller's
++/// CSPRNG): it gives the transfer id and a 32-byte seed, and each
++/// entry id is `blake2b_256(ENTRY_ID_DOMAIN, seed || index)` truncated
++/// to 16 bytes, so `debit` / `credit` need no RNG of their own.
+ #[cfg(feature = "signing")]
+ #[must_use = "TransferBuilder is incomplete until .signed_with(...) or .try_signed_with(...) is called"]
+ pub struct TransferBuilder {
+     id: TransferId,
++    entry_id_seed: [u8; 32],
+     journal_id: JournalId,
+     tx_template_id: TxTemplateId,
+     external_id: Option<ExternalId>,
+@@ -246,11 +267,30 @@ pub struct TransferBuilder {
+     user_data: [u8; 32],
+ }
+ 
++/// Domain tag for [`TransferBuilder`]'s entry-id derivation.
++#[cfg(feature = "signing")]
++const ENTRY_ID_DOMAIN: &[u8] = b"cipher-clerk/transfer-builder/entry-id/v1";
++
+ #[cfg(feature = "signing")]
+ impl TransferBuilder {
++    /// Start a builder, drawing randomness from `OsRng`. Requires the
++    /// `os-rng` feature; see [`Self::new_with_rng`].
++    #[cfg(feature = "os-rng")]
+     pub fn new(journal_id: JournalId) -> Self {
++        Self::new_with_rng(journal_id, &mut rand_core::OsRng)
++    }
++
++    /// Start a builder, drawing the transfer id and the entry-id seed
++    /// from a caller-supplied CSPRNG.
++    pub fn new_with_rng<R: rand_core::RngCore + rand_core::CryptoRng>(
++        journal_id: JournalId,
++        rng: &mut R,
++    ) -> Self {
++        let mut entry_id_seed = [0u8; 32];
++        rng.fill_bytes(&mut entry_id_seed);
+         Self {
+-            id: TransferId::random(),
++            id: TransferId::random_with_rng(rng),
++            entry_id_seed,
+             journal_id,
+             tx_template_id: TxTemplateId::ZERO,
+             external_id: None,
+@@ -291,6 +331,16 @@ impl TransferBuilder {
+         self
+     }
+ 
++    /// The id of the next entry: derived from the builder's seed and
++    /// the entry's position.
++    fn next_entry_id(&self) -> crate::ids::EntryId {
++        let index = (self.entries.len() as u64).to_le_bytes();
++        let h = crate::crypto::blake2b_256(ENTRY_ID_DOMAIN, &[&self.entry_id_seed, &index]);
++        let mut id = [0u8; 16];
++        id.copy_from_slice(&h[..16]);
++        crate::ids::EntryId(id)
++    }
++
+     /// Append a debit entry on `account` for `amount` in the given
+     /// `layer`. Inherits `account.ledger` and `account.code`.
+     pub fn debit(
+@@ -299,8 +349,9 @@ impl TransferBuilder {
+         layer: crate::types::Layer,
+         amount: crate::crypto::Amount,
+     ) -> Self {
++        let entry_id = self.next_entry_id();
+         self.entries.push(Entry::debit(
+-            crate::ids::EntryId::random(),
++            entry_id,
+             self.id,
+             self.journal_id,
+             account.id,
+@@ -319,8 +370,9 @@ impl TransferBuilder {
+         layer: crate::types::Layer,
+         amount: crate::crypto::Amount,
+     ) -> Self {
++        let entry_id = self.next_entry_id();
+         self.entries.push(Entry::credit(
+-            crate::ids::EntryId::random(),
++            entry_id,
+             self.id,
+             self.journal_id,
+             account.id,
+@@ -361,13 +413,25 @@ impl TransferBuilder {
+     /// Finalize and sign. `keys` must be in the order matching
+     /// first-appearance of distinct debited accounts in the entries
+     /// (the same convention the kernel uses on verification).
++    /// Uses `OsRng` for nonces; requires the `os-rng` feature.
++    #[cfg(feature = "os-rng")]
+     pub fn signed_by(self, keys: &[&crate::crypto::SecretKey]) -> Transfer {
+-        self.build_unsigned().signed_by(keys)
++        self.signed_by_with(keys, &mut rand_core::OsRng)
++    }
++
++    /// [`Self::signed_by`] with a caller-supplied CSPRNG for the nonces.
++    pub fn signed_by_with<R: rand_core::RngCore + rand_core::CryptoRng>(
++        self,
++        keys: &[&crate::crypto::SecretKey],
++        rng: &mut R,
++    ) -> Transfer {
++        self.build_unsigned().signed_by_with(keys, rng)
+     }
+ 
+     /// Convenience: pass `(account, secret_key)` pairs. The builder
+     /// looks up the right key for each debited account by id, so
+     /// callers don't have to remember the first-appearance ordering.
++    /// Uses `OsRng` for nonces; requires the `os-rng` feature.
+     ///
+     /// # Panics
+     ///
+@@ -375,11 +439,26 @@ impl TransferBuilder {
+     /// `(account, secret)` pair in `signers`. For untrusted /
+     /// fallible signing flows, prefer [`Self::try_signed_with`] which
+     /// returns a `Result`.
++    #[cfg(feature = "os-rng")]
+     pub fn signed_with(
+         self,
+         signers: &[(&crate::types::Account, &crate::crypto::SecretKey)],
+     ) -> Transfer {
+-        self.try_signed_with(signers)
++        self.signed_with_rng(signers, &mut rand_core::OsRng)
++    }
++
++    /// [`Self::signed_with`] with a caller-supplied CSPRNG for the
++    /// nonces.
++    ///
++    /// # Panics
++    ///
++    /// As [`Self::signed_with`].
++    pub fn signed_with_rng<R: rand_core::RngCore + rand_core::CryptoRng>(
++        self,
++        signers: &[(&crate::types::Account, &crate::crypto::SecretKey)],
++        rng: &mut R,
++    ) -> Transfer {
++        self.try_signed_with_rng(signers, rng)
+             .expect("no SecretKey provided for a debited account")
+     }
+ 
+@@ -387,10 +466,21 @@ impl TransferBuilder {
+     /// `Err(missing_account_id)` instead of panicking when a debited
+     /// account has no matching key on hand. Useful at FFI / CLI
+     /// boundaries where the caller may not have audited the signer
+-    /// set.
++    /// set. Uses `OsRng` for nonces; requires the `os-rng` feature.
++    #[cfg(feature = "os-rng")]
+     pub fn try_signed_with(
+         self,
+         signers: &[(&crate::types::Account, &crate::crypto::SecretKey)],
++    ) -> Result<Transfer, crate::ids::AccountId> {
++        self.try_signed_with_rng(signers, &mut rand_core::OsRng)
++    }
++
++    /// [`Self::try_signed_with`] with a caller-supplied CSPRNG for the
++    /// nonces.
++    pub fn try_signed_with_rng<R: rand_core::RngCore + rand_core::CryptoRng>(
++        self,
++        signers: &[(&crate::types::Account, &crate::crypto::SecretKey)],
++        rng: &mut R,
+     ) -> Result<Transfer, crate::ids::AccountId> {
+         let t = self.build_unsigned();
+         // Find distinct debited account ids in first-appearance order,
+@@ -413,6 +503,6 @@ impl TransferBuilder {
+                 .ok_or(*id)?;
+             keys.push(sk);
+         }
+-        Ok(t.signed_by(&keys))
++        Ok(t.signed_by_with(&keys, rng))
+     }
+ }
+diff --git a/src/viewing_keys.rs b/src/viewing_keys.rs
+index a3a81ca..9edd7b1 100644
+--- a/src/viewing_keys.rs
++++ b/src/viewing_keys.rs
+@@ -85,12 +85,18 @@ pub struct SpendKey {
+ }
+ 
+ impl SpendKey {
+-    /// Draw a fresh spend key.
+-    #[cfg(feature = "signing")]
++    /// Draw a fresh spend key from `OsRng`. Requires the `os-rng`
++    /// feature; see [`Self::generate_with_rng`].
++    #[cfg(feature = "os-rng")]
+     pub fn generate() -> Self {
+-        use rand_core::RngCore;
++        Self::generate_with_rng(&mut rand_core::OsRng)
++    }
++
++    /// Draw a fresh spend key from a caller-supplied CSPRNG.
++    #[cfg(feature = "signing")]
++    pub fn generate_with_rng<R: rand_core::RngCore + rand_core::CryptoRng>(rng: &mut R) -> Self {
+         let mut buf = [0u8; 64];
+-        rand_core::OsRng.fill_bytes(&mut buf);
++        rng.fill_bytes(&mut buf);
+         Self {
+             scalar: Scalar::from_bytes_mod_order_wide(&buf),
+         }
+@@ -288,15 +294,28 @@ const AEAD_TAG_LEN: usize = 16;
+ 
+ impl EncryptedEnvelope {
+     /// Seal an opening (`value`, `blinding`) under a recipient ivk
+-    /// pubkey. Picks a fresh ephemeral key.
+-    #[cfg(feature = "signing")]
++    /// pubkey. Picks a fresh ephemeral key from `OsRng`; requires the
++    /// `os-rng` feature. See [`Self::seal_with_rng`].
++    #[cfg(feature = "os-rng")]
+     pub fn seal(value: u64, blinding: &Blinding, recipient_ivk_pk: &AuthKey) -> Option<Self> {
+-        use rand_core::RngCore;
++        Self::seal_with_rng(value, blinding, recipient_ivk_pk, &mut rand_core::OsRng)
++    }
++
++    /// [`Self::seal`] with the ephemeral key drawn from a
++    /// caller-supplied CSPRNG. The AEAD nonce derives from the
++    /// ephemeral pubkey, so `rng` must never repeat an output.
++    #[cfg(feature = "signing")]
++    pub fn seal_with_rng<R: rand_core::RngCore + rand_core::CryptoRng>(
++        value: u64,
++        blinding: &Blinding,
++        recipient_ivk_pk: &AuthKey,
++        rng: &mut R,
++    ) -> Option<Self> {
+         let recipient_point = CompressedRistretto::from_slice(&recipient_ivk_pk.0)
+             .ok()?
+             .decompress()?;
+         let mut buf = [0u8; 64];
+-        rand_core::OsRng.fill_bytes(&mut buf);
++        rng.fill_bytes(&mut buf);
+         let e_sk = Scalar::from_bytes_mod_order_wide(&buf);
+         let e_pk = (&e_sk * RISTRETTO_BASEPOINT_TABLE).compress().to_bytes();
+         let shared = (e_sk * recipient_point).compress().to_bytes();
+@@ -385,8 +404,10 @@ const NOTE_PAYLOAD_LEN: usize = 4 + 8 + 32 + 32 + 32 + 32; // + transfer_blindin
+ impl EncryptedNoteEnvelope {
+     /// Seal a Note's contents PLUS the cross-clerk transfer's blinding
+     /// (which the receiver needs to open the kernel-transfer
+-    /// `amount_commit`) under a recipient ivk pubkey.
+-    #[cfg(feature = "signing")]
++    /// `amount_commit`) under a recipient ivk pubkey. Picks a fresh
++    /// ephemeral key from `OsRng`; requires the `os-rng` feature. See
++    /// [`Self::seal_note_with_rng`].
++    #[cfg(feature = "os-rng")]
+     pub fn seal_note(
+         asset_tag: u32,
+         value: u64,
+@@ -396,12 +417,38 @@ impl EncryptedNoteEnvelope {
+         transfer_blinding: &Blinding,
+         recipient_ivk_pk: &AuthKey,
+     ) -> Option<Self> {
+-        use rand_core::RngCore;
++        Self::seal_note_with_rng(
++            asset_tag,
++            value,
++            owner,
++            note_blinding,
++            rho,
++            transfer_blinding,
++            recipient_ivk_pk,
++            &mut rand_core::OsRng,
++        )
++    }
++
++    /// [`Self::seal_note`] with the ephemeral key drawn from a
++    /// caller-supplied CSPRNG. The AEAD nonce derives from the
++    /// ephemeral pubkey, so `rng` must never repeat an output.
++    #[cfg(feature = "signing")]
++    #[allow(clippy::too_many_arguments)]
++    pub fn seal_note_with_rng<R: rand_core::RngCore + rand_core::CryptoRng>(
++        asset_tag: u32,
++        value: u64,
++        owner: &AuthKey,
++        note_blinding: &Blinding,
++        rho: &[u8; 32],
++        transfer_blinding: &Blinding,
++        recipient_ivk_pk: &AuthKey,
++        rng: &mut R,
++    ) -> Option<Self> {
+         let recipient_point = CompressedRistretto::from_slice(&recipient_ivk_pk.0)
+             .ok()?
+             .decompress()?;
+         let mut buf = [0u8; 64];
+-        rand_core::OsRng.fill_bytes(&mut buf);
++        rng.fill_bytes(&mut buf);
+         let e_sk = Scalar::from_bytes_mod_order_wide(&buf);
+         let e_pk = (&e_sk * RISTRETTO_BASEPOINT_TABLE).compress().to_bytes();
+         let shared = (e_sk * recipient_point).compress().to_bytes();
+@@ -443,8 +490,10 @@ impl EncryptedNoteEnvelope {
+     /// against their pre-derived `(index → pk_d)` table.
+     ///
+     /// EXPERIMENTAL — gated behind both `viewing-keys` and
+-    /// `stealth-experimental`.
+-    #[cfg(all(feature = "signing", feature = "stealth-experimental"))]
++    /// `stealth-experimental`. Picks a fresh ephemeral key from
++    /// `OsRng`; requires the `os-rng` feature. See
++    /// [`Self::seal_note_to_address_with_rng`].
++    #[cfg(all(feature = "os-rng", feature = "stealth-experimental"))]
+     pub fn seal_note_to_address(
+         asset_tag: u32,
+         value: u64,
+@@ -452,11 +501,34 @@ impl EncryptedNoteEnvelope {
+         rho: &[u8; 32],
+         transfer_blinding: &Blinding,
+         address: &crate::stealth::Address,
++    ) -> Option<Self> {
++        Self::seal_note_to_address_with_rng(
++            asset_tag,
++            value,
++            note_blinding,
++            rho,
++            transfer_blinding,
++            address,
++            &mut rand_core::OsRng,
++        )
++    }
++
++    /// [`Self::seal_note_to_address`] with the ephemeral key drawn
++    /// from a caller-supplied CSPRNG. The AEAD nonce derives from the
++    /// ephemeral pubkey, so `rng` must never repeat an output.
++    #[cfg(all(feature = "signing", feature = "stealth-experimental"))]
++    pub fn seal_note_to_address_with_rng<R: rand_core::RngCore + rand_core::CryptoRng>(
++        asset_tag: u32,
++        value: u64,
++        note_blinding: &Blinding,
++        rho: &[u8; 32],
++        transfer_blinding: &Blinding,
++        address: &crate::stealth::Address,
++        rng: &mut R,
+     ) -> Option<Self> {
+         let owner = &address.pk_d;
+-        use rand_core::RngCore;
+         let mut buf = [0u8; 64];
+-        rand_core::OsRng.fill_bytes(&mut buf);
++        rng.fill_bytes(&mut buf);
+         let e_sk = Scalar::from_bytes_mod_order_wide(&buf);
+         let b_d = address.basepoint();
+         let pk_d_point = CompressedRistretto::from_slice(&address.pk_d.0)
+@@ -541,7 +613,7 @@ impl EncryptedNoteEnvelope {
+     }
+ }
+ 
+-#[cfg(all(test, feature = "signing"))]
++#[cfg(all(test, feature = "os-rng"))]
+ mod tests {
+     use super::*;
+ 
+diff --git a/src/voucher/mod.rs b/src/voucher/mod.rs
+index 16eac58..03ac17e 100644
+--- a/src/voucher/mod.rs
++++ b/src/voucher/mod.rs
+@@ -92,7 +92,9 @@ impl Voucher {
+     /// proof bytes so a real proof can be plugged in later without
+     /// invalidating already-signed vouchers (the signature would be
+     /// regenerated alongside the proof).
+-    #[cfg(feature = "signing")]
++    ///
++    /// Uses `OsRng` for the nonce; requires the `os-rng` feature.
++    #[cfg(feature = "os-rng")]
+     pub fn sign(
+         amount_commit: Amount,
+         envelope: EncryptedEnvelope,
+@@ -100,6 +102,28 @@ impl Voucher {
+         state_root_after: [u8; 32],
+         proof: crate::proof::Proof,
+         issuer_secret: &crate::crypto::SecretKey,
++    ) -> Self {
++        Self::sign_with_rng(
++            amount_commit,
++            envelope,
++            state_root_before,
++            state_root_after,
++            proof,
++            issuer_secret,
++            &mut rand_core::OsRng,
++        )
++    }
++
++    /// [`Self::sign`] with a caller-supplied CSPRNG for the nonce.
++    #[cfg(feature = "signing")]
++    pub fn sign_with_rng<R: rand_core::RngCore + rand_core::CryptoRng>(
++        amount_commit: Amount,
++        envelope: EncryptedEnvelope,
++        state_root_before: [u8; 32],
++        state_root_after: [u8; 32],
++        proof: crate::proof::Proof,
++        issuer_secret: &crate::crypto::SecretKey,
++        rng: &mut R,
+     ) -> Self {
+         let mut v = Self {
+             amount_commit,
+@@ -110,7 +134,7 @@ impl Voucher {
+             signature: Signature::ZERO,
+         };
+         let payload = v.signing_payload();
+-        v.signature = issuer_secret.sign(&payload, &mut rand_core::OsRng);
++        v.signature = issuer_secret.sign(&payload, rng);
+         v
+     }
+ 
+@@ -483,7 +507,9 @@ impl ShieldedVoucher {
+         out
+     }
+ 
+-    #[cfg(feature = "signing")]
++    /// Build and sign with the issuing clerk's secret key. Uses `OsRng`
++    /// for the nonce; requires the `os-rng` feature.
++    #[cfg(feature = "os-rng")]
+     pub fn sign(
+         amount_commit: Amount,
+         note_commit: Amount,
+@@ -492,6 +518,31 @@ impl ShieldedVoucher {
+         state_root_after: [u8; 32],
+         proof: crate::proof::Proof,
+         issuer_secret: &crate::crypto::SecretKey,
++    ) -> Self {
++        Self::sign_with_rng(
++            amount_commit,
++            note_commit,
++            envelope,
++            state_root_before,
++            state_root_after,
++            proof,
++            issuer_secret,
++            &mut rand_core::OsRng,
++        )
++    }
++
++    /// [`Self::sign`] with a caller-supplied CSPRNG for the nonce.
++    #[cfg(feature = "signing")]
++    #[allow(clippy::too_many_arguments)]
++    pub fn sign_with_rng<R: rand_core::RngCore + rand_core::CryptoRng>(
++        amount_commit: Amount,
++        note_commit: Amount,
++        envelope: EncryptedNoteEnvelope,
++        state_root_before: [u8; 32],
++        state_root_after: [u8; 32],
++        proof: crate::proof::Proof,
++        issuer_secret: &crate::crypto::SecretKey,
++        rng: &mut R,
+     ) -> Self {
+         let mut v = Self {
+             amount_commit,
+@@ -503,7 +554,7 @@ impl ShieldedVoucher {
+             signature: Signature::ZERO,
+         };
+         let payload = v.signing_payload();
+-        v.signature = issuer_secret.sign(&payload, &mut rand_core::OsRng);
++        v.signature = issuer_secret.sign(&payload, rng);
+         v
+     }
+ 
+@@ -682,7 +733,7 @@ impl ShieldedVoucher {
+     }
+ }
+ 
+-#[cfg(all(test, feature = "signing"))]
++#[cfg(all(test, feature = "os-rng"))]
+ mod tests {
+     use super::*;
+     use crate::crypto::{Blinding, Keypair};
+diff --git a/src/voucher/proof.rs b/src/voucher/proof.rs
+index 5a588ca..3e9b8a3 100644
+--- a/src/voucher/proof.rs
++++ b/src/voucher/proof.rs
+@@ -137,7 +137,7 @@ pub fn public_bytes(public: &Public) -> Vec<u8> {
+     out
+ }
+ 
+-#[cfg(test)]
++#[cfg(all(test, feature = "os-rng"))]
+ mod tests {
+     use super::*;
+     use crate::crypto::{Blinding, Keypair};
+diff --git a/tests/audit_edge_cases.rs b/tests/audit_edge_cases.rs
+index 2bb5a61..48a36e9 100644
+--- a/tests/audit_edge_cases.rs
++++ b/tests/audit_edge_cases.rs
+@@ -7,7 +7,7 @@
+ //!
+ //! Run with `cargo test --features signing`.
+ 
+-#![cfg(feature = "signing")]
++#![cfg(feature = "os-rng")]
+ 
+ extern crate alloc;
+ 
+diff --git a/tests/audit_replay.rs b/tests/audit_replay.rs
+index d0ab8f0..da07898 100644
+--- a/tests/audit_replay.rs
++++ b/tests/audit_replay.rs
+@@ -4,7 +4,7 @@
+ //!
+ //! Run with `cargo test --features signing`.
+ 
+-#![cfg(feature = "signing")]
++#![cfg(feature = "os-rng")]
+ 
+ extern crate alloc;
+ 
+diff --git a/tests/kernel_chains.rs b/tests/kernel_chains.rs
+index 2b9e9ad..b90d4c0 100644
+--- a/tests/kernel_chains.rs
++++ b/tests/kernel_chains.rs
+@@ -3,7 +3,7 @@
+ //!
+ //! Run with `cargo test --features signing`.
+ 
+-#![cfg(feature = "signing")]
++#![cfg(feature = "os-rng")]
+ 
+ extern crate alloc;
+ 
+diff --git a/tests/kernel_cross_feature.rs b/tests/kernel_cross_feature.rs
+index 449489d..69122af 100644
+--- a/tests/kernel_cross_feature.rs
++++ b/tests/kernel_cross_feature.rs
+@@ -7,7 +7,7 @@
+ //!
+ //! Run with `cargo test --features signing`.
+ 
+-#![cfg(feature = "signing")]
++#![cfg(feature = "os-rng")]
+ 
+ extern crate alloc;
+ 
+diff --git a/tests/kernel_flags.rs b/tests/kernel_flags.rs
+index 9809e10..87005ba 100644
+--- a/tests/kernel_flags.rs
++++ b/tests/kernel_flags.rs
+@@ -2,7 +2,7 @@
+ //!
+ //! Run with `cargo test --features signing`.
+ 
+-#![cfg(feature = "signing")]
++#![cfg(feature = "os-rng")]
+ 
+ extern crate alloc;
+ 
+diff --git a/tests/kernel_genesis.rs b/tests/kernel_genesis.rs
+index ffee7f2..f11dafc 100644
+--- a/tests/kernel_genesis.rs
++++ b/tests/kernel_genesis.rs
+@@ -4,7 +4,7 @@
+ //!
+ //! Run with `cargo test --features signing`.
+ 
+-#![cfg(feature = "signing")]
++#![cfg(feature = "os-rng")]
+ 
+ extern crate alloc;
+ 
+diff --git a/tests/kernel_happy_path.rs b/tests/kernel_happy_path.rs
+index 5649ad5..eca04eb 100644
+--- a/tests/kernel_happy_path.rs
++++ b/tests/kernel_happy_path.rs
+@@ -2,7 +2,7 @@
+ //!
+ //! Run with `cargo test --features signing`.
+ 
+-#![cfg(feature = "signing")]
++#![cfg(feature = "os-rng")]
+ 
+ extern crate alloc;
+ 
+diff --git a/tests/kernel_multi_entry.rs b/tests/kernel_multi_entry.rs
+index a5025f7..5ecf6d8 100644
+--- a/tests/kernel_multi_entry.rs
++++ b/tests/kernel_multi_entry.rs
+@@ -5,7 +5,7 @@
+ //!
+ //! Run with `cargo test --features signing`.
+ 
+-#![cfg(feature = "signing")]
++#![cfg(feature = "os-rng")]
+ 
+ extern crate alloc;
+ 
+diff --git a/tests/kernel_voiding.rs b/tests/kernel_voiding.rs
+index 574683f..9e5836b 100644
+--- a/tests/kernel_voiding.rs
++++ b/tests/kernel_voiding.rs
+@@ -4,7 +4,7 @@
+ //!
+ //! Run with `cargo test --features signing`.
+ 
+-#![cfg(feature = "signing")]
++#![cfg(feature = "os-rng")]
+ 
+ extern crate alloc;
+ 
+diff --git a/tests/proof_signature_flow.rs b/tests/proof_signature_flow.rs
+index 96b13c5..dac3250 100644
+--- a/tests/proof_signature_flow.rs
++++ b/tests/proof_signature_flow.rs
+@@ -18,7 +18,7 @@
+ //! and wrong-mode envelopes.
+ 
+ #![cfg(all(
+-    feature = "signing",
++    feature = "os-rng",
+     feature = "voucher",
+     feature = "settlement",
+     feature = "notes",
+diff --git a/tests/proptest_chains.rs b/tests/proptest_chains.rs
+index 9462017..2584e6d 100644
+--- a/tests/proptest_chains.rs
++++ b/tests/proptest_chains.rs
+@@ -13,7 +13,7 @@
+ //!
+ //! Run with `cargo test --features signing`.
+ 
+-#![cfg(feature = "signing")]
++#![cfg(feature = "os-rng")]
+ 
+ extern crate alloc;
+ 
+diff --git a/tests/proptest_determinism.rs b/tests/proptest_determinism.rs
+index a914996..74835fd 100644
+--- a/tests/proptest_determinism.rs
++++ b/tests/proptest_determinism.rs
+@@ -5,7 +5,7 @@
+ //!
+ //! Run with `cargo test --features signing`.
+ 
+-#![cfg(feature = "signing")]
++#![cfg(feature = "os-rng")]
+ 
+ extern crate alloc;
+ 
+diff --git a/tests/proptest_shadow.rs b/tests/proptest_shadow.rs
+index cb80fec..1709394 100644
+--- a/tests/proptest_shadow.rs
++++ b/tests/proptest_shadow.rs
+@@ -9,7 +9,7 @@
+ //!
+ //! Run with `cargo test --features signing`.
+ 
+-#![cfg(feature = "signing")]
++#![cfg(feature = "os-rng")]
+ 
+ extern crate alloc;
+ 
+diff --git a/tests/rng_parameter.rs b/tests/rng_parameter.rs
+new file mode 100644
+index 0000000..0003ea4
+--- /dev/null
++++ b/tests/rng_parameter.rs
+@@ -0,0 +1,154 @@
++//! Randomness as a parameter: everything `signing` offers works with a
++//! caller-supplied CSPRNG and without the `os-rng` feature. Gated on
++//! `signing` alone, so `cargo test --no-default-features --features
++//! signing` exercises the path a PVM / zkVM guest uses.
++
++#![cfg(feature = "signing")]
++
++use cipher_clerk::crypto::blake2b_256;
++use cipher_clerk::prelude::*;
++use cipher_clerk::state::Opening;
++use cipher_clerk::{OpeningsOracle, VecLedger};
++use rand_core::{CryptoRng, RngCore};
++
++/// A deterministic RNG for tests: blake2b over (seed, counter). Stands
++/// in for whatever seeded CSPRNG a guest is handed.
++struct SeededRng {
++    seed: [u8; 32],
++    counter: u64,
++}
++
++impl SeededRng {
++    fn new(seed: u8) -> Self {
++        Self {
++            seed: [seed; 32],
++            counter: 0,
++        }
++    }
++}
++
++impl RngCore for SeededRng {
++    fn next_u32(&mut self) -> u32 {
++        rand_core::impls::next_u32_via_fill(self)
++    }
++    fn next_u64(&mut self) -> u64 {
++        rand_core::impls::next_u64_via_fill(self)
++    }
++    fn fill_bytes(&mut self, dest: &mut [u8]) {
++        for chunk in dest.chunks_mut(32) {
++            let block = blake2b_256(
++                b"cipher-clerk/test/seeded-rng",
++                &[&self.seed, &self.counter.to_le_bytes()],
++            );
++            self.counter += 1;
++            chunk.copy_from_slice(&block[..chunk.len()]);
++        }
++    }
++    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
++        self.fill_bytes(dest);
++        Ok(())
++    }
++}
++
++impl CryptoRng for SeededRng {}
++
++/// Open a journal and two accounts, then build and sign one transfer,
++/// drawing every random input from `rng`.
++fn scenario(rng: &mut SeededRng) -> (VecLedger, OpeningsOracle, Vec<CreateAccount>, Transfer) {
++    let registrar = Keypair::generate_with(rng);
++    let journal = Journal::new(JournalId::random_with_rng(rng), registrar.public, 1);
++    let jid = journal.id;
++    let mut ledger = VecLedger::new();
++    ledger.set_journal(journal);
++
++    let value = 100u64;
++    let blinding = Blinding::random(rng);
++    let amount = Amount::commit(value, &blinding);
++    let oracle = OpeningsOracle::new(vec![Opening {
++        amount,
++        value,
++        blinding,
++    }]);
++
++    let alice_kp = Keypair::generate_with(rng);
++    let bob_kp = Keypair::generate_with(rng);
++    let alice = Account::open_with_rng(
++        AccountKind::Asset,
++        jid,
++        alice_kp.public,
++        Iso4217::USD,
++        BankCode::Vault,
++        rng,
++    );
++    let bob =
++        Account::liability_with_rng(jid, bob_kp.public, Iso4217::USD, BankCode::Checking, rng);
++    let creations = vec![
++        CreateAccount::signed_with(alice.clone(), &registrar.secret, rng),
++        CreateAccount::signed_with(bob.clone(), &registrar.secret, rng),
++    ];
++
++    let transfer = Transfer::builder_with_rng(jid, rng)
++        .debit(&alice, Layer::Settled, amount)
++        .credit(&bob, Layer::Settled, amount)
++        .signed_with_rng(&[(&alice, &alice_kp.secret)], rng);
++    (ledger, oracle, creations, transfer)
++}
++
++#[test]
++fn kernel_accepts_a_transfer_built_with_a_caller_rng() {
++    let (mut ledger, mut oracle, creations, transfer) = scenario(&mut SeededRng::new(1));
++    for r in cipher_clerk::apply_account_creations(&mut ledger, &creations, &mut oracle, 1_000) {
++        assert_eq!(r.status, EventStatus::Created);
++    }
++    let results = cipher_clerk::apply_batch(&mut ledger, &[transfer], &mut oracle, 2_000);
++    assert_eq!(results.len(), 1);
++    assert_eq!(results[0].status, EventStatus::Created);
++}
++
++#[test]
++fn same_seed_gives_the_same_transfer() {
++    let (_, _, _, a) = scenario(&mut SeededRng::new(7));
++    let (_, _, _, b) = scenario(&mut SeededRng::new(7));
++    let (_, _, _, c) = scenario(&mut SeededRng::new(8));
++    assert_eq!(a.signing_payload(), b.signing_payload());
++    assert_eq!(a.signatures, b.signatures);
++    assert_ne!(a.id, c.id);
++    assert_ne!(a.signatures, c.signatures);
++}
++
++#[test]
++fn builder_entry_ids_are_distinct() {
++    let mut rng = SeededRng::new(3);
++    let kp = Keypair::generate_with(&mut rng);
++    let jid = JournalId::random_with_rng(&mut rng);
++    let a = Account::asset_with_rng(jid, kp.public, Iso4217::USD, BankCode::Vault, &mut rng);
++    let amount = Amount::commit(1, &Blinding::random(&mut rng));
++    let t1 = Transfer::builder_with_rng(jid, &mut rng)
++        .debit(&a, Layer::Settled, amount)
++        .credit(&a, Layer::Settled, amount)
++        .debit(&a, Layer::Pending, amount)
++        .build_unsigned();
++    let t2 = Transfer::builder_with_rng(jid, &mut rng)
++        .debit(&a, Layer::Settled, amount)
++        .build_unsigned();
++    let mut ids: Vec<EntryId> = t1.entries.iter().chain(&t2.entries).map(|e| e.id).collect();
++    let n = ids.len();
++    ids.sort();
++    ids.dedup();
++    assert_eq!(ids.len(), n, "entry ids must not repeat");
++    assert_ne!(t1.id, t2.id);
++}
++
++#[cfg(feature = "viewing-keys")]
++#[test]
++fn envelope_seals_with_a_caller_rng() {
++    let mut rng = SeededRng::new(5);
++    let spend = SpendKey::generate_with_rng(&mut rng);
++    let ivk = spend.incoming_viewing_key();
++    let blinding = Blinding::random(&mut rng);
++    let env = EncryptedEnvelope::seal_with_rng(42, &blinding, &ivk.public(), &mut rng)
++        .expect("valid recipient key");
++    let (value, opened) = env.open(&ivk).expect("opens with the matching ivk");
++    assert_eq!(value, 42);
++    assert_eq!(opened.0, blinding.0);
++}
+-- 
+2.41.0
+

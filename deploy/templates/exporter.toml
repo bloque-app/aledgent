@@ -1,0 +1,12 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# `opsctl exporter` (image aledgent-ops). It runs beside the adapter, since it reads the adapter's
+# signals file: in the adapter's task or pod, sharing a volume mounted at /var/lib/aledgent.
+# The operations principal's token comes from the environment (your secret store), named here,
+# never written.
+listen = "0.0.0.0:9464"
+ingress = "<FILL ingress's base URL, e.g. http://10.0.0.10:8080>"
+token_env = "ALEDGENT_OPS_TOKEN"
+adapter_signals = "/var/lib/aledgent/settle-signals.json"
+review_owner = "settlement-operations"
+timeout_ms = 5000

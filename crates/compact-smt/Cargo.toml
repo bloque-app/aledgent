@@ -1,0 +1,36 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+[package]
+name = "compact-smt"
+version = "0.1.0"
+description = "The book's state commitment (DEC-25): a compact sparse Merkle tree for the kernel's six state trees and the service tree (v2 roots: shortcut leaves, only non-empty branches hashed), its inclusion and non-inclusion proofs and its multiproof, beside CipherClerk's v1 roots (a supported opt-in)."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# v2 is the book's default root format (DEC-25, amendment 0019, ruled 2026-10-05). `v1` makes
+# CipherClerk's full-depth tree the active version (`Version::ACTIVE`) for every crate in the build:
+# a supported opt-in (owner ruling cs-q04), chosen for a whole deployment at genesis, with smaller
+# witnesses and more actor gas. Both versions are always compiled, so differential tests compare
+# them in one binary.
+v1 = []
+
+[dependencies]
+# BLAKE2b (`crypto::blake2b_256`, VOS's scheduled BLAKE2b in the guest with `vos-blake2b`) and
+# the v1 tree's definitions. Leaf contents and leaf hashes are the kernel's in both versions.
+cipher-clerk = { workspace = true }
+# The multiproof crosses into the Agent inside the kernel witness (rkyv) and the service witness
+# (serde, postcard). Must match the kernel's rkyv configuration.
+rkyv = { version = "0.8", default-features = false, features = ["alloc", "bytecheck", "little_endian", "pointer_width_32"] }
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+
+[dev-dependencies]
+cipher-clerk = { workspace = true, features = ["helpers"] }
+proptest = { version = "1", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true

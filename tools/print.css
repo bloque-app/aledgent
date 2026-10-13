@@ -1,0 +1,31 @@
+/* Copyright (c) 2026 Pagos Cube LLC */
+/* SPDX-License-Identifier: Apache-2.0 OR MIT */
+@page { size: A4; margin: 18mm 16mm 18mm 16mm; }
+html { font-size: 10.5pt; }
+body { font-family: -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif; line-height: 1.42; color: #111; max-width: none; margin: 0; }
+h1 { font-size: 22pt; margin: 0 0 6pt; }
+h2 { font-size: 16pt; margin-top: 22pt; border-bottom: 1.5px solid #222; padding-bottom: 3pt; page-break-before: always; }
+h2:first-of-type { page-break-before: auto; }
+h3 { font-size: 13pt; margin-top: 16pt; }
+h4 { font-size: 11.5pt; margin-top: 12pt; }
+p, li { orphans: 3; widows: 3; }
+code { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 0.88em; background: #f3f3f3; padding: 0 2px; border-radius: 2px; }
+pre { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 8.6pt; background: #f6f6f6; border: 1px solid #ddd; padding: 6pt 8pt; white-space: pre-wrap; word-wrap: break-word; page-break-inside: avoid; }
+pre code { background: none; padding: 0; font-size: inherit; }
+pre.mermaid { background: #fff; border: none; text-align: center; page-break-inside: avoid; }
+pre.mermaid svg { max-width: 100%; height: auto; max-height: 240mm; }
+table { border-collapse: collapse; width: 100%; margin: 8pt 0 12pt; font-size: 9pt; page-break-inside: auto; }
+tr { page-break-inside: avoid; }
+th, td { border: 1px solid #bbb; padding: 3.5pt 5pt; vertical-align: top; text-align: left; }
+th { background: #eaeaea; }
+td:first-child code, th:first-child code { white-space: nowrap; }
+blockquote { margin: 10pt 0; padding: 6pt 10pt; border-left: 4px solid #8a6d1f; background: #fbf7ea; color: #222; page-break-inside: avoid; }
+blockquote p { margin: 4pt 0; }
+hr { border: 0; border-top: 1px solid #ccc; margin: 14pt 0; }
+a { color: #0b4f9c; text-decoration: none; }
+.frontmatter { font-size: 9pt; color: #444; border: 1px solid #ddd; padding: 6pt 8pt; margin-bottom: 14pt; background: #fafafa; }
+.frontmatter dt { font-weight: 600; display: inline; }
+.frontmatter dd { display: inline; margin: 0 12pt 0 4pt; }
+#TOC { font-size: 9pt; columns: 2; column-gap: 18pt; }
+#TOC ul { padding-left: 12pt; margin: 0; }
+#TOC > ul > li { margin-bottom: 2pt; }

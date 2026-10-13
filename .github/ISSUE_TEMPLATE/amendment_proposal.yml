@@ -1,0 +1,40 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+name: Amendment proposal
+description: Change what aledgent does (SPEC.md), or close an open question (OQ-*).
+labels: ["amendment", "decision"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Behaviour is decided in `SPEC.md` and changes only by amendment (CONTRIBUTING.md,
+        "Amendments"). The spec owner rules on it. Discuss here first; the amendment itself is a pull
+        request adding `amendments/NNNN-*.md`.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem, with evidence
+      description: A measurement, a failing case, a contradiction in the spec, a story the spec cannot serve.
+    validations:
+      required: true
+  - type: textarea
+    id: change
+    attributes:
+      label: The proposed change
+      description: The identifiers added, changed or withdrawn (never renumbered), and the text before and after.
+    validations:
+      required: true
+  - type: textarea
+    id: tradeoff
+    attributes:
+      label: Trade-off, stated plainly
+      description: What it costs, and what it rules out.
+    validations:
+      required: true
+  - type: checkboxes
+    id: guardrails
+    attributes:
+      label: Guardrails
+      options:
+        - label: It does not need an administrative path that moves value outside the command surface, nor any other non-goal in SPEC.md §13.
+          required: true

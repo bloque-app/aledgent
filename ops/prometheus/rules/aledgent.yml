@@ -1,0 +1,384 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# F-018, T-018-05: the alert rules of NFR-11's signals and the three extras (plan, "Signals").
+#
+# Every rule is `<metric>{<label>="<value>",...} <op> <integer>`: ops/src/alerts.rs evaluates this
+# very file in the tests that push each signal over its line (tests/alerts.rs), so keep to that
+# form. Thresholds are the deployment's; the values below are the V0 proposals, in milliseconds.
+#
+# severity "page" pages a human through Alertmanager's `pager` route; a failed reconciliation
+# pages and never opens a ticket (NFR-9). severity "warning" shows on the dashboard only.
+groups:
+  - name: aledgent-signals
+    rules:
+      # REQ-OP-8, AC-C4.2: the age of the oldest non-terminal operation, over its service level.
+      - alert: AledgentOldestNonTerminalOverServiceLevel
+        expr: aledgent_oldest_non_terminal_age_ms > 3600000
+        for: 5m
+        labels: { severity: page, owner: settlement-operations, signal: oldest-non-terminal }
+        annotations:
+          summary: The oldest non-terminal operation is older than its service level.
+          runbook: ops/runbooks/restore.md
+      # REQ-CS-7: a Received row older than the decision bound once the core is up.
+      - alert: AledgentReceivedOverDecisionBound
+        expr: aledgent_oldest_undecided_row_age_ms > 60000
+        for: 1m
+        labels: { severity: page, owner: platform, signal: oldest-non-terminal }
+        annotations:
+          summary: Ingress holds a row the core has not decided within the decision bound.
+          runbook: ops/runbooks/restore.md
+
+      # REQ-SA-7, REQ-IN-5: observation completeness. Any gap or re-scan difference pages.
+      - alert: AledgentObservationGap
+        expr: aledgent_adapter_alerts{kind="gap"} > 0
+        labels: { severity: page, owner: settlement-operations, signal: observation-completeness }
+        annotations:
+          summary: The adapter skipped a range of the settlement layer's inbox.
+          runbook: ops/runbooks/gap-filling.md
+      - alert: AledgentRescanDifference
+        expr: aledgent_observation_rescan_differences > 0
+        labels: { severity: page, owner: settlement-operations, signal: observation-completeness }
+        annotations:
+          summary: A re-scan found a record aledgent never ingested, or one the layer no longer shows.
+          runbook: ops/runbooks/gap-filling.md
+      - alert: AledgentObservationLag
+        expr: aledgent_observation_cursor_lag > 100
+        for: 10m
+        labels: { severity: page, owner: settlement-operations, signal: observation-completeness }
+        annotations:
+          summary: The adapter's cursor is far behind the finalized inbox.
+          runbook: ops/runbooks/gap-filling.md
+
+      # REQ-EV-6: undelivered notifications, by the age of the oldest.
+      - alert: AledgentUndeliveredNotification
+        expr: aledgent_oldest_undelivered_age_ms > 900000
+        for: 5m
+        labels: { severity: page, owner: integrations, signal: undelivered-notifications }
+        annotations:
+          summary: A notification has been owed for more than fifteen minutes.
+
+      # Anchor lag (F-017): the newest Final checkpoint older than twice the anchoring cadence
+      # (one hour by default; the cadence is OQ-11's), or a checkpoint in flight for an hour.
+      - alert: AledgentAnchorLag
+        expr: aledgent_anchor_lag_ms > 7200000
+        labels: { severity: page, owner: settlement-operations, signal: anchor-lag }
+        annotations:
+          summary: The newest Final checkpoint is older than twice the anchoring cadence.
+          runbook: ops/runbooks/anchoring.md
+      - alert: AledgentAnchorStuck
+        expr: aledgent_anchor_in_flight_age_ms > 3600000
+        labels: { severity: page, owner: settlement-operations, signal: anchor-lag }
+        annotations:
+          summary: A checkpoint has waited an hour for its anchor to become final.
+          runbook: ops/runbooks/anchoring.md
+      # F-017: anchoring's incidents. A commitment mismatch stops anchoring until an operator acts;
+      # an anchor aledgent never made is someone else writing under the instance.
+      - alert: AledgentAnchorCommitmentMismatch
+        expr: aledgent_anchor_incidents{kind="commitment_mismatch"} > 0
+        labels: { severity: page, owner: security, signal: anchoring }
+        annotations:
+          summary: The settlement layer recorded an anchor with another commitment; anchoring has stopped.
+          runbook: ops/runbooks/anchoring.md
+      - alert: AledgentUnknownAnchor
+        expr: aledgent_anchor_incidents{kind="unknown_anchor"} > 0
+        labels: { severity: page, owner: security, signal: anchoring }
+        annotations:
+          summary: The settlement layer holds an anchor aledgent never made.
+          runbook: ops/runbooks/anchoring.md
+      # REQ-PR-5, AC-J3.2: the latest settlement comparison differs, by as little as one minor unit.
+      - alert: AledgentSettlementDifference
+        expr: aledgent_settlement_differing_assets > 0
+        labels: { severity: page, owner: finance-operations, signal: reconciliation }
+        annotations:
+          summary: The book's position and the settlement layer's differ.
+          runbook: ops/runbooks/reconciliation-failure.md
+
+      # NFR-9, AC-J3.1, AC-J3.2: any non-zero result on any axis, or no run in 24 h, pages.
+      - alert: AledgentReconciliationDifference
+        expr: aledgent_reconciliation_differences > 0
+        labels: { severity: page, owner: finance-operations, signal: reconciliation }
+        annotations:
+          summary: The daily reconciliation found a difference of at least one minor unit.
+          runbook: ops/runbooks/reconciliation-failure.md
+      - alert: AledgentReconciliationNotRun
+        expr: aledgent_reconciliation_last_run_age_ms > 86400000
+        labels: { severity: page, owner: finance-operations, signal: reconciliation }
+        annotations:
+          summary: A reconciliation axis has not run in 24 hours.
+          runbook: ops/runbooks/reconciliation-failure.md
+
+      # REQ-LA-2, RISK-8: Suspense reconciled to zero on a cadence of a day.
+      - alert: AledgentSuspenseNotReconciled
+        expr: aledgent_suspense_oldest_age_ms > 86400000
+        labels: { severity: page, owner: finance-operations, signal: suspense }
+        annotations:
+          summary: A Suspense balance has not been zero for more than a day.
+          runbook: ops/runbooks/reconciliation-failure.md
+
+      # REQ-SN-2: liquidity of the positions that fund settlement, and the lanes' fees.
+      - alert: AledgentLiquidityShortfall
+        expr: aledgent_liquidity_alerts > 0
+        labels: { severity: page, owner: treasury, signal: liquidity }
+        annotations:
+          summary: A position or a lane's fees cannot cover what waits on it; withdrawals are parked.
+          runbook: ops/runbooks/crank-outage.md
+      - alert: AledgentLaneUnderFeeFloor
+        expr: aledgent_lane_under_fee_floor == 1
+        labels: { severity: page, owner: treasury, signal: liquidity }
+        annotations:
+          summary: A signing lane's native balance is under the fee floor.
+
+      # DEC-6, RISK-7: the ticker. Deadlines move only on ticks.
+      - alert: AledgentTickerStale
+        expr: aledgent_ticker_age_ms > 30000
+        labels: { severity: page, owner: platform, signal: ticker }
+        annotations:
+          summary: The core has applied no tick for thirty seconds; deadlines are not moving.
+          runbook: ops/runbooks/restore.md
+
+      # REQ-OP-6, AC-C4.1: the Needs-Review queue, past its service level, to its owner.
+      - alert: AledgentReviewOverdue
+        expr: aledgent_review_overdue > 0
+        labels: { severity: page, signal: needs-review }
+        annotations:
+          summary: An operation in the review queue is past its service level.
+
+      # the settlement layer: blocks need a crank when the chain is idle.
+      - alert: AledgentBlockProductionStalled
+        expr: aledgent_finalized_stall_ms > 120000
+        labels: { severity: page, owner: settlement-operations, signal: block-production }
+        annotations:
+          summary: The settlement layer's finalized height has not moved for two minutes.
+          runbook: ops/runbooks/crank-outage.md
+
+  - name: aledgent-operations
+    rules:
+      # A source that does not answer is a signal that cannot be seen.
+      - alert: AledgentSignalsDown
+        expr: aledgent_signals_up == 0
+        for: 2m
+        labels: { severity: page, owner: platform, signal: exporter }
+        annotations:
+          summary: A source of the operational signals does not answer.
+      - alert: AledgentAdapterSignalsStale
+        expr: aledgent_adapter_signals_age_ms > 60000
+        labels: { severity: page, owner: settlement-operations, signal: exporter }
+        annotations:
+          summary: The adapter has not written its signals for a minute.
+      # NFR-15 (amendment 0007): completion over its ceiling. The ceiling, 30 s at p99, is the one
+      # that breaches; the 19 s target is tracked on the dashboard and pages no one.
+      - alert: AledgentCompletionOverCeiling
+        expr: aledgent_completion_p99_ms > 30000
+        for: 5m
+        labels: { severity: page, owner: platform, signal: completion }
+        annotations:
+          summary: Completion of commands is over its 30 s ceiling at p99 (NFR-15).
+      # REQ-ER-2 (amendment 0006 item 8): a fault inside aledgent, answered ERR-Internal.
+      - alert: AledgentInternalFault
+        expr: aledgent_incident_latest_age_ms{kind="internal_fault"} < 3600000
+        labels: { severity: page, owner: platform, signal: audit }
+        annotations:
+          summary: A command failed on a fault inside aledgent and was answered ERR-Internal.
+      # F-013: an audit gap on the operator channel.
+      - alert: AledgentAuditGap
+        expr: aledgent_incident_latest_age_ms{kind="audit_gap"} < 3600000
+        labels: { severity: page, owner: security, signal: audit }
+        annotations:
+          summary: The audit store's head does not match what the core emitted.
+      # T-018-01: backups on their cadence (ops/backup/schedule.toml), with a margin of one.
+      - alert: AledgentCoreBackupLate
+        expr: aledgent_backup_last_age_ms{store="core"} > 7200000
+        labels: { severity: page, owner: platform, signal: backup }
+        annotations:
+          summary: The core has no verified backup from the last two cadences.
+          runbook: ops/runbooks/restore.md
+      - alert: AledgentAuditBackupLate
+        expr: aledgent_backup_last_age_ms{store="audit"} > 7200000
+        labels: { severity: page, owner: platform, signal: backup }
+        annotations:
+          summary: The audit trail has no verified backup from the last two cadences.
+      - alert: AledgentIngressBackupLate
+        expr: aledgent_backup_last_age_ms{store="ingress"} > 172800000
+        labels: { severity: page, owner: platform, signal: backup }
+        annotations:
+          summary: Ingress has no verified base backup from the last two days.
+      - alert: AledgentAdapterBackupLate
+        expr: aledgent_backup_last_age_ms{store="adapter"} > 172800000
+        labels: { severity: page, owner: platform, signal: backup }
+        annotations:
+          summary: The adapter has no verified base backup from the last two days.
+      # NFR-10: the drill, monthly (accepted proposal), and it must pass.
+      - alert: AledgentDrillFailed
+        expr: aledgent_drill_passed == 0
+        labels: { severity: page, owner: platform, signal: drill }
+        annotations:
+          summary: The last restore drill failed a check.
+          runbook: ops/runbooks/restore.md
+      - alert: AledgentDrillOverdue
+        expr: aledgent_drill_last_age_ms > 2764800000
+        labels: { severity: warning, owner: platform, signal: drill }
+        annotations:
+          summary: No restore drill in 32 days.
+      # T-005-15: the Agent core's off-node archive (NFR-4, NFR-10, NFR-21 (c)). Its lag is what
+      # losing the core's node now would lose if ingress's received-log were lost with it: the
+      # recovery point the operator states. A healthy sink keeps it near a second.
+      - alert: AledgentCoreArchiveLag
+        expr: aledgent_archive_lag_ms > 300000
+        for: 1m
+        labels: { severity: page, owner: platform, signal: backup }
+        annotations:
+          summary: Committed decisions have waited over 5 minutes for the off-node archive; losing the core's node now loses them unless ingress's received-log survives.
+          runbook: ops/runbooks/release/core-archive.md
+      - alert: AledgentCoreArchiveStale
+        expr: aledgent_archive_status_age_ms > 120000
+        labels: { severity: page, owner: platform, signal: backup }
+        annotations:
+          summary: The core host's archiver has not reported for 2 minutes (the host is down, or its archiver is).
+          runbook: ops/runbooks/release/core-archive.md
+      - alert: AledgentCoreArchiveConflict
+        expr: aledgent_archive_conflict > 0
+        labels: { severity: page, owner: security, signal: backup }
+        annotations:
+          summary: The core host refuses to write to the archive, whose history is not its logs' (two hosts of one core, or a node restored from an older copy; INV-25).
+          runbook: ops/runbooks/release/core-archive.md
+      - alert: AledgentCoreCheckpointLate
+        expr: aledgent_archive_checkpoint_age_ms > 7200000
+        labels: { severity: warning, owner: platform, signal: backup }
+        annotations:
+          summary: No checkpoint of the core Agent's runtime state in 2 hours; a restore re-sends every input since the last one.
+          runbook: ops/runbooks/release/core-archive.md
+
+  # T-018-10: the MVP release's blockers. Each links its runbook in ops/runbooks/release/. Rules whose metric nothing exports yet (ops/src/signals.rs, DEFERRED)
+  # are committed so that they page the day the metric appears. The Agent core's archive lag pages
+  # from its own rules (T-005-15, AledgentCoreArchiveLag).
+  - name: aledgent-release
+    rules:
+      # F18 (T-032-17): an input the Agent fails twice alone halts the core; or an incident
+      # stopped it. Reads go on; every input waits Received. Paged at once, not through the
+      # decision bound two minutes later.
+      - alert: AledgentCoreHalted
+        expr: aledgent_core_halted == 1
+        labels: { severity: page, owner: platform, signal: core-halt }
+        annotations:
+          summary: The core has stopped deciding; every input waits Received until a build that applies it.
+          runbook: ops/runbooks/release/core-halt.md
+
+      # T-013-13, REQ-AT-2, NFR-6: the audit trail reaches the audit store.
+      - alert: AledgentAuditNotShipped
+        expr: aledgent_audit_shipping_configured == 0
+        for: 10m
+        labels: { severity: page, owner: security, signal: audit-shipping }
+        annotations:
+          summary: The core ships its audit trail to no audit store; NFR-6's independent retention is not met.
+          runbook: ops/runbooks/release/audit-shipping.md
+      - alert: AledgentAuditShipLag
+        expr: aledgent_audit_ship_lag_ms > 300000
+        labels: { severity: page, owner: security, signal: audit-shipping }
+        annotations:
+          summary: An audit record has waited more than five minutes for the audit store.
+          runbook: ops/runbooks/release/audit-shipping.md
+      - alert: AledgentAuditStoreDown
+        expr: aledgent_audit_store_up == 0
+        for: 2m
+        labels: { severity: page, owner: platform, signal: audit-shipping }
+        annotations:
+          summary: The audit store does not take records; the outbox grows toward its bound.
+          runbook: ops/runbooks/release/audit-shipping.md
+      - alert: AledgentAuditStoreRefused
+        expr: aledgent_audit_store_refused == 1
+        labels: { severity: page, owner: security, signal: audit-shipping }
+        annotations:
+          summary: The audit store refused the core's record, or holds another at its head; shipping has stopped.
+          runbook: ops/runbooks/release/audit-shipping.md
+      - alert: AledgentAuditBackpressure
+        expr: aledgent_audit_backpressure == 1
+        labels: { severity: page, owner: platform, signal: audit-shipping }
+        annotations:
+          summary: The audit outbox is at its bound; the core decides nothing until the store takes records.
+          runbook: ops/runbooks/release/audit-shipping.md
+
+      # VOS: Authority decisions issued for invocations not yet acknowledged. VOS's Authority
+      # issuer refuses past 256 (MAX_AUTHORITY_OPERATION_ISSUER_RECORDS), a Local lane past 32
+      # retained results; the core host acknowledges each invocation at once, so any that stays is
+      # an acknowledgement failing, and the warning comes first.
+      - alert: AledgentVosAuthorityBacklog
+        expr: aledgent_vos_unacknowledged_authority_decisions > 191
+        labels: { severity: page, owner: platform, signal: vos-authority }
+        annotations:
+          summary: Unacknowledged Authority decisions are at three quarters of VOS's limit of 256.
+          runbook: ops/runbooks/release/vos-authority-backlog.md
+      - alert: AledgentVosAuthorityUnacknowledged
+        expr: aledgent_vos_unacknowledged_authority_decisions > 0
+        for: 10m
+        labels: { severity: warning, owner: platform, signal: vos-authority }
+        annotations:
+          summary: An Authority decision has stayed unacknowledged for ten minutes.
+          runbook: ops/runbooks/release/vos-authority-backlog.md
+
+      # NFR-19, NFR-20 (amendment 0012): the sharded profile's credit and revocation lags at p99,
+      # and the streams between Agents (REQ-RT-13). None exists with the one core Agent.
+      - alert: AledgentCreditLag
+        expr: aledgent_credit_lag_p99_ms > 2000
+        for: 5m
+        labels: { severity: page, owner: platform, signal: partition-lag }
+        annotations:
+          summary: Credits between partitions apply later than NFR-19's 2 s at p99.
+          runbook: ops/runbooks/release/partition-lag.md
+      - alert: AledgentRevocationLag
+        expr: aledgent_revocation_lag_p99_ms > 1000
+        for: 5m
+        labels: { severity: page, owner: security, signal: partition-lag }
+        annotations:
+          summary: Revocations take effect later than NFR-20's 1 s at p99.
+          runbook: ops/runbooks/release/partition-lag.md
+      - alert: AledgentStreamLag
+        expr: aledgent_stream_lag_ms > 2000
+        for: 5m
+        labels: { severity: page, owner: platform, signal: partition-lag }
+        annotations:
+          summary: A stream between the book's Agents (the relay) is behind by more than NFR-19's bound.
+          runbook: ops/runbooks/release/partition-lag.md
+      # F-034: native decide's replay found a divergence and the shard fenced itself.
+      - alert: AledgentReplayFenced
+        expr: aledgent_replay_fenced == 1
+        labels: { severity: page, owner: security, signal: partition-lag }
+        annotations:
+          summary: A shard's replay diverged from its native decision; the shard has fenced itself.
+          runbook: ops/runbooks/release/partition-lag.md
+
+      # R-03 (owner ruling rq-01, 2026-10-05): every message between the book's Agents is checked
+      # against its sender's certified commit, in report mode: applied whatever the check finds, and
+      # a failure pages security at once. A stream stays failing once a forged message was applied:
+      # its chain no longer meets the sender's. Messages applied and not yet covered by a
+      # certificate for a minute mean the relay is withholding them.
+      - alert: AledgentR03CheckFailed
+        expr: aledgent_r03_failing_streams > 0
+        labels: { severity: page, owner: security, signal: message-provenance }
+        annotations:
+          summary: A message between the book's Agents does not chain to its sender's certified commit; in report mode it was applied anyway.
+          runbook: ops/runbooks/release/r03-provenance.md
+      - alert: AledgentR03Unverified
+        expr: aledgent_r03_unverified_age_ms > 60000
+        for: 5m
+        labels: { severity: page, owner: security, signal: message-provenance }
+        annotations:
+          summary: Messages between the book's Agents were applied and no certificate of their sender has covered them for over a minute.
+          runbook: ops/runbooks/release/r03-provenance.md
+
+      # F-016: the settlement adapter does not serve (blind light client, wrong runtime, down).
+      # It restarts itself after three minutes blind; still not serving after five pages.
+      - alert: AledgentAdapterNotServing
+        expr: aledgent_adapter_serving == 0
+        for: 5m
+        labels: { severity: page, owner: settlement-operations, signal: settlement-adapter }
+        annotations:
+          summary: The settlement adapter is not serving; external legs are refused.
+          runbook: ops/runbooks/release/settlement-adapter-outage.md
+      # Blocks come and finality does not: Kreivo's finality follows Kusama's.
+      - alert: AledgentFinalityStalled
+        expr: aledgent_finality_lag_blocks > 20
+        for: 2m
+        labels: { severity: page, owner: settlement-operations, signal: settlement-adapter }
+        annotations:
+          summary: The settlement layer's finalized head is more than 20 blocks behind its best.
+          runbook: ops/runbooks/release/kreivo-finality-stall.md

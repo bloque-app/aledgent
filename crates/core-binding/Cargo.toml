@@ -1,0 +1,95 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+[package]
+name = "core-binding"
+version = "0.1.0"
+description = "The core Agent binding's host-independent half (F-005): the Agent's state layout and budget, the invocation envelope, the witnessed leaf store and the private-input vault the Agent runs the library over, the transition function itself, and (feature std) the driver that builds each invocation from a native run."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+default = ["full"]
+# The library's command groups the Agent applies (`calls`). `full` is every group: the core.
+# A guest build may leave groups out to fit the runtime's program limit (NOTES.md).
+full = ["custody", "settlement", "anchoring", "operator", "opening"]
+custody = []
+settlement = []
+anchoring = []
+operator = []
+opening = []
+# Layout 3 (`F-031` lever 2): the book in the Agent's committed maps. The host always has it
+# (`std`); a guest links it only when asked, since it adds to the program (about 0.4 MB).
+mapped = []
+# The host side: the recording store and vault, the witness builder over F-006's leaf store, the
+# driver, and the native Agent port. Never in the guest.
+std = ["dep:leaf-store", "ledger-kernel/std", "mapped"]
+# The Agent core: ingress's boundary::Core over the Agent, with the host's durable log
+# (core::AgentCore). What aledgent-core-host serves.
+ingress = ["std", "dep:ingress", "dep:tokio", "dep:serde_json"]
+# v1 roots (CipherClerk's full-depth tree): a supported opt-in beside the default v2 (DEC-25,
+# owner ruling cs-q04). Host and guests must agree: build both with it or neither.
+smt-v1 = ["ledger-kernel/smt-v1", "ledger-core/smt-v1", "leaf-store?/smt-v1"]
+# The library's raw lifecycle ports as calls, for the conformance suite's Agent targets only
+# (REQ-CS-5: tools/ci/check-conformance-ports.sh fails a production crate that enables it).
+conformance-ports = ["ledger-core/conformance-ports"]
+
+[dependencies]
+# The library, with its commands as serialisable calls (ledger_core::call).
+ledger-core = { path = "../ledger-core", features = ["serde"] }
+# The kernel binding: the leaf-store and vault traits the Agent implements over its inputs.
+ledger-kernel = { path = "../ledger-kernel", default-features = false }
+cipher-clerk = { workspace = true }
+# Must match the kernel's rkyv configuration: the witness carries the kernel's own archives.
+rkyv = { version = "0.8", default-features = false, features = ["alloc", "bytecheck", "little_endian", "pointer_width_32"] }
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+# The envelope's and the Agent state's binary form: compact, no_std, deterministic.
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+curve25519-dalek = { version = "4.1", default-features = false, features = ["alloc", "zeroize"] }
+zeroize = { version = "1", default-features = false }
+leaf-store = { path = "../leaf-store", optional = true }
+ingress = { path = "../../services/ingress", default-features = false, optional = true }
+tokio = { version = "1", features = ["rt", "sync"], optional = true }
+serde_json = { version = "1", optional = true }
+
+[dev-dependencies]
+core-binding = { path = ".", features = ["std"] }
+leaf-store = { path = "../leaf-store" }
+cipher-clerk = { workspace = true }
+# Peak heap per invocation, against the guest's 256 KiB (tests/heap.rs).
+peak_alloc = "0.3"
+# The guest's own heap, modelled: its allocator's placement over the 256 KiB arena (tests/guest_heap.rs).
+guest-heap = { path = "../guest-heap" }
+ledger-kernel = { path = "../ledger-kernel", features = ["std", "store-suite"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+serde_json = "1"
+# The audit store the core ships its trail to, in the tests of T-013-13.
+audit-store = { path = "../audit-store" }
+tempfile = "3"
+# Chainspec chunks as ingress carries them (tests/chainspec.rs).
+hex = "0.4"
+
+[[test]]
+name = "agent_core"
+required-features = ["ingress"]
+
+[[test]]
+name = "memory"
+required-features = ["ingress"]
+
+[[test]]
+name = "audit_memory"
+required-features = ["ingress"]
+
+[[test]]
+name = "roll_forward"
+required-features = ["ingress"]
+
+[[test]]
+name = "chainspec"
+required-features = ["ingress"]
+
+[lints]
+workspace = true

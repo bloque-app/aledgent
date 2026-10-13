@@ -1,0 +1,64 @@
+---
+title: Getting started
+description: Authenticate, send a transfer, and follow it to its decision.
+sidebar:
+  order: 1
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+<Aside type="caution" title="Prototype">
+This page is a stub of the public documentation. The request and reply shapes below are ingress's,
+from its OpenAPI document; the onboarding steps around them are not written yet.
+</Aside>
+
+aledgent is reached through one HTTP service, **ingress**. Every route needs a bearer credential,
+except the two under `/v1/auth`, which check what their body carries. Amounts are decimal-integer
+strings of minor units, identifiers are `did:aledgent:` strings, and times are milliseconds since
+the Unix epoch.
+
+<Steps>
+
+1. **Get a credential.** A principal presents a bearer token: an API key registered for its
+   identity, or a session from a passkey sign-in (`POST /v1/auth/challenge`, then
+   `POST /v1/auth/passkey`).
+
+2. **Send a transfer**, with a client key of your own:
+
+   ```sh
+   curl -X POST "$INGRESS/v1/transfers" \
+     -H "Authorization: Bearer $TOKEN" \
+     -H "client-key: payout-2026-10-13-0042" \
+     -H "content-type: application/json" \
+     -d '{"legs":[{"from":"did:aledgent:acct:…","to":"did:aledgent:acct:…","asset":"TSTA","amount":"125000"}],
+          "reference":{"invoice":"inv-8812"}}'
+   ```
+
+3. **Read the acknowledgement.** By default a transfer is acknowledged at `Received`, with `202`:
+
+   ```json
+   {
+     "operation_reference": "did:aledgent:op:…",
+     "state": "Received",
+     "class": "open-non-refunding",
+     "terminal": false,
+     "client_key": "payout-2026-10-13-0042",
+     "client_key_derived": false,
+     "reference": { "invoice": "inv-8812" }
+   }
+   ```
+
+   This is an acknowledgement, not an outcome: nothing is decided yet and no balance has changed.
+   `reference` is your own pass-through data, echoed back; it is not the operation reference.
+
+4. **Learn the decision** by notification, or by reading the operation:
+   `GET /v1/operations/{reference}`. See [The operation lifecycle](../../concepts/operation-lifecycle/)
+   for what each state means and what you are expected to do in it.
+
+</Steps>
+
+## Next
+
+- [The operation lifecycle](../../concepts/operation-lifecycle/): the states a caller sees, client
+  keys, and refusals.
+- [API reference](../../api/): every route ingress serves, generated from its OpenAPI document.

@@ -1,0 +1,75 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+name: Docs site
+
+# The public documentation site (site/, Starlight). Builds on every PR that touches it or the
+# ingress OpenAPI document the API reference is generated from; deploys to GitHub Pages from main.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - "services/ingress/openapi.json"
+      - ".github/workflows/docs.yml"
+  pull_request:
+    paths:
+      - "site/**"
+      - "services/ingress/openapi.json"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.ref }}
+  # A newer push supersedes a PR build; never cancel a deploy in flight.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: site
+    env:
+      # GitHub Pages serves a project site under /<repo>/.
+      SITE_URL: https://bloque-app.github.io
+      SITE_BASE: /aledgent/
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - name: Upload the site for Pages
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/dist
+
+  # Deploys only from the public repository. While aledgent is private this job is skipped, so a
+  # push to main cannot publish the site by accident (`visibility` is absent or 'private' then, and
+  # either fails the comparison). Pages must be set to deploy from "GitHub Actions".
+  deploy:
+    name: deploy
+    needs: build
+    if: >-
+      github.event_name != 'pull_request' &&
+      github.ref == 'refs/heads/main' &&
+      github.repository == 'bloque-app/aledgent' &&
+      github.event.repository.visibility == 'public'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

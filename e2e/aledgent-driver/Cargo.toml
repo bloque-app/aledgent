@@ -1,0 +1,37 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+[package]
+name = "aledgent-e2e-driver"
+version = "0.1.0"
+description = "The zombienet suite's aledgent driver (T-026-04, T-027-06), and the stress harness (F-032): step 3 and the fault cases through ingress, the in-process core and the settlement adapter's own process (the aledgent-settle binary, its PostgreSQL store, its light client), against the suite's Kreivo."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "aledgent-e2e-driver"
+path = "src/main.rs"
+
+[dependencies]
+# The adapter's configuration and test constants (F-016, F-027), and its in-process deployment kit:
+# ingress and the core as the adapter's own tests run them. The adapter itself runs as its binary.
+settle = { path = "../../services/settle" }
+ingress = { path = "../../services/ingress", default-features = false }
+ledger-core = { path = "../../crates/ledger-core" }
+# Ingress's surface over HTTP, for the adapter's process.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+# The stress harness (F-032): ingress over HTTP, API keys, and a software passkey (test only).
+authn = { path = "../../crates/authn", features = ["testing"] }
+base64 = "0.22"
+getrandom = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+sha2 = "0.10"
+hex = "0.4"
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process", "net", "io-util", "fs"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "std"] }
+
+[lints]
+workspace = true

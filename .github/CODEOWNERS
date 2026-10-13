@@ -1,0 +1,17 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Who reviews what (GOVERNANCE.md), in the public repository bloque-app/aledgent. The teams must exist
+# in bloque-app.
+
+*                       @bloque-app/aledgent-maintainers
+
+# The specification and its amendments: the spec owner rules on them.
+/SPEC.md                @bloque-app/aledgent-spec-owner
+/amendments/            @bloque-app/aledgent-spec-owner
+/GOVERNANCE.md          @bloque-app/aledgent-spec-owner
+
+# Licensing: the licence boundary between agents/ (AGPL) and the rest.
+/docs/oss/              @bloque-app/aledgent-spec-owner
+/REUSE.toml             @bloque-app/aledgent-maintainers
+/LICENSES/              @bloque-app/aledgent-spec-owner
+/tools/ci/check-no-vos.sh @bloque-app/aledgent-spec-owner

@@ -1,0 +1,33 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# F-002 S2, S3 (guest) and S4: drives VOS saga's standard AgentRuntime
+# (vosx/blobs/agent_runtime.pvm) through its canonical runtime ABI, as the
+# Local Agent host does, and records the host's own debug fields. Never
+# shipped. Links VOS, which is AGPL-3.0-or-later; this is measurement tooling
+# that is never distributed. Built inside the Linux container with VOS saga
+# 7bae926 mounted at /vos (spikes/README.md).
+[workspace]
+
+[package]
+name = "vos-host"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/bloque-app/aledgent"
+
+[dependencies]
+vos = { path = "/vos/vos" }
+vos-pvm = { path = "/vos/pvm/runtime" }
+vos-pvm-compiler = { path = "/vos/pvm/compiler" }
+vos-pvm-program = { path = "/vos/pvm/program" }
+curve25519-dalek = "4.1"
+ed25519-dalek = { version = "2", default-features = false, features = ["zeroize"] }
+
+[profile.release]
+debug = false
+
+[lints.rust]
+# `run.sh` sets `vos_declared` when the mounted VOS has declared actor resources,
+# and `vos_backends` when it has explicit Refine engine selection (VOS 0005).
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(vos_declared)", "cfg(vos_backends)"] }

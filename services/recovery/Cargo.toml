@@ -1,0 +1,29 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+[package]
+name = "recovery"
+version = "0.1.0"
+description = "The recovery-authority service of DEC-13: it holds the recovery key, apart from the core, and does one thing, approving a recovery (F-012, REQ-AU-15)."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The approval message and the types it binds, defined once, in the library (F-012). No
+# conformance ports, no simulator: this crate never touches a book.
+ledger-core = { path = "../../crates/ledger-core" }
+# `signing` gives the Schnorr signature over Ristretto the library verifies (F-012).
+cipher-clerk = { workspace = true, features = ["signing"] }
+# Nonces are derived from the key and the message: no host randomness.
+rand_chacha = { version = "0.3", default-features = false }
+rand_core = { version = "0.6", default-features = false }
+zeroize = { version = "1", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"
+ledger-kernel = { path = "../../crates/ledger-kernel" }
+
+[lints]
+workspace = true

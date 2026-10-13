@@ -1,0 +1,270 @@
+From b9f6d31c219e1ccdfdb21cee1656565f0cac7dad Mon Sep 17 00:00:00 2001
+From: Pablo Dorado <pablo@bloque.team>
+Date: Wed, 23 Sep 2026 13:54:08 -0500
+Subject: [PATCH 2/2] feat(kernel): refuse an entry whose ledger differs from
+ its account's
+
+The zero-sum invariant groups entries by their own `(ledger, layer)`,
+and nothing compared `entry.ledger` with the ledger of the account the
+entry posts to. A transfer could label both legs USD while crediting a
+EUR account: the (USD, Settled) group balances, the kernel accepts it,
+and value crosses currencies at a rate nobody signed.
+
+After loading the touched accounts, the kernel now checks every entry's
+`ledger` against its account's and refuses a mismatch with the new
+`EventStatus::EntryLedgerMustMatchAccount` (44, in the cross-field
+consistency block). `TransferBuilder` already copies `account.ledger`
+into each entry, so builder-made transfers are unaffected; the check
+catches hand-built entries. The shadow model in `proptest_shadow`
+mirrors the check.
+
+Tests: `tests/kernel_entry_currency.rs` (mismatch on the credit leg,
+on the debit leg, the matching case, and the builder case).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CHANGELOG.md                   |  12 +++
+ src/error.rs                   |   5 ++
+ src/kernel/apply.rs            |  14 ++++
+ tests/kernel_entry_currency.rs | 148 +++++++++++++++++++++++++++++++++
+ tests/proptest_shadow.rs       |   5 ++
+ 5 files changed, 184 insertions(+)
+ create mode 100644 tests/kernel_entry_currency.rs
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 119dd2b..780f12b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,18 @@ versions follow [SemVer](https://semver.org/) once we hit 1.0.
+ 
+ ## Unreleased — v0.1.x track
+ 
++### Added — the kernel checks an entry's currency against its account's
++
++`apply_batch` refuses a transfer when any entry's `ledger` differs from
++the `ledger` of the account it posts to, with the new
++`EventStatus::EntryLedgerMustMatchAccount` (44). The zero-sum invariant
++groups entries by their own `(ledger, layer)`, so before this a
++hand-built transfer could label both legs USD while crediting a EUR
++account: the USD group balanced and value crossed currencies.
++`TransferBuilder` already copies `account.ledger` into each entry, so
++transfers built with it are unaffected. The check runs after the
++accounts are loaded and before the closure and signature checks.
++
+ ### Changed — randomness is a parameter; `OsRng` moves to `os-rng`
+ 
+ `signing` no longer enables `rand_core/getrandom`, so it builds for
+diff --git a/src/error.rs b/src/error.rs
+index c90a66c..abce74f 100644
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -47,6 +47,11 @@ pub enum EventStatus {
+     EntryLedgerMismatch = 41,
+     LayerMismatchWithPending = 42,
+     VoidEntriesMustMirror = 43,
++    /// An entry's `ledger` (currency) differs from the `ledger` of the
++    /// account it posts to. Without this check the per-`(ledger, layer)`
++    /// zero-sum could be satisfied by labelling both legs with one
++    /// currency while the accounts hold two.
++    EntryLedgerMustMatchAccount = 44,
+ 
+     // ----- crypto -----
+     InvalidSignature = 60,
+diff --git a/src/kernel/apply.rs b/src/kernel/apply.rs
+index c18bd57..f294907 100644
+--- a/src/kernel/apply.rs
++++ b/src/kernel/apply.rs
+@@ -281,6 +281,20 @@ fn apply_one<L: LedgerState, W: Oracle>(
+         }
+     }
+ 
++    // ----- currency: every entry posts in its account's ledger -----
++    // The zero-sum above is per `(ledger, layer)` over the entries'
++    // own `ledger` fields; it only means "balanced per currency" if
++    // those fields are the accounts' currencies.
++    for e in &event.entries {
++        let acct = loaded
++            .iter()
++            .find(|a| a.id == e.account_id)
++            .expect("loaded above");
++        if e.ledger != acct.ledger {
++            return EventStatus::EntryLedgerMustMatchAccount;
++        }
++    }
++
+     // ----- closure check, collect debited accounts (signing key set) -----
+     let mut debited: Vec<&crate::types::Account> = Vec::new();
+     let mut credited: Vec<crate::ids::AccountId> = Vec::new();
+diff --git a/tests/kernel_entry_currency.rs b/tests/kernel_entry_currency.rs
+new file mode 100644
+index 0000000..879c203
+--- /dev/null
++++ b/tests/kernel_entry_currency.rs
+@@ -0,0 +1,148 @@
++//! An entry posts in its account's currency: `entry.ledger` must equal
++//! the `ledger` of the account it touches.
++//!
++//! The zero-sum check groups entries by their own `(ledger, layer)`.
++//! Without this check, a transfer could label both legs USD while the
++//! credited account holds EUR: the USD group balances, and value moves
++//! between currencies at a rate nobody signed up for.
++
++#![cfg(feature = "helpers")]
++
++use cipher_clerk::helpers::{MemLedger, MemOracle};
++use cipher_clerk::prelude::*;
++
++const USD: u32 = 840;
++const EUR: u32 = 978;
++
++struct Book {
++    ledger: MemLedger,
++    oracle: MemOracle,
++    journal: JournalId,
++    alice: Account,
++    alice_kp: Keypair,
++    bob_usd: Account,
++    carol_eur: Account,
++    carol_kp: Keypair,
++}
++
++/// Alice holds USD; Bob holds USD; Carol holds EUR. One journal.
++fn book() -> Book {
++    let mut ledger = MemLedger::new();
++    let mut oracle = MemOracle::new();
++    let registrar = Keypair::generate();
++    let journal = ledger.bootstrap_journal(registrar.public, 1);
++    let alice_kp = Keypair::generate();
++    let bob_kp = Keypair::generate();
++    let carol_kp = Keypair::generate();
++    let alice = Account::asset(journal, alice_kp.public, USD, 100);
++    let bob_usd = Account::liability(journal, bob_kp.public, USD, 200);
++    let carol_eur = Account::liability(journal, carol_kp.public, EUR, 200);
++    let r = cipher_clerk::apply_account_creations(
++        &mut ledger,
++        &[
++            CreateAccount::signed(alice.clone(), &registrar.secret),
++            CreateAccount::signed(bob_usd.clone(), &registrar.secret),
++            CreateAccount::signed(carol_eur.clone(), &registrar.secret),
++        ],
++        &mut oracle,
++        500_000,
++    );
++    for s in &r {
++        assert_eq!(s.status, EventStatus::Created);
++    }
++    Book {
++        ledger,
++        oracle,
++        journal,
++        alice,
++        alice_kp,
++        bob_usd,
++        carol_eur,
++        carol_kp,
++    }
++}
++
++/// A two-leg transfer whose entries carry the given ledgers, whatever
++/// the accounts hold.
++fn two_legs(
++    b: &mut Book,
++    debit: (&Account, u32),
++    credit: (&Account, u32),
++    signer: &SecretKey,
++) -> Transfer {
++    let amount = b.oracle.commit(100);
++    let id = TransferId::random();
++    let entries = vec![
++        Entry::debit(
++            EntryId::random(),
++            id,
++            b.journal,
++            debit.0.id,
++            Layer::Settled,
++            amount,
++            debit.1,
++            debit.0.code,
++        ),
++        Entry::credit(
++            EntryId::random(),
++            id,
++            b.journal,
++            credit.0.id,
++            Layer::Settled,
++            amount,
++            credit.1,
++            credit.0.code,
++        ),
++    ];
++    Transfer::draft(id, b.journal, entries).signed_by(&[signer])
++}
++
++#[test]
++fn credit_leg_in_another_currency_is_refused() {
++    let mut b = book();
++    let (alice, carol) = (b.alice.clone(), b.carol_eur.clone());
++    let signer = b.alice_kp.secret.clone();
++    // Both legs say USD, so the (USD, Settled) group balances; Carol's
++    // account is EUR.
++    let t = two_legs(&mut b, (&alice, USD), (&carol, USD), &signer);
++    let tid = t.id;
++    let r = cipher_clerk::apply_batch(&mut b.ledger, &[t], &mut b.oracle, 1_000_000);
++    assert_eq!(r[0].status, EventStatus::EntryLedgerMustMatchAccount);
++    assert!(b.ledger.get_transfer(&tid, &mut b.oracle).is_none());
++}
++
++#[test]
++fn debit_leg_in_another_currency_is_refused() {
++    let mut b = book();
++    let (carol, bob) = (b.carol_eur.clone(), b.bob_usd.clone());
++    let signer = b.carol_kp.secret.clone();
++    // Carol (EUR) is debited on an entry labelled USD.
++    let t = two_legs(&mut b, (&carol, USD), (&bob, USD), &signer);
++    let r = cipher_clerk::apply_batch(&mut b.ledger, &[t], &mut b.oracle, 1_000_000);
++    assert_eq!(r[0].status, EventStatus::EntryLedgerMustMatchAccount);
++}
++
++#[test]
++fn entries_in_their_accounts_currency_are_accepted() {
++    let mut b = book();
++    let (alice, bob) = (b.alice.clone(), b.bob_usd.clone());
++    let signer = b.alice_kp.secret.clone();
++    let t = two_legs(&mut b, (&alice, USD), (&bob, USD), &signer);
++    let r = cipher_clerk::apply_batch(&mut b.ledger, &[t], &mut b.oracle, 1_000_000);
++    assert_eq!(r[0].status, EventStatus::Created);
++}
++
++#[test]
++fn builder_transfers_carry_the_accounts_currency() {
++    // The builder copies `account.ledger` into each entry, so a
++    // cross-currency builder transfer fails the zero-sum, not the new
++    // check: the new check only catches hand-built entries.
++    let mut b = book();
++    let amount = b.oracle.commit(100);
++    let t = Transfer::builder(b.journal)
++        .debit(&b.alice, Layer::Settled, amount)
++        .credit(&b.carol_eur, Layer::Settled, amount)
++        .signed_with(&[(&b.alice, &b.alice_kp.secret)]);
++    let r = cipher_clerk::apply_batch(&mut b.ledger, &[t], &mut b.oracle, 1_000_000);
++    assert_eq!(r[0].status, EventStatus::UnbalancedTransfer);
++}
+diff --git a/tests/proptest_shadow.rs b/tests/proptest_shadow.rs
+index 1709394..6d34ff9 100644
+--- a/tests/proptest_shadow.rs
++++ b/tests/proptest_shadow.rs
+@@ -228,6 +228,11 @@ fn shadow_apply(shadow: &mut Shadow, t: &PlainTransfer) -> EventStatus {
+             return EventStatus::AccountsMustHaveSameJournal;
+         }
+     }
++    for e in &t.entries {
++        if shadow.accounts[&e.account_id.0].ledger != e.ledger {
++            return EventStatus::EntryLedgerMustMatchAccount;
++        }
++    }
+     for e in &t.entries {
+         let a = &shadow.accounts[&e.account_id.0];
+         if a.flags.contains(AccountFlags::CLOSED) {
+-- 
+2.41.0
+

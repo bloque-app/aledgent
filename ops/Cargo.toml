@@ -1,0 +1,71 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+[package]
+name = "ops"
+version = "0.1.0"
+description = "aledgent operations (F-018): backup jobs, the restore procedure and its drill, the signal exporter, alert rules and their evaluation, and the daily reconciliation of NFR-9."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "opsctl"
+path = "src/bin/opsctl.rs"
+
+[features]
+default = ["postgres"]
+# The PostgreSQL stores of ingress and the adapter, for the restore of their received-log and
+# records.
+postgres = ["ingress/postgres", "settle/postgres"]
+# v1 roots (CipherClerk's full-depth tree): a supported opt-in beside the default v2 (DEC-25,
+# owner ruling cs-q04). A deployment chooses its roots at genesis and builds every binary of it,
+# the core host and the core's guest included, with the same choice (deploy/docker: ROOTS=v1).
+smt-v1 = ["ledger-kernel/smt-v1", "ledger-core/smt-v1", "leaf-store/smt-v1", "core-binding/smt-v1", "ingress/smt-v1", "settle/smt-v1"]
+
+[dependencies]
+# The book: export and import (F-014), re-derivation, the commitment checks, the privileged-read
+# mechanism for the external source of axis 1 (F-013). Never with `conformance-ports`
+# (REQ-CS-5; tools/ci/check-conformance-ports.sh).
+ledger-core = { path = "../crates/ledger-core", features = ["serde"] }
+ledger-kernel = { path = "../crates/ledger-kernel", features = ["std"] }
+# F-006's leaf store: rebuilt from the delta log after a restore, and by axis 1's rebuild check.
+leaf-store = { path = "../crates/leaf-store" }
+# F-013's audit store: backed up by copy, and the sink of every privileged read here.
+audit-store = { path = "../crates/audit-store" }
+# F-005's Agent core: its host's log, the native replay a restore checks the archive with
+# (core_binding::host::replay_in), and the off-node archive itself (T-005-15, T-005-16). No VOS.
+core-binding = { path = "../crates/core-binding", features = ["ingress"] }
+core-archive = { path = "../crates/core-archive" }
+# F-009's boundary, received-log and in-process core; F-016's adapter and its store.
+ingress = { path = "../services/ingress", default-features = false }
+# F-035: the core's keys behind the signer service, for the restore and the drill.
+signer = { path = "../services/signer", default-features = false }
+settle = { path = "../services/settle", default-features = false }
+# F-017's verifier: the anchor commitment, and the settlement layer's public read of anchors for
+# the drill's INV-19 check (over a node's RPC in opsctl).
+verify = { path = "../crates/verify", features = ["rpc"] }
+cipher-clerk = { workspace = true }
+curve25519-dalek = { version = "4.1", default-features = false, features = ["alloc", "precomputed-tables", "zeroize"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+chacha20poly1305 = "0.10"
+getrandom = "0.3"
+hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "fs", "net", "signal"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "std"] }
+zeroize = "1"
+
+[dev-dependencies]
+tempfile = "3"
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
+
+[lints]
+workspace = true

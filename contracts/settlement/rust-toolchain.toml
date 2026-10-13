@@ -1,0 +1,11 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# `cargo-contract` 5.0.3 builds `core` for WASM with `-Zbuild-std-features=panic_immediate_abort`.
+# From Rust 1.92 that feature is a compile error ("panic_immediate_abort is now a real panic
+# strategy"), so this contract builds with 1.91, the last release that accepts it. The root
+# workspace keeps `stable`. See `features/F-026-settlement-contract/NOTES.md`.
+[toolchain]
+channel = "1.91"
+components = ["rust-src", "rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]
+profile = "minimal"

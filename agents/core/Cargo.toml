@@ -1,0 +1,80 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# The core Agent actor (F-005). Links VOS: AGPL-3.0-or-later (agents/Cargo.toml).
+#
+# Its own workspace, as VOS's own actors are: it builds for the guest target `riscv64em-vos` with
+# the canonical guest toolchain (rust-toolchain.toml) and `cargo actor` (.cargo/config.toml, the
+# scaffolding `vosx actor new` writes). `agents/core-host package` links and signs it.
+[workspace]
+
+[package]
+name = "aledgent-core"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/bloque-app/aledgent"
+
+[features]
+# v1 roots (CipherClerk's full-depth tree): a supported opt-in beside the default v2 (DEC-25,
+# owner ruling cs-q04). Host and guests must agree: build both with it or neither.
+smt-v1 = ["core-binding/smt-v1"]
+default = ["bin", "full"]
+bin = []
+# Every command group of the library: the core. Without it, the reservation path only
+# (identities, accounts, authority, issuance, reserve, capture, release, transfers, the lifecycle
+# tick). Neither fits the pinned runtime's 1 280 KiB program limit: a 1 969 952 B package with every
+# group, 1 453 878 B without (NOTES.md, proposals/vos/0003).
+full = ["core-binding/full"]
+# The library's raw lifecycle ports as calls: the conformance suite's Agent package only, never
+# the production one (REQ-CS-5).
+conformance-ports = ["core-binding/conformance-ports"]
+# Layout 3, the book in the Agent's committed maps (`F-031` lever 2): adds to the program, so only
+# the packages that measure or run it link it (the x86 bench's `mapped-timing`).
+mapped = ["core-binding/mapped"]
+# CipherClerk's curve arithmetic through VOS's precompiles 110-114 (`pvm-precompile`, with the
+# current shim, proposals/cipherclerk/0005), for a runtime with VOS's `native-curve`, which is
+# outside JAM (proposals/vos/0010, 0012). Off: the JAM-compatible guest does its curve arithmetic
+# in software, which costs less than the runtime's in-guest service of 110-114.
+native-curve = ["cipher-clerk/pvm-precompile"]
+# A larger guest heap (VOS's `actor-heap-*`, a static arena, no host call: JAM-compatible): the core
+# Agent's 256 KiB default holds a seed chunk of about ten records, since a chunk's witness brings every
+# leaf its records create (`F-036`). Opt-in, pending the owner's ruling
+# (amendment 0022 `a0022-q5`).
+heap-4m = ["vos/actor-heap-4m"]
+heap-16m = ["vos/actor-heap-16m"]
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+# CipherClerk in the guest hashes with VOS's BLAKE2b (proposals/cipherclerk/0003: about a third of
+# the gas of the `blake2` crate's per hash, the same digests, guest code only) and does its curve
+# arithmetic in software, unless the `native-curve` feature (outside JAM) asks for VOS's precompiles.
+cipher-clerk = { git = "https://codeberg.org/Virto/CipherClerk.git", rev = "e9a7b0851f183c14dbd1635dbf0437c86682ad6f", default-features = false, features = ["vos-blake2b"] }
+vos = { git = "https://codeberg.org/pandres95/VOS.git", rev = "c54fc1ff13fcd55b86f2cf4edc77b041b62e245f", default-features = false, features = ["macros", "pvm"] }
+
+[target.'cfg(not(target_arch = "riscv64"))'.dependencies]
+vos = { git = "https://codeberg.org/pandres95/VOS.git", rev = "c54fc1ff13fcd55b86f2cf4edc77b041b62e245f", default-features = false, features = ["macros", "extension"] }
+
+[dependencies]
+# Everything the Agent decides (Apache-2.0 OR MIT, no VOS).
+core-binding = { path = "../../crates/core-binding", default-features = false }
+
+# CipherClerk e9a7b08 with proposals/cipherclerk/0001 (tools/cipherclerk-patched.sh): `signing`
+# builds for the guest only with it. TODO(F-025): the upstream commit once 0001 is merged.
+[patch."https://codeberg.org/Virto/CipherClerk.git"]
+cipher-clerk = { path = "../../.cipherclerk-patched" }
+
+# The guest: optimised for size, whole-program LTO, abort on panic (owner ruling `core-opt-s`,
+# 2026-10-08). At `3` the program is 4.45-4.55 MB: over VOS's 4 MiB prepared-program cache
+# (`MAX_CACHED_INNER_PROGRAM_BYTES`, pvm/runtime/src/inner.rs), so the host re-prepared it on every
+# invocation, about 83 % of each input's time, and over JAM's `WC` = 4,000,000-octet service code
+# limit. `s` must keep it under 4,000,000 bytes; measured `s` against `3` on the same x86 CPU: about
+# 140 against 22 records/s (F-036). History: `z` while the runtime hashed the
+# program per invocation, then `3` (proposals/vos/0006-0009).
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
+codegen-units = 1

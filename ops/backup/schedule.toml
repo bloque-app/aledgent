@@ -1,0 +1,48 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# F-018, T-018-01: the backup schedule of every durable store (plan, "What must survive").
+#
+# Each job has a cadence and a retention (how many verified backups are kept). `opsctl backup due`
+# says which jobs are due; a job's run writes its artifacts and a manifest with each artifact's
+# SHA-256, and a backup that does not verify is not counted.
+#
+# Cadences are durations: a number and one of s, m, h, d.
+
+# The core: the F-014 export (the accepted proposal: export-first), the in-process core's sidecar,
+# and the openings sealed under the KMS's sealing key. The core Agent (F-005) is not backed up on a
+# cadence: its host streams every decision to the off-node archive (`aledgent-core-host serve
+# --archive`, T-005-15), and the exporter reads the archive's status as the core's backup
+# (ops/runbooks/release/core-archive.md).
+[[job]]
+store = "core"
+cadence = "1h"
+retain = 72
+
+# Ingress: the received-log, delivery attempts and recipients. A base backup daily; the WAL
+# archive runs continuously (`archive_command`, `archive_timeout = 60s`), and the job forces a
+# segment switch and checks the archiver at the cadence below.
+[[job]]
+store = "ingress"
+cadence = "24h"
+retain = 14
+wal_cadence = "5m"
+
+# The settlement adapter: instructions, extrinsics, cursors and gaps. The same as ingress; its own
+# database and role (F-016).
+[[job]]
+store = "adapter"
+cadence = "24h"
+retain = 14
+wal_cadence = "5m"
+
+# The audit trail: a verified copy of its append-only segments (F-013). The store never removes a
+# record; retention past NFR-6's period is its own.
+[[job]]
+store = "audit"
+cadence = "1h"
+retain = 72
+
+# Stores the plan's table gives no backup of their own.
+[excluded]
+leaf-store = "rebuilt from the committed delta log (DEC-4, F-006)"
+keys = "the KMS's or HSM's own backup; never in these backups (NFR-8)"

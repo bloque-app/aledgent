@@ -1,0 +1,34 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+[package]
+name = "core-archive"
+version = "0.1.0"
+description = "The core Agent's off-node archive (F-005, T-005-15 to T-005-18): every committed decision of the core host streamed to an object store (S3 with Object Lock and KMS, or a directory), checkpoints of the Agent's runtime state, and the verified read-back a restore lays out on a fresh node."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The host's log (archive.bin, replies.jsonl) and its entries; no VOS.
+core-binding = { path = "../core-binding", features = ["ingress"] }
+ingress = { path = "../../services/ingress", default-features = false }
+ledger-core = { path = "../ledger-core", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+base64 = "0.22"
+# S3 asks a locked upload for its MD5 as well as its checksum.
+md-5 = "0.10"
+# S3 over HTTPS, blocking: the archiver is a thread of its own, never the core's async runtime.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,140 @@
+From 07c53c23ebb7d9c5bffa9c44f83f57126de2ad16 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Pablo=20Andr=C3=A9s=20Dorado=20Su=C3=A1rez?=
+ <hola@pablodorado.com>
+Date: Sat, 3 Oct 2026 13:59:29 -0500
+Subject: [PATCH 3/5] perf(crypto): hash with VOS's BLAKE2b behind vos-blake2b
+
+On a VOS PVM guest, blake2b_256 and blake2b_512 dominate a kernel
+transition: a reservation in aledgent's core hashes about 8 470 times
+(sparse-Merkle paths), and the blake2 crate's compression plus the digest
+wrapper's per-hash buffer copies cost about 16 k gas a one-block hash.
+The new vos-blake2b feature routes both through vos_protocol::blake2b: a
+compression scheduled for the PVM's 13 registers and 25-cycle memory
+accesses (or VOS's precompile 100 where the runtime serves it), streaming
+whole blocks in place. Off the guest it is blake2b_simd. The digests are
+the blake2 crate's (tests/vos_blake2b.rs at every block boundary).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Cargo.toml           |  6 ++++++
+ src/crypto/hash.rs   | 24 ++++++++++++++++++++----
+ tests/vos_blake2b.rs | 35 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 61 insertions(+), 4 deletions(-)
+ create mode 100644 tests/vos_blake2b.rs
+
+diff --git a/Cargo.toml b/Cargo.toml
+index f52388b..417c2a8 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -75,6 +75,10 @@ roadmap = ["viewing-keys", "voucher", "disclosure", "settlement", "notes"]
+ # computation.  On non-PVM builds the shim falls through to dalek
+ # via host-fallback, so the same code path runs in tests.
+ pvm-precompile = ["dep:zkpvm-precompiles"]
++# VOS's BLAKE2b (vos-protocol): on a PVM guest, a compression scheduled for the
++# PVM's 13 registers and 25-cycle memory accesses, about a third of the gas of
++# the `blake2` crate's per hash; the same digests everywhere.
++vos-blake2b = ["dep:vos-protocol"]
+ 
+ [dependencies]
+ rkyv = { version = "0.8", default-features = false, features = ["alloc", "bytecheck", "little_endian", "pointer_width_32"] }
+@@ -99,6 +103,8 @@ bech32 = { version = "0.11", default-features = false, features = ["alloc"], opt
+ # non-PVM builds the shim's typed API falls through to dalek, so the same code
+ # path runs in tests. Enabled by the `pvm-precompile` feature.
+ zkpvm-precompiles = { git = "https://codeberg.org/Virto/VOS.git", rev = "9f5337fb39ccad5b779cf72cbd617e726e325aed", optional = true }
++# VOS's protocol primitives (no_std), for `vos-blake2b`.
++vos-protocol = { git = "https://codeberg.org/pandres95/VOS.git", rev = "6c794311ba506092be114ff5344fef4e338a8a85", optional = true }
+ 
+ [dev-dependencies]
+ proptest = "1"
+diff --git a/src/crypto/hash.rs b/src/crypto/hash.rs
+index 9d44a4e..7e5fe7e 100644
+--- a/src/crypto/hash.rs
++++ b/src/crypto/hash.rs
+@@ -7,11 +7,19 @@ pub type Blake2b512 = Blake2b<U64>;
+ /// Domain-separated 32-byte blake2b hash. Useful for hashing rkyv
+ /// archived bytes into Merkle node hashes or message digests.
+ pub fn blake2b_256(domain: &[u8], parts: &[&[u8]]) -> [u8; 32] {
+-    #[cfg(feature = "pvm-precompile")]
++    // VOS's BLAKE2b: on a PVM guest a compression scheduled for the 13-register
++    // PVM (or VOS's precompile 100 where the runtime serves it), streaming the
++    // input without the digest wrapper's per-hash buffer copies; elsewhere
++    // blake2b_simd. The same digest as the `blake2` crate.
++    #[cfg(feature = "vos-blake2b")]
++    {
++        return vos_protocol::blake2b::digest::<32>(domain, parts);
++    }
++    #[cfg(all(feature = "pvm-precompile", not(feature = "vos-blake2b")))]
+     {
+         return zkpvm_precompiles::blake2b_hash::<32>(domain, parts);
+     }
+-    #[cfg(not(feature = "pvm-precompile"))]
++    #[cfg(not(any(feature = "pvm-precompile", feature = "vos-blake2b")))]
+     {
+         let mut h = Blake2b256::new();
+         h.update(domain);
+@@ -29,11 +37,19 @@ pub fn blake2b_256(domain: &[u8], parts: &[&[u8]]) -> [u8; 32] {
+ /// challenge derivation and hash-to-curve where wide reduction matters;
+ /// exposed for users building compatible signing or commitment helpers.
+ pub fn blake2b_512(domain: &[u8], parts: &[&[u8]]) -> [u8; 64] {
+-    #[cfg(feature = "pvm-precompile")]
++    // VOS's BLAKE2b: on a PVM guest a compression scheduled for the 13-register
++    // PVM (or VOS's precompile 100 where the runtime serves it), streaming the
++    // input without the digest wrapper's per-hash buffer copies; elsewhere
++    // blake2b_simd. The same digest as the `blake2` crate.
++    #[cfg(feature = "vos-blake2b")]
++    {
++        return vos_protocol::blake2b::digest::<64>(domain, parts);
++    }
++    #[cfg(all(feature = "pvm-precompile", not(feature = "vos-blake2b")))]
+     {
+         return zkpvm_precompiles::blake2b_hash::<64>(domain, parts);
+     }
+-    #[cfg(not(feature = "pvm-precompile"))]
++    #[cfg(not(any(feature = "pvm-precompile", feature = "vos-blake2b")))]
+     {
+         let mut h = Blake2b512::new();
+         h.update(domain);
+diff --git a/tests/vos_blake2b.rs b/tests/vos_blake2b.rs
+new file mode 100644
+index 0000000..b3b93bd
+--- /dev/null
++++ b/tests/vos_blake2b.rs
+@@ -0,0 +1,35 @@
++//! `blake2b_256` / `blake2b_512` give the `blake2` crate's digests whichever backend the
++//! features select (with `vos-blake2b`, VOS's `vos_protocol::blake2b`).
++use blake2::digest::consts::{U32, U64};
++use blake2::{Blake2b, Digest};
++use cipher_clerk::crypto::{blake2b_256, blake2b_512};
++
++fn reference<D: Digest>(domain: &[u8], parts: &[&[u8]]) -> Vec<u8> {
++    let mut h = D::new();
++    h.update(domain);
++    for p in parts {
++        h.update(p);
++    }
++    h.finalize().to_vec()
++}
++
++#[test]
++fn digests_match_the_blake2_crate_at_every_block_boundary() {
++    let data: Vec<u8> = (0..1000u32).map(|i| (i * 37 + 11) as u8).collect();
++    for len in [0, 1, 63, 64, 103, 104, 105, 127, 128, 129, 255, 256, 257, 640, 1000] {
++        for split in [0, len / 3, len] {
++            let (a, b) = data[..len].split_at(split);
++            let domain = b"cipher-clerk/smt/node/v1";
++            assert_eq!(
++                blake2b_256(domain, &[a, b]).to_vec(),
++                reference::<Blake2b<U32>>(domain, &[a, b]),
++                "256, len {len}, split {split}"
++            );
++            assert_eq!(
++                blake2b_512(domain, &[a, b]).to_vec(),
++                reference::<Blake2b<U64>>(domain, &[a, b]),
++                "512, len {len}, split {split}"
++            );
++        }
++    }
++}
+-- 
+2.41.0
+

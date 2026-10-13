@@ -1,0 +1,35 @@
+running 1 test
+test agent::state_block_pvm::lifecycle_tests::f002_external_state_invocation_cost ... s2x s2-transfer-b1: input 1612 B, message 1657 B
+== s2x s2-transfer-b1 kernel ==
+  caller us (invoke + ack, excl. staging): n=1000 p50=969214 p95=1009470 p99=1058166 max=1653389
+  invoke elapsed_us: n=1000 p50=854257 p95=885995 p99=917986 max=1399109
+  invoke runtime gas: n=1000 p50=449811698 p95=452149690 p99=452370462 max=452500168
+  actor gas: n=1000 p50=40744557 p95=40744755 p99=40744755 max=40744755
+== s2x s2-transfer-b1 noop ==
+  caller us (invoke + ack, excl. staging): n=200 p50=911777 p95=935174 p99=946375 max=1003907
+  invoke elapsed_us: n=200 p50=795255 p95=814757 p99=827131 max=889057
+  invoke runtime gas: n=200 p50=409278096 p95=411558903 p99=411717950 max=411936906
+  actor gas: n=200 p50=199768 p95=199768 p99=199768 max=199768
+s2x s2-reserve-new-holding-b1: input 1676 B, message 1721 B
+== s2x s2-reserve-new-holding-b1 kernel ==
+  caller us (invoke + ack, excl. staging): n=1000 p50=986223 p95=1013010 p99=1047011 max=1134976
+  invoke elapsed_us: n=1000 p50=869936 p95=893042 p99=917523 max=1004095
+  invoke runtime gas: n=1000 p50=455299897 p95=457643560 p99=457850362 max=458043680
+  actor gas: n=1000 p50=46118868 p95=46118868 p99=46118868 max=46118868
+== s2x s2-reserve-new-holding-b1 noop ==
+  caller us (invoke + ack, excl. staging): n=200 p50=916870 p95=937986 p99=977823 max=991388
+  invoke elapsed_us: n=200 p50=799586 p95=819601 p99=860001 max=868540
+  invoke runtime gas: n=200 p50=409456493 p95=411689312 p99=411915285 max=411948595
+  actor gas: n=200 p50=201184 p95=201184 p99=201184 max=201184
+s2x s2-reserve-pooled-b1: input 1612 B, message 1657 B
+== s2x s2-reserve-pooled-b1 kernel ==
+  caller us (invoke + ack, excl. staging): n=1000 p50=985655 p95=1010589 p99=1043629 max=1085702
+  invoke elapsed_us: n=1000 p50=869063 p95=889884 p99=919578 max=961348
+  invoke runtime gas: n=1000 p50=449784931 p95=452128221 p99=452362305 max=452493639
+  actor gas: n=1000 p50=40744050 p95=40744050 p99=40744050 max=40744050
+== s2x s2-reserve-pooled-b1 noop ==
+  caller us (invoke + ack, excl. staging): n=200 p50=920300 p95=956453 p99=975855 max=1097596
+  invoke elapsed_us: n=200 p50=804315 p95=837769 p99=862921 max=976813
+  invoke runtime gas: n=200 p50=409324551 p95=411588297 p99=411713315 max=411737623
+  actor gas: n=200 p50=199768 p95=199768 p99=199768 max=199768
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1852 filtered out; finished in 3524.83s

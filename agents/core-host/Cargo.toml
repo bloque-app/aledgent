@@ -1,0 +1,59 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: AGPL-3.0-or-later
+[package]
+name = "core-host"
+version = "0.1.0"
+description = "aledgent's core host (F-005): drives the core Agent through VOS saga's AgentRuntime ABI, keeps the leaf store and builds witnesses, and serves ingress's boundary::Core over a local socket."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "aledgent-core-host"
+path = "src/main.rs"
+
+[features]
+# v1 roots (CipherClerk's full-depth tree): a supported opt-in beside the default v2 (DEC-25,
+# owner ruling cs-q04). Host and guests must agree: build both with it or neither.
+smt-v1 = ["core-binding/smt-v1", "shards/smt-v1", "ledger-kernel/smt-v1", "ledger-core/smt-v1"]
+# F-033: batches as composite invocations of aledgent's runtime (`F033_COMPOSITE`). Needs a VOS with
+# `vos::agent::composite` (fork branch `aledgent/composite-runtime`); the bench enables it when the
+# VOS it builds against has it, and the production image, on `perf/agent-stack`, does not.
+composite = []
+# T-032-11 (stress finding F15): jemalloc as the host's allocator, and its figures in the host's
+# report (`diag`). The system allocator keeps what many threads free in per-thread arenas.
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
+# F-034 (an experiment): `shards --runs native,...`, native decide with the shard Agents replaying
+# every committed round off the critical path.
+native-decide = ["shards/native-decide"]
+
+[dependencies]
+# The binding's host-independent half and its driver (Apache-2.0 OR MIT, no VOS).
+core-binding = { path = "../../crates/core-binding", features = ["std", "ingress"] }
+# The off-node archive: continuous backup and the restore's layout (T-005-15, T-005-16; no VOS).
+core-archive = { path = "../../crates/core-archive" }
+hex = "0.4"
+# The deployment's configuration file and the boundary::Core server (no VOS in ingress).
+ingress = { path = "../../services/ingress", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+ledger-core = { path = "../../crates/ledger-core", features = ["serde"] }
+ledger-kernel = { path = "../../crates/ledger-kernel" }
+# The book in shards (F-031, DEC-22): the shard Agents' host, over this crate's VOS port.
+shards = { path = "../../crates/shards", features = ["net"] }
+# One shard Agent per core (`aledgent-core-host shards`).
+core_affinity = "0.8"
+vos = { workspace = true, features = ["std"] }
+vos-pvm = { workspace = true }
+vos-pvm-compiler = { workspace = true }
+ed25519-dalek = { version = "2", default-features = false, features = ["zeroize"] }
+# The key boundary (F-035): the signer service's client. Every key this host uses is the signer's.
+signer = { path = "../../services/signer", default-features = false }
+tikv-jemallocator = { version = "0.6", optional = true }
+tikv-jemalloc-ctl = { version = "0.6", optional = true, features = ["stats"] }
+
+[lints]
+workspace = true

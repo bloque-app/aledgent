@@ -1,0 +1,48 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# aledgent's AgentRuntime (F-033, DEC-23): VOS's standard runtime with composite invocations, one
+# Linear transition across an Agent's own actors with ordered and exactly-once steps. Links VOS:
+# AGPL-3.0-or-later (agents/Cargo.toml).
+#
+# Its own workspace, as agents/core is: it builds for the guest target `riscv64em-vos` with the
+# canonical guest toolchain and `cargo actor` (.cargo/config.toml), and `aledgent-core-host
+# runtime-pvm` links it. The engine is VOS's (`vos::agent::wire::composite_engine`, fork branch
+# `aledgent/composite-runtime`): the standard runtime's internals are crate-private, so the steps
+# run where they are; this crate is the program an Agent pins, its rules and its public I/O.
+[workspace]
+
+[package]
+name = "aledgent-runtime"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/bloque-app/aledgent"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+# None by default: the JAM-compatible profile (PLAN.md `DEC-16`).
+# Without features this runtime issues only Gray Paper Refine host calls (machine to expunge, 9 to
+# 14), its actor programs travel in the work and are hashed once in the guest, and composite
+# invocations are runtime logic only. The three below are VOS's other profiles, parked because they
+# are outside JAM: `native-curve` and `blake2b-precompile` issue VOS's calls 110-114 and 100 (100 is
+# JIP-1's `log`); `vos-native` looks programs up on Gray Paper call 7, but by ProgramId, which no
+# JAM preimage store holds (GP 0.8.0 eq. 9.5 keys it by the preimage's hash). For comparison only.
+vos-native = ["vos/runtime-program-lookup"]
+blake2b-precompile = ["vos/runtime-blake2b-precompile"]
+native-curve = ["vos/runtime-native-curve"]
+# Commit the public I/O only for work a proof consumes (non-Direct); Direct work gets a constant.
+# Direct executors never read it (VOS vos/src/agent/runtime_pvm.rs, execute_to_halted_output).
+# Off by default: an open question.
+direct-public-io = []
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+vos = { git = "https://codeberg.org/pandres95/VOS.git", rev = "188bf1628934515e2f163bb8b9acdd05a93ff3ee", default-features = false, features = ["agent-runtime", "runtime-composite"] }
+
+# The guest: as VOS's bundled runtime builds.
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"

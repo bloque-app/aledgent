@@ -1,0 +1,85 @@
+diff --git a/agents/core-host/src/driver.rs b/agents/core-host/src/driver.rs
+index 0538515..f8bf65b 100644
+--- a/agents/core-host/src/driver.rs
++++ b/agents/core-host/src/driver.rs
+@@ -38,7 +38,7 @@ use vos::agent_sdk::{
+     RuntimeOutcome, RuntimeState, RuntimeTransition, RuntimeWork, SequencedInvocation, SpaceId,
+ };
+ use vos_pvm::ExitReason;
+-use vos_pvm::refine::{MemoryModel, PreparedProgram};
++use vos_pvm::refine::{MemoryModel, PreparedProgram, RefineBackend};
+ use vos_pvm::refine_host::RefineContext;
+ 
+ /// The Local host's outer budget for a runtime execution
+@@ -127,6 +127,8 @@ pub struct AgentKeys {
+ /// The standard AgentRuntime, prepared once, and one Local Agent's runtime state.
+ pub struct Runtime {
+     prepared: PreparedProgram,
++    /// The runtime program, kept for `F025_LOCKSTEP`'s cold run on the other engine.
++    runtime_pvm: Vec<u8>,
+     descriptor: AgentDescriptor,
+     authority: SigningKey,
+     /// The Agent's durable runtime state: the host persists it after every transition.
+@@ -150,7 +152,7 @@ impl Runtime {
+         runtime: &AdmittedRuntimePackage,
+         keys: &AgentKeys,
+     ) -> Result<Self, DriverError> {
+-        let prepared = PreparedProgram::new(runtime_pvm)
++        let prepared = PreparedProgram::with_backend(runtime_pvm, backend())
+             .map_err(|e| DriverError::Runtime(format!("prepare runtime: {e:?}")))?;
+         let d = keys.discriminator;
+         let space = SpaceId([0x11; 32]);
+@@ -197,6 +199,7 @@ impl Runtime {
+             .map_err(|e| DriverError::Runtime(format!("descriptor: {e:?}")))?;
+         let mut r = Self {
+             prepared,
++            runtime_pvm: runtime_pvm.to_vec(),
+             descriptor,
+             authority: keys.authority.clone(),
+             state: RuntimeState::default(),
+@@ -257,6 +260,27 @@ impl Runtime {
+         let inv = ctx.run();
+         let execution_us = exec_started.elapsed().as_micros() as u64;
+         let elapsed_us = started.elapsed().as_micros() as u64;
++        if lockstep() {
++            // Outside the timed region: the same input, cold, on the other engine.
++            let other = match backend() {
++                RefineBackend::Interpreter => RefineBackend::Recompiler,
++                RefineBackend::Recompiler => RefineBackend::Interpreter,
++            };
++            let theirs = RefineContext::load_with_backend(&self.runtime_pvm, &input, gas, other)
++                .map_err(|e| DriverError::Runtime(format!("load on {other:?}: {e:?}")))?
++                .run();
++            let seen = |i: &vos_pvm::refine::Invocation| {
++                (
++                    i.exit.clone(),
++                    i.pc,
++                    i.gas_used,
++                    i.registers,
++                    i.output_bounded(RuntimeTransition::MAX_ENCODED_BYTES),
++                )
++            };
++            assert_eq!(seen(&theirs), seen(&inv), "the two engines diverge");
++            eprintln!("f025-lockstep: identical ({} gas)", inv.gas_used);
++        }
+         if inv.exit != ExitReason::Halt {
+             return Err(DriverError::Runtime(format!(
+                 "runtime exit {:?} at pc {}",
+@@ -595,3 +619,17 @@ pub fn message(msg: vos::value::Msg) -> Vec<u8> {
+     m.extend_from_slice(&msg.encode());
+     m
+ }
++
++/// The engine `F025_BACKEND` selects: the interpreter unless it says `recompiler`.
++fn backend() -> RefineBackend {
++    match std::env::var("F025_BACKEND").as_deref() {
++        Ok("recompiler") => RefineBackend::Recompiler,
++        Ok("interpreter") | Err(_) => RefineBackend::Interpreter,
++        Ok(other) => panic!("F025_BACKEND={other}: interpreter or recompiler"),
++    }
++}
++
++/// `F025_LOCKSTEP=1`: every execution also runs on the other engine, and must match.
++fn lockstep() -> bool {
++    std::env::var("F025_LOCKSTEP").is_ok_and(|v| v == "1")
++}

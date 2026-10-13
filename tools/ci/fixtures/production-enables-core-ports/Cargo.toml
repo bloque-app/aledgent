@@ -1,0 +1,15 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# CI fixture: a "production" crate that enables ledger-core's forged store records.
+# `tools/ci/check-conformance-ports.sh` must reject it (exit 1). It is never built.
+[package]
+license = "Apache-2.0 OR MIT"
+name = "production-enables-core-ports"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+ledger-core = { path = "../../../../crates/ledger-core", features = ["conformance-ports"] }

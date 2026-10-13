@@ -1,0 +1,31 @@
+    Finished `release` profile [optimized] target(s) in 1.73s
+s2 s2-transfer-b1: input 1612 B, message 1657 B (limit 16384 B)
+  reply bytes [01, b0, 4a, 01, 00, 00, 00, 00, 00, 39, fc, bd, 01, 00, 00, 00, 00, 0b, 1d, ab, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 09, 00, 00, 00, dc, ff, ff, ff, 19, 00, 00, 00, 00, 00, 00, 00]
+== s2 s2-transfer-b1 kernel ==
+  caller e2e us (invoke + ack): n=1000 p50=470215 p95=612224 p99=742451 max=899131
+  invoke elapsed_us: n=1000 p50=442632 p95=570565 p99=677326 max=848540
+  actor gas: n=1000 p50=40744656 p95=40744854 p99=40744854 max=40744854
+== s2 s2-transfer-b1 noop ==
+  caller e2e us (invoke + ack): n=200 p50=425448 p95=727277 p99=913280 max=1219227
+  invoke elapsed_us: n=200 p50=395565 p95=659978 p99=725992 max=897801
+  actor gas: n=200 p50=199867 p95=199867 p99=199867 max=199867
+s2 s2-reserve-new-holding-b1: input 1676 B, message 1721 B (limit 16384 B)
+  reply bytes [01, b2, 6a, 01, 00, 00, 00, 00, 00, 71, d4, 0f, 02, 00, 00, 00, 00, 61, 1e, ab, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 09, 00, 00, 00, dc, ff, ff, ff, 19, 00, 00, 00, 00, 00, 00, 00]
+== s2 s2-reserve-new-holding-b1 kernel ==
+  caller e2e us (invoke + ack): n=1000 p50=478536 p95=670739 p99=777314 max=872581
+  invoke elapsed_us: n=1000 p50=450433 p95=619985 p99=705756 max=810888
+  actor gas: n=1000 p50=46118967 p95=46118967 p99=46118967 max=46118967
+== s2 s2-reserve-new-holding-b1 noop ==
+  caller e2e us (invoke + ack): n=200 p50=402544 p95=442511 p99=475461 max=493707
+  invoke elapsed_us: n=200 p50=374912 p95=411066 p99=436054 max=464994
+  actor gas: n=200 p50=201283 p95=201283 p99=201283 max=201283
+s2 s2-reserve-pooled-b1: input 1612 B, message 1657 B (limit 16384 B)
+  reply bytes [01, b0, 4a, 01, 00, 00, 00, 00, 00, 3e, fa, bd, 01, 00, 00, 00, 00, 0b, 1d, ab, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 09, 00, 00, 00, dc, ff, ff, ff, 19, 00, 00, 00, 00, 00, 00, 00]
+== s2 s2-reserve-pooled-b1 kernel ==
+  caller e2e us (invoke + ack): n=1000 p50=468553 p95=514516 p99=564259 max=761018
+  invoke elapsed_us: n=1000 p50=440868 p95=483222 p99=527925 max=722103
+  actor gas: n=1000 p50=40744149 p95=40744149 p99=40744149 max=40744149
+== s2 s2-reserve-pooled-b1 noop ==
+  caller e2e us (invoke + ack): n=200 p50=403427 p95=443555 p99=470662 max=548200
+  invoke elapsed_us: n=200 p50=375302 p95=415973 p99=444440 max=491375
+  actor gas: n=200 p50=199867 p95=199867 p99=199867 max=199867

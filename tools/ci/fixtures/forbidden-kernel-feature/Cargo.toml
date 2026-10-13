@@ -1,0 +1,15 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# CI fixture: a crate that enables an experimental CipherClerk layer.
+# `tools/ci/check-kernel-features.sh` must reject it (exit 1). It is never built.
+[package]
+license = "Apache-2.0 OR MIT"
+name = "forbidden-kernel-feature"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+cipher-clerk = { git = "https://codeberg.org/Virto/CipherClerk.git", rev = "e9a7b0851f183c14dbd1635dbf0437c86682ad6f", default-features = false, features = ["notes"] }

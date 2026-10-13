@@ -1,0 +1,8 @@
+[
+  { "name": "a-jam-ladder", "core": "agent-recompiler", "runner": "zombienet", "agent_profile": "jam=", "plan": "ladder", "pollers": "200", "drain_secs": "1200" },
+  { "name": "a-jam-burst", "core": "agent-recompiler", "runner": "zombienet", "agent_profile": "jam=", "plan": "burst", "pollers": "100", "drain_secs": "3000" },
+  { "name": "b-jam-anchoring", "core": "agent-recompiler", "runner": "zombienet", "agent_profile": "jam=", "phases": "b-1x:300:300,b-2x:600:300", "anchoring_ms": "60000", "pollers": "200", "drain_secs": "1200" },
+  { "name": "d-jam-faults", "core": "agent-recompiler", "runner": "zombienet", "agent_profile": "jam=", "phases": "d-1x:300:420", "faults": true, "pollers": "200", "drain_secs": "1200" },
+  { "name": "e-jam-soak-2h", "core": "agent-recompiler", "runner": "zombienet", "agent_profile": "jam=", "phases": "soak-2x:566:7200", "pollers": "200", "drain_secs": "900" },
+  { "name": "e-jam-soak-4h-hosted", "core": "agent-recompiler", "runner": "ubuntu-latest", "agent_profile": "jam=", "plan": "soak", "pollers": "200", "drain_secs": "900" }
+]

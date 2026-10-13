@@ -1,0 +1,49 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+[package]
+name = "verify"
+version = "0.1.0"
+description = "aledgent's anchor and disclosure verifier (F-017): the anchor commitment, the disclosure envelope, and a recipient's offline check of a disclosure against a public read of the settlement layer. Depends on nothing of aledgent's."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "aledgent-verify"
+path = "src/bin/aledgent-verify.rs"
+required-features = ["cli"]
+
+[features]
+default = ["std"]
+# Error types that implement std::error::Error, and the command-line verifier's logic
+# (verify::cli), so the suite tests it on every run. aledgent's core takes this crate without it.
+std = []
+# The public read of the settlement layer over a node's JSON-RPC (a thin reader of two storage
+# items at the finalized head).
+rpc = ["std", "dep:ureq", "dep:serde_json", "dep:twox-hash"]
+# The command-line verifier.
+cli = ["rpc"]
+# Serialisable envelope types, for the core's calls to carry a disclosure request (F-005).
+serde = ["dep:serde"]
+
+[dependencies]
+# What a recipient needs and nothing else (REQ-DS-3): blake2b for the commitment and the
+# signature challenge, and Ristretto arithmetic for the clerk's Schnorr signature. No aledgent
+# crate, no kernel: the verifier reads the claim's wire form itself.
+blake2 = { version = "0.10", default-features = false }
+curve25519-dalek = { version = "4.1", default-features = false }
+ureq = { version = "3", default-features = false, features = ["rustls"], optional = true }
+serde_json = { version = "1", optional = true }
+twox-hash = { version = "2", default-features = false, features = ["xxhash64"], optional = true }
+serde = { version = "1", default-features = false, features = ["derive", "alloc"], optional = true }
+
+[dev-dependencies]
+# The kernel's own disclosure verifiers, to show the claim's wire form is CipherClerk's.
+cipher-clerk = { workspace = true, features = ["disclosure", "signing"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+tempfile = "3"
+
+[lints]
+workspace = true

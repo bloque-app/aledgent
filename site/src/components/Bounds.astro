@@ -1,0 +1,131 @@
+---
+// "Bounds it is held to": the three latency numbers of SPEC.md §11, at p99, measured inside
+// aledgent. Latency has three numbers and no fourth.
+const bounds = [
+	{
+		value: '50',
+		unit: 'ms',
+		name: 'Acknowledge a command',
+		id: 'NFR-1',
+		text: 'A transfer, reservation or withdrawal is durably taken in and answered Received, with its operation reference.',
+	},
+	{
+		value: '1',
+		unit: 's',
+		name: 'Answer with a decision',
+		id: 'NFR-16',
+		text: 'Every command answered with its decision gets it, or a named refusal, from its arrival.',
+	},
+	{
+		value: '30',
+		unit: 's',
+		name: 'Complete it',
+		id: 'NFR-15',
+		text: 'Every command reaches the state it asks for, or is refused. With an external leg, completion ends at inclusion. 30 s is the ceiling; the target is 19 s.',
+	},
+];
+---
+
+<section class="bq-bounds not-content" aria-labelledby="bounds-title">
+	<div class="head">
+		<h2 id="bounds-title">Bounds it is held to</h2>
+		<p>Requirements of the specification (§11), at p99, measured inside aledgent.</p>
+	</div>
+	<dl>
+		{
+			bounds.map((b) => (
+				<div class="bound">
+					<dt>
+						<span class="name">{b.name}</span>
+						<span class="id">{b.id}</span>
+					</dt>
+					<dd class="value">
+						{b.value}
+						<span class="unit">{b.unit}</span>
+					</dd>
+					<dd class="text">{b.text}</dd>
+				</div>
+			))
+		}
+	</dl>
+</section>
+
+<style>
+	.bq-bounds {
+		margin-block: 3rem;
+		padding: clamp(1.25rem, 3vw, 2rem);
+		border: 1px solid var(--sl-color-hairline);
+		border-radius: var(--bq-radius-card);
+		background: var(--bq-surface);
+		box-shadow: var(--bq-shadow);
+	}
+	.head {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: baseline;
+		justify-content: space-between;
+		gap: 0.5rem 2rem;
+	}
+	h2 {
+		margin: 0;
+		font-family: var(--bq-font-display);
+		font-weight: 700;
+		font-size: var(--sl-text-2xl);
+		letter-spacing: -0.03em;
+		color: var(--sl-color-white);
+	}
+	.head p {
+		margin: 0;
+		font-size: var(--sl-text-sm);
+		color: var(--sl-color-gray-3);
+	}
+	dl {
+		display: grid;
+		gap: 1rem;
+		margin: 1.5rem 0 0;
+	}
+	@media (min-width: 50rem) {
+		dl {
+			grid-template-columns: repeat(3, minmax(0, 1fr));
+		}
+	}
+	.bound {
+		padding: 1.25rem;
+		border-radius: var(--bq-radius-field);
+		background: var(--sl-color-bg-inline-code);
+	}
+	dt {
+		display: flex;
+		justify-content: space-between;
+		gap: 1rem;
+		font-weight: 500;
+		color: var(--sl-color-white);
+	}
+	.id {
+		font-family: var(--__sl-font-mono);
+		font-size: var(--sl-text-xs);
+		color: var(--sl-color-gray-3);
+	}
+	dd {
+		margin: 0;
+	}
+	.value {
+		margin-top: 0.5rem;
+		font-family: var(--bq-font-display);
+		font-weight: 700;
+		font-size: 2.75rem;
+		line-height: 1;
+		letter-spacing: -0.04em;
+		color: var(--sl-color-text-accent);
+	}
+	.unit {
+		font-size: 1.25rem;
+		letter-spacing: -0.02em;
+	}
+	.text {
+		margin-top: 0.75rem;
+		font-size: var(--sl-text-sm);
+		line-height: 1.55;
+		color: var(--sl-color-gray-2);
+	}
+</style>

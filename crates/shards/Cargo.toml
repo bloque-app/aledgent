@@ -1,0 +1,53 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+[package]
+name = "shards"
+version = "0.1.0"
+description = "F-031 lever 3: the book held in shards of account partitions (DEC-22, amendment 0012): the shards' decisions and the exactly-once credit path, the principals Agent's state, the anchor over every shard's root, pools for hot accounts, the shard Agents' transition (feature agent) and their host (feature host)."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+default = ["std", "host"]
+# The native shard (`proto`): the prototype and the host's replica.
+std = ["ledger-kernel/std"]
+# The shard and principals Agents' transition, over the Agent's rows: what agents/shard runs.
+agent = ["dep:core-binding"]
+# The host of the shard Agents: replicas, private inputs, the relay, the router, the native port.
+host = ["std", "agent", "dep:rand_chacha", "dep:rand_core"]
+# F-034 (a prototype, off by default): native decide, VOS verify. The host decides and commits each
+# round on its native shard and a worker replays it through the shard Agent afterwards; a
+# divergence halts the shard. Without it the PVM stays on the commit's critical path.
+native-decide = ["host"]
+# v1 roots (CipherClerk's full-depth tree): a supported opt-in beside the default v2 (DEC-25,
+# owner ruling cs-q04). Host and guests must agree: build both with it or neither.
+smt-v1 = ["ledger-kernel/smt-v1", "core-binding?/smt-v1"]
+# The cross-host relay (an experiment; `NFR-21` (a)):
+# shard Agents and the principals Agent on several hosts, every exactly-once stream carried between
+# them over Noise (IK, static keys pinned by each host).
+net = ["host", "dep:snow"]
+
+[dependencies]
+cipher-clerk = { workspace = true }
+ledger-kernel = { path = "../ledger-kernel", default-features = false }
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+zeroize = { version = "1", default-features = false }
+# R-03 (`provenance`, owner rulings rq-01 and rq-02 of 2026-10-05): a receiver checks that a stream's
+# messages were committed by their sender, its voter's certificate over its outbox heads. In the guest
+# too: the check is the receiving Agent's (`report` by default in a deployment, never gating).
+ed25519-dalek = { version = "2", default-features = false, features = ["fast", "zeroize"] }
+core-binding = { path = "../core-binding", default-features = false, features = ["mapped"], optional = true }
+rand_chacha = { version = "0.3", default-features = false, optional = true }
+rand_core = { version = "0.6", default-features = false, optional = true }
+snow = { version = "0.10", optional = true }
+
+[dev-dependencies]
+curve25519-dalek = { version = "4", default-features = false, features = ["alloc"] }
+proptest = { version = "1", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true

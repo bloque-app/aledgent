@@ -1,0 +1,45 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# F-018, T-018-05: paging routes.
+#
+# Every alert of severity "page" reaches a human through the `pager` receiver; the owner label
+# says whose rotation. A failed reconciliation pages and never opens a ticket (NFR-9). Alerts of
+# severity "warning" go to `dashboard`, which notifies no one.
+#
+# No endpoint and no secret is in this repository: the pager's URL is read from a file the
+# deployment provisions (`url_file`). ops/src/alerts.rs routes the rules' alerts through this very
+# tree in the tests, where `pager` is the test route.
+route:
+  receiver: pager
+  group_by: [alertname, owner]
+  group_wait: 10s
+  group_interval: 1m
+  repeat_interval: 1h
+  routes:
+    - matchers: ['severity="warning"']
+      receiver: dashboard
+    # T-018-10: the book stops deciding, or its evidence stops reaching the audit store. Paged at
+    # once, without waiting to group, and again every 15 minutes while it lasts.
+    - matchers: ['severity="page"', 'signal="core-halt"']
+      receiver: pager
+      group_wait: 0s
+      repeat_interval: 15m
+    - matchers: ['severity="page"', 'signal="audit-shipping"']
+      receiver: pager
+      group_wait: 0s
+      repeat_interval: 15m
+    # R-03 (rq-01): a message between the book's Agents that its sender did not commit was applied
+    # (report mode). Security, at once.
+    - matchers: ['severity="page"', 'signal="message-provenance"']
+      receiver: pager
+      group_wait: 0s
+      repeat_interval: 15m
+    - matchers: ['severity="page"']
+      receiver: pager
+
+receivers:
+  - name: pager
+    webhook_configs:
+      - url_file: /etc/alertmanager/secrets/pager-url
+        send_resolved: true
+  - name: dashboard

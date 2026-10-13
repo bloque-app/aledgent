@@ -1,0 +1,22 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# F-018, T-018-04/05: Prometheus scrapes `opsctl exporter` and evaluates the rules in rules/.
+# Host names are the deployment's service names, not endpoints of this repository; nothing here
+# carries a secret.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - rules/aledgent.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  # NFR-11's signals, joined by the exporter (ops/src/exporter.rs).
+  - job_name: aledgent-ops
+    static_configs:
+      - targets: ["aledgent-ops-exporter:9464"]

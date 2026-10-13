@@ -1,0 +1,20 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+.scratch/
+.DS_Store
+.claude/worktrees/
+target/
+tools/ci/fixtures/*/Cargo.lock
+spikes/.books/
+.cipherclerk-patched/
+contracts/settlement/scripts/node_modules/
+tools/pass-import/node_modules/
+contracts/settlement/scripts/.state.json
+contracts/settlement/scripts/.e2e/
+
+# PDFs are build outputs of the Markdown sources (tools/md2pdf.sh); never tracked.
+*.pdf
+
+# The sensitivity audit of the open-source release is internal.
+docs/oss/PRUNING-REPORT.md
+__pycache__/

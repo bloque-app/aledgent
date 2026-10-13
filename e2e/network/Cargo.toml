@@ -1,0 +1,32 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+[package]
+name = "aledgent-e2e-network"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/bloque-app/aledgent"
+description = "The zombienet network aledgent's end-to-end suite runs against: a relay chain and Kreivo."
+
+# A workspace of its own, excluded from the root one: zombienet-sdk brings some 600 crates
+# (subxt, litep2p, whose build script needs `protoc`), none of which the services link. It is
+# built only by `.github/workflows/e2e-zombienet.yml`, on the self-hosted `zombienet` fleet.
+#
+# Cargo.lock started as an earlier suite's lock file, the proven resolution of
+# zombienet-sdk 0.4.15, and was pruned to what this crate uses.
+[workspace]
+
+[dependencies]
+serde_json = "1.0"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+# zombienet narrates the spawn through `tracing`; without a subscriber it looks hung.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Pinned to the version an earlier suite ran on the same kind of runner for weeks.
+zombienet-sdk = "=0.4.15"
+
+# Built to be run, once, in CI: no debug info (it is most of the size and the link time).
+[profile.ci]
+inherits = "dev"
+debug = 0
+incremental = false

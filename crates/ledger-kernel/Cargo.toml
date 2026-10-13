@@ -1,0 +1,61 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+[package]
+name = "ledger-kernel"
+version = "0.1.0"
+description = "aledgent's binding to the CipherClerk kernel: posting builders, the leaf-store trait, the working set, openings and keys, and chain-by-chain apply."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+default = ["std"]
+# Everything that needs the operating system: FileStore and FileVault.
+std = ["dep:redb"]
+# Raw kernel and store ports for the conformance suite (F-001 §11, F-015).
+# They offer arbitrary posting and state mutation, which the command surface
+# must never offer (REQ-CS-5): no production crate may enable this, and
+# tools/ci/check-conformance-ports.sh fails the build if one does.
+conformance-ports = []
+# The store write-rule suite (src/store/suite.rs), exported so that other
+# LeafStore implementations (F-006) run the same checks. Tests only.
+store-suite = ["std"]
+# Serialisable posting kinds, for the core's calls (F-005).
+serde = ["dep:serde"]
+# v1 roots (CipherClerk's full-depth tree): a supported opt-in beside the default v2 (DEC-25,
+# owner ruling cs-q04). Host and guests must agree: build both with it or neither.
+smt-v1 = ["compact-smt/v1"]
+
+[dependencies]
+# `signing` gives SecretKey and sign(): the core signs every kernel transfer
+# (DEC-3). Every RNG handed to it is a seeded ChaCha20 (REQ-RT-7).
+cipher-clerk = { workspace = true, features = ["signing"] }
+# The v2 (compact) tree beside v1, for DEC-25.
+compact-smt = { path = "../compact-smt" }
+# Scalar arithmetic on blindings, the same curve crate the kernel uses.
+curve25519-dalek = { version = "4.1", default-features = false, features = ["alloc", "precomputed-tables", "zeroize"] }
+rand_chacha = { version = "0.3", default-features = false }
+rand_core = { version = "0.6", default-features = false }
+# Must match the kernel's rkyv configuration (32-bit pointers, little endian):
+# stored records are the kernel's own archives.
+rkyv = { version = "0.8", default-features = false, features = ["alloc", "bytecheck", "little_endian", "pointer_width_32"] }
+zeroize = { version = "1", default-features = false }
+serde = { version = "1", default-features = false, features = ["derive", "alloc"], optional = true }
+# The file-backed store and vault (F-001 §10, proposal: redb). std only.
+redb = { version = "4", optional = true }
+
+[dev-dependencies]
+# `helpers` gives `MemLedger` / `MemOracle`, the kernel's own reference backend,
+# for differential tests only. It must never be a normal dependency (F-001 §1).
+cipher-clerk = { workspace = true, features = ["helpers"] }
+proptest = { version = "1", default-features = false, features = ["std"] }
+tempfile = "3"
+
+# The kernel and store cases of the M-0 gate live in the conformance suite
+# (crates/conformance/src/cases/f001.rs, F-015), which drives this crate
+# through the conformance ports.
+
+[lints]
+workspace = true

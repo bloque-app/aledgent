@@ -1,0 +1,24 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+[package]
+name = "audit-store"
+version = "0.1.0"
+description = "aledgent's audit store for the in-process host: append-only, hash-chained segment files on their own media, written under their own credential, readable by subject, principal, class and time (F-013)."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The record, its encoding and hash, and the trail's rules (F-013). No conformance ports.
+ledger-core = { path = "../ledger-core" }
+# blake2b, for the stored hash of the writer's credential.
+cipher-clerk = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+ledger-kernel = { path = "../ledger-kernel" }
+
+[lints]
+workspace = true

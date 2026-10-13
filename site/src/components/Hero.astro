@@ -1,0 +1,237 @@
+---
+// Replaces Starlight's Hero (used only by the landing page, the one page with `hero` set).
+// Title, tagline and actions come from the page's frontmatter as usual; `kicker` and `status`
+// are the two fields src/content.config.ts adds. The code panel is the real transfer request
+// and its 202 reply (services/ingress/openapi.json: POST /v1/transfers, CommandReply).
+import { withBase } from '../lib/url';
+
+// Starlight's own id for the page title (its skip link and ToC point at it).
+const PAGE_TITLE_ID = '_top';
+
+const { data } = Astro.locals.starlightRoute.entry;
+const { title = data.title, tagline, actions = [] } = data.hero ?? {};
+const { kicker, status = [] } = data as typeof data & { kicker?: string; status?: string[] };
+// Hand-highlighted, so the panel stays ink in both themes (Expressive Code follows the theme).
+const request = `<span class="p">\$</span> curl -X POST \$INGRESS/v1/transfers \\
+  -H <span class="s">"Authorization: Bearer \$TOKEN"</span> \\
+  -H <span class="s">"client-key: payout-2026-10-13-0042"</span> \\
+  -d <span class="s">'{"legs":[{"from":"did:aledgent:acct:…",
+               "to":"did:aledgent:acct:…",
+               "asset":"TSTA","amount":"125000"}],
+       "reference":{"invoice":"inv-8812"}}'</span>`;
+const reply = `{
+  <span class="k">"operation_reference"</span>: <span class="s">"did:aledgent:op:…"</span>,
+  <span class="k">"state"</span>: <span class="s">"Received"</span>,
+  <span class="k">"class"</span>: <span class="s">"open-non-refunding"</span>,
+  <span class="k">"terminal"</span>: <span class="b">false</span>,
+  <span class="k">"client_key"</span>: <span class="s">"payout-2026-10-13-0042"</span>,
+  <span class="k">"client_key_derived"</span>: <span class="b">false</span>,
+  <span class="k">"reference"</span>: {<span class="k">"invoice"</span>: <span class="s">"inv-8812"</span>}
+}`;
+---
+
+<section class="bq-hero not-content" aria-labelledby={PAGE_TITLE_ID}>
+	<div class="copy">
+		{kicker && <p class="kicker">{kicker}</p>}
+		<h1 id={PAGE_TITLE_ID} data-page-title set:html={title} />
+		{tagline && <p class="tagline" set:html={tagline} />}
+		{
+			actions.length > 0 && (
+				<div class="actions">
+					{actions.map(({ link, text, variant }) => (
+						<a class:list={['btn', variant === 'primary' ? 'primary' : 'secondary']} href={withBase(link)}>
+							{text}
+						</a>
+					))}
+				</div>
+			)
+		}
+		{
+			status.length > 0 && (
+				<ul class="status" aria-label="Status">
+					{status.map((item) => (
+						<li>{item}</li>
+					))}
+				</ul>
+			)
+		}
+	</div>
+	<figure class="panel" aria-label="A transfer request and its reply">
+		<figcaption><span class="dot" aria-hidden="true"></span>A transfer, answered at Received<span class="route">POST /v1/transfers</span></figcaption>
+		<pre><code set:html={request} /></pre>
+		<div class="reply">
+			<span class="code">202</span><span class="label">acknowledged at Received, not yet decided</span>
+		</div>
+		<pre><code set:html={reply} /></pre>
+	</figure>
+</section>
+
+<style>
+	.bq-hero {
+		/* Always ink, in both themes. */
+		--ink: #0d0c17;
+		--ink-surface: #17152a;
+		--ink-border: #2a2838;
+		--on-ink: #e9e6f2;
+		--on-ink-2: #9a96ad;
+		--lilac: #a78bfa;
+
+		display: grid;
+		gap: 2rem;
+		margin-block: 1rem 3rem;
+		padding: clamp(1.5rem, 4vw, 3.5rem);
+		border: 1px solid var(--ink-border); /* visible edge when the page is ink too */
+		border-radius: var(--bq-radius-card);
+		background: var(--ink);
+		color: var(--on-ink);
+	}
+	@media (min-width: 64rem) {
+		.bq-hero {
+			grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
+			align-items: center;
+			gap: 3rem;
+		}
+	}
+	.kicker {
+		margin: 0 0 1rem;
+		display: inline-block;
+		padding: 0.25rem 0.75rem;
+		border: 1px solid var(--ink-border);
+		border-radius: var(--bq-radius-pill);
+		font-size: var(--sl-text-xs);
+		font-weight: 500;
+		letter-spacing: 0.02em;
+		color: var(--lilac);
+	}
+	h1 {
+		margin: 0;
+		font-family: var(--bq-font-display);
+		font-weight: 700;
+		font-size: clamp(2rem, 4.2vw, 3.25rem);
+		line-height: 1.04;
+		letter-spacing: -0.04em;
+		color: #fbfaff;
+		text-wrap: balance;
+	}
+	.tagline {
+		margin: 1.25rem 0 0;
+		max-width: 36rem;
+		font-size: var(--sl-text-lg);
+		line-height: 1.6;
+		color: var(--on-ink);
+	}
+	.actions {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.75rem;
+		margin-top: 1.75rem;
+	}
+	.btn {
+		display: inline-flex;
+		align-items: center;
+		padding: 0.7rem 1.35rem;
+		border-radius: var(--bq-radius-pill);
+		font-weight: 500;
+		text-decoration: none;
+		line-height: 1.2;
+	}
+	.btn.primary {
+		background: #6a3cff;
+		color: #ffffff; /* 5.7:1 */
+	}
+	.btn.primary:hover {
+		background: #5a2ef0;
+	}
+	.btn.secondary {
+		border: 1px solid #38354a;
+		color: var(--on-ink);
+	}
+	.btn.secondary:hover {
+		border-color: var(--lilac);
+		color: #fbfaff;
+	}
+	.btn:focus-visible {
+		outline: 2px solid var(--lilac);
+		outline-offset: 2px;
+	}
+	.status {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.25rem 0;
+		margin: 1.75rem 0 0;
+		padding: 0;
+		list-style: none;
+		font-size: var(--sl-text-sm);
+		color: var(--on-ink-2); /* 6.8:1 on ink */
+	}
+	.status li:not(:last-child)::after {
+		content: '·';
+		margin-inline: 0.6rem;
+	}
+	.panel {
+		margin: 0;
+		min-width: 0;
+		border: 1px solid var(--ink-border);
+		border-radius: var(--bq-radius-field);
+		background: var(--ink-surface);
+		overflow: hidden;
+	}
+	figcaption {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		padding: 0.7rem 1rem;
+		border-bottom: 1px solid var(--ink-border);
+		font-family: var(--__sl-font-mono);
+		font-size: var(--sl-text-xs);
+		color: var(--on-ink-2);
+	}
+	.route {
+		margin-inline-start: auto;
+	}
+	.dot {
+		width: 0.5rem;
+		height: 0.5rem;
+		border-radius: 50%;
+		background: var(--lilac);
+	}
+	pre {
+		margin: 0;
+		padding: 1rem;
+		overflow-x: auto;
+		font-family: var(--__sl-font-mono);
+		font-size: 0.8125rem;
+		line-height: 1.6;
+		color: var(--on-ink);
+		background: none;
+		border: 0;
+	}
+	.reply {
+		display: flex;
+		align-items: center;
+		gap: 0.6rem;
+		padding: 0.6rem 1rem;
+		border-block: 1px solid var(--ink-border);
+		font-size: var(--sl-text-xs);
+		color: var(--on-ink-2);
+	}
+	.reply .code {
+		padding: 0.1rem 0.55rem;
+		border-radius: var(--bq-radius-pill);
+		background: #241d45;
+		color: var(--lilac);
+		font-family: var(--__sl-font-mono);
+		font-weight: 500;
+	}
+	/* The spans are injected with set:html, so scoped selectors cannot reach them. */
+	.panel :global(.p),
+	.panel :global(.b) {
+		color: var(--lilac);
+	}
+	.panel :global(.s) {
+		color: #d6d2e3;
+	}
+	.panel :global(.k) {
+		color: var(--on-ink-2);
+	}
+</style>

@@ -1,0 +1,20 @@
+running 1 test
+test agent::state_block_pvm::lifecycle_tests::f002_external_state_invocation_cost ... s3x transfer-1000000: input 5712 B, message 5841 B
+== s3x transfer-1000000 kernel ==
+  caller us (invoke + ack, excl. staging): n=100 p50=1084850 p95=1119305 p99=1134236 max=1259987
+  invoke elapsed_us: n=100 p50=958946 p95=988882 p99=999566 max=1102417
+  invoke runtime gas: n=100 p50=505967963 p95=508498994 p99=508754757 max=508786883
+  actor gas: n=100 p50=88858619 p95=88858619 p99=88858619 max=88858619
+s3x reserve-pooled-1000000: input 5408 B, message 5537 B
+== s3x reserve-pooled-1000000 kernel ==
+  caller us (invoke + ack, excl. staging): n=100 p50=1078878 p95=1121471 p99=1158264 max=1194472
+  invoke elapsed_us: n=100 p50=953362 p95=986061 p99=1027117 max=1065156
+  invoke runtime gas: n=100 p50=504955560 p95=507442840 p99=507762854 max=507842679
+  actor gas: n=100 p50=88433361 p95=88433361 p99=88433361 max=88433361
+s3x reserve-new-holding-1000000: input 5496 B, message 5625 B
+== s3x reserve-new-holding-1000000 kernel ==
+  caller us (invoke + ack, excl. staging): n=100 p50=1093693 p95=1118384 p99=1168922 max=1194715
+  invoke elapsed_us: n=100 p50=969262 p95=993572 p99=1046061 max=1051550
+  invoke runtime gas: n=100 p50=511414254 p95=513800935 p99=514018479 max=514063153
+  actor gas: n=100 p50=94642529 p95=94642727 p99=94642727 max=94642727
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1852 filtered out; finished in 343.51s

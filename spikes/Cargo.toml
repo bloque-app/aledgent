@@ -1,0 +1,21 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# F-002 measurement spikes: never shipped, never a dependency of a shipped crate.
+# Its own workspace, excluded from the root one; CI builds it in the `spikes` job.
+[workspace]
+resolver = "2"
+members = ["native"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/bloque-app/aledgent"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+# The spikes measure the release profile. No LTO, as the core would build by default.
+[profile.release]
+debug = false

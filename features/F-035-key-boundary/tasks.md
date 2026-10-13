@@ -1,0 +1,20 @@
+<!--
+Copyright (c) 2026 Pagos Cube LLC
+SPDX-License-Identifier: CC-BY-4.0
+-->
+
+# F-035 — tasks
+
+| ID | Task | Traces | Done when |
+|---|---|---|---|
+| T-035-01 | `ledger_kernel::keys`: `KeyRequest`, `KeyAnswer`, `Custody`; `RootKeys` (the derivations, counted per process with `std`); `KeyRing` over the root or a custody; `Answers` (the Agent's) and `Recording` (the host's) | guardrail 13, `NFR-8`, `REQ-RT-3`, `REQ-RT-7` | A custody ring gives the root ring's bytes; requests and answers round-trip; an unanswered question aborts |
+| T-035-02 | `core_binding`: the Agent's private input carries the custody's answers and the clerk's signatures, never the root or the clerk key; the driver records them from the replica's run; `HostKeys`; `Founding` holds keys, not secrets | guardrail 13, `NFR-8`, `REQ-RT-6` | The Agent's suite passes with answers only; no private input carries the root, the registrar's key or an account's key (`nfr_8_no_key_reaches_the_agents_private_inputs`) |
+| T-035-03 | `services/signer`: protocol, blocking client and its adapters (custody, clerk, Ed25519, secp256k1), configuration, backends (Vault, KMS, file), the listener with peer credentials and tokens, `SIGHUP` reload, the binary | `NFR-8`, `REQ-SA-8`, `REQ-AU-8` | `tests/signer.rs`: round trips for every scheme and backend, refusals, online rotation, fail-closed |
+| T-035-04 | The core host takes every key from the signer (`core_keys`) and refuses one in its environment; the Agent's keys behind `AgentSigner` | guardrail 13, `NFR-8` | `serve` holds no key; `tests/key_absent.rs`: the book runs over the core Agent with the signer in another process and loads no root |
+| T-035-05 | The adapter signs through the signer (`ServiceSigner`), the `KmsSigner` stub removed; file and environment keys only with `development_keys` | `NFR-8`, `REQ-SA-8` | `tests/signer_service.rs`; the canary template declares its development keys |
+| T-035-06 | Authenticate the core link: a token (SHA-256 in `core_link`) and the peer's user id; loopback-only TCP; ingress's token from `ALEDGENT_CORE_LINK_TOKEN` | `NFR-7`, `NFR-8`, `REQ-AU-8` | `tests/remote.rs`: an unauthenticated caller runs nothing; a wrong user id is refused; a routable TCP address is refused |
+| T-035-07 | The stress suite, the canary templates and the images run the signer; the release documentation, the feature notes and the decisions | `NFR-8` | the release documentation describes the shape; `NOTES.md` records the decisions and what is deferred |
+| T-035-08 | Owner ruling `key-custody-opt-in-kms`: Vault as the default backend, read by the signer itself after an AWS IAM login (signed STS request, KV v1 `.data`); KMS an opt-in for secp256k1 lane and anchor keys only; the KMS-sealed path and KMS Ed25519 dropped; the docs, `PLAN.md` (v0.8.5) and the deployment model reworded | `NFR-8`, `REQ-AU-8` | `nfr_8_an_iam_login_is_a_signed_sts_request`, `nfr_8_vault_keys_and_an_opt_in_kms_lane_round_trip`, `nfr_8_keys_load_from_vault_and_never_echo_a_value`; no doc names KMS as a requirement |
+| T-035-09 | Owner ruling `rq-02` (2026-10-05): one voter's key per Agent is the root of its messages until `F-021`; in Vault, used only by the signer, never KMS; the alerts on signing anomalies, built and not | `NFR-8`, `REQ-AU-8` | `NOTES.md` decision 14; the release documentation lists the voter keys, the trade-off and the signer's refusal alarm for the operator |
+| T-035-10 | Owner ruling `oss-q10` (2026-10-05): the signer's AWS region is required, with no default. `vault.auth.aws_iam.region` always, `aws_region` whenever a key is in KMS; a configuration without it does not start, and says which field is missing | `REQ-AU-8`, `NFR-8` | `config.rs` tests: a missing or blank region is refused at load |
+| T-035-11 | Post-freeze (`rq-06`): the signer's refusals as a metric for the operations exporter, and a rule that pages security | `NFR-8`, `NFR-11`, `REQ-AU-8` | A refused request shows in the metric and pages the test route; `PLAN.md` §4, post-freeze work |

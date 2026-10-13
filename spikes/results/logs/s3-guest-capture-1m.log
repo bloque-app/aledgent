@@ -1,0 +1,7 @@
+    Finished `release` profile [optimized] target(s) in 4.47s
+s3 capture-for-less-1000000: input 6936 B, message 7065 B (limit 16384 B)
+  reply bytes [01, 56, e0, 05, 00, 00, 00, 00, 00, 95, 89, 56, 06, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 09, 00, 00, 00, e4, ff, ff, ff, 11, 00, 00, 00, 00, 00, 00, 00]
+== s3 capture-for-less-1000000 kernel ==
+  caller e2e us (invoke + ack): n=1000 p50=596099 p95=724458 p99=787215 max=838341
+  invoke elapsed_us: n=1000 p50=565298 p95=683402 p99=748759 max=794249
+  actor gas: n=1000 p50=107062509 p95=107062707 p99=107062707 max=107062707

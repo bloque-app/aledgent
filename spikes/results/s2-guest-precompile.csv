@@ -1,0 +1,3 @@
+spike,case,variant,size,sample,metric,value,unit
+s2,s2-transfer-b1,message,1612,0,message_bytes,1657,bytes
+s2,s2-reserve-new-holding-b1,message,1676,0,message_bytes,1721,bytes

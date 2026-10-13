@@ -1,0 +1,12 @@
+{
+  "principals": [
+    { "name": "issuer", "role": "issuance_authority", "test_token": true },
+    {
+      "name": "custodian",
+      "role": "operator_authority",
+      "test_token": true,
+      "ops": ["transfer", "reserve", "capture", "release"]
+    },
+    { "name": "onboarding", "role": "identities_principal", "test_token": true }
+  ]
+}

@@ -1,0 +1,85 @@
+<!--
+Copyright (c) 2026 Pagos Cube LLC
+SPDX-License-Identifier: CC-BY-4.0
+-->
+
+# Runbook: settlement adapter outage
+
+`REQ-SA-5`, `REQ-SA-6`, `REQ-SA-7`, `REQ-OP-6`, `REQ-OP-9`, `INV-10`, `INV-11` · `F-016`, `F-027` ·
+**Pages:** `AledgentAdapterNotServing` (not serving for 5 minutes), `AledgentAdapterSignalsStale`,
+`AledgentSignalsDown`, `AledgentObservationLag`,
+`AledgentAnchorLag`, `AledgentLaneUnderFeeFloor`, the platform's task-not-running alarm · **Owner:**
+settlement-operations.
+
+**What an outage means.** The adapter is the only thing that touches Kreivo. While it is down:
+
+- **Internal transfers, reservations and queries carry on.** They never touch the settlement layer
+  (guardrail 9).
+- **New external legs are refused** with `ERR-SettlementLayerUnavailable` once its status lease lapses.
+- **In-flight batches** land or expire on chain, and are decided when the adapter returns.
+- **Nothing is released on a timer** (`REQ-OP-9`). An operation past its deadline goes to `Needs-Review`.
+
+## Preconditions
+
+- [ ] Confirm the state: `aledgent_adapter_serving` is 0, or the signals file is stale. Read the adapter's
+  alerts (`aledgent_adapter_alerts{kind}`): `unreachable`, `dry-run`, `batch:<lane>`, `gap:*`,
+  `review:<op>`.
+- [ ] Rule out a chain-side cause first: `aledgent_finalized_stall_ms` and `aledgent_finality_lag_blocks`.
+  If blocks or finality have stalled, follow [kreivo-finality-stall](kreivo-finality-stall.md) instead.
+
+## Steps
+
+1. **The task is not running.** The container scheduler restarts it. If it crash-loops, read the
+   adapter's log stream.
+   - A smoldot panic aborts the process by design, and the restart resumes it from its store.
+   - Repeated panics on one chain spec point to the boot nodes (step 3).
+2. **It runs but does not serve** (blind light client). It restarts itself after **3 minutes** blind.
+   Between restarts:
+   - check the egress path to the boot nodes (wss 443, tcp 30333);
+   - check that the Kusama checkpoint in the image is recent enough for warp sync. A stale one makes a
+     cold start take longer than 3 minutes, and the fix is a new pin and image.
+3. **Boot nodes.** Check the chain spec's boot nodes from outside the deployment's network. If entries
+   are dead, deploy a chain spec with live ones (`deploy/templates/chain-specs/`).
+4. **Dry runs fail** (a `dry-run` alert, nothing signed). The adapter backs off for a minute. If dry runs
+   keep failing over the light client, set the optional `dry_run_endpoint` to a Kreivo node the operator
+   runs. That node is then trusted for batch sizing only: it can make a batch fail whole, but it never
+   moves value. Record it as a finding.
+5. **Runtime mismatch** (it refuses to serve: the spec is not in `spec_versions`). Kreivo has upgraded to a
+   runtime with no pinned format. Deploy the adapter build that pins it (`services/settle/kreivo-pin*`).
+   There is no other way on.
+6. **Database.** If the adapter cannot reach `aledgent_settle`, follow the database server's own failover.
+   The adapter resumes from its cursor.
+7. **Keys.** If signing fails, read the signer's log: a signer that cannot log in to Vault or read its
+   secret does not start (check its Vault role's binding to the task's identity); for a lane opted into
+   KMS, check KMS reachability and the task role's `kms:Sign` grant. Do not fall back to a key in the
+   environment.
+8. **Liquidity.** A lane or anchor key under its fee floor parks instructions. Treasury tops up
+   ([crank-outage](../crank-outage.md), "Liquidity or fees short").
+
+**To pause on purpose:** scale the service to zero (nothing is signed). If the keys are in doubt, the
+contract's admin clears a bound or empties the key set.
+
+## Verification
+
+- [ ] `aledgent_adapter_serving == 1`, and the signals are fresh.
+- [ ] `aledgent_observation_cursor_lag` returns to about 0. The re-scan finds no difference; if it does,
+  follow [gap-filling](../gap-filling.md).
+- [ ] Parked withdrawals resume by themselves; nothing is resubmitted by hand. The oldest non-terminal
+  age falls.
+- [ ] Anchors resume, and the anchor lag falls under the interval.
+- [ ] Operations that reached `Needs-Review` during the outage are resolved one by one, with Kreivo's
+  records as evidence (`POST /v1/ops/operations/{reference}/resolve`). None is released without evidence,
+  and none outside the command surface (`REQ-AT-3`).
+
+## Rollback
+
+- A bad adapter release: redeploy the previous image digest, and it resumes from its store. First check
+  whether the release ran a store migration (`services/settle/migrations`). If it did, the previous
+  build must accept the migrated schema.
+- A dry-run node set in step 4: remove `dry_run_endpoint` once the light client's dry runs work again.
+
+## Exercised
+
+On every change: `ops/tests/alerts.rs` checks that `AledgentAdapterNotServing` and the adapter's other
+signals page the test route. Stopping and restarting the adapter against a local network is exercised by
+hand in a staging deployment; it is not exercised automatically yet.

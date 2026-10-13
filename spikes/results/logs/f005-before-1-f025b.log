@@ -1,0 +1,46 @@
+reserve 0: sync 2598 ms, state 11591 B
+reserve 1: sync 2548 ms, state 12600 B
+reserve 2: sync 2568 ms, state 13609 B
+reserve 3: sync 2567 ms, state 14618 B
+reserve 4: sync 2521 ms, state 15631 B
+reserve 5: sync 2532 ms, state 16640 B
+reserve 6: sync 2525 ms, state 17649 B
+reserve 7: sync 2525 ms, state 18658 B
+reserve 8: sync 2577 ms, state 19671 B
+reserve 9: sync 2551 ms, state 20680 B
+reserve 10: sync 2516 ms, state 21689 B
+reserve 11: sync 2598 ms, state 22698 B
+reserve 12: sync 2541 ms, state 23711 B
+reserve 13: sync 2558 ms, state 24720 B
+reserve 14: sync 2536 ms, state 25729 B
+reserve 15: sync 2563 ms, state 26738 B
+reserve 16: sync 2562 ms, state 27751 B
+reserve 17: sync 2570 ms, state 28760 B
+reserve 18: sync 2554 ms, state 29769 B
+reserve 19: sync 2676 ms, state 30778 B
+reserve 20: sync 2579 ms, state 31791 B
+reserve 21: sync 2604 ms, state 32800 B
+reserve 22: sync 2544 ms, state 33809 B
+reserve 23: sync 2617 ms, state 34818 B
+reserve 24: sync 2544 ms, state 35831 B
+reserve 25: sync 2612 ms, state 36661 B
+reservation 29 not committed, the run ends: Refused(OverBudget { bytes: 26921, budget: 26624 })
+metric,p50,p95,p99,max (n = 26, warm-up 3, budget 26624 B)
+ack_gas,33285711,37178624,37273317,37273317
+ack_us,38848,62477,64773,64773
+actor_gas,173414852,185906066,186238268,186238268
+blob_bytes,1981,2181,2277,2277
+caller_us,2557908,2616827,2675475,2675475
+invoke_decode_us,28,75,243,243
+invoke_encode_us,1975,2103,2215,2215
+invoke_execution_us,2508853,2548272,2603561,2603561
+invoke_gas,1487055177,1504462325,1504721305,1504721305
+invoke_input_bytes,1995724,2008100,2008826,2008826
+invoke_output_bytes,26682,38802,39632,39632
+invoke_preparation_us,3324,12058,13634,13634
+invoke_us,2515512,2551288,2607315,2607315
+message_bytes,187,187,188,188
+native_us,1776,6982,7091,7091
+state_bytes,23711,35831,36661,36661
+sync_us,2558446,2617957,2676987,2676987
+hot: inputs 33, service image 25491 B in 1 chunks, budget 26624 B

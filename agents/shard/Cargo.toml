@@ -1,0 +1,58 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# The book-shard and principals Agents' actor (F-031, DEC-22). Links VOS: AGPL-3.0-or-later
+# (agents/Cargo.toml).
+#
+# Its own workspace, as agents/core is: it builds for the guest target `riscv64em-vos` with the
+# canonical guest toolchain and `cargo actor` (.cargo/config.toml). `aledgent-core-host package`
+# links and signs it. One program, two roles fixed at genesis (`shards::agent`).
+[workspace]
+
+[package]
+name = "aledgent-shard"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/bloque-app/aledgent"
+
+[features]
+# v1 roots (CipherClerk's full-depth tree): a supported opt-in beside the default v2 (DEC-25,
+# owner ruling cs-q04). Host and guests must agree: build both with it or neither.
+smt-v1 = ["shards/smt-v1", "core-binding/smt-v1"]
+default = ["bin"]
+bin = []
+# CipherClerk's curve arithmetic through VOS's precompiles 110-114 (`pvm-precompile`), for a
+# runtime with VOS's `native-curve`, which is outside JAM (proposals/vos/0010, 0012). Off: the
+# JAM-compatible guest does its curve arithmetic in software.
+native-curve = ["cipher-clerk/pvm-precompile"]
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+# The guest levers agents/core takes (proposals/cipherclerk/0003-0004): CipherClerk hashes with VOS's
+# BLAKE2b (`vos-blake2b`), and the empty-subtree chain is a static table (0004, applied by
+# tools/cipherclerk-patched.sh). Curve arithmetic is in software unless `native-curve` (outside JAM).
+cipher-clerk = { git = "https://codeberg.org/Virto/CipherClerk.git", rev = "e9a7b0851f183c14dbd1635dbf0437c86682ad6f", default-features = false, features = ["vos-blake2b"] }
+vos = { git = "https://codeberg.org/pandres95/VOS.git", rev = "c54fc1ff13fcd55b86f2cf4edc77b041b62e245f", default-features = false, features = ["macros", "pvm"] }
+
+[target.'cfg(not(target_arch = "riscv64"))'.dependencies]
+vos = { git = "https://codeberg.org/pandres95/VOS.git", rev = "c54fc1ff13fcd55b86f2cf4edc77b041b62e245f", default-features = false, features = ["macros", "extension"] }
+
+[dependencies]
+# Everything the shard Agents decide (Apache-2.0 OR MIT, no VOS).
+shards = { path = "../../crates/shards", default-features = false, features = ["agent"] }
+core-binding = { path = "../../crates/core-binding", default-features = false, features = ["mapped"] }
+
+# CipherClerk e9a7b08 with proposals/cipherclerk/0001 and 0003-0005 (tools/cipherclerk-patched.sh).
+[patch."https://codeberg.org/Virto/CipherClerk.git"]
+cipher-clerk = { path = "../../.cipherclerk-patched" }
+
+# The guest: fastest code, whole-program LTO, abort on panic (as agents/core): with the program
+# hashed once or looked up by hash, size costs little and `3` cuts the actor's gas per command.
+[profile.release]
+opt-level = 3
+lto = true
+panic = "abort"
+codegen-units = 1

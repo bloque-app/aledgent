@@ -1,0 +1,6 @@
+Public certificate-authority certificates.
+
+The certificates in this file are published by their issuer so that anyone can verify TLS
+connections to the issuer's services. They are redistributed here unmodified, for that purpose
+only. No copyright or licence is claimed in them by the aledgent project, and the issuer's own
+terms apply.

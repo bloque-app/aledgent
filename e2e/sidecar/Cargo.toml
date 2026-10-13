@@ -1,0 +1,39 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+[package]
+name = "aledgent-sidecar"
+version = "0.1.0"
+description = "aledgent as a CI service container (deploy/docker/SIDECAR.md): ingress and the in-process core in one process, book only, in memory, with a fixed test genesis and a test-only operator token. Never a production deployment."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "aledgent-sidecar"
+path = "src/main.rs"
+
+[dependencies]
+# Ingress as it runs in production, over its in-memory store: no PostgreSQL. `http` for the
+# notification transport (no recipient is registered unless one is asked for).
+ingress = { path = "../../services/ingress", default-features = false, features = ["http"] }
+ledger-core = { path = "../../crates/ledger-core" }
+# The passkeys' key type (F-028): the sidecar accepts passkeys of its relying party.
+authn = { path = "../../crates/authn" }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+hex = "0.4"
+serde = "1"
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "std"] }
+
+[dev-dependencies]
+# A software authenticator for the passkey tests (`webauthn::testing`).
+authn = { path = "../../crates/authn", features = ["testing"] }
+base64 = "0.22"
+
+[lints]
+workspace = true

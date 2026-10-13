@@ -1,0 +1,60 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+[package]
+name = "conformance"
+version = "0.1.0"
+description = "aledgent's conformance suite: the spec catalogue, the case registry and runner, the harnesses, the closure checks, and the assurance declaration (F-015)."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+# The suite under v1 roots (CipherClerk's full-depth tree), the supported opt-in beside the default
+# v2 (DEC-25, owner ruling cs-q04): every case from a v1 genesis. CI runs the gate profile both ways.
+smt-v1 = ["ledger-kernel/smt-v1", "ledger-core/smt-v1", "leaf-store/smt-v1", "core-binding/smt-v1", "ingress/smt-v1", "settle/smt-v1", "ops/smt-v1"]
+
+[dependencies]
+# The raw kernel and store ports (F-001 §11). This crate is the only one
+# allowed to enable them: tools/ci/check-conformance-ports.sh (REQ-CS-5).
+ledger-kernel = { path = "../ledger-kernel", features = ["std", "conformance-ports"] }
+# Forged store records for the service-store cases (F-003), under the same rule; and the
+# simulated settlement layer (F-010).
+ledger-core = { path = "../ledger-core", features = ["serde", "conformance-ports", "sim"] }
+# F-006's leaf store: its store cases rebuild it from a target's committed delta log.
+leaf-store = { path = "../leaf-store" }
+# The recovery authority's service (F-012, DEC-13): the suite plays the recovery authority with it.
+recovery = { path = "../../services/recovery" }
+cipher-clerk = { workspace = true, features = ["signing"] }
+# F-009's cases run a whole ingress deployment in process (services/ingress's testkit), over the
+# in-process core. Without the PostgreSQL store and the HTTP transport.
+ingress = { path = "../../services/ingress", default-features = false }
+# F-016's cases run the settlement adapter against a fake settlement layer (services/settle's
+# test kit), without its RPC client, its PostgreSQL store or its HTTP transport.
+settle = { path = "../../services/settle", default-features = false }
+# F-005's target: the suite through the core Agent (natively, or in VOS through the core host).
+core-binding = { path = "../core-binding", features = ["std", "conformance-ports"] }
+# F-017's cases check a disclosure and an anchor as a recipient would.
+verify = { path = "../verify" }
+# F-018's cases run the restore drill, the signal exporter, the alert rules and the reconciliation
+# over the same in-process deployment (ops's kit), without PostgreSQL.
+ops = { path = "../../ops", default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
+# Point arithmetic for re-deriving balances from committed entries (NFR-4).
+curve25519-dalek = { version = "4.1", default-features = false, features = ["alloc", "precomputed-tables", "zeroize"] }
+libtest-mimic = "0.8"
+proptest = { version = "1", default-features = false, features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+toml = "0.9"
+
+# The runner (F-015 §2): lists every registered case by id, runs the current
+# gate profile, and writes target/conformance/report.json.
+[[test]]
+name = "suite"
+harness = false
+
+[lints]
+workspace = true

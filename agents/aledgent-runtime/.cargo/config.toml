@@ -1,0 +1,20 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# The runtime guest's build: VOS's bundled runtime's scaffolding
+# (services/agent-runtime/.cargo/config.toml at the pinned VOS), less its path-remapping wrapper.
+[target.riscv64em-vos]
+rustflags = [
+    "-Zunstable-options",
+    "-Zcrate-attr=no_std",
+    "-Zcrate-attr=no_main",
+    "-Aduplicate-macro-attributes",
+    "-Aunused-attributes",
+    "-Clink-arg=-Tpvm.ld",
+    "-Zremap-cwd-prefix=.",
+]
+
+[alias]
+actor = "rustc --lib --crate-type bin -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem --release --target riscv64em-vos.json"
+
+[unstable]
+json-target-spec = true

@@ -1,0 +1,38 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# F-027 T-027-03: pins the settlement executor's Kreivo transaction to Kreivo's own crates.
+#
+# A workspace of its own, excluded from the root one like `contracts/`: these are the
+# Polkadot SDK and Virto crates at the versions Kreivo `4aef055` (spec 133) locks, and they have no
+# place in the service's dependency tree. `services/settle` builds its transactions with its own
+# plain SCALE encoder (`src/chain/kreivo.rs`) and pins them in `vectors.json`; this crate rebuilds
+# the same bytes from the same inputs with Kreivo's types and checks them against that file. Run it
+# with `cargo test --manifest-path services/settle/kreivo-pin/Cargo.toml`.
+[workspace]
+
+[package]
+name = "kreivo-pin"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/bloque-app/aledgent"
+description = "Pins aledgent-settle's Kreivo v5 PassAuthenticate transactions to Kreivo's own types at 4aef055."
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+codec = { package = "parity-scale-codec", version = "=3.7.5", features = ["derive"] }
+scale-info = { version = "=2.11.6", features = ["derive"] }
+sp-core = { version = "=43.0.0", features = ["std"] }
+sp-crypto-hashing = "=0.1.0"
+sp-runtime = { version = "=48.0.0", features = ["std"] }
+sp-weights = { version = "=36.0.0", features = ["std"] }
+frame-support = { version = "=48.1.0", features = ["std"] }
+# The authenticator Kreivo's `Pass` composite uses for substrate keys, and its traits: the message
+# the device signs, the credential, and the device's own verification of it.
+fc-traits-authn = { version = "=2.2.0", features = ["std"] }
+pass-authenticators-substrate-keys = { version = "=1.0.0", default-features = false, features = ["runtime", "full-crypto"] }
+serde_json = "1"
+hex = "0.4"

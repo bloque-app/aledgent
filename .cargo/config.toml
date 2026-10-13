@@ -1,0 +1,6 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# `cargo xtask spec-ids [--check]`: regenerate or check the conformance
+# suite's spec catalogue (F-015 §1).
+[alias]
+xtask = "run --quiet -p conformance --bin xtask --"

@@ -1,0 +1,26 @@
+---
+// Wraps Starlight's own footer (edit link, last updated, pagination) and adds the licence line
+// to every page. Nothing of the default footer is copied.
+import Default from '@astrojs/starlight/components/Footer.astro';
+---
+
+<Default />
+<p class="bq-legal">
+	© 2026 Pagos Cube LLC · Code: Apache-2.0 OR MIT · <code>agents/</code>: AGPL-3.0-or-later · Docs:
+	CC-BY-4.0
+</p>
+
+<style>
+	.bq-legal {
+		margin-top: 2.5rem;
+		padding-top: 1.25rem;
+		border-top: 1px solid var(--sl-color-hairline);
+		font-size: var(--sl-text-xs);
+		color: var(--sl-color-gray-3);
+	}
+	.bq-legal code {
+		font-size: inherit;
+		background: none;
+		padding: 0;
+	}
+</style>

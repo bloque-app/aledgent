@@ -1,0 +1,31 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# F-002 S4 guest: an Agent actor holding a Linear blob of chosen size. Never
+# shipped. Built inside the Linux container by spikes/guest/build.sh.
+[workspace]
+
+[package]
+name = "state-blob"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/bloque-app/aledgent"
+
+[features]
+default = ["bin"]
+bin = []
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+vos = { path = "/vos/vos", default-features = false, features = ["macros", "pvm"] }
+
+[target.'cfg(not(target_arch = "riscv64"))'.dependencies]
+vos = { path = "/vos/vos", default-features = false, features = ["macros", "extension"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"

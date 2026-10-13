@@ -1,0 +1,37 @@
+    Finished `release` profile [optimized] target(s) in 2.38s
+s4 size 65536: 1 fill invocations (1 acknowledged); reset window 31
+s4 size 65536: 0 unacknowledged results retained
+s4 size 65536: 2/2 rows, Agent state 70557 B
+== s4 state 70557 B ==
+  caller e2e us (invoke + ack, in-process): n=1000 p50=186642 p95=212949 p99=267020 max=294931
+  invoke elapsed_us: n=1000 p50=138243 p95=161089 p99=195639 max=219259
+  ack elapsed_us: n=1000 p50=47886 p95=55458 p99=71306 max=128960
+  invoke input_bytes: n=1000 p50=141488 p95=144190 p99=144383 max=144383
+  invoke gas_used: n=1000 p50=99492808 p95=100941660 p99=101091460 max=101330253
+s4 size 1048576: 16 fill invocations (16 acknowledged); reset window 16
+s4 size 1048576: 0 unacknowledged results retained
+s4 size 1048576: 32/32 rows, Agent state 1057302 B
+== s4 state 1057302 B ==
+  caller e2e us (invoke + ack, in-process): n=1000 p50=921685 p95=965985 p99=1028652 max=1095437
+  invoke elapsed_us: n=1000 p50=514033 p95=544072 p99=585388 max=625917
+  ack elapsed_us: n=1000 p50=405641 p95=426230 p99=461317 max=538320
+  invoke input_bytes: n=1000 p50=1126882 p95=1128233 p99=1128233 max=1128233
+  invoke gas_used: n=1000 p50=346577979 p95=347314894 p99=347412390 max=347514795
+s4 size 2097152: 32 fill invocations (1 acknowledged); reset window 31
+s4 size 2097152: 31 unacknowledged results retained
+s4 size 2097152: 64/64 rows, Agent state 2147805 B
+== s4 state 2147805 B ==
+  caller e2e us (invoke + ack, in-process): n=1000 p50=2171055 p95=2226028 p99=2270123 max=2321194
+  invoke elapsed_us: n=1000 p50=1159185 p95=1195873 p99=1226864 max=1303584
+  ack elapsed_us: n=1000 p50=1007392 p95=1037583 p99=1078242 max=1126533
+  invoke input_bytes: n=1000 p50=2218736 p95=2221438 p99=2221631 max=2221631
+  invoke gas_used: n=1000 p50=822872078 p95=824337239 p99=824510856 max=824663856
+s4 size 4063232: 62 fill invocations (31 acknowledged); reset window 1
+s4 size 4063232: 31 unacknowledged results retained
+s4 size 4063232: 124/124 rows, Agent state 4121295 B
+== s4 state 4121295 B ==
+  caller e2e us (invoke + ack, in-process): n=1000 p50=3624633 p95=3702928 p99=3791100 max=4030252
+  invoke elapsed_us: n=1000 p50=1893996 p95=1938168 p99=1992384 max=2061138
+  ack elapsed_us: n=1000 p50=1719771 p95=1767336 p99=1828068 max=2096612
+  invoke input_bytes: n=1000 p50=4189331 p95=4189331 p99=4189331 max=4189331
+  invoke gas_used: n=1000 p50=1282926007 p95=1283076300 p99=1283132431 max=1283194468

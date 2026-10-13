@@ -1,0 +1,7 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# The canonical guest toolchain `vosx actor build` pins at the VOS commit this
+# crate targets (vosx/src/commands/build.rs, CANONICAL_GUEST_TOOLCHAIN).
+[toolchain]
+channel = "nightly-2026-03-20"
+components = ["rust-src"]

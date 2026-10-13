@@ -1,0 +1,448 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+name: E2E (zombienet)
+
+# aledgent's release gate (PLAN.md §5, "Release gate"): no release reaches the
+# Kreivo testnet or mainnet unless this suite passes. It spawns a relay chain and Kreivo from
+# release artifacts, deploys the settlement contract through the contracts store with the steps a
+# mainnet deployment runs, drives it end to end, injects faults, and checks every outcome at
+# finality by reading the contract's storage, as the settlement adapter does. `e2e/README.md` says
+# what each phase does and how to run it by hand.
+#
+# How it is shaped, and why:
+#
+# - A self-hosted runner labelled `zombienet` (x86-64, 16 vCPU). Never plain `self-hosted`: that
+#   label also matches other runners, and a job then lands wherever the schedule puts it. A public
+#   repository must never give pull requests from forks access to a self-hosted runner; this
+#   workflow runs on manual dispatch and release tags only.
+# - The whole network comes from release artifacts (e2e/scripts/prepare.sh): the Kreivo runtime wasm
+#   and polkadot-sdk binaries. zombienet builds Kreivo's genesis from the wasm itself.
+# - Bring-up is its own step, so a slow spawn reads as "Spawn network", not as a hanging test.
+# - Per-runner scratch (TMPDIR under RUNNER_TEMP), so the reclaim and the final `pkill` match this
+#   job's nodes and nothing else's; stale zombienet directories are reclaimed before spawning, and
+#   the network is stopped and removed whatever the outcome.
+# - Not on every pull request: the suite is long (a network, then ~20 transactions each waiting for
+#   finality). Manual dispatch, release tags, and callable by a release workflow.
+#
+# The runner has no Rust toolchain, so the two builds (the network crate and the contract) run in a `rust:1-bookworm` container on the same
+# runner, in a job-local directory deleted at the end, as x86-bench.yml does. The network, the node
+# processes and the Node.js suite run on the runner itself.
+
+on:
+  workflow_dispatch:
+    inputs:
+      kreivo_release:
+        description: "Kreivo release tag of virto-network/kreivo. Default 0.17.0 (3e0a5c3, spec 133), the runtime mainnet runs from 2026-09-30; 0.16.9 (spec 132) stays selectable, with psdk_release polkadot-stable2603-4"
+        type: string
+        default: "0.17.0"
+      kreivo_ref:
+        description: "Or build Kreivo's runtime from this branch, tag or commit instead of a release (about 20 minutes more)"
+        type: string
+        default: ""
+      psdk_release:
+        description: "polkadot-sdk release for polkadot and polkadot-parachain (Kreivo 0.17 needs stable2606: the default; 0.16.9 needs stable2603 or newer, e.g. polkadot-stable2603-4)"
+        type: string
+        default: polkadot-stable2606-2
+      driver:
+        description: "Who drives steps 3 and 4: the script (contracts/settlement/scripts) or aledgent (ingress and the core, and the adapter as its own process with PostgreSQL, over the light client)"
+        type: choice
+        options: [script, aledgent]
+        default: script
+      aledgent_connection:
+        description: "With the aledgent driver: how the adapter reaches Kreivo. light-client (as it runs by default), or rpc (its opt-in fallback, over the collator)"
+        type: choice
+        options: [light-client, rpc]
+        default: light-client
+      mainnet_parity:
+        description: "If the runtime under test is not the one Kreivo mainnet runs: warn, or fail (release tags always fail)"
+        type: choice
+        options: [warn, require]
+        default: warn
+      stress_phases:
+        description: "Stress scenario c (F-032), aledgent driver only: after step 3, the book under load (name:commands_per_min:secs,...) while withdrawals settle through the adapter. Empty: skipped"
+        type: string
+        default: ""
+  # The release gate: a release tag runs the full suite with the script driver and requires the
+  # runtime mainnet runs. A release workflow calls this one and `needs:` it.
+  push:
+    tags: ["v*"]
+  workflow_call:
+    inputs:
+      kreivo_release:
+        type: string
+        default: "0.17.0"
+      kreivo_ref:
+        type: string
+        default: ""
+      psdk_release:
+        type: string
+        default: polkadot-stable2606-2
+      driver:
+        type: string
+        default: script
+      aledgent_connection:
+        type: string
+        default: light-client
+      mainnet_parity:
+        type: string
+        default: require
+
+permissions:
+  contents: read
+
+# A new run supersedes its own branch's stale run, never another branch's: the fleet runs one job
+# per runner, each in its own VM, so runs on different refs cannot share ports or scratch. Never
+# cancelled on a tag or on main: a gate cut short proves nothing and has to be redone.
+concurrency:
+  group: e2e-zombienet-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') && github.ref != 'refs/heads/main' }}
+
+jobs:
+  e2e:
+    name: E2E (${{ inputs.driver || 'script' }} driver)
+    runs-on: zombienet
+    # The sum of the step budgets below, with room: a step's own timeout fires first and names the
+    # phase that hung.
+    timeout-minutes: 240
+    env:
+      IMAGE: rust:1-bookworm
+      # The aledgent driver's containers (the adapter, its namespace, PostgreSQL) and network.
+      ALEDGENT_TAG: ${{ github.run_id }}-${{ github.run_attempt }}
+      # A release tag has no inputs: it gates on the defaults, Kreivo 0.17.0 on stable2606-2.
+      KREIVO_RELEASE: ${{ inputs.kreivo_release || '0.17.0' }}
+      KREIVO_REF: ${{ inputs.kreivo_ref || '' }}
+      PSDK_RELEASE: ${{ inputs.psdk_release || 'polkadot-stable2606-2' }}
+      DRIVER: ${{ inputs.driver || 'script' }}
+      ALEDGENT_CONNECTION: ${{ inputs.aledgent_connection || 'light-client' }}
+      MAINNET_PARITY: ${{ inputs.mainnet_parity || 'require' }}
+      # The deployment, as on mainnet: the operator's own community publishes,
+      # licenses and instantiates. On a fresh network it does not exist, so the suite registers it
+      # first. //Alice administers it and is the contract's admin; //Bob is the contract's key;
+      # //Alice deposits (she holds the genesis assets); //Dave is the payee.
+      COMMUNITY_ID: "4242"
+      COMMUNITY_NAME: aledgent Test
+      ASSET: '{"Here":1}'
+      ASSET2: '{"Here":2}'
+      BOUND: "1000000"
+      BOUND_PERIOD: "1000"
+      PRUNED_STATE_BLOCKS: "16"
+    steps:
+      - name: Host facts
+        run: |
+          printf 'METER host cores=%s ram_mb=%s disk_free_gb=%s load=%s\n' \
+            "$(nproc)" "$(free -m | awk '/^Mem:/{print $2}')" \
+            "$(df -BG --output=avail "$RUNNER_TEMP" | tail -1 | tr -dc '0-9')" \
+            "$(awk '{print $1}' /proc/loadavg)"
+          grep -m1 'model name' /proc/cpuinfo || true
+          docker --version
+
+      - uses: actions/checkout@v4
+
+      - name: Job-local work directory
+        run: |
+          set -eu
+          WORK=$RUNNER_TEMP/e2e-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT
+          {
+            echo "WORK=$WORK"
+            echo "E2E_OUT=$WORK/out"
+            echo "STATE=$WORK/out/state.json"
+            echo "BUNDLE=$WORK/dist/aledgent_settlement_contract.contract"
+            echo "ARTIFACTS=$WORK/artifacts"
+          } >> "$GITHUB_ENV"
+          mkdir -p "$WORK/src" "$WORK/out" "$WORK/dist" "$WORK/artifacts" "$WORK/target" "$WORK/tools" \
+                   "$WORK/cargo-registry" "$WORK/cargo-git"
+          # A copy of this commit: the container never writes into the runner's checkout.
+          git archive HEAD | tar -x -C "$WORK/src"
+          # Whether this job pulls the image, so that cleanup removes only what it added.
+          if docker image inspect "$IMAGE" >/dev/null 2>&1; then echo "PULLED_IMAGE=no" >> "$GITHUB_ENV"; else echo "PULLED_IMAGE=yes" >> "$GITHUB_ENV"; fi
+          for i in 1 2 3 4 5; do docker pull -q "$IMAGE" && break; sleep $((i * 15)); done
+
+      # Cached between runs: the crates, cargo-contract (a C++ build of binaryen, minutes) and the two
+      # targets. Restored and saved explicitly, because the clean-up at the end deletes the
+      # directory before a post-job save would run.
+      - name: Restore build caches
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ${{ env.WORK }}/cargo-registry
+            ${{ env.WORK }}/cargo-git
+            ${{ env.WORK }}/tools
+            ${{ env.WORK }}/target
+          key: e2e-build-v1-${{ hashFiles('e2e/network/Cargo.lock', 'contracts/settlement/Cargo.lock', 'contracts/settlement/rust-toolchain.toml') }}
+          restore-keys: e2e-build-v1-
+
+      - name: Build the network and the contract (container)
+        timeout-minutes: 45
+        run: |
+          docker run --rm --init --name "e2e-build-$GITHUB_RUN_ID" \
+            -e BUILD_ALEDGENT="$([ "$DRIVER" = aledgent ] && echo 1 || echo 0)" \
+            -v "$WORK":/w \
+            -v "$WORK/cargo-registry":/usr/local/cargo/registry \
+            -v "$WORK/cargo-git":/usr/local/cargo/git \
+            -w /w "$IMAGE" bash /w/src/e2e/scripts/build.sh
+          # The container wrote as root; the runner reads the outputs.
+          docker run --rm -v "$WORK":/w "$IMAGE" chmod -R a+rX /w/dist /w/target /w/tools /w/cargo-registry /w/cargo-git
+          ls -la "$WORK/dist"
+
+      - name: Save build caches
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ env.WORK }}/cargo-registry
+            ${{ env.WORK }}/cargo-git
+            ${{ env.WORK }}/tools
+            ${{ env.WORK }}/target
+          key: e2e-build-v1-${{ hashFiles('e2e/network/Cargo.lock', 'contracts/settlement/Cargo.lock', 'contracts/settlement/rust-toolchain.toml') }}
+
+      - name: Build Kreivo's runtime from a commit (container)
+        if: env.KREIVO_REF != ''
+        timeout-minutes: 75
+        run: |
+          docker run --rm --init --name "e2e-kreivo-$GITHUB_RUN_ID" \
+            -e KREIVO_REF \
+            -v "$WORK":/w \
+            -v "$WORK/cargo-registry":/usr/local/cargo/registry \
+            -v "$WORK/cargo-git":/usr/local/cargo/git \
+            -w /w "$IMAGE" bash /w/src/e2e/scripts/build-kreivo.sh
+          {
+            echo "KREIVO_PREBUILT_WASM=$WORK/kreivo/kreivo_runtime.compact.compressed.wasm"
+            echo "KREIVO_PREBUILT_REF=$(cat "$WORK/kreivo/ref")"
+          } >> "$GITHUB_ENV"
+
+      - name: Fetch release artifacts
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OUT: ${{ env.WORK }}/artifacts
+        run: |
+          ./e2e/scripts/prepare.sh
+          cat "$ARTIFACTS/artifacts.env" >> "$GITHUB_ENV"
+          {
+            echo "### Runtime under test"
+            echo '```'
+            cat "$ARTIFACTS/artifacts.env"
+            "$ARTIFACTS/bin/polkadot-parachain" --version
+            "$ARTIFACTS/bin/polkadot" --version
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install the suite's dependencies
+        working-directory: contracts/settlement/scripts
+        run: npm ci --no-audit --no-fund
+
+      - name: Install the book-only scenario's dependencies (polkadot-api)
+        if: env.DRIVER == 'aledgent'
+        working-directory: e2e/papi
+        run: npm ci --no-audit --no-fund
+
+      # zombienet writes its base directory under $TMPDIR and hands it to each node as
+      # --base-path, so a per-runner TMPDIR makes the patterns below match this job's nodes only.
+      - name: Isolate this runner's zombienet scratch
+        run: |
+          ZN="$RUNNER_TEMP/zn"
+          mkdir -p "$ZN"
+          echo "TMPDIR=$ZN" >> "$GITHUB_ENV"
+          # polkadot kills a node when disk runs low ("Essential task `storage-monitor` failed"),
+          # which reads as a spawn timeout: print the space.
+          df -h "$ZN" | tail -1
+
+      - name: Reclaim the host before spawning a network
+        run: |
+          echo "stale nodes from this runner: $(pgrep -cf "$TMPDIR/zombie-" 2>/dev/null || echo 0)"
+          pkill -f "$TMPDIR/zombie-" || true
+          # Older than any run could be, so never a network in flight.
+          find "$TMPDIR" /tmp -maxdepth 1 -name 'zombie-*' -type d -mmin +180 -exec rm -rf {} + 2>/dev/null || true
+          df -h "$TMPDIR" | tail -1
+
+      - name: Spawn network
+        timeout-minutes: 25
+        env:
+          ZOMBIENET_KREIVO_WASM: ${{ env.WORK }}/artifacts/kreivo_runtime.compact.compressed.wasm
+          ZOMBIENET_POLKADOT_BIN: ${{ env.WORK }}/artifacts/bin/polkadot
+          ZOMBIENET_POLKADOT_PARACHAIN_BIN: ${{ env.WORK }}/artifacts/bin/polkadot-parachain
+        run: |
+          set -euo pipefail
+          # polkadot finds its workers on PATH.
+          export PATH="$ARTIFACTS/bin:$PATH"
+          printf 'METER phase=spawn_start t=%s\n' "$(date +%s)"
+          ENDPOINTS="$WORK/out/endpoints.env"
+          rm -f "$ENDPOINTS"
+          ZOMBIENET_ENV_FILE="$ENDPOINTS" nohup "$WORK/dist/spawn_network" > "$WORK/out/network.log" 2>&1 &
+          echo $! > "$WORK/spawn_network.pid"
+          for _ in $(seq 1 280); do
+            [ -s "$ENDPOINTS" ] && break
+            if ! kill -0 "$(cat "$WORK/spawn_network.pid")" 2>/dev/null; then
+              echo "::error::spawn_network exited before the network came up"
+              tail -100 "$WORK/out/network.log"
+              exit 1
+            fi
+            sleep 5
+          done
+          [ -s "$ENDPOINTS" ] || { echo "::error::the network did not come up in time"; tail -100 "$WORK/out/network.log"; exit 1; }
+          # Prove the endpoints answer before handing them on.
+          # shellcheck disable=SC1090
+          . "$ENDPOINTS"
+          for uri in "$KREIVO_WS" "$KREIVO_PRUNED_WS" "$RELAY_WS"; do
+            curl -s -m 5 -H 'Content-Type: application/json' \
+              -d '{"jsonrpc":"2.0","id":1,"method":"system_chain","params":[]}' \
+              "http://127.0.0.1:${uri##*:}" | grep -q result \
+              || { echo "::error::$uri does not answer"; exit 1; }
+          done
+          cat "$ENDPOINTS" >> "$GITHUB_ENV"
+          grep METER "$WORK/out/network.log" || true
+          printf 'METER phase=spawn_end t=%s\n' "$(date +%s)"
+
+      # The gate is about mainnet: say whether the runtime under test is the one mainnet runs.
+      - name: Runtime parity with Kreivo mainnet
+        run: |
+          set -euo pipefail
+          version() {
+            curl -s -m 15 -H 'Content-Type: application/json' \
+              -d '{"jsonrpc":"2.0","id":1,"method":"state_getRuntimeVersion","params":[]}' "$1" \
+              | python3 -c 'import json,sys; r=json.load(sys.stdin)["result"]; print(r["specName"], r["specVersion"], r["transactionVersion"])' 2>/dev/null || true
+          }
+          ours="$(version "http://127.0.0.1:${KREIVO_WS##*:}")"
+          mainnet=""
+          for url in https://kreivo.io; do
+            mainnet="$(version "$url")"
+            [ -n "$mainnet" ] && break
+          done
+          echo "under test: $ours; mainnet: ${mainnet:-unreachable}"
+          echo "Runtime under test: \`$ours\`; Kreivo mainnet: \`${mainnet:-unreachable}\`." >> "$GITHUB_STEP_SUMMARY"
+          if [ "$ours" != "$mainnet" ]; then
+            if [ "$MAINNET_PARITY" = require ]; then
+              echo "::error::the runtime under test ($ours) is not the one Kreivo mainnet runs (${mainnet:-unreachable})"
+              exit 1
+            fi
+            echo "::warning::the runtime under test ($ours) is not the one Kreivo mainnet runs (${mainnet:-unreachable})"
+          fi
+
+      - name: "Step 2: deploy through the contracts store"
+        id: deploy
+        timeout-minutes: 15
+        working-directory: contracts/settlement/scripts
+        run: node e2e.mjs deploy
+
+      # Each phase after the deployment runs even if the one before it failed, so that one run
+      # reports on every phase; any failure still fails the job.
+      - name: "Step 3: drive (${{ env.DRIVER }} driver)"
+        if: ${{ !cancelled() && steps.deploy.outcome == 'success' }}
+        timeout-minutes: 55
+        working-directory: contracts/settlement/scripts
+        run: |
+          case "$DRIVER" in
+            script) node e2e.mjs drive ;;
+            aledgent) "$GITHUB_WORKSPACE/e2e/drivers/aledgent.sh" drive ;;
+            *) echo "::error::unknown driver '$DRIVER'"; exit 1 ;;
+          esac
+        env:
+          DRIVER_BIN: ${{ env.WORK }}/dist/aledgent-e2e-driver
+          SETTLE_BIN: ${{ env.WORK }}/dist/aledgent-settle
+          ALEDGENT_IMAGE: ${{ env.IMAGE }}
+
+      - name: "Stress scenario c (F-032): the book under load, withdrawals through the adapter"
+        if: ${{ !cancelled() && steps.deploy.outcome == 'success' && env.DRIVER == 'aledgent' && inputs.stress_phases != '' }}
+        timeout-minutes: 60
+        working-directory: contracts/settlement/scripts
+        run: |
+          # The chain clock (NFR-15, T-032-12): every best and finalized head of the collator and
+          # the relay chain, against which a withdrawal's time is split into inclusion, finality
+          # and what the adapter adds.
+          mkdir -p "$E2E_OUT/aledgent/stress"
+          node "$GITHUB_WORKSPACE/e2e/scripts/heads.mjs" kreivo="$KREIVO_WS" relay="$RELAY_WS" \
+            > "$E2E_OUT/aledgent/stress/heads.jsonl" 2>&1 &
+          HEADS=$!
+          status=0
+          "$GITHUB_WORKSPACE/e2e/drivers/aledgent.sh" stress || status=$?
+          kill "$HEADS" 2>/dev/null || true
+          # The collator's log (txpool=debug): when each withdrawal's transaction reached its pool.
+          for f in "$TMPDIR"/zombie-*/kreivo01/kreivo01.log; do
+            [ -f "$f" ] && gzip -c "$f" > "$E2E_OUT/aledgent/stress/kreivo01.log.gz" || true
+          done
+          if [ -f "$E2E_OUT/aledgent/stress/summary.md" ]; then cat "$E2E_OUT/aledgent/stress/summary.md" >> "$GITHUB_STEP_SUMMARY"; fi
+          exit "$status"
+        env:
+          STRESS_PHASES: ${{ inputs.stress_phases }}
+
+      - name: "Step 3: check outcomes at finality"
+        if: ${{ !cancelled() && steps.deploy.outcome == 'success' }}
+        timeout-minutes: 10
+        working-directory: contracts/settlement/scripts
+        run: node e2e.mjs check
+
+      # With the aledgent driver, every case runs through the adapter's own process (e2e/README.md).
+      - name: "Step 4: fault injection (T-027-06, ${{ env.DRIVER }} driver)"
+        if: ${{ !cancelled() && steps.deploy.outcome == 'success' }}
+        timeout-minutes: 75
+        working-directory: contracts/settlement/scripts
+        run: |
+          case "$DRIVER" in
+            aledgent) "$GITHUB_WORKSPACE/e2e/drivers/aledgent.sh" faults ;;
+            *) node e2e.mjs faults ;;
+          esac
+
+      - name: "Step 4: check the final state"
+        if: ${{ !cancelled() && steps.deploy.outcome == 'success' }}
+        timeout-minutes: 10
+        working-directory: contracts/settlement/scripts
+        run: node e2e.mjs check final
+
+      # Before the artifacts are uploaded: the adapter's last log is kept, its test keys are not.
+      - name: Stop the aledgent driver
+        if: always() && env.DRIVER == 'aledgent'
+        working-directory: contracts/settlement/scripts
+        run: '"$GITHUB_WORKSPACE/e2e/drivers/aledgent.sh" stop || true'
+
+      - name: Job summary
+        if: always()
+        working-directory: contracts/settlement/scripts
+        run: |
+          [ -f "$E2E_OUT/report.json" ] && node e2e.mjs summary > /dev/null || true
+          [ -f "$E2E_OUT/summary.md" ] && cat "$E2E_OUT/summary.md" >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Collect node logs on failure
+        if: failure()
+        run: |
+          shopt -s nullglob
+          mkdir -p "$E2E_OUT/logs"
+          for f in "$TMPDIR"/zombie-*/*/*.log "$TMPDIR"/zombie-*/*.log; do
+            cp "$f" "$E2E_OUT/logs/$(basename "$(dirname "$f")")-$(basename "$f")" 2>/dev/null || true
+          done
+          for f in "$E2E_OUT"/logs/*.log; do
+            echo "::group::$f"; tail -n 150 "$f"; echo "::endgroup::"
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-zombienet-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.E2E_OUT }}
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Stop the network and clean up
+        if: always()
+        run: |
+          if [ -f "${WORK:-}/spawn_network.pid" ]; then
+            kill -TERM "$(cat "$WORK/spawn_network.pid")" 2>/dev/null || true
+            sleep 5
+          fi
+          pkill -f "${WORK:-/nonexistent}/dist/spawn_network" || true
+          # Scoped to this runner's scratch (see "Isolate this runner's zombienet scratch").
+          [ -n "${TMPDIR:-}" ] && pkill -f "$TMPDIR/zombie-" || true
+          sleep 2
+          [ -n "${TMPDIR:-}" ] && find "$TMPDIR" -maxdepth 1 -name 'zombie-*' -type d -exec rm -rf {} + 2>/dev/null || true
+          rm -rf contracts/settlement/scripts/node_modules
+          if [ -n "${WORK:-}" ] && [ -d "$WORK" ]; then
+            # The container wrote as root: delete from inside one.
+            docker run --rm -v "$WORK":/w "$IMAGE" find /w -mindepth 1 -delete || true
+            rmdir "$WORK" || rm -rf "$WORK" || true
+          fi
+          if [ "${PULLED_IMAGE:-no}" = yes ]; then docker image rm "$IMAGE" >/dev/null || true; fi
+          df -h "$RUNNER_TEMP" | tail -1

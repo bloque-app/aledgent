@@ -1,0 +1,102 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+[package]
+name = "settle"
+version = "0.1.0"
+description = "aledgent-settle (F-016, F-027): the settlement adapter and executor of the call outbox. The only component that touches the settlement layer; it holds the signing keys, outside the core, executes calls in batches on the settlement contract as the community PASS account, and reports what the layer did as observations."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "aledgent-settle"
+path = "src/main.rs"
+required-features = ["light-client", "http", "postgres"]
+
+[features]
+default = ["light-client", "http", "postgres"]
+# The settlement layer through subxt's embedded smoldot light client: how the adapter connects
+# unless its configuration opts into a node's RPC (NOTES.md, decisions 1, 25 and 29). Includes `rpc`.
+light-client = ["rpc", "dep:smoldot-light", "dep:ed25519-zebra"]
+# subxt's dynamic API, with metadata-driven encoding and decoding (NOTES.md, decision 1), over a
+# node's RPC only. The opt-in fallback transport; on its own it builds no binary.
+rpc = ["dep:subxt", "dep:scale-value"]
+# Ingress over HTTP.
+http = ["dep:reqwest"]
+# The adapter's store in PostgreSQL (accepted proposal): a database and role apart from ingress.
+postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "ingress/postgres"]
+# The binary dies where `ALEDGENT_SETTLE_CRASH_AT` says (`after-sign`, `after-persist`,
+# `after-broadcast`): the zombienet suite's "kill the adapter between signing and submitting"
+# (T-027-06). Only the suite's build enables it.
+fault-injection = []
+# The zombienet suite's light-client dry-run probe only (`examples/lc_dryrun_probe.rs`): subxt 0.44's
+# own light client (smoldot-light 0.17.2), which the adapter no longer uses, as path (c) beside it.
+probe-subxt-lightclient = ["light-client", "subxt/unstable-light-client"]
+# v1 roots (CipherClerk's full-depth tree): a supported opt-in beside the default v2 (DEC-25,
+# owner ruling cs-q04). A deployment chooses its roots at genesis and builds every binary of it,
+# the core host and the core's guest included, with the same choice (deploy/docker: ROOTS=v1).
+smt-v1 = ["ledger-kernel/smt-v1", "ledger-core/smt-v1", "ingress/smt-v1"]
+
+[dependencies]
+# Identifiers, amounts, the instruction's canonical digest and the boundary's types. No conformance
+# ports and no simulator: the adapter never holds a book (REQ-SA-8, guardrail 13).
+ledger-core = { path = "../../crates/ledger-core" }
+ledger-kernel = { path = "../../crates/ledger-kernel", default-features = false }
+# The wire forms of the settlement surface, defined once, in ingress; and its in-process
+# deployment for the test kit. Without PostgreSQL or the HTTP transport.
+ingress = { path = "../ingress", default-features = false }
+# The key boundary (F-035): the signer service's client only. The lane and anchor keys are the
+# signer's (AWS KMS in production); the adapter holds their identifiers and public halves.
+signer = { path = "../signer", default-features = false }
+axum = { version = "0.8", default-features = false }
+blake2 = "0.10"
+hex = "0.4"
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+parity-scale-codec = { version = "3", default-features = false, features = ["derive", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "std"] }
+zeroize = "1"
+subxt = { version = "0.44", optional = true }
+# The embedded light client (`chain/light.rs`): smoldot-light 2.x, not subxt 0.44's own (smoldot-light
+# 0.17.2), which could not dry-run the contract's `execute` (F-027 NOTES, decision 42).
+smoldot-light = { version = "2.1", optional = true }
+scale-value = { version = "0.18", optional = true }
+# Not used directly: smoldot (under `light-client`) uses ed25519-zebra's batch verifier, which
+# 4.2 moved behind its `alloc` feature without smoldot asking for it.
+ed25519-zebra = { version = "4", default-features = false, features = ["alloc"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
+tokio-postgres = { version = "0.7", optional = true }
+deadpool-postgres = { version = "0.14", optional = true }
+
+[dev-dependencies]
+# F-035: an in-process signer service for the lane key's test (tests/signer_service.rs).
+signer = { path = "../signer", default-features = false, features = ["server"] }
+sha2 = "0.10"
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
+# F-017's end-to-end test checks a disclosure as a recipient would, with nothing of aledgent's.
+verify = { path = "../../crates/verify", default-features = false }
+tempfile = "3"
+# The light-client probe (`examples/lc_dryrun_probe.rs`) prints smoldot's own log, which goes through `log`.
+log = "0.4"
+
+[[test]]
+name = "postgres"
+required-features = ["postgres"]
+
+[[test]]
+name = "live_node"
+required-features = ["light-client"]
+
+# The zombienet suite's light-client dry-run probe (F-027 NOTES, decision 36): built only by the
+# suite, never released.
+[[example]]
+name = "lc_dryrun_probe"
+required-features = ["light-client"]
+
+[lints]
+workspace = true

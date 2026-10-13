@@ -1,0 +1,60 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Gate profiles (F-015 §10, T-015-09).
+#
+# CI runs the `current` profile on every change to crates/ (job `conformance`).
+# A case is REQUIRED by a profile when its owner is one of the profile's
+# features, its id is selected (listed invariant, owned error, or acceptance
+# criterion of a listed epic), and its layer is allowed. A required case that
+# is still pending fails the gate; a pending case that is not required is
+# reported and ignored. A case with a body always runs, and a failure always
+# fails: a regression is a regression whoever owns it.
+#
+# `full` requires every case. It is red until the last feature lands, and CI
+# publishes it as a report without failing (job `conformance-full`).
+#
+# Move `current` forward when a milestone's features have landed.
+
+current = "m1"
+
+# M-0 · Foundations. "The conformance suite exists and fails" (PLAN §5): the
+# closure checks pass, the catalogue is current, and the kernel and store
+# cases of INV-1, INV-2, INV-3, INV-4, INV-7 and INV-25 pass.
+[profile.m0]
+milestone = "M-0"
+features = ["F-001", "F-002", "F-015"]
+invariants = ["INV-1", "INV-2", "INV-3", "INV-4", "INV-7", "INV-25"]
+layers = ["kernel", "store", "type", "architecture"]
+assurance = "milestone"
+
+# M-1 · The book, in a process (PLAN §5): Epics A (except US-A8), B, C, F, G,
+# H and K, and INV-1–INV-9, INV-14–INV-18 and INV-20–INV-25. Errors owned by
+# these features are required too. Cases in these epics owned by later
+# features (AC-K3.*, F-009; AC-K6.*, F-021) are listed as deferred, not required.
+[profile.m1]
+milestone = "M-1"
+features = [
+  "F-001", "F-002", "F-015",
+  "F-003", "F-004", "F-007", "F-008", "F-010", "F-011", "F-012", "F-013", "F-014",
+]
+invariants = [
+  "INV-1", "INV-2", "INV-3", "INV-4", "INV-5", "INV-6", "INV-7", "INV-8", "INV-9",
+  "INV-14", "INV-15", "INV-16", "INV-17", "INV-18",
+  "INV-20", "INV-21", "INV-22", "INV-23", "INV-24", "INV-25",
+]
+errors = true
+epics = ["A", "B", "C", "F", "G", "H", "K"]
+# US-A9 and US-C6 (amendment 0013) wait for F-028's enrolment (T-028-10 to
+# T-028-12, not built: the owner's ruling of 2026-10-08) and F-004's
+# open-reservations query (T-004-09).
+except_stories = ["US-A8", "US-A9", "US-C6"]
+# AC-C3.2 waited here for amendment 0006 item 11. Ruled on 2026-09-29: §5.6
+# has the edge, and AC-C3.2 is required like every other criterion.
+assurance = "milestone"
+
+# Every case: the full run, and the release declaration (REQ-AR-5: every
+# invariant declared; REQ-AR-6: the floor met).
+[profile.full]
+milestone = "V0"
+all = true
+assurance = "release"

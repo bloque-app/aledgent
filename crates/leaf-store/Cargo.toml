@@ -1,0 +1,44 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+[package]
+name = "leaf-store"
+version = "0.1.0"
+description = "aledgent's host-side leaf store (F-006): the book's leaves, SMT nodes and proofs, the witness builder, the delta archive, the applier and read views, history and indexes, the openings store, and rebuild from the committed delta log."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+# v1 roots (CipherClerk's full-depth tree): a supported opt-in beside the default v2 (DEC-25,
+# owner ruling cs-q04). Host and guests must agree: build both with it or neither. The standalone
+# witness of `witness` (CipherClerk's SuccinctTransitionWitness, F-006's offline verifier) is v1
+# only: its tests run with this feature.
+smt-v1 = ["ledger-kernel/smt-v1", "ledger-core/smt-v1"]
+
+[dependencies]
+# F-001's binding: the LeafStore trait this store implements, its write rules,
+# the working set the witness verifier runs the kernel over, and the vault
+# backend trait the openings store implements.
+ledger-kernel = { path = "../ledger-kernel", features = ["std"] }
+# The delta record and the service tree's leaves (T-006-01).
+ledger-core = { path = "../ledger-core" }
+cipher-clerk = { workspace = true }
+# Point arithmetic for the commitment checks of INV-5 and INV-6.
+curve25519-dalek = { version = "4.1", default-features = false, features = ["alloc", "precomputed-tables", "zeroize"] }
+# Must match the kernel's rkyv configuration: the witness is the kernel's own archive.
+rkyv = { version = "0.8", default-features = false, features = ["alloc", "bytecheck", "little_endian", "pointer_width_32"] }
+# The storage engine (plan Proposal: redb), behind `engine::Engine`.
+redb = "4"
+
+[dev-dependencies]
+# `helpers` gives the kernel's reference backend (MemLedger, MemOracle) for differential tests.
+cipher-clerk = { workspace = true, features = ["helpers"] }
+# F-001's store write-rule suite, run against this store.
+ledger-kernel = { path = "../ledger-kernel", features = ["std", "store-suite"] }
+proptest = { version = "1", default-features = false, features = ["std"] }
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -1,0 +1,25 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+[package]
+name = "guest-heap"
+version = "0.1.0"
+description = "A model of the core guest's heap for native tests (REQ-RT-1): a global allocator that serves from the system and replays every allocation of a window through the guest allocator's placement rules, so a test reads the arena the guest would need. Test-only: never linked by a guest or a host."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Not `[lints] workspace = true`: a global allocator is `unsafe impl GlobalAlloc`, which the
+# workspace forbids everywhere else. Here `unsafe` is denied, not forbidden, so that the one impl can
+# allow it (`src/lib.rs`): its four delegations to `System`. Any other `unsafe` in the crate, the
+# model included, is refused. Every other workspace lint applies. No crate may depend on this one
+# but as a dev-dependency (`tools/ci/check-guest-heap-dev-only.sh`).
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "deny"
+
+[lints.clippy]
+float_arithmetic = "deny"
+float_cmp = "deny"
+lossy_float_literal = "deny"

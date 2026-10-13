@@ -1,0 +1,87 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+name: Contracts
+
+# F-026: the settlement contract (ink!) is a workspace of its own (`contracts/settlement`), excluded
+# from the root one. This job runs only when it changes.
+on:
+  push:
+    paths:
+      - "contracts/**"
+      - ".github/workflows/contracts.yml"
+  pull_request:
+    paths:
+      - "contracts/**"
+      - ".github/workflows/contracts.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned. 5.0.3 builds ink! 5 contracts for `pallet-contracts`, which is what Kreivo runs.
+  CARGO_CONTRACT_VERSION: 5.0.3
+
+defaults:
+  run:
+    working-directory: contracts/settlement
+
+jobs:
+  # The toolchain is 1.91, from `contracts/settlement/rust-toolchain.toml`: cargo-contract 5.0.3's
+  # WASM build does not compile with Rust 1.92 and later (see F-026's NOTES.md).
+  test:
+    name: fmt, clippy and unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.91
+        with:
+          components: rustfmt, clippy, rust-src
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: contracts/settlement
+          key: test
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      # ink! generates `#[no_mangle]` exports, so the crate cannot `forbid(unsafe_code)`; our own
+      # code must still have none.
+      - name: No unsafe code
+        run: "! grep -rnw --include='*.rs' unsafe src"
+      - name: No floating point (INV-7)
+        run: ../../tools/ci/check-no-float.sh src
+      - name: The driving script and the zombienet suite parse
+        working-directory: contracts/settlement/scripts
+        run: node --check drive.mjs && node --check e2e.mjs
+
+  build:
+    name: cargo contract build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.91
+        with:
+          components: rust-src
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: contracts/settlement
+          key: build
+          cache-bin: true
+      - name: Install cargo-contract ${{ env.CARGO_CONTRACT_VERSION }}
+        run: |
+          if ! cargo contract --version 2>/dev/null | grep -q "$CARGO_CONTRACT_VERSION"; then
+            cargo install cargo-contract --version "$CARGO_CONTRACT_VERSION" --locked --force
+          fi
+          cargo contract --version
+      - run: cargo contract build --release
+      - name: Size against Kreivo's MaxCodeLen (192 KiB)
+        run: |
+          size=$(stat -c %s target/ink/aledgent_settlement_contract.wasm)
+          echo "contract code: $size bytes"
+          test "$size" -le $((192 * 1024))
+      - uses: actions/upload-artifact@v4
+        with:
+          name: settlement-contract
+          path: |
+            contracts/settlement/target/ink/aledgent_settlement_contract.contract
+            contracts/settlement/target/ink/aledgent_settlement_contract.wasm
+            contracts/settlement/target/ink/aledgent_settlement_contract.json

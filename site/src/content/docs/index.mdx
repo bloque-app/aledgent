@@ -1,0 +1,79 @@
+---
+title: Open-source ledger
+description: An open-source ledger whose book anyone it concerns can check against a public anchor. Bloque runs it in production.
+template: splash
+tableOfContents: false
+editUrl: false
+kicker: Open-source ledger
+hero:
+  title: A ledger whose book anyone it concerns can check against a public anchor.
+  tagline: aledgent keeps accounts, balances and operations in a deterministic kernel, verifies its genesis before it takes a command, and anchors a commitment to its state on Kreivo every hour. Bloque runs it in production.
+  actions:
+    - text: Read the guide
+      link: /start/getting-started/
+      variant: primary
+    - text: API reference
+      link: /api/
+      variant: secondary
+status:
+  - In production at Bloque since 12 October 2026
+  - No external audit yet
+  - Apache-2.0 OR MIT
+---
+
+import { CardGrid, LinkCard } from '@astrojs/starlight/components';
+import Concept from '../../components/Concept.astro';
+import Bounds from '../../components/Bounds.astro';
+import { withBase } from '../../lib/url';
+
+## Four ideas carry the whole system
+
+Read these first. Everything else in the guide refines one of them.
+
+<CardGrid>
+	<Concept n="01" label="Book" title="A deterministic kernel">
+		Balances live in a deterministic kernel, in exact integer minor units, and every input is kept
+		with its reply, so the book's state can be re-derived. A book starts from a verified genesis and
+		takes no command until the check passes.
+	</Concept>
+	<Concept
+		n="02"
+		label="Operations"
+		title="Received, then decided"
+		href="/concepts/operation-lifecycle/"
+		linkText="The operation lifecycle"
+	>
+		Every command gets an operation reference. A transfer is acknowledged at `Received`, then
+		decided. A client key makes a retry the same operation, never a second one.
+	</Concept>
+	<Concept n="03" label="Anchoring" title="A commitment on Kreivo">
+		Every hour, and on demand, a commitment to the book's state goes to a settlement contract on
+		Kreivo. aledgent cannot later claim to have held another state. It says nothing about solvency.
+	</Concept>
+	<Concept n="04" label="Ingress" title="One authenticated entry">
+		Services call with tokens, people with passkeys, and every route is denied by default. Each
+		command is checked against the grants its principal holds, for that account, asset and bound.
+	</Concept>
+</CardGrid>
+
+<Bounds />
+
+## Where to start
+
+<CardGrid>
+	<LinkCard
+		title="Integrate"
+		description="Authenticate, send a transfer, and follow it from Received to its decision."
+		href={withBase('/start/getting-started/')}
+	/>
+	<LinkCard
+		title="Operate"
+		description="What an operator watches, and how an operation that needs a human is resolved."
+		href={withBase('/operate/overview/')}
+	/>
+	<LinkCard
+		title="Verify"
+		description="Check a disclosure with crates/verify, without aledgent taking part. Today a disclosure is aledgent's signed assertion, not proof of the fact."
+		href="https://github.com/bloque-app/aledgent/tree/main/crates/verify"
+	/>
+</CardGrid>

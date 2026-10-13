@@ -1,0 +1,151 @@
+From 83964fdf2ddef3589702b1788a9e250901c65dca Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Pablo=20Andr=C3=A9s=20Dorado=20Su=C3=A1rez?=
+ <hola@pablodorado.com>
+Date: Sat, 3 Oct 2026 14:24:48 -0500
+Subject: [PATCH 5/5] build(precompile): the current VOS precompile shim for
+ pvm-precompile
+
+pvm-precompile pinned zkpvm-precompiles at VOS 9f5337f, whose shim emits a
+bare ecall that today's PVM compiler translates into a trap: the first
+curve operation of a guest built with the feature panicked. It now uses
+vos-pvm-precompiles, the current shim, which marks its ECALLs (csrw 0x801)
+and keeps the same API. Agent runtimes serve 110-114 (VOS fork branch
+agent/execution-limits, natively with the runtime feature native-curve).
+vos-protocol moves to the same VOS revision.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Cargo.lock         | 50 +++++++++++++++++++++++++++++++++++++---------
+ Cargo.toml         |  4 ++--
+ src/crypto/hash.rs |  4 +++-
+ 3 files changed, 46 insertions(+), 12 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 902aeb2..e33cb56 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -83,6 +83,12 @@ version = "1.0.102"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+ 
++[[package]]
++name = "arrayvec"
++version = "0.7.8"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
++
+ [[package]]
+ name = "autocfg"
+ version = "1.5.0"
+@@ -125,6 +131,16 @@ dependencies = [
+  "digest",
+ ]
+ 
++[[package]]
++name = "blake2b_simd"
++version = "1.0.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3560a7b1951efe814fcd721938313adc56753ca39f4b23847d7e9a2402f5dbff"
++dependencies = [
++ "arrayvec",
++ "constant_time_eq",
++]
++
+ [[package]]
+ name = "block-buffer"
+ version = "0.10.4"
+@@ -244,8 +260,9 @@ dependencies = [
+  "rand_core 0.6.4",
+  "rkyv",
+  "subtle",
++ "vos-protocol",
++ "vos-pvm-precompiles",
+  "zeroize",
+- "zkpvm-precompiles",
+ ]
+ 
+ [[package]]
+@@ -309,6 +326,12 @@ version = "1.0.5"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
+ 
++[[package]]
++name = "constant_time_eq"
++version = "0.4.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
++
+ [[package]]
+ name = "cpufeatures"
+ version = "0.2.17"
+@@ -1141,6 +1164,23 @@ version = "0.9.5"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+ 
++[[package]]
++name = "vos-protocol"
++version = "0.1.0"
++source = "git+https://codeberg.org/pandres95/VOS.git?rev=c54fc1ff13fcd55b86f2cf4edc77b041b62e245f#c54fc1ff13fcd55b86f2cf4edc77b041b62e245f"
++dependencies = [
++ "blake2b_simd",
++ "rkyv",
++]
++
++[[package]]
++name = "vos-pvm-precompiles"
++version = "0.1.0"
++source = "git+https://codeberg.org/pandres95/VOS.git?rev=c54fc1ff13fcd55b86f2cf4edc77b041b62e245f#c54fc1ff13fcd55b86f2cf4edc77b041b62e245f"
++dependencies = [
++ "curve25519-dalek",
++]
++
+ [[package]]
+ name = "wait-timeout"
+ version = "0.2.1"
+@@ -1362,14 +1402,6 @@ version = "1.8.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "b97154e67e32c85465826e8bcc1c59429aaaf107c1e4a9e53c8d8ccd5eff88d0"
+ 
+-[[package]]
+-name = "zkpvm-precompiles"
+-version = "0.1.0"
+-source = "git+https://codeberg.org/Virto/VOS.git?rev=9f5337fb39ccad5b779cf72cbd617e726e325aed#9f5337fb39ccad5b779cf72cbd617e726e325aed"
+-dependencies = [
+- "curve25519-dalek",
+-]
+-
+ [[package]]
+ name = "zmij"
+ version = "1.0.21"
+diff --git a/Cargo.toml b/Cargo.toml
+index 417c2a8..9efcccb 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -102,9 +102,9 @@ bech32 = { version = "0.11", default-features = false, features = ["alloc"], opt
+ # depending on the layout or mutable state of a sibling VOS checkout. On
+ # non-PVM builds the shim's typed API falls through to dalek, so the same code
+ # path runs in tests. Enabled by the `pvm-precompile` feature.
+-zkpvm-precompiles = { git = "https://codeberg.org/Virto/VOS.git", rev = "9f5337fb39ccad5b779cf72cbd617e726e325aed", optional = true }
++zkpvm-precompiles = { package = "vos-pvm-precompiles", git = "https://codeberg.org/pandres95/VOS.git", rev = "c54fc1ff13fcd55b86f2cf4edc77b041b62e245f", optional = true }
+ # VOS's protocol primitives (no_std), for `vos-blake2b`.
+-vos-protocol = { git = "https://codeberg.org/pandres95/VOS.git", rev = "6c794311ba506092be114ff5344fef4e338a8a85", optional = true }
++vos-protocol = { git = "https://codeberg.org/pandres95/VOS.git", rev = "c54fc1ff13fcd55b86f2cf4edc77b041b62e245f", optional = true }
+ 
+ [dev-dependencies]
+ proptest = "1"
+diff --git a/src/crypto/hash.rs b/src/crypto/hash.rs
+index 7e5fe7e..2dff35d 100644
+--- a/src/crypto/hash.rs
++++ b/src/crypto/hash.rs
+@@ -1,5 +1,7 @@
+ use blake2::digest::consts::{U32, U64};
+-use blake2::{Blake2b, Digest};
++#[cfg(not(any(feature = "pvm-precompile", feature = "vos-blake2b")))]
++use blake2::Digest;
++use blake2::Blake2b;
+ 
+ pub type Blake2b256 = Blake2b<U32>;
+ pub type Blake2b512 = Blake2b<U64>;
+-- 
+2.41.0
+

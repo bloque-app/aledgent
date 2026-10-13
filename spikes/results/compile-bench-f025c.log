@@ -1,0 +1,11 @@
+warning: unused variable: `unseen_admission`
+warning: unused variable: `transition_proof_access`
+    Finished `release` profile [optimized] target(s) in 47.43s
+compile-bench: runtime (1067590 B) Interpreter: median 90170 us
+compile-bench: runtime (1067590 B) Recompiler: median 99752 us
+compile-bench: actor (291219 B) Interpreter: median 23450 us
+compile-bench: actor (291219 B) Recompiler: median 30036 us, native code 4489278 B
+compile-bench: runtime (1081973 B) Interpreter: median 96971 us
+compile-bench: runtime (1081973 B) Recompiler: median 122049 us
+compile-bench: actor (1968379 B) Interpreter: median 113305 us
+compile-bench: actor (1968379 B) Recompiler: median 136319 us, native code 27828844 B

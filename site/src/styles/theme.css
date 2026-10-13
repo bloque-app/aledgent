@@ -1,0 +1,338 @@
+/* Copyright (c) 2026 Pagos Cube LLC */
+/* SPDX-License-Identifier: Apache-2.0 OR MIT */
+/*
+ * Bloque's design system, mapped onto Starlight's custom properties.
+ *
+ * Starlight's grey scale runs from --sl-color-white (strongest text) to --sl-color-black (page
+ * ground) in both themes; it is inverted for light mode. The map from Bloque's tokens to these
+ * variables is in site/README.md ("Theme map"). Everything below is unlayered, so it wins over
+ * Starlight's @layer starlight.* rules without !important.
+ */
+
+/* ---------------------------------------------------------------- tokens (dark: Starlight's base) */
+:root {
+	/* Bloque tokens, named once and reused below. */
+	--bq-ink: #0d0c17;
+	--bq-paper: #fbfaff;
+	--bq-sunken: #f4f2fa;
+	--bq-border: #e9e6f2;
+	--bq-border-strong: #d6d2e3;
+	--bq-text-2: #6d6982;
+	--bq-text-2-strong: #38354a;
+	--bq-text-3: #9a96ad;
+	--bq-violet: #6a3cff;
+	--bq-violet-100: #ece6ff;
+	--bq-lilac: #a78bfa;
+	--bq-ink-surface: #17152a;
+	--bq-ink-border: #2a2838;
+	--bq-ink-border-strong: #38354a;
+
+	--bq-radius-pill: 999px;
+	--bq-radius-card: 28px;
+	--bq-radius-field: 18px;
+
+	/* Dark theme (Starlight's :root defaults are its dark theme). */
+	--sl-color-white: var(--bq-paper);
+	--sl-color-gray-1: #e9e6f2;
+	--sl-color-gray-2: #d6d2e3;
+	--sl-color-gray-3: var(--bq-text-3); /* secondary text: 6.8:1 on ink */
+	--sl-color-gray-4: var(--bq-ink-border-strong);
+	--sl-color-gray-5: var(--bq-ink-border);
+	--sl-color-gray-6: var(--bq-ink-surface);
+	--sl-color-black: var(--bq-ink);
+
+	--sl-color-accent-low: #241d45; /* lilac tint on ink; derived, not a named token */
+	--sl-color-accent: var(--bq-lilac);
+	--sl-color-accent-high: var(--bq-lilac); /* Starlight's dark text-accent; 7.1:1 on ink */
+	--sl-color-text-accent: var(--bq-lilac);
+	--sl-color-text-invert: var(--bq-ink); /* text on an accent fill: ink on lilac, 7.1:1 */
+	--sl-color-bg: var(--bq-ink);
+	--sl-color-bg-nav: var(--bq-ink);
+	--sl-color-bg-sidebar: var(--bq-ink);
+	--sl-color-bg-inline-code: var(--bq-ink-surface);
+	--sl-color-hairline-light: var(--bq-ink-border);
+	--sl-color-hairline: var(--bq-ink-border);
+	--sl-color-hairline-shade: var(--bq-ink-border-strong);
+
+	--bq-surface: var(--bq-ink-surface);
+	--bq-sidebar-active: var(--bq-ink-surface);
+	--bq-shadow: none;
+
+	/* Type */
+	--sl-font: 'Geist', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+	--sl-font-mono: 'Geist Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+	--bq-font-display: 'Familjen Grotesk', 'Geist', ui-sans-serif, system-ui, sans-serif;
+	--sl-line-height: 1.6;
+	--sl-line-height-headings: 1.1;
+}
+
+/* ------------------------------------------------------------------------------------ light */
+:root[data-theme='light'],
+[data-theme='light'] ::backdrop {
+	--sl-color-white: var(--bq-ink);
+	--sl-color-gray-1: var(--bq-ink);
+	--sl-color-gray-2: var(--bq-text-2-strong); /* body text: 11.4:1 on paper */
+	--sl-color-gray-3: var(--bq-text-2); /* secondary text: 5.1:1 on paper, 4.7:1 on sunken */
+	--sl-color-gray-4: var(--bq-text-3); /* never text: 2.75:1 on paper (borders, icons only) */
+	--sl-color-gray-5: var(--bq-border-strong);
+	--sl-color-gray-6: var(--bq-border);
+	--sl-color-gray-7: var(--bq-sunken);
+	--sl-color-black: var(--bq-paper);
+
+	--sl-color-accent-low: var(--bq-violet-100);
+	--sl-color-accent: var(--bq-violet); /* 5.5:1 on paper, 4.7:1 on violet-100 */
+	--sl-color-accent-high: var(--bq-violet);
+	--sl-color-text-accent: var(--bq-violet);
+	--sl-color-text-invert: #ffffff; /* white on violet: 5.7:1 */
+	--sl-color-bg: var(--bq-paper);
+	--sl-color-bg-nav: var(--bq-paper);
+	--sl-color-bg-sidebar: var(--bq-paper);
+	--sl-color-bg-inline-code: var(--bq-sunken);
+	--sl-color-hairline-light: var(--bq-border);
+	--sl-color-hairline: var(--bq-border);
+	--sl-color-hairline-shade: var(--bq-border-strong);
+	--sl-color-backdrop-overlay: rgb(13 12 23 / 0.5);
+
+	--bq-surface: #ffffff;
+	--bq-sidebar-active: var(--bq-sunken);
+	--bq-shadow: 0 1px 2px rgb(13 12 23 / 0.04), 0 8px 24px -12px rgb(13 12 23 / 0.12);
+
+	--sl-shadow-sm: 0 1px 2px rgb(13 12 23 / 0.06);
+	--sl-shadow-md: 0 4px 12px -4px rgb(13 12 23 / 0.12);
+	--sl-shadow-lg: 0 16px 40px -16px rgb(13 12 23 / 0.24);
+}
+
+/* ------------------------------------------------------------------------------------- type */
+body {
+	font-feature-settings: 'ss01' 0;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+.sl-markdown-content :is(h1, h2, h3, h4, h5),
+.site-title,
+.starlight-aside__title {
+	font-family: var(--bq-font-display);
+	font-weight: 700;
+	letter-spacing: -0.025em;
+}
+
+h1,
+.sl-markdown-content h1 {
+	letter-spacing: -0.04em;
+}
+
+.sl-markdown-content h2 {
+	letter-spacing: -0.03em;
+}
+
+.site-title {
+	font-size: var(--sl-text-xl);
+	color: var(--sl-color-white);
+}
+
+/* The aledgent lockup ("aledgent. by bloque") replaces the title; keep it legible, above the
+   lockup's 24 px minimum height (brand usage sheet). */
+.site-title img {
+	height: 2.25rem;
+	width: auto;
+}
+
+/* --------------------------------------------------------------------------------- links, nav */
+.sl-markdown-content a:not(:where(.not-content *)) {
+	color: var(--sl-color-text-accent);
+	text-underline-offset: 0.18em;
+	text-decoration-thickness: 1px;
+}
+
+/* Active sidebar entry: a sunken pill with accent text, not Starlight's solid accent fill. */
+.sidebar-content a[aria-current='page'],
+.sidebar-content a[aria-current='page']:hover,
+.sidebar-content a[aria-current='page']:focus {
+	background-color: var(--bq-sidebar-active);
+	color: var(--sl-color-text-accent);
+	font-weight: 500;
+}
+
+.sidebar-content a {
+	border-radius: var(--bq-radius-pill);
+}
+
+/* --------------------------------------------------------------------------- code and inputs */
+.sl-markdown-content :not(pre) > code:not(:where(.not-content *)) {
+	border-radius: 6px;
+	border: 1px solid var(--sl-color-hairline);
+}
+
+site-search button[data-open-modal],
+.pagefind-ui__search-input,
+starlight-theme-select select,
+starlight-lang-select select {
+	border-radius: var(--bq-radius-field);
+}
+
+site-search button[data-open-modal] {
+	border-color: var(--sl-color-hairline-shade);
+}
+
+/* ---------------------------------------------------------------------------------- buttons */
+.sl-link-button,
+.action {
+	border-radius: var(--bq-radius-pill) !important;
+	font-weight: 500;
+}
+
+.sl-link-button.primary,
+.action.primary {
+	background: var(--sl-color-accent);
+	border-color: var(--sl-color-accent);
+	color: var(--sl-color-text-invert);
+}
+
+.sl-badge {
+	border-radius: var(--bq-radius-pill);
+}
+
+/* ------------------------------------------------------------------------------------ cards */
+.card,
+.sl-link-card {
+	border-radius: var(--bq-radius-card);
+	border: 1px solid var(--sl-color-hairline);
+	background: var(--bq-surface);
+	box-shadow: var(--bq-shadow);
+}
+
+.card {
+	padding: clamp(1.25rem, 3vw, 1.75rem);
+}
+
+.card .title {
+	font-family: var(--bq-font-display);
+	font-weight: 700;
+	letter-spacing: -0.025em;
+}
+
+/* Starlight colours each card icon from a rotating palette; keep them on the accent. */
+.card .icon {
+	background-color: var(--sl-color-accent-low) !important;
+	border-color: transparent !important;
+	color: var(--sl-color-text-accent);
+	border-radius: 12px;
+}
+
+.sl-link-card:hover {
+	border-color: var(--sl-color-accent);
+	background: var(--bq-surface);
+}
+
+/* ---------------------------------------------------------------------- asides: tinted, 1px */
+.starlight-aside {
+	border: 1px solid var(--bq-aside-border);
+	border-radius: var(--bq-radius-field);
+	background-color: var(--bq-aside-bg);
+	padding: 1rem 1.25rem;
+}
+
+.starlight-aside__title {
+	font-size: var(--sl-text-base);
+	letter-spacing: -0.01em;
+}
+
+.starlight-aside--note {
+	--bq-aside-bg: var(--sl-color-accent-low);
+	--bq-aside-border: color-mix(in srgb, var(--sl-color-accent) 30%, transparent);
+	--sl-color-asides-text-accent: var(--sl-color-text-accent);
+}
+
+.starlight-aside--tip {
+	--bq-aside-bg: var(--sl-color-gray-7, var(--bq-ink-surface));
+	--bq-aside-border: var(--sl-color-hairline-shade);
+	--sl-color-asides-text-accent: var(--sl-color-white);
+}
+
+.starlight-aside--caution {
+	--bq-aside-bg: color-mix(in srgb, var(--sl-color-orange) 12%, var(--sl-color-bg));
+	--bq-aside-border: color-mix(in srgb, var(--sl-color-orange) 45%, transparent);
+	--sl-color-asides-text-accent: var(--sl-color-orange-high);
+}
+
+.starlight-aside--danger {
+	--bq-aside-bg: color-mix(in srgb, var(--sl-color-red) 10%, var(--sl-color-bg));
+	--bq-aside-border: color-mix(in srgb, var(--sl-color-red) 40%, transparent);
+	--sl-color-asides-text-accent: var(--sl-color-red-high);
+}
+
+/* ------------------------------------------------------------------------------------ tables */
+.sl-markdown-content table:not(:where(.not-content *)) {
+	font-size: var(--sl-text-sm);
+}
+
+.sl-markdown-content :is(th, td):not(:where(.not-content *)) {
+	border-bottom: 1px solid var(--sl-color-hairline);
+}
+
+/* ------------------------------------------------------------------------------- header bar */
+header.header {
+	border-bottom-color: var(--sl-color-hairline);
+}
+
+/* Identifiers in table cells stay on one line; the table scrolls instead of breaking them. */
+.sl-markdown-content :is(td, th) code:not(:where(.not-content *)) {
+	white-space: nowrap;
+}
+
+/* ------------------------------------------------------------------ API reference (plugin) */
+/*
+ * starlight-openapi's component styles are scoped and unlayered (specificity 0,2,0) and load
+ * after this file, so these overrides carry `html:root` to win without !important.
+ */
+html:root .sl-openapi-section-panel {
+	background-color: var(--sl-color-bg-inline-code);
+	border-color: var(--sl-color-hairline);
+	border-radius: var(--bq-radius-field);
+	padding: 1rem 1.25rem;
+}
+
+html:root .sl-openapi-operation-description {
+	border: 1px solid var(--sl-color-hairline);
+	border-radius: var(--bq-radius-field);
+	overflow: hidden;
+}
+
+html:root .sl-openapi-operation-description-header {
+	border-bottom-color: var(--sl-color-hairline);
+}
+
+/* The snippet sits inside that bordered box: no second radius or frame of its own. */
+html:root .sl-openapi-operation-description .expressive-code .frame,
+html:root .sl-openapi-operation-description .expressive-code pre {
+	border: 0;
+	border-radius: 0;
+}
+
+html:root .sl-openapi-snippet-picker-value,
+html:root .sl-openapi-content-picker-select-value,
+html:root .sl-openapi-operation-url input {
+	border-radius: var(--bq-radius-pill);
+	border-color: var(--sl-color-hairline-shade);
+	background-color: var(--sl-color-bg);
+	padding-inline: 0.75rem;
+}
+
+html:root .sl-openapi-tag,
+html:root .sl-openapi-overview-navigation-link {
+	border-radius: var(--bq-radius-field);
+}
+
+/* Example bodies sit on the sunken surface, not gray-5 (syntax colours fell to 4.25:1 there). */
+html:root .sl-openapi-example div.expressive-code .frame pre {
+	background-color: var(--sl-color-bg-inline-code);
+}
+
+/* The plugin's "required" marker: accent text, 5.5:1 on paper and 7.1:1 on ink. */
+html:root .sl-openapi-key-required {
+	color: var(--sl-color-text-accent);
+}

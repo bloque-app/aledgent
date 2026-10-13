@@ -1,0 +1,791 @@
+{
+  "title": "aledgent — operations",
+  "uid": "aledgent-operations",
+  "description": "F-018, T-018-05: NFR-11's six signals (the anchor lag from F-017), the ticker, the Needs-Review queue with its owner and service level, block production, backups and the drill. Every value is a count, an age in milliseconds or the layer's integer units; none is a ledger fact.",
+  "schemaVersion": 39,
+  "version": 2,
+  "editable": false,
+  "tags": [
+    "aledgent",
+    "F-018"
+  ],
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "refresh": "30s",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "label": "Prometheus"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Oldest non-terminal operation (REQ-OP-8)",
+      "description": "NFR-11: age of the oldest non-terminal operation, and of the oldest row ingress holds undecided (REQ-CS-7). Pages over its service level.",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 8,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "aledgent_oldest_non_terminal_age_ms",
+          "legendFormat": "oldest non-terminal"
+        },
+        {
+          "refId": "B",
+          "expr": "aledgent_oldest_undecided_row_age_ms",
+          "legendFormat": "oldest Received row"
+        },
+        {
+          "refId": "C",
+          "expr": "aledgent_operations_open",
+          "legendFormat": "open"
+        },
+        {
+          "refId": "D",
+          "expr": "aledgent_operations_received",
+          "legendFormat": "Received"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "table",
+      "title": "Needs-Review queue (REQ-OP-6, AC-C4.1)",
+      "description": "The review queue with its owner (the label `owner`) and its service level. Every entry past the service level pages its owner. The operations themselves are listed on CTR-OPS, to an operator with authority: this dashboard carries no operation reference.",
+      "gridPos": {
+        "x": 8,
+        "y": 0,
+        "w": 16,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "aledgent_review_queue",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "{{owner}}"
+        },
+        {
+          "refId": "B",
+          "expr": "aledgent_needs_review",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "refId": "C",
+          "expr": "aledgent_review_overdue",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "refId": "D",
+          "expr": "aledgent_review_most_overdue_ms",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "refId": "E",
+          "expr": "aledgent_review_service_level_ms",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        {
+          "id": "merge",
+          "options": {}
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Observation completeness (REQ-SA-7, REQ-IN-5)",
+      "description": "NFR-11: the adapter's cursor lag behind the finalized inbox, open gaps, and differences its re-scans raised. Any gap or difference pages.",
+      "gridPos": {
+        "x": 0,
+        "y": 6,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "aledgent_observation_cursor_lag",
+          "legendFormat": "cursor lag"
+        },
+        {
+          "refId": "B",
+          "expr": "aledgent_adapter_alerts{kind=\"gap\"}",
+          "legendFormat": "open gaps"
+        },
+        {
+          "refId": "C",
+          "expr": "aledgent_observation_rescan_differences",
+          "legendFormat": "re-scan differences"
+        },
+        {
+          "refId": "D",
+          "expr": "aledgent_observation_gaps_total",
+          "legendFormat": "gaps, ever"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Undelivered notifications (REQ-EV-6)",
+      "description": "NFR-11: count and age of undelivered notifications.",
+      "gridPos": {
+        "x": 12,
+        "y": 6,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "aledgent_undelivered_notifications",
+          "legendFormat": "undelivered"
+        },
+        {
+          "refId": "B",
+          "expr": "aledgent_oldest_undelivered_age_ms",
+          "legendFormat": "oldest, ms"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Anchor lag (F-017)",
+      "description": "NFR-11: time since the newest Final checkpoint was created, and how long the checkpoint in flight has waited. Pages over twice the cadence, or an hour in flight.",
+      "gridPos": {
+        "x": 0,
+        "y": 13,
+        "w": 6,
+        "h": 5
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "aledgent_anchor_lag_ms",
+          "legendFormat": "anchor lag"
+        },
+        {
+          "refId": "B",
+          "expr": "aledgent_anchor_in_flight_age_ms",
+          "legendFormat": "in flight"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "type": "table",
+      "title": "Reconciliation per axis (NFR-9)",
+      "description": "NFR-11: the outcome of the daily reconciliation per axis, at one minor unit and zero tolerance. Any difference, or no run in 24 h, pages. Axis 3 is F-017's settlement comparison.",
+      "gridPos": {
+        "x": 6,
+        "y": 13,
+        "w": 18,
+        "h": 5
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "aledgent_reconciliation_differences",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "axis {{axis}}"
+        },
+        {
+          "refId": "B",
+          "expr": "aledgent_reconciliation_last_run_age_ms",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "refId": "C",
+          "expr": "aledgent_reconciliation_ran",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        {
+          "id": "merge",
+          "options": {}
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Liquidity of settlement positions (REQ-SN-2)",
+      "description": "NFR-11: the instance's position per asset and each lane's native balance, in the layer's integer units; open shortfalls page.",
+      "gridPos": {
+        "x": 0,
+        "y": 18,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "aledgent_position",
+          "legendFormat": "position {{asset}}"
+        },
+        {
+          "refId": "B",
+          "expr": "aledgent_lane_native",
+          "legendFormat": "lane {{lane}}"
+        },
+        {
+          "refId": "C",
+          "expr": "aledgent_lane_under_fee_floor",
+          "legendFormat": "under floor {{lane}}"
+        },
+        {
+          "refId": "D",
+          "expr": "aledgent_liquidity_alerts",
+          "legendFormat": "shortfalls {{kind}}"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Ticker (DEC-6, RISK-7)",
+      "description": "Time since the core applied its last tick: deadlines move only on ticks.",
+      "gridPos": {
+        "x": 12,
+        "y": 18,
+        "w": 6,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "aledgent_ticker_age_ms",
+          "legendFormat": "ticker age"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Block production (Kreivo's runtime)",
+      "description": "The settlement layer's finalized height and how long it has not moved: blocks need a crank when the chain is idle.",
+      "gridPos": {
+        "x": 18,
+        "y": 18,
+        "w": 6,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "aledgent_finalized_height",
+          "legendFormat": "finalized"
+        },
+        {
+          "refId": "B",
+          "expr": "aledgent_finalized_stall_ms",
+          "legendFormat": "stalled, ms"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "table",
+      "title": "Backups and the restore drill (NFR-4, NFR-10)",
+      "description": "Age of each store's last verified backup, and the last drill's age and result.",
+      "gridPos": {
+        "x": 0,
+        "y": 25,
+        "w": 12,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "aledgent_backup_last_age_ms",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "{{store}}"
+        },
+        {
+          "refId": "B",
+          "expr": "aledgent_drill_last_age_ms",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "refId": "C",
+          "expr": "aledgent_drill_passed",
+          "format": "table",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "table",
+      "title": "Sources and incidents",
+      "description": "Whether each source of the signals answers, the adapter's open alerts, and the operator channel's incidents (F-013).",
+      "gridPos": {
+        "x": 12,
+        "y": 25,
+        "w": 12,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "aledgent_signals_up",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "{{source}}"
+        },
+        {
+          "refId": "B",
+          "expr": "aledgent_adapter_signals_age_ms",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "refId": "C",
+          "expr": "aledgent_adapter_serving",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "refId": "D",
+          "expr": "aledgent_adapter_alerts",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "refId": "E",
+          "expr": "aledgent_incidents_total",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "refId": "F",
+          "expr": "aledgent_incident_latest_age_ms",
+          "format": "table",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "table",
+      "title": "Anchoring and the settlement comparison (F-017, REQ-PR-5)",
+      "description": "Anchoring's incidents by kind, the assets whose latest settlement comparison differs, and that comparison's age. Counts and ages: no position figure.",
+      "gridPos": {
+        "x": 0,
+        "y": 31,
+        "w": 12,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "aledgent_anchor_incidents",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "{{kind}}"
+        },
+        {
+          "refId": "B",
+          "expr": "aledgent_settlement_differing_assets",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "refId": "C",
+          "expr": "aledgent_settlement_comparison_age_ms",
+          "format": "table",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "stat",
+      "title": "Suspense (REQ-LA-2)",
+      "description": "Suspense balances not at zero at the last reconciliation, and how long the oldest has not been zero. Reconciled to zero within a day.",
+      "gridPos": {
+        "x": 12,
+        "y": 31,
+        "w": 12,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "aledgent_suspense_nonzero",
+          "legendFormat": "non-zero"
+        },
+        {
+          "refId": "B",
+          "expr": "aledgent_suspense_oldest_age_ms",
+          "legendFormat": "oldest, ms"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Completion (NFR-15)",
+      "description": "Amendment 0007: completion of a command, from receipt to the state it asks for. The ceiling, 30 s at p99, pages; the target, 19 s at p99, is tracked here.",
+      "gridPos": {
+        "x": 0,
+        "y": 37,
+        "w": 12,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "aledgent_completion_p99_ms",
+          "legendFormat": "p99 (ceiling 30 s, target 19 s)"
+        },
+        {
+          "refId": "B",
+          "expr": "aledgent_completion_p50_ms",
+          "legendFormat": "p50"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "type": "stat",
+      "title": "Core halt and the runtime's Authority backlog (F18, VOS)",
+      "description": "T-018-10: whether the core has stopped deciding (every input waits Received; core-halt runbook), and the Authority decisions issued for invocations not yet acknowledged, against VOS's limit of 256.",
+      "gridPos": {
+        "x": 0,
+        "y": 43,
+        "w": 12,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "aledgent_core_halted",
+          "legendFormat": "halted"
+        },
+        {
+          "refId": "B",
+          "expr": "aledgent_vos_unacknowledged_authority_decisions",
+          "legendFormat": "unacknowledged Authority decisions (limit 256)"
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "Audit trail shipping (T-013-13, REQ-AT-2, NFR-6)",
+      "description": "Records waiting in the core's audit outbox, the oldest one's age, what the audit store holds, and the store's state. At the outbox's bound the core refuses new inputs.",
+      "gridPos": {
+        "x": 12,
+        "y": 43,
+        "w": 12,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "aledgent_audit_unshipped_records",
+          "legendFormat": "unshipped"
+        },
+        {
+          "refId": "B",
+          "expr": "aledgent_audit_ship_lag_ms",
+          "legendFormat": "oldest unshipped, ms"
+        },
+        {
+          "refId": "C",
+          "expr": "aledgent_audit_shipped_records",
+          "legendFormat": "held by the store"
+        },
+        {
+          "refId": "D",
+          "expr": "aledgent_audit_store_up",
+          "legendFormat": "store up"
+        },
+        {
+          "refId": "E",
+          "expr": "aledgent_audit_store_refused",
+          "legendFormat": "refused"
+        },
+        {
+          "refId": "F",
+          "expr": "aledgent_audit_backpressure",
+          "legendFormat": "back-pressure"
+        },
+        {
+          "refId": "G",
+          "expr": "aledgent_audit_shipping_configured",
+          "legendFormat": "configured"
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "Settlement adapter and finality (F-016)",
+      "description": "Whether the adapter serves, the settlement layer's best and finalized heights, and how far finality is behind the best head.",
+      "gridPos": {
+        "x": 0,
+        "y": 49,
+        "w": 12,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "aledgent_adapter_serving",
+          "legendFormat": "serving"
+        },
+        {
+          "refId": "B",
+          "expr": "aledgent_best_height",
+          "legendFormat": "best"
+        },
+        {
+          "refId": "C",
+          "expr": "aledgent_finality_lag_blocks",
+          "legendFormat": "finality lag, blocks"
+        }
+      ]
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "The sharded profile's lags (NFR-19, NFR-20)",
+      "description": "NFR-19's credit lag, NFR-20's revocation lag, the streams between Agents and native decide's replay fence. Empty until the metric exists: none applies to the one core Agent of the MVP.",
+      "gridPos": {
+        "x": 12,
+        "y": 49,
+        "w": 12,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "aledgent_credit_lag_p99_ms",
+          "legendFormat": "credit lag p99 (NFR-19: 2 s)"
+        },
+        {
+          "refId": "B",
+          "expr": "aledgent_revocation_lag_p99_ms",
+          "legendFormat": "revocation lag p99 (NFR-20: 1 s)"
+        },
+        {
+          "refId": "C",
+          "expr": "aledgent_stream_lag_ms",
+          "legendFormat": "stream lag {{stream}}"
+        },
+        {
+          "refId": "D",
+          "expr": "aledgent_replay_fenced",
+          "legendFormat": "replay fenced"
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Core archive (T-005-15)",
+      "description": "The core host's off-node archive: how long the oldest committed decision not yet in it has waited (what losing the core's node with the received-log would lose now; pages at 5 min), and how many inputs that is. ops/runbooks/release/core-archive.md.",
+      "gridPos": {
+        "x": 0,
+        "y": 55,
+        "w": 12,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "aledgent_archive_lag_ms",
+          "legendFormat": "lag (pages at 5 min)"
+        },
+        {
+          "refId": "B",
+          "expr": "aledgent_archive_lag_inputs",
+          "legendFormat": "inputs not archived"
+        },
+        {
+          "refId": "C",
+          "expr": "aledgent_archive_checkpoint_age_ms",
+          "legendFormat": "checkpoint age"
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Messages between Agents: R-03 checks (rq-01)",
+      "description": "Every message between the book's Agents checked against its sender's certified commit, in report mode: applied whatever the check finds. Failing streams page security at once; messages unverified for over a minute page after five. Empty until the sharded profile's host exports them: no message crosses Agents with the one core Agent of the MVP.",
+      "gridPos": {
+        "x": 12,
+        "y": 55,
+        "w": 12,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "aledgent_r03_failing_streams",
+          "legendFormat": "failing streams (pages security)"
+        },
+        {
+          "refId": "B",
+          "expr": "aledgent_r03_unverified_age_ms",
+          "legendFormat": "oldest unverified message, ms"
+        },
+        {
+          "refId": "C",
+          "expr": "aledgent_r03_checks_total",
+          "legendFormat": "checks"
+        },
+        {
+          "refId": "D",
+          "expr": "aledgent_r03_failures_total",
+          "legendFormat": "failures {{reason}}"
+        }
+      ]
+    }
+  ]
+}

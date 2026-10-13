@@ -1,0 +1,43 @@
+    Finished `release` profile [optimized] target(s) in 5.47s
+s2 s2-capture-for-less-b1: input 2188 B, message 2233 B (limit 16384 B)
+  reply bytes [01, c3, b0, 01, 00, 00, 00, 00, 00, f7, 16, 74, 02, 00, 00, 00, 00, 9e, b8, c6, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 09, 00, 00, 00, dc, ff, ff, ff, 19, 00, 00, 00, 00, 00, 00, 00]
+== s2 s2-capture-for-less-b1 kernel ==
+  caller e2e us (invoke + ack): n=100 p50=485362 p95=512066 p99=526166 max=529698
+  invoke elapsed_us: n=100 p50=459114 p95=481612 p99=493819 max=500983
+  actor gas: n=100 p50=54527085 p95=54527085 p99=54527085 max=54527085
+s2 s2-conversion-b1: input 2828 B, message 2873 B (limit 16384 B)
+  reply bytes [01, bf, 22, 02, 00, 00, 00, 00, 00, 87, bc, 7b, 03, 00, 00, 00, 00, 1c, bd, e3, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 09, 00, 00, 00, dc, ff, ff, ff, 19, 00, 00, 00, 00, 00, 00, 00]
+== s2 s2-conversion-b1 kernel ==
+  caller e2e us (invoke + ack): n=100 p50=514655 p95=530462 p99=558983 max=683272
+  invoke elapsed_us: n=100 p50=488502 p95=505005 p99=531448 max=627989
+  actor gas: n=100 p50=73750795 p95=73750795 p99=73750795 max=73750795
+s2 s2-chain-2-b1: input 2708 B, message 2753 B (limit 16384 B)
+  reply bytes [01, 85, fb, 01, 00, 00, 00, 00, 00, 3f, bc, 7b, 03, 00, 00, 00, 00, 30, a3, fd, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 09, 00, 00, 00, dc, ff, ff, ff, 19, 00, 00, 00, 00, 00, 00, 00]
+== s2 s2-chain-2-b1 kernel ==
+  caller e2e us (invoke + ack): n=100 p50=518651 p95=539780 p99=548941 max=551354
+  invoke elapsed_us: n=100 p50=492076 p95=510805 p99=521219 max=524927
+  actor gas: n=100 p50=75437464 p95=75437662 p99=75437662 max=75437662
+s2 s2-chain-10-b1: input 11476 B, message 11521 B (limit 16384 B)
+  reply bytes [01, fd, 8a, 07, 00, 00, 00, 00, 00, cd, 6c, 6e, 11, 00, 00, 00, 00, e0, 9a, 95, 03, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 09, 00, 00, 00, dc, ff, ff, ff, 19, 00, 00, 00, 00, 00, 00, 00]
+== s2 s2-chain-10-b1 kernel ==
+  caller e2e us (invoke + ack): n=100 p50=978730 p95=1024565 p99=1061180 max=1073829
+  invoke elapsed_us: n=100 p50=942048 p95=979808 p99=1018369 max=1030827
+  actor gas: n=100 p50=353546645 p95=353546645 p99=353546645 max=353546645
+s2 s2-transfer-b4: input 4996 B, message 5041 B (limit 16384 B)
+  reply bytes [01, e6, 7a, 03, 00, 00, 00, 00, 00, 5f, 5d, f8, 06, 00, 00, 00, 00, aa, f6, a5, 01, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 09, 00, 00, 00, dc, ff, ff, ff, 19, 00, 00, 00, 00, 00, 00, 00]
+== s2 s2-transfer-b4 kernel ==
+  caller e2e us (invoke + ack): n=100 p50=634714 p95=675098 p99=741853 max=745171
+  invoke elapsed_us: n=100 p50=604662 p95=643228 p99=702397 max=710521
+  actor gas: n=100 p50=145127424 p95=145127424 p99=145127424 max=145127424
+s2 s2-transfer-b10: input 11764 B, message 11809 B (limit 16384 B)
+  reply bytes [01, 7e, db, 07, 00, 00, 00, 00, 00, a4, 02, 6f, 11, 00, 00, 00, 00, e5, 58, 99, 03, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 09, 00, 00, 00, dc, ff, ff, ff, 19, 00, 00, 00, 00, 00, 00, 00]
+== s2 s2-transfer-b10 kernel ==
+  caller e2e us (invoke + ack): n=100 p50=987082 p95=1035005 p99=1053558 max=1088056
+  invoke elapsed_us: n=100 p50=947278 p95=978381 p99=998426 max=1000841
+  actor gas: n=100 p50=353867125 p95=353867125 p99=353867125 max=353867125
+s2 s2-reserve-pooled-b4: input 4996 B, message 5041 B (limit 16384 B)
+  reply bytes [01, e6, 7a, 03, 00, 00, 00, 00, 00, cd, 3f, f8, 06, 00, 00, 00, 00, 91, 09, a4, 01, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 09, 00, 00, 00, dc, ff, ff, ff, 19, 00, 00, 00, 00, 00, 00, 00]
+== s2 s2-reserve-pooled-b4 kernel ==
+  caller e2e us (invoke + ack): n=100 p50=642605 p95=675887 p99=688620 max=742433
+  invoke elapsed_us: n=100 p50=611062 p95=640375 p99=654119 max=665696
+  actor gas: n=100 p50=144993664 p95=144993664 p99=144993664 max=144993664

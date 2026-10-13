@@ -1,0 +1,6 @@
+curve-bench ecall 110 ristretto_scalar_mult: 3921241 gas per operation (n=20)
+curve-bench ecall 111 ristretto_point_add: 448733 gas per operation (n=20)
+curve-bench ecall 112 scalar_from_bytes_mod_order_wide: 12058 gas per operation (n=20)
+curve-bench ecall 113 scalar_mul_mod_l: 26251 gas per operation (n=20)
+curve-bench ecall 114 scalar_add_mod_l: 22830 gas per operation (n=20)
+runtime-pvm 1083014 B, program [d2, 79, 44, 6c, 9c, 19, 79, 1e]

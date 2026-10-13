@@ -1,0 +1,739 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+name: Stress (manual)
+
+# The stress suite (F-032, features/F-032-stress/plan.md): a throwaway deployment on one
+# GitHub-hosted x86-64 runner (2 vCPU; never a self-hosted runner), the harness against it,
+# and the report. Scenarios:
+#
+#   a  the core as a VOS Agent, single node, book only      core=agent-recompiler | agent-interpreter
+#   b  as a, with hourly-or-faster anchoring                  anchoring_ms=<ms>
+#   d  faults under load: kill -9 and restart the core host (or ingress with the in-process
+#      core), restart PostgreSQL, kill -9 and restart ingress    faults=true
+#   e  soak                                                   plan=soak (or phases=...)
+#   the restore drill of NFR-10 (T-005-17), agent-* only       drill=true
+#      The core host streams every decision to an off-node archive; after the load its node is
+#      lost, a fresh one is restored from the archive (`opsctl restore core --from`, the VOS
+#      roll-forward included), the received-log's tail replayed, and the restored node must be the
+#      lost one, byte for byte (e2e/stress/run.sh, `drill`). It also runs on the first of every
+#      month, at small size (the drill's cadence, ops/runbooks/restore.md).
+#
+# core=inprocess runs the same against the in-process core: the baseline of everything but VOS.
+#
+# core=shards-recompiler | shards-interpreter (F-031 T-031-20, DEC-22): the book in shards, on VOS.
+# For each count in shard_counts, N book-shard Agents and one principals Agent in one Space, single
+# node, driven by `aledgent-core-host shards` (agents/core-host/src/sharded.rs): accounts opened
+# through the principals Agent, transfers routed to the payer's shard, credits between shards
+# relayed exactly once, a revocation half way. It reports decisions per second against N, the
+# credit lag (NFR-19) and the revocation lag (NFR-20), and checks the trial balance and the anchor.
+# VOS's per-invocation bounds are raised as the batch curve raises them: a Local Agent's rows are
+# its image, and the shard's book is in its rows.
+# Scenario c (the settlement adapter on a zombienet Kreivo) runs on the zombienet fleet, through
+# e2e-zombienet.yml.
+#
+# runner=zombienet runs any core on one self-hosted runner (16 vCPU: the stress gate's hardware
+# class, F-032 plan.md §6). There ingress and the harness are built in a container, as the core is,
+# and a job never runs past 180 minutes. agent_profile picks the core Agent's runtime profile on the perf stack, as
+# shard_profiles does for the shard Agents (one `label=features[@lookup]`; e.g. `jam=`);
+# empty: VOS's standard runtime as the tree builds it. Both defaults are JAM-compatible (PLAN.md
+# `DEC-16`): no runtime feature, Gray Paper host calls only. The
+# features `native-curve`, `blake2b-precompile` and `vos-native` (with `@lookup`) are outside JAM,
+# kept on the fork for comparison only.
+#
+# A matrix entry may also carry core_env (extra environment for the core host, e.g.
+# `MALLOC_ARENA_MAX=2`), core_args (extra arguments to `aledgent-core-host serve`, e.g.
+# `--replica-in-memory`) and core_features (the host's cargo features, e.g. `jemalloc`): T-032-11.
+# core_measure (agent-* only) runs `aledgent-core-host measure` with those arguments on the built
+# core Agent instead of a deployment, e.g. `--mix tick --n 3000 --warmup 0` (finding F18).
+#
+# Two ways to start it: a manual dispatch (one run, from the inputs), or a push to a branch named
+# `stress-runs/<anything>`, which runs every entry of that branch's e2e/stress/matrix.json in
+# parallel (one job each, same fields as the inputs). The second is how a feature branch runs the
+# suite before this file reaches main, where a dispatch can find it.
+#
+# The core Agent is built as the x86 bench builds it (.github/x86-bench/run.sh build-core): VOS at
+# vos_ref with vos_picks, the program limits raised, the engine chosen at run time (F025_BACKEND).
+# Every secret the run uses is a test value drawn by the run (e2e/stress/run.sh). Manual only.
+on:
+  push:
+    branches: ["stress-runs/**"]
+  # NFR-10's cadence: the restore drill of the core Agent, monthly, at small size.
+  schedule:
+    - cron: "17 6 1 * *"
+  workflow_dispatch:
+    inputs:
+      core:
+        description: "inprocess · agent-recompiler · agent-interpreter"
+        type: choice
+        options: [inprocess, agent-recompiler, agent-interpreter, shards-recompiler, shards-interpreter, shards-fleet]
+        default: inprocess
+      shard_counts:
+        description: "shards-*: shard Agent counts, run one after the other on one runner"
+        type: string
+        default: "1,2,4,8"
+      shard_ops:
+        description: "shards-*: transfers per count"
+        type: string
+        default: "2000"
+      shard_accounts:
+        description: "shards-*: accounts"
+        type: string
+        default: "256"
+      shard_batch:
+        description: "shards-*: commands per shard per round (one invocation, one kernel commit)"
+        type: string
+        default: "64"
+      runner:
+        description: "ubuntu-latest (GitHub-hosted, 2 vCPU) or zombienet (the self-hosted fleet, 16 vCPU, at most 180 minutes a job)"
+        type: choice
+        options: [ubuntu-latest, zombienet]
+        default: ubuntu-latest
+      shard_args:
+        description: "shards-*: extra arguments to `aledgent-core-host shards` (F-034: e.g. --runs verified,native,native@1500 --ops-per-shard 750; native runs need core_features native-decide)"
+        type: string
+        default: ""
+      shard_profiles:
+        description: "shards-*: VOS runtime profiles, space-separated label=features[@lookup], all measured in this one job; the default is JAM-compatible (features native-curve, blake2b-precompile, vos-native are outside JAM)"
+        type: string
+        default: "standard="
+      core_opt_level:
+        description: "agent-*: the core guest's opt-level for this run (e.g. \"s\" or 2); empty: the tree's (3)"
+        type: string
+        default: ""
+      agent_profile:
+        description: "agent-*: the core Agent's runtime profile, one label=features[@lookup]; empty: the standard runtime with no features, JAM-compatible (native-curve, blake2b-precompile, vos-native are outside JAM)"
+        type: string
+        default: ""
+      plan:
+        description: "smoke · ladder · sustained · burst · soak (ignored when phases is set)"
+        type: choice
+        options: [smoke, ladder, sustained, burst, soak]
+        default: ladder
+      phases:
+        description: "name:commands_per_min:secs,... (overrides plan)"
+        type: string
+        default: ""
+      holders:
+        description: "funded holders"
+        type: string
+        default: "200"
+      service_pct:
+        description: "share of transfers and reservations the operator makes for holders (an issuing client's pattern); the rest holders make with their own credentials"
+        type: string
+        default: "50"
+      anchoring_ms:
+        description: "scenario b: anchoring interval in ms (empty: no anchoring)"
+        type: string
+        default: ""
+      faults:
+        description: "scenario d: inject faults under load"
+        type: boolean
+        default: false
+      drill:
+        description: "agent-* only: the restore drill of NFR-10 after the load (T-005-17)"
+        type: boolean
+        default: false
+      drain_secs:
+        description: "how long to wait for the backlog to drain after the load"
+        type: string
+        default: "900"
+      vos_ref:
+        description: "VOS commit for the core Agent (the pin: perf/agent-stack c54fc1ff)"
+        type: string
+        default: c54fc1ff13fcd55b86f2cf4edc77b041b62e245f
+      vos_picks:
+        description: "commits cherry-picked onto vos_ref (none: no pick, for a VOS that has them)"
+        type: string
+        default: none
+
+permissions:
+  contents: read
+  # shards-fleet: the nodes of one group find each other, and the core built once, through this
+  # run's artifacts (or an earlier run's: fleet_build_run).
+  actions: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
+jobs:
+  plan:
+    name: the runs
+    runs-on: ubuntu-latest
+    outputs:
+      runs: ${{ steps.runs.outputs.runs }}
+      fleet: ${{ steps.runs.outputs.fleet }}
+      fleet_build: ${{ steps.runs.outputs.fleet_build }}
+      fleet_build_env: ${{ steps.runs.outputs.fleet_build_env }}
+    steps:
+      - uses: actions/checkout@v4
+        if: github.event_name == 'push'
+      - id: runs
+        env:
+          INPUTS: ${{ toJSON(inputs) }}
+        run: |
+          set -eu
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            runs=$(jq -c '.' e2e/stress/matrix.json)
+          elif [ "$GITHUB_EVENT_NAME" = schedule ]; then
+            # The monthly restore drill (NFR-10), at small size, on a hosted runner.
+            runs='[{"name":"drill-monthly","core":"agent-recompiler","agent_profile":"jam=","phases":"drill:120:300","pollers":"100","drain_secs":"900","drill":true}]'
+          else
+            runs=$(jq -c '[.]' <<<"$INPUTS")
+          fi
+          # Every field, with the inputs' defaults.
+          runs=$(jq -c 'map({
+            name: (.name // ""), core: (.core // "inprocess"), plan: (.plan // "ladder"),
+            phases: (.phases // ""), holders: ((.holders // "200") | tostring),
+            service_pct: ((.service_pct // "50") | tostring),
+            pollers: ((.pollers // "2000") | tostring),
+            anchoring_ms: ((.anchoring_ms // "") | tostring),
+            faults: (if (.faults == true or .faults == "true") then "1" else "0" end),
+            drill: (if (.drill == true or .drill == "true") then "1" else "0" end),
+            drain_secs: ((.drain_secs // "900") | tostring),
+            vos_ref: (.vos_ref // "c54fc1ff13fcd55b86f2cf4edc77b041b62e245f"),
+            vos_picks: (if .vos_picks == "none" then "" else (.vos_picks // "") end),
+            agent_profile: (.agent_profile // ""),
+            core_opt_level: ((.core_opt_level // "") | tostring),
+            shard_counts: ((.shard_counts // "1,2,4,8") | tostring),
+            shard_ops: ((.shard_ops // "2000") | tostring),
+            shard_accounts: ((.shard_accounts // "256") | tostring),
+            shard_batch: ((.shard_batch // "64") | tostring),
+            shard_profiles: (.shard_profiles // "standard="),
+            shard_args: (.shard_args // ""),
+            core_env: (.core_env // ""), core_args: (.core_args // ""),
+            core_features: (.core_features // ""),
+            core_measure: (.core_measure // ""),
+            core_measure_k: ((.core_measure_k // "") | tostring),
+            core_prebuilt: (if (.core_prebuilt == true or .core_prebuilt == "true") then "1" else "0" end),
+            core_measure_mixes: (.core_measure_mixes // ""),
+            fleet_nodes: ((.fleet_nodes // "16") | tostring),
+            fleet_counts: ((.fleet_counts // "") | tostring),
+            fleet_runner: (.fleet_runner // "small"),
+            fleet_args: (.fleet_args // ""),
+            fleet_probe: (if (.fleet_probe == true or .fleet_probe == "true") then "1" else "0" end),
+            fleet_build_run: ((.fleet_build_run // "") | tostring),
+            fleet_wait_secs: ((.fleet_wait_secs // "2400") | tostring),
+            runner: (.runner // "ubuntu-latest")})' <<<"$runs")
+          # shards-fleet (an experiment): one entry becomes
+          # fleet_nodes jobs of one group: node 0 holds the principals Agent, the router and the load,
+          # every other node its shard Agents. fleet_runner "small" is the small self-hosted pool
+          # (2 shared vCPU), "zombienet" the 16-vCPU one; both on the fleet's private network.
+          fleet=$(jq -c '[ .[] | select(.core == "shards-fleet")
+              | (. as $r | ($r.name | if . == "" then "fleet" else . end) as $g
+                 | range(0; ($r.fleet_nodes | tonumber)) as $i
+                 | $r + {fleet_index: ($i | tostring), fleet_group: $g, name: ($g + "-n" + ($i | tostring)),
+                         runs_on: (if $r.fleet_runner == "small" then ["self-hosted", "small"] else $r.fleet_runner end)}) ]' <<<"$runs")
+          runs=$(jq -c '[ .[] | select(.core != "shards-fleet") ]' <<<"$runs")
+          # The core is built once per run, on a GitHub-hosted runner, for every fleet entry that
+          # does not reuse an earlier run's build and is not a network probe.
+          first=$(jq -c '[ .[] | select(.fleet_build_run == "" and .fleet_probe != "1") ] | first // empty' <<<"$fleet")
+          # Or, with no fleet entry, the first entry with core_prebuilt (a machine without Docker
+          # cannot build the core in its container): one build per run, so one such variant per run.
+          [ -n "$first" ] || first=$(jq -c '[ .[] | select(.core_prebuilt == "1") ] | first // empty' <<<"$runs")
+          if [ -n "$first" ]; then echo "fleet_build=1" >> "$GITHUB_OUTPUT"; else echo "fleet_build=0" >> "$GITHUB_OUTPUT"; fi
+          [ -n "$first" ] || first='{}'
+          echo "fleet_build_env=$first" >> "$GITHUB_OUTPUT"
+          echo "runs=$runs" >> "$GITHUB_OUTPUT"
+          echo "fleet=$fleet" >> "$GITHUB_OUTPUT"
+          jq . <<<"$runs"
+          jq -c '.[] | {name, runs_on}' <<<"$fleet"
+
+  stress:
+    name: stress ${{ matrix.run.name }} (${{ matrix.run.core }}, ${{ matrix.run.phases != '' && 'custom phases' || matrix.run.plan }}${{ matrix.run.anchoring_ms != '' && ', anchoring' || '' }}${{ matrix.run.faults == '1' && ', faults' || '' }}${{ matrix.run.drill == '1' && ', restore drill' || '' }})
+    needs: [plan, fleet-build]
+    if: ${{ !cancelled() && needs.plan.outputs.runs != '[]' && needs.fleet-build.result != 'failure' }}
+    runs-on: ${{ matrix.run.runner }}
+    # The fleet is shared (four machines at most): never above 180 minutes there.
+    timeout-minutes: ${{ matrix.run.runner == 'zombienet' && 180 || 350 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        run: ${{ fromJSON(needs.plan.outputs.runs) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: free runner disk
+        if: ${{ matrix.run.runner != 'zombienet' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+          nproc; free -h; grep -m1 'model name' /proc/cpuinfo
+      - name: host facts
+        run: nproc; grep -m1 'model name' /proc/cpuinfo || true; df -h . || true
+      - name: work directory
+        run: |
+          echo "WORK=$RUNNER_TEMP/core-$GITHUB_RUN_ID" >> "$GITHUB_ENV"
+          echo "BIN=$GITHUB_WORKSPACE/target/release" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+        if: ${{ !startsWith(matrix.run.core, 'shards-') && matrix.run.runner != 'zombienet' }}
+      - uses: Swatinem/rust-cache@v2
+        if: ${{ !startsWith(matrix.run.core, 'shards-') && matrix.run.runner != 'zombienet' }}
+        with:
+          shared-key: stress
+      - name: build ingress and the harness
+        if: ${{ !startsWith(matrix.run.core, 'shards-') && matrix.run.runner != 'zombienet' && matrix.run.core_measure == '' && matrix.run.core_measure_k == '' }}
+        run: cargo build --release --locked --bin aledgent-ingress --bin aledgent-e2e-driver --bin opsctl --bin aledgent-signer
+      # The fleet's machines carry Docker and no Rust: build in the same image as the core, under
+      # $WORK, which the clean-up removes.
+      - name: build ingress and the harness (fleet, in a container)
+        if: ${{ !startsWith(matrix.run.core, 'shards-') && matrix.run.runner == 'zombienet' && matrix.run.core_measure == '' && matrix.run.core_measure_k == '' }}
+        run: |
+          set -eu
+          mkdir -p "$WORK/ingress-target" "$WORK/ingress-registry" "$WORK/ingress-git"
+          docker run --rm --init -v "$GITHUB_WORKSPACE":/src -v "$WORK/ingress-target":/target \
+            -v "$WORK/ingress-registry":/usr/local/cargo/registry -v "$WORK/ingress-git":/usr/local/cargo/git \
+            -e CARGO_TARGET_DIR=/target -e CARGO_INCREMENTAL=0 -e CARGO_TERM_COLOR=never -w /src rust:1-bookworm \
+            bash -c 'apt-get update -qq && apt-get install -y -qq --no-install-recommends clang pkg-config libssl-dev protobuf-compiler > /dev/null && cargo build --release --locked --bin aledgent-ingress --bin aledgent-e2e-driver --bin opsctl --bin aledgent-signer'
+          docker run --rm -v "$WORK":/w rust:1-bookworm chown -R "$(id -u):$(id -g)" /w
+          rm -rf "$WORK/ingress-registry" "$WORK/ingress-git"
+          echo "BIN=$WORK/ingress-target/release" >> "$GITHUB_ENV"
+          ls -l "$WORK/ingress-target/release/aledgent-ingress" "$WORK/ingress-target/release/aledgent-e2e-driver"
+          df -h / || true
+
+      # core_prebuilt: the core built once on a GitHub-hosted runner (fleet-build), downloaded here.
+      - uses: actions/download-artifact@v4
+        if: matrix.run.core_prebuilt == '1'
+        with:
+          name: fleet-core
+          path: ${{ runner.temp }}/core-${{ github.run_id }}/out/core
+      - name: the core, prebuilt
+        if: matrix.run.core_prebuilt == '1'
+        run: chmod +x "$WORK/out/core/aledgent-core-host" && ls -l "$WORK/out/core"
+      - name: build the core Agent (VOS, the host, the runtime, the package)
+        if: matrix.run.core != 'inprocess' && matrix.run.core_prebuilt != '1'
+        env:
+          VOS_URL: https://codeberg.org/pandres95/VOS.git
+          VOS_REF: ${{ matrix.run.vos_ref }}
+          VOS_PICKS: ${{ matrix.run.vos_picks }}
+          BUILD_SHARDS: ${{ startsWith(matrix.run.core, 'shards-') && '1' || '0' }}
+          CORE_OPT_LEVEL: ${{ matrix.run.core_opt_level }}
+          SHARD_PROFILES: ${{ startsWith(matrix.run.core, 'shards-') && matrix.run.shard_profiles || matrix.run.agent_profile }}
+          CORE_HOST_FEATURES: ${{ matrix.run.core_features }}
+        run: |
+          set -eu
+          mkdir -p "$WORK/aledgent" "$WORK/out" "$WORK/target" "$WORK/cargo-registry" "$WORK/cargo-git"
+          git archive HEAD | tar -x -C "$WORK/aledgent"
+          docker run --rm --init -e VOS_URL -e VOS_REF -e VOS_PICKS -e BUILD_SHARDS -e SHARD_PROFILES -e CORE_OPT_LEVEL -e CORE_HOST_FEATURES \
+            -v "$WORK":/w -v "$WORK/cargo-registry":/usr/local/cargo/registry \
+            -v "$WORK/cargo-git":/usr/local/cargo/git -w /w rust:1-bookworm \
+            bash /w/aledgent/.github/x86-bench/run.sh build-core
+          # The container wrote as root; hand the tree back without sudo (the fleet has none).
+          docker run --rm -v "$WORK":/w rust:1-bookworm chown -R "$(id -u):$(id -g)" /w
+          ls -l "$WORK/out/core"
+          # The build's intermediates are no longer needed.
+          rm -rf "$WORK/target" "$WORK/cargo-registry" "$WORK/cargo-git"
+          df -h /
+
+      - name: the book in shards, on VOS
+        if: ${{ startsWith(matrix.run.core, 'shards-') }}
+        env:
+          CORE_KIND: ${{ matrix.run.core }}
+          COUNTS: ${{ matrix.run.shard_counts }}
+          OPS: ${{ matrix.run.shard_ops }}
+          ACCOUNTS: ${{ matrix.run.shard_accounts }}
+          BATCH: ${{ matrix.run.shard_batch }}
+          SHARD_ARGS: ${{ matrix.run.shard_args }}
+        run: |
+          set -eu
+          OUT=$RUNNER_TEMP/stress-out
+          mkdir -p "$OUT/logs"
+          {
+            echo "## The book in shards on VOS: ${CORE_KIND#shards-} (${{ matrix.run.runner }}, $(nproc) vCPU)"
+            echo
+            echo "\`aledgent-core-host shards\` --counts $COUNTS --ops $OPS --accounts $ACCOUNTS --batch $BATCH $SHARD_ARGS; VOS ${{ matrix.run.vos_ref }} with ${{ matrix.run.vos_picks }}, every per-invocation bound raised. $(grep -m1 'model name' /proc/cpuinfo | sed 's/^model name[[:space:]]*: //')."
+            echo
+          } > "$OUT/summary.md"
+          rc=0
+          # Every profile on this one runner; the shard Agents take VOS's largest per-Agent bounds
+          # where the runtime has them (F025_MAX_LIMITS).
+          while read -r label lookup features; do
+            echo "### Profile \`$label\` (runtime features: $features; programs through historical_lookup: $lookup)" >> "$OUT/summary.md"
+            echo >> "$OUT/summary.md"
+            F025_MAX_LIMITS=1 F025_PROGRAM_LOOKUP=$lookup F025_BACKEND=${CORE_KIND#shards-} \
+              "$WORK/out/core/aledgent-core-host" shards \
+              "$WORK/out/core/rt-$label.pvm" "$WORK/out/core/shard.vos" "$OUT/shards-$label.csv" \
+              --counts "$COUNTS" --ops "$OPS" --accounts "$ACCOUNTS" --batch "$BATCH" $SHARD_ARGS \
+              >> "$OUT/summary.md" 2>> "$OUT/logs/shards.log" || rc=$?
+            echo >> "$OUT/summary.md"
+          done < "$WORK/out/core/profiles.txt"
+          tail -n 40 "$OUT/logs/shards.log"
+          cat "$OUT/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          cat "$OUT"/shards-*.csv || true
+          exit "$rc"
+
+      # core_measure (finding F18): `aledgent-core-host measure` with these arguments, on the core
+      # Agent this entry builds (its runtime profile included), instead of a deployment. The job
+      # fails if the measure does (the `tick` workload exits 1 when an input does not commit).
+      # core_measure_k (rd-shard-scope-2): k core Agents side by side, each the whole library over
+      # its own accounts, for each k and each mix of core_measure_mixes (tools/ci/measure-k.sh).
+      - name: the core Agents, k side by side
+        if: ${{ matrix.run.core_measure_k != '' && startsWith(matrix.run.core, 'agent-') }}
+        env:
+          CORE_KIND: ${{ matrix.run.core }}
+          MEASURE_ARGS: ${{ matrix.run.core_measure }}
+          KS: ${{ matrix.run.core_measure_k }}
+          MIXES: ${{ matrix.run.core_measure_mixes }}
+        run: |
+          set -eu
+          export OUT=$RUNNER_TEMP/stress-out
+          mkdir -p "$OUT"
+          {
+            echo "## k core Agents side by side ($CORE_KIND, $(nproc) vCPU, $(grep -m1 'model name' /proc/cpuinfo | sed 's/^model name[[:space:]]*: //'))"
+            echo
+            echo "\`aledgent-core-host measure\` $MEASURE_ARGS; mixes: $MIXES; k: $KS; core features: ${{ matrix.run.core_features }}."
+            echo
+          } > "$OUT/summary.md"
+          rc=0
+          bash tools/ci/measure-k.sh | tee -a "$OUT/summary.md" || rc=$?
+          cat "$OUT/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          cat "$OUT/measure-k.csv"
+          exit "$rc"
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() && matrix.run.core_measure_k != '' }}
+        with:
+          name: measure-k-${{ matrix.run.name }}-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/stress-out/summary.md
+            ${{ runner.temp }}/stress-out/measure-k.csv
+            ${{ runner.temp }}/stress-out/k/
+          retention-days: 30
+      - name: the core Agent, measured
+        if: ${{ matrix.run.core_measure != '' && matrix.run.core_measure_k == '' && startsWith(matrix.run.core, 'agent-') }}
+        env:
+          CORE_KIND: ${{ matrix.run.core }}
+          MEASURE_ARGS: ${{ matrix.run.core_measure }}
+        run: |
+          set -eu
+          OUT=$RUNNER_TEMP/stress-out
+          mkdir -p "$OUT/logs"
+          RT=$WORK/out/core/agent_runtime.pvm
+          LOOKUP=0
+          if [ -s "$WORK/out/core/profiles.txt" ]; then
+            read -r plabel plookup pfeat < "$WORK/out/core/profiles.txt"
+            RT=$WORK/out/core/rt-$plabel.pvm
+            LOOKUP=$plookup
+          fi
+          rc=0
+          # shellcheck disable=SC2086
+          F025_BACKEND=${CORE_KIND#agent-} F025_PROGRAM_LOOKUP=$LOOKUP "$WORK/out/core/aledgent-core-host" measure \
+            "$RT" "$WORK/out/core/core.vos" "$OUT/measure.csv" $MEASURE_ARGS \
+            > "$OUT/summary.md" 2> "$OUT/logs/measure.log" || rc=$?
+          { echo "## measure $MEASURE_ARGS ($CORE_KIND): exit $rc"; echo; echo '```'; tail -n 60 "$OUT/logs/measure.log"; echo '```'; echo '```'; cat "$OUT/summary.md"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          tail -n 80 "$OUT/logs/measure.log"
+          exit "$rc"
+
+      - name: PostgreSQL
+        if: ${{ !startsWith(matrix.run.core, 'shards-') && matrix.run.core_measure == '' && matrix.run.core_measure_k == '' }}
+        run: |
+          # A fleet machine is reused: a container a failed run left behind would hold the name.
+          docker rm -f stress-pg >/dev/null 2>&1 || true
+          docker run -d --name stress-pg -e POSTGRES_USER=stress -e POSTGRES_PASSWORD=stress \
+            -e POSTGRES_DB=ingress -p 127.0.0.1:55432:5432 postgres:16-alpine
+          for i in $(seq 1 90); do
+            if docker exec stress-pg pg_isready -U stress -h 127.0.0.1 >/dev/null 2>&1 \
+              && docker exec stress-pg psql -U stress -h 127.0.0.1 -d ingress -c 'select 1' >/dev/null 2>&1; then
+              echo "PostgreSQL ready"; exit 0
+            fi
+            sleep 1
+          done
+          docker logs stress-pg | tail -40
+          echo "::error::PostgreSQL did not start"; exit 1
+
+      - name: run
+        if: ${{ !startsWith(matrix.run.core, 'shards-') && matrix.run.core_measure == '' && matrix.run.core_measure_k == '' }}
+        env:
+          DATABASE_URL: postgres://stress:stress@127.0.0.1:55432/ingress
+          CORE_KIND: ${{ matrix.run.core }}
+          PLAN: ${{ matrix.run.plan }}
+          PHASES: ${{ matrix.run.phases }}
+          HOLDERS: ${{ matrix.run.holders }}
+          SERVICE_PCT: ${{ matrix.run.service_pct }}
+          POLLERS: ${{ matrix.run.pollers }}
+          ANCHORING_MS: ${{ matrix.run.anchoring_ms }}
+          FAULTS: ${{ matrix.run.faults }}
+          DRILL: ${{ matrix.run.drill }}
+          DRAIN_SECS: ${{ matrix.run.drain_secs }}
+          RUN_NAME: ${{ matrix.run.name }}
+          CORE_EXTRA_ENV: ${{ matrix.run.core_env }}
+          CORE_ARGS: ${{ matrix.run.core_args }}
+          PG_RESTART: docker restart stress-pg && sleep 3
+        run: |
+          set -eu
+          export BIN OPSCTL=$BIN/opsctl
+          PROFILE=""
+          if [ "$CORE_KIND" != inprocess ]; then
+            export CORE=agent CORE_HOST=$WORK/out/core/aledgent-core-host
+            export CORE_RUNTIME=$WORK/out/core/agent_runtime.pvm CORE_ACTOR=$WORK/out/core/core.vos
+            export CORE_ENV="F025_BACKEND=${CORE_KIND#agent-}"
+            # agent_profile: the runtime of that profile, and the host serving historical_lookup
+            # when the profile looks programs up.
+            if [ -s "$WORK/out/core/profiles.txt" ]; then
+              read -r plabel plookup pfeat < "$WORK/out/core/profiles.txt"
+              export CORE_RUNTIME=$WORK/out/core/rt-$plabel.pvm
+              export CORE_ENV="$CORE_ENV F025_PROGRAM_LOOKUP=$plookup"
+              PROFILE=", runtime $plabel ($pfeat, lookup $plookup)"
+            fi
+            # core_env and core_args: extra environment and arguments for the core host.
+            export CORE_ENV="$CORE_ENV ${CORE_EXTRA_ENV:-}" CORE_ARGS
+            if [ -n "${CORE_EXTRA_ENV:-}${CORE_ARGS:-}" ]; then PROFILE="$PROFILE, host ${CORE_EXTRA_ENV:-} ${CORE_ARGS:-}"; fi
+          fi
+          WHERE=$([ "${{ matrix.run.runner }}" = zombienet ] && echo "zombienet fleet" || echo "GitHub-hosted")
+          LABEL="${RUN_NAME:+$RUN_NAME: }$CORE_KIND ${PHASES:-$PLAN}${ANCHORING_MS:+ anchoring ${ANCHORING_MS} ms}$([ "$FAULTS" = 1 ] && echo ' faults' || true)$([ "$DRILL" = 1 ] && echo ' restore drill' || true)$PROFILE ($WHERE, $(nproc) vCPU, $(grep -m1 'model name' /proc/cpuinfo | sed 's/^model name[[:space:]]*: //'))"
+          export LABEL
+          rc=0
+          e2e/stress/run.sh "$RUNNER_TEMP/stress-out" || rc=$?
+          cat "$RUNNER_TEMP/stress-out/summary.md" >> "$GITHUB_STEP_SUMMARY" || true
+          exit "$rc"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stress-${{ matrix.run.name || matrix.run.core }}-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/stress-out/report.json
+            ${{ runner.temp }}/stress-out/shards-*.csv
+            ${{ runner.temp }}/stress-out/measure.csv
+            ${{ runner.temp }}/stress-out/summary.md
+            ${{ runner.temp }}/stress-out/events.txt
+            ${{ runner.temp }}/stress-out/logs/
+            ${{ runner.temp }}/stress-out/drill/
+            ${{ runner.temp }}/stress-out/drill-debug/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: clean up
+        if: always()
+        run: |
+          docker rm -f stress-pg >/dev/null 2>&1 || true
+          rm -rf "$RUNNER_TEMP/stress-out/deploy" || true
+          # A fleet machine is reused: leave nothing of this run behind. The container may have
+          # left root-owned files (a failed build): remove them from inside one.
+          if [ -n "${WORK:-}" ] && [ -d "$WORK" ]; then
+            docker run --rm -v "$WORK":/w rust:1-bookworm sh -c 'rm -rf /w/* /w/.[!.]*' || true
+            rm -rf "$WORK" || true
+          fi
+
+  # ---------------------------------------------------------------------------------------------
+  # core=shards-fleet (an experiment: NFR-21 (a)): the
+  # book's shard Agents spread over many machines, the relay carried between them over Noise
+  # (crates/shards/src/net). The core is built once here, on a GitHub-hosted runner, and every node
+  # of the group downloads it: a 2-vCPU node cannot build VOS in reasonable time, and a fleet build
+  # would hold the cloud quota the nodes need.
+  fleet-build:
+    name: fleet, the core (built once)
+    needs: plan
+    if: needs.plan.outputs.fleet_build == '1'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: build the core host, the runtime and the shard package
+        env:
+          VOS_URL: https://codeberg.org/pandres95/VOS.git
+          VOS_REF: ${{ fromJSON(needs.plan.outputs.fleet_build_env).vos_ref }}
+          VOS_PICKS: ${{ fromJSON(needs.plan.outputs.fleet_build_env).vos_picks }}
+          # The shards' build for a fleet group; the core Agent's, as the stress job builds it, for a
+          # core_prebuilt entry (its program limits and runtime profile are the core's).
+          BUILD_SHARDS: ${{ fromJSON(needs.plan.outputs.fleet_build_env).core == 'shards-fleet' && '1' || '0' }}
+          CORE_OPT_LEVEL: ${{ fromJSON(needs.plan.outputs.fleet_build_env).core_opt_level }}
+          SHARD_PROFILES: ${{ fromJSON(needs.plan.outputs.fleet_build_env).core == 'shards-fleet' && fromJSON(needs.plan.outputs.fleet_build_env).shard_profiles || fromJSON(needs.plan.outputs.fleet_build_env).agent_profile }}
+          CORE_HOST_FEATURES: ${{ fromJSON(needs.plan.outputs.fleet_build_env).core_features }}
+        run: |
+          set -eu
+          WORK=$RUNNER_TEMP/core
+          mkdir -p "$WORK/aledgent" "$WORK/out" "$WORK/target" "$WORK/cargo-registry" "$WORK/cargo-git"
+          git archive HEAD | tar -x -C "$WORK/aledgent"
+          docker run --rm --init -e VOS_URL -e VOS_REF -e VOS_PICKS -e BUILD_SHARDS -e SHARD_PROFILES -e CORE_OPT_LEVEL -e CORE_HOST_FEATURES \
+            -v "$WORK":/w -v "$WORK/cargo-registry":/usr/local/cargo/registry \
+            -v "$WORK/cargo-git":/usr/local/cargo/git -w /w rust:1-bookworm \
+            bash /w/aledgent/.github/x86-bench/run.sh build-core
+          sudo chown -R "$(id -u):$(id -g)" "$WORK/out"
+          ls -l "$WORK/out/core"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fleet-core
+          path: ${{ runner.temp }}/core/out/core/
+          retention-days: 14
+
+  fleet:
+    name: fleet ${{ matrix.node.name }}
+    needs: [plan, fleet-build]
+    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.fleet != '[]' && needs.fleet-build.result != 'failure' && needs.fleet-build.result != 'cancelled' }}
+    runs-on: ${{ matrix.node.runs_on }}
+    # The fleet is shared: never above 180 minutes.
+    timeout-minutes: 170
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ${{ fromJSON(needs.plan.outputs.fleet) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: host facts
+        run: |
+          nproc; free -m || true; grep -m1 'model name' /proc/cpuinfo || true; df -h . || true
+          echo "WORK=$RUNNER_TEMP/fleet-$GITHUB_RUN_ID" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        if: matrix.node.fleet_probe != '1' && matrix.node.fleet_build_run == ''
+        with:
+          name: fleet-core
+          path: ${{ runner.temp }}/fleet-${{ github.run_id }}/core
+      - uses: actions/download-artifact@v4
+        if: matrix.node.fleet_probe != '1' && matrix.node.fleet_build_run != ''
+        with:
+          name: fleet-core
+          path: ${{ runner.temp }}/fleet-${{ github.run_id }}/core
+          run-id: ${{ matrix.node.fleet_build_run }}
+          github-token: ${{ github.token }}
+      # The nodes of one group meet here. Each draws its relay key (a Noise static key: a test value
+      # that never leaves the machine) and publishes its IPv4 address and public key as the name of
+      # an artifact of this run. Node 0 waits for every node (late joiners included, up to
+      # fleet_wait_secs) and reports when each came up; the others wait for node 0 only, and learn
+      # their peers from it over the authenticated channel.
+      - name: fleet, this node
+        env:
+          GROUP: ${{ matrix.node.fleet_group }}
+          INDEX: ${{ matrix.node.fleet_index }}
+          PROBE: ${{ matrix.node.fleet_probe }}
+          # The fleet's private network, as a CIDR (e.g. 10.0.0.0/16): the repository variable
+          # FLEET_PRIVATE_CIDR. No default: unset, the relay uses the public address.
+          FLEET_PRIVATE_CIDR: ${{ vars.FLEET_PRIVATE_CIDR }}
+        run: |
+          set -eu
+          mkdir -p "$WORK/fleet"
+          # The fleet's private network when FLEET_PRIVATE_CIDR is set and this machine has an
+          # interface in it; the public address otherwise. The relay binds and advertises the same one.
+          ip=""
+          if [ -n "${FLEET_PRIVATE_CIDR:-}" ]; then
+            ip=$(ip -4 -o addr show | awk '{print $4}' | cut -d/ -f1 | python3 -c '
+          import ipaddress, os, sys
+          net = ipaddress.ip_network(os.environ["FLEET_PRIVATE_CIDR"], strict=False)
+          print(next((a for a in sys.stdin.read().split() if ipaddress.ip_address(a) in net), ""))')
+          fi
+          if [ -n "$ip" ]; then
+            echo "address: $ip, on the fleet's private network"
+          else
+            ip=$(ip -4 route get 1.1.1.1 | sed -n 's/.* src \([0-9.]*\).*/\1/p')
+            if [ -n "${FLEET_PRIVATE_CIDR:-}" ]; then
+              echo "::warning::no interface in $FLEET_PRIVATE_CIDR: falling back to the public address $ip"
+            else
+              echo "::warning::FLEET_PRIVATE_CIDR is not set: using the public address $ip"
+            fi
+          fi
+          echo "$ip" > "$WORK/fleet/bind.txt"
+          if [ "$PROBE" = 1 ]; then
+            key=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+          else
+            chmod +x "$WORK/core/aledgent-core-host"
+            key=$("$WORK/core/aledgent-core-host" fleet-key "$WORK/fleet/relay.key")
+          fi
+          echo "$INDEX $ip $key" > "$WORK/fleet/me.txt"
+          echo "RDV_NAME=rdv-$GROUP-a${GITHUB_RUN_ATTEMPT}-$INDEX-$ip-$key" >> "$GITHUB_ENV"
+          echo "node $INDEX of group $GROUP at $ip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.RDV_NAME }}
+          path: ${{ env.WORK }}/fleet/me.txt
+          retention-days: 1
+      - name: fleet, the other nodes
+        id: rdv
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GROUP: ${{ matrix.node.fleet_group }}
+          INDEX: ${{ matrix.node.fleet_index }}
+          NODES: ${{ matrix.node.fleet_nodes }}
+          RDV_WAIT_SECS: ${{ matrix.node.fleet_wait_secs }}
+        run: bash tools/ci/fleet-rendezvous.sh "$WORK/fleet/peers.txt"
+      - name: fleet, probe the network
+        if: matrix.node.fleet_probe == '1'
+        env:
+          INDEX: ${{ matrix.node.fleet_index }}
+        run: bash tools/ci/fleet-probe.sh "$WORK/fleet/peers.txt"
+      # The runs (fleet_counts: space-separated `N` or `N/phases`, at most four), one step each.
+      - name: fleet run 1
+        if: ${{ !cancelled() && matrix.node.fleet_probe != '1' && steps.rdv.outcome == 'success' }}
+        env:
+          K: "1"
+          INDEX: ${{ matrix.node.fleet_index }}
+          NODES: ${{ matrix.node.fleet_nodes }}
+          COUNTS: ${{ matrix.node.fleet_counts }}
+          FLEET_ARGS: ${{ matrix.node.fleet_args }}
+          BATCH: ${{ matrix.node.shard_batch }}
+          ACCOUNTS: ${{ matrix.node.shard_accounts }}
+          RDV_WAIT_SECS: ${{ matrix.node.fleet_wait_secs }}
+        run: OUT=$RUNNER_TEMP/stress-out bash tools/ci/fleet-run.sh
+      # Each run's results leave the machine as soon as the run ends, so a later cancel cannot lose them.
+      - uses: actions/upload-artifact@v4
+        if: always() && matrix.node.fleet_probe != '1'
+        with:
+          name: stress-${{ matrix.node.name }}-run1-${{ github.run_id }}-a${{ github.run_attempt }}
+          path: ${{ runner.temp }}/stress-out/run-1/
+          if-no-files-found: ignore
+          retention-days: 30
+      - name: fleet run 2
+        if: ${{ !cancelled() && matrix.node.fleet_probe != '1' && steps.rdv.outcome == 'success' }}
+        env:
+          K: "2"
+          INDEX: ${{ matrix.node.fleet_index }}
+          NODES: ${{ matrix.node.fleet_nodes }}
+          COUNTS: ${{ matrix.node.fleet_counts }}
+          FLEET_ARGS: ${{ matrix.node.fleet_args }}
+          BATCH: ${{ matrix.node.shard_batch }}
+          ACCOUNTS: ${{ matrix.node.shard_accounts }}
+          RDV_WAIT_SECS: ${{ matrix.node.fleet_wait_secs }}
+        run: OUT=$RUNNER_TEMP/stress-out bash tools/ci/fleet-run.sh
+      # Each run's results leave the machine as soon as the run ends, so a later cancel cannot lose them.
+      - uses: actions/upload-artifact@v4
+        if: always() && matrix.node.fleet_probe != '1'
+        with:
+          name: stress-${{ matrix.node.name }}-run2-${{ github.run_id }}-a${{ github.run_attempt }}
+          path: ${{ runner.temp }}/stress-out/run-2/
+          if-no-files-found: ignore
+          retention-days: 30
+      - name: fleet run 3
+        if: ${{ !cancelled() && matrix.node.fleet_probe != '1' && steps.rdv.outcome == 'success' }}
+        env:
+          K: "3"
+          INDEX: ${{ matrix.node.fleet_index }}
+          NODES: ${{ matrix.node.fleet_nodes }}
+          COUNTS: ${{ matrix.node.fleet_counts }}
+          FLEET_ARGS: ${{ matrix.node.fleet_args }}
+          BATCH: ${{ matrix.node.shard_batch }}
+          ACCOUNTS: ${{ matrix.node.shard_accounts }}
+          RDV_WAIT_SECS: ${{ matrix.node.fleet_wait_secs }}
+        run: OUT=$RUNNER_TEMP/stress-out bash tools/ci/fleet-run.sh
+      # Each run's results leave the machine as soon as the run ends, so a later cancel cannot lose them.
+      - uses: actions/upload-artifact@v4
+        if: always() && matrix.node.fleet_probe != '1'
+        with:
+          name: stress-${{ matrix.node.name }}-run3-${{ github.run_id }}-a${{ github.run_attempt }}
+          path: ${{ runner.temp }}/stress-out/run-3/
+          if-no-files-found: ignore
+          retention-days: 30
+      - name: fleet run 4
+        if: ${{ !cancelled() && matrix.node.fleet_probe != '1' && steps.rdv.outcome == 'success' }}
+        env:
+          K: "4"
+          INDEX: ${{ matrix.node.fleet_index }}
+          NODES: ${{ matrix.node.fleet_nodes }}
+          COUNTS: ${{ matrix.node.fleet_counts }}
+          FLEET_ARGS: ${{ matrix.node.fleet_args }}
+          BATCH: ${{ matrix.node.shard_batch }}
+          ACCOUNTS: ${{ matrix.node.shard_accounts }}
+          RDV_WAIT_SECS: ${{ matrix.node.fleet_wait_secs }}
+        run: OUT=$RUNNER_TEMP/stress-out bash tools/ci/fleet-run.sh
+      # Each run's results leave the machine as soon as the run ends, so a later cancel cannot lose them.
+      - uses: actions/upload-artifact@v4
+        if: always() && matrix.node.fleet_probe != '1'
+        with:
+          name: stress-${{ matrix.node.name }}-run4-${{ github.run_id }}-a${{ github.run_attempt }}
+          path: ${{ runner.temp }}/stress-out/run-4/
+          if-no-files-found: ignore
+          retention-days: 30
+      - name: clean up
+        if: always()
+        run: rm -rf "${WORK:-/nonexistent}" "$RUNNER_TEMP/stress-out" || true

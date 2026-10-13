@@ -1,0 +1,18 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Reviewed attestations (F-015 §9, REQ-AR-5).
+#
+# An invariant no case enforces may be declared "attested" only through an
+# entry here: the invariant, why it holds although no case shows it at its
+# layer, and who reviewed that reasoning. An entry without a justification or
+# a reviewer is refused. SPEC does not say what evidence an attestation needs
+# (F-015 Open points); a reviewed justification is the proposal.
+#
+# Nothing is attested yet.
+#
+# [[attest]]
+# id = "INV-n"
+# justification = "…"
+# reviewed_by = "…"
+
+attest = []

@@ -1,0 +1,56 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# The floor of REQ-AR-6, hand-written (F-015 §1, §9). Not generated: a change
+# here changes what the first release must declare, so it is reviewed like the
+# spec text it transcribes.
+#
+#   REQ-AR-6  The first release's assurance level MUST declare every invariant
+#   at the layer §9's V0 column names, or at a stronger one. [...] At least, it
+#   MUST declare:
+#     - INV-1–INV-4, INV-7 and INV-12 as kernel- or store-enforced;
+#     - INV-15, INV-16, INV-20 and INV-22 as service-enforced;
+#     - every disclosure as a signed assertion (REQ-PR-6), until an
+#       independently checkable construction ships (DEF-3).
+#   A later release MAY strengthen any entry. No release may weaken one
+#   without an amendment (REQ-AR-4).
+
+basis = "REQ-AR-6"
+
+[[require]]
+ids = ["INV-1", "INV-2", "INV-3", "INV-4", "INV-7", "INV-12"]
+layers = ["kernel", "store"]
+text = "INV-1–INV-4, INV-7 and INV-12 as kernel- or store-enforced"
+
+# "Service-enforced" is the least the line asks: an id enforced at service or
+# at any stronger layer meets it.
+[[require]]
+ids = ["INV-15", "INV-16", "INV-20", "INV-22"]
+layers = ["service", "kernel", "store", "credential"]
+text = "INV-15, INV-16, INV-20 and INV-22 as service-enforced"
+
+# SPEC §9 names a target layer and, since amendment 0006 item 2 (ruled
+# 2026-09-29), a V0 layer: where the first release enforces each invariant.
+# For these three the V0 column says service, below the target, and the
+# amendment is the record REQ-AR-4 requires. The declaration follows the V0
+# column; their cases at the target layer stay registered as the target
+# (features/F-015-conformance-suite/NOTES.md). A test checks these entries
+# against the V0 column of SPEC §9.
+
+[[v0_layer]]
+id = "INV-15"
+layers = ["service"]
+note = "SPEC §9: target store + service, V0 service (amendment 0006 item 2)."
+
+[[v0_layer]]
+id = "INV-16"
+layers = ["service"]
+note = "SPEC §9: target store, V0 service (amendment 0006 item 2)."
+
+[[v0_layer]]
+id = "INV-22"
+layers = ["service"]
+note = "SPEC §9: target credential, V0 service (amendment 0006 item 2)."
+
+[disclosures]
+mode = "signed-assertion"
+basis = "REQ-PR-6"

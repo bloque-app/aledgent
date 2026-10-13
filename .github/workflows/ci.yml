@@ -1,0 +1,526 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+name: CI
+
+on:
+  # Pushes to main and every pull request; a PR branch is not also run as a plain push.
+  push:
+    branches: [main]
+  pull_request:
+  # Nightly full-strength property tests.
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  # Disk on the runners is the binding limit (#59): line tables keep file:line in panics and
+  # backtraces at a fraction of full debug info, and incremental state is never reused in CI.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      # The kernel binding must stay no_std + alloc for the core's guest.
+      - run: cargo clippy -p ledger-kernel --no-default-features --all-targets -- -D warnings
+      # Every public item is documented (missing_docs is denied); links must resolve.
+      - run: cargo doc --workspace --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  test:
+    name: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Toolchains the runner image ships and this workspace never uses (#59).
+      - name: free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # Property tests run 1,000 cases on pull requests and their full 10,000 on main and nightly.
+      - name: property-test strength
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then n=1000; else n=10000; fi
+          # F007_WALKS is not reduced: it asserts that the walks reach every edge, and runs in seconds.
+          for v in F010_RUNS F004_CONCURRENCY_CASES F008_UNITS LEDGER_KERNEL_DIFF_CASES CONFORMANCE_REDERIVE_UNITS; do
+            echo "$v=$n" >> "$GITHUB_ENV"
+          done
+          echo "property tests at $n cases"
+      # F-009's PostgreSQL received-log is tested against a real server in a container
+      # (testcontainers): the runner's Docker must be up. Under CI a missing Docker fails those
+      # tests rather than skipping them.
+      - run: docker info --format '{{.ServerVersion}}'
+      # The test containers' Postgres images come from ECR Public's mirror of the official image,
+      # tagged under the names testcontainers asks for, so it never pulls from Docker Hub: GitHub's
+      # runners share IPs and hit Docker Hub's anonymous pull limit (`toomanyrequests`, 2026-10-09).
+      - name: Postgres images from ECR Public
+        run: |
+          # Retries, then leaves the image to testcontainers (Docker Hub) if ECR Public is down, so a
+          # mirror glitch never fails the job by itself.
+          for t in 11-alpine 16-alpine; do
+            for i in 1 2 3; do
+              docker pull -q public.ecr.aws/docker/library/postgres:$t \
+                && docker tag public.ecr.aws/docker/library/postgres:$t postgres:$t && break
+              echo "::warning::ECR Public pull of postgres:$t failed (attempt $i)"; sleep $((i * 10))
+            done
+          done
+      - run: cargo test --workspace
+      # F-005, F-031: ingress over the core Agent (AgentCore) needs core-binding's `ingress`
+      # feature, which nothing in the workspace enables, so `--workspace` skips these tests.
+      - run: cargo test -p core-binding --features ingress --test agent_core
+      # F-034 (an experiment): native decide, VOS verify, behind the shards crate's flag.
+      - run: cargo test -p shards --features native-decide --test native_decide
+      # DEC-25, owner ruling cs-q04: v1 roots are a supported opt-in. The crates with a root version,
+      # built with v1 (the default run above is v2, and its differential already runs every unit
+      # under both versions). The conformance suite from a v1 genesis is its own job below.
+      - name: v1 roots (supported opt-in)
+        env:
+          LEDGER_KERNEL_DIFF_CASES: "1000"
+        run: >-
+          cargo test -p compact-smt -p ledger-kernel -p ledger-core -p leaf-store -p core-binding -p shards
+          --features compact-smt/v1,ledger-kernel/smt-v1,ledger-core/smt-v1,leaf-store/smt-v1,core-binding/smt-v1,core-binding/ingress,shards/smt-v1
+      # The cross-host relay (an experiment, feature net): hosts in threads and as processes.
+      - run: cargo test -p shards --features net --test multihost
+      - name: disk left after the tests
+        if: always()
+        run: df -h /
+
+  # NFR-10, T-005-17: the restore drill of the core Agent, on every change. A deployment whose core
+  # Agent (the native transition) streams every decision to its off-node archive is backed up,
+  # loses its node, and is restored on a fresh one; the restored node must be the lost one, byte
+  # for byte, with no acknowledged operation lost (ops/tests/agent_drill.rs). The same drill runs
+  # over VOS in the stress workflow (`drill`), and monthly there.
+  restore-drill:
+    name: restore drill (NFR-10, Agent core)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: restore-drill
+      - run: cargo test -p core-binding --features ingress --test roll_forward
+      - run: cargo test -p core-archive --lib --test stream
+      - run: cargo test -p ops --test agent_drill -- --nocapture
+
+  # T-005-15: the archive's S3 sink against an S3 API with Object Lock and KMS (MinIO, its
+  # built-in KMS key): every object written once, encrypted under the key and locked.
+  archive-s3:
+    name: core archive on S3 (Object Lock, KMS)
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: aledgent-ci
+      AWS_SECRET_ACCESS_KEY: aledgent-ci-not-a-secret
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: archive-s3
+      # MinIO no longer publishes images or binaries of its own; Chainguard's build is the same
+      # server. The bucket is created with Object Lock by the runner's AWS CLI.
+      - name: MinIO with Object Lock and a KMS key
+        run: |
+          set -eu
+          docker run -d --name minio -p 127.0.0.1:9000:9000 \
+            -e MINIO_ROOT_USER="$AWS_ACCESS_KEY_ID" -e MINIO_ROOT_PASSWORD="$AWS_SECRET_ACCESS_KEY" \
+            -e MINIO_KMS_SECRET_KEY="aledgent-archive:$(head -c 32 /dev/urandom | base64)" \
+            cgr.dev/chainguard/minio:latest server /data
+          for _ in $(seq 1 60); do
+            curl -sf http://127.0.0.1:9000/minio/health/live && break
+            sleep 1
+          done
+          aws --endpoint-url http://127.0.0.1:9000 --region us-east-1 \
+            s3api create-bucket --bucket aledgent-archive --object-lock-enabled-for-bucket
+      - run: cargo test -p core-archive --test s3 -- --nocapture
+        env:
+          ALEDGENT_REQUIRE_S3_TEST: "1"
+          ALEDGENT_TEST_S3: s3://aledgent-archive/ci?region=us-east-1&endpoint=http://127.0.0.1:9000&path-style=true&kms-key-id=aledgent-archive&lock-mode=governance&retain-days=1
+      - name: MinIO's log
+        if: failure()
+        run: docker logs minio | tail -n 60
+
+  no-float:
+    name: no floating point in crates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # INV-7, REQ-KER-7: amounts are exact integer minor units.
+      - run: tools/ci/check-no-float.sh crates
+      # The same for the services (F-009 ingress onwards).
+      - run: tools/ci/check-no-float.sh services
+      # And for operations (F-018): signals and reconciliation are integers too.
+      - run: tools/ci/check-no-float.sh ops
+
+  kernel-features:
+    name: kernel feature graph
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      # F-001 §1, DEC-11, DEF-4: no experimental CipherClerk layer anywhere in the graph.
+      - run: tools/ci/check-kernel-features.sh
+      # The check must bite: a crate that enables `notes` has to be rejected with exit 1.
+      - name: self-test on a crate that enables a forbidden feature
+        run: |
+          set +e
+          tools/ci/check-kernel-features.sh --manifest-path tools/ci/fixtures/forbidden-kernel-feature/Cargo.toml
+          status=$?
+          if [ "$status" -ne 1 ]; then
+            echo "expected the check to reject the fixture with exit 1, got $status"
+            exit 1
+          fi
+
+  conformance-ports:
+    name: no production crate enables conformance-ports
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      # F-001 §11, REQ-CS-5: the raw ports are for the conformance suite only.
+      - run: tools/ci/check-conformance-ports.sh
+      # The check must bite: a crate that enables the ports has to be rejected with exit 1.
+      - name: self-test on a crate that enables the ports
+        run: |
+          set +e
+          tools/ci/check-conformance-ports.sh --manifest-path tools/ci/fixtures/production-enables-ports/Cargo.toml
+          status=$?
+          if [ "$status" -ne 1 ]; then
+            echo "expected the check to reject the fixture with exit 1, got $status"
+            exit 1
+          fi
+      # F-003: ledger-core's forged store records are under the same rule.
+      - name: self-test on a crate that enables ledger-core's ports
+        run: |
+          set +e
+          tools/ci/check-conformance-ports.sh --manifest-path tools/ci/fixtures/production-enables-core-ports/Cargo.toml
+          status=$?
+          if [ "$status" -ne 1 ]; then
+            echo "expected the check to reject the fixture with exit 1, got $status"
+            exit 1
+          fi
+      # T-036-34: the guest-heap model (a global allocator, unsafe) is a dev-dependency only.
+      - run: tools/ci/check-guest-heap-dev-only.sh
+      - name: self-test on a crate that links guest-heap
+        run: |
+          set +e
+          tools/ci/check-guest-heap-dev-only.sh --manifest-path tools/ci/fixtures/production-links-guest-heap/Cargo.toml
+          status=$?
+          if [ "$status" -ne 1 ]; then
+            echo "expected the check to reject the fixture with exit 1, got $status"
+            exit 1
+          fi
+
+  # F-005: VOS is AGPL-3.0-or-later. Only agents/ (and spikes/) may link it, and the core's guest
+  # must reach no clock, randomness or network (T-005-06, REQ-RT-7).
+  vos-boundary:
+    name: VOS boundary and guest determinism
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: tools/ci/check-no-vos.sh
+      - name: self-test on a crate outside agents/ that links VOS
+        run: |
+          set +e
+          tools/ci/check-no-vos.sh tools/ci/fixtures/depends-on-vos
+          status=$?
+          if [ "$status" -ne 1 ]; then
+            echo "expected the check to reject the fixture with exit 1, got $status"
+            exit 1
+          fi
+      - run: tools/ci/check-guest-deps.sh
+      - name: the shard Agents' guest (F-031, DEC-22)
+        run: >
+          tools/ci/check-guest-deps.sh agents/shard/Cargo.lock agents/shard/src crates/shards/src
+          crates/core-binding/src crates/ledger-kernel/src
+      # F-033: aledgent's runtime is a guest too, and decides nothing from a clock or the OS.
+      - run: tools/ci/check-guest-deps.sh agents/aledgent-runtime/Cargo.lock agents/aledgent-runtime/src
+      - name: self-test on a guest that reads the clock and OS randomness
+        run: |
+          set +e
+          tools/ci/check-guest-deps.sh tools/ci/fixtures/guest-with-clock/guest.lock tools/ci/fixtures/guest-with-clock/src
+          status=$?
+          if [ "$status" -ne 1 ]; then
+            echo "expected the check to reject the fixture with exit 1, got $status"
+            exit 1
+          fi
+      - run: tools/ci/check-no-float.sh agents
+
+  # Licensing (docs/oss/LICENSING.md §7): every tracked file carries its licence (an SPDX header
+  # where the format allows a comment, REUSE.toml otherwise), the licence its path requires
+  # (agents/ AGPL-3.0-or-later, prose CC-BY-4.0, the rest Apache-2.0 OR MIT), and every
+  # dependency's licence is on deny.toml's list. Fails on a missing header.
+  licensing:
+    name: licence headers, REUSE and dependency licences
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: SPDX headers and Cargo licence fields
+        run: python3 tools/oss/spdx.py --check
+      - name: REUSE compliance
+        uses: fsfe/reuse-action@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: Dependency licences (root, contract)
+        run: |
+          cargo deny check licenses
+          (cd contracts/settlement && cargo deny check licenses)
+      - name: Dependency licences (agents, VOS side)
+        run: |
+          tools/cipherclerk-patched.sh
+          (cd agents && cargo deny check licenses)
+
+  # F-005: the agents/ workspace (the core host; AGPL-3.0-or-later), on its own toolchain, with
+  # CipherClerk patched by tools/cipherclerk-patched.sh. The guest actor (agents/core) needs VOS's
+  # `cargo actor` and is built by hand (agents/README.md).
+  agents:
+    name: agents workspace (core host)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agents
+    steps:
+      - uses: actions/checkout@v4
+      - name: free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-03-20
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: agents
+      - run: ../tools/cipherclerk-patched.sh
+      # T-036-34: no core host or guest links the guest-heap model.
+      - run: ../tools/ci/check-guest-heap-dev-only.sh
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      # cs-q04: a v1 deployment builds its core host with v1 roots (deploy/docker/core.Dockerfile).
+      - run: cargo check --locked -p core-host --features smt-v1
+
+  # F-027 (T-027-03, T-027-07): the settlement executor's Kreivo PASS transactions, rebuilt with
+  # Kreivo's own crates in both formats it signs: spec 133 (Kreivo 4aef055, kreivo-pin) and spec 132
+  # (release 0.16.9, live on mainnet, kreivo-pin-132). Each is a workspace of its own, built from
+  # its committed lock file; services/settle's own tests check its encoder against the same
+  # vectors.json.
+  kreivo-pin:
+    name: kreivo pin (${{ matrix.crate }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [kreivo-pin, kreivo-pin-132]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: services/settle/${{ matrix.crate }}
+      - run: cargo fmt --manifest-path services/settle/${{ matrix.crate }}/Cargo.toml -- --check
+      - run: cargo clippy --locked --manifest-path services/settle/${{ matrix.crate }}/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --locked --manifest-path services/settle/${{ matrix.crate }}/Cargo.toml
+
+  spikes:
+    name: spikes (F-002 measurement code, never shipped)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: spikes
+      # spikes/ is its own workspace, outside the root one (spikes/README.md).
+      # The VOS guest and host crates under it need the pinned VOS checkout and
+      # a nightly toolchain; they are built by hand, as the README says.
+      - run: cargo fmt --manifest-path spikes/Cargo.toml --all -- --check
+      - run: cargo clippy --manifest-path spikes/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --manifest-path spikes/Cargo.toml --release
+
+  # F-028: the Kreivo Pass import tool (TypeScript, polkadot-api). Its conversion is tested offline,
+  # against the vector crates/authn decodes too; it never reaches a chain here.
+  pass-import:
+    name: pass-import (F-028 migration tool)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tools/pass-import
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+      - run: bun x tsc --noEmit -p tsconfig.json
+      - run: bun test
+
+  # The conformance suite's gate (F-015 §10, NFR-14). Required on crates/.
+  conformance:
+    name: conformance (current gate profile)
+    runs-on: ubuntu-latest
+    env:
+      CONFORMANCE_REPORT: ${{ github.workspace }}/target/conformance/report.json
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The commit message is read for an amendment citation.
+          fetch-depth: 0
+      # Toolchains the runner image ships and this workspace never uses (#59).
+      - name: free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # F-015 §1: the spec catalogue is current with SPEC.md.
+      - run: cargo xtask spec-ids --check
+      # The closure checks, the catalogue check, and every case the current
+      # profile of crates/conformance/gates.toml requires, on both stores.
+      - run: cargo test -p conformance --test suite
+      # F-031 (T-031-03): the suite through the native Agent again, eight inputs per invocation.
+      # Its report is kept apart: the declaration below is generated from the run above.
+      - name: through the Agent, batched
+        run: cargo test -p conformance --test suite
+        env:
+          CONFORMANCE_TARGETS: through-agent/native
+          CONFORMANCE_AGENT_BATCH: "8"
+          CONFORMANCE_REPORT: ${{ github.workspace }}/target/conformance/batched/report.json
+      # F-015 §9, REQ-AR-5, REQ-AR-6: the assurance declaration, generated from
+      # this run only, and verified against it. At a milestone the floor's
+      # shortfall is reported; a release profile fails on it. A weakening
+      # against the last released declaration fails unless the commit cites a
+      # file in amendments/ (REQ-AR-4).
+      - name: assurance declaration
+        run: |
+          set -euo pipefail
+          args=(--report "$CONFORMANCE_REPORT" --target in-process --out target/conformance/assurance.json)
+          if [ -f crates/conformance/assurance/baseline.json ]; then
+            args+=(--baseline crates/conformance/assurance/baseline.json)
+            message=$(git log -1 --format=%B "${{ github.event.pull_request.head.sha || github.sha }}")
+            amendment=$(grep -oE 'amendments/[0-9]{4}-[A-Za-z0-9._-]+\.md' <<<"$message" | head -1 || true)
+            if [ -n "$amendment" ]; then
+              args+=(--amendment "$amendment")
+            fi
+          fi
+          cargo run -q -p conformance --bin assurance -- "${args[@]}"
+          cargo run -q -p conformance --bin assurance -- verify \
+            --declaration target/conformance/assurance.json --report "$CONFORMANCE_REPORT"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: conformance-gate
+          path: target/conformance/
+
+  # Owner ruling cs-q04: v1 roots (CipherClerk's full-depth trees) are a supported opt-in beside the
+  # default v2 (DEC-25), chosen for a whole deployment at genesis. The gate profile again, every case
+  # from a v1 genesis: its checkpoints are construction 1 (AC-J1.5, REQ-PR-10). Its report is kept
+  # apart; the assurance declaration is the v2 run's.
+  conformance-v1:
+    name: conformance (v1 roots at genesis)
+    runs-on: ubuntu-latest
+    env:
+      CONFORMANCE_REPORT: ${{ github.workspace }}/target/conformance/v1/report.json
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Toolchains the runner image ships and this workspace never uses (#59).
+      - name: free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p conformance --features smt-v1 --test suite
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: conformance-gate-v1
+          path: target/conformance/v1/
+
+  # The full run: every case of every feature. It is red until the last
+  # feature lands, so it is published as a report and never fails the build.
+  conformance-full:
+    name: conformance full run (report)
+    runs-on: ubuntu-latest
+    env:
+      CONFORMANCE_PROFILE: full
+      CONFORMANCE_REPORT_ONLY: "1"
+      CONFORMANCE_REPORT: ${{ github.workspace }}/target/conformance/full/report.json
+    steps:
+      - uses: actions/checkout@v4
+      # Toolchains the runner image ships and this workspace never uses (#59).
+      - name: free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: full run
+        run: cargo test -p conformance --test suite -- --format terse | tee target-full.log
+      - name: declaration of the full run
+        run: |
+          cargo run -q -p conformance --bin assurance -- --report "$CONFORMANCE_REPORT" \
+            --target in-process --mode milestone --out target/conformance/full/assurance.json \
+            | tee -a target-full.log
+          {
+            echo '## Conformance, full run'
+            echo '```'
+            grep '^conformance:\|^assurance:\|^  INV-' target-full.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: conformance-full
+          path: target/conformance/full/

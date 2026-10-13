@@ -1,0 +1,45 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# F-027 T-027-07: pins the settlement executor's spec 132 Kreivo transaction (Kreivo release 0.16.9,
+# the runtime live on mainnet) to the crates that release locks.
+#
+# A workspace of its own, like `../kreivo-pin` (spec 133, Kreivo `4aef055`), and apart from it: the
+# two runtimes lock different, incompatible Polkadot SDK and Virto releases, which cannot share one
+# lock file. `services/settle` builds its transactions with its own plain SCALE encoder
+# (`src/chain/kreivo.rs`) and pins them in `vectors.json`; this crate rebuilds the same bytes from
+# the same inputs with Kreivo 0.16.9's types and checks them against that file. Run it with
+# `cargo test --locked --manifest-path services/settle/kreivo-pin-132/Cargo.toml`.
+#
+# The two git dependencies are declared as Kreivo 0.16.9 declares them (no revision), so that they
+# unify with pass-authenticators' own dependency on frame-contrib; `Cargo.lock`, seeded from Kreivo
+# 0.16.9's own lock file, pins them to that release's revisions (pass-authenticators `92c3484`,
+# frame-contrib `26630fb`), and a test checks that it still does. Always build with `--locked`.
+[workspace]
+
+[package]
+name = "kreivo-pin-132"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/bloque-app/aledgent"
+description = "Pins aledgent-settle's spec 132 Kreivo PASS transactions to Kreivo 0.16.9's own types."
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+codec = { package = "parity-scale-codec", version = "=3.7.5", features = ["derive"] }
+scale-info = { version = "=2.11.6", features = ["derive"] }
+sp-core = { version = "=38.1.0", features = ["std"] }
+sp-crypto-hashing = "=0.1.0"
+sp-runtime = { version = "=44.0.0", features = ["std"] }
+sp-weights = { version = "=33.1.0", features = ["std"] }
+frame-support = { version = "=43.0.0", features = ["std"] }
+# The authenticator Kreivo 0.16.9's `Pass` composite uses for substrate keys, and its traits: the
+# message the device signs (`context ‖ authority ‖ challenge` at this revision), the credential, and
+# the device's own verification of it.
+fc-traits-authn = { git = "https://github.com/virto-network/frame-contrib", features = ["std"] }
+pass-authenticators-substrate-keys = { git = "https://github.com/virto-network/pass-authenticators", default-features = false, features = ["runtime", "full-crypto"] }
+serde_json = "1"
+hex = "0.4"
