@@ -589,7 +589,6 @@ fn on_runtime(spec_version: u32, transaction_version: u32) -> KitOptions {
     }
 }
 
-/// The formats whose message the device's signature on `e` verifies in: exactly one.
 /// The runtimes whose format the extrinsic's device signature verifies in: 133's signature
 /// verifies as 134's too, since 134 signs exactly as 133 does.
 fn signed_in(e: &ExtrinsicRow) -> Vec<u32> {
