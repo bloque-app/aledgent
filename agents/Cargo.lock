@@ -154,7 +154,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "audit-store"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "cipher-clerk",
  "ledger-core",
@@ -162,7 +162,7 @@ dependencies = [
 
 [[package]]
 name = "authn"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "base64 0.22.1",
  "blake2",
@@ -498,7 +498,7 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "core-archive"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "base64 0.22.1",
  "core-binding",
@@ -1070,7 +1070,7 @@ dependencies = [
 
 [[package]]
 name = "ingress"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "audit-store",
  "authn",
@@ -1882,7 +1882,7 @@ dependencies = [
 
 [[package]]
 name = "signer"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "ed25519-dalek",
  "k256",

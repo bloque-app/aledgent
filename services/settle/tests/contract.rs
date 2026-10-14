@@ -589,7 +589,8 @@ fn on_runtime(spec_version: u32, transaction_version: u32) -> KitOptions {
     }
 }
 
-/// The formats whose message the device's signature on `e` verifies in: exactly one.
+/// The runtimes whose format the extrinsic's device signature verifies in: 133's signature
+/// verifies as 134's too, since 134 signs exactly as 133 does.
 fn signed_in(e: &ExtrinsicRow) -> Vec<u32> {
     let (tx, _, _) = envelopes(e);
     let c = &tx.credential;
@@ -633,7 +634,7 @@ async fn t_027_07_a_runtime_upgrade_seen_mid_run_switches_the_format_for_the_nex
     let after = k.withdrawal(&alice, 20, "after").await;
     until_all(&mut k, &alice, std::slice::from_ref(&after), "Settled", 5).await;
     let e = extrinsic(&k, &after).await;
-    assert_eq!(signed_in(&e), vec![133]);
+    assert_eq!(signed_in(&e), vec![133, 134]);
     assert_ne!(
         e.extrinsic.hash,
         extrinsic(&k, &before).await.extrinsic.hash
@@ -680,5 +681,5 @@ async fn t_027_07_a_batch_in_flight_across_the_upgrade_is_released_on_both_proof
     assert_eq!(k.balances(&alice).await, (1_000, 0));
     let next = k.withdrawal(&alice, 10, "next").await;
     until_all(&mut k, &alice, std::slice::from_ref(&next), "Settled", 5).await;
-    assert_eq!(signed_in(&extrinsic(&k, &next).await), vec![133]);
+    assert_eq!(signed_in(&extrinsic(&k, &next).await), vec![133, 134]);
 }

@@ -170,8 +170,9 @@ live on mainnet) and spec 133 (`4aef055` onward) differ in the order of the mess
 signs; the adapter reads the runtime's `spec_version` on every step and signs each batch in that
 runtime's format, so a runtime upgrade switches the next batch. It refuses to serve a runtime it has
 no format for, or whose transaction extensions are not its format's, and it refuses to start with a
-`spec_versions` entry it has no format for. Today that is `[132, 133]`; a new Kreivo runtime needs
-its format added and pinned (`services/settle/kreivo-pin*`) before it is enacted.
+`spec_versions` entry it has no format for. Today that is `[132, 133, 134]` (134, Kreivo `0.17.1`,
+signs as 133 does); a new Kreivo runtime needs its format added and pinned
+(`services/settle/kreivo-pin*`) before it is enacted.
 
 A device key in a file or in an environment variable (`{ "env": "VAR" }`) is for development only
 (`NFR-8`), and the adapter refuses one unless its configuration says `"development_keys": true`.
