@@ -5,7 +5,10 @@
 //!
 //! - **spec 132**, Kreivo release `0.16.9` (`db3d8af`): what Kreivo mainnet runs (its runtime code
 //!   hash is that release's, read on 2026-09-29);
-//! - **spec 133**, Kreivo `4aef055` onward, up to the release that carries kreivo#501.
+//! - **spec 133**, Kreivo `4aef055` onward, up to the release that carries kreivo#501;
+//! - **spec 134**, Kreivo release `0.17.1` (`87f8728`), enacted on mainnet on 2026-10-14: spec 133's
+//!   format unchanged (the release adds asset calls to the contracts' chain extension, and its
+//!   transaction extensions, `transaction_version` and PASS crates are spec 133's).
 //!
 //! What it speaks:
 //!
@@ -916,7 +919,7 @@ pub const EXTENSIONS_133: &[&str] = &[
 ];
 
 /// Every format the executor signs in. A `spec_version` not listed here is refused.
-pub const FORMATS: [TxFormat; 2] = [
+pub const FORMATS: [TxFormat; 3] = [
     TxFormat {
         spec_version: 132,
         kreivo: "0.16.9 (db3d8af)",
@@ -926,6 +929,14 @@ pub const FORMATS: [TxFormat; 2] = [
     TxFormat {
         spec_version: 133,
         kreivo: "4aef055",
+        order: MessageOrder::ChallengeFirst,
+        extensions: EXTENSIONS_133,
+    },
+    // Kreivo 0.17.1 changes no transaction byte: its lockfile moves nothing but its own version, so
+    // `services/settle/kreivo-pin` (spec 133) proves these bytes too.
+    TxFormat {
+        spec_version: 134,
+        kreivo: "0.17.1 (87f8728)",
         order: MessageOrder::ChallengeFirst,
         extensions: EXTENSIONS_133,
     },
@@ -1748,7 +1759,10 @@ mod tests {
         // The same nine extensions; 133 appends DynamicMaxBlockWeight, which encodes nothing.
         assert_eq!(f132.extensions, &f133.extensions[..9]);
         assert_eq!(f133.extensions[9..], ["DynamicMaxBlockWeight"]);
-        for unknown in [0, 131, 134, 135, u32::MAX] {
+        // 134 (Kreivo 0.17.1) signs exactly as 133 does.
+        let f134 = TxFormat::of(134).unwrap();
+        assert_eq!((f134.order, f134.extensions), (f133.order, f133.extensions));
+        for unknown in [0, 131, 135, 136, u32::MAX] {
             assert_eq!(TxFormat::of(unknown), None, "{unknown}");
         }
         // The two messages hold the same bytes in the two orders.
@@ -1767,7 +1781,7 @@ mod tests {
         let device = Arc::new(DevSigner::from_secret(&[0x5e; 32]).unwrap());
         let pass = PassAccount::new(device, [0x51; 32]);
         let call = contracts_call(&[9; 32], &CallLimits::default(), &execute_data(&[]));
-        for spec_version in [131, 134] {
+        for spec_version in [131, 135] {
             let p = TxParams {
                 genesis: [0x6e; 32],
                 spec_version,

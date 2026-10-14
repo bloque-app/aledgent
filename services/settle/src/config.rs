@@ -546,9 +546,9 @@ mod tests {
         assert_eq!(c.adapter.spec_versions, vec![132, 133]);
         assert!(c.adapter.spec_versions_without_format().is_empty());
         let c = with(|m| {
-            m["adapter"]["spec_versions"] = serde_json::json!([132, 134, 133, 1]);
+            m["adapter"]["spec_versions"] = serde_json::json!([132, 135, 133, 1]);
         });
-        assert_eq!(c.adapter.spec_versions_without_format(), vec![134, 1]);
+        assert_eq!(c.adapter.spec_versions_without_format(), vec![135, 1]);
     }
 
     #[test]

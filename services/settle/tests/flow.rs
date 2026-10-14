@@ -285,13 +285,13 @@ async fn ac_e4_2_an_unlisted_spec_version_stops_service() {
 async fn t_027_07_req_sa_2_an_allowed_runtime_with_no_known_format_stops_service() {
     let options = KitOptions {
         fake: FakeConfig {
-            spec_version: 134,
+            spec_version: 135,
             ..FakeConfig::default()
         },
         ..KitOptions::default()
     };
-    let (k, why) = refuses_with(options, |k| k.reconfigure(|c| c.spec_versions.push(134))).await;
-    assert_eq!(why, vec![Refusing::TxFormat { found: 134 }]);
+    let (k, why) = refuses_with(options, |k| k.reconfigure(|c| c.spec_versions.push(135))).await;
+    assert_eq!(why, vec![Refusing::TxFormat { found: 135 }]);
     unavailable(&k).await;
     assert!(k.store.extrinsics().await.unwrap().is_empty());
 }
