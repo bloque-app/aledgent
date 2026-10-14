@@ -654,7 +654,7 @@ mod tests {
             timeout_ms: None,
         });
         assert_eq!(production.check_key_sources(), Ok(true));
-        assert_eq!(c.adapter.spec_versions, vec![133]);
+        assert_eq!(c.adapter.spec_versions, vec![133, 134]);
         assert!(c.adapter.spec_versions_without_format().is_empty());
         // The chain spec: Kreivo's verified light spec, 12 boot nodes (the single boot node is
         // lifted), and a genesis state root whose genesis block is the one the
