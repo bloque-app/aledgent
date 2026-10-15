@@ -13,6 +13,9 @@ path = [
   "tools/pass-import/bun.lock",
   "tools/ci/fixtures/**",
   "services/ingress/migrations/*.sql",
+  # The core stream's test PKI (F-038): test values, never a deployment's.
+  "services/ingress/tests/fixtures/stream/*.pem",
+  "services/ingress/tests/fixtures/stream/*.key",
   "**/*.txt",
 ]
 precedence = "aggregate"
