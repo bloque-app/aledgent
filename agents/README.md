@@ -54,6 +54,9 @@ anywhere with the toolchain and `rust-src`.
     aledgent-core-host measure agent_runtime.pvm core.vos reserve.csv --n 100 --warmup 3
     # reservations, captures and transfers: the Agent's state and gas against the book's size
     aledgent-core-host measure agent_runtime.pvm core.vos mixed.csv --n 1000 --warmup 4 --mix mixed
+    # identities and accounts opened, 24 inputs an invocation: per-round figures (PROFROUND) to
+    # stderr, the service tree's leaves by kind at the end (profiling)
+    aledgent-core-host measure agent_runtime.pvm core.vos open.csv --n 12000 --warmup 0 --batch 24 --mix open
 
     # Serve boundary::Core on the deployment's core_endpoint (the same file ingress reads),
     # streaming every decision to the off-node archive (T-005-15; ops/runbooks/release/core-archive.md)

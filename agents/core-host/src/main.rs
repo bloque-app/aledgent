@@ -10,10 +10,11 @@
 //! aledgent-core-host restore --config <file> --runtime <runtime.pvm> --actor <actor.vos> --state <dir> [--budget <bytes>]
 //!                                    finish a restore `opsctl restore core --from` laid out: the Agent
 //!                                    re-sent every archived input after its checkpoint (T-005-16)
-//! aledgent-core-host measure <runtime.pvm> <actor.vos> <out.csv> [--n N] [--warmup W] [--mix reserve|mixed] [--batch N] [--mapped]
+//! aledgent-core-host measure <runtime.pvm> <actor.vos> <out.csv> [--n N] [--warmup W] [--mix reserve|mixed|card|transfers|tick|open|custody|head|positions] [--batch N] [--mapped]
 //!                                    the reservation path, or reservations, captures and
 //!                                    transfers, through the Agent (T-005-10, T-005-14), N
-//!                                    inputs per invocation (T-031-05)
+//!                                    inputs per invocation (T-031-05); `--mix open` opens
+//!                                    identities and accounts (profiling, measure.rs)
 //! aledgent-core-host code-manifest --actor <vos> --runtime <pvm> --profile <json> --out <file>
 //!                                    the genesis code's manifest (amendment 0023's `aledgent/code/v1`)
 //!                                    of this host, package and runtime (F-036, code.rs)
@@ -87,7 +88,7 @@ fn usage() -> ! {
          aledgent-core-host build-spec --config <file> --chainspec <file> --actor <vos> --runtime <pvm> --out <dir> [--unnamed-code] [--max-memory <bytes>]\n  \
          aledgent-core-host verify-genesis --config <file> --chainspec <file> --manifest <file> --runtime <pvm> --actor <vos> [--unnamed-code] [--segments K] [--engine interpreter|recompiler] [--out <report>]\n  \
          aledgent-core-host install-verified --config <file> --state <dir> --report <file> [--genesis-manifest <file>] [--archive <spec>]\n  \
-         aledgent-core-host measure <runtime.pvm> <actor.vos> <out.csv> [--n N] [--warmup W] [--mix reserve|mixed] [--batch N] [--mapped]\n  \
+         aledgent-core-host measure <runtime.pvm> <actor.vos> <out.csv> [--n N] [--warmup W] [--mix reserve|mixed|card|transfers|tick|open|custody|head|positions] [--batch N] [--mapped]\n  \
          aledgent-core-host batch-curve <runtime.pvm> <actor.vos> <out.csv> [--sizes ...] [--rounds R] [--accounts A]\n  \
          aledgent-core-host shards <runtime.pvm> <shard.vos> <out.csv> [--counts 1,2,4,8] [--accounts A] [--ops M] [--batch B]\n  \
          aledgent-core-host fleet <runtime.pvm> <shard.vos> <out.csv> --index I --nodes N --peers F --port P --key K [--per-node K] [--phases ...]\n  \
