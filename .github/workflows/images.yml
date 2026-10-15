@@ -41,7 +41,7 @@ name: Images
 # and `genesis_manifest` (its genesis code manifest, `aledgent/code/v1`, in hex) builds nothing else:
 # the job `core on genesis` builds the current `aledgent-core-host` with the package and the runtime
 # copied from that image (core.Dockerfile, target `core-on-genesis`), and the build fails unless they
-# are the manifest's (`aledgent-core-host check-code`), and its version `genesis_code` when given.
+# are the manifest's (`aledgent-core-host check-code`), and its version `genesis_code` (required).
 # The host takes the genesis image's roots (its label `app.aledgent.roots`; `roots` when it has
 # none). From `main` or `develop` it is pushed as `host-<commit>-on-genesis-<the genesis digest's
 # first 12 hex>` only, never `sha-<commit>`, so it cannot be taken for a core built from source.
@@ -85,7 +85,7 @@ on:
         type: string
         default: ""
       genesis_code:
-        description: "With genesis_image, optional: the genesis code version H0 (64 hex) the manifest must have"
+        description: "With genesis_image, required: the genesis code version H0 (64 hex) the manifest must have"
         type: string
         default: ""
   workflow_call:
@@ -603,8 +603,10 @@ jobs:
             fi
             python3 -c 'import sys; sys.stdout.buffer.write(bytes.fromhex(sys.argv[1]))' \
               "$GENESIS_MANIFEST" > "$code/code.bin"
-            if [ -n "$GENESIS_CODE" ] && ! [[ "$GENESIS_CODE" =~ ^[0-9a-f]{64}$ ]]; then
-              echo "::error::genesis_code: 64 hex, not '$GENESIS_CODE'"
+            # Required on a dispatch: without H0 the check proves only that the bytes are the supplied
+            # manifest's, not the deployment's genesis code (review of #28).
+            if ! [[ "$GENESIS_CODE" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::genesis_code: the deployment's genesis code version H0 (64 hex) is required with genesis_image, not '$GENESIS_CODE'"
               exit 1
             fi
           fi
