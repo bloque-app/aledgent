@@ -89,7 +89,7 @@ recovery point").
      <core image>@sha256:<digest> \
      restore core --from 's3://<bucket>/<prefix>?region=<region>' \
      --config /etc/aledgent/ingress.json --state /var/lib/aledgent/core \
-     --anchors-rpc <Kreivo node URL> --report /var/lib/aledgent/drills \
+     --anchors-rpc <Kreivo archive node URL> --report /var/lib/aledgent/drills \
      --core-host aledgent-core-host \
      --runtime /usr/share/aledgent/agent_runtime.pvm --actor /usr/share/aledgent/core.vos
    ```

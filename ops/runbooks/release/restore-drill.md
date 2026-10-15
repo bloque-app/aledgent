@@ -37,9 +37,12 @@ The production-class drill below still runs by hand, on the deployment's own arc
 
 - [ ] An **isolated host** with no network path to production, of the production instance class.
 - [ ] The latest verified backups: the core's archive (`opsctl archive verify --from <spec> --config
-  <deployment config> --anchors-rpc <node URL>`), audit, ingress and adapter (base backup and WAL, `opsctl
+  <deployment config> --anchors-rpc <archive node URL>`), audit, ingress and adapter (base backup and WAL, `opsctl
   backup verify`).
 - [ ] A read-only role on the archive's bucket, and `kms:Decrypt` on its key.
+- [ ] The Kreivo node for `--anchors-rpc` is an **archive node**: `INV-19` reads each anchor's state at
+  the block it was anchored in, and a node that prunes state (the public RPC endpoints do) answers "State
+  already discarded". The drill then fails `INV-19` for the older anchors although the book is intact.
 - [ ] The keys for the drill come from Vault's own backup into the drill's signer only, never an
   environment.
 

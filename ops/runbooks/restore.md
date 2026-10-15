@@ -98,6 +98,15 @@ against the layer only; `--anchors-rpc` names the node to read), and `NFR-4`
 (every acknowledged operation present). Recovery time and the data-loss window are recorded with the
 result; the exporter reads the latest drill record (`aledgent_drill_passed`, `aledgent_drill_last_age_ms`).
 
+**`--anchors-rpc` must be an archive node.** `INV-19` reads the anchors' state at the block each was
+anchored in, which can be long ago. A node that prunes state (the public Kreivo RPC endpoints do)
+answers "State already discarded" for those blocks, and `INV-19` then fails for the older anchors with a
+message that reads like a fault of the book. It is the node, not the book: name a node that keeps every
+block's state and run the check again.
+
+A failing check's detail in the report (and on the console) is the count of what it found and at most 20
+examples, not every item: the count says how widespread it is, the examples say what kind.
+
 ## Cadence (accepted proposal)
 
 Before production (a gate of `M-3`), then monthly, and after every change of the VOS or CipherClerk pin.
