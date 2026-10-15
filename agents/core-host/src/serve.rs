@@ -53,8 +53,10 @@
 //! socket on the same host with the token in `ALEDGENT_CORE_STREAM_TOKEN`) and answers ingress's
 //! calls down that stream; it listens on no network port. Either link, or both at once during
 //! the transition, reaches the core through one `ingress::feed::Sequencer`: ingress's signature on
-//! every forwarded input is checked against `stream.ingress_keys` (required in production; with
-//! them, no unsigned or unsequenced input is taken, from the host's start) before the Agent sees
+//! every forwarded input is checked against `stream.ingress_keys` (required in production with
+//! `stream.dial`; with them, no unsigned or unsequenced input is taken, from the host's start;
+//! without them and without `stream.dial`, the socket takes a legacy ingress's unsequenced
+//! inputs as before, `F-038` §12 step 0) before the Agent sees
 //! it, a stale feeder's epoch is fenced, duplicates are answered from the reply log, and early arrivals
 //! wait for the gap. The Agent and the host's calls into it are unchanged (`DEC-26(d)`,
 //! `DEC-27` (i)). `core_endpoint` is optional when `stream.dial` is set.
@@ -510,12 +512,14 @@ pub fn serve(args: &[String]) -> Result<(), String> {
         None => None,
     };
     // F-038 §5: the keys ingress's feeds are checked against, on every link; required in
-    // production, where the host then takes no unsigned or unsequenced input from its start.
+    // production once the host dials the new link. With them the host takes no unsigned or
+    // unsequenced input from its start. Without them (and without `stream.dial`) it serves the
+    // legacy socket link, as a host of an earlier release does (F-038 §12 step 0).
     let feed_keys = c.core_feed_keys().map_err(|e| format!("{path}: {e}"))?;
     if feed_keys.is_none() {
         eprintln!(
-            "aledgent-core-host: WARNING: no stream.ingress_keys (development profile only): \
-             feeds on the socket are taken unsigned (F-038 §5)"
+            "aledgent-core-host: no stream.ingress_keys: the legacy socket link, unsequenced \
+             inputs taken as before F-038 (§12 step 0); feeds on the socket are taken unsigned"
         );
     }
     if dir.join(core_archive::RESTORE_FILE).exists() {

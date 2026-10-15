@@ -678,3 +678,204 @@ async fn t_038_03_a_row_once_ambiguous_keeps_its_feed_sequence() {
         );
     }
 }
+
+/// The in-process core behind a feed cut short by a hand-over: armed, it runs one feed and never
+/// answers it (its feeder is killed meanwhile); then it holds the next feed until released and
+/// answers it `Unavailable`; then it answers as the in-process core does. Every feed's sequences
+/// and input keys are recorded.
+#[derive(Clone)]
+struct Handover {
+    inner: TestCore,
+    fed: Arc<Mutex<Vec<Fed>>>,
+    /// 0: answer; 1: run, then never answer; 2: hold, then answer unavailable.
+    step: Arc<std::sync::atomic::AtomicU8>,
+    ran: Arc<AtomicBool>,
+    holding: Arc<AtomicBool>,
+    release: Arc<AtomicBool>,
+    /// Which recorded feed ran unanswered.
+    armed: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Core for Handover {
+    async fn apply(&self, input: &CoreInput) -> Result<CoreReply, CoreError> {
+        self.inner.apply(input).await
+    }
+
+    async fn feed(&self, feed: &ingress::feed::Feed) -> ingress::feed::FeedReply {
+        use ingress::feed::FeedReply;
+        let inputs = feed.inputs().unwrap();
+        self.fed.lock().unwrap().push(
+            feed.items
+                .iter()
+                .zip(&inputs)
+                .map(|(f, i)| (f.seq, i.key))
+                .collect(),
+        );
+        match self.step.load(Ordering::SeqCst) {
+            1 => {
+                self.armed
+                    .store(self.fed.lock().unwrap().len() - 1, Ordering::SeqCst);
+                let _ = self.inner.apply_batch(&inputs).await;
+                self.step.store(2, Ordering::SeqCst);
+                self.ran.store(true, Ordering::SeqCst);
+                // The link failed after the core ran it: no answer ever reaches this feeder.
+                std::future::pending::<FeedReply>().await
+            }
+            2 => {
+                self.holding.store(true, Ordering::SeqCst);
+                while !self.release.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                self.step.store(0, Ordering::SeqCst);
+                FeedReply::Unavailable
+            }
+            _ => FeedReply::Answers {
+                answers: self
+                    .inner
+                    .apply_batch(&inputs)
+                    .await
+                    .into_iter()
+                    .map(ingress::remote::BatchAnswer::of)
+                    .collect(),
+            },
+        }
+    }
+
+    async fn outbox(
+        &self,
+        cursor: Option<&str>,
+        undelivered: bool,
+        now: Time,
+    ) -> Result<OutboxPage, CoreError> {
+        self.inner.outbox(cursor, undelivered, now).await
+    }
+
+    async fn last_tick(&self) -> Result<Option<Time>, CoreError> {
+        self.inner.last_tick().await
+    }
+
+    async fn query(
+        &self,
+        caller: &CallerBody,
+        query: &Query,
+        now: Time,
+    ) -> Result<QueryReply, CoreError> {
+        self.inner.query(caller, query, now).await
+    }
+
+    async fn credential(&self, credential: &str) -> Result<Option<CredentialBody>, CoreError> {
+        self.inner.credential(credential).await
+    }
+
+    async fn party_of(&self, principal: &str) -> Result<Option<String>, CoreError> {
+        self.inner.party_of(principal).await
+    }
+}
+
+/// `T-038-03` (`F-038` §3, `REQ-CS-7`, `INV-18`), the review's finding F4: a row an earlier feeder
+/// sent (it carries a feed sequence, and the core ran it) is in flight for the feeder that takes
+/// the lease over, even before any answer of its own says so. When that feeder's first round is
+/// answered unavailable, the row keeps its sequence and is sent again at it; a reservation logged
+/// meanwhile cannot take the sequence ahead of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn t_038_03_a_row_an_earlier_feeder_sent_keeps_its_feed_sequence() {
+    let journal = MemJournal::new();
+    let inner = InProcessCore::in_memory(genesis(T0), journal.clone()).with_clerk(test_clerk());
+    inner.start().unwrap();
+    let founded = inner.founded().unwrap();
+    let core = Handover {
+        inner,
+        fed: Arc::default(),
+        step: Arc::default(),
+        ran: Arc::default(),
+        holding: Arc::default(),
+        release: Arc::default(),
+        armed: Arc::default(),
+    };
+    let mut d = Deployment::assemble(
+        MemStore::new(Duration::from_millis(50)),
+        fast_config("ingress-0"),
+        core.clone(),
+        founded,
+        journal,
+    )
+    .await;
+    let alice = d.party("alice", 10_000).await;
+    let bob = d.party("bob", 0).await;
+    d.drive_ticks();
+    assert!(d.quiesce(Duration::from_secs(30)).await);
+    core.step.store(1, Ordering::SeqCst);
+    let (s, r) = d
+        .call(
+            "POST",
+            "/v1/transfers",
+            Some(&alice.token),
+            &[("client-key", "sent-before")],
+            Some(json!({ "legs": [{ "from": alice.account, "to": bob.account, "asset": USD, "amount": "1" }] })),
+        )
+        .await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{r}");
+    let start = Instant::now();
+    while !core.ran.load(Ordering::SeqCst) {
+        assert!(start.elapsed() < Duration::from_secs(10), "the first feed");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    // The feeder dies with its feed unanswered; another replica takes the lease once it lapses.
+    d.replica.kill();
+    let mut next = fast_config("ingress-1");
+    // No tick of its own within the test: the rows fed are the test's.
+    next.tick_interval = Duration::from_secs(3_600);
+    let (_next, surface) = d.replica_on(d.store.clone(), next);
+    let start = Instant::now();
+    while !core.holding.load(Ordering::SeqCst) {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the new feeder's first round"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    // While that round is in flight, a reservation is logged: reservations go first
+    // (`T-009-04`), but not ahead of a row that may have run.
+    let (s, r) = ingress::testkit::call(
+        &surface,
+        "POST",
+        "/v1/reservations",
+        Some(&alice.token),
+        &[],
+        Some(json!({ "payer": alice.account, "asset": USD, "amount": "1" })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{r}");
+    core.release.store(true, Ordering::SeqCst);
+    assert!(
+        d.quiesce(Duration::from_secs(30)).await,
+        "every row decided"
+    );
+    let fed = core.fed.lock().unwrap().clone();
+    let mut seq_of: std::collections::HashMap<InputKey, u64> = Default::default();
+    for (seq, key) in fed.iter().flatten() {
+        assert_eq!(
+            *seq_of.entry(*key).or_insert(*seq),
+            *seq,
+            "an input fed at two sequences: a row an earlier feeder sent gave its sequence back \
+             ({fed:?})"
+        );
+    }
+    // The rows the earlier feeder sent are decided before the reservation.
+    let sent: Vec<InputKey> = fed[core.armed.load(Ordering::SeqCst)]
+        .iter()
+        .map(|(_, k)| *k)
+        .collect();
+    let rows = d.store.rows().await.unwrap();
+    let reserved = rows
+        .iter()
+        .find(|r| r.new.reserves)
+        .and_then(|r| r.core_input_seq)
+        .unwrap();
+    for r in rows.iter().filter(|r| sent.contains(&r.new.op_ref)) {
+        assert!(
+            r.core_input_seq.unwrap() < reserved,
+            "a row an earlier feeder sent is decided first"
+        );
+    }
+}

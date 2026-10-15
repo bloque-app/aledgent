@@ -26,10 +26,12 @@
 //!
 //! A sequencer with [`FeedKeys`] refuses every unsequenced apply from the moment it exists: an
 //! unsigned input never reaches the core, before any feed or after a restart. Without keys (the
-//! development profile only: production refuses to start without them,
-//! [`crate::config::DeploymentConfig::core_feed_keys`]) it refuses them once it has taken a feed,
-//! so an ingress of an earlier release cannot slip an input in out of order while a rollout is
-//! mixed (`F-038` §4).
+//! development profile, or a production host that serves the legacy socket link alone, with no
+//! `stream.dial`: a production host dialing the new link refuses to start without them,
+//! [`crate::config::DeploymentConfig::core_feed_keys`]) it takes unsequenced inputs as a host of
+//! an earlier release does (`F-038` §12 step 0), and refuses them once it has taken a feed, so an
+//! ingress of an earlier release cannot slip an input in out of order while a rollout is mixed
+//! (`F-038` §4).
 
 use std::collections::HashMap;
 use std::sync::Arc;

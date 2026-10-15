@@ -31,6 +31,13 @@
 //! is configured (`DEC-27` (f)). Leadership (the ticker and the delivery worker) is taken only with
 //! a core too, since delivery pages the outbox through it.
 //!
+//! **The legacy link** ([`ForwardLink::Legacy`], `F-038` §12 step 0). A deployment whose new link
+//! is not configured (no `stream` section) forwards exactly as before `F-038`: leadership alone
+//! gates the forwarder, rows are marked forwarded and handed to the core as
+//! [`Core::apply_batch`], with no feed lease, no feed sequence and no signature. A core host of an
+//! earlier release knows nothing else, so a running deployment keeps working when ingress is
+//! released before its core host is rebuilt.
+//!
 //! **The drain** ([`Replica::drain`], `DEC-27` (e)): no new feed, the one in flight finished, the
 //! lease released and leadership resigned, so another replica takes them at its next renewal.
 //!
@@ -117,6 +124,22 @@ pub struct Config {
     /// `None`: unsigned, for a core no link separates from ingress, or a socket link whose host
     /// has no `stream.ingress_keys` yet.
     pub feed_signer: Option<SharedFeedSigner>,
+    /// How the forwarder reaches the core (`F-038` §12): the sequenced feed under the feed lease,
+    /// or the legacy link of a core host that predates it. [`ForwardLink::Legacy`] by default.
+    pub link: ForwardLink,
+}
+
+/// How the forwarder hands rows to the core (`F-038` §12, the transition).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ForwardLink {
+    /// As before `F-038`: under leadership, [`Core::apply_batch`], no feed lease, no feed
+    /// sequence, no signature. What a core host of an earlier release speaks; the default for a
+    /// deployment that configures no `stream` section.
+    #[default]
+    Legacy,
+    /// The sequenced feed (`DEC-27` (d), (f)): under the feed lease, every row at its feed
+    /// sequence, signed when a feed key is configured ([`Core::feed`]).
+    Sequenced,
 }
 
 /// A feed signer shared by a replica's parts. Never formatted.
@@ -154,6 +177,7 @@ impl Default for Config {
             genesis_gate: false,
             archived: Arc::default(),
             feed_signer: None,
+            link: ForwardLink::Legacy,
         }
     }
 }
@@ -588,6 +612,11 @@ async fn leadership<S: Store, C: Core>(shared: Arc<Shared<S, C>>) {
             tracing::info!(replica = %replica, "leading");
             shared.wake.notify_one();
         }
+        if shared.config.link == ForwardLink::Legacy {
+            // F-038 §12 step 0: no feed lease; leadership alone gates the forwarder, as before.
+            tokio::time::sleep(every).await;
+            continue;
+        }
         let epoch = if can {
             match shared
                 .store
@@ -620,8 +649,14 @@ async fn leadership<S: Store, C: Core>(shared: Arc<Shared<S, C>>) {
 async fn forwarder<S: Store, C: Core>(shared: Arc<Shared<S, C>>) {
     let mut wait = shared.config.retry_base;
     loop {
-        // F-038: the forwarder feeds under the feed lease, and starts nothing while draining.
-        let Some(epoch) = shared.feeds().filter(|_| !shared.draining()) else {
+        // F-038: the forwarder feeds under the feed lease, and starts nothing while draining. On
+        // the legacy link (`F-038` §12 step 0), leadership alone gates it, as before.
+        // `epoch` is `None` on the legacy link.
+        let may = match shared.config.link {
+            ForwardLink::Sequenced => shared.feeds().map(Some),
+            ForwardLink::Legacy => shared.leads().then_some(None),
+        };
+        let Some(epoch) = may.filter(|_| !shared.draining()) else {
             tokio::time::sleep(shared.config.poll).await;
             continue;
         };
@@ -652,7 +687,10 @@ async fn forwarder<S: Store, C: Core>(shared: Arc<Shared<S, C>>) {
             continue;
         }
         shared.forwarding.store(true, Ordering::SeqCst);
-        let fed = forward(&shared, epoch, rows, &mut wait).await;
+        let fed = match epoch {
+            Some(epoch) => forward(&shared, epoch, rows, &mut wait).await,
+            None => forward_legacy(&shared, rows, &mut wait).await,
+        };
         shared.forwarding.store(false, Ordering::SeqCst);
         if let Err(e) = fed {
             tracing::warn!(error = %e, "forwarding stopped; it resumes from the log");
@@ -661,12 +699,84 @@ async fn forwarder<S: Store, C: Core>(shared: Arc<Shared<S, C>>) {
     }
 }
 
-/// Forward `rows`, in order (module documentation): mark them forwarded, hand them to the core,
-/// and decide the prefix it answered. A row the core may have run (its answer was ambiguous) is
+/// Forward `rows` on the legacy link (`F-038` §12 step 0), exactly as before `F-038`: mark them
+/// forwarded, hand them to the core as [`Core::apply_batch`], and decide the prefix it answered.
+/// A row the core may have run (its answer was ambiguous) is in flight: it, and every row before
+/// it, is retried with backoff until answered. The rows after the last one in flight certainly did
+/// not run; they go back to the queue, which is read again, so a reservation logged meanwhile goes
+/// before them. `wait` is the backoff, kept across calls.
+async fn forward_legacy<S: Store, C: Core>(
+    shared: &Shared<S, C>,
+    rows: Vec<Row>,
+    wait: &mut std::time::Duration,
+) -> Result<(), String> {
+    let mut marked = Vec::with_capacity(rows.len());
+    let mut inputs = Vec::with_capacity(rows.len());
+    // One commit for the batch's marks (stress finding F13: two commits per input).
+    let keys: Vec<InputKey> = rows.iter().map(|r| r.new.op_ref).collect();
+    let rows = shared
+        .store
+        .mark_forwarded_many(&keys, shared.clock.now())
+        .await
+        .map_err(|e| e.to_string())?;
+    for row in rows {
+        // A row that does not make an input stops the batch there: the rows before it go on.
+        match input_of(&row) {
+            Ok(input) => inputs.push(input),
+            Err(e) if marked.is_empty() => return Err(e),
+            Err(_) => break,
+        }
+        marked.push(row);
+    }
+    let mut from = 0;
+    loop {
+        if !shared.leads() {
+            return Err("leadership lost".into());
+        }
+        let answers = shared.core.apply_batch(&inputs[from..]).await;
+        let in_flight = answers
+            .iter()
+            .rposition(|a| *a == Err(CoreError::Ambiguous))
+            .map_or(0, |i| from + i + 1);
+        let mut replies = Vec::new();
+        for answer in answers {
+            let Ok(reply) = answer else { break };
+            replies.push(reply);
+        }
+        let decided = replies.len();
+        decide(
+            shared,
+            &marked[from..from + decided],
+            &inputs[from..from + decided],
+            &replies,
+        )
+        .await?;
+        from += decided;
+        // Done, or progress with nothing in flight: the rows after the decided prefix certainly
+        // did not run (a core answers past what one invocation carries as `Unavailable`), and go
+        // back to the queue at once, without a backoff (`T-031-18`).
+        if from == inputs.len() || (decided > 0 && in_flight <= from) {
+            *wait = shared.config.retry_base;
+            return Ok(());
+        }
+        Metrics::inc(&shared.metrics.forward_retries);
+        tokio::time::sleep(*wait).await;
+        *wait = (*wait * 2).min(shared.config.retry_max);
+        if in_flight <= from {
+            return Ok(());
+        }
+        inputs.truncate(in_flight);
+        marked.truncate(in_flight);
+    }
+}
+
+/// Forward `rows` as a sequenced feed, in order (module documentation): mark them fed under the
+/// lease's `epoch`, hand them to the core, and decide the prefix it answered. A row the core may
+/// have run (its answer was ambiguous, or it arrived with a feed sequence from an earlier send) is
 /// in flight: it, and every row before it, is retried with backoff until answered, as one row was
-/// before batches. The rows after the last one in flight certainly did not run; they go back to
-/// the queue, which is read again, so a reservation logged meanwhile goes before them. `wait` is
-/// the backoff, kept across calls.
+/// before batches. The rows after the last one in flight certainly did not run; they give back
+/// their sequences and go back to the queue, which is read again, so a reservation logged
+/// meanwhile goes before them. `wait` is the backoff, kept across calls.
 async fn forward<S: Store, C: Core>(
     shared: &Shared<S, C>,
     epoch: u64,
@@ -679,6 +789,13 @@ async fn forward<S: Store, C: Core>(
     // One commit for the batch's marks (stress finding F13: two commits per input), and their feed
     // sequences under the lease (`F-038`).
     let keys: Vec<InputKey> = rows.iter().map(|r| r.new.op_ref).collect();
+    // Rows that arrive already carrying a feed sequence were sent before, by an earlier call or an
+    // earlier feeder, and may have run: they count as ambiguous from the start (`F-038` §3).
+    let carried: std::collections::HashSet<InputKey> = rows
+        .iter()
+        .filter(|r| r.feed_seq.is_some())
+        .map(|r| r.new.op_ref)
+        .collect();
     let rows = match shared
         .store
         .mark_fed(
@@ -718,8 +835,12 @@ async fn forward<S: Store, C: Core>(
     let mut from = 0;
     // Past the last row any round answered ambiguous: it, and every row before it, may have run,
     // whatever a later round answers (`F-038` §3). An ambiguous row answered unavailable next
-    // still keeps its sequence; only the rows from here on are ever given back.
-    let mut ambiguous_to = 0;
+    // still keeps its sequence; only the rows from here on are ever given back. It starts past the
+    // last row that arrived with a sequence: one sent before this call may have run.
+    let mut ambiguous_to = marked
+        .iter()
+        .rposition(|r| carried.contains(&r.new.op_ref))
+        .map_or(0, |i| i + 1);
     loop {
         if shared.feeds() != Some(epoch) {
             return Err("the feed lease moved".into());
@@ -1209,7 +1330,9 @@ pub async fn drain<S: Store, C: Core>(shared: &Shared<S, C>, within: Duration) {
     }
     shared.feed_epoch.store(0, Ordering::SeqCst);
     let replica = &shared.config.replica;
-    if let Err(e) = shared.store.release_feed(BOOK, replica).await {
+    if shared.config.link == ForwardLink::Sequenced
+        && let Err(e) = shared.store.release_feed(BOOK, replica).await
+    {
         tracing::warn!(error = %e, "the feed lease was not released; it expires instead");
     }
     let _ = shared.store.resign(replica).await;

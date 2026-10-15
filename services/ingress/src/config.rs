@@ -804,18 +804,24 @@ pub struct ArchivedIdentifiers {
 
 impl DeploymentConfig {
     /// The keys the core host checks ingress's feeds against (`F-038` §5, `DEC-27` (f)), on every
-    /// link it serves. In production they are required, and the host refuses to start without
-    /// them: a host with keys takes no unsigned or unsequenced input from the moment it starts
-    /// ([`crate::feed::Sequencer`]). Only the development profile may run without them.
+    /// link it serves. A host with keys takes no unsigned or unsequenced input from the moment it
+    /// starts ([`crate::feed::Sequencer`]). In production they are required once the host dials
+    /// the new link (`stream.dial`), and it refuses to start without them. A production host
+    /// without `stream.dial` and without keys serves the legacy socket link alone (`F-038` §12
+    /// step 0): it takes the unsequenced inputs of an ingress of an earlier release, exactly as a
+    /// host of that release does, so the next core host build still runs against a legacy ingress
+    /// during the transition.
     pub fn core_feed_keys(&self) -> Result<Option<crate::feed::FeedKeys>, String> {
         let keys = match &self.stream {
             Some(s) => s.ingress_keys()?,
             None => None,
         };
-        if keys.is_none() && self.profile == Profile::Production {
+        let dials = self.stream.as_ref().is_some_and(|s| s.dial.is_some());
+        if keys.is_none() && self.profile == Profile::Production && dials {
             return Err(
-                "stream.ingress_keys is required in production: the core host takes no unsigned \
-                 input (F-038 §5); configure them with ingress's stream.feed_key"
+                "stream.dial in production needs stream.ingress_keys: the core host takes no \
+                 unsigned input on the new link (F-038 §5); configure them with ingress's \
+                 stream.feed_key"
                     .into(),
             );
         }
@@ -823,15 +829,23 @@ impl DeploymentConfig {
     }
 
     /// Check that ingress signs what it forwards to a core in another process (`F-038` §5, §12):
-    /// in production, an ingress with `core_endpoint` needs `stream.feed_key`, as one with
-    /// `stream.listen` does ([`StreamSection::check`]), since the core host refuses unsigned
-    /// inputs there.
+    /// in production, an ingress on `core_endpoint` with the new link configured (a `stream`
+    /// section, [`DeploymentConfig::forward_link`]) needs `stream.feed_key`, as one with
+    /// `stream.listen` does ([`StreamSection::check`]), since the core host with keys refuses
+    /// unsigned inputs. Without a `stream` section ingress forwards on the legacy link, which
+    /// carries no feed and no signature, and needs no feed key (`F-038` §12 step 0).
     pub fn check_forward_signing(&self) -> Result<(), String> {
         let signs = self.stream.as_ref().is_some_and(|s| s.feed_key.is_some());
-        if self.profile == Profile::Production && self.core_endpoint.is_some() && !signs {
+        let sequenced = self.forward_link() == crate::service::ForwardLink::Sequenced;
+        if self.profile == Profile::Production
+            && self.core_endpoint.is_some()
+            && sequenced
+            && !signs
+        {
             return Err(
-                "core_endpoint in production needs stream.feed_key: every forwarded command is \
-                 signed, and the core host refuses unsigned ones (F-038 §5)"
+                "core_endpoint in production with a stream section needs stream.feed_key: every \
+                 command forwarded on the new link is signed, and the core host refuses unsigned \
+                 ones (F-038 §5)"
                     .into(),
             );
         }
@@ -1063,7 +1077,20 @@ impl DeploymentConfig {
                 .max(1),
             // T-036-25: a chainspec book takes commands only once its core says so.
             genesis_gate: self.genesis.chainspec.is_some(),
+            link: self.forward_link(),
             ..Config::default()
+        }
+    }
+
+    /// How ingress forwards to its core (`F-038` §12): the sequenced feed once the new link is
+    /// configured (a `stream` section: a listener, a feed key, or the keys the core host checks),
+    /// and otherwise the legacy link, exactly as before `F-038`, which a core host of an earlier
+    /// release speaks.
+    pub fn forward_link(&self) -> crate::service::ForwardLink {
+        if self.stream.is_some() {
+            crate::service::ForwardLink::Sequenced
+        } else {
+            crate::service::ForwardLink::Legacy
         }
     }
 }
@@ -1195,9 +1222,11 @@ mod tests {
         assert!(bad.check(Profile::Development).is_err());
     }
 
-    /// `T-038-14`, `DEC-27` (f): in production the core host refuses to start without
-    /// `stream.ingress_keys`, and an ingress forwarding over `core_endpoint` without
-    /// `stream.feed_key`; the development profile may run without either.
+    /// `T-038-14`, `DEC-27` (f), `F-038` §12: in production, once the new link is configured, the
+    /// core host refuses to dial it without `stream.ingress_keys`, and an ingress forwarding over
+    /// `core_endpoint` refuses to start without `stream.feed_key`; with no `stream` section both
+    /// run the legacy socket link, as before `F-038`; the development profile may run without
+    /// either.
     #[test]
     fn t_038_14_production_requires_the_feed_keys_on_both_sides() {
         use crate::feed::FeedSigner as _;
@@ -1221,11 +1250,38 @@ mod tests {
             "signer": { "socket": "/run/signer.sock", "client": "ingress", "token_file": "/t" },
             "key": "ingress-feed",
         });
+        // No stream section: the legacy socket link on both sides (`F-038` §12 step 0), which
+        // neither signs nor checks, as before `F-038`.
         let none = with("production", None);
-        assert!(none.core_feed_keys().is_err(), "no keys, no host");
         assert!(
-            none.check_forward_signing().is_err(),
-            "no feed key, no ingress"
+            none.core_feed_keys().unwrap().is_none(),
+            "a legacy host starts"
+        );
+        assert!(
+            none.check_forward_signing().is_ok(),
+            "a legacy ingress starts"
+        );
+        assert_eq!(none.forward_link(), crate::service::ForwardLink::Legacy);
+        // The new link configured: the keys on both sides.
+        let unsigned = with(
+            "production",
+            Some(serde_json::json!({ "ingress_keys": [key] })),
+        );
+        assert_eq!(
+            unsigned.forward_link(),
+            crate::service::ForwardLink::Sequenced
+        );
+        assert!(
+            unsigned.check_forward_signing().is_err(),
+            "the new link without a feed key, no ingress"
+        );
+        let dialing = with(
+            "production",
+            Some(serde_json::json!({ "dial": { "connect": ["unix:/s"], "peer_uids": [1000] } })),
+        );
+        assert!(
+            dialing.core_feed_keys().is_err(),
+            "a dialer without keys, no host"
         );
         let both = with(
             "production",

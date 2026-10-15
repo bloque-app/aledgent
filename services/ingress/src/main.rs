@@ -35,7 +35,11 @@
 //!
 //! With `core_endpoint` set, the core is the core Agent's host (`F-005`, `aledgent-core-host
 //! serve`), reached over a local socket ([`ingress::remote`]); the core's root and clerk key are
-//! then that process's, and ingress reads neither.
+//! then that process's, and ingress reads neither. Without a `stream` section that link is the
+//! legacy one (`F-038` §12 step 0): rows go as `apply_batch`, exactly as before `F-038`, with no
+//! feed, feed lease, roster or signature, so a core host of an earlier release keeps deciding.
+//! A `stream` section switches it to the sequenced feed, signed with `stream.feed_key`. A start-up
+//! log line names the link in use.
 //!
 //! With `stream.listen` set (`F-038`, `DEC-27`), ingress runs apart from every core: it listens
 //! for the core hosts that dial out to it ([`ingress::stream`]), acknowledges with no core
@@ -56,7 +60,7 @@ use ingress::config::{
 };
 use ingress::inprocess::{BOOK_CACHE_BYTES, FileJournal, InProcessCore};
 use ingress::remote::{Endpoint, LinkToken, RemoteCore};
-use ingress::service::SharedFeedSigner;
+use ingress::service::{ForwardLink, SharedFeedSigner};
 use ingress::store::Store;
 use ingress::store::pg::{PgOptions, PgStore};
 use ingress::stream::StreamCore;
@@ -149,13 +153,43 @@ fn health(args: &[String]) -> Result<(), String> {
 /// through the core Agent takes seconds today (`notes/MEASUREMENTS-F005.md`).
 const REMOTE_CORE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Say, once at start, which link forwards to the core (`F-038` §12): the operator reads from the
+/// log alone whether this instance speaks the new link or the legacy one.
+fn log_link(c: &DeploymentConfig) {
+    let listen = c.stream.as_ref().and_then(|s| s.listen.as_deref());
+    let signed = c
+        .stream
+        .as_ref()
+        .is_some_and(|s| s.feed_key.is_some() || s.development_feed_key.is_some());
+    match (listen, c.forward_link(), c.core_endpoint.as_deref()) {
+        (Some(listen), _, _) => tracing::info!(
+            listen,
+            signed,
+            "core link: the core stream (F-038): a sequenced feed under the feed lease, the roster"
+        ),
+        (None, ForwardLink::Sequenced, Some(endpoint)) => tracing::info!(
+            endpoint,
+            signed,
+            "core link: the socket with the sequenced feed (F-038 §12): under the feed lease"
+        ),
+        (None, ForwardLink::Legacy, Some(endpoint)) => tracing::info!(
+            endpoint,
+            "core link: legacy socket (F-038 §12 step 0): apply and apply_batch as before F-038, \
+             no feed, no feed lease, no roster, no signature; a stream section switches it"
+        ),
+        (None, link, None) => tracing::info!(?link, "core link: the in-process core"),
+    }
+}
+
 async fn serve(args: &[String]) -> Result<(), String> {
     let c = config(args)?;
     if let Some(s) = &c.stream {
         s.check(c.profile)?;
     }
-    // F-038 §5, §12: in production, what goes to a core in another process is signed.
+    // F-038 §5, §12: in production, what goes to a core in another process on the new link is
+    // signed; the legacy socket link (no `stream` section) neither signs nor needs a feed key.
     c.check_forward_signing()?;
+    log_link(&c);
     let store = connect(&c).await?;
     // F-038: the stream, when ingress listens for cores; the socket link otherwise.
     if let Some(s) = c.stream.clone().filter(|s| s.listen.is_some()) {
