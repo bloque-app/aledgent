@@ -1016,6 +1016,18 @@ the writer of its own partitions. *Decision:*
   profile), cached at most `NFR-20` old, and the queries it serves. Those reads go up the stream the core
   host that holds the principals role (or the queried state) opened, and their answers come back down it,
   as commands do. No core is ever dialed for a read either.
+- **(e″) Ingress authenticates while no core answers.** Ingress keeps, in its own database, a durable copy
+  of the verifiers it last read from the book for the schemes it checks: an API key's hash (`api-key`) and a
+  passkey's public key, credential handle, `rpId` and backup flag (`webauthn-es256`). Public material only
+  (`REQ-AU-8`). It refreshes an entry on every read the book answers, as the cache does today, and falls back
+  to the copy only when no core answers. A proof is checked against a verifier the book admitted, never
+  accepted for its form alone: an unknown API key, or an assertion from a passkey the book never admitted,
+  fails as it does today. The copy only lets ingress acknowledge. The core still checks, at decision, that
+  the credential is in its identity's set and covers what it asks (`REQ-AU-3`, `REQ-AU-20`), so a credential
+  removed while no core answered is acknowledged and then refused under its named condition. No credential
+  joins a set while no core answers: that is a decision of the book. `key` proofs (reclaims, recovery
+  approvals) are verified by the core, so they need no copy. Configured service tokens and passkey sessions
+  already authenticate without the core.
 - **(f) Ingress signs what it forwards.** Each command carries ingress's signature over its received row
   (through the signer, `F-035`), and the core host checks it before the Agent sees the input. mTLS says
   which peer is connected; the signature says the command is the one ingress recorded.
