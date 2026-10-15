@@ -5,13 +5,14 @@
 //! The forwarder sends rows to the core as a [`Feed`]: the partition it feeds, the **epoch** of
 //! the feed lease it holds (`crate::store::Store::try_feed`), and each row's core input with its
 //! **feed sequence**, gapless per partition and fixed the first time the row is sent. Each item
-//! carries ingress's Ed25519 signature over [`message`], made through the signer service
-//! (`F-035`) by a [`FeedSigner`].
+//! carries ingress's Ed25519 signature over [`message`] (the partition, the epoch, the sequence
+//! and the input), made through the signer service (`F-035`) by a [`FeedSigner`].
 //!
 //! The core host answers a feed through a [`Sequencer`] in front of its core, on every link it
 //! serves (the Unix socket and the stream alike):
 //!
-//! 1. every item's signature is checked against the configured [`FeedKeys`]; a missing or wrong
+//! 1. every item's signature is checked against the configured [`FeedKeys`], over the feed's
+//!    epoch as well, so a captured item replayed under another epoch fails it; a missing or wrong
 //!    one refuses the whole feed, and nothing in it reaches the core;
 //! 2. an epoch below the highest seen for the partition is **fenced**: nothing runs; a higher one
 //!    is adopted, and its first sequence becomes the one expected (a new feeder resends from its
@@ -21,8 +22,12 @@
 //!    [`Sequencer::hold`] for the gap to fill, then refused with the sequence expected;
 //! 4. the rest go to the core as one batch ([`Core::apply_batch`], `T-031-04`).
 //!
-//! Once a sequencer has taken a feed it refuses unsequenced applies: an ingress of an earlier
-//! release cannot slip an input in out of order while a rollout is mixed (`F-038` §4).
+//! A sequencer with [`FeedKeys`] refuses every unsequenced apply from the moment it exists: an
+//! unsigned input never reaches the core, before any feed or after a restart. Without keys (the
+//! development profile only: production refuses to start without them,
+//! [`crate::config::DeploymentConfig::core_feed_keys`]) it refuses them once it has taken a feed,
+//! so an ingress of an earlier release cannot slip an input in out of order while a rollout is
+//! mixed (`F-038` §4).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -116,12 +121,15 @@ impl FeedReply {
 }
 
 /// What ingress signs for one item: SHA-256 over the domain, the partition (its length, four bytes
-/// big endian, then its bytes), the sequence (eight bytes big endian) and the input's bytes.
-pub fn message(partition: &str, seq: u64, input: &[u8]) -> [u8; 32] {
+/// big endian, then its bytes), the feed lease's epoch and the sequence (eight bytes big endian
+/// each) and the input's bytes. The epoch is signed so that a captured item cannot be replayed
+/// under a higher epoch to fence the real feeder (the feeds are signed afresh on every send).
+pub fn message(partition: &str, epoch: u64, seq: u64, input: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(FEED_DOMAIN);
     h.update((partition.len() as u32).to_be_bytes());
     h.update(partition.as_bytes());
+    h.update(epoch.to_be_bytes());
     h.update(seq.to_be_bytes());
     h.update(input);
     h.finalize().into()
@@ -264,6 +272,7 @@ impl Feed {
                 let signature = match signer {
                     Some(s) => Some(hex::encode(s.sign(&message(
                         partition,
+                        epoch,
                         *seq,
                         json.as_bytes(),
                     ))?)),
@@ -324,9 +333,10 @@ pub struct Sequencer<C> {
 }
 
 impl<C: Core> Sequencer<C> {
-    /// A sequencer over `core`, checking every item against `keys`. `None` takes unsigned feeds:
-    /// a socket link of a deployment that has not configured `stream.ingress_keys` yet (the stream
-    /// always configures them).
+    /// A sequencer over `core`, checking every item against `keys`; with them, it refuses every
+    /// unsequenced apply from the start. `None` takes unsigned feeds, and unsequenced applies
+    /// until the first feed: the development profile only (production refuses to start without
+    /// `stream.ingress_keys`, `F-038` §5).
     pub fn new(core: C, keys: Option<FeedKeys>) -> Sequencer<C> {
         Sequencer {
             core,
@@ -366,7 +376,7 @@ impl<C: Core> Sequencer<C> {
         }
         if let Some(keys) = &self.keys {
             for f in &feed.items {
-                let msg = message(&feed.partition, f.seq, f.input.as_bytes());
+                let msg = message(&feed.partition, feed.epoch, f.seq, f.input.as_bytes());
                 if !keys.verifies(&msg, f.signature.as_deref()) {
                     tracing::error!(
                         partition = %feed.partition,
@@ -421,8 +431,11 @@ impl<C: Core> Sequencer<C> {
         }
     }
 
+    /// Whether an unsequenced apply is refused: always with keys (an unsigned input never reaches
+    /// the core, whatever this process has seen since it started), and without them once a feed
+    /// was taken.
     fn refuses_unsequenced(&self) -> bool {
-        self.sequenced.load(Ordering::Acquire)
+        self.keys.is_some() || self.sequenced.load(Ordering::Acquire)
     }
 }
 
@@ -697,24 +710,73 @@ mod tests {
         assert_eq!(seq.core().ran(), vec![1, 2, 3]);
     }
 
-    /// `T-038-15`: once a sequencer has taken a feed, an unsequenced apply (an ingress of an
-    /// earlier release, mid-rollout) is refused as unavailable and runs nothing.
+    /// `T-038-04`, `T-038-15` (`DEC-27` (f)): a sequencer with ingress's keys refuses every
+    /// unsequenced apply from the moment it exists, before any feed was seen, and again after a
+    /// restart (a new sequencer over the same core): nothing unsigned reaches the core.
     #[tokio::test]
-    async fn t_038_15_unsequenced_applies_are_refused_once_a_feed_was_taken() {
+    async fn dec_27_f_a_host_with_keys_refuses_unsequenced_applies_from_the_start() {
         let (seq, k) = sequencer();
+        assert_eq!(seq.apply(&tick(1)).await, Err(CoreError::Unavailable));
+        assert_eq!(
+            seq.apply_batch(&[tick(1)]).await,
+            vec![Err(CoreError::Unavailable)]
+        );
+        assert!(seq.core().ran().is_empty(), "nothing ran before any feed");
+        assert_eq!(
+            answered(&seq.feed(&feed(1, 1, &[2], Some(&k))).await),
+            vec![1]
+        );
+        assert_eq!(seq.apply(&tick(3)).await, Err(CoreError::Unavailable));
+        // The host restarts: its sequencer is new, the core the same.
+        let keys = FeedKeys::of(&[k.public()]).unwrap();
+        let restarted = Sequencer::new(Arc::clone(seq.core()), Some(keys));
+        assert_eq!(restarted.apply(&tick(4)).await, Err(CoreError::Unavailable));
+        assert_eq!(
+            restarted.apply_batch(&[tick(4)]).await,
+            vec![Err(CoreError::Unavailable)]
+        );
+        assert_eq!(restarted.core().ran(), vec![2], "only the signed feed ran");
+    }
+
+    /// `T-038-15`, the development profile only: a sequencer without keys takes unsequenced
+    /// applies until it has taken a feed, then refuses them as unavailable, running nothing.
+    #[tokio::test]
+    async fn t_038_15_without_keys_unsequenced_applies_are_refused_once_a_feed_was_taken() {
+        let seq = Sequencer::new(Arc::new(Counting::default()), None);
         assert!(
             seq.apply(&tick(1)).await.is_ok(),
             "before any feed: as before"
         );
-        assert_eq!(
-            answered(&seq.feed(&feed(1, 1, &[2], Some(&k))).await),
-            vec![2]
-        );
+        assert_eq!(answered(&seq.feed(&feed(1, 1, &[2], None)).await), vec![2]);
         assert_eq!(seq.apply(&tick(3)).await, Err(CoreError::Unavailable));
         assert_eq!(
             seq.apply_batch(&[tick(3)]).await,
             vec![Err(CoreError::Unavailable)]
         );
         assert_eq!(seq.core().ran(), vec![1, 2]);
+    }
+
+    /// `DEC-27` (d), (f): the epoch is under ingress's signature. A captured item replayed under
+    /// another epoch is refused whole, runs nothing, and does not move the sequencer's epoch: the
+    /// real feeder's next feed is taken, not fenced.
+    #[tokio::test]
+    async fn dec_27_f_a_tampered_epoch_is_refused() {
+        let (seq, k) = sequencer();
+        assert_eq!(
+            answered(&seq.feed(&feed(1, 1, &[1], Some(&k))).await),
+            vec![1]
+        );
+        let mut replayed = feed(1, 2, &[2], Some(&k));
+        replayed.epoch = u64::MAX;
+        assert!(matches!(
+            seq.feed(&replayed).await,
+            FeedReply::Refused { .. }
+        ));
+        assert_eq!(seq.core().ran(), vec![1], "nothing ran");
+        assert_eq!(
+            answered(&seq.feed(&feed(1, 2, &[2], Some(&k))).await),
+            vec![2],
+            "the real feeder is not fenced"
+        );
     }
 }

@@ -7,6 +7,12 @@
       "uids": ["<FILL-NUMBER the user id the core host's container runs as>"],
       "token_sha256": ["<FILL the SHA-256 of /etc/aledgent/core-signer.token: aledgent-signer token-sha256 <file>>"],
       "keys": ["keyring", "clerk", "agent-authority", "agent-package"]
+    },
+    {
+      "name": "ingress",
+      "uids": ["<FILL-NUMBER the user id ingress's container runs as>"],
+      "token_sha256": ["<FILL the SHA-256 of /etc/aledgent/ingress-signer.token: aledgent-signer token-sha256 <file>>"],
+      "keys": ["ingress-feed"]
     }
   ],
   "vault": {
@@ -24,6 +30,7 @@
     { "id": "keyring", "scheme": "key_ring", "source": { "vault": { "path": "secret/<core signer secret>", "field": "keyring" } } },
     { "id": "clerk", "scheme": "clerk", "source": { "vault": { "path": "secret/<core signer secret>", "field": "clerk" } } },
     { "id": "agent-authority", "scheme": "ed25519", "source": { "vault": { "path": "secret/<core signer secret>", "field": "agent-authority" } } },
-    { "id": "agent-package", "scheme": "ed25519", "source": { "vault": { "path": "secret/<core signer secret>", "field": "agent-package" } } }
+    { "id": "agent-package", "scheme": "ed25519", "source": { "vault": { "path": "secret/<core signer secret>", "field": "agent-package" } } },
+    { "id": "ingress-feed", "scheme": "ed25519", "source": { "vault": { "path": "secret/<core signer secret>", "field": "ingress-feed" } } }
   ]
 }

@@ -382,6 +382,7 @@ async fn t_038_02_only_an_authenticated_core_gets_a_stream() {
         });
         let dial = h.dial(vec![Target::Unix {
             path: path.clone(),
+            peer_uids: vec![my_uid()],
             token: ingress::remote::LinkToken::new(&presented).unwrap(),
         }]);
         if admitted {
@@ -392,6 +393,49 @@ async fn t_038_02_only_an_authenticated_core_gets_a_stream() {
         }
         dial.abort();
         serve.abort();
+    }
+    assert_eq!(h.inputs(), 0, "nothing ran");
+}
+
+/// This process's user id, from a socket pair's peer credentials.
+fn my_uid() -> u32 {
+    let (a, _b) = tokio::net::UnixStream::pair().unwrap();
+    a.peer_cred().unwrap().uid()
+}
+
+/// `T-038-02` (`DEC-27` (h′), `REQ-AU-8`): on a Unix socket the core host checks the peer's user
+/// id against ingress's before it sends its token. A socket served by a process of another user
+/// id (a path taken over) gets a connection and nothing on it: no hello, no token; ingress's own
+/// user id gets the hello.
+#[tokio::test(flavor = "multi_thread")]
+async fn t_038_02_the_core_host_sends_its_token_only_to_ingress_s_user_id() {
+    let h = host();
+    let dir = tempfile::tempdir().unwrap();
+    let secret = "ab".repeat(32);
+    let me = my_uid();
+    for (uids, sent) in [(vec![me.wrapping_add(1)], false), (vec![me], true)] {
+        let path = dir.path().join(format!("taken-{sent}.sock"));
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let dial = h.dial(vec![Target::Unix {
+            path,
+            peer_uids: uids.clone(),
+            token: ingress::remote::LinkToken::new(&secret).unwrap(),
+        }]);
+        let (mut s, _) = tokio::time::timeout(PATIENCE, listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut got = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_millis(500), s.read_to_end(&mut got)).await;
+        if sent {
+            assert!(
+                String::from_utf8_lossy(&got).contains(&secret),
+                "the hello carries the token"
+            );
+        } else {
+            assert!(got.is_empty(), "nothing sent to user ids {uids:?}");
+        }
+        dial.abort();
     }
     assert_eq!(h.inputs(), 0, "nothing ran");
 }
@@ -605,6 +649,103 @@ async fn dec_27_e_a_go_away_hands_the_feed_over_with_nothing_decided_twice_or_ou
         panic!("rows hold {numbers:?} against the core's {n} inputs");
     }
     decided_in_feed_order(&d.store).await;
+    dial.abort();
+}
+
+/// `DEC-27` (d), `T-038-04`: after a go-away hands the feed to another instance under a higher
+/// epoch, the old feeder's next item (a fresh input, signed with ingress's key, at the next sequence
+/// the old feeder would use) is refused `Fenced` by the core host's sequencer itself, and the
+/// Agent's core runs nothing. A fresh input is one the core's reply log cannot absorb as a replay:
+/// only the epoch fence stops it.
+#[tokio::test(flavor = "multi_thread")]
+async fn dec_27_d_a_fenced_feeder_is_refused_by_the_core_host_itself() {
+    use ingress::boundary::{CoreInput, InputBody, InputKey};
+    use ingress::clock::Clock as _;
+    use ingress::feed::{Feed, FeedReply};
+    // Replicas whose tickers stay quiet, so the core's input count moves only with the test.
+    let quiet = |name: &str| {
+        let mut c = config(name, ingress_key());
+        c.tick_interval = Duration::from_secs(365 * 86_400);
+        c
+    };
+    let a = instance("ingress-a").await;
+    let b = instance("ingress-b").await;
+    let lb = proxy(vec![a.addr, b.addr]).await;
+    let h = host();
+    let dial = h.dial(vec![target(lb.addr, "core")]);
+    let mut d = deployment(&h, &a, "ingress-a").await;
+    let alice = d.party("alice", 1_000).await;
+    let bob = d.party("bob", 0).await;
+    let (from, to) = (alice.account.clone().unwrap(), bob.account.clone().unwrap());
+    d.replica.kill();
+    let (ra, router_a) = d.replica_on(d.store.clone(), quiet("ingress-a2"));
+    d.replica = ra;
+    d.router = router_a;
+    until("a feeds again", || d.replica.shared.feeds().is_some()).await;
+    let (rb, router_b) = replica(&d, b.hub.clone(), quiet("ingress-b"));
+    let old = d.replica.shared.feeds().expect("a feeds");
+    let transfer_on = |router: Router, key: String| {
+        let (token, from, to) = (alice.token.clone(), from.clone(), to.clone());
+        async move {
+            let (s, v) = call(
+                &router,
+                "POST",
+                "/v1/transfers",
+                Some(&token),
+                &[("client-key", &key)],
+                Some(transfer(&from, &to)),
+            )
+            .await;
+            assert_eq!(s, StatusCode::ACCEPTED, "{v}");
+        }
+    };
+    for i in 0..5 {
+        transfer_on(d.router.clone(), format!("f-{i}")).await;
+    }
+    assert!(d.quiesce(PATIENCE).await, "a's rows decided");
+    // The next sequence the old feeder would give a row of its own.
+    let old_next = d
+        .store
+        .rows()
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|r| r.feed_seq)
+        .max()
+        .unwrap()
+        + 1;
+    ingress::service::drain(&d.replica.shared, Duration::from_secs(5)).await;
+    a.hub.go_away("release");
+    until("b feeds", || rb.shared.feeds().is_some()).await;
+    let new = rb.shared.feeds().unwrap();
+    assert!(new > old, "a new epoch");
+    for i in 5..10 {
+        transfer_on(router_b.clone(), format!("f-{i}")).await;
+    }
+    assert!(d.quiesce(PATIENCE).await, "b's rows decided");
+    assert!(
+        d.all_delivered(PATIENCE).await,
+        "every notification delivered"
+    );
+    assert!(d.quiesce(PATIENCE).await, "their records decided");
+    let inputs = h.inputs();
+    let fresh = CoreInput {
+        key: InputKey([0xEE; 16]),
+        body: InputBody::Tick { now: d.clock.now() },
+    };
+    let stale = Feed::build(
+        BOOK,
+        old,
+        &[(old_next, &fresh)],
+        Some(&ingress_key() as &dyn FeedSigner),
+    )
+    .unwrap();
+    assert_eq!(
+        h.seq.feed(&stale).await,
+        FeedReply::Fenced { epoch: new },
+        "the core host refuses the old feeder"
+    );
+    assert_eq!(h.inputs(), inputs, "the core ran nothing");
     dial.abort();
 }
 

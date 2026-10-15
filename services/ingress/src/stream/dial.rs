@@ -4,6 +4,9 @@
 //! every address it is given and answers ingress's calls from its core, which is the host's
 //! [`crate::feed::Sequencer`] in front of the Agent.
 //!
+//! On a Unix socket the core host checks the peer's user id against the configured
+//! `stream.dial.peer_uids` before it sends its token, as ingress checks the core host's.
+//!
 //! Per address, one stream at a time, kept up for ever: a failed dial or a lost stream is retried
 //! with backoff (100 ms, doubling to 5 s); a [`Msg::GoAway`] dials a new stream at once while the
 //! old one keeps answering until ingress closes it. Feeds on one stream are answered in the order
@@ -37,6 +40,10 @@ pub enum Target {
     Unix {
         /// Its path.
         path: PathBuf,
+        /// The user ids ingress may run as: the socket's peer credentials are checked against
+        /// them before the token is sent, so a process that took the socket's path gets nothing.
+        /// Empty admits no one.
+        peer_uids: Vec<u32>,
         /// The link's token.
         token: LinkToken,
     },
@@ -88,11 +95,25 @@ async fn connect(target: &Target, hello: &Hello, t: Timings) -> Result<Box<dyn D
                     .map_err(|e| format!("the TLS handshake: {e}"))?;
             Box::new(tls)
         }
-        Target::Unix { path, .. } => Box::new(
-            tokio::net::UnixStream::connect(path)
+        Target::Unix {
+            path, peer_uids, ..
+        } => {
+            let s = tokio::net::UnixStream::connect(path)
                 .await
-                .map_err(|e| e.to_string())?,
-        ),
+                .map_err(|e| e.to_string())?;
+            // The server side's check, the other way (`DEC-27` (h′)): the token goes only to a
+            // peer running as one of ingress's user ids.
+            let uid = s
+                .peer_cred()
+                .map_err(|e| format!("the socket's peer credentials: {e}"))?
+                .uid();
+            if !peer_uids.contains(&uid) {
+                return Err(format!(
+                    "the socket's peer runs as user id {uid}, not one of ingress's: no token sent"
+                ));
+            }
+            Box::new(s)
+        }
     };
     let mut hello = hello.clone();
     if let Target::Unix { token, .. } = target {

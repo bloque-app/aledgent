@@ -154,6 +154,8 @@ async fn serve(args: &[String]) -> Result<(), String> {
     if let Some(s) = &c.stream {
         s.check(c.profile)?;
     }
+    // F-038 §5, §12: in production, what goes to a core in another process is signed.
+    c.check_forward_signing()?;
     let store = connect(&c).await?;
     // F-038: the stream, when ingress listens for cores; the socket link otherwise.
     if let Some(s) = c.stream.clone().filter(|s| s.listen.is_some()) {

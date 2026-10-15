@@ -440,6 +440,10 @@ pub struct DialSection {
     /// The partitions it writes. Absent: the book ([`crate::feed::BOOK`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partitions: Option<Vec<String>>,
+    /// The user ids ingress may run as, for `unix:` addresses: the core host checks the socket's
+    /// peer credentials against them before it sends its token. Required with a `unix:` address.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peer_uids: Vec<u32>,
 }
 
 /// The core stream's section (`F-038` §11).
@@ -466,7 +470,8 @@ pub struct StreamSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dial: Option<DialSection>,
     /// The feed keys' public halves the core host accepts, hex (two while one rotates). Required
-    /// with `dial`; on the socket link, checked whenever present.
+    /// with `dial`, and for the core host in production on every link
+    /// ([`DeploymentConfig::core_feed_keys`]); with them, the host takes no unsigned input.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ingress_keys: Vec<String>,
     /// How often each side pings, milliseconds. Absent: 1 000.
@@ -521,13 +526,22 @@ impl StreamSection {
                 return Err("stream.dial.connect is empty".into());
             }
             for a in &d.connect {
-                if let crate::stream::Address::Tls(_) = crate::stream::Address::parse(a)? {
-                    if self.tls.is_none() {
-                        return Err(format!("stream.dial: {a} needs stream.tls"));
+                match crate::stream::Address::parse(a)? {
+                    crate::stream::Address::Tls(_) => {
+                        if self.tls.is_none() {
+                            return Err(format!("stream.dial: {a} needs stream.tls"));
+                        }
+                        if d.server_name.is_none() {
+                            return Err(format!("stream.dial: {a} needs stream.dial.server_name"));
+                        }
                     }
-                    if d.server_name.is_none() {
-                        return Err(format!("stream.dial: {a} needs stream.dial.server_name"));
+                    crate::stream::Address::Unix(_) if d.peer_uids.is_empty() => {
+                        return Err(format!(
+                            "stream.dial: {a} needs stream.dial.peer_uids: the core host sends \
+                             its token only to ingress's user id"
+                        ));
                     }
+                    crate::stream::Address::Unix(_) => {}
                 }
             }
             crate::feed::FeedKeys::parse(&self.ingress_keys)?;
@@ -635,6 +649,7 @@ impl StreamSection {
                 }
                 crate::stream::Address::Unix(path) => crate::stream::Target::Unix {
                     path,
+                    peer_uids: d.peer_uids.clone(),
                     token: crate::remote::LinkToken::new(&token().ok_or_else(|| {
                         format!("{ENV_CORE_STREAM_TOKEN} is not set: refusing to start")
                     })?)?,
@@ -730,6 +745,41 @@ pub struct ArchivedIdentifiers {
 }
 
 impl DeploymentConfig {
+    /// The keys the core host checks ingress's feeds against (`F-038` §5, `DEC-27` (f)), on every
+    /// link it serves. In production they are required, and the host refuses to start without
+    /// them: a host with keys takes no unsigned or unsequenced input from the moment it starts
+    /// ([`crate::feed::Sequencer`]). Only the development profile may run without them.
+    pub fn core_feed_keys(&self) -> Result<Option<crate::feed::FeedKeys>, String> {
+        let keys = match &self.stream {
+            Some(s) => s.ingress_keys()?,
+            None => None,
+        };
+        if keys.is_none() && self.profile == Profile::Production {
+            return Err(
+                "stream.ingress_keys is required in production: the core host takes no unsigned \
+                 input (F-038 §5); configure them with ingress's stream.feed_key"
+                    .into(),
+            );
+        }
+        Ok(keys)
+    }
+
+    /// Check that ingress signs what it forwards to a core in another process (`F-038` §5, §12):
+    /// in production, an ingress with `core_endpoint` needs `stream.feed_key`, as one with
+    /// `stream.listen` does ([`StreamSection::check`]), since the core host refuses unsigned
+    /// inputs there.
+    pub fn check_forward_signing(&self) -> Result<(), String> {
+        let signs = self.stream.as_ref().is_some_and(|s| s.feed_key.is_some());
+        if self.profile == Profile::Production && self.core_endpoint.is_some() && !signs {
+            return Err(
+                "core_endpoint in production needs stream.feed_key: every forwarded command is \
+                 signed, and the core host refuses unsigned ones (F-038 §5)"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
     /// The archived identifiers this deployment names, read and checked against the digest its
     /// genesis's chainspec commits (`T-036-29`); none when it names none.
     pub fn archived(&self) -> Result<crate::archived::ArchivedIds, String> {
@@ -1025,6 +1075,10 @@ mod tests {
                 serde_json::json!({ "dial": { "connect": [] }, "ingress_keys": [key] }),
                 Development,
             ),
+            (
+                serde_json::json!({ "dial": { "connect": ["unix:/s"] }, "ingress_keys": [key] }),
+                Development,
+            ),
         ];
         for (v, p) in refused {
             assert!(s(v.clone()).check(p).is_err(), "{v} under {p:?}");
@@ -1043,13 +1097,56 @@ mod tests {
                 Production,
             ),
             (
-                serde_json::json!({ "dial": { "connect": ["unix:/s"] }, "ingress_keys": [key] }),
+                serde_json::json!({ "dial": { "connect": ["unix:/s"], "peer_uids": [1000] }, "ingress_keys": [key] }),
                 Production,
             ),
         ];
         for (v, p) in accepted {
             assert!(s(v.clone()).check(p).is_ok(), "{v} under {p:?}");
         }
+    }
+
+    /// `T-038-14`, `DEC-27` (f): in production the core host refuses to start without
+    /// `stream.ingress_keys`, and an ingress forwarding over `core_endpoint` without
+    /// `stream.feed_key`; the development profile may run without either.
+    #[test]
+    fn t_038_14_production_requires_the_feed_keys_on_both_sides() {
+        use crate::feed::FeedSigner as _;
+        let template: serde_json::Value = serde_json::from_str(&fill_numbers(include_str!(
+            "../../../deploy/templates/ingress.json"
+        )))
+        .unwrap();
+        let key = hex::encode(crate::feed::LocalFeedKey::from_seed([1; 32]).public());
+        let with = |profile: &str, stream: Option<serde_json::Value>| {
+            let mut t = template.clone();
+            t["profile"] = profile.into();
+            match stream {
+                Some(s) => t["stream"] = s,
+                None => {
+                    t.as_object_mut().unwrap().remove("stream");
+                }
+            }
+            serde_json::from_value::<DeploymentConfig>(t).unwrap()
+        };
+        let feed_key = serde_json::json!({
+            "signer": { "socket": "/run/signer.sock", "client": "ingress", "token_file": "/t" },
+            "key": "ingress-feed",
+        });
+        let none = with("production", None);
+        assert!(none.core_feed_keys().is_err(), "no keys, no host");
+        assert!(
+            none.check_forward_signing().is_err(),
+            "no feed key, no ingress"
+        );
+        let both = with(
+            "production",
+            Some(serde_json::json!({ "feed_key": feed_key, "ingress_keys": [key] })),
+        );
+        assert!(both.core_feed_keys().unwrap().is_some());
+        assert!(both.check_forward_signing().is_ok());
+        let dev = with("development", None);
+        assert!(dev.core_feed_keys().unwrap().is_none());
+        assert!(dev.check_forward_signing().is_ok());
     }
 
     #[test]
@@ -1299,6 +1396,12 @@ mod tests {
         let link = c.core_link.as_ref().expect("the core link's credential");
         assert_eq!(link.token_sha256.len(), 1);
         assert!(!link.peer_uids.is_empty());
+        // F-038 §5, §12: in production both sides carry the feed keys: ingress signs through the
+        // signer, and the core host checks against ingress's public key.
+        assert!(c.check_forward_signing().is_ok());
+        let stream = c.stream.as_ref().expect("the feed keys");
+        assert!(stream.feed_key.is_some());
+        assert_eq!(stream.ingress_keys.len(), 1);
         let keys = c
             .core_keys
             .as_ref()
