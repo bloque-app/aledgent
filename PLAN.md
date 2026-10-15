@@ -976,6 +976,49 @@ book says which code ran each input and that code is still there. *Cost:* about 
 the first upgrade is taken. Traces: `REQ-RT-3`, `REQ-RT-15`–`REQ-RT-18`, `REQ-PR-10`, `REQ-PR-11`,
 `REQ-OS-2`, `NFR-22`, `US-K7`.
 
+**`DEC-27` Ingress is a fleet of its own, and the cores pull from it.** *Proposed 2026-10-15; waits for the
+owner.* Today ingress and the core are separate processes on one node, and ingress pushes each command to
+the core host over a Unix socket that authenticates by the peer's user id. A reboot of that node on
+2026-10-14 (applying a node configuration, 21:36–21:38Z) refused 36 requests with 502 and 504 from the load
+balancer, because ingress went down with the node. `NFR-5`, `NFR-17` (no change may need a maintenance
+period, an upgrade included) and `NFR-21(b)` (any execution node is replaceable while every command is still
+acknowledged within `NFR-1`) forbid that. The shape also does not extend to cores in several regions, each
+the writer of its own partitions. *Decision:*
+
+- **(a) Ingress runs apart from every execution node**, as at least two instances in different availability
+  zones behind the load balancer, holding no state of its own outside its database (the received log, client
+  keys, challenges, passkey counters). An ingress release goes out blue/green: the new set is healthy before
+  the old one drains, so no request is refused. A core's restart, replacement or loss never takes ingress
+  with it.
+- **(b) The acknowledgement needs no core.** Ingress acknowledges a command once it is durable in the
+  received log (`NFR-1`, `REQ-CS-2`), whether or not any core is reachable. The received log's database is
+  the durable copy `NFR-21(c)` counts, so it runs replicated across zones.
+- **(c) The cores pull.** Each core host connects out to the received log, takes the commands of the
+  partitions it writes, in the log's order, and writes each reply and decision back to the log's row
+  (`forwarded_at`, `core_input_seq`, `core_reply`, `decided_at`, which ingress writes today). A core host
+  listens on no network port, as today, and a regional core pulls only its own partitions. A wake-up
+  (`LISTEN`/`NOTIFY` or the like) keeps the pull's latency within `NFR-16`.
+- **(d) Ingress signs what it forwards.** A command reaches a core with ingress's signature over the
+  received row (through the signer, `F-035`), and the core host checks it before the Agent sees the input.
+  This replaces the peer-credential check, which only holds on one machine.
+- **(e) A command answered with its decision** (`REQ-CS-8`) waits for the decision on its row. If no core
+  decides within `NFR-16`, ingress answers `ERR-DecisionUnavailable` (`REQ-CS-7`), never a 5xx. A command that
+  moves value is acknowledged and decided once a core takes it.
+- **(f) The Agent is unchanged.** Commands reach it as the same inputs. The change is in ingress and the core
+  host. The genesis check does not verify the host's own binary on a restart with a replica (`F-036`), but the
+  image must carry the genesis package and runtime bytes exactly, copied from the pinned image, until
+  `DEC-26`'s upgrades exist.
+
+*Alternatives:* (1) keep the push and move it to a network socket with mutual TLS: each core opens a port, and
+ingress must know where every partition's writer is; (2) a second ingress on another node pushing to the
+same core: still needs a network link to the core, and still stops when the core's node does for anything
+answered with its decision. *Why:* the requirement is that ingress never stops taking commands, and the
+pull keeps the core's surface as small as the Unix socket made it. *Cost:* a database round trip on the
+path to the core (measured against `NFR-16` before it is adopted); a signature per command; ingress's
+database becomes the hand-off point and must be replicated across zones. *Reversibility:* medium: the
+received log already holds what the pull needs. Traces: `NFR-1`, `NFR-5`, `NFR-16`, `NFR-17`, `NFR-21`,
+`REQ-AR-7`, `REQ-CS-2`, `REQ-CS-7`, `REQ-CS-8`, `NFR-7`.
+
 ---
 
 ## 3. Dependencies: what we are waiting on
@@ -1039,6 +1082,7 @@ Each feature names its exit criterion by spec identifier. If a feature's tests d
 | `F-035` | **The key boundary** (guardrail 13, the `M-3` exit's "no key material in the book's process"). `aledgent-signer`: a process that holds every key the operator holds and no book state, on a Unix socket with peer credentials and a token per caller, grants per key and revocation on the next request. Its keys rest in Vault, which it reads itself at start under Vault's AWS IAM auth (no secret in its environment); AWS KMS is an opt-in, per key, for the secp256k1 lane and anchor keys only (owner ruling `key-custody-opt-in-kms`, 2026-10-04). Holders' passkeys (P-256) are theirs, out of its scope. The core host asks it for every kernel key, signature and blinding and passes the Agent the answers, never a key; the adapter signs its lanes and anchors through it. The ingress–core link authenticated by a token and the peer's user id. Supersedes `F-005` NOTES decisions 15–16 and the `KmsSigner` stub | `REQ-AR-3`, `NFR-8`, `REQ-SA-8`, `REQ-AU-8`, `REQ-RT-6` | Signing round trips for every scheme and backend; unauthenticated and ungranted callers refused; online rotation; the book runs over the core Agent with its keys in another process and loads no root |
 | `F-036` | **Seeded genesis: aledgent's chainspec** [PENDING AMENDMENT 0022-A1] (`REQ-RC-6`; owner rulings of 2026-10-08: one operator-held verifier for many identities, `seed-history-commitment`, `genesis-chainspec`). The book's first state is defined by a chainspec (identities, delegated accounts, aliases, opening balances with their reconciliation, the operator's grants, the history's root) whose digest genesis carries, and **built natively** with the same library code, as a Substrate chain's genesis state is (`aledgent-core-host build-spec`). The core host builds it in its replica before the Agent's first input, refuses to start unless its roots are the reviewed manifest's, and founds the Agent on them in one invocation (`StateGenesis`); replay and restore rebuild it from the chainspec kept beside the archive. `verify-genesis` executes it chunk by chunk inside the PVM, and the book takes no traffic until it passes (ruling `a0022-q2`). The chainspec's header names its genesis code with amendment 0023's manifest (H₀: package, runtime and the host executable that builds it, with their build profiles), and the core host refuses to build or found the genesis under other binaries. A re-founded book continues the settlement contract's anchor sequence (amendment 0022, option (e)) | `REQ-RC-6`, `REQ-RC-4`, `REQ-RT-3`, `DEC-4`, `INV-17`, `NFR-17` | The built genesis equals the book the same records make as commands; a genesis whose roots are not the chainspec's is refused; a restore rebuilds it; `verify-genesis` reaches the same roots; binaries other than the genesis code are refused; the full-size synthetic book builds natively in under a minute (`F-036`) |
 | `F-037` | **Code history and upgrades** (`DEC-26`, amendment 0023, ruled 2026-10-08). The hot-row and ring-entry fields and checkpoint `v3`; the `Upgrade`, `MigrateConstruction` and `SetAuthority` inputs and the modes; `CodeSource` with `fs`, `s3`, `https`, `exec`, C-ABI plugins (`aledgent-code-fetch`) and, in the open-source distribution, `kreivo-preimage`; per-range restore under the frozen call format; snapshots with leaf chunks and the per-shard archive; the `code-history` gate; the legal hold and the break-glass role. After `F-036` (the chainspec names *H₀* and the initial mode), before `F-021` (warp sync admits a fresh replica) | `REQ-RT-3`, `REQ-RT-15`–`REQ-RT-18`, `REQ-PR-11`, `NFR-22`, `US-K7` | `AC-K7.1`–`AC-K7.8` pass; the `code-history` gate replays a fixture archive across an upgrade and a construction migration from genesis, at every input; a fast and a full resync reach the same roots |
+| `F-038` | **Ingress fleet and the pull relay** (`DEC-27`, proposed). Ingress as at least two instances across zones, released blue/green; the acknowledgement on the received log alone; core hosts pulling their partitions' commands from the log in order and writing replies and decisions back; ingress's signature on every forwarded command, checked by the core host; `ERR-DecisionUnavailable` instead of a 5xx when no core decides in time. The Agent and its genesis bytes are unchanged | `NFR-1`, `NFR-5`, `NFR-16`, `NFR-17`, `NFR-21`, `REQ-AR-7`, `REQ-CS-7` | A node reboot, a core restart and an ingress release, each under the stress suite's load, refuse no request and acknowledge every command within `NFR-1`; a command answered with its decision gets its decision or `ERR-DecisionUnavailable`, never a 5xx; a forwarded command without a valid ingress signature never reaches the Agent |
 
 ### Track C: the settlement pallet
 
