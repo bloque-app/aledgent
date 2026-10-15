@@ -1,9 +1,9 @@
 ---
 name: aledgent
 summary: A private, provable ledger of record — identities that own accounts, value that moves between them instantly and confidentially, and one settlement layer through which value enters, leaves, and is anchored.
-spec_version: 0.4.24
+spec_version: 0.4.25
 status: draft
-date: 2026-10-13
+date: 2026-10-14
 ---
 
 # aledgent — System Specification
@@ -813,6 +813,15 @@ explicit gap that the operator can see.
 
 **`REQ-SA-8`** The adapter MUST hold no authority over a ledger account and MUST NOT be able to cause an
 entry. Its credentials MUST be scoped to submitting evidence and executing the instructions it was given.
+
+**`REQ-SA-9`** When the settlement layer changes its rules, the adapter MUST decide whether it can keep
+serving from what an instruction it submits must carry under the new rules. That means the version of the
+instruction format the layer declares, the parts every instruction must carry and the types of their data,
+and the type of each call the adapter submits, all as the layer itself describes them. A version number of
+the layer's rules alone MUST NOT decide it, either way. Before it signs the first instruction under rules it
+has not served before, the adapter MUST have the settlement layer itself confirm that an instruction it
+built and signed under them is valid, and it refuses to serve until the layer does. An operator MAY name in
+configuration the format to use for a set of rules. The layer's confirmation is still required.
 
 > **Trade-off, stated plainly.** `REQ-SA-7` conflicts with recovery. A settlement layer keeps recent
 > history only for a bounded window. An observer that falls behind that window cannot read what it
@@ -1901,6 +1910,11 @@ committed anything.
   submission with `ERR-UnsupportedLeg` (`REQ-SA-1`).
 - `AC-E4.2` Given an adapter whose connected network is not the declared settlement layer, Then the
   adapter refuses to serve (`REQ-SA-2`).
+- `AC-E4.3` Given a change to the settlement layer's rules that leaves what an instruction must carry
+  unchanged, Then the adapter keeps serving, with no new release or configuration (`REQ-SA-9`).
+- `AC-E4.4` Given a change that alters what an instruction must carry, or an instruction the layer does not
+  confirm as valid, Then the adapter refuses to serve until it has a format the layer confirms
+  (`REQ-SA-9`).
 
 ### Epic F — Multi-asset
 
@@ -3110,7 +3124,7 @@ invalid. This specification MUST NOT contain a requirement that serves no story.
 | B — Internal transfers | `US-B1`–`US-B3` | `REQ-KER-1`, `REQ-KER-10`, `REQ-BA-4`, `REQ-SL-5`, `REQ-CS-10` | `INV-1`, `INV-3`, `INV-25` |
 | C — Reservations | `US-C1`–`US-C6` | `REQ-BA-1`–`REQ-BA-4`, `REQ-OP-2`, `REQ-OP-5`, `REQ-OP-9`, `REQ-QR-7`, `REQ-EV-8` | `INV-14`, `INV-15`, `INV-21` |
 | D — Inbound | `US-D1`–`US-D3` | `REQ-IN-1`–`REQ-IN-7`, `REQ-SA-7`, `REQ-SI-*` | `INV-10`, `INV-11`, `INV-12` |
-| E — Outbound | `US-E1`, `US-E3`, `US-E4` | `REQ-SO-1`–`REQ-SO-8`, `REQ-SA-1`–`REQ-SA-8`, `REQ-SL-2`–`REQ-SL-4`, `REQ-SL-6`–`REQ-SL-10`, `REQ-SN-2` | `INV-10`, `INV-13`, `INV-23` |
+| E — Outbound | `US-E1`, `US-E3`, `US-E4` | `REQ-SO-1`–`REQ-SO-8`, `REQ-SA-1`–`REQ-SA-9`, `REQ-SL-2`–`REQ-SL-4`, `REQ-SL-6`–`REQ-SL-10`, `REQ-SN-2` | `INV-10`, `INV-13`, `INV-23` |
 | F — Multi-asset | `US-F1`–`US-F5` | `REQ-AS-1`–`REQ-AS-9`, `REQ-AU-10`, `REQ-KER-2` | `INV-4`, `INV-5`, `INV-7`, `INV-24` |
 | G — Agents | `US-G1`–`US-G4` | `REQ-AG-1`–`REQ-AG-4`, `REQ-AU-1`–`REQ-AU-4`, `REQ-AU-7`, `REQ-AU-21`, `REQ-EV-7` | `INV-22` |
 | H — Querying | `US-H1`–`US-H5` | `REQ-QR-1`–`REQ-QR-7`, `REQ-BA-5`, `REQ-PO-1`–`REQ-PO-5` | `INV-6`, `INV-20` |

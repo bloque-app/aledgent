@@ -63,7 +63,8 @@ parse is an error. The old decoder silently fell back to the native asset.
 
 **Start-up assertions** (`REQ-SA-2`, `REQ-AS-2`). The adapter refuses to serve unless:
 - the genesis hash is the declared one;
-- the runtime `spec_version` is on an allow-list;
+- the runtime's transaction surface is one the adapter has a format for, confirmed by the layer
+  (`REQ-SA-9`, amendment 0031; it replaced a `spec_version` allow-list);
 - the pallet is in the metadata;
 - our instance is registered and our keys are on it;
 - each supported asset's on-chain decimals equal the registry's precision. On Kreivo decimals are metadata
