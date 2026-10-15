@@ -24,10 +24,14 @@
 //! core's boundary, and each must come back with the reply the log recorded: the window between
 //! the last archived segment and the failure is re-decided, not lost (`NFR-4`).
 
+use std::collections::BTreeSet;
+
+use core_binding::hot::RingEntry;
 use ingress::boundary::{Core, CoreReply, InputKey, Outcome};
 use ingress::service::input_of;
 use ingress::store::Row;
 use ingress::wire::state_named;
+use ledger_core::call::Call;
 use ledger_core::export::rederive::Acknowledgement;
 use ledger_core::id::OperationId;
 use ledger_kernel::store::LeafStore as _;
@@ -40,7 +44,31 @@ use crate::restore::{RebuildReport, decided_inputs, rebuild_leaf_store};
 
 /// The acknowledgements the archived replies show (`NFR-4`): every decided operation, and the
 /// state its reply showed.
-pub fn acknowledgements(replies: &[(InputKey, CoreReply)]) -> Vec<Acknowledgement> {
+///
+/// A reply to one of the settlement adapter's inputs (a declaration, an observation, a check, a
+/// head, a gap, a re-scan, an anchor, a position cut, an attestation) names the reference ingress
+/// minted for that input, and no operation: the core keeps what the adapter reported in its
+/// settlement store, at coordinates, and the re-scan checks it (`REQ-IN-5`). No operation is
+/// behind that reference, so it cannot be lost as one, and holding it to
+/// [`ledger_core::export::rederive::check_acknowledged`] refused every restore of a book that has
+/// an adapter (the 2026-10-15 restore drill: 63,947 of 70,761 replies). The archive's entries carry
+/// each input's call, so such a reply is told by its reference being the one an archived
+/// `Call::Adapter` ran under. The adapter's acknowledgement of an instruction, its signing record and
+/// its evidence check name the *real* operation, not the minted one, and stay checked, as does
+/// every other command's reply. The received-log's own check ([`crate::drill::acknowledgements`])
+/// skips the adapter's commands for the same reason.
+pub fn acknowledgements(
+    replies: &[(InputKey, CoreReply)],
+    entries: &[RingEntry],
+) -> Vec<Acknowledgement> {
+    let adapter_inputs: BTreeSet<OperationId> = entries
+        .iter()
+        .flat_map(|e| &e.calls)
+        .filter_map(|c| match c {
+            Call::Adapter { ctx, .. } => Some(ctx.op),
+            _ => None,
+        })
+        .collect();
     let mut out = Vec::new();
     for (_, r) in replies {
         if let Outcome::Decided {
@@ -49,6 +77,7 @@ pub fn acknowledgements(replies: &[(InputKey, CoreReply)]) -> Vec<Acknowledgemen
             ..
         } = &r.outcome
             && let Ok(op) = OperationId::parse(operation_reference)
+            && !adapter_inputs.contains(&op)
         {
             out.push(Acknowledgement {
                 op,
@@ -91,7 +120,7 @@ pub fn verify(
             .map_err(|e| Error::Restore(format!("the archive does not re-derive: {e:?}")))?;
     let store = replica.book().store();
     let rebuild = rebuild_leaf_store(store, None)?;
-    let acks = acknowledgements(&fetched.replies_parsed);
+    let acks = acknowledgements(&fetched.replies_parsed, &fetched.entries);
     let mut out = checks(&replica, &acks, None, &rebuild, layer.map(|l| (l, 0)));
     // The roots at the archive's point: the chain's last entry, re-derived.
     let p = &fetched.point;
