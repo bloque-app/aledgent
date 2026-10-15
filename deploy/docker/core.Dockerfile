@@ -57,6 +57,15 @@
 # ROOTS, which must be the genesis's: the check refuses a manifest of another construction. The
 # image carries the check's report as /usr/share/aledgent/genesis-code.json and the genesis image as
 # the label `app.aledgent.genesis.image`. Without a target the build is `core`, as before.
+#
+# The image also carries `opsctl` (/usr/local/bin/opsctl, from the root workspace, as the ops image
+# builds it, with the same ROOTS), so that a restore from the off-node archive runs from one
+# image: `opsctl restore core --from … --core-host aledgent-core-host --runtime
+# /usr/share/aledgent/agent_runtime.pvm --actor /usr/share/aledgent/core.vos` needs both binaries
+# and the Agent's programs on one filesystem (ops/runbooks/release/total-loss-recovery.md, path B).
+# Run it with `--entrypoint /usr/local/bin/opsctl`. It is built in a stage of its own and changes
+# nothing the Agent runs. Both targets carry it: `core` and `core-on-genesis` (whose package and
+# runtime stay the genesis image's bytes).
 
 ARG ROOTS=v2
 # The deployment's pinned core image, for `core-on-genesis` only (scratch: none, and that target
@@ -144,6 +153,29 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
  && /out/bin/aledgent-core-host package "$elf" /out/share/core.vos \
  && ls -l /out/share
 
+# opsctl, for a restore from this image (header): the root workspace, as services.Dockerfile builds
+# it (RUSTUP_TOOLCHAIN pins the toolchain rust-toolchain.toml leaves at `stable`; `--locked`).
+FROM ${BUILD_IMAGE} AS opsctl
+ARG ROOTS
+ENV RUSTUP_TOOLCHAIN=1.98.0 \
+    CARGO_TERM_COLOR=never \
+    CARGO_INCREMENTAL=0 \
+    CARGO_NET_RETRY=10 \
+    CARGO_NET_GIT_FETCH_WITH_CLI=true
+WORKDIR /src
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/src/target,sharing=locked \
+    case "$ROOTS" in \
+      v2) roots="" ;; \
+      v1) roots="--features ops/smt-v1" ;; \
+      *) echo "ROOTS must be v1 or v2, not '$ROOTS'" >&2; exit 1 ;; \
+    esac \
+ && cargo build --release --locked $roots -p ops --bin opsctl \
+ && mkdir -p /out/bin \
+ && cp target/release/opsctl /out/bin/
+
 # A deployment's genesis package and runtime (the target `core-on-genesis`): its pinned core
 # image, and its genesis code (a named build context, `--build-context genesis-code=<dir>`; empty
 # by default, and the check refuses it).
@@ -189,6 +221,8 @@ LABEL org.opencontainers.image.title="aledgent-core" \
       app.aledgent.genesis.image="${GENESIS_IMAGE}" \
       app.aledgent.roots="${ROOTS}"
 COPY --from=on-genesis /out/bin/aledgent-core-host /usr/local/bin/aledgent-core-host
+# A restore runs from this image (header): `--entrypoint /usr/local/bin/opsctl`.
+COPY --from=opsctl /out/bin/opsctl /usr/local/bin/opsctl
 COPY --from=on-genesis /genesis/share /usr/share/aledgent
 COPY --from=on-genesis --chown=65532:65532 /out/state /var/lib/aledgent/core
 USER 65532:65532
@@ -212,6 +246,8 @@ LABEL org.opencontainers.image.title="aledgent-core" \
       app.aledgent.vos.runtime-features="none (JAM-compatible: Gray Paper host calls only)" \
       app.aledgent.roots="${ROOTS}"
 COPY --from=build /out/bin/aledgent-core-host /usr/local/bin/aledgent-core-host
+# A restore runs from this image (header): `--entrypoint /usr/local/bin/opsctl`.
+COPY --from=opsctl /out/bin/opsctl /usr/local/bin/opsctl
 COPY --from=build /out/share /usr/share/aledgent
 # The Agent's state (`--state`): agent.state, archive.bin, replies.jsonl. Mount a durable volume.
 COPY --from=build --chown=65532:65532 /out/state /var/lib/aledgent/core

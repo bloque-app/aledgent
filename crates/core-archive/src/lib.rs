@@ -38,7 +38,9 @@ pub mod store;
 
 pub use archive::{Access, Archive, ArchiveSink, ArchiveSource, open};
 pub use archiver::{ArchiveStatus, Archiver, ArchiverConfig, ArchivingLog, STATUS_FILE};
-pub use fetch::{Fetched, RESTORE_FILE, RestorePlan, fetch, lay_out};
+pub use fetch::{
+    DEFAULT_CONCURRENCY, Fetched, RESTORE_FILE, RestorePlan, fetch, fetch_with, lay_out,
+};
 
 /// The book an archive belongs to: its genesis operation reference, hex.
 pub fn book_of(genesis_op: &ledger_core::id::OperationId) -> String {

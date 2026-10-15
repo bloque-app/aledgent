@@ -442,6 +442,10 @@ jobs:
           out=$(docker run --rm aledgent-core:ci no-such-command 2>&1 || true)
           echo "$out"
           grep -q 'aledgent-core-host serve' <<<"$out"
+          # opsctl beside it, for a restore from this one image (core.Dockerfile's header).
+          out=$(docker run --rm --entrypoint /usr/local/bin/opsctl aledgent-core:ci no-such-command 2>&1 || true)
+          echo "$out"
+          grep -q 'usage: opsctl' <<<"$out"
           test "$(docker image inspect -f '{{.Config.User}}' aledgent-core:ci)" = "65532:65532"
           test "$(docker image inspect -f '{{index .Config.Labels "app.aledgent.roots"}}' aledgent-core:ci)" = "$ROOTS"
           id=$(docker create aledgent-core:ci)
@@ -697,6 +701,8 @@ jobs:
           out=$(docker run --rm "$img" no-such-command 2>&1 || true)
           grep -q 'aledgent-core-host serve' <<<"$out"
           grep -q 'aledgent-core-host check-code' <<<"$out"
+          out=$(docker run --rm --entrypoint /usr/local/bin/opsctl "$img" no-such-command 2>&1 || true)
+          grep -q 'usage: opsctl' <<<"$out"
           test "$(docker image inspect -f '{{.Config.User}}' "$img")" = "65532:65532"
           test "$(docker image inspect -f '{{index .Config.Labels "app.aledgent.roots"}}' "$img")" = "$ROOTS_GENESIS"
           test "$(docker image inspect -f '{{index .Config.Labels "app.aledgent.genesis.image"}}' "$img")" = "$GENESIS"

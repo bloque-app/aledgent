@@ -74,7 +74,9 @@ anywhere with the toolchain and `rust-src`.
     #   (Object Lock defaults to compliance, 400 days)
 
     # A fresh node from the archive (T-005-16): opsctl checks it and lays it out, then the Agent is
-    # re-sent every archived input after its checkpoint (opsctl runs this with --core-host)
+    # re-sent every archived input after its checkpoint (opsctl runs this with --core-host). The core
+    # image carries opsctl too (--entrypoint /usr/local/bin/opsctl); a chainspec book's chainspec comes
+    # from the archive unless --chainspec names it; segments are read --fetch-concurrency (32) at once
     opsctl restore core --from <archive> --config deployment.json --state <empty dir> --anchors-rpc <node>
     aledgent-core-host restore --config deployment.json --runtime agent_runtime.pvm --actor core.vos --state <dir>
 

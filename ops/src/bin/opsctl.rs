@@ -22,7 +22,8 @@
 //!                                                 the received-log; write its rebuilt journal
 //! opsctl restore core --from <archive> --config <deployment config> --state <empty dir>
 //!                     (--anchors-rpc <node URL> | --no-anchors) [--from-genesis] [--report <dir>]
-//!                     [--accept-damaged-archive]
+//!                     [--accept-damaged-archive] [--fetch-concurrency <n>]
+//!                     [--chainspec <file>] [--genesis-manifest <file>] [--unnamed-code]
 //!                     [--core-host <aledgent-core-host> --runtime <pvm> --actor <vos> [--budget <bytes>]]
 //!                                                 restore the Agent core from its off-node archive
 //!                                                 (T-005-16): check it, re-derive the book and run
@@ -32,6 +33,7 @@
 //!                                                 re-send through the restored core every input the
 //!                                                 received-log shows decided after the archive's point
 //! opsctl archive verify --from <archive> --config <deployment config> (--anchors-rpc <URL> | --no-anchors)
+//!                       [--fetch-concurrency <n>] [--chainspec <file>]
 //!                                                 check the archive and re-derive its book, laying
 //!                                                 nothing out
 //! opsctl archive status --state <dir>             the core host's archiver status
@@ -39,6 +41,25 @@
 //! opsctl health --config <exporter.toml>          exit 0 when the exporter at the configuration's
 //!                                                 `listen` answers GET /metrics with 200: the
 //!                                                 image's HEALTHCHECK
+//! ```
+//!
+//! `restore core --from` and `archive verify` read the archive's segments `--fetch-concurrency` at
+//! once (default 32, at most 256; `core_archive::fetch_with`), and check them strictly in order, as
+//! one at a time would. A chainspec book (`F-036`) re-derives from its chainspec: `--chainspec
+//! <file>`, or else the archive's copy (`<prefix>/chainspec/<digest>.bin`), fetched by the digest
+//! the deployment's genesis commits and refused unless it is that chainspec. With `--core-host`,
+//! the core host's `restore` gets `--archive <the same spec>` for such a book (it lays out the
+//! chainspec and its kept verify-genesis report from there), and `--chainspec`,
+//! `--genesis-manifest` and `--unnamed-code` as given here.
+//!
+//! `--core-host` runs the core host on this machine: both binaries, the Agent's programs and the
+//! `--state` directory on one filesystem. The core image (`deploy/docker/core.Dockerfile`) carries
+//! `opsctl` beside `aledgent-core-host` for this:
+//!
+//! ```text
+//! podman run --rm --entrypoint /usr/local/bin/opsctl -v <state>:/var/lib/aledgent/core … <core image> \
+//!   restore core --from … --state /var/lib/aledgent/core … --core-host aledgent-core-host \
+//!   --runtime /usr/share/aledgent/agent_runtime.pvm --actor /usr/share/aledgent/core.vos
 //! ```
 //!
 //! An archive is `fs:<dir>` or `s3://<bucket>/<prefix>?region=…` (`core_archive::open`); its
@@ -314,6 +335,22 @@ async fn restore_core(args: &[String]) -> Result<(), Error> {
     }
 }
 
+/// The most segments `--fetch-concurrency` reads at once.
+const MAX_FETCH_CONCURRENCY: usize = 256;
+
+/// `w` as one word of a POSIX shell command, for a command printed to be run by hand (an archive
+/// spec carries `?` and `&`).
+fn shell_word(w: &str) -> String {
+    let plain = !w.is_empty()
+        && w.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-./:=,+@%".contains(&b));
+    if plain {
+        w.to_owned()
+    } else {
+        format!("'{}'", w.replace('\'', "'\\''"))
+    }
+}
+
 fn flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
 }
@@ -322,23 +359,57 @@ fn flag(args: &[String], name: &str) -> bool {
 /// service's when the configuration names `core_keys` (`F-035`: production, where no key is in any
 /// process but the signer's); otherwise the key-ring root and the clerk key come from the
 /// environment (development only). Secrets are never logged.
-fn founding(args: &[String]) -> Result<core_binding::core::Founding, Error> {
+///
+/// A chainspec book (`F-036`) re-derives from its chainspec: `--chainspec <file>`, or else the
+/// archive's own copy (`<prefix>/chainspec/<digest>.bin`, kept there by the core host), fetched by
+/// the digest this genesis commits. Either must be the chainspec the genesis commits.
+fn founding(
+    args: &[String],
+    archive: Option<&core_archive::Archive>,
+) -> Result<core_binding::core::Founding, Error> {
     use ingress::config::{DeploymentConfig, ENV_CLERK_KEY, ENV_CORE_ROOT};
     let config_path = arg(args, "--config")?;
     let text = std::fs::read_to_string(&config_path)?;
     let config: DeploymentConfig =
         serde_json::from_str(&text).map_err(|e| Error::Config(format!("{config_path}: {e}")))?;
     let (mut genesis, op, at) = config.genesis.agent_genesis().map_err(Error::Config)?;
-    // F-036: a chainspec book re-derives from its chainspec (`--chainspec <file>`).
     if let Some(c) = genesis.chainspec {
-        let path = opt(args, "--chainspec").ok_or_else(|| {
-            Error::Config("this genesis commits a chainspec: --chainspec <file> is required".into())
-        })?;
-        let spec = ledger_core::chainspec::ChainSpec::from_bytes(&std::fs::read(&path)?)
-            .map_err(|e| Error::Config(format!("{path}: {e:?}")))?;
+        let digest = hex::encode(c.digest);
+        let (from, bytes) = match (opt(args, "--chainspec"), archive) {
+            (Some(path), _) => {
+                let bytes = std::fs::read(&path)?;
+                (path, bytes)
+            }
+            (None, Some(a)) => {
+                let bytes = a
+                    .get_chainspec(&digest)
+                    .map_err(|e| Error::Restore(format!("the archive's chainspec: {e}")))?
+                    .ok_or_else(|| {
+                        Error::Config(format!(
+                            "this genesis commits chainspec {digest}, and the archive keeps none: \
+                             --chainspec <file> is required"
+                        ))
+                    })?;
+                (
+                    format!(
+                        "{}: {}",
+                        a.describe(),
+                        core_archive::archive::chainspec_name(&digest)
+                    ),
+                    bytes,
+                )
+            }
+            (None, None) => {
+                return Err(Error::Config(format!(
+                    "this genesis commits chainspec {digest}: --chainspec <file> is required"
+                )));
+            }
+        };
+        let spec = ledger_core::chainspec::ChainSpec::from_bytes(&bytes)
+            .map_err(|e| Error::Config(format!("{from}: {e:?}")))?;
         if spec.commitment() != c {
             return Err(Error::Config(format!(
-                "{path}: not the chainspec this genesis commits"
+                "{from}: not the chainspec this genesis commits"
             )));
         }
         genesis.spec = Some(std::sync::Arc::new(spec));
@@ -397,7 +468,8 @@ fn anchors(args: &[String]) -> Result<Option<verify::rpc::RpcAnchors>, Error> {
     }
 }
 
-/// Read and check the archive `--from`, and re-derive its book (`ops::agent`).
+/// Read and check the archive `--from`, and re-derive its book (`ops::agent`). The last item:
+/// whether its genesis commits a chainspec (`F-036`).
 fn archive_verified(
     args: &[String],
 ) -> Result<
@@ -405,14 +477,34 @@ fn archive_verified(
         core_archive::Archive,
         core_archive::Fetched,
         ops::agent::Verified,
+        bool,
     ),
     Error,
 > {
-    let founding = founding(args)?;
     let spec = arg(args, "--from")?;
     let archive = core_archive::open(&spec, core_archive::Access::Read).map_err(Error::Config)?;
+    let founding = founding(args, Some(&archive))?;
+    let concurrency = match opt(args, "--fetch-concurrency") {
+        Some(n) => n
+            .parse::<usize>()
+            .ok()
+            .filter(|n| (1..=MAX_FETCH_CONCURRENCY).contains(n))
+            .ok_or_else(|| {
+                Error::Config(format!(
+                    "--fetch-concurrency: segments read at once, 1 to {MAX_FETCH_CONCURRENCY}"
+                ))
+            })?,
+        None => core_archive::DEFAULT_CONCURRENCY,
+    };
     let book = core_archive::book_of(&founding.op);
-    let fetched = core_archive::fetch(&archive, Some(&book)).map_err(Error::Restore)?;
+    let read = std::time::Instant::now();
+    let fetched =
+        core_archive::fetch_with(&archive, Some(&book), concurrency).map_err(Error::Restore)?;
+    println!(
+        "read and checked {} segments in {} ms, {concurrency} at once",
+        fetched.segments,
+        read.elapsed().as_millis()
+    );
     for n in &fetched.notes {
         println!("note: {n}");
     }
@@ -425,6 +517,7 @@ fn archive_verified(
         ));
     }
     let layer = anchors(args)?;
+    let chainspec_book = founding.genesis.chainspec.is_some();
     let verified = ops::agent::verify(
         &fetched,
         &founding,
@@ -448,7 +541,7 @@ fn archive_verified(
                 c.header.point.entries
             ))
     );
-    Ok((archive, fetched, verified))
+    Ok((archive, fetched, verified, chainspec_book))
 }
 
 /// `restore core --from` (module documentation; `ops::agent`).
@@ -456,7 +549,7 @@ fn restore_core_from(args: &[String]) -> Result<(), Error> {
     let started = std::time::Instant::now();
     let started_at = now();
     let state = path(args, "--state")?;
-    let (archive, fetched, verified) = archive_verified(args)?;
+    let (archive, fetched, verified, chainspec_book) = archive_verified(args)?;
     let mut report = ops::drill::DrillReport {
         id: format!("restore-agent-{started_at}"),
         host: opt(args, "--host-name").unwrap_or_else(|| "opsctl".into()),
@@ -530,6 +623,21 @@ fn restore_core_from(args: &[String]) -> Result<(), Error> {
         if let Some(b) = opt(args, "--budget") {
             v.extend(["--budget".into(), b]);
         }
+        // F-036: a chainspec book's core host needs its chainspec too, and the verify-genesis
+        // report kept beside it, or the restored book takes no command. It reads both from the
+        // archive (`aledgent-core-host restore --archive`), by the digest genesis commits, unless
+        // a chainspec was given here; and it takes the genesis flags its own serve took.
+        if chainspec_book {
+            v.extend(["--archive".into(), arg(args, "--from")?]);
+        }
+        for name in ["--chainspec", "--genesis-manifest"] {
+            if let Some(x) = opt(args, name) {
+                v.extend([name.to_owned(), x]);
+            }
+        }
+        if flag(args, "--unnamed-code") {
+            v.push("--unnamed-code".into());
+        }
         Ok(v)
     };
     match opt(args, "--core-host") {
@@ -592,7 +700,11 @@ fn restore_core_from(args: &[String]) -> Result<(), Error> {
             record(&report)?;
             println!(
                 "next: {} (with the core host's secrets in its environment)",
-                host_args("aledgent-core-host")?.join(" ")
+                host_args("aledgent-core-host")?
+                    .iter()
+                    .map(|a| shell_word(a.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(" ")
             );
         }
     }
@@ -775,7 +887,7 @@ async fn run(args: &[String]) -> Result<(), Error> {
         #[cfg(feature = "postgres")]
         ["restore", "core-tail"] => restore_core_tail(args).await,
         ["archive", "verify"] => {
-            let (_, _, verified) = archive_verified(args)?;
+            let (_, _, verified, _) = archive_verified(args)?;
             if verified.passed() {
                 Ok(())
             } else {

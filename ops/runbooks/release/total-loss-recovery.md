@@ -76,16 +76,37 @@ recovery point").
 1. **Check the archive and lay it out on the fresh node.** On the replacement node (or the drill's
    isolated host), with the node's signer running and reading its keys from Vault (`F-035`: the
    deployment file's `core_keys` names them; no key goes into any environment, and the core host and
-   `opsctl` refuse or ignore one there), and a read-only role on the bucket:
+   `opsctl` refuse or ignore one there), and a read-only role on the bucket. Run it from the **core
+   image** the node ran (by digest): it carries `opsctl` beside `aledgent-core-host` and the Agent's
+   programs, which `--core-host` needs on one filesystem. Mount the deployment file, the signer's
+   socket directory and the empty state directory as the core's unit does:
 
    ```sh
-   opsctl restore core --from 's3://<bucket>/<prefix>?region=<region>' \
-     --config deployment.json --state /var/lib/aledgent/core \
+   podman run --rm --entrypoint /usr/local/bin/opsctl \
+     -v /etc/aledgent/ingress.json:/etc/aledgent/ingress.json:ro \
+     -v <signer socket dir>:<signer socket dir> \
+     -v /var/lib/aledgent/core:/var/lib/aledgent/core -v /var/lib/aledgent/drills:/var/lib/aledgent/drills \
+     <core image>@sha256:<digest> \
+     restore core --from 's3://<bucket>/<prefix>?region=<region>' \
+     --config /etc/aledgent/ingress.json --state /var/lib/aledgent/core \
      --anchors-rpc <Kreivo node URL> --report /var/lib/aledgent/drills \
-     --core-host aledgent-core-host --runtime agent_runtime.pvm --actor core.vos
+     --core-host aledgent-core-host \
+     --runtime /usr/share/aledgent/agent_runtime.pvm --actor /usr/share/aledgent/core.vos
    ```
 
-   It reads every segment and checks each one: its digest, its offsets and the entries' hash chain. It
+   Take the bucket and prefix from the core unit's `--archive`, without `kms-key-id`: the prefix is
+   per genesis (`core/g8`, not `core`). A chainspec book (`F-036`) needs its chainspec: `opsctl` reads
+   it from the archive (`<prefix>/chainspec/<digest>.bin`, by the digest the deployment's genesis
+   commits, and refuses any other), and passes `--archive` to the core host's `restore`, which lays
+   out the chainspec and its kept `verify-genesis` report. `--chainspec <file>` overrides the
+   archive's copy. Pass `--unnamed-code` and `--genesis-manifest <file>` when the core unit's `serve`
+   has them; `opsctl` hands both to the core host.
+
+   It reads every segment and checks each one: its digest, its offsets and the entries' hash chain.
+   The segments are read 32 at a time (`--fetch-concurrency <n>`, 1 to 256) and checked strictly in
+   order, as one at a time would: a missing or damaged segment ends or fails the read exactly as
+   before. One request a segment at 86 ms (the 2026-10-15 drill, with the CLI) is about 90 minutes for
+   65k segments one at a time, and **about 3 minutes** 32 at a time; it prints the time it took. It
    re-derives the book natively from genesis, reaching every entry's roots, and runs the drill's checks:
    `INV-6`, `INV-5`, the roots at the archive's point, `INV-19` against the anchors on Kreivo, and
    `NFR-4` against every archived reply. It **refuses** if any check fails. It also refuses if Kreivo
@@ -95,7 +116,9 @@ recovery point").
    Then it lays out the empty `--state` directory. `aledgent-core-host restore` starts the Agent from the
    archive's latest checkpoint and re-sends every archived input after it through VOS, each checked
    against its archived entry. The Agent must end at the archive's point: its input number, log head and
-   roots. Without `--core-host` it prints that command, to run on the node.
+   roots. Without `--core-host` it prints that command, to run on the node in the same image; it then
+   records no `roll-forward` check, so check the core host's `restore.done.json` by hand: its `rolled`
+   `to` and `kernel_root` are the archive's point.
 2. **Start the core host** on the directory, with the same `--archive` (the archiver resumes where the
    bucket stands). Do **not** start ingress yet.
 3. **Replay the received-log's tail** through the restored core:
