@@ -16,7 +16,9 @@
 //!    one refuses the whole feed, and nothing in it reaches the core;
 //! 2. an epoch below the highest seen for the partition is **fenced**: nothing runs; a higher one
 //!    is adopted, and its first sequence becomes the one expected (a new feeder resends from its
-//!    lowest undecided row);
+//!    lowest undecided row); the epoch is bound to the link (stream) that brought it, and the same
+//!    epoch on another open link is fenced too, so a core holding a stream to every instance
+//!    (`T-038-21`) takes commands from the lease's holder only ([`Core::feed_on`]);
 //! 3. within an epoch, an item below the expected sequence is a duplicate, answered from the
 //!    core's replies without running again (`INV-18`); an early arrival is held for
 //!    [`Sequencer::hold`] for the gap to fill, then refused with the sequence expected;
@@ -315,7 +317,14 @@ impl Feed {
 struct Position {
     epoch: u64,
     next: Option<u64>,
+    /// The link that brought the current epoch, while it is open (`T-038-21`): the same epoch on
+    /// any other link is refused.
+    link: Option<u64>,
 }
+
+/// The link id of feeds that name none: the socket link ([`crate::remote::serve`]), whose
+/// connections are one request each, and a caller in process.
+pub const SOCKET_LINK: u64 = u64::MAX;
 
 #[derive(Debug, Default)]
 struct Partition {
@@ -368,7 +377,7 @@ impl<C: Core> Sequencer<C> {
         Arc::clone(map.entry(name.to_owned()).or_default())
     }
 
-    async fn take(&self, feed: &Feed) -> FeedReply {
+    async fn take(&self, feed: &Feed, link: u64) -> FeedReply {
         if !feed.contiguous() {
             return FeedReply::Refused {
                 reason: "a feed's sequences are contiguous and it has an item".into(),
@@ -406,9 +415,19 @@ impl<C: Core> Sequencer<C> {
                 return FeedReply::Fenced { epoch: at.epoch };
             }
             if feed.epoch > at.epoch {
-                // A new feeder: it resends from its lowest undecided row.
+                // A new feeder: it resends from its lowest undecided row, on the link it came by.
                 at.epoch = feed.epoch;
                 at.next = Some(first);
+                at.link = Some(link);
+            }
+            match at.link {
+                // The epoch's feeder is on another open link: this one only reads (`T-038-21`).
+                Some(owner) if owner != link => {
+                    return FeedReply::Fenced { epoch: at.epoch };
+                }
+                // Its link closed: the feeder came back on a new one.
+                None => at.link = Some(link),
+                Some(_) => {}
             }
             let next = *at.next.get_or_insert(first);
             if first > next {
@@ -455,7 +474,27 @@ impl<C: Core> Core for Sequencer<C> {
     }
 
     async fn feed(&self, feed: &Feed) -> FeedReply {
-        self.take(feed).await
+        self.take(feed, SOCKET_LINK).await
+    }
+
+    async fn feed_on(&self, feed: &Feed, link: u64) -> FeedReply {
+        self.take(feed, link).await
+    }
+
+    async fn link_closed(&self, link: u64) {
+        let parts: Vec<Arc<Partition>> = self
+            .partitions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        for part in parts {
+            let mut at = part.at.lock().await;
+            if at.link == Some(link) {
+                at.link = None;
+            }
+        }
     }
 
     async fn outbox(
@@ -754,6 +793,43 @@ mod tests {
             vec![Err(CoreError::Unavailable)]
         );
         assert_eq!(seq.core().ran(), vec![1, 2]);
+    }
+
+    /// `T-038-21`: the lease's epoch is bound to the stream that brought it. The same epoch on
+    /// another open stream is fenced and runs nothing; a higher epoch on another stream takes
+    /// over; once the binding stream closes, its feeder may come back on a new one.
+    #[tokio::test]
+    async fn t_038_21_an_epoch_feeds_on_one_stream_only() {
+        let (seq, k) = sequencer();
+        assert_eq!(
+            answered(&seq.feed_on(&feed(1, 1, &[1], Some(&k)), 10).await),
+            vec![1]
+        );
+        assert_eq!(
+            seq.feed_on(&feed(1, 2, &[2], Some(&k)), 11).await,
+            FeedReply::Fenced { epoch: 1 }
+        );
+        assert_eq!(seq.core().ran(), vec![1], "the other stream ran nothing");
+        assert_eq!(
+            answered(&seq.feed_on(&feed(1, 2, &[2], Some(&k)), 10).await),
+            vec![2]
+        );
+        seq.link_closed(10).await;
+        assert_eq!(
+            answered(&seq.feed_on(&feed(1, 3, &[3], Some(&k)), 12).await),
+            vec![3],
+            "the feeder is back on a new stream"
+        );
+        assert_eq!(
+            answered(&seq.feed_on(&feed(2, 4, &[4], Some(&k)), 11).await),
+            vec![4],
+            "a new holder takes over on its own stream"
+        );
+        assert_eq!(
+            seq.feed_on(&feed(2, 5, &[5], Some(&k)), 12).await,
+            FeedReply::Fenced { epoch: 2 }
+        );
+        assert_eq!(seq.core().ran(), vec![1, 2, 3, 4]);
     }
 
     /// `DEC-27` (d), (f): the epoch is under ingress's signature. A captured item replayed under

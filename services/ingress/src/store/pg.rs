@@ -1344,6 +1344,51 @@ impl Store for PgStore {
             verifier: r.get(3),
         }))
     }
+
+    async fn advertise(
+        &self,
+        instance: &str,
+        address: &str,
+        ttl: std::time::Duration,
+    ) -> Result<Vec<crate::stream::RosterEntry>, StoreError> {
+        let c = self.client().await?;
+        let ms = i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX);
+        // The database's clock, as the feed lease's: the instances' clocks never decide who is
+        // live.
+        c.execute(
+            "INSERT INTO ingress_roster (instance, address, expires_at) \
+             VALUES ($1, $2, clock_timestamp() + $3::bigint * interval '1 millisecond') \
+             ON CONFLICT (instance) DO UPDATE SET \
+               address = EXCLUDED.address, expires_at = EXCLUDED.expires_at",
+            &[&instance, &address, &ms],
+        )
+        .await
+        .map_err(err)?;
+        Ok(c.query(
+            "SELECT instance, address FROM ingress_roster \
+             WHERE expires_at > clock_timestamp() ORDER BY instance",
+            &[],
+        )
+        .await
+        .map_err(err)?
+        .into_iter()
+        .map(|r| crate::stream::RosterEntry {
+            instance: r.get(0),
+            address: r.get(1),
+        })
+        .collect())
+    }
+
+    async fn withdraw(&self, instance: &str) -> Result<(), StoreError> {
+        let c = self.client().await?;
+        c.execute(
+            "DELETE FROM ingress_roster WHERE instance = $1",
+            &[&instance],
+        )
+        .await
+        .map_err(err)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

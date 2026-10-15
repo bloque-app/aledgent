@@ -11,8 +11,13 @@
 //! [`StreamCore`] sends a feed down the newest live session whose core writes the feed's partition,
 //! and a read down the newest live session that holds the principals role (credentials, ties) or
 //! writes the book (the rest). With no session, a feed is unavailable (nothing ran) and a read is
-//! unavailable: the replica answers credentials from its copy (`DEC-27` (e″)). A session lost with
-//! a call pending answers a feed as ambiguous and a read as unavailable.
+//! unavailable: the replica answers credentials from its copy (`DEC-27` (e″)) and a query
+//! `ERR-DecisionUnavailable`. A session lost with a call pending answers a feed as ambiguous and a
+//! read as unavailable.
+//!
+//! **The roster** (`T-038-21`): [`advertise`] keeps this instance in the fleet's roster in
+//! ingress's database; every greeting carries the live roster, and a change of it is sent down
+//! every live stream ([`StreamCore::set_roster`]), so each core keeps one stream to every instance.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -22,7 +27,7 @@ use ledger_core::account::Time;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
 
-use super::{Greeting, Hello, Msg, Timings, VERSIONS, negotiate, recv, send};
+use super::{Greeting, Hello, Msg, RosterEntry, Timings, VERSIONS, negotiate, recv, send};
 use crate::boundary::{
     CallerBody, Core, CoreError, CoreInput, CoreReply, CredentialBody, OutboxPage, Query,
     QueryReply,
@@ -75,6 +80,8 @@ struct Hub {
     sessions: Mutex<Vec<Arc<Session>>>,
     draining: AtomicBool,
     next_session: AtomicU64,
+    /// The fleet's live instances as this one last read them ([`advertise`]).
+    roster: Mutex<Vec<RosterEntry>>,
 }
 
 /// The core behind the streams the core hosts opened to this instance (module documentation).
@@ -102,8 +109,46 @@ impl StreamCore {
                 sessions: Mutex::new(Vec::new()),
                 draining: AtomicBool::new(false),
                 next_session: AtomicU64::new(1),
+                roster: Mutex::new(Vec::new()),
             }),
         }
+    }
+
+    /// This instance's name.
+    pub fn instance(&self) -> &str {
+        &self.hub.instance
+    }
+
+    /// How many streams cores have opened to this instance since it started.
+    pub fn streams_opened(&self) -> u64 {
+        self.hub.next_session.load(Ordering::SeqCst) - 1
+    }
+
+    /// The roster every greeting carries from now on (`T-038-21`); when it changed, it is sent
+    /// down every live stream too, so each core drops the instances that left and dials the ones
+    /// that came.
+    pub fn set_roster(&self, roster: Vec<RosterEntry>) {
+        {
+            let mut held = self.hub.roster.lock().unwrap_or_else(|p| p.into_inner());
+            if *held == roster {
+                return;
+            }
+            held.clone_from(&roster);
+        }
+        for s in self.all().iter().filter(|s| s.live()) {
+            let _ = s.out.send(Msg::Roster {
+                roster: roster.clone(),
+            });
+        }
+    }
+
+    /// The roster greetings carry.
+    pub fn roster(&self) -> Vec<RosterEntry> {
+        self.hub
+            .roster
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     fn all(&self) -> std::sync::MutexGuard<'_, Vec<Arc<Session>>> {
@@ -261,8 +306,10 @@ impl StreamCore {
         let welcome = Greeting::Welcome {
             version,
             instance: self.hub.instance.clone(),
+            roster: self.roster(),
         };
-        if send(&mut s, &welcome).await.is_err() {
+        if send(&mut s, &welcome).await.is_err() || hello.roster_only {
+            // A roster read (`T-038-21`): answered, and closed with no stream.
             return;
         }
         let (out, rx) = mpsc::unbounded_channel();
@@ -324,9 +371,34 @@ impl StreamCore {
                 }
                 Msg::Pong => {}
                 // A core never calls ingress, nor sends it away.
-                Msg::Call { .. } | Msg::GoAway { .. } => break,
+                Msg::Call { .. } | Msg::GoAway { .. } | Msg::Roster { .. } => break,
             }
         }
+    }
+}
+
+/// Keep `core`'s instance in the fleet's roster at `address` (`T-038-21`), renewing its entry every
+/// [`Timings::roster`] for [`Timings::roster_ttl`], and hand the live roster to every greeting it
+/// sends from then on. Once the instance drains, its entry is withdrawn, so the cores drop its
+/// stream, and the task ends. A store that does not answer leaves the last roster in place.
+pub async fn advertise<S: crate::store::Store>(store: S, core: StreamCore, address: String) {
+    let t = core.hub.timings;
+    loop {
+        if core.draining() {
+            core.set_roster(Vec::new());
+            if let Err(e) = store.withdraw(core.instance()).await {
+                tracing::warn!(error = %e, "the roster entry was not withdrawn; it lapses instead");
+            }
+            return;
+        }
+        match store
+            .advertise(core.instance(), &address, t.roster_ttl())
+            .await
+        {
+            Ok(roster) => core.set_roster(roster),
+            Err(e) => tracing::warn!(error = %e, "the roster was not renewed"),
+        }
+        tokio::time::sleep(t.roster).await;
     }
 }
 

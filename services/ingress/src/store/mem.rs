@@ -33,6 +33,8 @@ struct Inner {
     ties: HashMap<String, String>,
     feeds: HashMap<String, FeedLease>,
     verifiers: HashMap<String, crate::boundary::CredentialBody>,
+    /// The fleet's roster (`T-038-21`): each instance's address and when its entry lapses.
+    roster: HashMap<String, (String, Instant)>,
 }
 
 /// A partition's feed lease (`F-038`).
@@ -565,6 +567,35 @@ impl Store for MemStore {
         credential: &str,
     ) -> Result<Option<crate::boundary::CredentialBody>, StoreError> {
         Ok(self.lock().verifiers.get(credential).cloned())
+    }
+
+    async fn advertise(
+        &self,
+        instance: &str,
+        address: &str,
+        ttl: Duration,
+    ) -> Result<Vec<crate::stream::RosterEntry>, StoreError> {
+        let mut inner = self.lock();
+        let now = Instant::now();
+        inner
+            .roster
+            .insert(instance.to_owned(), (address.to_owned(), now + ttl));
+        inner.roster.retain(|_, (_, until)| *until > now);
+        let mut live: Vec<crate::stream::RosterEntry> = inner
+            .roster
+            .iter()
+            .map(|(i, (a, _))| crate::stream::RosterEntry {
+                instance: i.clone(),
+                address: a.clone(),
+            })
+            .collect();
+        live.sort();
+        Ok(live)
+    }
+
+    async fn withdraw(&self, instance: &str) -> Result<(), StoreError> {
+        self.lock().roster.remove(instance);
+        Ok(())
     }
 }
 

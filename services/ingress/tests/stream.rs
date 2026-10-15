@@ -64,6 +64,7 @@ fn timings() -> Timings {
         dead_after: Duration::from_millis(300),
         call_timeout: Duration::from_secs(20),
         hello_timeout: Duration::from_secs(2),
+        roster: Duration::from_millis(100),
     }
 }
 
@@ -1028,6 +1029,207 @@ async fn dec_27_e2_a_forged_key_proof_is_refused_at_the_door() {
             .await;
         assert_eq!(s, StatusCode::OK, "{r}");
     }
+}
+
+/// `T-038-21` (`DEC-27` (e′), the owner's option (b)): two instances share one database and each
+/// advertises itself in the roster; the core host dials the fleet's stable name, reads the roster
+/// and keeps one stream to each instance, dialed directly. A query to either instance is answered
+/// over its own stream. Only the feed lease's holder feeds: the same epoch on the other instance's
+/// stream is refused by the core host and runs nothing. When the feeding instance dies, the other
+/// takes the lease over the stream it already has, and commands are decided again with no new
+/// stream opened to it. An instance with no stream answers a query `ERR-DecisionUnavailable` (503,
+/// `Retry-After`) at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn t_038_21_a_core_dials_every_instance_from_the_roster() {
+    use ingress::boundary::{CoreInput, InputBody, InputKey};
+    use ingress::clock::Clock as _;
+    use ingress::feed::{Feed, FeedReply};
+    use tower::ServiceExt as _;
+    let quiet = |name: &str| {
+        let mut c = config(name, ingress_key());
+        c.tick_interval = Duration::from_secs(365 * 86_400);
+        c
+    };
+    let a = instance("ingress-a").await;
+    let b = instance("ingress-b").await;
+    let cfg = quiet("ingress-a");
+    let store = MemStore::new(cfg.lease);
+    let advertised = |i: &Instance| {
+        tokio::spawn(ingress::stream::advertise(
+            store.clone(),
+            i.hub.clone(),
+            format!("tls:{}", i.addr),
+        ))
+    };
+    let adv_a = advertised(&a);
+    let adv_b = advertised(&b);
+    until("both instances in the roster", || {
+        a.hub.roster().len() == 2 && b.hub.roster().len() == 2
+    })
+    .await;
+    // The stable name: a load balancer over both. The core dials only it.
+    let lb = proxy(vec![a.addr, b.addr]).await;
+    let h = host();
+    let dial = h.dial(vec![target(lb.addr, "core")]);
+    // The stream through the stable name brings the roster; then one stream to each instance,
+    // dialed directly, and the first one dropped.
+    until("a stream to each instance, dialed from the roster", || {
+        a.hub.sessions().len() == 1
+            && b.hub.sessions().len() == 1
+            && a.hub.streams_opened() + b.hub.streams_opened() == 3
+    })
+    .await;
+    let mut d = Deployment::assemble(
+        store.clone(),
+        cfg,
+        a.hub.clone(),
+        h.founded,
+        MemJournal::new(),
+    )
+    .await;
+    let alice = d.party("alice", 1_000).await;
+    let bob = d.party("bob", 0).await;
+    let (from, to) = (alice.account.clone().unwrap(), bob.account.clone().unwrap());
+    let (mut rb, router_b) = replica(&d, b.hub.clone(), quiet("ingress-b"));
+
+    // Reads: each instance answers over its own stream.
+    let custody = format!("/v1/accounts/{from}/custody");
+    for router in [&d.router, &router_b] {
+        let (s, v) = call(router, "GET", &custody, Some(&alice.token), &[], None).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+    }
+
+    // An instance the core has no stream to answers at once, with the named condition.
+    let (_rc, router_c) = replica(
+        &d,
+        StreamCore::new("ingress-c", timings()),
+        quiet("ingress-c"),
+    );
+    let started = Instant::now();
+    let req = axum::http::Request::builder()
+        .uri(&custody)
+        .header("authorization", format!("Bearer {}", alice.token))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = router_c.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        resp.headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok()),
+        Some("1")
+    );
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"], "ERR-DecisionUnavailable");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "never held open"
+    );
+
+    // Commands: one feeder. The same epoch on the other instance's stream runs nothing.
+    until("one instance feeds", || {
+        d.replica.shared.feeds().is_some() || rb.shared.feeds().is_some()
+    })
+    .await;
+    let a_feeds = d.replica.shared.feeds().is_some();
+    let epoch = if a_feeds {
+        d.replica.shared.feeds()
+    } else {
+        rb.shared.feeds()
+    }
+    .unwrap();
+    let send = |router: Router, key: String| {
+        let (token, from, to) = (alice.token.clone(), from.clone(), to.clone());
+        async move {
+            let (s, v) = call(
+                &router,
+                "POST",
+                "/v1/transfers",
+                Some(&token),
+                &[("client-key", &key)],
+                Some(transfer(&from, &to)),
+            )
+            .await;
+            assert_eq!(s, StatusCode::ACCEPTED, "{v}");
+        }
+    };
+    for i in 0..4 {
+        let r = if i % 2 == 0 { &d.router } else { &router_b };
+        send(r.clone(), format!("r-{i}")).await;
+    }
+    assert!(d.quiesce(PATIENCE).await, "every row decided");
+    assert!(
+        d.all_delivered(PATIENCE).await,
+        "every notification delivered"
+    );
+    assert!(d.quiesce(PATIENCE).await, "their records decided");
+    let next = d
+        .store
+        .rows()
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|r| r.feed_seq)
+        .max()
+        .unwrap()
+        + 1;
+    let inputs = h.inputs();
+    let fresh = CoreInput {
+        key: InputKey([0xCD; 16]),
+        body: InputBody::Tick { now: d.clock.now() },
+    };
+    let stray = Feed::build(
+        BOOK,
+        epoch,
+        &[(next, &fresh)],
+        Some(&ingress_key() as &dyn FeedSigner),
+    )
+    .unwrap();
+    let (other, survivor_router) = if a_feeds {
+        (&b, router_b.clone())
+    } else {
+        (&a, d.router.clone())
+    };
+    assert_eq!(
+        other.hub.feed(&stray).await,
+        FeedReply::Fenced { epoch },
+        "the core refuses a feed on the stream that does not hold the lease"
+    );
+    assert_eq!(h.inputs(), inputs, "nothing ran");
+
+    // The feeding instance dies: its replica, its listener and streams, its roster entry.
+    let opened = other.hub.streams_opened();
+    if a_feeds {
+        d.replica.kill();
+        a._serve.abort();
+        adv_a.abort();
+    } else {
+        rb.kill();
+        b._serve.abort();
+        adv_b.abort();
+    }
+    let survivor = if a_feeds {
+        Arc::clone(&rb.shared)
+    } else {
+        Arc::clone(&d.replica.shared)
+    };
+    let went = Instant::now();
+    until("the survivor feeds", || survivor.feeds().is_some()).await;
+    println!("T-038-21: the lease moved in {:?}", went.elapsed());
+    for i in 4..8 {
+        send(survivor_router.clone(), format!("r-{i}")).await;
+    }
+    assert!(d.quiesce(PATIENCE).await, "decided again");
+    assert_eq!(
+        other.hub.streams_opened(),
+        opened,
+        "the core did not reconnect to the survivor"
+    );
+    decided_in_feed_order(&d.store).await;
+    dial.abort();
 }
 
 /// `T-038-13` (`NFR-5`, `NFR-17`): `/ready` answers 200 while the replica serves and 503 once it

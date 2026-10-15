@@ -24,6 +24,18 @@
 //! **Go-away** (`DEC-27` (e)). A draining instance sends [`Msg::GoAway`] and refuses new
 //! handshakes; the core dials a new stream at once and keeps answering the old one until it closes.
 //!
+//! **The roster** (`T-038-21`, `DEC-27` (e′), the owner's option (b)). Each instance advertises,
+//! in ingress's database, an address its region's cores reach it at ([`hub::advertise`]); every
+//! [`Greeting::Welcome`] carries the live ones. A core host dials the fleet's stable name, reads
+//! the roster from it ([`Hello::roster_only`]), then keeps one stream to **every** instance in it,
+//! dialed directly, reading the roster again every [`Timings::roster`] and on every go-away, and
+//! dropping the streams of instances that left. So every instance reads from the core over its
+//! own stream, and when the feeding instance goes, another that already has a stream takes the
+//! lease: no reconnect on the way. Commands stay single-fed: only the feed lease's holder feeds,
+//! and the core host binds the lease's epoch to the stream that brought it
+//! ([`crate::feed::Sequencer`]), refusing the same epoch from any other stream. With an empty
+//! roster (one instance, nothing advertised) the core keeps the stream it dialed, as before.
+//!
 //! **Transports** ([`tls`]): mutual TLS over TCP under the operator's own CA (`tls:<host:port>`),
 //! or a Unix socket on the same host, authenticated by the peer's user id and a token as the socket
 //! link is (`unix:<path>`, `DEC-27` (h′)).
@@ -39,7 +51,7 @@ pub mod hub;
 pub mod tls;
 
 pub use dial::{DialConfig, Target, dial};
-pub use hub::{Listen, StreamCore};
+pub use hub::{Listen, StreamCore, advertise};
 
 /// The protocol version this build speaks.
 pub const VERSION: u32 = 1;
@@ -63,6 +75,20 @@ pub struct Hello {
     /// authenticates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// Only the roster is asked for (`T-038-21`): ingress answers [`Greeting::Welcome`] with it
+    /// and closes; no stream is opened.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub roster_only: bool,
+}
+
+/// One live ingress instance of the fleet (`T-038-21`, `DEC-27` (e′)): its name and the address its
+/// region's cores reach it at, as it advertises it in ingress's database.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct RosterEntry {
+    /// The instance's name.
+    pub instance: String,
+    /// `tls:<host:port>` or `unix:<path>`.
+    pub address: String,
 }
 
 impl core::fmt::Debug for Hello {
@@ -86,6 +112,11 @@ pub enum Greeting {
         version: u32,
         /// The instance's name, for the logs.
         instance: String,
+        /// The fleet's live instances, as ingress's database lists them (`T-038-21`): the core
+        /// host dials every one. Empty when the instance advertises none (one instance, a test):
+        /// the core keeps the stream it dialed.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        roster: Vec<RosterEntry>,
     },
     /// The stream is refused, and closes.
     Refused {
@@ -121,6 +152,11 @@ pub enum Msg {
         /// Why.
         reason: String,
     },
+    /// The fleet's live instances changed (`T-038-21`): ingress to core, on every stream.
+    Roster {
+        /// The live instances.
+        roster: Vec<RosterEntry>,
+    },
 }
 
 /// The stream's timings.
@@ -135,6 +171,9 @@ pub struct Timings {
     pub call_timeout: Duration,
     /// How long a connection has to complete its handshake.
     pub hello_timeout: Duration,
+    /// How often the core host reads the roster again (`T-038-21`), besides on every go-away; and
+    /// how often an instance renews its own entry in it.
+    pub roster: Duration,
 }
 
 impl Default for Timings {
@@ -144,7 +183,16 @@ impl Default for Timings {
             dead_after: Duration::from_secs(3),
             call_timeout: Duration::from_secs(60),
             hello_timeout: Duration::from_secs(5),
+            roster: Duration::from_secs(2),
         }
+    }
+}
+
+impl Timings {
+    /// How long an instance's roster entry lives without a renewal: three renewals, so one
+    /// missed write does not drop a live instance, and a dead one leaves within seconds.
+    pub fn roster_ttl(&self) -> Duration {
+        self.roster * 3
     }
 }
 
@@ -217,6 +265,7 @@ mod tests {
             partitions: vec!["book".into()],
             principals: true,
             token: Some("secret-token".into()),
+            roster_only: false,
         };
         assert!(!format!("{hello:?}").contains("secret"));
         let back: Hello = serde_json::from_slice(&serde_json::to_vec(&hello).unwrap()).unwrap();

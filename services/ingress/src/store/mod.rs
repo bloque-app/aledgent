@@ -628,4 +628,16 @@ pub trait Store: Clone + Send + Sync + 'static {
         &self,
         credential: &str,
     ) -> impl Future<Output = Result<Option<crate::boundary::CredentialBody>, StoreError>> + Send;
+
+    /// Advertise `instance` at `address` in the fleet's roster for `ttl` on the store's clock
+    /// (`T-038-21`, `DEC-27` (e′)), and return the live roster, this instance included, by name.
+    fn advertise(
+        &self,
+        instance: &str,
+        address: &str,
+        ttl: std::time::Duration,
+    ) -> impl Future<Output = Result<Vec<crate::stream::RosterEntry>, StoreError>> + Send;
+
+    /// Take `instance` out of the roster: on drain, so the cores drop its stream.
+    fn withdraw(&self, instance: &str) -> impl Future<Output = Result<(), StoreError>> + Send;
 }

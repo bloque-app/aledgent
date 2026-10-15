@@ -168,6 +168,14 @@ async fn serve(args: &[String]) -> Result<(), String> {
                 tracing::error!(error = %e, "the core stream's listener stopped");
             }
         });
+        // T-038-21: this instance in the fleet's roster, at the address its region's cores reach.
+        let address = s.advertised_address()?;
+        tracing::info!(%address, "advertising this instance to the cores");
+        tokio::spawn(ingress::stream::advertise(
+            store.clone(),
+            core.clone(),
+            address,
+        ));
         let drain = s.drain();
         return run(c, store, core.clone(), signer, Some((core, drain))).await;
     }
@@ -342,6 +350,11 @@ async fn run<C: Core + Clone>(
             tracing::info!(?drain, "draining");
             service::drain(&shared, drain).await;
             if let Some((hub, _)) = &stream {
+                // Out of the roster first, so the cores the go-away sends to re-read it drop
+                // this instance (`T-038-21`).
+                if let Err(e) = shared.store.withdraw(hub.instance()).await {
+                    tracing::warn!(error = %e, "the roster entry was not withdrawn; it lapses");
+                }
                 hub.go_away("draining");
                 tokio::time::sleep(drain).await;
             }

@@ -345,7 +345,8 @@ async fn t_009_06_one_leader_and_a_dead_leader_is_replaced() {
 /// `T-038-03` on PostgreSQL (`DEC-27` (d)): one holder of the book's feed lease at a time, on the
 /// database's clock; the epoch rises on a change of holder, never on a renewal; a stale holder's
 /// mark is fenced and marks nothing; sequences are gapless and kept by a resend, and the rows in
-/// flight come back first. The verifier copy keeps and forgets (`T-038-10`).
+/// flight come back first. The verifier copy keeps and forgets (`T-038-10`). The roster lists the
+/// live instances (`T-038-21`).
 #[tokio::test(flavor = "multi_thread")]
 async fn t_038_03_the_feed_lease_on_postgres() {
     use ingress::feed::BOOK;
@@ -428,6 +429,24 @@ async fn t_038_03_the_feed_lease_on_postgres() {
     assert_eq!(b.copied_verifier("c").await.unwrap(), Some(body));
     b.copy_verifier("c", None, 2).await.unwrap();
     assert_eq!(a.copied_verifier("c").await.unwrap(), None);
+
+    // T-038-21: the roster on the database's clock: both instances listed; one withdrawn on
+    // drain; one whose entry lapses leaves it.
+    let ttl = Duration::from_millis(300);
+    a.advertise("a", "tls:10.0.0.1:7443", ttl).await.unwrap();
+    let roster = b.advertise("b", "tls:10.0.0.2:7443", ttl).await.unwrap();
+    let names: Vec<&str> = roster.iter().map(|e| e.instance.as_str()).collect();
+    assert_eq!(names, ["a", "b"]);
+    assert_eq!(roster[1].address, "tls:10.0.0.2:7443");
+    b.withdraw("b").await.unwrap();
+    let roster = a.advertise("a", "tls:10.0.0.1:7443", ttl).await.unwrap();
+    assert_eq!(roster.len(), 1);
+    b.advertise("b", "tls:10.0.0.2:7443", Duration::from_millis(1))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let roster = a.advertise("a", "tls:10.0.0.1:7443", ttl).await.unwrap();
+    assert_eq!(roster.len(), 1, "a lapsed entry leaves the roster");
 }
 
 /// `T-009-03`, `REQ-AR-7` end to end on PostgreSQL: two replicas share the log; transfers are

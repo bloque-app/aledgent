@@ -537,6 +537,24 @@ pub trait Core: Send + Sync + 'static {
         }
     }
 
+    /// Take a feed that came by the core host's link `link` (`T-038-21`): the host's sequencer
+    /// binds the feed lease's epoch to the link that brought it, so any other stream only reads.
+    /// The default ignores the link.
+    fn feed_on(
+        &self,
+        feed: &crate::feed::Feed,
+        link: u64,
+    ) -> impl Future<Output = crate::feed::FeedReply> + Send {
+        let _ = link;
+        self.feed(feed)
+    }
+
+    /// The core host's link `link` closed: an epoch it brought may come back on another link.
+    fn link_closed(&self, link: u64) -> impl Future<Output = ()> + Send {
+        let _ = link;
+        async {}
+    }
+
     /// Whether this replica can reach a core that writes `partition` now (`F-038` §3): a replica
     /// takes the feed lease and leadership only while it can. A core in process or behind the
     /// socket always can; the stream's only while a core has a stream open to this replica.

@@ -484,6 +484,30 @@ pub struct StreamSection {
     /// Absent: 5 000.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drain_ms: Option<u64>,
+    /// The address this instance's region's cores reach it at, advertised in the fleet's roster
+    /// (`T-038-21`): `tls:<host:port>` or `unix:<path>`. Absent: detected from `listen`
+    /// ([`StreamSection::advertised_address`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advertise: Option<String>,
+    /// How often an instance renews its roster entry, and a core host reads the roster again,
+    /// milliseconds. Absent: 2 000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roster_ms: Option<u64>,
+}
+
+/// The address of the interface this host routes from: a UDP socket "connected" to a
+/// documentation address (RFC 5737, RFC 3849), which sends nothing, and its local address read
+/// back.
+fn routed_ip(v6: bool) -> Option<std::net::IpAddr> {
+    let (bind, probe) = if v6 {
+        ("[::]:0", "[2001:db8::1]:9")
+    } else {
+        ("0.0.0.0:0", "192.0.2.1:9")
+    };
+    let s = std::net::UdpSocket::bind(bind).ok()?;
+    s.connect(probe).ok()?;
+    let ip = s.local_addr().ok()?.ip();
+    (!ip.is_unspecified()).then_some(ip)
 }
 
 /// How long a draining ingress keeps answering, by default.
@@ -510,6 +534,9 @@ impl StreamSection {
                         .into(),
                 );
             }
+        }
+        if let Some(a) = &self.advertise {
+            crate::stream::Address::parse(a).map_err(|e| format!("stream.advertise: {e}"))?;
         }
         if self.development_feed_key.is_some() && profile != Profile::Development {
             return Err(
@@ -557,8 +584,39 @@ impl StreamSection {
             dead_after: self
                 .dead_after_ms
                 .map_or(d.dead_after, Duration::from_millis),
+            roster: self.roster_ms.map_or(d.roster, Duration::from_millis),
             ..d
         }
+    }
+
+    /// The address this instance advertises in the fleet's roster (`T-038-21`): `advertise` as
+    /// configured; or `listen` itself when it names a Unix socket or a specific host; or, for a
+    /// listener on every interface (`0.0.0.0`, `[::]`), the address of the interface this host
+    /// routes from (a task's or pod's own address on ECS or Kubernetes), with `listen`'s port.
+    pub fn advertised_address(&self) -> Result<String, String> {
+        if let Some(a) = &self.advertise {
+            crate::stream::Address::parse(a)?;
+            return Ok(a.clone());
+        }
+        let listen = self.listen.as_deref().ok_or("stream.listen is missing")?;
+        let crate::stream::Address::Tls(addr) = crate::stream::Address::parse(listen)? else {
+            return Ok(listen.to_owned());
+        };
+        let bound: std::net::SocketAddr = match addr.parse() {
+            Ok(a) => a,
+            // A host name: the cores resolve it as this instance does.
+            Err(_) => return Ok(listen.to_owned()),
+        };
+        if !bound.ip().is_unspecified() {
+            return Ok(listen.to_owned());
+        }
+        let ip = routed_ip(bound.is_ipv6()).ok_or(
+            "stream.advertise: this instance's address could not be detected (no route); set it",
+        )?;
+        Ok(format!(
+            "tls:{}",
+            std::net::SocketAddr::new(ip, bound.port())
+        ))
     }
 
     /// How long a draining ingress keeps answering.
@@ -1104,6 +1162,37 @@ mod tests {
         for (v, p) in accepted {
             assert!(s(v.clone()).check(p).is_ok(), "{v} under {p:?}");
         }
+    }
+
+    /// `T-038-21`: the advertised address is the configured one; else `listen` when it names a
+    /// host or a socket; else, on every interface, this host's routed address with `listen`'s
+    /// port. A malformed one is refused at load.
+    #[test]
+    fn t_038_21_the_advertised_address() {
+        let s = |v: serde_json::Value| serde_json::from_value::<StreamSection>(v).unwrap();
+        let tls = serde_json::json!({ "ca": "ca.pem", "cert": "c.pem", "key": "c.key" });
+        assert_eq!(
+            s(serde_json::json!({ "listen": "tls:0.0.0.0:7443", "advertise": "tls:10.0.0.7:7443" }))
+                .advertised_address(),
+            Ok("tls:10.0.0.7:7443".into())
+        );
+        for listen in [
+            "tls:10.1.2.3:7443",
+            "tls:ingress-a.internal:7443",
+            "unix:/run/i.sock",
+        ] {
+            assert_eq!(
+                s(serde_json::json!({ "listen": listen })).advertised_address(),
+                Ok(listen.into())
+            );
+        }
+        if let Ok(a) = s(serde_json::json!({ "listen": "tls:0.0.0.0:7443" })).advertised_address() {
+            assert!(a.starts_with("tls:") && a.ends_with(":7443") && !a.contains("0.0.0.0"));
+        }
+        let bad = s(
+            serde_json::json!({ "listen": "tls:0.0.0.0:7443", "tls": tls, "advertise": "10.0.0.7" }),
+        );
+        assert!(bad.check(Profile::Development).is_err());
     }
 
     /// `T-038-14`, `DEC-27` (f): in production the core host refuses to start without
