@@ -85,6 +85,42 @@ measurements in `notes/MEASUREMENTS-F005.md` used `MAX_RUNTIME_PROGRAM_BYTES` an
 copy (`--config` with a `[patch."https://codeberg.org/pandres95/VOS.git"]` table). The change is
 drafted as `proposals/vos/0003`.
 
+## A new host on a deployment's genesis bytes (`F-038` §12 step 0)
+
+A deployment's core image is pinned by digest and never updated in place: its chainspec's genesis
+code names the package (`core.vos`) and the runtime (`agent_runtime.pvm`) byte for byte, and a
+rebuild from source need not reproduce them. To give such a deployment a newer host (the stream
+link of `F-038`, for one), build an image of the **current host with the package and the runtime
+copied from the deployment's pinned image** (`DEC-27` (i)). The Agent does not change; the host's
+own binary is not checked on a restart with a replica (`code.rs`).
+
+1. **The genesis code.** The manifest the chainspec was built with (`code.bin`, the file
+   `migrate chainspec build --code` took), or one taken from the chainspec, with the genesis bytes
+   copied out of the pinned image and a current core image's host:
+
+        id=$(docker create <pinned core image>@sha256:<digest>)
+        docker cp "$id:/usr/share/aledgent" genesis && docker rm "$id"
+        docker run --rm --user "$(id -u)" -v "$PWD:/w" <a current aledgent-core image> check-code \
+          --chainspec /w/chainspec.bin --actor /w/genesis/core.vos \
+          --runtime /w/genesis/agent_runtime.pvm --write-manifest /w/code.bin
+
+   `check-code` prints the genesis code's version *H₀* and refuses bytes that are not its. A book
+   founded without a chainspec has no genesis code: a manifest written by the pinned image's own
+   host (`code-manifest`) proves only that the bytes are that image's, which the digest already
+   does.
+2. **The image.** A manual dispatch of `.github/workflows/images.yml` from `main` or `develop` with
+   `genesis_image` (`ghcr.io/bloque-app/aledgent-core@sha256:…`), `genesis_manifest`
+   (`xxd -p code.bin | tr -d '\n'`) and, best, `genesis_code` (*H₀*). It builds this repository's
+   host with the genesis image's roots, copies the two programs from that image, and fails unless
+   `check-code` passes; nothing else is built. The result is pushed as
+   `ghcr.io/bloque-app/aledgent-core:host-<commit>-on-genesis-<the genesis digest's first 12 hex>`,
+   never as `sha-<commit>` or a version, so it is never taken for a core built from source; it
+   carries the check's report in `/usr/share/aledgent/genesis-code.json` and the genesis image in
+   the label `app.aledgent.genesis.image`. Outside CI the same build is
+   `deploy/docker/core.Dockerfile`'s target `core-on-genesis` (its header).
+3. **The deployment** pins the new image by digest, as it pinned the old one; on its first restart
+   the host checks the package and the runtime against the chainspec again, as every restart does.
+
 ## aledgent's runtime (`F-033`)
 
     # The runtime, against the VOS its Cargo.toml pins (or --config a [patch] onto a checkout).

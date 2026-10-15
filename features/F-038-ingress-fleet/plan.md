@@ -285,6 +285,27 @@ the link in a log line at start.
    `ingress_keys` and no `stream.dial`, runs against the legacy ingress as the old one did. Then the keys
    go on both sides (`ingress_keys` on the host, `stream.feed_key` on ingress, in one `stream` section),
    which switches ingress to the sequenced feed on the same socket; then the new link (step 1 onwards).
+
+   *How the host is rebuilt* (`T-038-25`). A rebuild of the package from source need not reproduce
+   the genesis bytes, so the image is never rebuilt whole: `deploy/docker/core.Dockerfile`'s target
+   `core-on-genesis` builds the current `aledgent-core-host` (the same steps as a core from source)
+   and copies `core.vos` and `agent_runtime.pvm` from the deployment's core image, named by digest
+   (`GENESIS_IMAGE`). Before the image is made, the new host's `check-code` checks the copied bytes
+   against the deployment's genesis code — the chainspec's header, or the manifest the chainspec
+   was built with — exactly as a restart checks them (package and runtime, in this build's
+   construction; the host itself is not checked, `DEC-27` (i)), and against *H₀* when given; any
+   difference fails the build. The host takes the genesis image's roots. CI builds it on a manual
+   dispatch with `genesis_image`, `genesis_manifest` and `genesis_code`, and builds nothing else;
+   the image is pushed as `aledgent-core:host-<commit>-on-genesis-<the genesis digest's first 12
+   hex>`, never as `sha-<commit>` or a version, so it cannot be taken for a core built from source.
+   Every pull request that touches the images builds it on the current release's core image and
+   requires it to pass, and requires a copy of that image with one byte of `core.vos` changed, and
+   a genesis named by tag, to fail. The operator's steps are in `agents/README.md`.
+
+   *Trade-off, stated plainly:* the check proves that the image carries the genesis code's package
+   and runtime; it does not prove that the new host decides as the genesis host did. That rests on
+   the frozen call format (`DEC-26` (d)) and on the restart's genesis check against the manifest's
+   roots, as it did before this feature.
 1. Release this feature everywhere: the node's ingress (socket), the core host (socket and stream), with
    `ingress_keys` and the feed key configured on both. The node's ingress now feeds under the lease, signed.
 2. Start the fleet's instances in stream mode beside it. Whichever holds the lease feeds; the other cannot
