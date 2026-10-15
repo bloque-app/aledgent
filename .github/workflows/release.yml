@@ -70,11 +70,31 @@ jobs:
       tag: ${{ steps.rp.outputs.tag_name }}
       # The released commit: a run queued behind another may run at a later head of main.
       sha: ${{ steps.rp.outputs.sha }}
+    # The App's credentials live in the `release` environment (main and develop only). A pull
+    # request opened with the workflow's own token starts no workflow, so the release pull
+    # request's required checks would never run (owner ruling v0w-release-please-token,
+    # 2026-10-14): release-please acts as the aledgent-release App instead.
+    environment: release
+    env:
+      HAS_APP: ${{ secrets.ALEDGENT_RELEASE_APP_ID != '' && secrets.ALEDGENT_RELEASE_APP_KEY != '' }}
     steps:
+      - name: The aledgent-release App's token
+        id: app
+        if: env.HAS_APP == 'true'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.ALEDGENT_RELEASE_APP_ID }}
+          private-key: ${{ secrets.ALEDGENT_RELEASE_APP_KEY }}
+          owner: bloque-app
+          repositories: aledgent
+          permission-contents: write
+          permission-pull-requests: write
       - id: rp
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # Without the App (a fork, or its secrets unset) the workflow's token still works; its
+          # release pull request then needs a push to start its checks.
+          token: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
