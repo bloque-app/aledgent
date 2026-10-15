@@ -1016,7 +1016,7 @@ the writer of its own partitions. *Decision:*
   profile), cached at most `NFR-20` old, and the queries it serves. Those reads go up the stream the core
   host that holds the principals role (or the queried state) opened, and their answers come back down it,
   as commands do. No core is ever dialed for a read either. *Every instance reads* (the owner's ruling
-  of 2026-10-15 on `T-038-21`, option (b)): each region's cores are deployed beside that region's own
+  of 2026-10-15, option (b)): each region's cores are deployed beside that region's own
   set of ingress instances, which hold the region's partitions, so a core only ever dials its own
   region's instances. Each instance advertises, in ingress's database, an address its region's cores
   reach it at (configured, or detected from its listener): a roster of live instances, renewed every few
@@ -1061,7 +1061,7 @@ the writer of its own partitions. *Decision:*
   decides within `NFR-16` (no core connected, or a handover in progress), ingress answers
   `ERR-DecisionUnavailable` (`REQ-CS-7`). What is forbidden is a 5xx with nothing behind it: no instance
   answering, a bare 502 or 504 from a load balancer. A 503 from ingress carrying the named error is
-  allowed (the owner's ruling of 2026-10-15 on `T-038-23`): it keeps HTTP 503, with a `Retry-After` of one
+  allowed (the owner's ruling of 2026-10-15): it keeps HTTP 503, with a `Retry-After` of one
   second, `NFR-16`'s bound and the order of a planned hand-over, so a client retrying with the same client
   key usually finds a core deciding again. A command that moves value is acknowledged and decided once a
   core takes it.
