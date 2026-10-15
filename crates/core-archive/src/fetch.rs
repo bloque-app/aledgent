@@ -128,11 +128,12 @@ pub fn fetch_with(
     } else {
         let ahead = Ahead::new(end, concurrency);
         std::thread::scope(|s| {
+            // Stops the readers however the check ends, before the scope waits for them; taken
+            // before any reader starts, so a reader that fails to spawn stops those already running.
+            let _stop = StopOnDrop(&ahead);
             for _ in 0..concurrency.min(usize::try_from(end).unwrap_or(usize::MAX)) {
                 s.spawn(|| ahead.work(source));
             }
-            // Stops the readers however the check ends, before the scope waits for them.
-            let _stop = StopOnDrop(&ahead);
             read_segments(end, book, &mut notes, &mut damaged, &mut |n| ahead.take(n))
         })?
     };
