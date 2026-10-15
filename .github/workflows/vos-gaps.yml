@@ -1,0 +1,93 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+name: VOS gaps (manual)
+
+# The tests of the VOS fork's gap branches (codeberg.org/pandres95/VOS, `gap/1` ... `gap/5`):
+# the changes aledgent needs from VOS that upstream `saga/agents` does not have yet (PLAN.md,
+# `DEP-11`). One job per branch, each on a GitHub-hosted Linux runner, since VOS's multi-node code
+# is Linux-only:
+#
+# - gap1, `gap/1-space-join`: a node joins a Space beyond its fixed roster (enrolment);
+# - gap2, `gap/2-shared-create`: a Shared Agent created, installed and invoked across replicas,
+#   and a replica joining from a common checkpoint;
+# - gap3, `gap/3-change-replicas`: a signed `ChangeReplicas`, the membership change of a Shared
+#   Agent's committee (voter replacement, one voter to three, fresh joiners, observers);
+# - gap4, `gap/4-local-rehost`: a Local Agent exported from one host and imported on another;
+# - gap5, `gap/5-checkpoint-archive`: the checkpoint-archive sink and source.
+#
+# Each job builds the candidate Authority ELF from its checkout, runs every non-ignored `vos` and
+# `vosx` test, then the branch's own tests with `--include-ignored` (.github/vos-gaps/run.sh).
+# Five upstream tests that fail on `saga/agents` itself are skipped, and run.sh lists them.
+# A run tests each branch's current tip and prints the commit it tested.
+#
+# Manual only. Never add a push, pull_request or schedule trigger here.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vos-gaps
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.key }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      # Hosted-runner slots are shared with the rest of CI: take at most three, in this order.
+      max-parallel: 3
+      matrix:
+        include:
+          - key: gap2
+            url: https://codeberg.org/pandres95/VOS.git
+            ref: gap/2-shared-create
+          - key: gap3
+            url: https://codeberg.org/pandres95/VOS.git
+            ref: gap/3-change-replicas
+          - key: gap1
+            url: https://codeberg.org/pandres95/VOS.git
+            ref: gap/1-space-join
+          # Baseline row (upstream saga/agents); re-enable when its tip moves.
+          # - key: base
+          #   url: https://codeberg.org/Virto/VOS.git
+          #   ref: saga/agents
+          - key: gap5
+            url: https://codeberg.org/pandres95/VOS.git
+            ref: gap/5-checkpoint-archive
+          - key: gap4
+            url: https://codeberg.org/pandres95/VOS.git
+            ref: gap/4-local-rehost
+    env:
+      VOS_URL: ${{ matrix.url }}
+      VOS_REF: ${{ matrix.ref }}
+      KEY: ${{ matrix.key }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: disk
+        run: |
+          set -eux
+          df -h / /mnt || true
+          # Free the preinstalled SDKs we never use; VOS test builds are large.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo mkdir -p /mnt/w && sudo chown "$USER" /mnt/w
+          df -h / /mnt
+      - name: system packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends clang lld pkg-config libssl-dev cmake protobuf-compiler >/dev/null
+      - name: tests
+        run: bash .github/vos-gaps/run.sh
+      - name: summary
+        if: always()
+        run: if [ -f /mnt/w/out/summary.md ]; then cat /mnt/w/out/summary.md >> "$GITHUB_STEP_SUMMARY"; fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vos-gaps-${{ matrix.key }}
+          path: /mnt/w/out
+          if-no-files-found: warn
+          retention-days: 14
