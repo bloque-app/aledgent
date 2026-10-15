@@ -105,12 +105,14 @@ own binary is not checked on a restart with a replica (`code.rs`).
           --runtime /w/genesis/agent_runtime.pvm --write-manifest /w/code.bin
 
    `check-code` prints the genesis code's version *H₀* and refuses bytes that are not its. A book
-   founded without a chainspec has no genesis code: a manifest written by the pinned image's own
-   host (`code-manifest`) proves only that the bytes are that image's, which the digest already
-   does.
+   founded without a chainspec has no genesis code to give: a manifest written by the pinned image's
+   own host (`code-manifest`) proves only that the bytes are that image's, which the digest already
+   does. The CI workflow below needs *H₀*, so such a book cannot be rebuilt through CI; it can only
+   be rebuilt locally (the Dockerfile's target, below), with the code hash known by other means.
 2. **The image.** A manual dispatch of `.github/workflows/images.yml` from `main` or `develop` with
    `genesis_image` (`ghcr.io/bloque-app/aledgent-core@sha256:…`), `genesis_manifest`
-   (`xxd -p code.bin | tr -d '\n'`) and, best, `genesis_code` (*H₀*). It builds this repository's
+   (`xxd -p code.bin | tr -d '\n'`) and `genesis_code` (*H₀*, 64 hex, either case), which is
+   required: the run stops at its first step without it. It builds this repository's
    host with the genesis image's roots, copies the two programs from that image, and fails unless
    `check-code` passes; nothing else is built. The result is pushed as
    `ghcr.io/bloque-app/aledgent-core:host-<commit>-on-genesis-<the genesis digest's first 12 hex>`,

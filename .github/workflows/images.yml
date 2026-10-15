@@ -85,7 +85,7 @@ on:
         type: string
         default: ""
       genesis_code:
-        description: "With genesis_image, required: the genesis code version H0 (64 hex) the manifest must have"
+        description: "With genesis_image, required: the genesis code version H0 (64 hex, either case) the manifest must have"
         type: string
         default: ""
   workflow_call:
@@ -604,7 +604,10 @@ jobs:
             python3 -c 'import sys; sys.stdout.buffer.write(bytes.fromhex(sys.argv[1]))' \
               "$GENESIS_MANIFEST" > "$code/code.bin"
             # Required on a dispatch: without H0 the check proves only that the bytes are the supplied
-            # manifest's, not the deployment's genesis code (review of #28).
+            # manifest's, not the deployment's genesis code (review of #28). Either case is accepted
+            # and lowercased here, once, so that the check, the build argument and the output all
+            # carry the same lowercase value.
+            GENESIS_CODE="${GENESIS_CODE,,}"
             if ! [[ "$GENESIS_CODE" =~ ^[0-9a-f]{64}$ ]]; then
               echo "::error::genesis_code: the deployment's genesis code version H0 (64 hex) is required with genesis_image, not '$GENESIS_CODE'"
               exit 1
