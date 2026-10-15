@@ -95,9 +95,10 @@ jobs:
           owner: bloque-app
           repositories: aledgent
           permission-contents: write
+          # Pull requests write also covers the release pull request's labels
+          # (`autorelease: pending`, `autorelease: tagged`); the App has no Issues
+          # permission, and asking for one would fail the mint.
           permission-pull-requests: write
-          # The release pull request's labels (`autorelease: pending`, `autorelease: tagged`).
-          permission-issues: write
       - id: rp
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
