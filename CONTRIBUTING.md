@@ -103,9 +103,11 @@ are protected alike (one approving review, code owners, the required checks, sig
   release pull request open against `main` that bumps the workspace version and `CHANGELOG.md`: a
   `feat` is a minor release, a `fix` or anything else a patch, a breaking change (`feat!:`, or a
   `BREAKING CHANGE:` footer) a major one, or a minor one before 1.0.0. Merging it tags `vX.Y.Z` and
-  publishes the release. GitHub does not run checks on a pull request opened by its own Actions
-  token: close and reopen the release pull request to run them. After a release, merge `main` back
-  into `develop`.
+  publishes the release. release-please opens that pull request as the `aledgent-release` GitHub
+  App, so its checks start on their own. Only if the App's secrets are missing from the `release`
+  environment does it fall back to the Actions token (the release workflow warns), and GitHub does
+  not run checks on a pull request that token opened: then close and reopen the release pull
+  request to run them. After a release, merge `main` back into `develop`.
 - **Images.** A release or a pre-release publishes every image to `ghcr.io/bloque-app/aledgent-<name>`
   (ingress, settle, ops, signer, core, sidecar) as `sha-<commit>` and `v<version>` (`+` becomes `_`
   in an image tag), and attaches `images.json`, each image by digest (`.github/workflows/release.yml`).
