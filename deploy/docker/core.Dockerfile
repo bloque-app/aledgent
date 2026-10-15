@@ -44,16 +44,19 @@
 #   docker buildx build -f deploy/docker/core.Dockerfile --target core-on-genesis \
 #     --build-arg GENESIS_IMAGE=ghcr.io/bloque-app/aledgent-core@sha256:<digest> \
 #     --build-arg ROOTS=<the genesis image's app.aledgent.roots> \
-#     [--build-arg GENESIS_CODE=<H0, 64 hex>] \
+#     --build-arg GENESIS_CODE=<H0, 64 hex> \
 #     --build-context genesis-code=<dir with code.bin or chainspec.bin> .
 #
 # GENESIS_IMAGE must name its image by digest. `genesis-code` is a directory holding either the
 # deployment's genesis code manifest (`code.bin`, `aledgent/code/v1`, as `code-manifest --out` and
 # `check-code --write-manifest` write it) or its chainspec (`chainspec.bin`, whose header names the
-# code); GENESIS_CODE, when given, must be that code's version. The host is built with ROOTS, which
-# must be the genesis's: the check refuses a manifest of another construction. The image carries
-# the check's report as /usr/share/aledgent/genesis-code.json and the genesis image as the label
-# `app.aledgent.genesis.image`. Without a target the build is `core`, as before.
+# code); GENESIS_CODE must be that code's version, and is required: without it the check proves
+# only that the bytes are the supplied manifest's, not the deployment's genesis code. The workflow
+# images.yml always passes it, and so cannot rebuild a book that has no chainspec; the target itself
+# still accepts it empty, for a local build where the manifest is trusted. The host is built with
+# ROOTS, which must be the genesis's: the check refuses a manifest of another construction. The
+# image carries the check's report as /usr/share/aledgent/genesis-code.json and the genesis image as
+# the label `app.aledgent.genesis.image`. Without a target the build is `core`, as before.
 
 ARG ROOTS=v2
 # The deployment's pinned core image, for `core-on-genesis` only (scratch: none, and that target
