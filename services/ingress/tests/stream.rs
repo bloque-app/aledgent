@@ -671,6 +671,9 @@ async fn dec_27_f_a_forwarded_command_without_a_valid_signature_never_reaches_th
     d.replica.kill();
     let forger = LocalFeedKey::from_seed([0x66; 32]);
     let (rx, router_x) = replica(&d, a.hub.clone(), config("ingress-x", forger));
+    until("x feeds", || rx.shared.feeds().is_some()).await;
+    // Whatever the killed replica had already sent has landed by now.
+    tokio::time::sleep(Duration::from_millis(300)).await;
     let before = h.inputs();
     let (s, v) = call(
         &router_x,
@@ -682,7 +685,6 @@ async fn dec_27_f_a_forwarded_command_without_a_valid_signature_never_reaches_th
     )
     .await;
     assert_eq!(s, StatusCode::ACCEPTED, "{v}");
-    until("x feeds", || rx.shared.feeds().is_some()).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(h.inputs(), before, "nothing reached the core");
     let row = || async {
