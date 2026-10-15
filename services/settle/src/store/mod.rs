@@ -371,6 +371,29 @@ pub struct AlertRow {
     pub raised: u64,
 }
 
+/// A runtime of the settlement layer the adapter has served (`T-027-12`, `REQ-SA-9`): the layer
+/// confirmed a transaction signed in the format chosen for it. Kept, so a restart does not ask
+/// again; never removed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeRow {
+    /// The runtime's identity: `<spec_version>:<surface fingerprint, hex>:<format name>`.
+    pub key: String,
+    /// Its `spec_version`.
+    pub spec_version: u32,
+    /// Its `transaction_version`.
+    pub transaction_version: u32,
+    /// Its transaction extensions, in order.
+    pub extensions: Vec<String>,
+    /// The digest of the types of what a transaction carries, hex.
+    pub types: String,
+    /// The format confirmed.
+    pub format: String,
+    /// The hash of the transaction the layer found valid, hex.
+    pub extrinsic: String,
+    /// When.
+    pub confirmed_at: Time,
+}
+
 /// What inserting an instruction found.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Inserted {
@@ -526,6 +549,13 @@ pub trait Store: Clone + Send + Sync + 'static {
         epoch: u64,
         row: &AnchorRow,
     ) -> impl Future<Output = StoreResult<()>> + Send;
+
+    /// Every runtime the layer confirmed a format on (`T-027-12`).
+    fn runtimes(&self) -> impl Future<Output = StoreResult<Vec<RuntimeRow>>> + Send;
+
+    /// Record a runtime the layer confirmed a format on; a second record of one key keeps the
+    /// first.
+    fn confirm_runtime(&self, row: &RuntimeRow) -> impl Future<Output = StoreResult<()>> + Send;
 }
 
 /// The asset of a call, for the liquidity check.

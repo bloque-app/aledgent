@@ -29,7 +29,6 @@ value (the PASS account's user id and the contract's account below are examples)
   "adapter": {
     "holder": "settle-0",
     "genesis": "<the declared genesis hash, hex>",
-    "spec_versions": [132, 133],
     "instance": 1,
     "assets": [{ "asset": "USD", "chain": "Here(1)" }],
     "keys": [
@@ -165,14 +164,37 @@ finality cannot invalidate it. The era still ends at or before the batch's earli
 within `challenge_window`, and must leave a block above the best head to be included in; when
 finality lags too far for that, the batch waits for the next step.
 
-**The transaction's format follows the runtime** (`T-027-07`). Kreivo spec 132 (release `0.16.9`,
-live on mainnet) and spec 133 (`4aef055` onward) differ in the order of the message the device
-signs; the adapter reads the runtime's `spec_version` on every step and signs each batch in that
-runtime's format, so a runtime upgrade switches the next batch. It refuses to serve a runtime it has
-no format for, or whose transaction extensions are not its format's, and it refuses to start with a
-`spec_versions` entry it has no format for. Today that is `[132, 133, 134]` (134, Kreivo `0.17.1`,
-signs as 133 does); a new Kreivo runtime needs its format added and pinned
-(`services/settle/kreivo-pin*`) before it is enacted.
+**The transaction's format follows the runtime's transaction surface** (`T-027-07`, `T-027-12`,
+`REQ-SA-9`). Kreivo spec 132 (release `0.16.9`) and spec 133 (`4aef055` onward) differ in the order
+of the message the device signs. On every step the adapter reads, from the runtime's live metadata,
+what a transaction must carry: its `transaction_version`, its transaction extensions in order, and a
+digest of their explicit and implicit types and of `Contracts::call`'s
+(`src/chain/surface.rs`). It signs each batch in the format whose surface that is (`kreivo-132`:
+`transaction_version` 12; `kreivo-133`: 13), so a runtime upgrade that changes the surface switches
+the next batch, and one that changes nothing a transaction carries (spec 133 to 134, Kreivo `0.17.1`)
+needs no release and no configuration. **The `spec_version` decides nothing.** A surface the adapter
+has no format for is refused (`unknown_surface`), and so is a new Kreivo format until it is added
+and pinned (`services/settle/kreivo-pin*`).
+
+**The layer confirms each runtime before anything is broadcast on it.** The first transaction signed
+on a runtime not served before (its `spec_version`, surface and format) is validated by the runtime
+itself, without being included (`TaggedTransactionQueue_validate_transaction`, over the light
+client), at the block the runtime was read at: the runtime that validates it is the one it was
+signed for, even when an upgrade lands in between. Valid: the runtime is recorded as served in the
+store (`migrations/0005_runtimes.sql`, so a restart does not ask again) and the batch goes out.
+Invalid for what it carries (a proof or signer that does not verify, an origin no extension
+authorised, bytes the runtime cannot decode, which the runtime reports as a failed call): nothing is
+stored or broadcast, a `runtime:<spec_version>` alert is raised, and the adapter refuses to serve on
+that runtime (`unconfirmed`) until it restarts or the runtime changes. Anything else (invalid for
+now: a nonce, fees, the era, the block's resources): nothing is stored or broadcast either, the calls
+wait unsigned, and the next step signs and asks again. This is what catches a format change the
+metadata does not show, such as the device message's order.
+
+`spec_versions`, in a file that still has it, is **informational**: it is accepted, logged at
+start-up, and gates nothing. An operator may instead name the format for a runtime whose surface
+would otherwise match none, or another: `"formats": { "135": "kreivo-133" }` under `adapter`. The
+named format is used for that `spec_version` whatever its surface, still only after the layer
+confirms it; a name the adapter does not know stops it at start-up.
 
 A device key in a file or in an environment variable (`{ "env": "VAR" }`) is for development only
 (`NFR-8`), and the adapter refuses one unless its configuration says `"development_keys": true`.

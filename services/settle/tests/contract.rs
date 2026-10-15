@@ -13,11 +13,11 @@ use ledger_core::settlement::envelope::{anchor_reference, operation_reference};
 use ledger_core::settlement::{Incident, NonceFact, SigningRecord};
 use parity_scale_codec::Decode;
 use serde_json::Value;
-use settle::adapter::CrashPoint;
+use settle::adapter::{CrashPoint, Refusing};
 use settle::chain::fake::FakeConfig;
 use settle::chain::fake::position_account;
 use settle::chain::kreivo::{self, Envelope};
-use settle::chain::{Chain, InboxEvent, InboxRead, blake2_256};
+use settle::chain::{Chain, InboxEvent, InboxRead, Validity, blake2_256};
 use settle::signer::recover;
 use settle::store::{ExtrinsicRow, ExtrinsicStatus, InstructionState, NotExecuted, Store};
 use settle::testkit::{ADAPTER_TOKEN, INSTANCE, Kit, KitOptions, PAYEE, TEST_PASS_USER, chain_usd};
@@ -577,21 +577,17 @@ async fn t_027_03_a_tampered_pass_transaction_is_never_included() {
 
 // ------------------------------------------------------------------------------ T-027-07
 
-/// A kit on the fake layer running Kreivo spec `spec_version`.
-fn on_runtime(spec_version: u32, transaction_version: u32) -> KitOptions {
+/// A kit on the fake layer running Kreivo spec `spec_version` in `format`.
+fn on_runtime(spec_version: u32, format: &kreivo::TxFormat) -> KitOptions {
     KitOptions {
-        fake: FakeConfig {
-            spec_version,
-            transaction_version,
-            ..FakeConfig::default()
-        },
+        fake: FakeConfig::running(spec_version, format),
         ..KitOptions::default()
     }
 }
 
-/// The runtimes whose format the extrinsic's device signature verifies in: 133's signature
-/// verifies as 134's too, since 134 signs exactly as 133 does.
-fn signed_in(e: &ExtrinsicRow) -> Vec<u32> {
+/// The formats whose device message the extrinsic's signature verifies in (`T-027-12`: a
+/// format, not a `spec_version`; spec 134 signs in `kreivo-133`).
+fn signed_in(e: &ExtrinsicRow) -> Vec<&'static str> {
     let (tx, _, _) = envelopes(e);
     let c = &tx.credential;
     kreivo::FORMATS
@@ -600,7 +596,7 @@ fn signed_in(e: &ExtrinsicRow) -> Vec<u32> {
             let digest = blake2_256(&kreivo::signed_message(f, c.context, &c.challenge));
             recover(&digest, &c.signature).is_some_and(|p| blake2_256(&p) == c.device_id)
         })
-        .map(|f| f.spec_version)
+        .map(|f| f.name)
         .collect()
 }
 
@@ -609,32 +605,33 @@ fn signed_in(e: &ExtrinsicRow) -> Vec<u32> {
 /// the batch settles.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn t_027_07_on_spec_132_the_device_signs_in_that_runtimes_order() {
-    let mut k = serving_kit(on_runtime(132, 12)).await;
+    let mut k = serving_kit(on_runtime(132, &kreivo::FORMAT_132)).await;
     let alice = k.d.party("alice", 1_000).await;
     let op = k.withdrawal(&alice, 10, "old").await;
     until_all(&mut k, &alice, std::slice::from_ref(&op), "Settled", 5).await;
-    assert_eq!(signed_in(&extrinsic(&k, &op).await), vec![132]);
+    assert_eq!(signed_in(&extrinsic(&k, &op).await), vec!["kreivo-132"]);
     assert_eq!(k.chain.balance_of(&PAYEE, &chain_usd()), 10);
 }
 
 /// `T-027-07`, `REQ-SA-2`: a runtime upgrade from spec 132 to spec 133 seen mid-run switches the
 /// format for the next batch; the adapter keeps serving, and each batch settles in its runtime's
-/// order.
+/// order. Since `T-027-12` the switch follows the surface (133's `transaction_version`,
+/// extensions and types), and the layer confirms the new format before the batch goes out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn t_027_07_a_runtime_upgrade_seen_mid_run_switches_the_format_for_the_next_batch() {
-    let mut k = serving_kit(on_runtime(132, 12)).await;
+    let mut k = serving_kit(on_runtime(132, &kreivo::FORMAT_132)).await;
     let alice = k.d.party("alice", 1_000).await;
     let before = k.withdrawal(&alice, 10, "before").await;
     until_all(&mut k, &alice, std::slice::from_ref(&before), "Settled", 5).await;
-    assert_eq!(signed_in(&extrinsic(&k, &before).await), vec![132]);
+    assert_eq!(signed_in(&extrinsic(&k, &before).await), vec!["kreivo-132"]);
     // Kreivo upgrades to the release after mainnet's (spec 133).
-    k.chain.set_spec_version(133);
+    k.chain.upgrade_to(133, &kreivo::FORMAT_133);
     k.chain.advance(1);
     assert!(k.step().await.unwrap().serving, "{:?}", k.adapter.status());
     let after = k.withdrawal(&alice, 20, "after").await;
     until_all(&mut k, &alice, std::slice::from_ref(&after), "Settled", 5).await;
     let e = extrinsic(&k, &after).await;
-    assert_eq!(signed_in(&e), vec![133, 134]);
+    assert_eq!(signed_in(&e), vec!["kreivo-133"]);
     assert_ne!(
         e.extrinsic.hash,
         extrinsic(&k, &before).await.extrinsic.hash
@@ -649,14 +646,14 @@ async fn t_027_07_a_runtime_upgrade_seen_mid_run_switches_the_format_for_the_nex
 /// its call is released on both proofs; the next batch goes out in spec 133's format.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn t_027_07_a_batch_in_flight_across_the_upgrade_is_released_on_both_proofs() {
-    let mut k = serving_kit(on_runtime(132, 12)).await;
+    let mut k = serving_kit(on_runtime(132, &kreivo::FORMAT_132)).await;
     let alice = k.d.party("alice", 1_000).await;
     let op = k.withdrawal(&alice, 10, "in-flight").await;
     k.chain.drop_submissions(true);
     let r = k.step().await.unwrap();
     assert_eq!((r.signed, r.broadcast), (1, 1));
-    assert_eq!(signed_in(&extrinsic(&k, &op).await), vec![132]);
-    k.chain.set_spec_version(133);
+    assert_eq!(signed_in(&extrinsic(&k, &op).await), vec!["kreivo-132"]);
+    k.chain.upgrade_to(133, &kreivo::FORMAT_133);
     k.chain.drop_submissions(false);
     until_all(&mut k, &alice, std::slice::from_ref(&op), "Released", 120).await;
     assert!(matches!(
@@ -681,5 +678,350 @@ async fn t_027_07_a_batch_in_flight_across_the_upgrade_is_released_on_both_proof
     assert_eq!(k.balances(&alice).await, (1_000, 0));
     let next = k.withdrawal(&alice, 10, "next").await;
     until_all(&mut k, &alice, std::slice::from_ref(&next), "Settled", 5).await;
-    assert_eq!(signed_in(&extrinsic(&k, &next).await), vec![133, 134]);
+    assert_eq!(signed_in(&extrinsic(&k, &next).await), vec!["kreivo-133"]);
+}
+
+// ------------------------------------------------------------------------------ T-027-12
+
+/// The runtimes the store records as served: `(spec_version, format)`.
+async fn served(k: &Kit) -> Vec<(u32, String)> {
+    k.store
+        .runtimes()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.spec_version, r.format))
+        .collect()
+}
+
+async fn alert_open(k: &Kit, key: &str) -> bool {
+    k.store
+        .alerts()
+        .await
+        .unwrap()
+        .iter()
+        .any(|a| a.key == key && a.cleared_at.is_none())
+}
+
+/// `AC-E4.3`, `T-027-12`, `REQ-SA-9`: Kreivo 133 to 134 (release `0.17.1`, 2026-10-14) changed the
+/// `spec_version` and nothing a transaction carries. The adapter keeps serving with no
+/// configuration change and no format entry for 134; the next batch is confirmed by the layer on
+/// the new runtime, then broadcast, and settles. A runtime served once is never asked again, not
+/// even after a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ac_e4_3_t_027_12_an_upgrade_that_changes_nothing_a_transaction_carries_keeps_serving() {
+    let mut k = serving_kit(KitOptions::default()).await;
+    let alice = k.d.party("alice", 1_000).await;
+    let first = k.withdrawal(&alice, 10, "on-133").await;
+    until_all(&mut k, &alice, std::slice::from_ref(&first), "Settled", 5).await;
+    assert_eq!(
+        k.chain.validations(),
+        1,
+        "the first batch on 133 was confirmed"
+    );
+    assert_eq!(served(&k).await, vec![(133, "kreivo-133".to_owned())]);
+    // Kreivo 0.17.1: spec 134, its surface unchanged. Nothing in the configuration names it.
+    let c = k.adapter.config();
+    assert!(c.spec_versions.is_empty() && c.formats.is_empty());
+    assert!(kreivo::FORMATS.iter().all(|f| f.name != "kreivo-134"));
+    k.chain.set_spec_version(134);
+    k.chain.advance(1);
+    assert!(k.step().await.unwrap().serving, "{:?}", k.adapter.status());
+    let second = k.withdrawal(&alice, 20, "on-134").await;
+    let r = k.step().await.unwrap();
+    assert_eq!((r.signed, r.broadcast), (1, 1));
+    assert_eq!(
+        k.chain.validations(),
+        2,
+        "confirmed on 134 before it went out"
+    );
+    until_all(&mut k, &alice, std::slice::from_ref(&second), "Settled", 5).await;
+    assert_eq!(signed_in(&extrinsic(&k, &second).await), vec!["kreivo-133"]);
+    assert_eq!(
+        served(&k).await,
+        vec![
+            (133, "kreivo-133".to_owned()),
+            (134, "kreivo-133".to_owned())
+        ]
+    );
+    // Served: neither the next batch nor a restarted adapter asks again.
+    k.restart();
+    let third = k.withdrawal(&alice, 30, "after-restart").await;
+    until_all(&mut k, &alice, std::slice::from_ref(&third), "Settled", 5).await;
+    assert_eq!(k.chain.validations(), 2);
+    assert_eq!(k.chain.balance_of(&PAYEE, &chain_usd()), 60);
+}
+
+/// `AC-E4.4`, `T-027-12`, `REQ-SA-9`: on a runtime whose surface is unchanged, a transaction the
+/// layer finds invalid for what it carries (here `BadProof`) is never stored or broadcast; the
+/// adapter refuses to serve on that runtime, raises an alert naming it, and signs nothing more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ac_e4_4_t_027_12_a_transaction_the_layer_does_not_confirm_stops_service() {
+    let mut k = serving_kit(KitOptions::default()).await;
+    let alice = k.d.party("alice", 1_000).await;
+    k.chain.set_spec_version(134);
+    k.chain
+        .answer_validations(Some(Validity::Refused("Invalid(BadProof)".into())));
+    k.chain.advance(1);
+    assert!(
+        k.step().await.unwrap().serving,
+        "a known surface, not yet confirmed"
+    );
+    let op = k.withdrawal(&alice, 10, "refused").await;
+    let r = k.step().await.unwrap();
+    assert_eq!((r.signed, r.broadcast), (0, 0));
+    assert_eq!(k.chain.validations(), 1);
+    assert!(
+        k.store.extrinsics().await.unwrap().is_empty(),
+        "never stored"
+    );
+    assert_eq!(k.chain.pool_len(), 0, "never broadcast");
+    let refusing = [Refusing::Unconfirmed {
+        spec_version: 134,
+        format: "kreivo-133".into(),
+        error: "Invalid(BadProof)".into(),
+    }];
+    assert_eq!(k.adapter.status(), (false, &refusing[..]));
+    assert!(alert_open(&k, "runtime:134").await);
+    // Declared to the core: outbound operations are refused; the call waits, unsigned.
+    k.chain.advance(1);
+    assert!(!k.step().await.unwrap().serving);
+    assert_eq!(k.adapter.status().1, &refusing[..]);
+    let (s, v) = k.withdraw(&alice, 5, "after").await;
+    assert_eq!(
+        (s, v["error"].as_str()),
+        (422, Some("ERR-SettlementLayerUnavailable")),
+        "{v}"
+    );
+    assert_eq!(
+        instruction(&k, &op).await.state,
+        InstructionState::Acknowledged
+    );
+    assert_eq!(k.chain.validations(), 1, "nothing more was signed");
+    assert!(served(&k).await.is_empty());
+}
+
+/// `AC-E4.4`, `T-027-12`: the case the surface cannot see. A runtime whose metadata is spec 133's
+/// to the byte but whose authenticator verifies the device message in the other order (as Kreivo
+/// `cf69b67`, spec 133 with the old order, would: `F-027` NOTES, decision 23). The surface selects
+/// `kreivo-133`; the layer itself refuses the signature, and nothing goes out. The operator then
+/// names `kreivo-132` for that `spec_version`: the adapter serves again, and broadcasts only once
+/// the layer confirms that format.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ac_e4_4_t_027_12_an_order_flipped_under_an_unchanged_surface_is_caught_by_the_layer() {
+    let mut k = serving_kit(KitOptions {
+        fake: FakeConfig {
+            spec_version: 135,
+            order: kreivo::MessageOrder::AuthorityFirst,
+            ..FakeConfig::default()
+        },
+        ..KitOptions::default()
+    })
+    .await;
+    let alice = k.d.party("alice", 1_000).await;
+    let op = k.withdrawal(&alice, 10, "flipped").await;
+    k.step().await.unwrap();
+    let (serving, why) = k.adapter.status();
+    assert!(!serving);
+    assert!(
+        matches!(
+            why,
+            [Refusing::Unconfirmed { spec_version: 135, format, error }]
+                if format == "kreivo-133" && error.contains("BadProof")
+        ),
+        "{why:?}"
+    );
+    assert!(k.store.extrinsics().await.unwrap().is_empty());
+    assert_eq!(k.chain.pool_len(), 0);
+    // The operator names spec 135's format (amendment 0031: still confirmed by the layer).
+    k.reconfigure(|c| {
+        c.formats.insert(135, "kreivo-132".into());
+    });
+    until_all(&mut k, &alice, std::slice::from_ref(&op), "Settled", 5).await;
+    assert_eq!(signed_in(&extrinsic(&k, &op).await), vec!["kreivo-132"]);
+    assert_eq!(k.chain.validations(), 2);
+    assert_eq!(served(&k).await, vec![(135, "kreivo-132".to_owned())]);
+}
+
+/// `AC-E4.4`, `T-027-12`, `REQ-SA-9`, `F-027` NOTES decision 51: a validity error that says
+/// nothing of the format (a nonce, fees, the era, the block's resources) neither confirms the
+/// runtime nor refuses it, and **nothing goes out on a runtime the layer has not confirmed**: the
+/// batch is neither stored nor broadcast, no nonce moves, and its calls stay acknowledged and
+/// unsigned. Each step rebuilds the transaction and asks again; once the layer confirms, it goes
+/// out, and later transactions on the runtime are not validated again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ac_e4_4_t_027_12_a_transient_validity_error_broadcasts_nothing_until_confirmed() {
+    let mut k = serving_kit(KitOptions::default()).await;
+    let alice = k.d.party("alice", 1_000).await;
+    k.chain
+        .answer_validations(Some(Validity::NotNow("Invalid(Future)".into())));
+    let op = k.withdrawal(&alice, 10, "transient").await;
+    let lane = hex::encode(k.lanes[0].account());
+    for asked in 1..=2 {
+        let r = k.step().await.unwrap();
+        assert_eq!(
+            (r.signed, r.broadcast),
+            (0, 0),
+            "nothing goes out before the layer confirms"
+        );
+        assert_eq!(k.chain.validations(), asked, "rebuilt and asked again");
+        assert!(k.adapter.status().0, "{:?}", k.adapter.status());
+        assert!(!alert_open(&k, "runtime:133").await, "not a refusal");
+        assert!(served(&k).await.is_empty(), "not confirmed");
+        assert!(
+            k.store.extrinsics().await.unwrap().is_empty(),
+            "never stored"
+        );
+        assert_eq!(k.chain.pool_len(), 0, "never broadcast");
+        assert_eq!(
+            k.store.lane(&lane).await.unwrap().map(|l| l.next_nonce),
+            None,
+            "no nonce moved"
+        );
+        assert_eq!(
+            instruction(&k, &op).await.state,
+            InstructionState::Acknowledged
+        );
+        k.chain.advance(1);
+    }
+    k.chain.answer_validations(None);
+    until_all(&mut k, &alice, std::slice::from_ref(&op), "Settled", 5).await;
+    assert_eq!(k.chain.validations(), 3, "validated again, and confirmed");
+    assert_eq!(served(&k).await, vec![(133, "kreivo-133".to_owned())]);
+    // Confirmed: the next transaction on the runtime goes out unvalidated, as before.
+    let next = k.withdrawal(&alice, 20, "next").await;
+    until_all(&mut k, &alice, std::slice::from_ref(&next), "Settled", 5).await;
+    assert_eq!(k.chain.validations(), 3);
+}
+
+/// `AC-E4.3`, `T-027-12`, `REQ-SA-9`, `F-027` NOTES decision 51: Kreivo upgrades (133 to 134, its
+/// surface unchanged) in a block produced after the step read its best head and before it read the
+/// runtime it signs for. The batch is signed for 134 and validated at the block 134 was read at,
+/// by 134: never by 133 at the head the step started from, which would refuse it (`BadProof`: the
+/// `spec_version` is in its challenge) and stop the adapter with `Unconfirmed` until a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ac_e4_3_t_027_12_an_upgrade_between_a_steps_start_and_its_signing_is_not_refused() {
+    let mut k = serving_kit(KitOptions::default()).await;
+    let alice = k.d.party("alice", 1_000).await;
+    let op = k.withdrawal(&alice, 10, "mid-step").await;
+    let before = k.chain.best_number();
+    // The step's assertions read the runtime first (still 133), then the step reads its heads;
+    // the upgrade lands before the next read, the one the batch is signed for.
+    k.chain.before_next_runtime_read(|c| {
+        c.before_next_runtime_read(|c| {
+            c.produce();
+            c.set_spec_version(134);
+        });
+    });
+    let r = k.step().await.unwrap();
+    assert_eq!(r.best, before, "the step started on 133's head");
+    assert_eq!(
+        k.chain.best_number(),
+        before + 1,
+        "134 was enacted mid-step"
+    );
+    let (serving, why) = k.adapter.status();
+    assert!(serving, "{why:?}");
+    assert!(
+        !why.iter()
+            .any(|w| matches!(w, Refusing::Unconfirmed { .. })),
+        "{why:?}"
+    );
+    assert!(!alert_open(&k, "runtime:134").await);
+    // Confirmed by 134 and broadcast at once.
+    assert_eq!((r.signed, r.broadcast), (1, 1));
+    assert_eq!(k.chain.validations(), 1);
+    assert_eq!(served(&k).await, vec![(134, "kreivo-133".to_owned())]);
+    // The next steps carry it to settlement, and keep serving.
+    until_all(&mut k, &alice, std::slice::from_ref(&op), "Settled", 5).await;
+    assert!(k.adapter.status().0);
+    assert_eq!(k.chain.balance_of(&PAYEE, &chain_usd()), 10);
+}
+
+/// `AC-E4.4`, `T-027-12`, `F-027` NOTES decision 51: before a refusal is taken as one of the
+/// format, the runtime at the block the transaction was validated at must be the one it was signed
+/// for. Here the layer's runtime at that block changes after the signing (a layer whose answer for
+/// the block is not what it reported when the runtime was read): the transaction, signed for 133,
+/// is refused by 134. Neither confirmed nor refused: nothing goes out, the adapter keeps serving
+/// with no alert, and the next step signs for 134, which the layer confirms, and broadcasts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ac_e4_4_t_027_12_a_refusal_by_another_runtime_than_the_one_signed_for_refuses_nothing() {
+    let mut k = serving_kit(KitOptions::default()).await;
+    let alice = k.d.party("alice", 1_000).await;
+    let op = k.withdrawal(&alice, 10, "validated-by-134").await;
+    k.chain.before_next_validation(|c| c.set_spec_version(134));
+    let r = k.step().await.unwrap();
+    assert_eq!((r.signed, r.broadcast), (0, 0));
+    assert_eq!(k.chain.validations(), 1);
+    let (serving, why) = k.adapter.status();
+    assert!(serving && why.is_empty(), "{why:?}");
+    assert!(!alert_open(&k, "runtime:133").await);
+    assert!(!alert_open(&k, "runtime:134").await);
+    assert!(served(&k).await.is_empty());
+    assert!(k.store.extrinsics().await.unwrap().is_empty());
+    assert_eq!(k.chain.pool_len(), 0);
+    assert_eq!(
+        instruction(&k, &op).await.state,
+        InstructionState::Acknowledged
+    );
+    // The next step signs for 134, which the layer confirms, and broadcasts.
+    k.chain.advance(1);
+    let r = k.step().await.unwrap();
+    assert_eq!((r.signed, r.broadcast), (1, 1));
+    assert_eq!(k.chain.validations(), 2);
+    assert_eq!(served(&k).await, vec![(134, "kreivo-133".to_owned())]);
+    until_all(&mut k, &alice, std::slice::from_ref(&op), "Settled", 5).await;
+}
+
+/// `T-027-12`, `REQ-SA-9` ("an operator MAY name in configuration the format to use for a set of
+/// rules; the layer's confirmation is still required"): a runtime whose types match no format
+/// (as an extension's type gaining a variant would) is refused until the operator names one; then
+/// it serves, but nothing is broadcast until the layer confirms the named format, and a layer that
+/// refuses it stops service again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_027_12_a_runtime_the_operator_maps_is_served_only_after_the_layer_confirms_it() {
+    let mut k = Kit::start_with(KitOptions {
+        fake: FakeConfig {
+            spec_version: 140,
+            types: Some([7; 32]),
+            ..FakeConfig::default()
+        },
+        ..KitOptions::default()
+    })
+    .await;
+    assert!(!k.step().await.unwrap().serving);
+    assert!(matches!(
+        k.adapter.status().1,
+        [Refusing::UnknownSurface {
+            spec_version: 140,
+            ..
+        }]
+    ));
+    k.reconfigure(|c| {
+        c.formats.insert(140, "kreivo-133".into());
+    });
+    // Named, but the layer refuses it: nothing goes out.
+    k.chain
+        .answer_validations(Some(Validity::Refused("Invalid(Custom(3))".into())));
+    assert!(k.step().await.unwrap().serving);
+    let alice = k.d.party("alice", 1_000).await;
+    let op = k.withdrawal(&alice, 10, "mapped").await;
+    k.step().await.unwrap();
+    assert_eq!(
+        k.adapter.status().1,
+        &[Refusing::Unconfirmed {
+            spec_version: 140,
+            format: "kreivo-133".into(),
+            error: "Invalid(Custom(3))".into(),
+        }][..]
+    );
+    assert!(k.store.extrinsics().await.unwrap().is_empty());
+    assert_eq!(k.chain.pool_len(), 0);
+    // A restart asks again; the layer now confirms it.
+    k.chain.answer_validations(None);
+    k.restart();
+    until_all(&mut k, &alice, std::slice::from_ref(&op), "Settled", 5).await;
+    assert_eq!(k.chain.validations(), 2);
+    assert_eq!(served(&k).await, vec![(140, "kreivo-133".to_owned())]);
+    assert!(!alert_open(&k, "runtime:140").await);
 }

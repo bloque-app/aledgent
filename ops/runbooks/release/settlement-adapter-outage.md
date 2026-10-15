@@ -44,9 +44,29 @@ settlement-operations.
    keep failing over the light client, set the optional `dry_run_endpoint` to a Kreivo node the operator
    runs. That node is then trusted for batch sizing only: it can make a batch fail whole, but it never
    moves value. Record it as a finding.
-5. **Runtime mismatch** (it refuses to serve: the spec is not in `spec_versions`). Kreivo has upgraded to a
-   runtime with no pinned format. Deploy the adapter build that pins it (`services/settle/kreivo-pin*`).
-   There is no other way on.
+5. **Runtime mismatch.** A Kreivo upgrade that changes only the `spec_version` does not stop the adapter
+   (since `T-027-12`); `spec_versions` in its configuration gates nothing. It refuses to serve on a
+   runtime upgrade for one of two reasons, which the `refusing` alert names:
+   - **`unknown_surface`**: what a transaction must carry changed (the `transaction_version`, the
+     transaction extensions, or the types of their data or of `Contracts::call`), and the adapter has
+     no format for it. Deploy the adapter build that pins the new format (`services/settle/kreivo-pin*`).
+     If the change is known not to touch what the adapter signs (an asset location type that gained a
+     variant, for instance), the operator can instead name a known format for that `spec_version` in
+     `adapter.formats` (`{ "<spec_version>": "kreivo-133" }`) and restart: the layer still has to
+     confirm it before anything is broadcast. Record either as a finding.
+   - **`unconfirmed`** (with a `runtime:<spec_version>` alert): the surface matched a format, but the
+     runtime refused a transaction signed in it (`BadProof`, `BadSigner`, `UnknownOrigin`, an
+     extension's `Custom` error, bytes it cannot decode). The format changed in a way the metadata
+     does not show, such as the order of the PASS device's message. Nothing was broadcast. Deploy the
+     build with the right format, or name it in `adapter.formats`; a restart asks the layer again. A
+     restart alone with nothing changed is refused again. An upgrade enacted while a step was signing
+     does not cause it: the transaction is validated by the runtime it was signed for, and a refusal
+     from any other runtime is not taken as one (the step signs again). So `unconfirmed` right after
+     an upgrade is still a real format change, not a race to restart away.
+   - **Neither** (no alert, the `warn` log "neither confirmed nor refused", withdrawals acknowledged but
+     not signed): the layer found the first transaction signed on a new runtime invalid *for now* (a
+     nonce, fees, the era), which neither confirms the runtime nor refuses it. Nothing goes out on that runtime until it confirms; each step asks
+     again. If it lasts, check the lane's fees and nonce (step 8) before anything else.
 6. **Database.** If the adapter cannot reach `aledgent_settle`, follow the database server's own failover.
    The adapter resumes from its cursor.
 7. **Keys.** If signing fails, read the signer's log: a signer that cannot log in to Vault or read its

@@ -78,22 +78,8 @@ pub const CASES: &[Case] = &[
     service_case!("AC-E3.3", ac_e3_3__service, &["REQ-OP-6", "REQ-SN-2"]),
     service_case!("AC-E4.1", ac_e4_1__service, &["REQ-SA-1", "REQ-OS-2"]),
     service_case!("AC-E4.2", ac_e4_2__service, &["REQ-SA-2"]),
-    // Amendment 0031: pending until `T-027-12` builds the format chosen by the runtime's surface and
-    // the layer's confirmation.
-    Case::pending(
-        "AC-E4.3",
-        "ac_e4_3_an_upgrade_that_changes_nothing_signed_keeps_the_adapter_serving__service",
-        Layer::Service,
-        Feature::F016,
-        &["REQ-SA-9"],
-    ),
-    Case::pending(
-        "AC-E4.4",
-        "ac_e4_4_a_changed_surface_or_an_unconfirmed_instruction_refuses_to_serve__service",
-        Layer::Service,
-        Feature::F016,
-        &["REQ-SA-9"],
-    ),
+    service_case!("AC-E4.3", ac_e4_3__service, &["REQ-SA-9"]),
+    service_case!("AC-E4.4", ac_e4_4__service, &["REQ-SA-9"]),
 ];
 
 type Result<T = ()> = std::result::Result<T, String>;
@@ -215,11 +201,12 @@ fn err_settlement_layer_unavailable__service(_: &mut dyn Harness) -> Outcome {
         return Outcome::Fail("no runtime".into());
     };
     rt.block_on(async {
-        // A runtime not on the adapter's list (DEC-20: a decimals mismatch no longer stops the
-        // adapter; it holds the one asset, AC-E4.1).
+        // A runtime whose transaction surface the adapter has no format for (REQ-SA-9; DEC-20: a
+        // decimals mismatch no longer stops the adapter; it holds the one asset, AC-E4.1).
         let mut k = Kit::start_with(KitOptions {
             fake: settle::chain::fake::FakeConfig {
                 spec_version: 999,
+                transaction_version: 99,
                 ..Default::default()
             },
             ..KitOptions::default()
@@ -521,38 +508,104 @@ fn ac_e4_1__service(_: &mut dyn Harness) -> Outcome {
 }
 
 /// `AC-E4.2`: an adapter whose network is not the declared one refuses to serve — a wrong
-/// genesis, and a runtime not on its list. (Decimals that differ from the registry's hold the one
-/// asset, not the adapter: `DEC-20`, `F-029`.)
+/// genesis. (Decimals that differ from the registry's hold the one asset, not the adapter:
+/// `DEC-20`, `F-029`. A runtime's rules are `AC-E4.3` and `AC-E4.4`'s: `REQ-SA-9`.)
 fn ac_e4_2__service(_: &mut dyn Harness) -> Outcome {
     run(|| async {
-        for options in [
-            KitOptions {
-                fake: settle::chain::fake::FakeConfig {
-                    genesis: [0x01; 32],
-                    ..Default::default()
-                },
-                ..KitOptions::default()
+        let mut k = Kit::start_with(KitOptions {
+            fake: settle::chain::fake::FakeConfig {
+                genesis: [0x01; 32],
+                ..Default::default()
             },
-            KitOptions {
-                fake: settle::chain::fake::FakeConfig {
-                    spec_version: 999,
-                    ..Default::default()
-                },
-                ..KitOptions::default()
-            },
-        ] {
-            let mut k = Kit::start_with(options).await;
-            let r = k.step().await.map_err(|e| e.to_string())?;
-            check(!r.serving, || "the adapter served".into())?;
-            let alice = k.d.party("alice", 1_000).await;
-            let (s, v) = k.withdraw(&alice, 5, "w").await;
-            check(
-                s == 422 && v["error"] == "ERR-SettlementLayerUnavailable",
-                || format!("{s} {v}"),
-            )?;
-            check(k.chain.pool_len() == 0, || "something was broadcast".into())?;
-        }
-        Ok(())
+            ..KitOptions::default()
+        })
+        .await;
+        let r = k.step().await.map_err(|e| e.to_string())?;
+        check(!r.serving, || "the adapter served".into())?;
+        refused_and_nothing_broadcast(&k).await
+    })
+}
+
+/// While the adapter refuses: the core refuses an outbound operation, and nothing was broadcast.
+async fn refused_and_nothing_broadcast(k: &Kit) -> Result {
+    let alice = k.d.party("zed", 1_000).await;
+    let (s, v) = k.withdraw(&alice, 5, "w").await;
+    check(
+        s == 422 && v["error"] == "ERR-SettlementLayerUnavailable",
+        || format!("{s} {v}"),
+    )?;
+    check(k.chain.pool_len() == 0, || "something was broadcast".into())
+}
+
+/// `AC-E4.3` (`REQ-SA-9`): a change of the layer's rules that leaves what an instruction must
+/// carry unchanged (Kreivo spec 133 to 134) keeps the adapter serving, with no new release or
+/// configuration: the next withdrawal is confirmed by the layer, signed and settled.
+fn ac_e4_3__service(_: &mut dyn Harness) -> Outcome {
+    run(|| async {
+        let mut k = serving(KitOptions::default()).await?;
+        let alice = k.d.party("alice", 1_000).await;
+        let before = k.withdrawal(&alice, 10, "before").await;
+        until(&mut k, &alice, &before, "Settled", 5).await?;
+        let config = k.adapter.config().clone();
+        k.chain.set_spec_version(134);
+        k.chain.advance(1);
+        let r = k.step().await.map_err(|e| e.to_string())?;
+        check(r.serving, || {
+            format!("the adapter refuses: {:?}", k.adapter.status())
+        })?;
+        let after = k.withdrawal(&alice, 20, "after").await;
+        until(&mut k, &alice, &after, "Settled", 5).await?;
+        check(k.adapter.config() == &config, || {
+            "the configuration changed".into()
+        })?;
+        check(k.chain.validations() == 2, || {
+            format!(
+                "{} validations, expected one per runtime",
+                k.chain.validations()
+            )
+        })
+    })
+}
+
+/// `AC-E4.4` (`REQ-SA-9`): a change that alters what an instruction must carry (a new
+/// `transaction_version`), or an instruction the layer does not confirm as valid, makes the
+/// adapter refuse to serve, and nothing is broadcast.
+fn ac_e4_4__service(_: &mut dyn Harness) -> Outcome {
+    run(|| async {
+        // An altered surface: refused before anything is signed.
+        let mut k = serving(KitOptions::default()).await?;
+        k.chain.upgrade(|c| {
+            c.spec_version = 134;
+            c.transaction_version = 14;
+        });
+        let r = k.step().await.map_err(|e| e.to_string())?;
+        check(!r.serving, || "the adapter served a changed surface".into())?;
+        refused_and_nothing_broadcast(&k).await?;
+        // An unchanged surface on which the layer refuses the signed instruction.
+        let mut k = serving(KitOptions::default()).await?;
+        k.chain.set_spec_version(134);
+        k.chain
+            .answer_validations(Some(settle::chain::Validity::Refused(
+                "Invalid(BadProof)".into(),
+            )));
+        let alice = k.d.party("alice", 1_000).await;
+        let op = k.withdrawal(&alice, 10, "w").await;
+        step(&mut k).await?;
+        step(&mut k).await?;
+        check(!k.adapter.status().0, || "the adapter served".into())?;
+        check(
+            instruction_state(&k, &op).await? == InstructionState::Acknowledged,
+            || "the instruction left Acknowledged".into(),
+        )?;
+        check(
+            k.store
+                .extrinsics()
+                .await
+                .map_err(|e| e.to_string())?
+                .is_empty(),
+            || "a transaction was stored".into(),
+        )?;
+        refused_and_nothing_broadcast(&k).await
     })
 }
 
