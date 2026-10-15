@@ -1011,6 +1011,11 @@ the writer of its own partitions. *Decision:*
   the lease expires. A command sent on the old stream and not yet answered is sent again by the new feeder
   and dropped by the core if it was already taken. Decisions pause for the reconnect: well under a second
   for a planned switch, a few seconds for a crash. Acknowledgements never pause.
+- **(e′) Ingress's reads ride the same stream.** Ingress also reads from the book: a caller's credentials
+  and grants from the principals role (the single core Agent today, `aledgent-principals` in the sharded
+  profile), cached at most `NFR-20` old, and the queries it serves. Those reads go up the stream the core
+  host that holds the principals role (or the queried state) opened, and their answers come back down it,
+  as commands do. No core is ever dialed for a read either.
 - **(f) Ingress signs what it forwards.** Each command carries ingress's signature over its received row
   (through the signer, `F-035`), and the core host checks it before the Agent sees the input. mTLS says
   which peer is connected; the signature says the command is the one ingress recorded.
