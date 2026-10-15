@@ -999,14 +999,18 @@ the writer of its own partitions. *Decision:*
   log's order; the core sends back each reply and decision, which ingress records on the row. A core host
   listens on no network port, as today. A regional core connects to the nearest ingress instance and
   receives only its own partitions.
-- **(d) One feeder per partition, and the core keeps the order.** For each partition, exactly one ingress
-  instance holds a lease (in ingress's database) to feed it. The core tracks the next sequence it expects
-  per partition: it drops a duplicate and holds an early arrival, so ordering comes from the received log,
-  never from which stream a command arrived on.
-- **(e) A drain hands over without refusing.** An ingress instance that is leaving tells its cores to
-  reconnect (a go-away, as HTTP/2's) and releases its leases; the new set takes them over. A command sent
-  on the old stream and not yet answered is sent again by the new feeder and dropped by the core if it was
-  already taken. Decisions pause for the reconnect, well under a second.
+- **(d) The feed follows the connection, and the core keeps the order.** The core always dials; ingress
+  never dials a core, so only ingress needs a stable address. Any ingress instance takes a client's command
+  and writes it to the received log. The instance holding a core's stream holds the lease to feed that
+  core's partitions: it reads their new rows and sends them down. The core tracks the next sequence it
+  expects per partition: it drops a duplicate and holds an early arrival, so ordering comes from the
+  received log, never from which stream or instance a command arrived on.
+- **(e) A switch reconnects without refusing.** An ingress instance that is leaving sends its cores a
+  go-away (as HTTP/2's), and each core reconnects to the stable address and lands on a live instance, which
+  takes the lease over. If an instance crashes, the core notices through keepalives within seconds, and
+  the lease expires. A command sent on the old stream and not yet answered is sent again by the new feeder
+  and dropped by the core if it was already taken. Decisions pause for the reconnect: well under a second
+  for a planned switch, a few seconds for a crash. Acknowledgements never pause.
 - **(f) Ingress signs what it forwards.** Each command carries ingress's signature over its received row
   (through the signer, `F-035`), and the core host checks it before the Agent sees the input. mTLS says
   which peer is connected; the signature says the command is the one ingress recorded.
@@ -1021,6 +1025,12 @@ the writer of its own partitions. *Decision:*
   does (an ECS deployment, Kubernetes' rolling update with a readiness check and a drain hook, two
   systemd or podman units behind a proxy). Bloque's AWS deployment is one reference; a provider-neutral one
   (Kubernetes, or podman quadlets as the node runs today) ships beside it.
+- **(h′) One machine is a supported shape.** Ingress, a core and PostgreSQL on one machine run the same
+  binaries and the same protocol: the core connects to ingress locally, over mutual TLS on the loopback
+  interface or over a Unix socket with peer credentials (today's link, kept as the same-host transport).
+  An ingress release on one machine is a second instance on another port and a local proxy that switches
+  to it before the old one drains. What one machine cannot give is surviving its own reboot or the loss of
+  its disk; such a deployment states it in its assurance level (`REQ-AR-5`) and does not claim `NFR-21`.
 - **(i) The Agent is unchanged.** Commands reach it as the same inputs, and the host's calls into it keep
   their formats (`DEC-26(d)`). The change is in ingress and the core host. The genesis check does not
   verify the host's own binary on a restart with a replica (`F-036`), but the image must carry the genesis
