@@ -1250,6 +1250,45 @@ impl Store for PgStore {
             .collect()
     }
 
+    async fn unfeed(
+        &self,
+        partition: &str,
+        holder: &str,
+        epoch: u64,
+        from: u64,
+    ) -> Result<(), StoreError> {
+        let mut c = self.client().await?;
+        let tx = c.transaction().await.map_err(err)?;
+        let held = tx
+            .query_opt(
+                "SELECT next_seq FROM feed_lease WHERE partition = $1 AND holder = $2 \
+                 AND epoch = $3 AND expires_at > clock_timestamp() FOR UPDATE",
+                &[&partition, &holder, &i64_of(epoch)?],
+            )
+            .await
+            .map_err(err)?;
+        if held.is_none() {
+            return Err(StoreError::fenced());
+        }
+        let from = i64_of(from)?;
+        // The tail is undecided by contract (the caller gives back only what certainly did not
+        // run), so it is found through the undecided index, never by a scan of the log.
+        tx.execute(
+            "UPDATE received_log SET feed_seq = NULL, feed_epoch = NULL \
+             WHERE status <> 'Decided' AND feed_seq >= $1",
+            &[&from],
+        )
+        .await
+        .map_err(err)?;
+        tx.execute(
+            "UPDATE feed_lease SET next_seq = LEAST(next_seq, $2) WHERE partition = $1",
+            &[&partition, &from],
+        )
+        .await
+        .map_err(err)?;
+        tx.commit().await.map_err(err)
+    }
+
     async fn copy_verifier(
         &self,
         credential: &str,

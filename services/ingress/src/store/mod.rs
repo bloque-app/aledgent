@@ -601,6 +601,19 @@ pub trait Store: Clone + Send + Sync + 'static {
         at: Time,
     ) -> impl Future<Output = Result<Vec<Row>, StoreError>> + Send;
 
+    /// Give back the feed sequences from `from` on (`F-038` §3): the rows holding them were sent
+    /// and certainly did not run, so they go back to the queue without a sequence, and the next
+    /// row sent takes `from` again. Only under the lease `holder` holds at `epoch` (else
+    /// [`StoreError::fenced`], and nothing changes); only the partition's tail, every row of
+    /// which is undecided.
+    fn unfeed(
+        &self,
+        partition: &str,
+        holder: &str,
+        epoch: u64,
+        from: u64,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
     /// Keep what the book answered for `credential` (`F-038` §7, `DEC-27` (e″)): its public
     /// material, or, for `None` (no working credential), forget it.
     fn copy_verifier(

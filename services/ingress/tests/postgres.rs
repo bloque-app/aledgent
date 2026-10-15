@@ -410,6 +410,13 @@ async fn t_038_03_the_feed_lease_on_postgres() {
     );
     let fed = b.mark_fed(BOOK, "b", 2, &next, 9).await.unwrap();
     assert_eq!(seqs(&fed), vec![Some(1), Some(2), Some(3), Some(4)]);
+    // Rows that certainly did not run give their sequences back, the holder only.
+    assert!(a.unfeed(BOOK, "a", 1, 3).await.unwrap_err().is_fenced());
+    b.unfeed(BOOK, "b", 2, 3).await.unwrap();
+    assert_eq!(b.get(keys[0]).await.unwrap().unwrap().feed_seq, None);
+    assert_eq!(b.get(keys[3]).await.unwrap().unwrap().feed_seq, Some(2));
+    let fed = b.mark_fed(BOOK, "b", 2, &[keys[2]], 10).await.unwrap();
+    assert_eq!(seqs(&fed), vec![Some(3)]);
 
     let body = ingress::boundary::CredentialBody {
         identity: "did:aledgent:id:x".into(),

@@ -508,6 +508,40 @@ impl Store for MemStore {
         Ok(out)
     }
 
+    async fn unfeed(
+        &self,
+        partition: &str,
+        holder: &str,
+        epoch: u64,
+        from: u64,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.lock();
+        let now = Instant::now();
+        match inner.feeds.get(partition) {
+            Some(l) if l.holder == holder && l.epoch == epoch && l.until > now => {}
+            _ => return Err(StoreError::fenced()),
+        }
+        let tail = inner
+            .rows
+            .values()
+            .filter(|r| r.feed_seq.is_some_and(|s| s >= from));
+        if tail.clone().any(|r| r.status == Status::Decided) {
+            return Err(StoreError(
+                "a decided row holds a sequence to give back".into(),
+            ));
+        }
+        let keys: Vec<u64> = tail.map(|r| r.seq).collect();
+        for k in keys {
+            if let Some(r) = inner.rows.get_mut(&k) {
+                r.feed_seq = None;
+            }
+        }
+        if let Some(l) = inner.feeds.get_mut(partition) {
+            l.next_seq = l.next_seq.min(from);
+        }
+        Ok(())
+    }
+
     async fn copy_verifier(
         &self,
         credential: &str,
@@ -676,6 +710,20 @@ mod tests {
         s.mark_decided(k(5), 1, Vec::new(), 10).await.unwrap();
         let fed = s.mark_fed(BOOK, "b", 2, &[k(5)], 10).await.unwrap();
         assert_eq!(seqs(&fed), vec![None]);
+        // Rows that certainly did not run give their sequences back: they return to the queue
+        // without one, and the next row sent takes the first of them again. Only the holder can.
+        assert!(s.unfeed(BOOK, "a", 1, 3).await.unwrap_err().is_fenced());
+        s.unfeed(BOOK, "b", 2, 3).await.unwrap();
+        assert_eq!(s.get(k(1)).await.unwrap().unwrap().feed_seq, None);
+        assert_eq!(s.get(k(4)).await.unwrap().unwrap().feed_seq, Some(2));
+        let next = s.next_undecided_batch(10).await.unwrap();
+        assert_eq!(
+            refs(&next),
+            vec![2, 4, 1, 3],
+            "in flight, then the queue again"
+        );
+        let fed = s.mark_fed(BOOK, "b", 2, &[k(3)], 11).await.unwrap();
+        assert_eq!(seqs(&fed), vec![Some(3)]);
         // A lapsed lease, taken again by its own holder, is a new epoch too.
         assert_eq!(
             s.try_feed(BOOK, "b", Duration::ZERO).await.unwrap(),

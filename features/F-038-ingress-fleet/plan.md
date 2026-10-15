@@ -90,16 +90,21 @@ the next **feed sequence**.
   transaction that marks it forwarded, under the lease's holder and epoch. A forwarder whose epoch is no
   longer the lease's is refused that transaction (fenced) and stops.
 - The queue is read in-flight first: undecided rows that already have a feed sequence, in that order, then
-  the rest as before (reservations first, then arrival). A row is therefore always sent with the sequence it
-  was first given, after every row with a lower one.
+  the rest as before (reservations first, then arrival). A row the core may have run is therefore always
+  resent with the sequence it was first given, after every row with a lower one.
+- Rows the core certainly did not run (answered unavailable, or never sent) give their sequences back, the
+  partition's tail, under the lease (`Store::unfeed`), and return to the queue: a reservation logged
+  meanwhile still goes before them (`T-009-04`, `T-031-18`), and the next row sent takes the first of those
+  sequences again. The core host expects exactly that sequence, since nothing at or past it ran.
 - Today the book has one writer, the core Agent, so there is one partition, `book`. The sharded profile
   routes each row to its payer's partition; that routing is `T-038-22`'s, and the lease and the sequencer
   are per partition already.
 - Leadership (the ticker and the delivery worker, `F-009`) is unchanged, except that an instance that
   cannot reach a core does not take it: delivery pages the outbox through the core.
 
-*Trade-off, stated plainly:* rows that went back to the queue after a partial batch keep their sequence,
-so a reservation logged meanwhile no longer goes before them (`T-031-18`'s small gain on the retry path).
+*Trade-off, stated plainly:* a row the core may have run (an ambiguous answer) keeps its place ahead of
+any reservation logged after it, where before the forwarder retried it first anyway; and every lease
+renewal is a write to ingress's database, every third of the lease.
 
 ### 4. The core host keeps the order (the sequencer)
 

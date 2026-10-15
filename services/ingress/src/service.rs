@@ -762,8 +762,12 @@ async fn forward<S: Store, C: Core>(
         from += decided;
         // Done, or progress with nothing in flight: the rows after the decided prefix certainly
         // did not run (a core answers past what one invocation carries as `Unavailable`), and go
-        // back to the queue at once, without a backoff (`T-031-18`).
+        // back to the queue at once, without a backoff (`T-031-18`), giving back their feed
+        // sequences, so a reservation logged meanwhile still goes before them (`F-038` §3).
         if from == inputs.len() || (decided > 0 && in_flight <= from) {
+            if from < inputs.len() {
+                give_back(shared, epoch, seqs[from]).await;
+            }
             *wait = shared.config.retry_base;
             return Ok(());
         }
@@ -771,11 +775,28 @@ async fn forward<S: Store, C: Core>(
         tokio::time::sleep(*wait).await;
         *wait = (*wait * 2).min(shared.config.retry_max);
         if in_flight <= from {
+            give_back(shared, epoch, seqs[from]).await;
             return Ok(());
+        }
+        // The rows the core may have run stay in flight with their sequences; the rest go back.
+        if in_flight < inputs.len() {
+            give_back(shared, epoch, seqs[in_flight]).await;
         }
         inputs.truncate(in_flight);
         marked.truncate(in_flight);
         seqs.truncate(in_flight);
+    }
+}
+
+/// Give back the feed sequences from `seq` on: their rows certainly did not run (`F-038` §3). A
+/// failure only leaves them their sequences, which is safe: they are resent first.
+async fn give_back<S: Store, C: Core>(shared: &Shared<S, C>, epoch: u64, seq: u64) {
+    if let Err(e) = shared
+        .store
+        .unfeed(BOOK, &shared.config.replica, epoch, seq)
+        .await
+    {
+        tracing::warn!(error = %e, "feed sequences not given back; their rows keep them");
     }
 }
 
