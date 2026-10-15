@@ -78,6 +78,22 @@ pub const CASES: &[Case] = &[
     service_case!("AC-E3.3", ac_e3_3__service, &["REQ-OP-6", "REQ-SN-2"]),
     service_case!("AC-E4.1", ac_e4_1__service, &["REQ-SA-1", "REQ-OS-2"]),
     service_case!("AC-E4.2", ac_e4_2__service, &["REQ-SA-2"]),
+    // Amendment 0031: pending until `T-027-12` builds the format chosen by the runtime's surface and
+    // the layer's confirmation.
+    Case::pending(
+        "AC-E4.3",
+        "ac_e4_3_an_upgrade_that_changes_nothing_signed_keeps_the_adapter_serving__service",
+        Layer::Service,
+        Feature::F016,
+        &["REQ-SA-9"],
+    ),
+    Case::pending(
+        "AC-E4.4",
+        "ac_e4_4_a_changed_surface_or_an_unconfirmed_instruction_refuses_to_serve__service",
+        Layer::Service,
+        Feature::F016,
+        &["REQ-SA-9"],
+    ),
 ];
 
 type Result<T = ()> = std::result::Result<T, String>;
