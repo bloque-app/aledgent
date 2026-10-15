@@ -107,17 +107,26 @@ async fn run() -> Result<(), String> {
         .ok_or("usage: aledgent-settle <config.json>")?;
     let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
     let config: ProcessConfig = serde_json::from_str(&text).map_err(|e| format!("{path}: {e}"))?;
-    // F-027 T-027-07: every allowed runtime must be one the adapter can sign for.
-    let unknown = config.adapter.spec_versions_without_format();
+    // F-027 T-027-12 (REQ-SA-9): a format the operator names must be one the adapter can sign in.
+    let unknown = config.adapter.unknown_formats();
     if !unknown.is_empty() {
         return Err(format!(
-            "{path}: no Kreivo transaction format is known for spec_versions {unknown:?}; the \
-             adapter signs for {:?}",
+            "{path}: adapter.formats names {unknown:?}, which the adapter does not know; it signs \
+             in {:?}",
             settle::chain::kreivo::FORMATS
                 .iter()
-                .map(|f| f.spec_version)
+                .map(|f| f.name)
                 .collect::<Vec<_>>()
         ));
+    }
+    // A runtime's spec_version gates nothing since T-027-12: a list from an older file is kept
+    // for the record only.
+    if !config.adapter.spec_versions.is_empty() {
+        tracing::info!(
+            spec_versions = ?config.adapter.spec_versions,
+            "adapter.spec_versions is informational: the format follows the runtime's transaction \
+             surface, confirmed by the layer (T-027-12); the list gates nothing"
+        );
     }
     // F-035: the keys behind the signer service; development keys only if the file says so.
     let keys = Keys::of(&config)?;

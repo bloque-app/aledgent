@@ -53,7 +53,7 @@ use parity_scale_codec::{Decode, Encode};
 use super::kreivo::{self, CallLimits, TxParams};
 use super::{
     AccountId32, BatchCall, BlockRef, Chain, ChainAsset, ChainError, ChainResult, DryRun,
-    InboxRead, Included, InstanceView, Mortality, RuntimeInfo, SignedExtrinsic,
+    InboxRead, Included, InstanceView, Mortality, RuntimeInfo, SignedExtrinsic, Validity,
 };
 use crate::signer::Signer;
 
@@ -450,16 +450,18 @@ impl Chain for RpcChain {
             tracing::info!(
                 from = known.spec_version,
                 to = version.spec_version,
-                format = ?kreivo::TxFormat::of(version.spec_version).map(|f| f.kreivo),
+                transaction_version = version.transaction_version,
                 "the settlement layer's runtime changed; its metadata is reloaded"
             );
         }
         let metadata = self.client.metadata();
+        // T-027-12: what a transaction must carry, as this runtime's metadata describes it.
         let extensions = metadata
             .extrinsic()
             .transaction_extensions_by_version(kreivo::EXTENSION_VERSION)
             .map(|it| it.map(|e| e.identifier().to_owned()).collect())
             .unwrap_or_default();
+        let types = super::surface::fingerprint(&metadata, &self.names.contracts);
         let block_hash_count = self
             .client
             .constants()
@@ -472,7 +474,11 @@ impl Chain for RpcChain {
         Ok(RuntimeInfo {
             genesis: self.client.genesis_hash().0,
             spec_version: version.spec_version,
-            extensions,
+            surface: kreivo::Surface {
+                transaction_version: version.transaction_version,
+                extensions,
+                types,
+            },
             pallet: metadata.pallet_by_name(&self.names.contracts).is_some(),
             block_hash_count,
         })
@@ -753,6 +759,7 @@ impl Chain for RpcChain {
         era: &Mortality,
         context: &BlockRef,
         limits: &CallLimits,
+        runtime: &kreivo::Signing,
     ) -> ChainResult<SignedExtrinsic> {
         // Born at the context, the finalized head: its hash is the birth hash, read from nothing.
         if era.birth != context.number {
@@ -769,15 +776,13 @@ impl Chain for RpcChain {
             .map_err(invalid)?;
         let call = kreivo::contracts_call(&contract, limits, &kreivo::execute_data(&envelopes));
         let birth_hash = H256(context.hash);
-        let version = self
-            .rpc
-            .state_get_runtime_version(None)
-            .await
-            .map_err(unavailable)?;
+        // The runtime the adapter checked and chose the format for (T-027-12), not one read again
+        // here: should the runtime change in between, the transaction is not valid on the new one
+        // and the next step signs for it.
         let p = TxParams {
             genesis: self.client.genesis_hash().0,
-            spec_version: version.spec_version,
-            transaction_version: version.transaction_version,
+            spec_version: runtime.spec_version,
+            transaction_version: runtime.transaction_version,
             era: *era,
             birth_hash: birth_hash.0,
             nonce: u32::try_from(nonce).map_err(|_| invalid("a nonce past Kreivo's u32"))?,
@@ -787,7 +792,24 @@ impl Chain for RpcChain {
             u32::try_from(context.number).map_err(|_| invalid("a block past Kreivo's u32"))?,
             context.hash,
         );
-        Ok(kreivo::sign(signer, &call, &p, context).await?)
+        Ok(kreivo::sign(signer, &runtime.format, &call, &p, context).await?)
+    }
+
+    /// Over this client (the light client by default): the layer's own answer, never the dry-run
+    /// node's. A runtime that cannot decode the bytes panics in its API's argument decoding ("Bad
+    /// input data provided to validate_transaction"), which is the format refused too.
+    async fn validate(&self, at: &BlockRef, extrinsic: &SignedExtrinsic) -> ChainResult<Validity> {
+        let args = kreivo::validate_transaction_args(&extrinsic.bytes, &at.hash);
+        match self
+            .runtime_call(kreivo::VALIDATE_TRANSACTION, &args, at.hash)
+            .await
+        {
+            Ok(bytes) => kreivo::transaction_validity(&bytes).map_err(invalid),
+            Err(ChainError::Unavailable(e)) if e.contains("Bad input data provided") => Ok(
+                Validity::Refused(format!("the runtime cannot decode it: {e}")),
+            ),
+            Err(e) => Err(e),
+        }
     }
 
     /// Submit and keep watching until the client reports the transaction's end (finalized,

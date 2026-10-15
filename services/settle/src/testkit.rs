@@ -132,7 +132,8 @@ pub fn adapter_config(genesis: [u8; 32]) -> AdapterConfig {
     AdapterConfig {
         holder: "settle-0".into(),
         genesis: hex::encode(genesis),
-        spec_versions: vec![132, 133],
+        spec_versions: Vec::new(),
+        formats: Default::default(),
         instance: INSTANCE,
         assets: vec![AssetBinding {
             asset: USD.into(),

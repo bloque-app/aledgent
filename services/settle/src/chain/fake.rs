@@ -38,6 +38,12 @@
 //!   a call Kreivo carried out otherwise than asked would.
 //! - **Eras born only at the signing context** ([`Chain::sign_batch`]): the birth hash is the
 //!   context's own, as the adapter's light client can give no other.
+//! - **A runtime with a surface and an authenticator** (`T-027-12`): its `transaction_version`,
+//!   extensions and types digest, which select the adapter's format, and, apart from them, the
+//!   order its PASS authenticator verifies ([`FakeConfig::order`]). Upgrades change any of them
+//!   ([`FakeChain::set_spec_version`], [`FakeChain::upgrade_to`], [`FakeChain::upgrade`]).
+//!   [`Chain::validate`] checks a transaction as the runtime would, or answers what a test says
+//!   ([`FakeChain::answer_validations`]).
 //! - **A reader fault** ([`FakeChain::misread_reference_of`]): an inbox entry the chain holds is
 //!   read back naming no operation of the deployment, as a faulty decoder would read it. The
 //!   stored bytes, and so the coordinate, are unchanged.
@@ -53,7 +59,7 @@ use super::kreivo::{self, AssetId, Call, Envelope, Refusal, TxParams, Weight};
 use super::{
     AccountId32, BatchCall, BatchFailure, BlockRef, Chain, ChainAsset, ChainError, ChainResult,
     DryRun, InboxEvent, InboxRead, Included, InstanceView, Mortality, RuntimeInfo, SignedExtrinsic,
-    blake2_256,
+    Validity, blake2_256,
 };
 use crate::signer::{Signer, recover};
 
@@ -78,21 +84,51 @@ pub struct FakeConfig {
     pub transaction_version: u32,
     /// How old a PASS challenge's context may be, in blocks (Kreivo: 30 minutes of blocks).
     pub challenge_window: u64,
-    /// The transaction extensions its metadata names; `None`: those of the format its
-    /// `spec_version` selects (`T-027-07`), or none for a runtime with no known format.
-    pub extensions: Option<Vec<String>>,
+    /// The transaction extensions its metadata names (`T-027-12`).
+    pub extensions: Vec<String>,
+    /// The digest of the types of what its transactions carry, as its metadata would give it
+    /// (`T-027-12`, `chain::surface`); `None` for metadata with no `Contracts::call`.
+    pub types: Option<[u8; 32]>,
+    /// The order of the device's message its PASS authenticator verifies: what the runtime
+    /// actually checks, whatever its metadata says (a runtime can flip it with no change of
+    /// surface, as Kreivo `cf69b67` did under spec 133: `F-027` NOTES, decision 23).
+    pub order: kreivo::MessageOrder,
+}
+
+impl FakeConfig {
+    /// A runtime of `spec_version` whose surface and authenticator are `format`'s.
+    pub fn running(spec_version: u32, format: &kreivo::TxFormat) -> FakeConfig {
+        FakeConfig {
+            spec_version,
+            ..FakeConfig::default()
+        }
+        .with_format(format)
+    }
+
+    /// This runtime with `format`'s surface and authenticator.
+    pub fn with_format(mut self, format: &kreivo::TxFormat) -> FakeConfig {
+        self.transaction_version = format.transaction_version;
+        self.extensions = format.extensions.iter().map(|e| (*e).to_owned()).collect();
+        self.types = Some(format.types);
+        self.order = format.order;
+        self
+    }
 }
 
 impl Default for FakeConfig {
+    /// Kreivo spec 133 (`4aef055`), in its format.
     fn default() -> Self {
+        let f = kreivo::FORMAT_133;
         FakeConfig {
             genesis: [0x6e; 32],
             spec_version: 133,
             pallet: true,
             block_hash_count: 256,
-            transaction_version: 1,
+            transaction_version: f.transaction_version,
             challenge_window: 300,
-            extensions: None,
+            extensions: f.extensions.iter().map(|e| (*e).to_owned()).collect(),
+            types: Some(f.types),
+            order: f.order,
         }
     }
 }
@@ -191,6 +227,10 @@ struct State {
     gas: BTreeMap<[u8; 32], (Weight, Weight)>,
     /// Every included batch's storage deposit limit and what it put down, by transaction hash.
     deposits: BTreeMap<[u8; 32], (Option<u128>, u128)>,
+    /// What every validation is answered with, if a test says so ([`FakeChain::answer_validations`]).
+    validity: Option<Validity>,
+    /// How many transactions were validated.
+    validations: usize,
 }
 
 /// The fake settlement layer. Clones share one chain. See the module documentation.
@@ -576,6 +616,8 @@ impl FakeChain {
                 extrinsic_limit: kreivo::NORMAL_EXTRINSIC_MAX_0_16_9,
                 gas: BTreeMap::new(),
                 deposits: BTreeMap::new(),
+                validity: None,
+                validations: 0,
             })),
         }
     }
@@ -737,11 +779,40 @@ impl FakeChain {
         });
     }
 
-    /// Set the change of a runtime's `spec_version` (a runtime upgrade). From the next block on,
-    /// transactions are checked in the new runtime's format, and a transaction signed for the old
-    /// one no longer verifies (`CheckSpecVersion`'s implicit is in its challenge).
+    /// A runtime upgrade that changes the `spec_version` and nothing a transaction carries (Kreivo
+    /// 133 to 134). From the next block on, a transaction signed for the old runtime no longer
+    /// verifies (`CheckSpecVersion`'s implicit is in its challenge).
     pub fn set_spec_version(&self, spec_version: u32) {
         lock(&self.state).config.spec_version = spec_version;
+    }
+
+    /// A runtime upgrade to `spec_version` in `format` (Kreivo 132 to 133): its surface and the
+    /// order its authenticator verifies are `format`'s from now on.
+    pub fn upgrade_to(&self, spec_version: u32, format: &kreivo::TxFormat) {
+        let mut s = lock(&self.state);
+        let config = s.config.clone();
+        s.config = FakeConfig {
+            spec_version,
+            ..config
+        }
+        .with_format(format);
+    }
+
+    /// Any runtime upgrade: `f` changes the runtime's configuration from now on (its surface, the
+    /// order its authenticator verifies, ...).
+    pub fn upgrade(&self, f: impl FnOnce(&mut FakeConfig)) {
+        f(&mut lock(&self.state).config);
+    }
+
+    /// Answer every validation ([`Chain::validate`]) with `validity` from now on, whatever the
+    /// transaction; `None`: validate each as the runtime would (the default).
+    pub fn answer_validations(&self, validity: Option<Validity>) {
+        lock(&self.state).validity = validity;
+    }
+
+    /// How many transactions the runtime was asked to validate.
+    pub fn validations(&self) -> usize {
+        lock(&self.state).validations
     }
 
     /// Send value to the deployment's contract account by a plain transfer: value outside the
@@ -867,7 +938,10 @@ impl FakeChain {
             return None;
         }
         // The device's message, in the order the runtime's authenticator verifies.
-        let format = kreivo::TxFormat::of(s.config.spec_version)?;
+        let format = kreivo::TxFormat {
+            order: s.config.order,
+            ..kreivo::FORMAT_133
+        };
         let digest = blake2_256(&kreivo::signed_message(&format, c.context, &c.challenge));
         let public = recover(&digest, &c.signature)?;
         (blake2_256(&public) == c.device_id).then(|| kreivo::pass_account(&c.user_id))
@@ -1165,15 +1239,14 @@ impl FakeChain {
 impl Chain for FakeChain {
     async fn runtime(&self) -> ChainResult<RuntimeInfo> {
         let s = lock(&self.state);
-        let extensions = s.config.extensions.clone().unwrap_or_else(|| {
-            kreivo::TxFormat::of(s.config.spec_version)
-                .map(|f| f.extensions.iter().map(|e| (*e).to_owned()).collect())
-                .unwrap_or_default()
-        });
         Ok(RuntimeInfo {
             genesis: s.config.genesis,
             spec_version: s.config.spec_version,
-            extensions,
+            surface: kreivo::Surface {
+                transaction_version: s.config.transaction_version,
+                extensions: s.config.extensions.clone(),
+                types: s.config.types,
+            },
             pallet: s.config.pallet,
             block_hash_count: s.config.block_hash_count,
         })
@@ -1375,6 +1448,7 @@ impl Chain for FakeChain {
         era: &Mortality,
         context: &BlockRef,
         limits: &kreivo::CallLimits,
+        runtime: &kreivo::Signing,
     ) -> ChainResult<SignedExtrinsic> {
         // As the node's client does: the era is born at the context, whose hash is its birth
         // hash; no block is looked up by number (`F-027`, finding 4 of the first zombienet runs).
@@ -1408,8 +1482,8 @@ impl Chain for FakeChain {
             );
             let p = TxParams {
                 genesis: s.config.genesis,
-                spec_version: s.config.spec_version,
-                transaction_version: s.config.transaction_version,
+                spec_version: runtime.spec_version,
+                transaction_version: runtime.transaction_version,
                 era: *era,
                 birth_hash,
                 nonce: u32::try_from(nonce)
@@ -1423,7 +1497,38 @@ impl Chain for FakeChain {
             );
             (p, call, context)
         };
-        Ok(kreivo::sign(signer, &call, &p, context).await?)
+        Ok(kreivo::sign(signer, &runtime.format, &call, &p, context).await?)
+    }
+
+    /// As the runtime validates a transaction from the network, for the block after `at`: bytes
+    /// it cannot decode, and a challenge or signature that does not verify in the order its
+    /// authenticator checks (as a device message in the wrong order, or a transaction for another
+    /// runtime, gives), are `Refused`; a stale or future nonce, and fees it cannot pay, `NotNow`.
+    /// A test can answer every validation instead ([`FakeChain::answer_validations`]).
+    async fn validate(&self, at: &BlockRef, extrinsic: &SignedExtrinsic) -> ChainResult<Validity> {
+        let world = self.world_at(at)?;
+        let mut s = lock(&self.state);
+        s.validations += 1;
+        if let Some(v) = &s.validity {
+            return Ok(v.clone());
+        }
+        let Ok(tx) = kreivo::decode_extrinsic(&extrinsic.bytes) else {
+            return Ok(Validity::Refused(
+                "the runtime cannot decode it: Bad input data".into(),
+            ));
+        };
+        let Some(who) = Self::authorise(&s, at.number + 1, &tx) else {
+            return Ok(Validity::Refused("Invalid(BadProof)".into()));
+        };
+        let expected = world.nonces.get(&who).copied().unwrap_or(0);
+        Ok(match u64::from(tx.nonce).cmp(&expected) {
+            std::cmp::Ordering::Less => Validity::NotNow("Invalid(Stale)".into()),
+            std::cmp::Ordering::Greater => Validity::NotNow("Invalid(Future)".into()),
+            std::cmp::Ordering::Equal if world.native.get(&who).copied().unwrap_or(0) < FEE => {
+                Validity::NotNow("Invalid(Payment)".into())
+            }
+            std::cmp::Ordering::Equal => Validity::Valid,
+        })
     }
 
     async fn submit(&self, extrinsic: &SignedExtrinsic) -> ChainResult<()> {

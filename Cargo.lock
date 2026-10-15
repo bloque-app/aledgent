@@ -5495,6 +5495,7 @@ dependencies = [
  "log",
  "parity-scale-codec",
  "reqwest",
+ "scale-info",
  "scale-value",
  "serde",
  "serde_json",

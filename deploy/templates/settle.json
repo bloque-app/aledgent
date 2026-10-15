@@ -3,7 +3,6 @@
   "adapter": {
     "holder": "settle-canary-0",
     "genesis": "c710a5f16adc17bcd212cff0aedcbf1c1212a043cdc0fb2dcba861efe5305b01",
-    "spec_versions": [133, 134],
     "instance": 1,
     "assets": [
       { "asset": "COPM", "chain": "Here(100)" },

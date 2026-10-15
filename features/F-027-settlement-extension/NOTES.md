@@ -701,3 +701,145 @@ The light-client probe (decision 42; one peer, script driver, step 4 skipped):
   a batch included meanwhile, cannot walk back to it (`find_extrinsic` needs the bodies): the step stops
   and retries, deciding nothing and releasing nothing. Deciding inclusion from the inbox and the nonce
   alone would remove the dependency.
+
+## The format by the runtime's surface, confirmed by the layer (T-027-12, amendment 0031, 2026-10-14)
+
+On 2026-10-14 at 21:01Z Kreivo mainnet enacted release `0.17.1`, spec 134. Its transaction extensions,
+their types, its `transaction_version` (13) and its PASS crates are spec 133's, yet the adapter stopped:
+`spec_versions` did not list 134 and `TxFormat::of(134)` had no entry. PR #7 added both as a stopgap.
+Amendment 0031 (`REQ-SA-9`, `AC-E4.3`, `AC-E4.4`) makes the rule a requirement: decide from what an
+instruction must carry, never from a version number alone, and have the layer confirm before the first
+broadcast under rules not served before.
+
+Read from mainnet's own metadata (`Metadata_metadata_at_version(15)` over `https://kreivo.io`, read
+only, at blocks #38 653 511 (spec 132), #39 643 511 (spec 133) and #39 650 511 (spec 134)): specs 133
+and 134 give the same surface digest, `2da44f41…`; spec 132 gives `08ee0c93…`, with
+`transaction_version` 12 and no `DynamicMaxBlockWeight`.
+
+### Decisions (T-027-12)
+
+44. **The format is chosen by the runtime's transaction surface.** `kreivo::Surface` is three things
+    read from live metadata on every step (`RpcChain::runtime`): the `transaction_version`, the
+    identifiers of the transaction extensions of extension version 0 in order, and a digest of the
+    types of what a transaction carries (`chain::surface`). `TxFormat` names the surface it applies
+    to (`kreivo-132`: 12, `EXTENSIONS_132`, `TYPES_132`; `kreivo-133`: 13, `EXTENSIONS_133`,
+    `TYPES_133`) besides the Kreivo revision it is pinned against (`kreivo-pin`, `kreivo-pin-132`,
+    unchanged), and `TxFormat::by_surface` selects. The `spec_version` plays no part, so 134 needs
+    no entry: PR #7's stopgap is removed, and `kreivo-133` covers 133 and 134. Signing takes the
+    format chosen (`kreivo::sign(signer, format, …)`, `Chain::sign_batch(…, &Signing)`), with the
+    `spec_version` and `transaction_version` of the runtime the step checked; `sign` no longer
+    selects or refuses anything. A surface with no format is refused (`Refusing::UnknownSurface`,
+    which replaces `SpecVersion`, `TxFormat` and `Extensions`).
+45. **What the digest covers.** Each extension's identifier, its explicit type and its implicit
+    type; the contracts pallet's index and its `call` call's index; and `call`'s arguments, names
+    and types. A type's digest is its shape as SCALE encodes it: composites by field, in order;
+    variants by index, with their names and fields; sequences, arrays with their length, tuples,
+    primitives, compacts and bit sequences; field and variant names included; type paths, type
+    parameters and docs excluded. Recursive types get a fixed marker. **What it does not cover**:
+    anything the runtime does with the bytes rather than how they are typed, such as the order of
+    the message a PASS device signs (the 132 → 133 change, decision 23), how an extension computes
+    its implicit data, or what the contract does with `execute`; and the rest of the metadata
+    (other calls, storage, events). Those are the confirmation's (decision 47).
+46. **Not subxt's validation hash.** The brief preferred subxt's own mechanism
+    (`subxt_metadata::utils::validation`) over a hand-written digest. It is not usable here: it
+    XORs a composite's field hashes, on purpose (subxt encodes by field name, so field order does
+    not matter to it), which makes it blind to two fields swapped, and so to a change of every byte
+    the positional encoder in `kreivo.rs` writes. The digest is this crate's own
+    (`chain/surface.rs`, about a hundred lines over `scale-info`'s registry), which also keeps the
+    pinned values independent of subxt's releases. They are pinned in code and derived from reduced
+    fixtures of mainnet's metadata (`services/settle/fixtures/surface-{132,133,134}.json`: the type
+    registry cut down to the types the digest reads, renumbered; `SurfaceTypes::reduced` checks the
+    reduced registry digests as the full one does). The ignored test
+    `t_027_12_write_surface_fixtures` rewrites them from saved metadata when a format is added.
+    Trade-off, stated plainly: field and variant names are in the digest, so a rename that moves no
+    byte (or a variant added to a type the adapter encodes as `None`, such as the fee asset's
+    location) stops the adapter until a release or the operator's mapping (decision 49) covers it.
+    A false stop was preferred to a false start; the confirmation alone could not tell a type change
+    that happens to validate from one that does not.
+47. **The layer's confirmation before the first broadcast on a runtime.** A runtime is its
+    `spec_version`, its surface's fingerprint and the format chosen. Before the first transaction
+    signed on a runtime the store does not record as served is broadcast, on every path that
+    broadcasts something newly signed (lane batches, anchors, bindings), the runtime validates it:
+    `TaggedTransactionQueue_validate_transaction(External, extrinsic, best block hash)` through
+    `state_call` at the step's best head, over the adapter's own client (the light client by
+    default; never `dry_run_endpoint`'s node, which is trusted for batch sizes only).
+    `kreivo::transaction_validity` reads the answer:
+    - **Valid**: the runtime is recorded as served (`settle_runtimes`, migration
+      `0005_runtimes.sql`; `Store::confirm_runtime`, never removed), so a restart does not ask again,
+      and the transaction is stored, recorded with the core and broadcast as before.
+    - **Invalid for what it carries** (`BadProof`, `BadSigner`, `UnknownOrigin`,
+      `IndeterminateImplicit`, `Call`, `Custom(_)`, `BadMandatory`, `MandatoryValidation`, or a
+      runtime that cannot decode the bytes, which panics in the API's argument decoding): nothing
+      is stored or broadcast, the calls stay acknowledged and unsigned, a `runtime:<spec_version>`
+      alert is raised, and the adapter refuses to serve on that runtime
+      (`Refusing::Unconfirmed { spec_version, format, error }`). The refusal is held in memory: a
+      restart asks again, which is how a fix (a release, or the operator's mapping) is taken up.
+      Before refusing, the runtime is read again: if it changed since the transaction was signed
+      (whose `spec_version` is in its implicit data, so any upgrade makes it a `BadProof`), nothing
+      is broadcast and nothing is refused; the next step signs for the new runtime.
+    - **Invalid for now** (`Payment`, `Future`, `Stale`, `AncientBirthBlock`, `ExhaustsResources`,
+      any `UnknownTransaction`): no evidence either way. The transaction goes out as any does (the
+      pool validates it again), and the runtime is neither recorded nor refused: the next
+      transaction signed on it is validated again.
+    `Custom(_)` is classed with the refusals because it cannot be told which extension raised it
+    and `PassAuthenticate` raises its own; that leans to a false stop, as decision 46 does.
+    **What the confirmation catches that the surface does not**: a device message in another order
+    (shown by the fake layer: a runtime with 133's surface whose authenticator verifies 132's order
+    is refused with `BadProof`), a wrong `CheckSpecVersion`/`CheckTxVersion`/`CheckGenesis` implicit,
+    a call the runtime cannot decode. **What it does not**: anything the runtime checks only on
+    dispatch, after validation (the contract's own refusals are recorded per call in its inbox, as
+    before).
+48. **`spec_versions` gates nothing.** `AdapterConfig::spec_versions` is optional and
+    informational: a file that has it still parses, and the adapter logs the list at start-up
+    ("informational … gates nothing"). The README's example and the canary's template drop it.
+    Start-up no longer checks it.
+49. **The operator's mapping.** `adapter.formats` maps a `spec_version` to a known format's name
+    (`{ "135": "kreivo-133" }`). The named format is used for that `spec_version` whatever its surface
+    (explicit beats inferred), and the confirmation is still required before anything signed in it
+    is broadcast (amendment 0031). A name the adapter does not know stops it at start-up
+    (`AdapterConfig::unknown_formats`).
+50. **The fake layer** runs Kreivo spec 133 in `kreivo-133` by default, now with its real
+    `transaction_version` (13, not 1) and surface; `FakeConfig::order` is the order its
+    authenticator actually verifies, independent of its surface, so a test can flip it under an
+    unchanged surface. `set_spec_version` is an upgrade that changes nothing a transaction carries,
+    `upgrade_to(spec, format)` one to another format, `upgrade(f)` any change. `Chain::validate`
+    checks a transaction as the runtime would (decode, challenge and signature in its order, then
+    nonce and fees), or answers what a test says (`answer_validations`).
+
+### Tests (T-027-12)
+
+- **Unit** (`chain::surface`): the fixtures' digests are the pinned `TYPES_132` and `TYPES_133`, 133 and
+  134 identical, 132 different in all three parts, `Contracts::call` at (80, 6); the digest changes
+  with two call arguments swapped (which subxt's hash would not see), a call or pallet index, an
+  extension renamed, reordered or retyped. (`chain::kreivo`): each known surface selects its format,
+  by name too, and any changed part (`transaction_version` 14, nine extensions, other types, no types,
+  132's surface under 13) selects none; the validation's arguments, and every `InvalidTransaction`
+  and `UnknownTransaction` classed. (`config`): `spec_versions` optional, old lists parse, `formats`
+  with an unknown name reported.
+- **`tests/contract.rs`**: `AC-E4.3` 133 → 134 keeps serving with no configuration and no format entry
+  for 134, one validation per runtime, none after a restart; `AC-E4.4` an unchanged surface whose
+  validation answers `BadProof`: nothing stored or broadcast, `Unconfirmed`, `runtime:134` alert,
+  `ERR-SettlementLayerUnavailable` once declared; an order flipped under 133's surface is refused
+  by the (fake) layer itself, and the operator's mapping to `kreivo-132` then settles after
+  confirmation; a transient answer goes out, confirms nothing, and the next batch confirms; a runtime
+  with unknown types is refused until mapped, then served only after the layer confirms. `T-027-07`'s
+  three tests carry over (`upgrade_to` instead of `set_spec_version`; `signed_in` lists formats).
+- **`tests/flow.rs`**: an unknown `transaction_version` and other extensions refuse with
+  `UnknownSurface`; a `spec_versions` list gates nothing either way; an upgrade to an unknown surface
+  stops submission and signing until the surface is known again.
+- **`tests/anchoring.rs`**: an anchor the layer does not confirm is neither stored nor broadcast.
+- **Conformance** (`crates/conformance`, `F-016`): `AC-E4.3` and `AC-E4.4` registered as service cases;
+  `AC-E4.2` keeps the wrong genesis, and `ERR-SettlementLayerUnavailable` uses an unknown surface.
+
+### Open (T-027-12)
+
+- **Not run against a live runtime.** The validation probe's request and the decoding of its answer
+  are written from `sp-runtime`'s `TransactionValidity` and tested against hand-built bytes; the
+  light client's answer to `TaggedTransactionQueue_validate_transaction` was not observed. A
+  validation runs the extensions' `validate`, not the call, so the missing child-trie proof entries
+  of decisions 36 and 42 should not arise; the zombienet suite is where it can be seen. A probe that
+  fails to answer (`ChainError::Unavailable`) ends the step, as a dry run's failure did before decision
+  35, and nothing is signed or stored by it.
+- **The aledgent driver** (`e2e/aledgent-driver`) still sets `spec_versions`, now informational. A local
+  Kreivo built from a revision whose types differ from mainnet's (an asset location type, say) has
+  another surface digest and is refused until its format is mapped (`adapter.formats`) or pinned.

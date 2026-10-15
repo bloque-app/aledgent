@@ -26,6 +26,7 @@ struct Inner {
     alerts: BTreeMap<String, AlertRow>,
     anchors: BTreeMap<u64, AnchorRow>,
     binds: std::collections::BTreeMap<String, super::BindRow>,
+    runtimes: BTreeMap<String, super::RuntimeRow>,
 }
 
 impl Inner {
@@ -55,6 +56,18 @@ impl MemStore {
 }
 
 impl Store for MemStore {
+    async fn runtimes(&self) -> StoreResult<Vec<super::RuntimeRow>> {
+        Ok(self.lock().runtimes.values().cloned().collect())
+    }
+
+    async fn confirm_runtime(&self, row: &super::RuntimeRow) -> StoreResult<()> {
+        self.lock()
+            .runtimes
+            .entry(row.key.clone())
+            .or_insert_with(|| row.clone());
+        Ok(())
+    }
+
     async fn anchors(&self) -> StoreResult<Vec<AnchorRow>> {
         Ok(self.lock().anchors.values().cloned().collect())
     }

@@ -341,6 +341,44 @@ async fn t_027_02_a_refused_anchor_call_is_observed_with_the_contracts_reason() 
     ))));
 }
 
+/// `T-027-12`, `AC-E4.4`, `REQ-SA-9`: the anchor key's first transaction on a runtime not served
+/// before is confirmed by the layer too. Refused, it is neither stored nor broadcast, and the
+/// adapter refuses to serve on that runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_027_12_an_anchor_the_layer_does_not_confirm_is_never_stored_or_broadcast() {
+    let mut k = anchoring_kit().await;
+    k.d.party("alice", 1_000).await;
+    k.chain.set_spec_version(134);
+    k.chain
+        .answer_validations(Some(settle::chain::Validity::Refused(
+            "Invalid(BadSigner)".into(),
+        )));
+    k.pass(ANCHOR_INTERVAL_MS).await;
+    k.step().await.unwrap();
+    assert_eq!(k.chain.validations(), 1);
+    let (serving, why) = k.adapter.status();
+    assert!(!serving);
+    assert!(
+        matches!(
+            why,
+            [settle::adapter::Refusing::Unconfirmed {
+                spec_version: 134,
+                ..
+            }]
+        ),
+        "{why:?}"
+    );
+    assert!(
+        k.store
+            .anchors()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.extrinsic.is_none())
+    );
+    assert_eq!(k.chain.anchor_submissions(), 0);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_adapter_without_an_anchor_key_does_not_anchor() {
     let mut k = Kit::start().await;

@@ -25,6 +25,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
     (2, include_str!("../../migrations/0002_anchors.sql")),
     (3, include_str!("../../migrations/0003_batches.sql")),
     (4, include_str!("../../migrations/0004_binds.sql")),
+    (5, include_str!("../../migrations/0005_runtimes.sql")),
 ];
 
 /// The adapter's store in PostgreSQL. Clones share the pool.
@@ -394,6 +395,23 @@ impl Store for PgStore {
     async fn binds(&self) -> StoreResult<Vec<super::BindRow>> {
         self.bodies("SELECT body FROM settle_binds ORDER BY reference")
             .await
+    }
+
+    async fn runtimes(&self) -> StoreResult<Vec<super::RuntimeRow>> {
+        self.bodies("SELECT body FROM settle_runtimes ORDER BY runtime")
+            .await
+    }
+
+    async fn confirm_runtime(&self, row: &super::RuntimeRow) -> StoreResult<()> {
+        let c = self.client().await?;
+        c.execute(
+            "INSERT INTO settle_runtimes (runtime, body) VALUES ($1, $2) \
+             ON CONFLICT (runtime) DO NOTHING",
+            &[&row.key, &to_json(row)?],
+        )
+        .await
+        .map_err(err)?;
+        Ok(())
     }
 
     async fn put_bind(&self, epoch: u64, row: &super::BindRow) -> StoreResult<()> {

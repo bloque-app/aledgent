@@ -1,14 +1,16 @@
 // Copyright (c) 2026 Pagos Cube LLC
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Kreivo, as the executor speaks to it (`F-027`, `DEC-17`, `DEC-18`), in the two transaction
-//! formats of the runtimes it signs for (`T-027-07`, see [`TxFormat`]):
+//! formats of the runtimes it signs for (`T-027-07`, see [`TxFormat`]), each chosen by the
+//! runtime's transaction surface, never by its `spec_version` (`T-027-12`, `REQ-SA-9`):
 //!
-//! - **spec 132**, Kreivo release `0.16.9` (`db3d8af`): what Kreivo mainnet runs (its runtime code
-//!   hash is that release's, read on 2026-09-29);
-//! - **spec 133**, Kreivo `4aef055` onward, up to the release that carries kreivo#501;
-//! - **spec 134**, Kreivo release `0.17.1` (`87f8728`), enacted on mainnet on 2026-10-14: spec 133's
-//!   format unchanged (the release adds asset calls to the contracts' chain extension, and its
-//!   transaction extensions, `transaction_version` and PASS crates are spec 133's).
+//! - [`FORMAT_132`]: Kreivo release `0.16.9` (`db3d8af`, spec 132, `transaction_version` 12), what
+//!   Kreivo mainnet ran until 2026-10 (its runtime code hash was that release's, read on
+//!   2026-09-29);
+//! - [`FORMAT_133`]: Kreivo `4aef055` onward (spec 133, `transaction_version` 13), and every
+//!   runtime since whose surface is the same: Kreivo release `0.17.1` (spec 134), enacted on
+//!   mainnet on 2026-10-14, is one (it adds asset calls to the contracts' chain extension; its
+//!   transaction extensions, their types, `transaction_version` and PASS crates are spec 133's).
 //!
 //! What it speaks:
 //!
@@ -65,8 +67,11 @@
 //! which signs `context ‖ authority ‖ challenge`; pass-authenticators PR #16 (`7f240c3`) moved
 //! the authority last, and every published runtime of spec 133 locks it or a later version
 //! (1.0.0 at `4aef055`, 1.2.0 at kreivo#501). A device that signs the other order is refused
-//! with `BadSigner`. So the executor signs only for a `spec_version` it has a format for, and
-//! refuses any other ([`TxFormat::of`]).
+//! with `BadSigner`. Nothing in the metadata shows the order; Kreivo bumped `transaction_version`
+//! with it. So the executor signs only for a surface it has a format for
+//! ([`TxFormat::by_surface`]), and the layer itself confirms the format on each runtime before
+//! the first transaction signed in it is broadcast ([`transaction_validity`]): an order flipped
+//! with no change of surface fails there.
 
 use parity_scale_codec::{Compact, Decode, Encode};
 
@@ -859,6 +864,80 @@ pub fn message_result<T: Decode>(data: &[u8]) -> Result<T, String> {
     }
 }
 
+// ------------------------------------------------------------------------------ validation
+
+/// `TransactionSource::External`: a transaction validated as one from the network is.
+pub const SOURCE_EXTERNAL: u8 = 2;
+
+/// The runtime API that validates a transaction without including it (`T-027-12`).
+pub const VALIDATE_TRANSACTION: &str = "TaggedTransactionQueue_validate_transaction";
+
+/// [`VALIDATE_TRANSACTION`]'s arguments: `(TransactionSource::External, extrinsic, block_hash)`.
+/// `extrinsic` is the transaction's bytes as broadcast, which are already its own SCALE encoding
+/// (length-prefixed).
+pub fn validate_transaction_args(extrinsic: &[u8], at: &[u8; 32]) -> Vec<u8> {
+    let mut b = vec![SOURCE_EXTERNAL];
+    b.extend_from_slice(extrinsic);
+    b.extend_from_slice(at);
+    b
+}
+
+/// What [`VALIDATE_TRANSACTION`] answered: `TransactionValidity`, that is
+/// `Result<ValidTransaction, TransactionValidityError>` (`sp-runtime`'s `transaction_validity`),
+/// classed as `REQ-SA-9` needs it ([`super::Validity`]).
+///
+/// - `Valid`: the layer confirms the transaction.
+/// - `Refused`, evidence that the transaction is not built as the runtime reads it:
+///   `InvalidTransaction::BadProof` and `BadSigner` (a signature that does not verify, as a
+///   device message in the wrong order gives), `UnknownOrigin` (no extension authorised it: what
+///   `PassAuthenticate` leaves when it does not), `IndeterminateImplicit`, `Call`, `Custom` (an
+///   extension's own error), `BadMandatory` and `MandatoryValidation`.
+/// - `NotNow`, which says nothing of the format: `Payment`, `Future`, `Stale` (its nonce),
+///   `AncientBirthBlock` (its era), `ExhaustsResources`, and every `UnknownTransaction`.
+pub fn transaction_validity(bytes: &[u8]) -> Result<super::Validity, String> {
+    use super::Validity;
+    let mut b = bytes;
+    let byte = |b: &mut &[u8]| u8::decode(b).map_err(|e| e.to_string());
+    match byte(&mut b)? {
+        0 => {
+            // ValidTransaction { priority, requires, provides, longevity, propagate }.
+            <(u64, Vec<Vec<u8>>, Vec<Vec<u8>>, u64, bool)>::decode(&mut b)
+                .map_err(|e| e.to_string())?;
+            Ok(Validity::Valid)
+        }
+        1 => match byte(&mut b)? {
+            0 => {
+                let refused = |why: &str| Ok(Validity::Refused(format!("Invalid({why})")));
+                let not_now = |why: &str| Ok(Validity::NotNow(format!("Invalid({why})")));
+                match byte(&mut b)? {
+                    0 => refused("Call"),
+                    1 => not_now("Payment"),
+                    2 => not_now("Future"),
+                    3 => not_now("Stale"),
+                    4 => refused("BadProof"),
+                    5 => not_now("AncientBirthBlock"),
+                    6 => not_now("ExhaustsResources"),
+                    7 => refused(&format!("Custom({})", byte(&mut b)?)),
+                    8 => refused("BadMandatory"),
+                    9 => refused("MandatoryValidation"),
+                    10 => refused("BadSigner"),
+                    11 => refused("IndeterminateImplicit"),
+                    12 => refused("UnknownOrigin"),
+                    other => Err(format!("an InvalidTransaction of index {other}")),
+                }
+            }
+            1 => Ok(Validity::NotNow(match byte(&mut b)? {
+                0 => "Unknown(CannotLookup)".into(),
+                1 => "Unknown(NoUnsignedValidator)".into(),
+                2 => format!("Unknown(Custom({}))", byte(&mut b)?),
+                other => return Err(format!("an UnknownTransaction of index {other}")),
+            })),
+            other => Err(format!("a TransactionValidityError of index {other}")),
+        },
+        other => Err(format!("a TransactionValidity of index {other}")),
+    }
+}
+
 // ------------------------------------------------------------------------------ formats
 
 /// The order of the message a PASS device signs.
@@ -872,20 +951,77 @@ pub enum MessageOrder {
     ChallengeFirst,
 }
 
-/// A Kreivo transaction format (`T-027-07`): what differs between the runtimes the executor signs
-/// for. Everything else in the transaction is the same in every format here, and each format's
-/// bytes are pinned against Kreivo's own crates at the revisions [`TxFormat::kreivo`] names.
+/// A Kreivo transaction format (`T-027-07`, `T-027-12`): what differs between the runtimes the
+/// executor signs for, and **the transaction surface it applies to** (`REQ-SA-9`). Everything else
+/// in the transaction is the same in every format here, and each format's bytes are pinned against
+/// Kreivo's own crates at the revisions [`TxFormat::kreivo`] names.
+///
+/// A runtime is signed for in the format whose surface is the runtime's ([`TxFormat::matches`]):
+/// its `transaction_version`, its transaction extensions in order, and the digest of the types of
+/// what a transaction carries (`chain::surface`). Its `spec_version` plays no part: a runtime
+/// upgrade that changes none of these keeps the format (amendment 0031).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TxFormat {
-    /// The runtime's `spec_version`.
-    pub spec_version: u32,
+    /// Its name, as an operator names it in the configuration's `formats`.
+    pub name: &'static str,
     /// The Kreivo revision the format is pinned against.
     pub kreivo: &'static str,
     /// The order of the message the device signs.
     pub order: MessageOrder,
+    /// The runtime's `transaction_version` the format applies to.
+    pub transaction_version: u32,
     /// The runtime's transaction extensions, as its metadata names them for extension version 0,
-    /// in order: the runtime is refused unless it names exactly these.
+    /// in order.
     pub extensions: &'static [&'static str],
+    /// The digest of the types of what a transaction carries in this format (`chain::surface`),
+    /// derived from Kreivo's live metadata (`services/settle/fixtures/surface-*.json`).
+    pub types: [u8; 32],
+}
+
+/// What a runtime's transactions must carry, as its metadata describes it (`T-027-12`,
+/// `REQ-SA-9`): what selects the format a transaction is signed in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Surface {
+    /// The runtime's `transaction_version`.
+    pub transaction_version: u32,
+    /// Its transaction extensions, as its metadata names them for extension version 0, in order.
+    pub extensions: Vec<String>,
+    /// The digest of the types of what a transaction carries (`chain::surface`): every extension's
+    /// explicit and implicit types and the `Contracts::call` call. `None` when the metadata has
+    /// no such call to read.
+    pub types: Option<[u8; 32]>,
+}
+
+impl Surface {
+    /// The surface of `format`, as a runtime that matches it describes it.
+    pub fn of(format: &TxFormat) -> Surface {
+        Surface {
+            transaction_version: format.transaction_version,
+            extensions: format.extensions.iter().map(|e| (*e).to_owned()).collect(),
+            types: Some(format.types),
+        }
+    }
+
+    /// One digest of the whole surface: part of the identity of a runtime the layer confirmed.
+    pub fn fingerprint(&self) -> [u8; 32] {
+        let mut b = self.transaction_version.encode();
+        self.extensions.encode_to(&mut b);
+        self.types.encode_to(&mut b);
+        blake2_256(&b)
+    }
+}
+
+/// What a transaction is signed for (`T-027-12`): the runtime's `spec_version` and
+/// `transaction_version`, which its implicit data carries, and the format chosen for the runtime's
+/// surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Signing {
+    /// The runtime's `spec_version` (`CheckSpecVersion`).
+    pub spec_version: u32,
+    /// The runtime's `transaction_version` (`CheckTxVersion`).
+    pub transaction_version: u32,
+    /// The format the transaction is signed in.
+    pub format: TxFormat,
 }
 
 /// Spec 132's transaction extensions (Kreivo `0.16.9`): the nine of the module documentation,
@@ -918,38 +1054,68 @@ pub const EXTENSIONS_133: &[&str] = &[
     "DynamicMaxBlockWeight",
 ];
 
-/// Every format the executor signs in. A `spec_version` not listed here is refused.
-pub const FORMATS: [TxFormat; 3] = [
-    TxFormat {
-        spec_version: 132,
-        kreivo: "0.16.9 (db3d8af)",
-        order: MessageOrder::AuthorityFirst,
-        extensions: EXTENSIONS_132,
-    },
-    TxFormat {
-        spec_version: 133,
-        kreivo: "4aef055",
-        order: MessageOrder::ChallengeFirst,
-        extensions: EXTENSIONS_133,
-    },
-    // Kreivo 0.17.1 changes no transaction byte: its lockfile moves nothing but its own version, so
-    // `services/settle/kreivo-pin` (spec 133) proves these bytes too.
-    TxFormat {
-        spec_version: 134,
-        kreivo: "0.17.1 (87f8728)",
-        order: MessageOrder::ChallengeFirst,
-        extensions: EXTENSIONS_133,
-    },
+/// Kreivo `0.16.9`'s format (spec 132, `transaction_version` 12): what mainnet ran until
+/// 2026-10. Pinned by `services/settle/kreivo-pin-132`.
+pub const FORMAT_132: TxFormat = TxFormat {
+    name: "kreivo-132",
+    kreivo: "0.16.9 (db3d8af)",
+    order: MessageOrder::AuthorityFirst,
+    transaction_version: 12,
+    extensions: EXTENSIONS_132,
+    types: TYPES_132,
+};
+
+/// Kreivo `4aef055`'s format (spec 133, `transaction_version` 13), and every runtime since whose
+/// surface is the same: Kreivo `0.17.1` (spec 134, enacted on mainnet on 2026-10-14) is one
+/// (`fixtures/surface-134.json`). Pinned by `services/settle/kreivo-pin`.
+pub const FORMAT_133: TxFormat = TxFormat {
+    name: "kreivo-133",
+    kreivo: "4aef055",
+    order: MessageOrder::ChallengeFirst,
+    transaction_version: 13,
+    extensions: EXTENSIONS_133,
+    types: TYPES_133,
+};
+
+/// The digest of spec 132's types (`fixtures/surface-132.json`):
+/// `08ee0c93fccb4d17d867892381ba9f61cd08e56e52a993d0c3645f12ba999bb9`.
+pub const TYPES_132: [u8; 32] = [
+    0x08, 0xee, 0x0c, 0x93, 0xfc, 0xcb, 0x4d, 0x17, 0xd8, 0x67, 0x89, 0x23, 0x81, 0xba, 0x9f, 0x61,
+    0xcd, 0x08, 0xe5, 0x6e, 0x52, 0xa9, 0x93, 0xd0, 0xc3, 0x64, 0x5f, 0x12, 0xba, 0x99, 0x9b, 0xb9,
 ];
 
+/// The digest of spec 133's types (`fixtures/surface-133.json`), and spec 134's
+/// (`fixtures/surface-134.json`): `2da44f419d560b7bff6d56438e512190d93e6079703f584c67bbd8061ef34064`.
+pub const TYPES_133: [u8; 32] = [
+    0x2d, 0xa4, 0x4f, 0x41, 0x9d, 0x56, 0x0b, 0x7b, 0xff, 0x6d, 0x56, 0x43, 0x8e, 0x51, 0x21, 0x90,
+    0xd9, 0x3e, 0x60, 0x79, 0x70, 0x3f, 0x58, 0x4c, 0x67, 0xbb, 0xd8, 0x06, 0x1e, 0xf3, 0x40, 0x64,
+];
+
+/// Every format the executor signs in. A runtime whose surface is none of theirs is refused,
+/// unless the operator names one for it (and the layer then confirms it, `REQ-SA-9`).
+pub const FORMATS: [TxFormat; 2] = [FORMAT_132, FORMAT_133];
+
 impl TxFormat {
-    /// The format of the runtime whose `spec_version` this is; `None` for one it does not know,
-    /// never a guess.
-    pub fn of(spec_version: u32) -> Option<TxFormat> {
-        FORMATS
-            .iter()
-            .copied()
-            .find(|f| f.spec_version == spec_version)
+    /// The format whose surface is `surface`; `None` for one it does not know, never a guess.
+    pub fn by_surface(surface: &Surface) -> Option<TxFormat> {
+        FORMATS.iter().copied().find(|f| f.matches(surface))
+    }
+
+    /// The format an operator names `name`.
+    pub fn named(name: &str) -> Option<TxFormat> {
+        FORMATS.iter().copied().find(|f| f.name == name)
+    }
+
+    /// Whether `surface` is this format's: the same `transaction_version`, the same extensions in
+    /// the same order, and the same types.
+    pub fn matches(&self, surface: &Surface) -> bool {
+        surface.transaction_version == self.transaction_version
+            && surface
+                .extensions
+                .iter()
+                .map(String::as_str)
+                .eq(self.extensions.iter().copied())
+            && surface.types == Some(self.types)
     }
 }
 
@@ -1131,12 +1297,6 @@ pub fn extrinsic(credential: &PassCredential, p: &TxParams, call: &[u8]) -> Vec<
 /// Why a transaction was not signed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SignError {
-    /// No transaction format is known for the runtime's `spec_version` (`T-027-07`): nothing is
-    /// signed rather than guessed.
-    UnknownRuntime {
-        /// The runtime's `spec_version`.
-        spec_version: u32,
-    },
     /// The signer did not sign.
     Signer(SignerError),
 }
@@ -1144,11 +1304,6 @@ pub enum SignError {
 impl std::fmt::Display for SignError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SignError::UnknownRuntime { spec_version } => write!(
-                f,
-                "no Kreivo transaction format is known for spec_version {spec_version}; \
-                 refusing to sign"
-            ),
             SignError::Signer(e) => e.fmt(f),
         }
     }
@@ -1165,31 +1320,28 @@ impl From<SignerError> for SignError {
 impl From<SignError> for super::ChainError {
     fn from(e: SignError) -> Self {
         match e {
-            SignError::UnknownRuntime { .. } => super::ChainError::Invalid(e.to_string()),
             SignError::Signer(e) => super::ChainError::Unavailable(e.to_string()),
         }
     }
 }
 
 /// Sign `call` as the PASS account behind `signer` (its hashed user id, and its device key), with
-/// the challenge's context at block `context` (its number and hash), in the format of the runtime
-/// `p.spec_version` names; a runtime with no known format is refused. The device key signs
-/// through [`Signer`] and is never seen here.
+/// the challenge's context at block `context` (its number and hash), in `format`: the one the
+/// adapter chose for the runtime's surface (`T-027-12`), never one guessed from `p`. The device
+/// key signs through [`Signer`] and is never seen here.
 pub async fn sign(
     signer: &dyn Signer,
+    format: &TxFormat,
     call: &[u8],
     p: &TxParams,
     context: (u32, [u8; 32]),
 ) -> Result<SignedExtrinsic, SignError> {
-    let format = TxFormat::of(p.spec_version).ok_or(SignError::UnknownRuntime {
-        spec_version: p.spec_version,
-    })?;
     let user_id = signer
         .pass_user()
         .ok_or_else(|| SignerError::Unavailable("the key is not a PASS account's device".into()))?;
     let xtc = extrinsic_context(call, p);
     let challenge = challenge(&context.1, &xtc);
-    let digest = blake2_256(&signed_message(&format, context.0, &challenge));
+    let digest = blake2_256(&signed_message(format, context.0, &challenge));
     let signature = signer.sign(digest).await?;
     let credential = PassCredential {
         device_id: signer.device(),
@@ -1622,7 +1774,12 @@ mod tests {
     /// A pinned vector: fixed inputs, and every byte this module derives from them, in the
     /// format of `spec_version`, compared with the file at `path` (under this crate).
     /// `UPDATE_KREIVO_VECTORS=1` rewrites the file.
-    async fn check_pinned_vector(spec_version: u32, transaction_version: u32, path: &str) {
+    async fn check_pinned_vector(
+        format: &TxFormat,
+        spec_version: u32,
+        transaction_version: u32,
+        path: &str,
+    ) {
         let secret = [0x5e; 32];
         let user = [0x51; 32];
         let device = Arc::new(DevSigner::from_secret(&secret).unwrap());
@@ -1677,9 +1834,8 @@ mod tests {
         let call = contracts_call(&contract, &limits, &data);
         let xtc = extrinsic_context(&call, &p);
         let ch = challenge(&context.1, &xtc);
-        let format = TxFormat::of(spec_version).unwrap();
-        let message = signed_message(&format, context.0, &ch);
-        let signed = sign(&pass, &call, &p, context).await.unwrap();
+        let message = signed_message(format, context.0, &ch);
+        let signed = sign(&pass, format, &call, &p, context).await.unwrap();
         let tx = decode_extrinsic(&signed.bytes).unwrap();
         fn h(b: impl AsRef<[u8]>) -> String {
             hex::encode(b)
@@ -1740,30 +1896,66 @@ mod tests {
     /// the same file, so this test and that crate together pin the transaction to Kreivo's types.
     #[tokio::test]
     async fn t_027_03_the_pass_transaction_matches_the_pinned_vector() {
-        check_pinned_vector(133, 1, "kreivo-pin/vectors.json").await;
+        check_pinned_vector(&FORMAT_133, 133, 1, "kreivo-pin/vectors.json").await;
     }
 
     /// The spec 132 vector (`services/settle/kreivo-pin-132/vectors.json`), which `kreivo-pin-132`
     /// rebuilds with the crates Kreivo release `0.16.9`, the runtime live on mainnet, locks.
     #[tokio::test]
     async fn t_027_07_the_spec_132_transaction_matches_its_pinned_vector() {
-        check_pinned_vector(132, 12, "kreivo-pin-132/vectors.json").await;
+        check_pinned_vector(&FORMAT_132, 132, 12, "kreivo-pin-132/vectors.json").await;
     }
 
+    /// `T-027-07`, `T-027-12`: each known surface has one format, chosen by the surface alone, and
+    /// no other surface is guessed at.
     #[test]
-    fn t_027_07_each_known_runtime_has_one_format_and_no_other_is_guessed() {
-        let f132 = TxFormat::of(132).unwrap();
-        let f133 = TxFormat::of(133).unwrap();
+    fn t_027_12_each_known_surface_has_one_format_and_no_other_is_guessed() {
+        let (f132, f133) = (FORMAT_132, FORMAT_133);
         assert_eq!(f132.order, MessageOrder::AuthorityFirst);
         assert_eq!(f133.order, MessageOrder::ChallengeFirst);
         // The same nine extensions; 133 appends DynamicMaxBlockWeight, which encodes nothing.
         assert_eq!(f132.extensions, &f133.extensions[..9]);
         assert_eq!(f133.extensions[9..], ["DynamicMaxBlockWeight"]);
-        // 134 (Kreivo 0.17.1) signs exactly as 133 does.
-        let f134 = TxFormat::of(134).unwrap();
-        assert_eq!((f134.order, f134.extensions), (f133.order, f133.extensions));
-        for unknown in [0, 131, 135, 136, u32::MAX] {
-            assert_eq!(TxFormat::of(unknown), None, "{unknown}");
+        // The one real format change came with a transaction_version bump.
+        assert_eq!(
+            (f132.transaction_version, f133.transaction_version),
+            (12, 13)
+        );
+        assert_eq!(TxFormat::by_surface(&Surface::of(&f132)), Some(f132));
+        assert_eq!(TxFormat::by_surface(&Surface::of(&f133)), Some(f133));
+        assert_eq!(TxFormat::named("kreivo-132"), Some(f132));
+        assert_eq!(TxFormat::named("kreivo-133"), Some(f133));
+        assert_eq!(TxFormat::named("kreivo-134"), None);
+        // Any part of the surface changed: no format.
+        let changed = [
+            Surface {
+                transaction_version: 14,
+                ..Surface::of(&f133)
+            },
+            Surface {
+                extensions: f133.extensions[..9]
+                    .iter()
+                    .map(|e| (*e).to_owned())
+                    .collect(),
+                ..Surface::of(&f133)
+            },
+            Surface {
+                types: Some([7; 32]),
+                ..Surface::of(&f133)
+            },
+            Surface {
+                types: None,
+                ..Surface::of(&f133)
+            },
+            // 132's extensions and types under 133's transaction_version.
+            Surface {
+                transaction_version: 13,
+                ..Surface::of(&f132)
+            },
+        ];
+        for s in changed {
+            assert_eq!(TxFormat::by_surface(&s), None, "{s:?}");
+            assert_ne!(s.fingerprint(), Surface::of(&f133).fingerprint());
         }
         // The two messages hold the same bytes in the two orders.
         let (ch, cx) = ([0xc4; 32], 7u32);
@@ -1776,26 +1968,51 @@ mod tests {
         assert_eq!(&b[36..], &PASS_AUTHORITY);
     }
 
-    #[tokio::test]
-    async fn t_027_07_an_unknown_runtime_is_refused_not_signed() {
-        let device = Arc::new(DevSigner::from_secret(&[0x5e; 32]).unwrap());
-        let pass = PassAccount::new(device, [0x51; 32]);
-        let call = contracts_call(&[9; 32], &CallLimits::default(), &execute_data(&[]));
-        for spec_version in [131, 135] {
-            let p = TxParams {
-                genesis: [0x6e; 32],
-                spec_version,
-                transaction_version: 1,
-                era: Mortality::at(64, 10),
-                birth_hash: [0xb1; 32],
-                nonce: 7,
-                tip: 0,
-            };
+    /// `T-027-12`: `TaggedTransactionQueue_validate_transaction`'s arguments, and its answer classed
+    /// as the confirmation needs it.
+    #[test]
+    fn t_027_12_a_validation_is_asked_and_read_as_the_runtime_answers_it() {
+        use super::super::Validity;
+        let args = validate_transaction_args(&[0x08, 0xaa, 0xbb], &[0x11; 32]);
+        assert_eq!(args[0], SOURCE_EXTERNAL);
+        assert_eq!(&args[1..4], &[0x08, 0xaa, 0xbb]);
+        assert_eq!(&args[4..], &[0x11; 32]);
+        // Ok(ValidTransaction { priority, requires, provides, longevity, propagate }).
+        let mut ok = vec![0u8];
+        (7u64, vec![vec![1u8]], vec![vec![2u8]], 64u64, true).encode_to(&mut ok);
+        assert_eq!(transaction_validity(&ok), Ok(Validity::Valid));
+        let invalid = |b: &[u8]| transaction_validity(&[&[1u8, 0][..], b].concat()).unwrap();
+        for (bytes, refused) in [
+            (&[0u8][..], true),
+            (&[1], false),
+            (&[2], false),
+            (&[3], false),
+            (&[4], true),
+            (&[5], false),
+            (&[6], false),
+            (&[7, 3], true),
+            (&[8], true),
+            (&[9], true),
+            (&[10], true),
+            (&[11], true),
+            (&[12], true),
+        ] {
             assert_eq!(
-                sign(&pass, &call, &p, (9, [0xc0; 32])).await,
-                Err(SignError::UnknownRuntime { spec_version })
+                matches!(invalid(bytes), Validity::Refused(_)),
+                refused,
+                "{bytes:?}"
             );
+            assert_ne!(invalid(bytes), Validity::Valid);
         }
+        assert_eq!(invalid(&[4]), Validity::Refused("Invalid(BadProof)".into()));
+        assert_eq!(invalid(&[3]), Validity::NotNow("Invalid(Stale)".into()));
+        // Unknown validity is not evidence against the format.
+        assert!(matches!(
+            transaction_validity(&[1, 1, 2, 9]),
+            Ok(Validity::NotNow(_))
+        ));
+        assert!(transaction_validity(&[1, 0, 13]).is_err());
+        assert!(transaction_validity(&[2]).is_err());
     }
 
     #[tokio::test]
@@ -1812,7 +2029,9 @@ mod tests {
             tip: 0,
         };
         let call = contracts_call(&[9; 32], &CallLimits::default(), &execute_data(&[]));
-        let signed = sign(&pass, &call, &p, (9, [0xc0; 32])).await.unwrap();
+        let signed = sign(&pass, &FORMAT_133, &call, &p, (9, [0xc0; 32]))
+            .await
+            .unwrap();
         assert_eq!(signed.hash, blake2_256(&signed.bytes));
         let tx = decode_extrinsic(&signed.bytes).unwrap();
         assert_eq!(tx.call, call);
@@ -1826,7 +2045,7 @@ mod tests {
             tx.credential.challenge,
             challenge(&[0xc0; 32], &extrinsic_context(&call, &p))
         );
-        let format = TxFormat::of(133).unwrap();
+        let format = FORMAT_133;
         let digest = blake2_256(&signed_message(&format, 9, &tx.credential.challenge));
         let public = crate::signer::recover(&digest, &tx.credential.signature).unwrap();
         assert_eq!(blake2_256(&public), tx.credential.device_id);
@@ -1835,7 +2054,7 @@ mod tests {
         assert_ne!(pass.account(), device.account());
         // A plain key is not a PASS account's device.
         assert!(
-            sign(device.as_ref(), &call, &p, (9, [0xc0; 32]))
+            sign(device.as_ref(), &FORMAT_133, &call, &p, (9, [0xc0; 32]))
                 .await
                 .is_err()
         );
