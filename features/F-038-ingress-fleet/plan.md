@@ -9,7 +9,7 @@ SPDX-License-Identifier: CC-BY-4.0
 |---|---|
 | Milestone | M-3 — Production V0 (`DEC-27`, proposed 2026-10-15; its operator guides gate `M-3D`) |
 | Track | B |
-| Home | `services/ingress` (`stream`, `remote`, `service`, `credentials`, `surface`, `store`, `config`, `main`, `readiness`), `agents/core-host` (`serve`, host side only), `services/ingress/migrations/0007_*` |
+| Home | `services/ingress` (`stream`, `remote`, `service`, `credentials`, `surface`, `store`, `config`, `main`, `readiness`), `agents/core-host` (`serve`, host side only), `services/ingress/migrations/0007_*`, `0008_*` |
 | Depends on | `F-009` (the received log, the forwarder, leadership), `F-035` (the signer, the authenticated core link), `F-028` (credential schemes), `F-036` (the genesis gate), `T-009-26` (the migration runner and its checksums) |
 | Unblocks | An operator's ingress fleet (Bloque's on AWS is the first); `F-039`'s operator guides for AWS and for one machine |
 | Realises | `DEC-27` (a) to (i), (e′), (e″), (h′); `NFR-1`, `NFR-5`, `NFR-16`, `NFR-17`, `NFR-21`, `REQ-AR-7`, `REQ-CS-2`, `REQ-CS-7`, `REQ-CS-8`, `REQ-AU-3`, `REQ-AU-8`, `REQ-AU-20`, `NFR-7` |
@@ -56,7 +56,8 @@ Unix-socket link's do (`ingress::remote`); the core host calls the dialing end.
 - **Messages after the handshake**, each with an `id` the answer repeats, so several are in flight:
   `Call { id, request }` (ingress to core: any request of `ingress::remote::Request`, the reads and the
   sequenced feed below), `Answer { id, response }` (core to ingress), `Ping`/`Pong` (both ways),
-  `GoAway { reason }` (ingress to core). The request and response types are the socket link's, so the
+  `GoAway { reason }` and `Roster { roster }` (ingress to core, §6); a `Hello` may ask for the roster
+  only (`roster_only`), answered by a `Welcome` that carries it, and closed. The request and response types are the socket link's, so the
   host answers both links with one function, and the host's calls into the Agent are untouched
   (`DEC-26(d)`, `DEC-27` (i)).
 - **Keepalive.** Each side sends `Ping` every `keepalive_ms` (1 000 by default) and drops a peer it has
@@ -150,10 +151,43 @@ the last tick, the next deadline, the genesis gate) is a `Call` up the stream th
 it. No core is dialed for a read. An instance with no stream answers credentials from its copy (§7), ties
 from its store (as today), and the rest as unavailable.
 
-*Trade-off, stated plainly:* behind one stable address a core reaches one ingress instance per stream. The
-core host dials every address it is given (`stream.dial.connect`), so a deployment that lists each instance
-gets reads on all of them; one that lists only a load-balanced name gets reads on the instance the stream
-landed on, and queries elsewhere answer unavailable until `T-038-21` lets a core reach every instance.
+**Every instance reads: the roster (`T-038-21`, the owner's option (b), 2026-10-15).** Each region's
+cores are deployed beside that region's own set of ingress instances, which hold its partitions, so a
+core only ever dials its own region's instances. Then:
+
+- **Advertised addresses.** Each instance advertises an address its region's cores reach it at
+  (`stream.advertise`; by default detected from `stream.listen`: the listener's own host, or, on every
+  interface, the address this host routes from, which on ECS or Kubernetes is the task's or pod's), in
+  ingress's database (`ingress_roster`, migration 8): one row per live instance, renewed every
+  `roster_ms` (2 s) for three times that on the database's clock, deleted on drain.
+- **Roster, then direct dials.** Every `Welcome` carries the live rows, and ingress sends a `Roster`
+  message down every stream when they change. A core host dials the fleet's stable name as before, takes
+  the roster from that greeting, then dials **every** instance in it directly, over the same mutual TLS
+  (the fleet's certificate names the stable name, whatever address it is dialed at) or the same socket
+  credentials, keeping one stream per instance and dropping the stable-name one. It reads the roster again
+  from the stable name (`Hello { roster_only }`, answered and closed) on every go-away and while no stream
+  is up, and drops the streams of instances that left. An empty roster (nothing advertised) keeps the
+  stream through the configured addresses, as before.
+- **Commands stay single-fed.** Only the feed lease's holder feeds a partition, as before. The core host
+  binds the lease's epoch (signed, §5) to the stream that brought it, and refuses the same epoch on any
+  other stream `Fenced`: the other streams only read. When the binding stream closes, its feeder may come
+  back on a new one; a higher epoch on another stream is a new holder, as before.
+- **Every instance answers reads** (credentials, ties, queries) from the core over its own stream. An
+  instance with no stream to a core yet answers `ERR-DecisionUnavailable` (503, `Retry-After`), never a
+  request held open (§8). Reclaims are unchanged (§7).
+- **Failover.** When the feeding instance goes, its lease lapses and an instance that already has a
+  stream takes it: no reconnect on the way. The go-away drain stays (§9), and the draining instance leaves
+  the roster before it sends its go-away.
+
+*Why (b) and not a relay between instances (option (a)):* a relay adds ingress-to-ingress trust and a hop
+on every read, and keeps every reader depending on whichever instance holds the core's one stream; with
+regional fleets beside their cores, the roster adds neither. The operator's only requirement is that a
+region's cores can reach that region's ingress instances, which the core stream needs already. On one
+machine the roster is the local instances (`DEC-27` (h′)).
+
+*Trade-off, stated plainly:* each core holds a stream to every instance of its region, so a fleet of N
+instances means N streams per core and N keepalives; and the roster is one more write per instance every
+`roster_ms`.
 
 ### 7. The durable verifier copy, and door checks
 
@@ -182,10 +216,15 @@ than `decision_wait`, and the reply is `ERR-DecisionUnavailable` (`REQ-CS-7`). T
 is decided once a core takes it. Ingress no longer depends on any core to answer, so a load balancer in front
 of it never sees ingress down because a core is.
 
-*Open point for the owner:* ingress maps `ERR-DecisionUnavailable` to HTTP 503 today. `DEC-27` (g) says
-"never a 5xx", read here as "never a gateway error (502, 504) or an unnamed failure": the reply is the named
-condition with its body. Whether its status should leave the 5xx class is a contract change this feature
-does not make; it is raised as an issue labelled `decision` (`T-038-23`).
+*The owner's ruling (2026-10-15, `T-038-23`):* `ERR-DecisionUnavailable` stays HTTP 503. What `DEC-27` (g)
+forbids is a 5xx with nothing behind it (no instance answering, a bare 502 or 504 from a load balancer);
+a 503 from ingress carrying the named error is allowed. It carries `Retry-After: 1`
+(`surface::DECISION_RETRY_AFTER_SECS`): one second is `NFR-16`'s bound and the order of a planned
+hand-over (§9, well under a second), so a client retrying with the same client key usually finds a core
+deciding again; after a crash (a few seconds: `dead_after` and the lease) a retry is answered the same
+named condition, never another outcome. The OpenAPI document declares the header on the 5XX response.
+A query is bounded the same way: an instance whose core does not answer within `NFR-16` (no stream yet,
+a core restarting) answers `ERR-DecisionUnavailable` instead of holding the request open.
 
 ### 9. Go-away and the drain
 
@@ -210,8 +249,8 @@ One file for both processes (`DeploymentConfig`), as today:
 
 - `stream.listen` (ingress): `tls:<addr>` with `stream.tls` (`ca`, `cert`, `key`), or `unix:<path>` with
   `stream.link` (`token_sha256`, `uids`); `stream.feed_key` (the signer's endpoint and key id) or, in the
-  development profile only, `stream.development_feed_key` (a file); `keepalive_ms`, `dead_after_ms`,
-  `drain_ms`.
+  development profile only, `stream.development_feed_key` (a file); `stream.advertise` (the roster
+  address, detected by default); `keepalive_ms`, `dead_after_ms`, `drain_ms`, `roster_ms`.
 - `stream.dial` (core host): `connect` (addresses), `server_name`, `tls`, `partitions` (default
   `["book"]`), for a Unix socket the token from `ALEDGENT_CORE_STREAM_TOKEN` and `peer_uids` (ingress's user
   ids, required); `stream.ingress_keys` (hex, required in production).
@@ -239,7 +278,6 @@ real infrastructure is `T-038-20`'s, and the operator guides are `F-039`'s (`T-0
 
 ## Not in this feature
 
-- Instance discovery, so that every ingress instance can read from every core (`T-038-21`).
 - Routing rows to several partitions and regional cores (`T-038-22`): the sharded profile is not yet what
   production runs.
 - Infrastructure (load balancers, certificates, the ECS service): the operator's repository.
