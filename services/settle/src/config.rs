@@ -121,6 +121,15 @@ pub struct AdapterConfig {
     /// again for that.
     #[serde(default = "default_batch_gas_margin_percent")]
     pub batch_gas_margin_percent: u64,
+    /// After how many consecutive "not now" answers of the layer (`Stale`, `Future`, `Payment`,
+    /// `ExhaustsResources`, `AncientBirthBlock`, an unknown validity) to the first transaction
+    /// signed on a runtime not yet confirmed the adapter raises that runtime's
+    /// `runtime:<spec_version>` alert, which pages (`F-027` NOTES, decision 52). Default 10: at
+    /// least one answer a step while calls wait, and a step at least every `interval` (2 s in the
+    /// deployment template), so about 20 s, well inside the four minutes or so a withdrawal can wait
+    /// unsigned before it ends as never signed. 0 is taken as 1.
+    #[serde(default = "default_not_now_alert_after")]
+    pub not_now_alert_after: u32,
 }
 
 /// [`ProcessConfig::wake_poll`]'s default, in milliseconds.
@@ -131,6 +140,11 @@ pub fn default_wake_poll() -> Time {
 /// [`AdapterConfig::challenge_window`]'s default.
 pub fn default_challenge_window() -> u64 {
     256
+}
+
+/// [`AdapterConfig::not_now_alert_after`]'s default.
+pub fn default_not_now_alert_after() -> u32 {
+    10
 }
 
 /// [`AdapterConfig::batch_gas_margin_percent`]'s default: half again.

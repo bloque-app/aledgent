@@ -307,6 +307,12 @@ pub struct Adapter<C: Chain, S: Store, T: Transport> {
     /// The runtimes on which the layer refused a transaction signed in the format chosen for
     /// them (`T-027-12`), by [`Chosen::key`]: refused until the process restarts.
     refused: BTreeMap<String, Refusing>,
+    /// Consecutive "not now" answers to the first transaction on each runtime not yet confirmed,
+    /// by [`Chosen::key`] (`F-027` NOTES, decision 52): at
+    /// [`AdapterConfig::not_now_alert_after`] the runtime's alert is raised. Held in memory: a
+    /// restart counts again; an alert already raised is in the store, and stays open until a
+    /// runtime is confirmed.
+    not_now: BTreeMap<String, u32>,
 }
 
 /// The format the adapter signs in on a runtime, and that runtime's identity (`T-027-12`).
@@ -465,6 +471,7 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             declared_support: Vec::new(),
             last_seen: None,
             refused: BTreeMap::new(),
+            not_now: BTreeMap::new(),
         }
     }
 
@@ -695,7 +702,9 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
     ///   answer it cannot class): neither a confirmation nor a refusal, so nothing is broadcast
     ///   (`REQ-SA-9`: no service until the layer confirms). Nothing is stored and no nonce moves;
     ///   the calls stay acknowledged and unsigned, and the next step rebuilds the transaction and
-    ///   asks again.
+    ///   asks again. After [`AdapterConfig::not_now_alert_after`] such answers in a row on the
+    ///   runtime, its `runtime:<spec_version>` alert is raised, naming the last answer (`F-027`
+    ///   NOTES, decision 52); the runtime's confirmation clears it.
     ///
     /// `false` means `ext` is dropped: the caller stores nothing and puts its calls back.
     async fn confirmed(&mut self, chosen: &Chosen, ext: &SignedExtrinsic) -> StepResult<bool> {
@@ -726,7 +735,28 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                         confirmed_at: now,
                     })
                     .await?;
-                self.store.clear(&alert, now).await?;
+                // Decision 52: the runtime's alert clears, and so does any other runtime's this
+                // process has not refused (one a "not now" held, upgraded away from since, maybe
+                // before a restart): nothing waits on it any more.
+                let refused: BTreeSet<String> = self
+                    .refused
+                    .values()
+                    .filter_map(|r| match r {
+                        Refusing::Unconfirmed { spec_version, .. } => {
+                            Some(format!("runtime:{spec_version}"))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                for open in self.store.alerts().await? {
+                    if open.cleared_at.is_none()
+                        && open.key.starts_with("runtime:")
+                        && (open.key == alert || !refused.contains(&open.key))
+                    {
+                        self.store.clear(&open.key, now).await?;
+                    }
+                }
+                self.not_now.clear();
                 tracing::info!(
                     spec_version,
                     format,
@@ -736,13 +766,44 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                 Ok(true)
             }
             Validity::NotNow(why) => {
+                let answers = self.not_now.entry(chosen.key.clone()).or_insert(0);
+                *answers = answers.saturating_add(1);
+                let answers = *answers;
                 tracing::warn!(
                     spec_version,
                     format,
                     why = %why,
+                    answers,
                     "the settlement layer's runtime neither confirmed nor refused the format; \
                      nothing is broadcast, and the next step signs and asks again"
                 );
+                // Decision 52: a "not now" that persists holds every withdrawal on the runtime
+                // until it ends as never signed, long before the oldest-operation page could
+                // fire. From the threshold on, the runtime's alert is open, and it pages.
+                if answers >= self.config.not_now_alert_after.max(1)
+                    && self
+                        .store
+                        .raise(
+                            &alert,
+                            &format!(
+                                "the settlement layer answered \"not now\" {answers} times in a \
+                                 row to a transaction signed in format {format} on spec_version \
+                                 {spec_version}, last: {why}; nothing is broadcast on it until it \
+                                 confirms"
+                            ),
+                            now,
+                        )
+                        .await?
+                {
+                    tracing::error!(
+                        spec_version,
+                        format,
+                        why = %why,
+                        answers,
+                        "the settlement layer has not confirmed the runtime after repeated \
+                         \"not now\" answers; withdrawals on it wait unsigned"
+                    );
+                }
                 Ok(false)
             }
             Validity::Refused(why) => {
@@ -769,6 +830,11 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                     format: format.to_owned(),
                     error: why.clone(),
                 };
+                // An alert the "not now" answers raised would keep their detail: the refusal's
+                // replaces it.
+                if self.not_now.remove(&chosen.key).is_some() {
+                    self.store.clear(&alert, now).await?;
+                }
                 self.store
                     .raise(
                         &alert,

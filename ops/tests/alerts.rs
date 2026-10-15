@@ -334,6 +334,18 @@ fn nfr_11_each_signal_over_its_line_pages_the_test_route() {
         ("AledgentAdapterNotServing", "settlement-adapter", |s| {
             s.adapter.as_mut().unwrap().serving = false
         }),
+        // F-027 NOTES decision 52: a runtime the layer has not confirmed.
+        (
+            "AledgentAdapterRuntimeUnconfirmed",
+            "settlement-adapter",
+            |s| {
+                s.adapter
+                    .as_mut()
+                    .unwrap()
+                    .alerts
+                    .insert("runtime".into(), 1);
+            },
+        ),
         ("AledgentFinalityStalled", "settlement-adapter", |s| {
             s.adapter.as_mut().unwrap().best = 141
         }),
@@ -630,7 +642,7 @@ fn t_018_10_release_alerts_link_their_runbooks_and_route_to_the_pager() {
             r.alert
         );
     }
-    assert_eq!(release, 16, "the release alerts");
+    assert_eq!(release, 17, "the release alerts");
     let routing = Routing::committed().unwrap();
     let mut labels = BTreeMap::new();
     labels.insert("severity".to_owned(), "page".to_owned());

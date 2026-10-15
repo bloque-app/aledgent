@@ -151,6 +151,7 @@ pub fn adapter_config(genesis: [u8; 32]) -> AdapterConfig {
         anchor_key: None,
         batch_gas_cap: None,
         batch_gas_margin_percent: crate::config::default_batch_gas_margin_percent(),
+        not_now_alert_after: crate::config::default_not_now_alert_after(),
     }
 }
 

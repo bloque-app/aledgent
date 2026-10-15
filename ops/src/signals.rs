@@ -101,7 +101,7 @@ pub const SIGNALS: &[(&str, &[&str])] = &[
 
 /// The kinds of the adapter's alerts (`F-016`), each exported even at zero.
 pub const ADAPTER_ALERTS: &[&str] = &[
-    "digest", "fees", "gap", "incident", "lane", "position", "refusing", "rescan",
+    "digest", "fees", "gap", "incident", "lane", "position", "refusing", "rescan", "runtime",
 ];
 
 /// Anchoring's signals beyond the anchor lag (`F-017`), and the `Suspense` report (`REQ-LA-2`).
