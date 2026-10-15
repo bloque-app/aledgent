@@ -29,7 +29,8 @@ use core_archive::{Archiver, ArchiverConfig, ArchivingLog, book_of, fetch, lay_o
 use core_binding::core::{AgentCore, FileLog, Founding, HostLog as _, roll_forward_agent};
 use core_binding::host::ReplicaStores;
 use core_binding::hot::{Hot, Limits, MAX_BUDGET};
-use ingress::boundary::CoreReply;
+use ingress::auth::{CredentialKind, Token};
+use ingress::boundary::{CoreReply, Outcome};
 use ingress::inprocess::MemJournal;
 use ingress::store::Store as _;
 use ingress::store::mem::MemStore;
@@ -94,8 +95,12 @@ async fn workload(d: &AgentDeployment, tag: &str, n: u32) {
     }
 }
 
+/// The adapter principal's bearer token: a constant, public, worth nothing.
+const ADAPTER_TOKEN: &str = "adapter-token";
+
 /// The settlement configuration names the deployment's instance, which every checkpoint's
-/// commitment binds (`F-017`): with it, the book takes checkpoints on its ticks.
+/// commitment binds (`F-017`): with it, the book takes checkpoints on its ticks. The adapter it
+/// names is a principal with a token, so [`adapter_inputs`] can speak as it.
 async fn configure_settlement(d: &AgentDeployment) {
     let op = d.operator.token.clone();
     let (s, v) = d
@@ -108,6 +113,14 @@ async fn configure_settlement(d: &AgentDeployment) {
         )
         .await;
     assert_eq!(s.as_u16(), 200, "{v}");
+    d.auth
+        .add_token(
+            &Token::new(ADAPTER_TOKEN.as_bytes()),
+            v["result"]["identity"].as_str().unwrap(),
+            v["result"]["credential"].as_str().unwrap(),
+            CredentialKind::Service,
+        )
+        .expect("the adapter's token registers");
     let (s, v) = d
         .call_decided(
             "POST",
@@ -125,6 +138,45 @@ async fn configure_settlement(d: &AgentDeployment) {
         )
         .await;
     assert_eq!(s.as_u16(), 200, "{v}");
+}
+
+/// What the settlement adapter sends the core, `n` times: its status, the finalised heads it
+/// observed, and the ranges it skipped. Each is decided under a reference ingress minted for
+/// it, and none of them is an operation (`REQ-IN-5`): most of a real book's replies are of this
+/// kind.
+async fn adapter_inputs(d: &AgentDeployment, n: u64) {
+    for i in 0..n {
+        let (s, v) = d
+            .call_decided(
+                "POST",
+                "/v1/settlement/declarations",
+                Some(ADAPTER_TOKEN),
+                &[("client-key", &format!("declare-{i}"))],
+                Some(json!({ "serving": true, "lease": 60_000u64 })),
+            )
+            .await;
+        assert_eq!(s.as_u16(), 200, "declare: {v}");
+        let (s, v) = d
+            .call_decided(
+                "POST",
+                "/v1/settlement/heads",
+                Some(ADAPTER_TOKEN),
+                &[("client-key", &format!("head-{i}"))],
+                Some(json!({ "height": 100 + i, "next_seq": 0 })),
+            )
+            .await;
+        assert_eq!(s.as_u16(), 200, "head: {v}");
+        let (s, v) = d
+            .call_decided(
+                "POST",
+                "/v1/settlement/gaps",
+                Some(ADAPTER_TOKEN),
+                &[("client-key", &format!("gap-{i}"))],
+                Some(json!({ "from": i, "to": i + 1, "reason": "pruned" })),
+            )
+            .await;
+        assert_eq!(s.as_u16(), 200, "gap: {v}");
+    }
 }
 
 fn replies_by_input(bytes: &[u8]) -> BTreeMap<u64, CoreReply> {
@@ -178,6 +230,7 @@ async fn nfr_10_the_agent_core_restore_drill() {
     )
     .await;
     configure_settlement(&d).await;
+    adapter_inputs(&d, 6).await;
     workload(&d, "a", 10).await;
     // An anchoring interval passes: the book takes checkpoints (F-017), which the restore's
     // anchor checks read.
@@ -209,6 +262,21 @@ async fn nfr_10_the_agent_core_restore_drill() {
     }
     assert!(verified.passed());
     assert!(verified.rebuild.is_clean());
+    // The archive holds the adapter's replies, which name no operation (the 2026-10-15 drill's
+    // g8 archive was mostly these), and NFR-4 holds the other replies to the book without them.
+    let observed = f
+        .replies_parsed
+        .iter()
+        .filter(|(_, r)| {
+            matches!(&r.outcome, Outcome::Decided { result, .. } if result.settlement.is_some())
+        })
+        .count();
+    assert!(observed >= 18, "{observed} adapter replies archived");
+    let held = ops::agent::acknowledgements(&f.replies_parsed, &f.entries);
+    assert!(
+        ops::agent::acknowledgements(&f.replies_parsed, &[]).len() >= held.len() + 18,
+        "the adapter's declarations and heads and gaps are not held to the book as operations"
+    );
     for name in [
         "INV-6",
         "INV-5",
