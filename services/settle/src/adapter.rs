@@ -313,6 +313,11 @@ pub struct Adapter<C: Chain, S: Store, T: Transport> {
     /// restart counts again; an alert already raised is in the store, and stays open until a
     /// runtime is confirmed.
     not_now: BTreeMap<String, u32>,
+    /// The confirmed runtimes, by [`Chosen::key`], whose `runtime:<spec_version>` alert this
+    /// process has made sure is cleared (decision 52): a confirmation stored before its alert was
+    /// cleared (a store error, a crash in between) would otherwise leave the alert open, paging,
+    /// since every later step finds the runtime confirmed and never reaches the clearing.
+    alert_settled: BTreeSet<String>,
 }
 
 /// The format the adapter signs in on a runtime, and that runtime's identity (`T-027-12`).
@@ -472,6 +477,7 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             last_seen: None,
             refused: BTreeMap::new(),
             not_now: BTreeMap::new(),
+            alert_settled: BTreeSet::new(),
         }
     }
 
@@ -715,6 +721,26 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             .iter()
             .any(|r| r.key == chosen.key)
         {
+            // Once a process: an alert left open by a confirmation that was stored before its
+            // alert was cleared is cleared now (unless this process refused that runtime).
+            if !self.alert_settled.contains(&chosen.key) {
+                let alert = format!("runtime:{}", chosen.signing.spec_version);
+                let refused = self.refused.values().any(|r| {
+                    matches!(r, Refusing::Unconfirmed { spec_version, .. }
+                        if *spec_version == chosen.signing.spec_version)
+                });
+                if !refused
+                    && self
+                        .store
+                        .alerts()
+                        .await?
+                        .iter()
+                        .any(|a| a.key == alert && a.cleared_at.is_none())
+                {
+                    self.store.clear(&alert, self.now()).await?;
+                }
+                self.alert_settled.insert(chosen.key.clone());
+            }
             return Ok(true);
         }
         let now = self.now();
@@ -757,6 +783,7 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                     }
                 }
                 self.not_now.clear();
+                self.alert_settled.insert(chosen.key.clone());
                 tracing::info!(
                     spec_version,
                     format,

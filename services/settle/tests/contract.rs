@@ -973,6 +973,34 @@ async fn t_027_12_a_runtime_upgraded_away_from_has_its_not_now_alert_cleared() {
     assert!(!alert_open(&k, "runtime:134").await);
 }
 
+/// `F-027` NOTES decision 52: a confirmation stored before its alert was cleared (a store error or
+/// a crash in between) leaves `runtime:<spec_version>` open; every later step finds the runtime
+/// confirmed and returns early. The next process clears it once, on its first transaction for the
+/// runtime, instead of paging until another runtime is confirmed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_027_12_an_alert_left_open_by_a_stored_confirmation_is_cleared() {
+    let mut k = serving_kit(KitOptions::default()).await;
+    let alice = k.d.party("alice", 1_000).await;
+    let first = k.withdrawal(&alice, 10, "confirms").await;
+    until_all(&mut k, &alice, std::slice::from_ref(&first), "Settled", 5).await;
+    assert_eq!(served(&k).await, vec![(133, "kreivo-133".to_owned())]);
+    // The crash between storing the confirmation and clearing the alert, recreated.
+    let now = k.now();
+    assert!(
+        k.store
+            .raise("runtime:133", "left open", now)
+            .await
+            .unwrap()
+    );
+    k.restart();
+    let second = k.withdrawal(&alice, 10, "after the restart").await;
+    until_all(&mut k, &alice, std::slice::from_ref(&second), "Settled", 5).await;
+    assert!(
+        !alert_open(&k, "runtime:133").await,
+        "cleared on the next transaction for the confirmed runtime"
+    );
+}
+
 /// `AC-E4.3`, `T-027-12`, `REQ-SA-9`, `F-027` NOTES decision 51: Kreivo upgrades (133 to 134, its
 /// surface unchanged) in a block produced after the step read its best head and before it read the
 /// runtime it signs for. The batch is signed for 134 and validated at the block 134 was read at,
