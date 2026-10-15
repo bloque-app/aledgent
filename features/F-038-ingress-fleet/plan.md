@@ -129,8 +129,10 @@ the core input's JSON exactly as signed. The host's sequencer, in front of the A
 One mutex per partition serialises feeds from every stream and the socket. A host with `ingress_keys`
 refuses every unsequenced `apply` or `apply_batch` (an ingress of an earlier release, or anything unsigned)
 as unavailable from the moment it starts, with no window before a first feed and none after a restart.
-Production requires the keys (§5). Without them (development only), the host refuses unsequenced inputs
-once it has seen a sequenced feed: nothing runs out of order during a mixed rollout.
+Production requires the keys once the host dials the new link (§5). Without them (development, or a
+production host on the legacy socket link alone, §12 step 0), the host takes unsequenced inputs as a host
+of the earlier release does, and refuses them once it has seen a sequenced feed: nothing runs out of order
+during a mixed rollout.
 
 ### 5. Ingress signs what it forwards
 
@@ -140,9 +142,14 @@ is accepted only in the development profile. The epoch is signed (feeds are sign
 so a captured item replayed under a higher epoch fails the check instead of fencing the real feeder. The
 core host checks it against `stream.ingress_keys` (two during a rotation) before the Agent sees the input.
 mTLS says which peer is connected; the signature says the command is the one ingress recorded at that
-position. The host checks it on every link it serves. In production `ingress_keys` is required: the core
-host refuses to start without it, and so does an ingress forwarding over `core_endpoint` without
-`stream.feed_key`, so both links carry signed feeds during the transition (§12).
+position. The host checks it on every link it serves. In production, once the new link is configured,
+the keys are required on both sides: a core host with `stream.dial` refuses to start without
+`ingress_keys`, and an ingress with a `stream` section (on the stream or on `core_endpoint`) refuses to
+start without `stream.feed_key`, so both links carry signed feeds during the transition (§12). A
+deployment with no `stream` section runs the legacy socket link (§12 step 0): ingress sends no feed and
+signs nothing, and the core host, with no keys, takes its unsequenced inputs as before this feature. A host
+with `ingress_keys` refuses unsigned or unsequenced input from its start whatever else it is configured
+with.
 
 ### 6. Reads ride the stream
 
@@ -259,8 +266,25 @@ One file for both processes (`DeploymentConfig`), as today:
 An ingress with `stream.listen` serves the stream instead of dialing `core_endpoint`; one with
 `core_endpoint` works as today. The core host serves `core_endpoint` and dials `stream.dial` at once.
 
+Which link ingress forwards on follows from the `stream` section alone: without one, the legacy socket
+link (rows sent as `apply_batch`, exactly as before this feature: no feed, no feed lease, no roster, no
+signature); with one, the sequenced feed under the feed lease, signed with `stream.feed_key`. Ingress names
+the link in a log line at start.
+
 ### 12. The transition, both transports at once
 
+0. **Keep the legacy socket link until the core host is rebuilt.** A node never updates its core host in
+   place: the host's image carries the genesis package's bytes, so a release of ingress meets the core host
+   it already had, which speaks only the socket link of `F-035` and answers a feed `unavailable`. Merging
+   this feature therefore changes nothing for a running deployment: with no `stream` section its ingress
+   starts on the legacy link (no feed key needed in production), sends `apply_batch` as before, takes no
+   feed lease and joins no roster, and its decisions and ticks carry on against the old host
+   (`f_038_s12_a_new_ingress_runs_against_a_core_host_of_the_earlier_release`). A deployment leaves step 0
+   only once its core host is rebuilt with this feature's code, with the genesis package and runtime bytes
+   copied from its pinned image (the Agent does not change, `DEC-27` (i)). That rebuilt host, still with no
+   `ingress_keys` and no `stream.dial`, runs against the legacy ingress as the old one did. Then the keys
+   go on both sides (`ingress_keys` on the host, `stream.feed_key` on ingress, in one `stream` section),
+   which switches ingress to the sequenced feed on the same socket; then the new link (step 1 onwards).
 1. Release this feature everywhere: the node's ingress (socket), the core host (socket and stream), with
    `ingress_keys` and the feed key configured on both. The node's ingress now feeds under the lease, signed.
 2. Start the fleet's instances in stream mode beside it. Whichever holds the lease feeds; the other cannot
