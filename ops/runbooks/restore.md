@@ -18,7 +18,12 @@ archive, and its restore is `opsctl restore core --from <archive>` then `opsctl 
 (`release/total-loss-recovery.md`, path B; `release/core-archive.md`). The
 steps below are the in-process core's; steps 1, 2 and 5 apply to both.
 
-**A chainspec book** (`F-036`): `aledgent-core-host restore --archive <spec>` lays out the chainspec and the
+Both run from the core image, which carries `opsctl` beside `aledgent-core-host` and the Agent's programs
+(`--entrypoint /usr/local/bin/opsctl`; `deploy/docker/core.Dockerfile`).
+
+**A chainspec book** (`F-036`): `opsctl restore core --from` reads the chainspec from the archive by the
+digest the genesis commits (`--chainspec <file>` overrides it), and with `--core-host` passes `--archive`
+on: `aledgent-core-host restore --archive <spec>` lays out the chainspec and the
 book's `verify-genesis` report from the archive, where `install-verified --archive` kept them (`T-036-25`).
 A restored book whose report was never archived takes no command (`ERR-InitialStateNotSealed`) until it is
 installed again: `aledgent-core-host install-verified --config <file> --state <dir> --report <the window's
