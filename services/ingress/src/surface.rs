@@ -1240,7 +1240,9 @@ async fn answer<S: Store, C: Core>(
     // deployment's `decision_wait`, or a principal's answering wait for its transfers and
     // reservations (`REQ-CS-9`, amendment 0013), which never exceeds it. Past it the command is
     // kept, and a retry under the same client key gets the decision once it is made
-    // (`REQ-CS-7`, `ERR-DecisionUnavailable`, amendment 0006 item 8).
+    // (`REQ-CS-7`, `ERR-DecisionUnavailable`, amendment 0006 item 8). While no replica holds a
+    // live feed lease (no core connected, or a handover), at most `NFR-16` (`F-038` §8).
+    let wait = shared.decision_wait(wait);
     shared.wake.notify_one();
     let waited = tokio::time::timeout(wait, async {
         loop {
@@ -1430,44 +1432,53 @@ async fn command_reply<S: Store, C: Core>(
         }
     }
     let mut issued = None;
-    let (command, canonical) = match pending {
-        None => (command, canonical),
-        Some(p) => {
-            // A repeat: its stored reply, without verifying anything again.
-            match shared
-                .store
-                .find(&domain, command.surface(), &client_key)
-                .await
-            {
-                Ok(Some(row)) if row.new.body_digest != digest.0 => {
-                    return refusal(Refusal::ClientKeyReused);
+    // F-038 §7: a `key` proof is checked at the door, like a passkey's.
+    let door = credentials::has_key_proof(&body);
+    let (command, canonical) = if pending.is_none() && !door {
+        (command, canonical)
+    } else {
+        // A repeat: its stored reply, without verifying anything again.
+        match shared
+            .store
+            .find(&domain, command.surface(), &client_key)
+            .await
+        {
+            Ok(Some(row)) if row.new.body_digest != digest.0 => {
+                return refusal(Refusal::ClientKeyReused);
+            }
+            Ok(Some(row)) => {
+                return answer(
+                    shared,
+                    &who.principal,
+                    row,
+                    None,
+                    shared.config.decision_wait,
+                )
+                .await;
+            }
+            Ok(None) => {}
+            Err(_) => return refusal(Refusal::DecisionUnavailable),
+        }
+        if door && let Err(r) = credentials::check_key_proof(shared, who, &body).await {
+            return refusal(r);
+        }
+        match pending {
+            None => (command, canonical),
+            Some(p) => {
+                match credentials::prepare(shared, who, obo.as_ref(), &mut body, p).await {
+                    Ok(secret) => issued = secret,
+                    Err(r) => return refusal(r),
                 }
-                Ok(Some(row)) => {
-                    return answer(
-                        shared,
-                        &who.principal,
-                        row,
-                        None,
-                        shared.config.decision_wait,
-                    )
-                    .await;
+                let c = match Command::parse(&body) {
+                    Ok(c) => c,
+                    Err(r) => return refusal(r),
+                };
+                let canonical = c.canonical();
+                if canonical.len() > MAX_COMMAND_BYTES {
+                    return refusal(too_large(route));
                 }
-                Ok(None) => {}
-                Err(_) => return refusal(Refusal::DecisionUnavailable),
+                (c, canonical)
             }
-            match credentials::prepare(shared, who, obo.as_ref(), &mut body, p).await {
-                Ok(secret) => issued = secret,
-                Err(r) => return refusal(r),
-            }
-            let c = match Command::parse(&body) {
-                Ok(c) => c,
-                Err(r) => return refusal(r),
-            };
-            let canonical = c.canonical();
-            if canonical.len() > MAX_COMMAND_BYTES {
-                return refusal(too_large(route));
-            }
-            (c, canonical)
         }
     };
     let intake = command.intake();

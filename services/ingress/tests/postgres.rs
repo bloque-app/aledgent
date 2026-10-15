@@ -342,6 +342,87 @@ async fn t_009_06_one_leader_and_a_dead_leader_is_replaced() {
     }
 }
 
+/// `T-038-03` on PostgreSQL (`DEC-27` (d)): one holder of the book's feed lease at a time, on the
+/// database's clock; the epoch rises on a change of holder, never on a renewal; a stale holder's
+/// mark is fenced and marks nothing; sequences are gapless and kept by a resend, and the rows in
+/// flight come back first. The verifier copy keeps and forgets (`T-038-10`).
+#[tokio::test(flavor = "multi_thread")]
+async fn t_038_03_the_feed_lease_on_postgres() {
+    use ingress::feed::BOOK;
+    let Some((_pg, url)) = server().await else {
+        return;
+    };
+    let a = store(&url).await;
+    let b = store(&url).await;
+    let long = Duration::from_secs(60);
+    assert_eq!(a.try_feed(BOOK, "a", long).await.unwrap(), Some(1));
+    assert_eq!(
+        a.try_feed(BOOK, "a", long).await.unwrap(),
+        Some(1),
+        "renewed"
+    );
+    assert_eq!(b.try_feed(BOOK, "b", long).await.unwrap(), None);
+    assert!(b.feed_live(BOOK).await.unwrap());
+    let mut keys = Vec::new();
+    for n in 1..=4u8 {
+        let row = command(n, "did:aledgent:id:feed", &format!("f-{n}"), n % 2 == 0);
+        keys.push(row.op_ref);
+        a.append(row).await.unwrap();
+    }
+    let seqs = |rows: &[ingress::store::Row]| rows.iter().map(|r| r.feed_seq).collect::<Vec<_>>();
+    let fed = a
+        .mark_fed(BOOK, "a", 1, &[keys[1], keys[3], keys[0]], 7)
+        .await
+        .unwrap();
+    assert_eq!(seqs(&fed), vec![Some(1), Some(2), Some(3)]);
+    assert!(
+        b.mark_fed(BOOK, "b", 1, &[keys[2]], 8)
+            .await
+            .unwrap_err()
+            .is_fenced()
+    );
+    assert!(
+        a.mark_fed(BOOK, "a", 2, &[keys[2]], 8)
+            .await
+            .unwrap_err()
+            .is_fenced()
+    );
+    a.release_feed(BOOK, "a").await.unwrap();
+    assert!(!b.feed_live(BOOK).await.unwrap());
+    assert_eq!(b.try_feed(BOOK, "b", long).await.unwrap(), Some(2));
+    assert!(
+        a.mark_fed(BOOK, "a", 1, &[keys[2]], 9)
+            .await
+            .unwrap_err()
+            .is_fenced()
+    );
+    let next: Vec<InputKey> = b
+        .next_undecided_batch(10)
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.new.op_ref)
+        .collect();
+    assert_eq!(
+        next,
+        vec![keys[1], keys[3], keys[0], keys[2]],
+        "in flight first"
+    );
+    let fed = b.mark_fed(BOOK, "b", 2, &next, 9).await.unwrap();
+    assert_eq!(seqs(&fed), vec![Some(1), Some(2), Some(3), Some(4)]);
+
+    let body = ingress::boundary::CredentialBody {
+        identity: "did:aledgent:id:x".into(),
+        kind: "person".into(),
+        scheme: "api-key".into(),
+        verifier: "ab".repeat(32),
+    };
+    a.copy_verifier("c", Some(&body), 1).await.unwrap();
+    assert_eq!(b.copied_verifier("c").await.unwrap(), Some(body));
+    b.copy_verifier("c", None, 2).await.unwrap();
+    assert_eq!(a.copied_verifier("c").await.unwrap(), None);
+}
+
 /// `T-009-03`, `REQ-AR-7` end to end on PostgreSQL: two replicas share the log; transfers are
 /// acknowledged while the core is down; the leading replica is dropped; the other decides every
 /// row, with gapless input numbers.
@@ -680,7 +761,9 @@ async fn t_009_25_migration_6_applies_on_a_live_log_and_fails_fast_behind_a_lock
         .iter()
         .map(|r| r.get(0))
         .collect();
-    assert_eq!(applied, vec![1, 2, 3, 4, 5, 6]);
+    // And every later one (7, F-038).
+    let latest = ingress::store::migrate::MIGRATIONS.len() as i32;
+    assert_eq!(applied, (1..=latest).collect::<Vec<_>>());
 
     // A database at version 5, with rows, as a deployment is before the upgrade.
     raw.batch_execute("CREATE DATABASE live").await.unwrap();
@@ -746,7 +829,7 @@ async fn t_009_25_migration_6_applies_on_a_live_log_and_fails_fast_behind_a_lock
         .await
         .unwrap()
         .get(0);
-    assert_eq!(at, 6);
+    assert_eq!(at, latest, "6 and every later one");
     let columns: Vec<(String, String, Option<String>)> = live
         .query(
             "SELECT column_name, is_nullable, column_default FROM information_schema.columns \

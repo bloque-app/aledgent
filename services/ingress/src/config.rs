@@ -400,6 +400,259 @@ pub struct DeploymentConfig {
     /// Absent: apply at start, 5 s.
     #[serde(default, skip_serializing_if = "MigrationsConfig::is_default")]
     pub migrations: MigrationsConfig,
+    /// The core stream (`F-038`, `DEC-27`): ingress's listener the core hosts dial
+    /// (`stream.listen`), and what the core host dials (`stream.dial`). Absent: the socket link
+    /// alone, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<StreamSection>,
+    /// Where ingress serves `GET /ready` and `GET /live` (`F-038` §10, [`crate::readiness`]),
+    /// `host:port`, apart from the client surface. Absent: not served.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness_listen: Option<String>,
+}
+
+/// The variable holding the core host's token for a stream over a Unix socket (`F-038`): its
+/// SHA-256 is what `stream.link.token_sha256` lists on ingress's side.
+pub const ENV_CORE_STREAM_TOKEN: &str = "ALEDGENT_CORE_STREAM_TOKEN";
+
+/// The feed key behind the signer service (`F-038` §5).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FeedKeyConfig {
+    /// Where the signer is, and ingress's token file.
+    pub signer: signer::client::SignerEndpoint,
+    /// The Ed25519 key's identifier.
+    pub key: String,
+}
+
+/// What the core host dials (`F-038` §11).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DialSection {
+    /// Every address: `tls:<host:port>` or `unix:<path>`. One stream each.
+    pub connect: Vec<String>,
+    /// The name ingress's certificate carries, for `tls:` addresses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_name: Option<String>,
+    /// The core's name in ingress's logs. Absent: `core`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub core: Option<String>,
+    /// The partitions it writes. Absent: the book ([`crate::feed::BOOK`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partitions: Option<Vec<String>>,
+}
+
+/// The core stream's section (`F-038` §11).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamSection {
+    /// Ingress's listener for cores: `tls:<host:port>` (with `tls`) or `unix:<path>` (with
+    /// `link`). With it, ingress serves the stream instead of dialing `core_endpoint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<String>,
+    /// This side's TLS files, for a `tls:` listener or `tls:` dial addresses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<crate::stream::tls::TlsFiles>,
+    /// Who a `unix:` listener lets in: the SHA-256 of the core host's token and its user ids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<CoreLink>,
+    /// Ingress's feed key behind the signer service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feed_key: Option<FeedKeyConfig>,
+    /// A file holding the feed key's seed, hex: the development profile only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub development_feed_key: Option<String>,
+    /// What the core host dials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dial: Option<DialSection>,
+    /// The feed keys' public halves the core host accepts, hex (two while one rotates). Required
+    /// with `dial`; on the socket link, checked whenever present.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ingress_keys: Vec<String>,
+    /// How often each side pings, milliseconds. Absent: 1 000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keepalive_ms: Option<u64>,
+    /// How long a side waits on silence before it drops the stream, milliseconds. Absent: 3 000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dead_after_ms: Option<u64>,
+    /// How long a draining ingress keeps answering clients after its go-away, milliseconds.
+    /// Absent: 5 000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_ms: Option<u64>,
+}
+
+/// How long a draining ingress keeps answering, by default.
+pub const DEFAULT_DRAIN: Duration = Duration::from_secs(5);
+
+impl StreamSection {
+    /// Check the section for `profile` (`T-038-14`): every file a transport needs, a feed key for
+    /// a production listener, a development key only in development, the keys a dialer checks.
+    pub fn check(&self, profile: Profile) -> Result<(), String> {
+        if let Some(l) = &self.listen {
+            match crate::stream::Address::parse(l)? {
+                crate::stream::Address::Tls(_) if self.tls.is_none() => {
+                    return Err("stream.listen is tls: and stream.tls is missing".into());
+                }
+                crate::stream::Address::Unix(_) if self.link.is_none() => {
+                    return Err("stream.listen is unix: and stream.link is missing".into());
+                }
+                _ => {}
+            }
+            if profile == Profile::Production && self.feed_key.is_none() {
+                return Err(
+                    "stream.listen in production needs stream.feed_key: every forwarded command \
+                     is signed (F-038)"
+                        .into(),
+                );
+            }
+        }
+        if self.development_feed_key.is_some() && profile != Profile::Development {
+            return Err(
+                "stream.development_feed_key outside the development profile: production keys \
+                 live in the signer (guardrail 13)"
+                    .into(),
+            );
+        }
+        if self.feed_key.is_some() && self.development_feed_key.is_some() {
+            return Err("stream.feed_key and stream.development_feed_key: one of them".into());
+        }
+        if let Some(d) = &self.dial {
+            if d.connect.is_empty() {
+                return Err("stream.dial.connect is empty".into());
+            }
+            for a in &d.connect {
+                if let crate::stream::Address::Tls(_) = crate::stream::Address::parse(a)? {
+                    if self.tls.is_none() {
+                        return Err(format!("stream.dial: {a} needs stream.tls"));
+                    }
+                    if d.server_name.is_none() {
+                        return Err(format!("stream.dial: {a} needs stream.dial.server_name"));
+                    }
+                }
+            }
+            crate::feed::FeedKeys::parse(&self.ingress_keys)?;
+        }
+        Ok(())
+    }
+
+    /// The stream's timings.
+    pub fn timings(&self) -> crate::stream::Timings {
+        let d = crate::stream::Timings::default();
+        crate::stream::Timings {
+            keepalive: self.keepalive_ms.map_or(d.keepalive, Duration::from_millis),
+            dead_after: self
+                .dead_after_ms
+                .map_or(d.dead_after, Duration::from_millis),
+            ..d
+        }
+    }
+
+    /// How long a draining ingress keeps answering.
+    pub fn drain(&self) -> Duration {
+        self.drain_ms.map_or(DEFAULT_DRAIN, Duration::from_millis)
+    }
+
+    /// The keys the core host checks feeds with, if any are listed.
+    pub fn ingress_keys(&self) -> Result<Option<crate::feed::FeedKeys>, String> {
+        if self.ingress_keys.is_empty() {
+            return Ok(None);
+        }
+        crate::feed::FeedKeys::parse(&self.ingress_keys).map(Some)
+    }
+
+    /// Ingress's feed signer: the signer service's key, a development file, or none.
+    pub fn feed_signer(
+        &self,
+        profile: Profile,
+    ) -> Result<Option<crate::service::SharedFeedSigner>, String> {
+        self.check(profile)?;
+        if let Some(k) = &self.feed_key {
+            let key = crate::feed::ServiceFeedKey::connect(&k.signer, &k.key)?;
+            return Ok(Some(crate::service::SharedFeedSigner(std::sync::Arc::new(
+                key,
+            ))));
+        }
+        if let Some(path) = &self.development_feed_key {
+            let key = crate::feed::LocalFeedKey::from_file(std::path::Path::new(path))?;
+            return Ok(Some(crate::service::SharedFeedSigner(std::sync::Arc::new(
+                key,
+            ))));
+        }
+        Ok(None)
+    }
+
+    /// Bind ingress's listener for cores, if `listen` names one.
+    pub async fn bind(&self) -> Result<Option<crate::stream::Listen>, String> {
+        let Some(l) = &self.listen else {
+            return Ok(None);
+        };
+        Ok(Some(match crate::stream::Address::parse(l)? {
+            crate::stream::Address::Tls(addr) => {
+                let tls = self.tls.as_ref().ok_or("stream.tls is missing")?;
+                crate::stream::Listen::Tls {
+                    acceptor: tls.acceptor()?,
+                    listener: tokio::net::TcpListener::bind(&addr)
+                        .await
+                        .map_err(|e| format!("stream.listen {addr}: {e}"))?,
+                }
+            }
+            crate::stream::Address::Unix(path) => {
+                let link = self.link.as_ref().ok_or("stream.link is missing")?;
+                let _ = std::fs::remove_file(&path);
+                crate::stream::Listen::Unix {
+                    auth: link.auth()?,
+                    listener: tokio::net::UnixListener::bind(&path)
+                        .map_err(|e| format!("stream.listen {}: {e}", path.display()))?,
+                }
+            }
+        }))
+    }
+
+    /// What the core host dials, if `dial` is set; a `unix:` address takes its token from
+    /// `token` (the environment's [`ENV_CORE_STREAM_TOKEN`] in a deployment).
+    pub fn dial_config(
+        &self,
+        token: impl Fn() -> Option<String>,
+    ) -> Result<Option<crate::stream::DialConfig>, String> {
+        let Some(d) = &self.dial else {
+            return Ok(None);
+        };
+        let mut targets = Vec::with_capacity(d.connect.len());
+        for a in &d.connect {
+            targets.push(match crate::stream::Address::parse(a)? {
+                crate::stream::Address::Tls(addr) => {
+                    let tls = self.tls.as_ref().ok_or("stream.tls is missing")?;
+                    let name = d
+                        .server_name
+                        .clone()
+                        .ok_or("stream.dial.server_name is missing")?;
+                    crate::stream::Target::Tls {
+                        addr,
+                        server_name: rustls_pki_types::ServerName::try_from(name)
+                            .map_err(|e| format!("stream.dial.server_name: {e}"))?,
+                        connector: tls.connector()?,
+                    }
+                }
+                crate::stream::Address::Unix(path) => crate::stream::Target::Unix {
+                    path,
+                    token: crate::remote::LinkToken::new(&token().ok_or_else(|| {
+                        format!("{ENV_CORE_STREAM_TOKEN} is not set: refusing to start")
+                    })?)?,
+                },
+            });
+        }
+        let partitions = d
+            .partitions
+            .clone()
+            .unwrap_or_else(|| vec![crate::feed::BOOK.to_owned()]);
+        Ok(Some(crate::stream::DialConfig {
+            targets,
+            core: d.core.clone().unwrap_or_else(|| "core".into()),
+            principals: partitions.iter().any(|p| p == crate::feed::BOOK),
+            partitions,
+            timings: self.timings(),
+        }))
+    }
 }
 
 /// The lock timeout a migration runs under when the configuration names none: 5 s.
@@ -716,6 +969,88 @@ pub fn secret_hex32(var: &str) -> Result<[u8; 32], String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `T-038-14` (`REQ-AU-8`, `NFR-7`): a stream section missing what its transport needs, a
+    /// production listener without the signer's feed key, a file key outside development, and a
+    /// dialer without the keys it checks feeds with are each refused at load.
+    #[test]
+    fn t_038_14_an_incomplete_stream_section_is_refused_at_load() {
+        use Profile::{Development, Production};
+        let s = |v: serde_json::Value| serde_json::from_value::<StreamSection>(v).unwrap();
+        let tls = serde_json::json!({ "ca": "ca.pem", "cert": "c.pem", "key": "c.key" });
+        use crate::feed::FeedSigner as _;
+        let key = hex::encode(crate::feed::LocalFeedKey::from_seed([1; 32]).public());
+        let feed_key = serde_json::json!({
+            "signer": { "socket": "/run/signer.sock", "client": "ingress", "token_file": "/t" },
+            "key": "ingress-feed",
+        });
+        let refused = [
+            (
+                serde_json::json!({ "listen": "tls:0.0.0.0:7443" }),
+                Development,
+            ),
+            (
+                serde_json::json!({ "listen": "unix:/run/s.sock" }),
+                Development,
+            ),
+            (
+                serde_json::json!({ "listen": "tcp:0.0.0.0:7443", "tls": tls }),
+                Development,
+            ),
+            (
+                serde_json::json!({ "listen": "tls:0.0.0.0:7443", "tls": tls }),
+                Production,
+            ),
+            (
+                serde_json::json!({ "development_feed_key": "k.hex" }),
+                Production,
+            ),
+            (
+                serde_json::json!({ "feed_key": feed_key, "development_feed_key": "k.hex" }),
+                Development,
+            ),
+            (
+                serde_json::json!({ "dial": { "connect": ["tls:i:7443"], "server_name": "i" }, "ingress_keys": [key] }),
+                Development,
+            ),
+            (
+                serde_json::json!({ "dial": { "connect": ["tls:i:7443"] }, "tls": tls, "ingress_keys": [key] }),
+                Development,
+            ),
+            (
+                serde_json::json!({ "dial": { "connect": ["unix:/s"] } }),
+                Development,
+            ),
+            (
+                serde_json::json!({ "dial": { "connect": [] }, "ingress_keys": [key] }),
+                Development,
+            ),
+        ];
+        for (v, p) in refused {
+            assert!(s(v.clone()).check(p).is_err(), "{v} under {p:?}");
+        }
+        let accepted = [
+            (
+                serde_json::json!({ "listen": "tls:0.0.0.0:7443", "tls": tls }),
+                Development,
+            ),
+            (
+                serde_json::json!({ "listen": "tls:0.0.0.0:7443", "tls": tls, "feed_key": feed_key }),
+                Production,
+            ),
+            (
+                serde_json::json!({ "dial": { "connect": ["tls:i:7443"], "server_name": "i" }, "tls": tls, "ingress_keys": [key] }),
+                Production,
+            ),
+            (
+                serde_json::json!({ "dial": { "connect": ["unix:/s"] }, "ingress_keys": [key] }),
+                Production,
+            ),
+        ];
+        for (v, p) in accepted {
+            assert!(s(v.clone()).check(p).is_ok(), "{v} under {p:?}");
+        }
+    }
 
     #[test]
     fn a_genesis_config_builds_the_core_genesis() {

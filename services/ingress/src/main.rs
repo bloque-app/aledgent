@@ -36,6 +36,14 @@
 //! With `core_endpoint` set, the core is the core Agent's host (`F-005`, `aledgent-core-host
 //! serve`), reached over a local socket ([`ingress::remote`]); the core's root and clerk key are
 //! then that process's, and ingress reads neither.
+//!
+//! With `stream.listen` set (`F-038`, `DEC-27`), ingress runs apart from every core: it listens
+//! for the core hosts that dial out to it ([`ingress::stream`]), acknowledges with no core
+//! connected, and signs every forwarded command with `stream.feed_key` (the signer service). On
+//! `SIGTERM` (or `SIGINT`) it drains: `GET /ready` turns 503, the feed in flight finishes, the
+//! feed lease is released, every core gets a go-away, and clients are answered for
+//! `stream.drain_ms` before the process exits. `readiness_listen` serves `/ready` and `/live` on
+//! a port of its own ([`ingress::readiness`]).
 
 use std::sync::Arc;
 
@@ -48,9 +56,11 @@ use ingress::config::{
 };
 use ingress::inprocess::{BOOK_CACHE_BYTES, FileJournal, InProcessCore};
 use ingress::remote::{Endpoint, LinkToken, RemoteCore};
+use ingress::service::SharedFeedSigner;
 use ingress::store::Store;
 use ingress::store::pg::{PgOptions, PgStore};
-use ingress::{delivery, openapi, service, store, surface};
+use ingress::stream::StreamCore;
+use ingress::{delivery, openapi, readiness, service, store, surface};
 
 fn arg(args: &[String], name: &str) -> Result<String, String> {
     args.windows(2)
@@ -141,7 +151,29 @@ const REMOTE_CORE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 
 async fn serve(args: &[String]) -> Result<(), String> {
     let c = config(args)?;
+    if let Some(s) = &c.stream {
+        s.check(c.profile)?;
+    }
     let store = connect(&c).await?;
+    // F-038: the stream, when ingress listens for cores; the socket link otherwise.
+    if let Some(s) = c.stream.clone().filter(|s| s.listen.is_some()) {
+        let signer = s.feed_signer(c.profile)?;
+        let listen = s.bind().await?.ok_or("stream.listen")?;
+        let core = StreamCore::new(&c.replica, s.timings());
+        let hub = core.clone();
+        tokio::spawn(async move {
+            if let Err(e) = hub.serve(listen).await {
+                tracing::error!(error = %e, "the core stream's listener stopped");
+            }
+        });
+        let drain = s.drain();
+        return run(c, store, core.clone(), signer, Some((core, drain))).await;
+    }
+    // The socket link signs too once a feed key is configured: the transition (`F-038` §12).
+    let signer = match &c.stream {
+        Some(s) => s.feed_signer(c.profile)?,
+        None => None,
+    };
     if let Some(e) = &c.core_endpoint {
         let endpoint = Endpoint::parse(e)
             .ok_or_else(|| format!("core_endpoint {e}: unix:<path> or tcp:<addr>"))?;
@@ -156,6 +188,8 @@ async fn serve(args: &[String]) -> Result<(), String> {
             c,
             store,
             RemoteCore::new(endpoint, REMOTE_CORE_TIMEOUT, token),
+            signer,
+            None,
         )
         .await;
     }
@@ -173,12 +207,12 @@ async fn serve(args: &[String]) -> Result<(), String> {
             let core = InProcessCore::on_disk(genesis, journal, path, BOOK_CACHE_BYTES);
             let core = with_audit(with_clerk(core)?, &c)?;
             core.start()?;
-            run(c, store, core).await
+            run(c, store, core, None, None).await
         }
         None => {
             let core = with_audit(with_clerk(InProcessCore::in_memory(genesis, journal))?, &c)?;
             core.start()?;
-            run(c, store, core).await
+            run(c, store, core, None, None).await
         }
     }
 }
@@ -224,7 +258,29 @@ where
     Ok(core.with_clerk(Arc::new(clerk)))
 }
 
-async fn run<C: Core + Clone>(c: DeploymentConfig, store: PgStore, core: C) -> Result<(), String> {
+/// The signal a replica drains on: `SIGTERM` (an orchestrator's stop) or `SIGINT`.
+async fn stop_signal() {
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    tokio::select! {
+        _ = term => {}
+        _ = tokio::signal::ctrl_c() => {}
+    }
+}
+
+async fn run<C: Core + Clone>(
+    c: DeploymentConfig,
+    store: PgStore,
+    core: C,
+    feed_signer: Option<SharedFeedSigner>,
+    stream: Option<(StreamCore, std::time::Duration)>,
+) -> Result<(), String> {
     let auth = Authenticator::new();
     auth.allow_holders(c.allow_holder_credentials);
     // T-031-13: the API-key cache's TTL, never above NFR-20's bound.
@@ -252,15 +308,41 @@ async fn run<C: Core + Clone>(c: DeploymentConfig, store: PgStore, core: C) -> R
             "archived identifiers answer ERR-IdentifierArchived"
         );
     }
+    // F-038: every forwarded command signed, on either link, once a feed key is configured.
+    service.feed_signer = feed_signer;
     let replica = service::Replica::start(store, core, clock, auth, Arc::new(transport), service);
     let app = surface::router(Arc::clone(&replica.shared));
+    // F-038 §10: readiness on a port of its own, apart from the client surface.
+    if let Some(addr) = &c.readiness_listen {
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(|e| format!("readiness_listen {addr}: {e}"))?;
+        let router = readiness::router(Arc::clone(&replica.shared));
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, router).await {
+                tracing::error!(error = %e, "the readiness listener stopped");
+            }
+        });
+    }
     let listener = tokio::net::TcpListener::bind(&c.listen)
         .await
         .map_err(|e| format!("{}: {e}", c.listen))?;
     tracing::info!(listen = %c.listen, replica = %c.replica, "serving");
+    let shared = Arc::clone(&replica.shared);
     axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
+        .with_graceful_shutdown(async move {
+            stop_signal().await;
+            // F-038 §9: not ready, the feed in flight finished, the lease released, every core
+            // sent away; clients answered meanwhile, then for the drain period.
+            let drain = stream
+                .as_ref()
+                .map_or(ingress::config::DEFAULT_DRAIN, |(_, d)| *d);
+            tracing::info!(?drain, "draining");
+            service::drain(&shared, drain).await;
+            if let Some((hub, _)) = &stream {
+                hub.go_away("draining");
+                tokio::time::sleep(drain).await;
+            }
         })
         .await
         .map_err(|e| e.to_string())

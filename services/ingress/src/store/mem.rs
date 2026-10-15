@@ -31,6 +31,16 @@ struct Inner {
     counters: HashMap<String, u32>,
     challenges: HashMap<[u8; 16], Time>,
     ties: HashMap<String, String>,
+    feeds: HashMap<String, FeedLease>,
+    verifiers: HashMap<String, crate::boundary::CredentialBody>,
+}
+
+/// A partition's feed lease (`F-038`).
+struct FeedLease {
+    holder: String,
+    epoch: u64,
+    until: Instant,
+    next_seq: u64,
 }
 
 /// The ingress store in memory.
@@ -188,6 +198,7 @@ impl Store for MemStore {
             replied_at: None,
             completed_at: None,
             submitted_at: None,
+            feed_seq: None,
         };
         inner.by_ref.insert(stored.new.op_ref, seq);
         if let Some(k) = key {
@@ -207,20 +218,20 @@ impl Store for MemStore {
     }
 
     async fn next_undecided(&self) -> Result<Option<Row>, StoreError> {
-        let inner = self.lock();
-        let undecided = || inner.rows.values().filter(|r| r.status != Status::Decided);
-        Ok(undecided()
-            .find(|r| r.new.reserves)
-            .or_else(|| undecided().next())
-            .cloned())
+        Ok(self.next_undecided_batch(1).await?.into_iter().next())
     }
 
     async fn next_undecided_batch(&self, n: usize) -> Result<Vec<Row>, StoreError> {
         let inner = self.lock();
         let undecided = || inner.rows.values().filter(|r| r.status != Status::Decided);
-        Ok(undecided()
-            .filter(|r| r.new.reserves)
-            .chain(undecided().filter(|r| !r.new.reserves))
+        // F-038: rows in flight first, by the feed sequence they were given.
+        let mut in_flight: Vec<&Row> = undecided().filter(|r| r.feed_seq.is_some()).collect();
+        in_flight.sort_by_key(|r| r.feed_seq);
+        let fresh = || undecided().filter(|r| r.feed_seq.is_none());
+        Ok(in_flight
+            .into_iter()
+            .chain(fresh().filter(|r| r.new.reserves))
+            .chain(fresh().filter(|r| !r.new.reserves))
             .take(n)
             .cloned()
             .collect())
@@ -409,6 +420,118 @@ impl Store for MemStore {
         }
         Ok(())
     }
+
+    async fn try_feed(
+        &self,
+        partition: &str,
+        holder: &str,
+        lease: Duration,
+    ) -> Result<Option<u64>, StoreError> {
+        let mut inner = self.lock();
+        let now = Instant::now();
+        match inner.feeds.get_mut(partition) {
+            None => {
+                inner.feeds.insert(
+                    partition.to_owned(),
+                    FeedLease {
+                        holder: holder.to_owned(),
+                        epoch: 1,
+                        until: now + lease,
+                        next_seq: 1,
+                    },
+                );
+                Ok(Some(1))
+            }
+            Some(l) if l.holder == holder && l.until > now => {
+                l.until = now + lease;
+                Ok(Some(l.epoch))
+            }
+            Some(l) if l.until <= now => {
+                l.holder = holder.to_owned();
+                l.epoch += 1;
+                l.until = now + lease;
+                Ok(Some(l.epoch))
+            }
+            Some(_) => Ok(None),
+        }
+    }
+
+    async fn release_feed(&self, partition: &str, holder: &str) -> Result<(), StoreError> {
+        let mut inner = self.lock();
+        if let Some(l) = inner.feeds.get_mut(partition)
+            && l.holder == holder
+        {
+            l.until = Instant::now();
+        }
+        Ok(())
+    }
+
+    async fn feed_live(&self, partition: &str) -> Result<bool, StoreError> {
+        let now = Instant::now();
+        Ok(self
+            .lock()
+            .feeds
+            .get(partition)
+            .is_some_and(|l| l.until > now))
+    }
+
+    async fn mark_fed(
+        &self,
+        partition: &str,
+        holder: &str,
+        epoch: u64,
+        op_refs: &[InputKey],
+        at: Time,
+    ) -> Result<Vec<Row>, StoreError> {
+        let mut inner = self.lock();
+        let now = Instant::now();
+        let mut next = match inner.feeds.get(partition) {
+            Some(l) if l.holder == holder && l.epoch == epoch && l.until > now => l.next_seq,
+            _ => return Err(StoreError::fenced()),
+        };
+        let mut out = Vec::with_capacity(op_refs.len());
+        for r in op_refs {
+            let row = row_mut(&mut inner, *r)?;
+            if row.status == Status::Received {
+                row.status = Status::Forwarded;
+                row.forwarded_at = Some(at);
+            }
+            if row.feed_seq.is_none() && row.status != Status::Decided {
+                row.feed_seq = Some(next);
+                next += 1;
+            }
+            out.push(row.clone());
+        }
+        if let Some(l) = inner.feeds.get_mut(partition) {
+            l.next_seq = next;
+        }
+        Ok(out)
+    }
+
+    async fn copy_verifier(
+        &self,
+        credential: &str,
+        found: Option<&crate::boundary::CredentialBody>,
+        _at: Time,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.lock();
+        match found {
+            Some(f) => {
+                inner.verifiers.insert(credential.to_owned(), f.clone());
+            }
+            None => {
+                inner.verifiers.remove(credential);
+            }
+        }
+        Ok(())
+    }
+
+    async fn copied_verifier(
+        &self,
+        credential: &str,
+    ) -> Result<Option<crate::boundary::CredentialBody>, StoreError> {
+        Ok(self.lock().verifiers.get(credential).cloned())
+    }
 }
 
 #[cfg(test)]
@@ -482,5 +605,100 @@ mod tests {
             s.next_undecided().await.unwrap().map(|r| r.new.op_ref.0[0]),
             Some(2)
         );
+    }
+
+    /// `T-038-03` (`DEC-27` (d)): one holder of a partition's feed lease at a time; its epoch
+    /// rises on every change of holder, never on a renewal; a stale holder's mark is fenced and
+    /// marks nothing; feed sequences are gapless, kept by every resend, and the rows in flight
+    /// come back first, in their sequence's order.
+    #[tokio::test]
+    async fn t_038_03_the_feed_lease_fences_and_sequences_are_gapless() {
+        use crate::feed::BOOK;
+        let s = MemStore::new(Duration::from_secs(1));
+        let long = Duration::from_secs(60);
+        assert_eq!(s.try_feed(BOOK, "a", long).await.unwrap(), Some(1));
+        assert_eq!(
+            s.try_feed(BOOK, "a", long).await.unwrap(),
+            Some(1),
+            "renewed"
+        );
+        assert_eq!(s.try_feed(BOOK, "b", long).await.unwrap(), None);
+        assert!(s.feed_live(BOOK).await.unwrap());
+        for (n, reserves) in [(1, false), (2, true), (3, false), (4, true)] {
+            s.append(row(n, reserves)).await.unwrap();
+        }
+        let refs = |rows: &[Row]| rows.iter().map(|r| r.new.op_ref.0[0]).collect::<Vec<_>>();
+        let seqs = |rows: &[Row]| rows.iter().map(|r| r.feed_seq).collect::<Vec<_>>();
+        // `a` sends 2, 4 and 1 (the forwarder's order): sequences 1, 2, 3.
+        let k = |n: u8| InputKey([n; 16]);
+        let fed = s
+            .mark_fed(BOOK, "a", 1, &[k(2), k(4), k(1)], 7)
+            .await
+            .unwrap();
+        assert_eq!(seqs(&fed), vec![Some(1), Some(2), Some(3)]);
+        assert!(fed.iter().all(|r| r.status == Status::Forwarded));
+        // A stale epoch, or another holder, marks nothing.
+        assert!(
+            s.mark_fed(BOOK, "a", 2, &[k(3)], 8)
+                .await
+                .unwrap_err()
+                .is_fenced()
+        );
+        assert!(
+            s.mark_fed(BOOK, "b", 1, &[k(3)], 8)
+                .await
+                .unwrap_err()
+                .is_fenced()
+        );
+        assert_eq!(s.get(k(3)).await.unwrap().unwrap().feed_seq, None);
+        // `a` lets go: `b` takes the lease under a new epoch, and `a` is fenced.
+        s.release_feed(BOOK, "a").await.unwrap();
+        assert!(!s.feed_live(BOOK).await.unwrap());
+        assert_eq!(s.try_feed(BOOK, "b", long).await.unwrap(), Some(2));
+        assert_eq!(s.try_feed(BOOK, "a", long).await.unwrap(), None);
+        assert!(
+            s.mark_fed(BOOK, "a", 1, &[k(3)], 9)
+                .await
+                .unwrap_err()
+                .is_fenced()
+        );
+        // In flight first, by sequence; then the fresh rows, reservations first.
+        let next = s.next_undecided_batch(10).await.unwrap();
+        assert_eq!(refs(&next), vec![2, 4, 1, 3]);
+        // `b` resends them: each keeps its sequence, and the fresh one gets the next.
+        let fed = s
+            .mark_fed(BOOK, "b", 2, &[k(2), k(4), k(1), k(3)], 9)
+            .await
+            .unwrap();
+        assert_eq!(seqs(&fed), vec![Some(1), Some(2), Some(3), Some(4)]);
+        // A decided row gets no sequence.
+        s.append(row(5, false)).await.unwrap();
+        s.mark_decided(k(5), 1, Vec::new(), 10).await.unwrap();
+        let fed = s.mark_fed(BOOK, "b", 2, &[k(5)], 10).await.unwrap();
+        assert_eq!(seqs(&fed), vec![None]);
+        // A lapsed lease, taken again by its own holder, is a new epoch too.
+        assert_eq!(
+            s.try_feed(BOOK, "b", Duration::ZERO).await.unwrap(),
+            Some(2)
+        );
+        assert_eq!(s.try_feed(BOOK, "b", long).await.unwrap(), Some(3));
+    }
+
+    /// `T-038-10`: the verifier copy keeps what the book answered and forgets a credential the
+    /// book says is gone.
+    #[tokio::test]
+    async fn t_038_10_the_verifier_copy_keeps_and_forgets() {
+        let s = MemStore::new(Duration::from_secs(1));
+        let body = crate::boundary::CredentialBody {
+            identity: "did:aledgent:id:x".into(),
+            kind: "person".into(),
+            scheme: "api-key".into(),
+            verifier: "ab".repeat(32),
+        };
+        assert_eq!(s.copied_verifier("c").await.unwrap(), None);
+        s.copy_verifier("c", Some(&body), 1).await.unwrap();
+        assert_eq!(s.copied_verifier("c").await.unwrap(), Some(body));
+        s.copy_verifier("c", None, 2).await.unwrap();
+        assert_eq!(s.copied_verifier("c").await.unwrap(), None);
     }
 }

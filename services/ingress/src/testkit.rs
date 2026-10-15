@@ -282,6 +282,7 @@ pub fn fast_config(replica: &str) -> Config {
         core_batch: crate::service::DEFAULT_CORE_BATCH,
         genesis_gate: false,
         archived: Arc::default(),
+        feed_signer: None,
     }
 }
 

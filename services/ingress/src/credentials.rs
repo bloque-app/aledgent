@@ -68,6 +68,9 @@ const CACHE_ENTRIES: usize = 65_536;
 pub struct VerifierCache {
     ttl_ms: AtomicU64,
     entries: Mutex<HashMap<String, (Instant, Option<CredentialBody>)>>,
+    /// What this process last wrote to the durable copy per credential (`F-038` §7), so the copy
+    /// is written when an answer changes, not on every read.
+    copied: Mutex<HashMap<String, CredentialBody>>,
 }
 
 impl Default for VerifierCache {
@@ -75,11 +78,44 @@ impl Default for VerifierCache {
         VerifierCache {
             ttl_ms: AtomicU64::new(API_KEY_CACHE_TTL.as_millis() as u64),
             entries: Mutex::new(HashMap::new()),
+            copied: Mutex::new(HashMap::new()),
         }
     }
 }
 
+/// What the durable copy should do with an answer the book gave (`F-038` §7).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CopyWrite {
+    /// Nothing: the copy holds it already, or it never held the credential.
+    Nothing,
+    /// Keep this verifier.
+    Keep(CredentialBody),
+    /// Forget the credential: the book holds no working credential under it any more.
+    Forget,
+}
+
 impl VerifierCache {
+    /// What the durable copy should do with `found`, the book's answer for `credential`, given
+    /// what this process last wrote there. "No working credential" for one this process never
+    /// copied writes nothing: a caller presenting made-up credentials never writes to the store.
+    pub fn copy_write(&self, credential: &str, found: Option<&CredentialBody>) -> CopyWrite {
+        let mut copied = self.copied.lock().unwrap_or_else(|p| p.into_inner());
+        match found {
+            Some(f) if copied.get(credential) == Some(f) => CopyWrite::Nothing,
+            Some(f) => {
+                if copied.len() >= CACHE_ENTRIES {
+                    copied.clear();
+                }
+                copied.insert(credential.to_owned(), f.clone());
+                CopyWrite::Keep(f.clone())
+            }
+            None => match copied.remove(credential) {
+                Some(_) => CopyWrite::Forget,
+                None => CopyWrite::Nothing,
+            },
+        }
+    }
+
     /// Set the TTL. Zero reads the core on every request; above `NFR-20`'s bound is refused.
     pub fn set_ttl(&self, ttl: Duration) -> Result<(), String> {
         if ttl > API_KEY_CACHE_MAX_TTL {
@@ -221,16 +257,69 @@ fn passkeys<S: Store, C: Core>(shared: &Shared<S, C>) -> Result<std::sync::Arc<P
     shared.auth.passkeys().ok_or(Refusal::CredentialInvalid)
 }
 
+/// What the book holds for `credential` (`F-038` §7, `DEC-27` (e″)): read from the core, the
+/// answer kept in the durable copy when it changed; or, when no core answers, the copy's last
+/// answer. A credential the copy does not hold, while no core answers, is
+/// `ERR-DecisionUnavailable`: never accepted for its form alone, and safe to retry.
+pub async fn verifier_of<S: Store, C: Core>(
+    shared: &Shared<S, C>,
+    credential: &str,
+) -> Result<Option<CredentialBody>, Refusal> {
+    match shared.core.credential(credential).await {
+        Ok(found) => {
+            copy(shared, credential, found.as_ref());
+            Ok(found)
+        }
+        Err(_) => from_copy(shared, credential).await,
+    }
+}
+
+/// The durable copy's answer for `credential`, read because no core answers.
+async fn from_copy<S: Store, C: Core>(
+    shared: &Shared<S, C>,
+    credential: &str,
+) -> Result<Option<CredentialBody>, Refusal> {
+    match shared.store.copied_verifier(credential).await {
+        Ok(Some(found)) => {
+            crate::metrics::Metrics::inc(&shared.metrics.verifier_copy_used);
+            Ok(Some(found))
+        }
+        _ => Err(Refusal::DecisionUnavailable),
+    }
+}
+
+/// Keep `found` in the durable copy if it changed, off the request's path: the write never adds
+/// to the caller's wait (`NFR-1`), and one that fails is tried again on the next change.
+fn copy<S: Store, C: Core>(
+    shared: &Shared<S, C>,
+    credential: &str,
+    found: Option<&CredentialBody>,
+) {
+    let write = shared.auth.verifiers().copy_write(credential, found);
+    if write == CopyWrite::Nothing {
+        return;
+    }
+    let store = shared.store.clone();
+    let id = credential.to_owned();
+    let at = shared.clock.now();
+    tokio::spawn(async move {
+        let kept = match &write {
+            CopyWrite::Keep(f) => Some(f),
+            _ => None,
+        };
+        if let Err(e) = store.copy_verifier(&id, kept, at).await {
+            tracing::warn!(error = %e, "the verifier copy was not written");
+        }
+    });
+}
+
 /// A working passkey the core holds: its body and its public material.
 async fn passkey_of<S: Store, C: Core>(
     shared: &Shared<S, C>,
     credential: &str,
 ) -> Result<(CredentialBody, PasskeyKey), Refusal> {
-    let found = shared
-        .core
-        .credential(credential)
-        .await
-        .map_err(|_| Refusal::DecisionUnavailable)?
+    let found = verifier_of(shared, credential)
+        .await?
         .ok_or(Refusal::CredentialInvalid)?;
     if found.scheme != Scheme::WebAuthnEs256.name() {
         return Err(Refusal::CredentialInvalid);
@@ -372,13 +461,15 @@ pub async fn authenticate<S: Store, C: Core>(
                 Some(found) => found,
                 None => {
                     let read_at = Instant::now();
-                    let found = shared
-                        .core
-                        .credential(&id)
-                        .await
-                        .map_err(|_| Refusal::DecisionUnavailable)?;
-                    cache.put(&id, read_at, found.clone());
-                    found
+                    match shared.core.credential(&id).await {
+                        Ok(found) => {
+                            cache.put(&id, read_at, found.clone());
+                            copy(shared, &id, found.as_ref());
+                            found
+                        }
+                        // F-038 §7: no core answers; the copy's last answer, never cached.
+                        Err(_) => from_copy(shared, &id).await?,
+                    }
                 }
             };
             shared.auth.finish_api_key(&k, found.as_ref())
@@ -459,6 +550,73 @@ fn register_target(
     }
 }
 
+/// The custody epoch of `account` a reclaim's proof binds, as the holder `who` sees it
+/// (`REQ-AU-13`). Book state: when no core answers, `ERR-DecisionUnavailable`.
+async fn custody_epoch<S: Store, C: Core>(
+    shared: &Shared<S, C>,
+    who: &Authenticated,
+    account: &str,
+) -> Result<u64, Refusal> {
+    match shared
+        .core
+        .query(
+            &who.caller(None),
+            &Query::Custody {
+                account: account.to_owned(),
+            },
+            shared.clock.now(),
+        )
+        .await
+        .map_err(|_| Refusal::DecisionUnavailable)?
+    {
+        QueryReply::Custody(v) => Ok(v.epoch),
+        QueryReply::Refused { error } => Err(error),
+        _ => Err(Refusal::CredentialInvalid),
+    }
+}
+
+/// Whether `body` carries a `key` proof that [`check_key_proof`] checks at the door: a reclaim
+/// with a `key` credential's signature.
+pub fn has_key_proof(body: &CommandBody) -> bool {
+    matches!(body, CommandBody::ReclaimCustody(c) if c.signature.is_some())
+}
+
+/// The door check of a `key` proof (`F-038` §7, `DEC-27` (e″), `T-038-11`): a reclaim carrying a
+/// `key` credential's signature is checked here, against the credential's verifier as the book
+/// last answered it (live, or the durable copy when no core answers), over the reclaim challenge,
+/// before the command is logged. A forged or mismatched proof is `ERR-CredentialInvalid`, which
+/// the core would answer too; the core still verifies the proof at decision. The challenge binds
+/// the account's custody epoch, which is book state: when no core answers that read, the reclaim
+/// (answered with its decision, `REQ-CS-8`) is `ERR-DecisionUnavailable` at once. Every other
+/// command passes ([`has_key_proof`]).
+pub async fn check_key_proof<S: Store, C: Core>(
+    shared: &Shared<S, C>,
+    who: &Authenticated,
+    body: &CommandBody,
+) -> Result<(), Refusal> {
+    let CommandBody::ReclaimCustody(c) = body else {
+        return Ok(());
+    };
+    let Some(sig) = &c.signature else {
+        // A passkey's proof: [`prepare`] verifies it.
+        return Ok(());
+    };
+    let account = AccountId::parse(&c.account).map_err(|_| Refusal::UnknownAccount)?;
+    let sig = crate::custody::signature(sig, Refusal::CredentialInvalid)?;
+    let epoch = custody_epoch(shared, who, &c.account).await?;
+    let found = verifier_of(shared, &c.proof_credential)
+        .await?
+        .ok_or(Refusal::CredentialInvalid)?;
+    if found.scheme != Scheme::Key.name() {
+        return Err(Refusal::CredentialInvalid);
+    }
+    let verifier = hex::decode(&found.verifier).map_err(|_| Refusal::CredentialInvalid)?;
+    if !ledger_core::custody::verifies(&verifier, &reclaim_challenge(&account, epoch), &sig) {
+        return Err(Refusal::CredentialInvalid);
+    }
+    Ok(())
+}
+
 /// Do what a credential command needs before it is logged. Returns an API key's secret, when one
 /// was drawn, for the reply that decides the command.
 pub async fn prepare<S: Store, C: Core>(
@@ -498,23 +656,7 @@ pub async fn prepare<S: Store, C: Core>(
         (Pending::ReclaimAssertion(a), CommandBody::ReclaimCustody(c)) => {
             let pk = passkeys(shared)?;
             let account = AccountId::parse(&c.account).map_err(|_| Refusal::UnknownAccount)?;
-            // The epoch the proof binds, as the holder sees it (`REQ-AU-13`).
-            let epoch = match shared
-                .core
-                .query(
-                    &who.caller(None),
-                    &Query::Custody {
-                        account: c.account.clone(),
-                    },
-                    now,
-                )
-                .await
-                .map_err(|_| Refusal::DecisionUnavailable)?
-            {
-                QueryReply::Custody(v) => v.epoch,
-                QueryReply::Refused { error } => return Err(error),
-                _ => return Err(Refusal::CredentialInvalid),
-            };
+            let epoch = custody_epoch(shared, who, &c.account).await?;
             let (_, key) = passkey_of(shared, &c.proof_credential).await?;
             check_assertion(
                 shared,

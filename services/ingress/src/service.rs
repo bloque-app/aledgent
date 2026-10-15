@@ -21,6 +21,19 @@
 //! of it in the queue. The reply and its input number are stored on the row, and whoever waits on
 //! the row is woken.
 //!
+//! **The feed lease** (`F-038`, `DEC-27` (d)). The forwarder feeds only while its replica holds the
+//! feed lease of the partition ([`Store::try_feed`]), which a replica takes, and renews every third
+//! of the lease, only while it can reach a core for it ([`Core::can_feed`]). Each row gets its feed
+//! sequence the first time it is sent, under the lease's epoch ([`Store::mark_fed`]); the rows in
+//! flight are read back first, by that sequence, so every resend keeps its place. A forwarder whose
+//! epoch is no longer the lease's is fenced: by the store before it marks anything, and by the core
+//! host's sequencer before anything runs. Every item is signed by [`Config::feed_signer`] when one
+//! is configured (`DEC-27` (f)). Leadership (the ticker and the delivery worker) is taken only with
+//! a core too, since delivery pages the outbox through it.
+//!
+//! **The drain** ([`Replica::drain`], `DEC-27` (e)): no new feed, the one in flight finished, the
+//! lease released and leadership resigned, so another replica takes them at its next renewal.
+//!
 //! **The ticker** logs a tick input `{now}` every interval, from the ingress clock (`DEC-6`). At
 //! most one tick waits undecided: during an outage ticks do not pile up, and the first tick after
 //! the core returns carries the current time.
@@ -29,7 +42,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use ledger_core::account::Time;
@@ -44,6 +57,7 @@ use crate::boundary::{
 use crate::clock::SharedClock;
 use crate::command::Command;
 use crate::delivery::{Transport, backoff, signed_headers};
+use crate::feed::{BOOK, Feed, FeedReply, FeedSigner};
 use crate::metrics::Metrics;
 use crate::pass_through::Echo;
 use crate::store::{Attempt, DecidedRow, InputKind, NewRow, Row, Status, Store, StoreError};
@@ -99,6 +113,20 @@ pub struct Config {
     /// The prior system's identifiers the initial state left out (`REQ-RC-7`): a request naming
     /// one is answered `ERR-IdentifierArchived` ([`crate::archived`]). Empty: none.
     pub archived: Arc<crate::archived::ArchivedIds>,
+    /// Who signs every forwarded input (`F-038`, `DEC-27` (f)): the signer service's feed key.
+    /// `None`: unsigned, for a core no link separates from ingress, or a socket link whose host
+    /// has no `stream.ingress_keys` yet.
+    pub feed_signer: Option<SharedFeedSigner>,
+}
+
+/// A feed signer shared by a replica's parts. Never formatted.
+#[derive(Clone)]
+pub struct SharedFeedSigner(pub Arc<dyn FeedSigner>);
+
+impl std::fmt::Debug for SharedFeedSigner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SharedFeedSigner(<redacted>)")
+    }
 }
 
 /// The default of [`Config::core_batch`]: the core Agent's own default batch
@@ -125,6 +153,7 @@ impl Default for Config {
             core_batch: DEFAULT_CORE_BATCH,
             genesis_gate: false,
             archived: Arc::default(),
+            feed_signer: None,
         }
     }
 }
@@ -166,6 +195,15 @@ pub struct Shared<S: Store, C: Core> {
     pub genesis_open: AtomicBool,
     /// Reply stamps on their way to the store ([`Shared::stamp_reply`], `T-009-25`).
     pub replies: tokio::sync::mpsc::Sender<(InputKey, Time)>,
+    /// The epoch of the book's feed lease this replica holds, 0 for none (`F-038`).
+    pub feed_epoch: AtomicU64,
+    /// Whether anyone held a live feed lease of the book at this replica's last look (`F-038`
+    /// §8): when no one does, a command answered with its decision waits at most `NFR-16`.
+    pub feed_live: AtomicBool,
+    /// Whether this replica drains ([`Replica::drain`]).
+    pub draining: AtomicBool,
+    /// Whether a feed is in flight.
+    pub forwarding: AtomicBool,
 }
 
 /// The most reply stamps waiting for the store at once (`T-009-25`). Past it a stamp is dropped
@@ -286,6 +324,29 @@ impl<S: Store, C: Core> Shared<S, C> {
 
     fn leads(&self) -> bool {
         self.leading.load(Ordering::SeqCst)
+    }
+
+    /// The epoch of the feed lease this replica holds, if it holds it (`F-038`).
+    pub fn feeds(&self) -> Option<u64> {
+        match self.feed_epoch.load(Ordering::SeqCst) {
+            0 => None,
+            e => Some(e),
+        }
+    }
+
+    /// Whether this replica drains.
+    pub fn draining(&self) -> bool {
+        self.draining.load(Ordering::SeqCst)
+    }
+
+    /// How long a command answered with its decision may wait for it (`F-038` §8, `DEC-27` (g)):
+    /// `wait`, or at most `NFR-16` while no replica holds a live feed lease of the book.
+    pub fn decision_wait(&self, wait: Duration) -> Duration {
+        if self.feed_live.load(Ordering::SeqCst) {
+            wait
+        } else {
+            wait.min(crate::answering::NFR_16)
+        }
     }
 
     /// Note that ingress has just sent the reply to the command that logged `op_ref`: its
@@ -510,17 +571,48 @@ pub fn input_of(row: &Row) -> Result<CoreInput, String> {
 
 async fn leadership<S: Store, C: Core>(shared: Arc<Shared<S, C>>) {
     let every = shared.config.lease / 3;
+    let replica = shared.config.replica.clone();
     loop {
-        let leads = shared
-            .store
-            .try_lead(&shared.config.replica)
-            .await
-            .unwrap_or(false);
+        // F-038: leadership and the feed lease only with a core to reach, and never while draining.
+        let can = shared.core.can_feed(BOOK) && !shared.draining();
+        let leads = if can {
+            shared.store.try_lead(&replica).await.unwrap_or(false)
+        } else {
+            if shared.leads() {
+                let _ = shared.store.resign(&replica).await;
+            }
+            false
+        };
         let was = shared.leading.swap(leads, Ordering::SeqCst);
         if leads && !was {
-            tracing::info!(replica = %shared.config.replica, "leading");
+            tracing::info!(replica = %replica, "leading");
             shared.wake.notify_one();
         }
+        let epoch = if can {
+            match shared
+                .store
+                .try_feed(BOOK, &replica, shared.config.lease)
+                .await
+            {
+                Ok(e) => e.unwrap_or(0),
+                Err(e) => {
+                    tracing::warn!(error = %e, "the store did not renew the feed lease");
+                    0
+                }
+            }
+        } else {
+            if shared.feeds().is_some() && !shared.forwarding.load(Ordering::SeqCst) {
+                let _ = shared.store.release_feed(BOOK, &replica).await;
+            }
+            0
+        };
+        let before = shared.feed_epoch.swap(epoch, Ordering::SeqCst);
+        if epoch != 0 && before != epoch {
+            tracing::info!(replica = %replica, epoch, "feeding the book");
+            shared.wake.notify_one();
+        }
+        let live = epoch != 0 || shared.store.feed_live(BOOK).await.unwrap_or(true);
+        shared.feed_live.store(live, Ordering::SeqCst);
         tokio::time::sleep(every).await;
     }
 }
@@ -528,10 +620,11 @@ async fn leadership<S: Store, C: Core>(shared: Arc<Shared<S, C>>) {
 async fn forwarder<S: Store, C: Core>(shared: Arc<Shared<S, C>>) {
     let mut wait = shared.config.retry_base;
     loop {
-        if !shared.leads() {
+        // F-038: the forwarder feeds under the feed lease, and starts nothing while draining.
+        let Some(epoch) = shared.feeds().filter(|_| !shared.draining()) else {
             tokio::time::sleep(shared.config.poll).await;
             continue;
-        }
+        };
         let n = shared.config.core_batch.max(1);
         let next = if n == 1 {
             shared
@@ -558,7 +651,10 @@ async fn forwarder<S: Store, C: Core>(shared: Arc<Shared<S, C>>) {
             }
             continue;
         }
-        if let Err(e) = forward(&shared, rows, &mut wait).await {
+        shared.forwarding.store(true, Ordering::SeqCst);
+        let fed = forward(&shared, epoch, rows, &mut wait).await;
+        shared.forwarding.store(false, Ordering::SeqCst);
+        if let Err(e) = fed {
             tracing::warn!(error = %e, "forwarding stopped; it resumes from the log");
             tokio::time::sleep(shared.config.poll).await;
         }
@@ -573,33 +669,79 @@ async fn forwarder<S: Store, C: Core>(shared: Arc<Shared<S, C>>) {
 /// the backoff, kept across calls.
 async fn forward<S: Store, C: Core>(
     shared: &Shared<S, C>,
+    epoch: u64,
     rows: Vec<Row>,
     wait: &mut std::time::Duration,
 ) -> Result<(), String> {
     let mut marked = Vec::with_capacity(rows.len());
     let mut inputs = Vec::with_capacity(rows.len());
-    // One commit for the batch's marks (stress finding F13: two commits per input).
+    let mut seqs = Vec::with_capacity(rows.len());
+    // One commit for the batch's marks (stress finding F13: two commits per input), and their feed
+    // sequences under the lease (`F-038`).
     let keys: Vec<InputKey> = rows.iter().map(|r| r.new.op_ref).collect();
-    let rows = shared
+    let rows = match shared
         .store
-        .mark_forwarded_many(&keys, shared.clock.now())
+        .mark_fed(
+            BOOK,
+            &shared.config.replica,
+            epoch,
+            &keys,
+            shared.clock.now(),
+        )
         .await
-        .map_err(|e| e.to_string())?;
+    {
+        Ok(rows) => rows,
+        Err(e) if e.is_fenced() => {
+            let _ =
+                shared
+                    .feed_epoch
+                    .compare_exchange(epoch, 0, Ordering::SeqCst, Ordering::SeqCst);
+            return Err("the feed lease moved".into());
+        }
+        Err(e) => return Err(e.to_string()),
+    };
     for row in rows {
-        // A row that does not make an input stops the batch there: the rows before it go on.
+        // A row decided meanwhile has no sequence; it, or a row that does not make an input, stops
+        // the batch there: the rows before it go on.
+        let Some(seq) = row.feed_seq else { break };
         match input_of(&row) {
             Ok(input) => inputs.push(input),
             Err(e) if marked.is_empty() => return Err(e),
             Err(_) => break,
         }
+        seqs.push(seq);
         marked.push(row);
+    }
+    if marked.is_empty() {
+        return Ok(());
     }
     let mut from = 0;
     loop {
-        if !shared.leads() {
-            return Err("leadership lost".into());
+        if shared.feeds() != Some(epoch) {
+            return Err("the feed lease moved".into());
         }
-        let answers = shared.core.apply_batch(&inputs[from..]).await;
+        let feed = signed_feed(shared, epoch, &seqs[from..], &inputs[from..]).await?;
+        let reply = shared.core.feed(&feed).await;
+        match &reply {
+            FeedReply::Fenced { epoch: held } => {
+                tracing::warn!(epoch, held, "the core holds a newer feeder: this one stops");
+                let _ = shared.feed_epoch.compare_exchange(
+                    epoch,
+                    0,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+                return Err("fenced by the core".into());
+            }
+            FeedReply::Refused { reason } => {
+                tracing::error!(%reason, "ALERT core link: the core refused a feed (F-038)");
+            }
+            FeedReply::Gap { expected } => {
+                tracing::warn!(expected, "the core expects an earlier feed sequence");
+            }
+            _ => {}
+        }
+        let answers = reply.results(inputs.len() - from);
         let in_flight = answers
             .iter()
             .rposition(|a| *a == Err(CoreError::Ambiguous))
@@ -633,6 +775,34 @@ async fn forward<S: Store, C: Core>(
         }
         inputs.truncate(in_flight);
         marked.truncate(in_flight);
+        seqs.truncate(in_flight);
+    }
+}
+
+/// A feed of `inputs` at `seqs` under `epoch`, each signed by the replica's feed signer, off the
+/// runtime's threads (the signer's client blocks).
+async fn signed_feed<S: Store, C: Core>(
+    shared: &Shared<S, C>,
+    epoch: u64,
+    seqs: &[u64],
+    inputs: &[CoreInput],
+) -> Result<Feed, String> {
+    match shared.config.feed_signer.clone() {
+        None => {
+            let items: Vec<(u64, &CoreInput)> = seqs.iter().copied().zip(inputs).collect();
+            Feed::build(BOOK, epoch, &items, None)
+        }
+        Some(signer) => {
+            let owned: Vec<(u64, CoreInput)> =
+                seqs.iter().copied().zip(inputs.iter().cloned()).collect();
+            tokio::task::spawn_blocking(move || {
+                let items: Vec<(u64, &CoreInput)> = owned.iter().map(|(s, i)| (*s, i)).collect();
+                Feed::build(BOOK, epoch, &items, Some(&*signer.0))
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("the feed signer: {e}"))
+        }
     }
 }
 
@@ -966,6 +1136,10 @@ impl<S: Store, C: Core> Replica<S, C> {
             genesis_open: AtomicBool::new(!config.genesis_gate),
             config,
             replies,
+            feed_epoch: AtomicU64::new(0),
+            feed_live: AtomicBool::new(true),
+            draining: AtomicBool::new(false),
+            forwarding: AtomicBool::new(false),
         });
         let tasks = vec![
             tokio::spawn(stamper(Arc::clone(&shared), stamps)),
@@ -988,7 +1162,32 @@ impl<S: Store, C: Core> Replica<S, C> {
             t.abort();
         }
         self.shared.leading.store(false, Ordering::SeqCst);
+        self.shared.feed_epoch.store(0, Ordering::SeqCst);
     }
+
+    /// Drain it (`F-038` §9, `DEC-27` (e)): start no feed, let the one in flight finish (for at
+    /// most `within`), then release the feed lease and resign leadership, so another replica takes
+    /// them at its next renewal. The surface keeps answering: acknowledgements never pause.
+    pub async fn drain(&self, within: Duration) {
+        drain(&self.shared, within).await;
+    }
+}
+
+/// [`Replica::drain`], over what a replica's parts share.
+pub async fn drain<S: Store, C: Core>(shared: &Shared<S, C>, within: Duration) {
+    shared.draining.store(true, Ordering::SeqCst);
+    let until = tokio::time::Instant::now() + within;
+    while shared.forwarding.load(Ordering::SeqCst) && tokio::time::Instant::now() < until {
+        tokio::time::sleep(shared.config.poll).await;
+    }
+    shared.feed_epoch.store(0, Ordering::SeqCst);
+    let replica = &shared.config.replica;
+    if let Err(e) = shared.store.release_feed(BOOK, replica).await {
+        tracing::warn!(error = %e, "the feed lease was not released; it expires instead");
+    }
+    let _ = shared.store.resign(replica).await;
+    shared.leading.store(false, Ordering::SeqCst);
+    tracing::info!(replica = %replica, "drained: the feed and leadership are released");
 }
 
 impl<S: Store, C: Core> Drop for Replica<S, C> {

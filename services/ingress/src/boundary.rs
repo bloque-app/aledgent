@@ -512,6 +512,38 @@ pub trait Core: Send + Sync + 'static {
     fn genesis_open(&self) -> impl Future<Output = Result<bool, CoreError>> + Send {
         async { Ok(true) }
     }
+
+    /// Take a sequenced, signed feed (`F-038`, [`crate::feed`]). The default is a core no link
+    /// separates from ingress (the in-process core, a test's): its inputs applied as a batch,
+    /// sequences and signatures unread. A core across a link sends the feed (the socket's
+    /// [`crate::remote::RemoteCore`], the stream's [`crate::stream::StreamCore`]), and the core
+    /// host answers it through a [`crate::feed::Sequencer`].
+    fn feed(
+        &self,
+        feed: &crate::feed::Feed,
+    ) -> impl Future<Output = crate::feed::FeedReply> + Send {
+        async move {
+            match feed.inputs() {
+                Ok(inputs) => crate::feed::FeedReply::Answers {
+                    answers: self
+                        .apply_batch(&inputs)
+                        .await
+                        .into_iter()
+                        .map(crate::remote::BatchAnswer::of)
+                        .collect(),
+                },
+                Err(reason) => crate::feed::FeedReply::Refused { reason },
+            }
+        }
+    }
+
+    /// Whether this replica can reach a core that writes `partition` now (`F-038` §3): a replica
+    /// takes the feed lease and leadership only while it can. A core in process or behind the
+    /// socket always can; the stream's only while a core has a stream open to this replica.
+    fn can_feed(&self, partition: &str) -> bool {
+        let _ = partition;
+        true
+    }
 }
 
 #[cfg(test)]
