@@ -1,5 +1,14 @@
 {
   "components": {
+    "headers": {
+      "RetryAfter": {
+        "description": "On ERR-DecisionUnavailable (503): seconds to wait before retrying with the same client key (DEC-27 (g)).",
+        "schema": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      }
+    },
     "schemas": {
       "AccountKindBody": {
         "description": "The kind of a ledger account.",
@@ -5841,7 +5850,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "This replica's metrics, in the Prometheus text format."
@@ -5879,7 +5893,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "This document."
@@ -5948,7 +5967,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Open a ledger account: by its owner, by the identities principal for any identity, or under a delegated grant over the owner naming `open_account` (REQ-ID-6, amendment 0025)."
@@ -5997,7 +6021,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "An account's owner, kind, custody and status: for whoever reaches it, the operator, the identities principal, and a holder of a grant over its owner (amendment 0028)."
@@ -6070,7 +6099,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Whether a spend would pass the checks before the kernel, or why not."
@@ -6148,7 +6182,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Close a ledger account."
@@ -6197,7 +6236,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "An account's custody, its recoveries and successions, and its named successor (F-012)."
@@ -6275,7 +6319,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Owned to delegated custody, by the holder only (F-012)."
@@ -6353,7 +6402,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Delegated to owned custody, with a proven credential and the mechanisms acknowledged (F-012)."
@@ -6402,7 +6456,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Every grant over the account, live and revoked: the operator's, or the account owner's (REQ-RC-7)."
@@ -6451,7 +6510,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "The recovery mechanisms that apply to an account, and the digest reclaim_custody carries (F-012)."
@@ -6529,7 +6593,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "The named successor's claim: a pending succession, then, after its delay, the account (F-012)."
@@ -6607,7 +6676,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Name the account's successor, or clear the name (F-012)."
@@ -6671,7 +6745,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "The account an alias names, for a principal that reaches it; ERR-UnknownAccount otherwise, and ERR-IdentifierArchived for a prior system's identifier the initial state left out (REQ-RC-7)."
@@ -6712,7 +6791,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "The asset registry."
@@ -6760,7 +6844,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "security": [],
@@ -6809,7 +6898,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "security": [],
@@ -6886,7 +6980,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Balances by account or identity, each kind labelled, from one view."
@@ -6955,7 +7054,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Register a credential into the caller's own set, within its scope (F-012); or, by the identities principal acting for an identity it manages (`on-behalf-of`), into that identity's set (amendment 0025 R2)."
@@ -7033,7 +7137,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Remove a credential from the caller's own set, at once (F-012)."
@@ -7102,7 +7211,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Issue a disclosure: a signed assertion about the subject, anchored at a final checkpoint (F-017)."
@@ -7154,7 +7268,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Verify a disclosure against this deployment's final checkpoints and clerk key; no side effect (F-017)."
@@ -7223,7 +7342,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Grant bounded authority."
@@ -7301,7 +7425,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Revoke a grant and every grant derived from it."
@@ -7370,7 +7499,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Open an identity with its first credential: the identities principal's, the operator or the holder of the `open_identity` operator grant (REQ-ID-6, amendment 0025)."
@@ -7419,7 +7553,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "The grants over the identity, live and revoked, with their ids, ops, bounds and parent: every one for the identity itself, the operator and the identities principal; a holder's own for any other caller; ERR-NotAuthorised to a caller holding none (amendment 0026)."
@@ -7468,7 +7607,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "The recovery mechanisms a new owned-custody account would have, and the digest open_account carries (F-012)."
@@ -7537,7 +7681,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Issue value into an account."
@@ -7703,7 +7852,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "A page of movements, filtered, with a cursor. A limit is required."
@@ -7744,7 +7898,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Undelivered notifications with their age. The operator's."
@@ -7793,7 +7952,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "An operation's state, with its class."
@@ -7871,7 +8035,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Operator: name the account by an alias, (source, name), as a seed's aliases do; a system account's role is one. An alias names one account for good. The operator's policy authority alone (REQ-RC-7)."
@@ -7949,7 +8118,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Operator: freeze an account (F-013)."
@@ -8027,7 +8201,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Operator: initiate the recovery of an owned-custody account on the holder's out-of-band request (F-012)."
@@ -8105,7 +8284,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Operator: unfreeze an account (F-013)."
@@ -8174,7 +8358,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Operator: declare what the settlement adapter supports (F-013)."
@@ -8212,7 +8401,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Operator: every checkpoint, the recorded settlement comparisons, and anchoring's incidents (F-017)."
@@ -8279,7 +8473,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Operator: create a checkpoint now, or answer the latest when nothing is new (F-017)."
@@ -8348,7 +8547,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Operator: register an asset, book-only, with its one precision (F-013, REQ-AS-7)."
@@ -8426,7 +8630,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Issuance authority: bind a book-only asset to its settlement-layer location, at zero divergence; the layer checks that its holding equals the book's outstanding balance (amendment 0011, REQ-AS-8, DEC-20)."
@@ -8504,7 +8713,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Operator: deprecate an asset (F-013)."
@@ -8582,7 +8796,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Operator: import credentials' public material into an identity's set; refused while an account of the identity is owned (REQ-MG-7, REQ-MG-8, F-028)."
@@ -8620,7 +8839,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Operator: every registered integrating party and the principals tied to it (REQ-ID-7)."
@@ -8687,7 +8911,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Operator: register an integrating party, identified by its organisation identity, with the principals tied to it. The operator's policy authority alone; no grant gives it (REQ-ID-7)."
@@ -8765,7 +8994,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Operator: tie a principal to a registered party; from then on its client keys are the party's (REQ-ID-7, REQ-OP-10). A principal is tied to at most one party, for good."
@@ -8834,7 +9068,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Operator: grant issuance authority (F-013)."
@@ -8912,7 +9151,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Operator: revoke issuance authority (F-013)."
@@ -8990,7 +9234,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Operator: name the block and transaction that prove a Needs-Review operation's outcome, for the settlement adapter to fetch and verify (REQ-RC-5)."
@@ -9068,7 +9317,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Operator: resolve a Needs-Review operation on cited evidence (F-013)."
@@ -9146,7 +9400,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Operator: resume an open operation past its deadline (F-007, F-013)."
@@ -9224,7 +9483,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Operator: propose a reversal (F-013)."
@@ -9293,7 +9557,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Operator: grant operator capabilities (F-013)."
@@ -9371,7 +9640,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Operator: revoke operator capabilities (F-013)."
@@ -9449,7 +9723,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Operator: complete a pending recovery with the recovery authority's approval, after its delay (F-012)."
@@ -9527,7 +9806,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Operator: approve a reversal another principal proposed (F-013)."
@@ -9596,7 +9880,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Operator: the settlement configuration, naming the adapter's identity; set once (F-010)."
@@ -9665,7 +9954,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Operator: compare the book with the settlement layer's positions at the latest cut (F-017)."
@@ -9703,7 +9997,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "The operational signals: counts and ages, never a ledger fact. The operator's, with the read_signals kind."
@@ -9741,7 +10040,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "The caller's answering setting: whether its transfers and reservations are answered with their decision, and the wait (REQ-CS-9)."
@@ -9787,7 +10091,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Set the caller's answering setting: its transfers and reservations taken in from now on are acknowledged at Received (the default) or answered with their decision, waiting at most wait_ms (REQ-CS-9). Answered with its result."
@@ -9865,7 +10174,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Cancel a pending recovery or succession, with a credential of the holder (F-012)."
@@ -9934,7 +10248,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Redeem value out of an account."
@@ -10013,7 +10332,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Reserve against an account. Acknowledged at Received; the decision (Reserved or Rejected) follows by query and notification."
@@ -10091,7 +10415,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Capture a reservation, matched by identity."
@@ -10169,7 +10498,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Release a reservation."
@@ -10238,7 +10572,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Settlement adapter: an instruction is durable in its store (F-016). The adapter's principal only."
@@ -10276,7 +10615,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Settlement adapter: the checkpoint in flight and whether a comparison is due (F-017). The adapter's principal only."
@@ -10345,7 +10689,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Settlement adapter: an anchor instruction is durable in its store (F-017). The adapter's principal only."
@@ -10414,7 +10763,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Settlement adapter: its anchor extrinsic provably did not execute; the anchor is emitted again (F-017)."
@@ -10483,7 +10837,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Settlement adapter: what the settlement layer's metadata states about an asset location it binds, at a finalised height (DEC-20). Registration reads it; a difference from the registry holds the asset. The adapter's principal only."
@@ -10524,7 +10883,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Settlement executor: the call outbox, every external movement and anchor as an envelope — reference, target, call, expiry — not yet taken over (F-027). The adapter's principal only."
@@ -10593,7 +10957,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Settlement adapter: a canonical check of a coordinate already observed (F-016)."
@@ -10662,7 +11031,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Settlement adapter: its status and what it supports (F-016). The adapter's principal only."
@@ -10703,7 +11077,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Settlement adapter: the evidence authorities submitted for operations in Needs-Review, not yet checked, each a block and a transaction to fetch and verify on its own (REQ-RC-5). The adapter's principal only."
@@ -10772,7 +11151,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Settlement adapter: it fetched and verified submitted evidence and reported the records it found; the core resolves the operation on what they prove, or finds the evidence unprovable (REQ-RC-5)."
@@ -10841,7 +11225,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Settlement adapter: a range it was forced to skip, visible to operators (F-016)."
@@ -10910,7 +11299,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Settlement adapter: the finalised head of an observation cycle (F-016)."
@@ -10951,7 +11345,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Settlement adapter: the instructions it has not acknowledged (F-016). The adapter's principal only."
@@ -11020,7 +11419,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Settlement adapter: a record of the settlement layer, at its coordinate (F-016)."
@@ -11089,7 +11493,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Settlement adapter: the settlement layer's positions at a finalized block, compared at once (F-017)."
@@ -11158,7 +11567,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Settlement adapter: a re-scan of a range; every difference is an incident (F-016)."
@@ -11227,7 +11641,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Settlement adapter: the one transaction it signed for an instruction, before it submits it, or that it never will sign one (F-016, owner ruling 2026-09-24)."
@@ -11327,7 +11746,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "A statement for a period. The period is required."
@@ -11406,7 +11830,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Transfer between ledger accounts, one leg or many. Acknowledged at Received."
@@ -11470,7 +11899,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "The trial balance, on commitments and on openings. The operator's."
@@ -11549,7 +11983,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Withdraw through the settlement layer. Acknowledged at Received; the decision follows by query and notification."
@@ -11627,7 +12066,12 @@
                 }
               }
             },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
           }
         },
         "summary": "Hand a reserved withdrawal to the settlement adapter, to a destination (F-010, F-016)."

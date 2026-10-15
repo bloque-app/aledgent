@@ -102,7 +102,7 @@ const LEADER_LOCK: i64 = 0x616c_6564_6765_6e74;
 const COLUMNS: &str = "seq, op_ref, input_kind, principal, credential, on_behalf_of, surface, \
      client_key, key_derived, body_digest, body, reserves, synchronous, received_at, status, \
      forwarded_at, core_input_seq, core_reply, decided_at, client_key_domain, pass_through, \
-     arrived_at, replied_at, completed_at, submitted_at";
+     arrived_at, replied_at, completed_at, submitted_at, feed_seq";
 
 /// How the store connects.
 #[derive(Clone)]
@@ -218,6 +218,7 @@ fn row_of(r: &PgRow) -> Result<Row, StoreError> {
         replied_at: opt("replied_at")?,
         completed_at: opt("completed_at")?,
         submitted_at: opt("submitted_at")?,
+        feed_seq: opt("feed_seq")?,
     })
 }
 
@@ -624,36 +625,43 @@ impl Store for PgStore {
     }
 
     async fn next_undecided(&self) -> Result<Option<Row>, StoreError> {
-        let c = self.client().await?;
-        c.query_opt(
-            &format!(
-                "SELECT {COLUMNS} FROM received_log WHERE status <> 'Decided' \
-                 ORDER BY reserves DESC, seq LIMIT 1"
-            ),
-            &[],
-        )
-        .await
-        .map_err(err)?
-        .as_ref()
-        .map(row_of)
-        .transpose()
+        Ok(self.next_undecided_batch(1).await?.into_iter().next())
     }
 
     async fn next_undecided_batch(&self, n: usize) -> Result<Vec<Row>, StoreError> {
         let c = self.client().await?;
         let limit = i64::try_from(n).unwrap_or(i64::MAX);
-        c.query(
-            &format!(
-                "SELECT {COLUMNS} FROM received_log WHERE status <> 'Decided' \
-                 ORDER BY reserves DESC, seq LIMIT $1"
-            ),
-            &[&limit],
-        )
-        .await
-        .map_err(err)?
-        .iter()
-        .map(row_of)
-        .collect()
+        // F-038: rows in flight first, by their feed sequence; both reads use the undecided index.
+        let mut rows = c
+            .query(
+                &format!(
+                    "SELECT {COLUMNS} FROM received_log WHERE status <> 'Decided' \
+                     AND feed_seq IS NOT NULL ORDER BY feed_seq LIMIT $1"
+                ),
+                &[&limit],
+            )
+            .await
+            .map_err(err)?
+            .iter()
+            .map(row_of)
+            .collect::<Result<Vec<_>, _>>()?;
+        let left = limit - i64::try_from(rows.len()).unwrap_or(limit);
+        if left > 0 {
+            let fresh = c
+                .query(
+                    &format!(
+                        "SELECT {COLUMNS} FROM received_log WHERE status <> 'Decided' \
+                         AND feed_seq IS NULL ORDER BY reserves DESC, seq LIMIT $1"
+                    ),
+                    &[&left],
+                )
+                .await
+                .map_err(err)?;
+            for r in &fresh {
+                rows.push(row_of(r)?);
+            }
+        }
+        Ok(rows)
     }
 
     async fn mark_forwarded(&self, op_ref: InputKey, at: Time) -> Result<Row, StoreError> {
@@ -1087,6 +1095,298 @@ impl Store for PgStore {
                 .execute("SELECT pg_advisory_unlock($1)", &[&LEADER_LOCK])
                 .await;
         }
+        Ok(())
+    }
+
+    async fn try_feed(
+        &self,
+        partition: &str,
+        holder: &str,
+        lease: std::time::Duration,
+    ) -> Result<Option<u64>, StoreError> {
+        let c = self.client().await?;
+        let ms = i64::try_from(lease.as_millis()).unwrap_or(i64::MAX);
+        // The database's clock, so the instances' clocks never decide who holds it. A renewal by
+        // the live holder keeps the epoch; a change of holder, or a lapse, raises it.
+        let row = c
+            .query_opt(
+                "INSERT INTO feed_lease AS l (partition, holder, epoch, expires_at, next_seq) \
+                 VALUES ($1, $2, 1, clock_timestamp() + $3::bigint * interval '1 millisecond', 1) \
+                 ON CONFLICT (partition) DO UPDATE SET \
+                   epoch = CASE WHEN l.holder = EXCLUDED.holder \
+                                 AND l.expires_at > clock_timestamp() \
+                            THEN l.epoch ELSE l.epoch + 1 END, \
+                   holder = EXCLUDED.holder, \
+                   expires_at = EXCLUDED.expires_at \
+                 WHERE l.holder = EXCLUDED.holder OR l.expires_at <= clock_timestamp() \
+                 RETURNING epoch",
+                &[&partition, &holder, &ms],
+            )
+            .await
+            .map_err(err)?;
+        row.map(|r| u64_of(r.get(0))).transpose()
+    }
+
+    async fn release_feed(&self, partition: &str, holder: &str) -> Result<(), StoreError> {
+        let c = self.client().await?;
+        c.execute(
+            "UPDATE feed_lease SET expires_at = clock_timestamp() - interval '1 millisecond' \
+             WHERE partition = $1 AND holder = $2",
+            &[&partition, &holder],
+        )
+        .await
+        .map_err(err)?;
+        Ok(())
+    }
+
+    async fn feed_live(&self, partition: &str) -> Result<bool, StoreError> {
+        let c = self.client().await?;
+        Ok(c.query_one(
+            "SELECT EXISTS (SELECT 1 FROM feed_lease WHERE partition = $1 \
+             AND expires_at > clock_timestamp())",
+            &[&partition],
+        )
+        .await
+        .map_err(err)?
+        .get(0))
+    }
+
+    async fn mark_fed(
+        &self,
+        partition: &str,
+        holder: &str,
+        epoch: u64,
+        op_refs: &[InputKey],
+        at: Time,
+    ) -> Result<Vec<Row>, StoreError> {
+        if op_refs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut c = self.client().await?;
+        let tx = c.transaction().await.map_err(err)?;
+        // The lease row, locked: every assignment of the partition's sequences queues here, so
+        // they are gapless and unique without an index on the log.
+        let lease = tx
+            .query_opt(
+                "SELECT next_seq FROM feed_lease WHERE partition = $1 AND holder = $2 \
+                 AND epoch = $3 AND expires_at > clock_timestamp() FOR UPDATE",
+                &[&partition, &holder, &i64_of(epoch)?],
+            )
+            .await
+            .map_err(err)?;
+        let Some(lease) = lease else {
+            return Err(StoreError::fenced());
+        };
+        let mut next: i64 = lease.get(0);
+        let keys: Vec<&[u8]> = op_refs.iter().map(|r| r.0.as_slice()).collect();
+        let current = tx
+            .query(
+                "SELECT op_ref, feed_seq, status FROM received_log WHERE op_ref = ANY($1) \
+                 FOR UPDATE",
+                &[&keys],
+            )
+            .await
+            .map_err(err)?;
+        let mut state = std::collections::HashMap::with_capacity(current.len());
+        for r in &current {
+            let op: Vec<u8> = r.get(0);
+            let seq: Option<i64> = r.get(1);
+            let status: String = r.get(2);
+            state.insert(op, (seq, status));
+        }
+        let mut assign: Vec<&[u8]> = Vec::new();
+        let mut seqs: Vec<i64> = Vec::new();
+        for k in &keys {
+            if let Some((None, status)) = state.get(*k)
+                && status != "Decided"
+            {
+                assign.push(k);
+                seqs.push(next);
+                next += 1;
+            }
+        }
+        if !assign.is_empty() {
+            tx.execute(
+                "UPDATE received_log r SET feed_seq = v.s, feed_epoch = $3 \
+                 FROM unnest($1::bytea[], $2::bigint[]) AS v(op, s) WHERE r.op_ref = v.op",
+                &[&assign, &seqs, &i64_of(epoch)?],
+            )
+            .await
+            .map_err(err)?;
+            tx.execute(
+                "UPDATE feed_lease SET next_seq = $2 WHERE partition = $1",
+                &[&partition, &next],
+            )
+            .await
+            .map_err(err)?;
+        }
+        tx.execute(
+            "UPDATE received_log SET status = 'Forwarded', forwarded_at = $2 \
+             WHERE op_ref = ANY($1) AND status = 'Received'",
+            &[&keys, &i64_of(at)?],
+        )
+        .await
+        .map_err(err)?;
+        let rows = tx
+            .query(
+                &format!("SELECT {COLUMNS} FROM received_log WHERE op_ref = ANY($1)"),
+                &[&keys],
+            )
+            .await
+            .map_err(err)?;
+        tx.commit().await.map_err(err)?;
+        let mut by_key = std::collections::HashMap::with_capacity(rows.len());
+        for r in &rows {
+            let row = row_of(r)?;
+            by_key.insert(row.new.op_ref, row);
+        }
+        op_refs
+            .iter()
+            .map(|k| {
+                by_key
+                    .remove(k)
+                    .ok_or_else(|| StoreError("a forwarded row vanished".into()))
+            })
+            .collect()
+    }
+
+    async fn unfeed(
+        &self,
+        partition: &str,
+        holder: &str,
+        epoch: u64,
+        from: u64,
+    ) -> Result<(), StoreError> {
+        let mut c = self.client().await?;
+        let tx = c.transaction().await.map_err(err)?;
+        let held = tx
+            .query_opt(
+                "SELECT next_seq FROM feed_lease WHERE partition = $1 AND holder = $2 \
+                 AND epoch = $3 AND expires_at > clock_timestamp() FOR UPDATE",
+                &[&partition, &holder, &i64_of(epoch)?],
+            )
+            .await
+            .map_err(err)?;
+        if held.is_none() {
+            return Err(StoreError::fenced());
+        }
+        let from = i64_of(from)?;
+        // The tail is undecided by contract (the caller gives back only what certainly did not
+        // run), so it is found through the undecided index, never by a scan of the log.
+        tx.execute(
+            "UPDATE received_log SET feed_seq = NULL, feed_epoch = NULL \
+             WHERE status <> 'Decided' AND feed_seq >= $1",
+            &[&from],
+        )
+        .await
+        .map_err(err)?;
+        tx.execute(
+            "UPDATE feed_lease SET next_seq = LEAST(next_seq, $2) WHERE partition = $1",
+            &[&partition, &from],
+        )
+        .await
+        .map_err(err)?;
+        tx.commit().await.map_err(err)
+    }
+
+    async fn copy_verifier(
+        &self,
+        credential: &str,
+        found: Option<&crate::boundary::CredentialBody>,
+        at: Time,
+    ) -> Result<(), StoreError> {
+        let c = self.client().await?;
+        match found {
+            Some(f) => c
+                .execute(
+                    "INSERT INTO verifier_copy (credential, identity, kind, scheme, verifier, \
+                     read_at) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (credential) DO UPDATE \
+                     SET identity = EXCLUDED.identity, kind = EXCLUDED.kind, \
+                     scheme = EXCLUDED.scheme, verifier = EXCLUDED.verifier, \
+                     read_at = EXCLUDED.read_at",
+                    &[
+                        &credential,
+                        &f.identity,
+                        &f.kind,
+                        &f.scheme,
+                        &f.verifier,
+                        &i64_of(at)?,
+                    ],
+                )
+                .await
+                .map_err(err)?,
+            None => c
+                .execute(
+                    "DELETE FROM verifier_copy WHERE credential = $1",
+                    &[&credential],
+                )
+                .await
+                .map_err(err)?,
+        };
+        Ok(())
+    }
+
+    async fn copied_verifier(
+        &self,
+        credential: &str,
+    ) -> Result<Option<crate::boundary::CredentialBody>, StoreError> {
+        let c = self.client().await?;
+        Ok(c.query_opt(
+            "SELECT identity, kind, scheme, verifier FROM verifier_copy WHERE credential = $1",
+            &[&credential],
+        )
+        .await
+        .map_err(err)?
+        .map(|r| crate::boundary::CredentialBody {
+            identity: r.get(0),
+            kind: r.get(1),
+            scheme: r.get(2),
+            verifier: r.get(3),
+        }))
+    }
+
+    async fn advertise(
+        &self,
+        instance: &str,
+        address: &str,
+        ttl: std::time::Duration,
+    ) -> Result<Vec<crate::stream::RosterEntry>, StoreError> {
+        let c = self.client().await?;
+        let ms = i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX);
+        // The database's clock, as the feed lease's: the instances' clocks never decide who is
+        // live.
+        c.execute(
+            "INSERT INTO ingress_roster (instance, address, expires_at) \
+             VALUES ($1, $2, clock_timestamp() + $3::bigint * interval '1 millisecond') \
+             ON CONFLICT (instance) DO UPDATE SET \
+               address = EXCLUDED.address, expires_at = EXCLUDED.expires_at",
+            &[&instance, &address, &ms],
+        )
+        .await
+        .map_err(err)?;
+        Ok(c.query(
+            "SELECT instance, address FROM ingress_roster \
+             WHERE expires_at > clock_timestamp() ORDER BY instance",
+            &[],
+        )
+        .await
+        .map_err(err)?
+        .into_iter()
+        .map(|r| crate::stream::RosterEntry {
+            instance: r.get(0),
+            address: r.get(1),
+        })
+        .collect())
+    }
+
+    async fn withdraw(&self, instance: &str) -> Result<(), StoreError> {
+        let c = self.client().await?;
+        c.execute(
+            "DELETE FROM ingress_roster WHERE instance = $1",
+            &[&instance],
+        )
+        .await
+        .map_err(err)?;
         Ok(())
     }
 }

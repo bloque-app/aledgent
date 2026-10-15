@@ -697,12 +697,25 @@ async fn req_cs_4_every_refusal_matches_its_openapi_description() {
         let status = resp.status();
         // Every refusal is a 4xx but the two of amendment 0006 item 8, which are the server's:
         // `ERR-DecisionUnavailable` (503, retry with the same client key) and `ERR-Internal`.
+        // `DEC-27` (g), `T-038-23`: the 503 says when to retry; nothing else does.
+        let retry = resp.headers().get(axum::http::header::RETRY_AFTER).cloned();
         match r {
             Refusal::DecisionUnavailable => {
-                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE)
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(
+                    retry.as_ref().and_then(|v| v.to_str().ok()),
+                    Some(
+                        ingress::surface::DECISION_RETRY_AFTER_SECS
+                            .to_string()
+                            .as_str()
+                    )
+                );
             }
             Refusal::Internal => assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR),
             _ => assert!(status.is_client_error(), "{}: a refusal is a 4xx", r.code()),
+        }
+        if r != Refusal::DecisionUnavailable {
+            assert!(retry.is_none(), "{}: no Retry-After", r.code());
         }
         assert_eq!(
             u64::from(status.as_u16()),
@@ -733,6 +746,12 @@ async fn req_cs_4_every_refusal_matches_its_openapi_description() {
                 route.path
             );
         }
+        assert_eq!(
+            op["responses"]["5XX"]["headers"]["Retry-After"]["$ref"],
+            "#/components/headers/RetryAfter",
+            "{}: the 503 declares Retry-After",
+            route.path
+        );
         if let Handler::Command(_) = route.handler {
             assert!(op["requestBody"].is_object(), "{}", route.path);
         }

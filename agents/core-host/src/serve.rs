@@ -47,6 +47,19 @@
 //! **The core link** (`F-035`): ingress authenticates to this process with a token whose SHA-256
 //! the deployment file's `core_link` lists, and the peer's user id (`ingress::remote`). Without
 //! `core_link`, `serve` does not start.
+//!
+//! **The core stream** (`F-038`, `DEC-27`): with `stream.dial`, this process also dials out to
+//! ingress's core listener (every address listed, mutual TLS under the operator's CA, or a Unix
+//! socket on the same host with the token in `ALEDGENT_CORE_STREAM_TOKEN`) and answers ingress's
+//! calls down that stream; it listens on no network port. Either link, or both at once during
+//! the transition, reaches the core through one `ingress::feed::Sequencer`: ingress's signature on
+//! every forwarded input is checked against `stream.ingress_keys` (required in production with
+//! `stream.dial`; with them, no unsigned or unsequenced input is taken, from the host's start;
+//! without them and without `stream.dial`, the socket takes a legacy ingress's unsequenced
+//! inputs as before, `F-038` §12 step 0) before the Agent sees
+//! it, a stale feeder's epoch is fenced, duplicates are answered from the reply log, and early arrivals
+//! wait for the gap. The Agent and the host's calls into it are unchanged (`DEC-26(d)`,
+//! `DEC-27` (i)). `core_endpoint` is optional when `stream.dial` is set.
 
 use std::fs::{self, File};
 use std::io::Write as _;
@@ -466,17 +479,49 @@ pub fn serve(args: &[String]) -> Result<(), String> {
         actor,
     } = setup(args)?;
     let path = need(args, "--config")?;
-    let endpoint = c
-        .core_endpoint
-        .as_deref()
-        .and_then(Endpoint::parse)
-        .ok_or_else(|| format!("{path}: core_endpoint (unix:<path> or tcp:<addr>) is required"))?;
+    // F-038: the socket (`core_endpoint`), the stream (`stream.dial`), or both at once during the
+    // transition; at least one.
+    let stream = c.stream.as_ref();
+    if let Some(s) = stream {
+        s.check(c.profile).map_err(|e| format!("{path}: {e}"))?;
+    }
+    let dial = stream
+        .map(|s| s.dial_config(|| std::env::var(ingress::config::ENV_CORE_STREAM_TOKEN).ok()))
+        .transpose()
+        .map_err(|e| format!("{path}: {e}"))?
+        .flatten();
+    let endpoint = match c.core_endpoint.as_deref() {
+        Some(e) => Some(Endpoint::parse(e).ok_or_else(|| {
+            format!("{path}: core_endpoint (unix:<path> or tcp:<addr>) is malformed")
+        })?),
+        None if dial.is_some() => None,
+        None => {
+            return Err(format!(
+                "{path}: core_endpoint (unix:<path> or tcp:<addr>) or stream.dial is required"
+            ));
+        }
+    };
     // F-035: the core link is authenticated; no core_link, no start.
-    let link = c
-        .core_link
-        .as_ref()
-        .ok_or_else(|| format!("{path}: core_link is required (F-035)"))?
-        .auth()?;
+    let link = match &endpoint {
+        Some(_) => Some(
+            c.core_link
+                .as_ref()
+                .ok_or_else(|| format!("{path}: core_link is required (F-035)"))?
+                .auth()?,
+        ),
+        None => None,
+    };
+    // F-038 §5: the keys ingress's feeds are checked against, on every link; required in
+    // production once the host dials the new link. With them the host takes no unsigned or
+    // unsequenced input from its start. Without them (and without `stream.dial`) it serves the
+    // legacy socket link, as a host of an earlier release does (F-038 §12 step 0).
+    let feed_keys = c.core_feed_keys().map_err(|e| format!("{path}: {e}"))?;
+    if feed_keys.is_none() {
+        eprintln!(
+            "aledgent-core-host: no stream.ingress_keys: the legacy socket link, unsequenced \
+             inputs taken as before F-038 (§12 step 0); feeds on the socket are taken unsigned"
+        );
+    }
     if dir.join(core_archive::RESTORE_FILE).exists() {
         return Err(format!(
             "{}: a restore is laid out and not finished: run `aledgent-core-host restore` first",
@@ -581,13 +626,35 @@ pub fn serve(args: &[String]) -> Result<(), String> {
     core.set_batch_limits(
         BatchLimits::with_inputs(batch).with_actor_gas(crate::driver::actor_gas()),
     );
-    eprintln!("aledgent-core-host: serving on {endpoint:?}");
+    // F-038 §4: one sequencer in front of the core, for every link: signatures checked, stale
+    // feeders fenced, the order kept. The Agent's calls are unchanged (`DEC-26(d)`).
+    let core = Arc::new(ingress::feed::Sequencer::new(core, feed_keys));
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
-    rt.block_on(ingress::remote::serve(endpoint, Arc::new(core), link))
-        .map_err(|e| e.to_string())
+    rt.block_on(async move {
+        if let Some(d) = dial {
+            eprintln!(
+                "aledgent-core-host: dialing ingress at {:?} (F-038)",
+                d.targets
+            );
+            let core = Arc::clone(&core);
+            let dialer = tokio::spawn(ingress::stream::dial(d, core));
+            if endpoint.is_none() {
+                return dialer.await.map_err(|e| e.to_string());
+            }
+        }
+        match (endpoint, link) {
+            (Some(endpoint), Some(link)) => {
+                eprintln!("aledgent-core-host: serving on {endpoint:?}");
+                ingress::remote::serve(endpoint, core, link)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            _ => Err("no link to serve".into()),
+        }
+    })
 }
 
 /// The core over `log`: shipping its audit trail to the audit store when one is configured

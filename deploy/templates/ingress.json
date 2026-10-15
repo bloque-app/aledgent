@@ -77,6 +77,17 @@
     "token_sha256": ["<FILL the SHA-256 of ALEDGENT_CORE_LINK_TOKEN, hex>"],
     "peer_uids": ["<FILL-NUMBER the user id ingress's container runs as>"]
   },
+  "stream": {
+    "feed_key": {
+      "signer": {
+        "socket": "/run/aledgent-signer/signer.sock",
+        "client": "ingress",
+        "token_file": "/etc/aledgent/ingress-signer.token"
+      },
+      "key": "ingress-feed"
+    },
+    "ingress_keys": ["<FILL the public half of the signer's ingress-feed key, hex>"]
+  },
   "core_keys": {
     "signer": {
       "socket": "/run/aledgent-signer/signer.sock",

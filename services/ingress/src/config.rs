@@ -400,6 +400,332 @@ pub struct DeploymentConfig {
     /// Absent: apply at start, 5 s.
     #[serde(default, skip_serializing_if = "MigrationsConfig::is_default")]
     pub migrations: MigrationsConfig,
+    /// The core stream (`F-038`, `DEC-27`): ingress's listener the core hosts dial
+    /// (`stream.listen`), and what the core host dials (`stream.dial`). Absent: the socket link
+    /// alone, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<StreamSection>,
+    /// Where ingress serves `GET /ready` and `GET /live` (`F-038` §10, [`crate::readiness`]),
+    /// `host:port`, apart from the client surface. Absent: not served.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness_listen: Option<String>,
+}
+
+/// The variable holding the core host's token for a stream over a Unix socket (`F-038`): its
+/// SHA-256 is what `stream.link.token_sha256` lists on ingress's side.
+pub const ENV_CORE_STREAM_TOKEN: &str = "ALEDGENT_CORE_STREAM_TOKEN";
+
+/// The feed key behind the signer service (`F-038` §5).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FeedKeyConfig {
+    /// Where the signer is, and ingress's token file.
+    pub signer: signer::client::SignerEndpoint,
+    /// The Ed25519 key's identifier.
+    pub key: String,
+}
+
+/// What the core host dials (`F-038` §11).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DialSection {
+    /// Every address: `tls:<host:port>` or `unix:<path>`. One stream each.
+    pub connect: Vec<String>,
+    /// The name ingress's certificate carries, for `tls:` addresses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_name: Option<String>,
+    /// The core's name in ingress's logs. Absent: `core`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub core: Option<String>,
+    /// The partitions it writes. Absent: the book ([`crate::feed::BOOK`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partitions: Option<Vec<String>>,
+    /// The user ids ingress may run as, for `unix:` addresses: the core host checks the socket's
+    /// peer credentials against them before it sends its token. Required with a `unix:` address.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peer_uids: Vec<u32>,
+}
+
+/// The core stream's section (`F-038` §11).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamSection {
+    /// Ingress's listener for cores: `tls:<host:port>` (with `tls`) or `unix:<path>` (with
+    /// `link`). With it, ingress serves the stream instead of dialing `core_endpoint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<String>,
+    /// This side's TLS files, for a `tls:` listener or `tls:` dial addresses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<crate::stream::tls::TlsFiles>,
+    /// Who a `unix:` listener lets in: the SHA-256 of the core host's token and its user ids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<CoreLink>,
+    /// Ingress's feed key behind the signer service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feed_key: Option<FeedKeyConfig>,
+    /// A file holding the feed key's seed, hex: the development profile only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub development_feed_key: Option<String>,
+    /// What the core host dials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dial: Option<DialSection>,
+    /// The feed keys' public halves the core host accepts, hex (two while one rotates). Required
+    /// with `dial`, and for the core host in production on every link
+    /// ([`DeploymentConfig::core_feed_keys`]); with them, the host takes no unsigned input.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ingress_keys: Vec<String>,
+    /// How often each side pings, milliseconds. Absent: 1 000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keepalive_ms: Option<u64>,
+    /// How long a side waits on silence before it drops the stream, milliseconds. Absent: 3 000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dead_after_ms: Option<u64>,
+    /// How long a draining ingress keeps answering clients after its go-away, milliseconds.
+    /// Absent: 5 000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_ms: Option<u64>,
+    /// The address this instance's region's cores reach it at, advertised in the fleet's roster
+    /// (`T-038-21`): `tls:<host:port>` or `unix:<path>`. Absent: detected from `listen`
+    /// ([`StreamSection::advertised_address`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advertise: Option<String>,
+    /// How often an instance renews its roster entry, and a core host reads the roster again,
+    /// milliseconds. Absent: 2 000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roster_ms: Option<u64>,
+}
+
+/// The address of the interface this host routes from: a UDP socket "connected" to a
+/// documentation address (RFC 5737, RFC 3849), which sends nothing, and its local address read
+/// back.
+fn routed_ip(v6: bool) -> Option<std::net::IpAddr> {
+    let (bind, probe) = if v6 {
+        ("[::]:0", "[2001:db8::1]:9")
+    } else {
+        ("0.0.0.0:0", "192.0.2.1:9")
+    };
+    let s = std::net::UdpSocket::bind(bind).ok()?;
+    s.connect(probe).ok()?;
+    let ip = s.local_addr().ok()?.ip();
+    (!ip.is_unspecified()).then_some(ip)
+}
+
+/// How long a draining ingress keeps answering, by default.
+pub const DEFAULT_DRAIN: Duration = Duration::from_secs(5);
+
+impl StreamSection {
+    /// Check the section for `profile` (`T-038-14`): every file a transport needs, a feed key for
+    /// a production listener, a development key only in development, the keys a dialer checks.
+    pub fn check(&self, profile: Profile) -> Result<(), String> {
+        if let Some(l) = &self.listen {
+            match crate::stream::Address::parse(l)? {
+                crate::stream::Address::Tls(_) if self.tls.is_none() => {
+                    return Err("stream.listen is tls: and stream.tls is missing".into());
+                }
+                crate::stream::Address::Unix(_) if self.link.is_none() => {
+                    return Err("stream.listen is unix: and stream.link is missing".into());
+                }
+                _ => {}
+            }
+            if profile == Profile::Production && self.feed_key.is_none() {
+                return Err(
+                    "stream.listen in production needs stream.feed_key: every forwarded command \
+                     is signed (F-038)"
+                        .into(),
+                );
+            }
+        }
+        if let Some(a) = &self.advertise {
+            crate::stream::Address::parse(a).map_err(|e| format!("stream.advertise: {e}"))?;
+        }
+        if self.development_feed_key.is_some() && profile != Profile::Development {
+            return Err(
+                "stream.development_feed_key outside the development profile: production keys \
+                 live in the signer (guardrail 13)"
+                    .into(),
+            );
+        }
+        if self.feed_key.is_some() && self.development_feed_key.is_some() {
+            return Err("stream.feed_key and stream.development_feed_key: one of them".into());
+        }
+        if let Some(d) = &self.dial {
+            if d.connect.is_empty() {
+                return Err("stream.dial.connect is empty".into());
+            }
+            for a in &d.connect {
+                match crate::stream::Address::parse(a)? {
+                    crate::stream::Address::Tls(_) => {
+                        if self.tls.is_none() {
+                            return Err(format!("stream.dial: {a} needs stream.tls"));
+                        }
+                        if d.server_name.is_none() {
+                            return Err(format!("stream.dial: {a} needs stream.dial.server_name"));
+                        }
+                    }
+                    crate::stream::Address::Unix(_) if d.peer_uids.is_empty() => {
+                        return Err(format!(
+                            "stream.dial: {a} needs stream.dial.peer_uids: the core host sends \
+                             its token only to ingress's user id"
+                        ));
+                    }
+                    crate::stream::Address::Unix(_) => {}
+                }
+            }
+            crate::feed::FeedKeys::parse(&self.ingress_keys)?;
+        }
+        Ok(())
+    }
+
+    /// The stream's timings.
+    pub fn timings(&self) -> crate::stream::Timings {
+        let d = crate::stream::Timings::default();
+        crate::stream::Timings {
+            keepalive: self.keepalive_ms.map_or(d.keepalive, Duration::from_millis),
+            dead_after: self
+                .dead_after_ms
+                .map_or(d.dead_after, Duration::from_millis),
+            roster: self.roster_ms.map_or(d.roster, Duration::from_millis),
+            ..d
+        }
+    }
+
+    /// The address this instance advertises in the fleet's roster (`T-038-21`): `advertise` as
+    /// configured; or `listen` itself when it names a Unix socket or a specific host; or, for a
+    /// listener on every interface (`0.0.0.0`, `[::]`), the address of the interface this host
+    /// routes from (a task's or pod's own address on ECS or Kubernetes), with `listen`'s port.
+    pub fn advertised_address(&self) -> Result<String, String> {
+        if let Some(a) = &self.advertise {
+            crate::stream::Address::parse(a)?;
+            return Ok(a.clone());
+        }
+        let listen = self.listen.as_deref().ok_or("stream.listen is missing")?;
+        let crate::stream::Address::Tls(addr) = crate::stream::Address::parse(listen)? else {
+            return Ok(listen.to_owned());
+        };
+        let bound: std::net::SocketAddr = match addr.parse() {
+            Ok(a) => a,
+            // A host name: the cores resolve it as this instance does.
+            Err(_) => return Ok(listen.to_owned()),
+        };
+        if !bound.ip().is_unspecified() {
+            return Ok(listen.to_owned());
+        }
+        let ip = routed_ip(bound.is_ipv6()).ok_or(
+            "stream.advertise: this instance's address could not be detected (no route); set it",
+        )?;
+        Ok(format!(
+            "tls:{}",
+            std::net::SocketAddr::new(ip, bound.port())
+        ))
+    }
+
+    /// How long a draining ingress keeps answering.
+    pub fn drain(&self) -> Duration {
+        self.drain_ms.map_or(DEFAULT_DRAIN, Duration::from_millis)
+    }
+
+    /// The keys the core host checks feeds with, if any are listed.
+    pub fn ingress_keys(&self) -> Result<Option<crate::feed::FeedKeys>, String> {
+        if self.ingress_keys.is_empty() {
+            return Ok(None);
+        }
+        crate::feed::FeedKeys::parse(&self.ingress_keys).map(Some)
+    }
+
+    /// Ingress's feed signer: the signer service's key, a development file, or none.
+    pub fn feed_signer(
+        &self,
+        profile: Profile,
+    ) -> Result<Option<crate::service::SharedFeedSigner>, String> {
+        self.check(profile)?;
+        if let Some(k) = &self.feed_key {
+            let key = crate::feed::ServiceFeedKey::connect(&k.signer, &k.key)?;
+            return Ok(Some(crate::service::SharedFeedSigner(std::sync::Arc::new(
+                key,
+            ))));
+        }
+        if let Some(path) = &self.development_feed_key {
+            let key = crate::feed::LocalFeedKey::from_file(std::path::Path::new(path))?;
+            return Ok(Some(crate::service::SharedFeedSigner(std::sync::Arc::new(
+                key,
+            ))));
+        }
+        Ok(None)
+    }
+
+    /// Bind ingress's listener for cores, if `listen` names one.
+    pub async fn bind(&self) -> Result<Option<crate::stream::Listen>, String> {
+        let Some(l) = &self.listen else {
+            return Ok(None);
+        };
+        Ok(Some(match crate::stream::Address::parse(l)? {
+            crate::stream::Address::Tls(addr) => {
+                let tls = self.tls.as_ref().ok_or("stream.tls is missing")?;
+                crate::stream::Listen::Tls {
+                    acceptor: tls.acceptor()?,
+                    listener: tokio::net::TcpListener::bind(&addr)
+                        .await
+                        .map_err(|e| format!("stream.listen {addr}: {e}"))?,
+                }
+            }
+            crate::stream::Address::Unix(path) => {
+                let link = self.link.as_ref().ok_or("stream.link is missing")?;
+                let _ = std::fs::remove_file(&path);
+                crate::stream::Listen::Unix {
+                    auth: link.auth()?,
+                    listener: tokio::net::UnixListener::bind(&path)
+                        .map_err(|e| format!("stream.listen {}: {e}", path.display()))?,
+                }
+            }
+        }))
+    }
+
+    /// What the core host dials, if `dial` is set; a `unix:` address takes its token from
+    /// `token` (the environment's [`ENV_CORE_STREAM_TOKEN`] in a deployment).
+    pub fn dial_config(
+        &self,
+        token: impl Fn() -> Option<String>,
+    ) -> Result<Option<crate::stream::DialConfig>, String> {
+        let Some(d) = &self.dial else {
+            return Ok(None);
+        };
+        let mut targets = Vec::with_capacity(d.connect.len());
+        for a in &d.connect {
+            targets.push(match crate::stream::Address::parse(a)? {
+                crate::stream::Address::Tls(addr) => {
+                    let tls = self.tls.as_ref().ok_or("stream.tls is missing")?;
+                    let name = d
+                        .server_name
+                        .clone()
+                        .ok_or("stream.dial.server_name is missing")?;
+                    crate::stream::Target::Tls {
+                        addr,
+                        server_name: rustls_pki_types::ServerName::try_from(name)
+                            .map_err(|e| format!("stream.dial.server_name: {e}"))?,
+                        connector: tls.connector()?,
+                    }
+                }
+                crate::stream::Address::Unix(path) => crate::stream::Target::Unix {
+                    path,
+                    peer_uids: d.peer_uids.clone(),
+                    token: crate::remote::LinkToken::new(&token().ok_or_else(|| {
+                        format!("{ENV_CORE_STREAM_TOKEN} is not set: refusing to start")
+                    })?)?,
+                },
+            });
+        }
+        let partitions = d
+            .partitions
+            .clone()
+            .unwrap_or_else(|| vec![crate::feed::BOOK.to_owned()]);
+        Ok(Some(crate::stream::DialConfig {
+            targets,
+            core: d.core.clone().unwrap_or_else(|| "core".into()),
+            principals: partitions.iter().any(|p| p == crate::feed::BOOK),
+            partitions,
+            timings: self.timings(),
+        }))
+    }
 }
 
 /// The lock timeout a migration runs under when the configuration names none: 5 s.
@@ -477,6 +803,55 @@ pub struct ArchivedIdentifiers {
 }
 
 impl DeploymentConfig {
+    /// The keys the core host checks ingress's feeds against (`F-038` §5, `DEC-27` (f)), on every
+    /// link it serves. A host with keys takes no unsigned or unsequenced input from the moment it
+    /// starts ([`crate::feed::Sequencer`]). In production they are required once the host dials
+    /// the new link (`stream.dial`), and it refuses to start without them. A production host
+    /// without `stream.dial` and without keys serves the legacy socket link alone (`F-038` §12
+    /// step 0): it takes the unsequenced inputs of an ingress of an earlier release, exactly as a
+    /// host of that release does, so the next core host build still runs against a legacy ingress
+    /// during the transition.
+    pub fn core_feed_keys(&self) -> Result<Option<crate::feed::FeedKeys>, String> {
+        let keys = match &self.stream {
+            Some(s) => s.ingress_keys()?,
+            None => None,
+        };
+        let dials = self.stream.as_ref().is_some_and(|s| s.dial.is_some());
+        if keys.is_none() && self.profile == Profile::Production && dials {
+            return Err(
+                "stream.dial in production needs stream.ingress_keys: the core host takes no \
+                 unsigned input on the new link (F-038 §5); configure them with ingress's \
+                 stream.feed_key"
+                    .into(),
+            );
+        }
+        Ok(keys)
+    }
+
+    /// Check that ingress signs what it forwards to a core in another process (`F-038` §5, §12):
+    /// in production, an ingress on `core_endpoint` with the new link configured (a `stream`
+    /// section, [`DeploymentConfig::forward_link`]) needs `stream.feed_key`, as one with
+    /// `stream.listen` does ([`StreamSection::check`]), since the core host with keys refuses
+    /// unsigned inputs. Without a `stream` section ingress forwards on the legacy link, which
+    /// carries no feed and no signature, and needs no feed key (`F-038` §12 step 0).
+    pub fn check_forward_signing(&self) -> Result<(), String> {
+        let signs = self.stream.as_ref().is_some_and(|s| s.feed_key.is_some());
+        let sequenced = self.forward_link() == crate::service::ForwardLink::Sequenced;
+        if self.profile == Profile::Production
+            && self.core_endpoint.is_some()
+            && sequenced
+            && !signs
+        {
+            return Err(
+                "core_endpoint in production with a stream section needs stream.feed_key: every \
+                 command forwarded on the new link is signed, and the core host refuses unsigned \
+                 ones (F-038 §5)"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
     /// The archived identifiers this deployment names, read and checked against the digest its
     /// genesis's chainspec commits (`T-036-29`); none when it names none.
     pub fn archived(&self) -> Result<crate::archived::ArchivedIds, String> {
@@ -702,7 +1077,20 @@ impl DeploymentConfig {
                 .max(1),
             // T-036-25: a chainspec book takes commands only once its core says so.
             genesis_gate: self.genesis.chainspec.is_some(),
+            link: self.forward_link(),
             ..Config::default()
+        }
+    }
+
+    /// How ingress forwards to its core (`F-038` §12): the sequenced feed once the new link is
+    /// configured (a `stream` section: a listener, a feed key, or the keys the core host checks),
+    /// and otherwise the legacy link, exactly as before `F-038`, which a core host of an earlier
+    /// release speaks.
+    pub fn forward_link(&self) -> crate::service::ForwardLink {
+        if self.stream.is_some() {
+            crate::service::ForwardLink::Sequenced
+        } else {
+            crate::service::ForwardLink::Legacy
         }
     }
 }
@@ -716,6 +1104,195 @@ pub fn secret_hex32(var: &str) -> Result<[u8; 32], String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `T-038-14` (`REQ-AU-8`, `NFR-7`): a stream section missing what its transport needs, a
+    /// production listener without the signer's feed key, a file key outside development, and a
+    /// dialer without the keys it checks feeds with are each refused at load.
+    #[test]
+    fn t_038_14_an_incomplete_stream_section_is_refused_at_load() {
+        use Profile::{Development, Production};
+        let s = |v: serde_json::Value| serde_json::from_value::<StreamSection>(v).unwrap();
+        let tls = serde_json::json!({ "ca": "ca.pem", "cert": "c.pem", "key": "c.key" });
+        use crate::feed::FeedSigner as _;
+        let key = hex::encode(crate::feed::LocalFeedKey::from_seed([1; 32]).public());
+        let feed_key = serde_json::json!({
+            "signer": { "socket": "/run/signer.sock", "client": "ingress", "token_file": "/t" },
+            "key": "ingress-feed",
+        });
+        let refused = [
+            (
+                serde_json::json!({ "listen": "tls:0.0.0.0:7443" }),
+                Development,
+            ),
+            (
+                serde_json::json!({ "listen": "unix:/run/s.sock" }),
+                Development,
+            ),
+            (
+                serde_json::json!({ "listen": "tcp:0.0.0.0:7443", "tls": tls }),
+                Development,
+            ),
+            (
+                serde_json::json!({ "listen": "tls:0.0.0.0:7443", "tls": tls }),
+                Production,
+            ),
+            (
+                serde_json::json!({ "development_feed_key": "k.hex" }),
+                Production,
+            ),
+            (
+                serde_json::json!({ "feed_key": feed_key, "development_feed_key": "k.hex" }),
+                Development,
+            ),
+            (
+                serde_json::json!({ "dial": { "connect": ["tls:i:7443"], "server_name": "i" }, "ingress_keys": [key] }),
+                Development,
+            ),
+            (
+                serde_json::json!({ "dial": { "connect": ["tls:i:7443"] }, "tls": tls, "ingress_keys": [key] }),
+                Development,
+            ),
+            (
+                serde_json::json!({ "dial": { "connect": ["unix:/s"] } }),
+                Development,
+            ),
+            (
+                serde_json::json!({ "dial": { "connect": [] }, "ingress_keys": [key] }),
+                Development,
+            ),
+            (
+                serde_json::json!({ "dial": { "connect": ["unix:/s"] }, "ingress_keys": [key] }),
+                Development,
+            ),
+        ];
+        for (v, p) in refused {
+            assert!(s(v.clone()).check(p).is_err(), "{v} under {p:?}");
+        }
+        let accepted = [
+            (
+                serde_json::json!({ "listen": "tls:0.0.0.0:7443", "tls": tls }),
+                Development,
+            ),
+            (
+                serde_json::json!({ "listen": "tls:0.0.0.0:7443", "tls": tls, "feed_key": feed_key }),
+                Production,
+            ),
+            (
+                serde_json::json!({ "dial": { "connect": ["tls:i:7443"], "server_name": "i" }, "tls": tls, "ingress_keys": [key] }),
+                Production,
+            ),
+            (
+                serde_json::json!({ "dial": { "connect": ["unix:/s"], "peer_uids": [1000] }, "ingress_keys": [key] }),
+                Production,
+            ),
+        ];
+        for (v, p) in accepted {
+            assert!(s(v.clone()).check(p).is_ok(), "{v} under {p:?}");
+        }
+    }
+
+    /// `T-038-21`: the advertised address is the configured one; else `listen` when it names a
+    /// host or a socket; else, on every interface, this host's routed address with `listen`'s
+    /// port. A malformed one is refused at load.
+    #[test]
+    fn t_038_21_the_advertised_address() {
+        let s = |v: serde_json::Value| serde_json::from_value::<StreamSection>(v).unwrap();
+        let tls = serde_json::json!({ "ca": "ca.pem", "cert": "c.pem", "key": "c.key" });
+        assert_eq!(
+            s(serde_json::json!({ "listen": "tls:0.0.0.0:7443", "advertise": "tls:10.0.0.7:7443" }))
+                .advertised_address(),
+            Ok("tls:10.0.0.7:7443".into())
+        );
+        for listen in [
+            "tls:10.1.2.3:7443",
+            "tls:ingress-a.internal:7443",
+            "unix:/run/i.sock",
+        ] {
+            assert_eq!(
+                s(serde_json::json!({ "listen": listen })).advertised_address(),
+                Ok(listen.into())
+            );
+        }
+        if let Ok(a) = s(serde_json::json!({ "listen": "tls:0.0.0.0:7443" })).advertised_address() {
+            assert!(a.starts_with("tls:") && a.ends_with(":7443") && !a.contains("0.0.0.0"));
+        }
+        let bad = s(
+            serde_json::json!({ "listen": "tls:0.0.0.0:7443", "tls": tls, "advertise": "10.0.0.7" }),
+        );
+        assert!(bad.check(Profile::Development).is_err());
+    }
+
+    /// `T-038-14`, `DEC-27` (f), `F-038` §12: in production, once the new link is configured, the
+    /// core host refuses to dial it without `stream.ingress_keys`, and an ingress forwarding over
+    /// `core_endpoint` refuses to start without `stream.feed_key`; with no `stream` section both
+    /// run the legacy socket link, as before `F-038`; the development profile may run without
+    /// either.
+    #[test]
+    fn t_038_14_production_requires_the_feed_keys_on_both_sides() {
+        use crate::feed::FeedSigner as _;
+        let template: serde_json::Value = serde_json::from_str(&fill_numbers(include_str!(
+            "../../../deploy/templates/ingress.json"
+        )))
+        .unwrap();
+        let key = hex::encode(crate::feed::LocalFeedKey::from_seed([1; 32]).public());
+        let with = |profile: &str, stream: Option<serde_json::Value>| {
+            let mut t = template.clone();
+            t["profile"] = profile.into();
+            match stream {
+                Some(s) => t["stream"] = s,
+                None => {
+                    t.as_object_mut().unwrap().remove("stream");
+                }
+            }
+            serde_json::from_value::<DeploymentConfig>(t).unwrap()
+        };
+        let feed_key = serde_json::json!({
+            "signer": { "socket": "/run/signer.sock", "client": "ingress", "token_file": "/t" },
+            "key": "ingress-feed",
+        });
+        // No stream section: the legacy socket link on both sides (`F-038` §12 step 0), which
+        // neither signs nor checks, as before `F-038`.
+        let none = with("production", None);
+        assert!(
+            none.core_feed_keys().unwrap().is_none(),
+            "a legacy host starts"
+        );
+        assert!(
+            none.check_forward_signing().is_ok(),
+            "a legacy ingress starts"
+        );
+        assert_eq!(none.forward_link(), crate::service::ForwardLink::Legacy);
+        // The new link configured: the keys on both sides.
+        let unsigned = with(
+            "production",
+            Some(serde_json::json!({ "ingress_keys": [key] })),
+        );
+        assert_eq!(
+            unsigned.forward_link(),
+            crate::service::ForwardLink::Sequenced
+        );
+        assert!(
+            unsigned.check_forward_signing().is_err(),
+            "the new link without a feed key, no ingress"
+        );
+        let dialing = with(
+            "production",
+            Some(serde_json::json!({ "dial": { "connect": ["unix:/s"], "peer_uids": [1000] } })),
+        );
+        assert!(
+            dialing.core_feed_keys().is_err(),
+            "a dialer without keys, no host"
+        );
+        let both = with(
+            "production",
+            Some(serde_json::json!({ "feed_key": feed_key, "ingress_keys": [key] })),
+        );
+        assert!(both.core_feed_keys().unwrap().is_some());
+        assert!(both.check_forward_signing().is_ok());
+        let dev = with("development", None);
+        assert!(dev.core_feed_keys().unwrap().is_none());
+        assert!(dev.check_forward_signing().is_ok());
+    }
 
     #[test]
     fn a_genesis_config_builds_the_core_genesis() {
@@ -964,6 +1541,12 @@ mod tests {
         let link = c.core_link.as_ref().expect("the core link's credential");
         assert_eq!(link.token_sha256.len(), 1);
         assert!(!link.peer_uids.is_empty());
+        // F-038 §5, §12: in production both sides carry the feed keys: ingress signs through the
+        // signer, and the core host checks against ingress's public key.
+        assert!(c.check_forward_signing().is_ok());
+        let stream = c.stream.as_ref().expect("the feed keys");
+        assert!(stream.feed_key.is_some());
+        assert_eq!(stream.ingress_keys.len(), 1);
         let keys = c
             .core_keys
             .as_ref()

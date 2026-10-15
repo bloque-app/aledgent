@@ -222,3 +222,68 @@ async fn nfr_1_the_acknowledgement_series_includes_authentication() {
         ack.p99_us
     );
 }
+
+/// `T-038-10` (`DEC-27` (e″), `REQ-AU-3`): two ingress instances share one database. Instance A
+/// copies an API key's verifier; the credential is removed; instance B, which never copied it
+/// (another process, its own cache), reads "no working credential" from the book and deletes the
+/// copy's row. With no core answering, the key no longer authenticates on A either.
+#[tokio::test(flavor = "multi_thread")]
+async fn t_038_10_a_revoked_credential_leaves_the_shared_copy_whoever_copied_it() {
+    use ingress::store::Store as _;
+    let d = Deployment::start().await;
+    let alice = d.party("alice", 100).await;
+    let (key, credential) = api_key(&d, &alice.token, "ak-shared").await;
+    // A authenticates the key while the core answers: the copy keeps its verifier.
+    authenticate(&d.replica.shared, &bearer(&key))
+        .await
+        .unwrap_or_else(|r| panic!("the key authenticates: {r:?}"));
+    let copied = || async { d.store.copied_verifier(&credential).await.unwrap() };
+    let start = Instant::now();
+    while copied().await.is_none() {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the copy is written"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let (s, v) = d
+        .call(
+            "POST",
+            &format!("/v1/credentials/{credential}/remove"),
+            Some(&alice.token),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(d.core.credential(&credential).await, Ok(None), "removed");
+    // B: another instance over the same database, with an authenticator of its own.
+    let b = ingress::service::Replica::start(
+        d.store.clone(),
+        d.core.clone(),
+        std::sync::Arc::new(d.clock.clone()),
+        ingress::auth::Authenticator::new(),
+        std::sync::Arc::clone(&d.recipients) as std::sync::Arc<dyn ingress::delivery::Transport>,
+        fast_config("ingress-b"),
+    );
+    assert_eq!(
+        authenticate(&b.shared, &bearer(&key)).await.err(),
+        Some(Refusal::CredentialInvalid)
+    );
+    let start = Instant::now();
+    while copied().await.is_some() {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "B forgets the copy A wrote"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // No core answers: A reads the copy, which no longer holds the key.
+    d.core.stop();
+    d.auth.verifiers().set_ttl(Duration::ZERO).unwrap();
+    assert_eq!(
+        authenticate(&d.replica.shared, &bearer(&key)).await.err(),
+        Some(Refusal::DecisionUnavailable),
+        "the revoked key is not authenticated from the copy on A"
+    );
+}

@@ -29,6 +29,11 @@
 //! travels in the clear, so a TCP endpoint must be loopback ([`serve`] refuses another); the
 //! deployment's link is a Unix socket. Callers of ingress itself are authenticated by ingress
 //! before a command becomes an input, as before.
+//!
+//! **Feeds** (`F-038`). The forwarder sends rows as a sequenced, signed [`Request::Feed`]
+//! ([`crate::feed`]), which the host answers through its sequencer; the core stream
+//! ([`crate::stream`]) carries these same requests and responses, in the other direction of
+//! dialing. This link stays as the same-host transport and for the transition (`DEC-27` (h′)).
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -47,6 +52,7 @@ use crate::boundary::{
     CallerBody, Core, CoreError, CoreInput, CoreReply, CredentialBody, OutboxPage, Query,
     QueryReply,
 };
+use crate::feed::{Feed, FeedReply};
 
 /// The largest frame either side accepts: well above any reply the core gives (an outbox page
 /// is under 16 KiB), well below anything that would let a peer exhaust memory.
@@ -101,6 +107,11 @@ pub enum Request {
     },
     /// [`Core::genesis_open`] (`T-036-25`).
     GenesisOpen,
+    /// [`Core::feed`] (`F-038`): a sequenced, signed run of the received log.
+    Feed {
+        /// The feed.
+        feed: Feed,
+    },
 }
 
 /// The first frame of every connection (`F-035`): the link's token. Never formatted.
@@ -142,6 +153,11 @@ impl LinkToken {
             ));
         }
         Ok(LinkToken(Zeroizing::new(t.to_owned())))
+    }
+
+    /// The token itself, for the frame that carries it (`F-038`'s stream on a Unix socket).
+    pub(crate) fn expose(&self) -> &str {
+        &self.0
     }
 
     /// Its SHA-256, hex: what the host's configuration lists.
@@ -248,6 +264,11 @@ pub enum Response {
         /// `false` while a chainspec book waits for its `verify-genesis` report.
         open: bool,
     },
+    /// A feed's answer (`F-038`).
+    Fed {
+        /// The answer.
+        reply: FeedReply,
+    },
     /// The core did not run the request.
     Unavailable,
     /// The core may have run it.
@@ -274,7 +295,8 @@ pub enum BatchAnswer {
 }
 
 impl BatchAnswer {
-    fn of(r: Result<CoreReply, CoreError>) -> BatchAnswer {
+    /// The answer for `r`.
+    pub fn of(r: Result<CoreReply, CoreError>) -> BatchAnswer {
         match r {
             Ok(reply) => BatchAnswer::Applied { reply },
             Err(CoreError::Unavailable) => BatchAnswer::Unavailable,
@@ -282,7 +304,8 @@ impl BatchAnswer {
         }
     }
 
-    fn result(self) -> Result<CoreReply, CoreError> {
+    /// The result it carries.
+    pub fn result(self) -> Result<CoreReply, CoreError> {
         match self {
             BatchAnswer::Applied { reply } => Ok(reply),
             BatchAnswer::Unavailable => Err(CoreError::Unavailable),
@@ -298,7 +321,7 @@ fn error_response(e: CoreError) -> Response {
     }
 }
 
-async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Vec<u8>> {
+pub(crate) async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Vec<u8>> {
     let mut len = [0u8; 4];
     r.read_exact(&mut len).await?;
     let len = u32::from_be_bytes(len) as usize;
@@ -310,7 +333,10 @@ async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Vec<u8>>
     Ok(buf)
 }
 
-async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) async fn write_frame<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    bytes: &[u8],
+) -> std::io::Result<()> {
     let len = u32::try_from(bytes.len()).map_err(|_| std::io::Error::other("a frame too large"))?;
     w.write_all(&len.to_be_bytes()).await?;
     w.write_all(bytes).await?;
@@ -363,6 +389,9 @@ pub async fn answer<C: Core>(core: &C, request: Request) -> Response {
         Request::PartyOf { principal } => match core.party_of(&principal).await {
             Ok(party) => Response::PartyOf { party },
             Err(e) => error_response(e),
+        },
+        Request::Feed { feed } => Response::Fed {
+            reply: core.feed(&feed).await,
         },
     }
 }
@@ -667,6 +696,15 @@ impl Core for RemoteCore {
             Ok(Response::PartyOf { party }) => Ok(party),
             Ok(r) => Err(Self::read_error(r)),
             Err(_) => Err(CoreError::Unavailable),
+        }
+    }
+
+    async fn feed(&self, feed: &Feed) -> FeedReply {
+        let request = Request::Feed { feed: feed.clone() };
+        match self.call(&request).await {
+            Ok(Response::Fed { reply }) => reply,
+            Ok(Response::Unavailable) | Err(false) => FeedReply::Unavailable,
+            Ok(_) | Err(true) => FeedReply::Ambiguous,
         }
     }
 

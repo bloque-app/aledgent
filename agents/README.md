@@ -7,7 +7,12 @@ SPDX-License-Identifier: CC-BY-4.0
 
 Everything here links VOS and is **AGPL-3.0-or-later**. The rest of aledgent is Apache-2.0 OR MIT
 and never links it: `tools/ci/check-no-vos.sh` fails the build if a manifest outside `agents/` and
-`spikes/` names a VOS crate. ingress reaches the core over a local socket (`ingress::remote`).
+`spikes/` names a VOS crate. ingress reaches the core over a local socket (`ingress::remote`), or
+the core host dials out to ingress over the core stream (`ingress::stream`, `F-038`): mutual TLS
+under the operator's CA, or a Unix socket on one machine. Both links reach the core through one
+sequencer (`ingress::feed::Sequencer`) that checks ingress's signature on every forwarded input
+against `stream.ingress_keys`, fences a stale feeder's epoch and keeps the received log's order.
+The Agent and the host's calls into it do not change for either link.
 `features/F-005-core-agent-binding/NOTES.md` records the licensing boundary, and
 `docs/oss/LICENSING.md` the licence of every part.
 
@@ -58,8 +63,10 @@ anywhere with the toolchain and `rust-src`.
     # stderr, the service tree's leaves by kind at the end (profiling)
     aledgent-core-host measure agent_runtime.pvm core.vos open.csv --n 12000 --warmup 0 --batch 24 --mix open
 
-    # Serve boundary::Core on the deployment's core_endpoint (the same file ingress reads),
-    # streaming every decision to the off-node archive (T-005-15; ops/runbooks/release/core-archive.md)
+    # Serve boundary::Core on the deployment's core_endpoint (the same file ingress reads), and/or
+    # dial ingress's core listener with stream.dial (F-038; a Unix-socket address reads its token
+    # from ALEDGENT_CORE_STREAM_TOKEN), streaming every decision to the off-node archive (T-005-15;
+    # ops/runbooks/release/core-archive.md)
     ALEDGENT_CORE_ROOT=… ALEDGENT_CORE_AGENT_KEY=… ALEDGENT_CORE_PACKAGE_KEY=… \
       aledgent-core-host serve --config deployment.json --runtime agent_runtime.pvm \
         --actor core.vos --state <dir> \

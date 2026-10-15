@@ -355,8 +355,10 @@ fn operation(route: &crate::surface::Route) -> Value {
     }
     responses.insert("4XX".into(), refusals());
     // `ERR-DecisionUnavailable` (503) and `ERR-Internal` (500): the same body, a server status
-    // (amendment 0006 item 8).
-    responses.insert("5XX".into(), refusals());
+    // (amendment 0006 item 8). The 503 carries `Retry-After` (`DEC-27` (g), `T-038-23`).
+    let mut server = refusals();
+    server["headers"] = json!({ "Retry-After": { "$ref": "#/components/headers/RetryAfter" } });
+    responses.insert("5XX".into(), server);
     if !params.is_empty() {
         op.insert("parameters".into(), Value::Array(params));
     }
@@ -504,6 +506,13 @@ pub fn document() -> Value {
         },
         "components": {
             "securitySchemes": { "bearer": { "type": "http", "scheme": "bearer" } },
+            "headers": {
+                "RetryAfter": {
+                    "description": "On ERR-DecisionUnavailable (503): seconds to wait before \
+                                    retrying with the same client key (DEC-27 (g)).",
+                    "schema": { "type": "integer", "minimum": 0 }
+                }
+            },
             "schemas": schemas(),
         }
     })
