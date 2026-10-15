@@ -187,8 +187,14 @@ authorised, bytes the runtime cannot decode, which the runtime reports as a fail
 stored or broadcast, a `runtime:<spec_version>` alert is raised, and the adapter refuses to serve on
 that runtime (`unconfirmed`) until it restarts or the runtime changes. Anything else (invalid for
 now: a nonce, fees, the era, the block's resources): nothing is stored or broadcast either, the calls
-wait unsigned, and the next step signs and asks again. This is what catches a format change the
-metadata does not show, such as the device message's order.
+wait unsigned, and the next step signs and asks again. After `adapter.not_now_alert_after` such
+answers in a row (default 10, about 20 s of steps) the `runtime:<spec_version>` alert is raised, naming
+the last answer, and it pages: a withdrawal waits unsigned only about 4.5 minutes before it ends as
+never signed, long before any other page would fire (F-027 NOTES, decision 52). The runtime's
+confirmation clears it. This is what catches a format change the metadata does not show, such as the
+device message's order. Over the light client, a validation smoldot could not start (or one that called
+a host function it does not provide) reads as a refusal too; a restart clears it (decision 53, and
+the outage runbook).
 
 `spec_versions`, in a file that still has it, is **informational**: it is accepted, logged at
 start-up, and gates nothing. An operator may instead name the format for a runtime whose surface

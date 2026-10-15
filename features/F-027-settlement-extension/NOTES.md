@@ -900,3 +900,111 @@ and 134 give the same surface digest, `2da44f41…`; spec 132 gives `08ee0c93…
 - **The aledgent driver** (`e2e/aledgent-driver`) still sets `spec_versions`, now informational. A local
   Kreivo built from a revision whose types differ from mainnet's (an asset location type, say) has
   another surface digest and is refused until its format is mapped (`adapter.formats`) or pinned.
+
+## Follow-ups from T-027-12's review (2026-10-15)
+
+Three findings of PR #13's review that did not block it: a "not now" that persists raised nothing
+(decision 51, F3); nobody had compared how long a withdrawal waits unsigned with the page that was
+meant to catch it; and the light client names a failure to start the runtime as it names a runtime
+that ran and failed.
+
+### Decisions
+
+52. **A "not now" that persists pages, because the expiry comes long before the oldest-operation
+    page.** The numbers, and where each comes from:
+    - **The expiry.** `submit_outbound` gives a withdrawal's instruction the expiry *last finalized
+      height the core holds + `expiry_window`* (`crates/ledger-core/src/ledger/settlement.rs`);
+      `expiry_window` is the settlement configuration's, **150 heights** in
+      `deploy/templates/settlement.json`, with `block_time` 2 000 ms. Kreivo mainnet's block time
+      is 2.0 s at p50 (mean 2.1 s) and its finality lag 31.8 s at p50, 49.5 s at p99 (about 16 and
+      25 blocks; `features/F-032-stress/NOTES-withdrawals.md`, 2026-10-04). When the core
+      instructs, the best head is already a finality lag above the height the expiry counts from.
+    - **The last moment to sign.** The adapter signs only an era that ends at or before the expiry
+      and leaves a block above the best head (`REQ-SL-4`; `Mortality::within`, `born_at_finalized`).
+      Once the best head is within a few blocks of the expiry no era fits, and the adapter
+      tombstones the call (`NotExecuted::NeverSigned`, reported to the core as never signed).
+      `max_era` (64) and `challenge_window` (256) bound how long a *signed* transaction lives; they
+      do not shorten the unsigned wait. So a withdrawal can wait unsigned for about **150 − 16 =
+      134 blocks, 4.5 minutes** (about 4.2 minutes at a p99 finality lag, 4.7 at the mean block
+      time).
+    - **Its end.** Once the finalized head passes the expiry, the core holds the non-inclusion
+      proven (never signed, so no nonce to consume) and releases the reservation: the operation
+      ends **`Released`, about 150 blocks (5 minutes) after it was instructed**. That is terminal
+      and is not `Needs-Review`: the deadline the core requires is later still (after now +
+      150 × 2 000 ms + `finality_margin` 120 000 ms = 7 minutes), so the review queue is never
+      reached.
+    - **The page.** `AledgentOldestNonTerminalOverServiceLevel` (`NFR-11`, `REQ-OP-8`) pages when
+      the oldest non-terminal operation is over **3 600 000 ms for 5 minutes: 65 minutes**
+      (`ops/prometheus/rules/aledgent.yml`). A withdrawal held by a "not now" is terminal after 5,
+      so that page **never fires** for it; nor does `AledgentAdapterNotServing` (the adapter still
+      serves), and `AledgentAnchorLag` (anchors held the same way) waits two hours. Every
+      withdrawal on the runtime would end released, one after another, with nobody paged.
+    So the "not now" answers now raise an alert of their own, and it pages. After
+    `adapter.not_now_alert_after` (default **10**) "not now" answers in a row to the first
+    transaction on a runtime not yet confirmed, the adapter raises that runtime's
+    `runtime:<spec_version>` alert (`Adapter::confirmed`), the same key a refusal raises, its detail
+    naming the count and the answer at that point (`Invalid(Payment)`, say; later answers are in the
+    `warn` log, which counts them). The runtime's confirmation clears it, and with it any other
+    runtime's `runtime:*` alert this process has not refused (one held by "not now" and upgraded
+    away from, perhaps before a restart: nothing waits on it any more). A refusal of the runtime
+    replaces a "not now" alert's detail with its own. The count is in memory, so a restart counts
+    again from zero; an alert already raised is in the store and stays open. The new rule
+    `AledgentAdapterRuntimeUnconfirmed` (`aledgent_adapter_alerts{kind="runtime"} > 0`, no `for`;
+    `runtime` is now exported at zero) pages settlement-operations; it also pages a refusal
+    (`Unconfirmed`) at once, five minutes before `AledgentAdapterNotServing` would.
+    **Why 10.** At least one validation a step while calls wait (one per signing path with
+    something to sign: each lane's batch, the anchor, a binding), and a step at least every
+    `interval` (2 000 ms in `deploy/templates/settle.json`; 1 000 by default), sooner on news; a
+    step itself takes about 0.4 s. Ten answers is then at most about 24 s, plus a scrape and an
+    evaluation, against 4.5 minutes of signable window: the page comes with about four minutes to
+    spare. Fewer would page on the odd transient (a `Future` nonce once), more would eat the
+    window. **The ordering to keep**: `not_now_alert_after` × (`interval` + 0.4 s) + the scrape and
+    evaluation interval must stay well under (`expiry_window` − the finality lag in blocks) ×
+    the block time. An operator who lengthens `interval` or shortens `expiry_window` must check it;
+    nothing checks it at start-up, since the adapter does not read the core's settlement
+    configuration. Trade-off, stated plainly: the page tells someone within a minute, but the
+    withdrawals instructed before it is fixed still end released when their expiry passes;
+    nothing is held past it (`REQ-SL-4`), and nothing can be.
+
+53. **The light client's failure to start the runtime reads as a refusal: documented, not told
+    apart.** smoldot's `RuntimeCallError::Execution` carries three cases
+    (`RuntimeCallExecutionError`): `Execution` (the runtime ran and trapped or panicked: what
+    decision 51 means by a refusal), `Start` (the virtual machine could not start the function:
+    `FunctionNotFound`, `NotAFunction`, `SignatureNotSupported`, `InvalidParameters`, or
+    `DataSizeOverflow`) and `ForbiddenHostFunction` (the runtime called an off-chain host function,
+    which a light client does not provide). Over `state_call` all three reach the adapter alike: a
+    JSON-RPC server error, code -32000, whose message is the error's display, "Error during the
+    execution of the runtime: …" (`light-base/src/json_rpc_service/background.rs`, at the pinned
+    fork). No code, field or structured value tells them apart; only the text after the colon
+    does. Decision 51 recognises the prefix and nothing else (`rpc::call_failure`), and matching
+    the inner texts as well would tie the classification to wording smoldot does not promise, so
+    it is not done. **The case**: `validate_transaction` on a new runtime answered with `Start` or
+    `ForbiddenHostFunction` is classed `Refused`: the adapter refuses that runtime
+    (`Unconfirmed`), raises `runtime:<spec_version>`, and pages. **How to recognise it**: the
+    alert's detail and the `error` log "did not confirm the transaction format on its runtime"
+    carry the client's message after "the runtime failed validating it (it cannot decode it):";
+    a format the runtime cannot decode reads "Error during the execution of the runtime: Runtime
+    has trapped: …" (or "Runtime has aborted: …"), whereas this case reads "Error during the
+    execution of the runtime: " followed by one of "Function to start was not found.", "Symbol to
+    start is not a function.", "Function to start uses unsupported signature.", "The types of the
+    provided parameters don't match the signature.", "DataSizeOverflow" or
+    "ForbiddenHostFunction". **What clears it**: a restart. The refusal is held in memory, the
+    runtime is not recorded as served, and the restarted process asks the layer again; when the
+    cause was the light client's, the runtime confirms then. If the same answer comes back after a
+    restart, the light client cannot run that runtime's validation, which no restart fixes: record
+    it as a finding, and the explicit fallback is a node's RPC (`"connection": "rpc"`, README),
+    which validates in a node's executor. Trade-off, stated plainly: a false stop until restart,
+    which decision 51 already preferred to a false start.
+
+### Tests
+
+- **`tests/contract.rs`**: `ac_e4_4_t_027_12_repeated_not_now_answers_raise_the_runtime_alert_until_confirmed`:
+  nine "not now" answers (`Invalid(Stale)`) raise nothing; the tenth (`Invalid(Payment)`) raises
+  `runtime:133` naming it and the count, with nothing broadcast and the adapter still serving; the
+  confirmation clears it and the withdrawal settles.
+  `t_027_12_a_runtime_upgraded_away_from_has_its_not_now_alert_cleared`: an alert raised on 133 is
+  cleared by 134's confirmation.
+- **`ops/tests/alerts.rs`**: `AledgentAdapterRuntimeUnconfirmed` pages the test route with an open
+  `runtime` alert, and a healthy deployment (`runtime` at zero) pages no one.
+- Decision 53 changes no code, so it has no test of its own; decision 51's tests of
+  `rpc::call_failure` stand.
