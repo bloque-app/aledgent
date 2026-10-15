@@ -13,9 +13,10 @@
 #   4. a squash merge's subject is always the pull request's title (`squash_merge_commit_title:
 #      PR_TITLE`; GitHub's default uses a one-commit PR's commit subject instead), the title the
 #      check validates and release-please reads;
-#   5. the environment `release`, which holds the App key of the bloque-ledgent dispatch, is usable
-#      from `main` and `develop` only: its `v*` tag policy is removed, since no release job runs on a
-#      tag and anyone with write access can push one.
+#   5. the environment `release`, which holds the App's credentials (ALEDGENT_RELEASE_APP_ID and
+#      ALEDGENT_RELEASE_APP_KEY: the key that release-please and the bloque-ledgent dispatch both
+#      mint their tokens from), is usable from `main` and `develop` only: its `v*` tag policy is
+#      removed, since no release job runs on a tag and anyone with write access can push one.
 #
 #   tools/release/protect-branches.sh            # print what it would send
 #   tools/release/protect-branches.sh --apply    # send it (a repository administrator's gh login)
