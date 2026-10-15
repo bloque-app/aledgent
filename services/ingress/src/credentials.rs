@@ -86,7 +86,7 @@ impl Default for VerifierCache {
 /// What the durable copy should do with an answer the book gave (`F-038` §7).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CopyWrite {
-    /// Nothing: the copy holds it already, or it never held the credential.
+    /// Nothing: this process wrote that verifier last.
     Nothing,
     /// Keep this verifier.
     Keep(CredentialBody),
@@ -96,8 +96,12 @@ pub enum CopyWrite {
 
 impl VerifierCache {
     /// What the durable copy should do with `found`, the book's answer for `credential`, given
-    /// what this process last wrote there. "No working credential" for one this process never
-    /// copied writes nothing: a caller presenting made-up credentials never writes to the store.
+    /// what this process last wrote there. A verifier is written when it differs from what this
+    /// process last wrote. "No working credential" always forgets the credential, whoever copied
+    /// it: another instance, this one before a restart, or before its map was cleared. Otherwise a
+    /// revoked credential would stay in the copy and authenticate while no core answers. Deleting
+    /// a row that is not there changes nothing; an API key's negative answer is cached for the
+    /// TTL, so a caller repeating one made-up key does not repeat the delete within it.
     pub fn copy_write(&self, credential: &str, found: Option<&CredentialBody>) -> CopyWrite {
         let mut copied = self.copied.lock().unwrap_or_else(|p| p.into_inner());
         match found {
@@ -109,10 +113,10 @@ impl VerifierCache {
                 copied.insert(credential.to_owned(), f.clone());
                 CopyWrite::Keep(f.clone())
             }
-            None => match copied.remove(credential) {
-                Some(_) => CopyWrite::Forget,
-                None => CopyWrite::Nothing,
-            },
+            None => {
+                copied.remove(credential);
+                CopyWrite::Forget
+            }
         }
     }
 

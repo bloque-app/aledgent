@@ -483,3 +483,198 @@ async fn t_031_18_a_core_that_runs_part_of_a_batch_is_fed_the_rest_without_backo
     let numbers: Vec<u64> = rows.iter().map(|r| r.core_input_seq.unwrap()).collect();
     assert!(numbers.windows(2).all(|w| w[0] < w[1]), "{numbers:?}");
 }
+
+/// One feed as the scripted core saw it: each item's sequence and input key.
+type Fed = Vec<(u64, InputKey)>;
+
+/// The in-process core behind a scripted feed: it records every feed's sequences and input keys;
+/// armed, it runs one feed and answers it `Ambiguous` (the link failed after it ran), then holds
+/// the next until released and answers it `Unavailable`.
+#[derive(Clone)]
+struct Scripted {
+    inner: TestCore,
+    fed: Arc<Mutex<Vec<Fed>>>,
+    /// 0: answer; 1: run and answer ambiguous; 2: hold, then answer unavailable.
+    step: Arc<std::sync::atomic::AtomicU8>,
+    holding: Arc<AtomicBool>,
+    release: Arc<AtomicBool>,
+    /// Which recorded feed was answered ambiguous.
+    armed: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Core for Scripted {
+    async fn apply(&self, input: &CoreInput) -> Result<CoreReply, CoreError> {
+        self.inner.apply(input).await
+    }
+
+    async fn feed(&self, feed: &ingress::feed::Feed) -> ingress::feed::FeedReply {
+        use ingress::feed::FeedReply;
+        let inputs = feed.inputs().unwrap();
+        self.fed.lock().unwrap().push(
+            feed.items
+                .iter()
+                .zip(&inputs)
+                .map(|(f, i)| (f.seq, i.key))
+                .collect(),
+        );
+        match self.step.load(Ordering::SeqCst) {
+            1 => {
+                self.armed
+                    .store(self.fed.lock().unwrap().len() - 1, Ordering::SeqCst);
+                let _ = self.inner.apply_batch(&inputs).await;
+                self.step.store(2, Ordering::SeqCst);
+                FeedReply::Ambiguous
+            }
+            2 => {
+                self.holding.store(true, Ordering::SeqCst);
+                while !self.release.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                self.step.store(0, Ordering::SeqCst);
+                FeedReply::Unavailable
+            }
+            _ => FeedReply::Answers {
+                answers: self
+                    .inner
+                    .apply_batch(&inputs)
+                    .await
+                    .into_iter()
+                    .map(ingress::remote::BatchAnswer::of)
+                    .collect(),
+            },
+        }
+    }
+
+    async fn outbox(
+        &self,
+        cursor: Option<&str>,
+        undelivered: bool,
+        now: Time,
+    ) -> Result<OutboxPage, CoreError> {
+        self.inner.outbox(cursor, undelivered, now).await
+    }
+
+    async fn last_tick(&self) -> Result<Option<Time>, CoreError> {
+        self.inner.last_tick().await
+    }
+
+    async fn query(
+        &self,
+        caller: &CallerBody,
+        query: &Query,
+        now: Time,
+    ) -> Result<QueryReply, CoreError> {
+        self.inner.query(caller, query, now).await
+    }
+
+    async fn credential(&self, credential: &str) -> Result<Option<CredentialBody>, CoreError> {
+        self.inner.credential(credential).await
+    }
+
+    async fn party_of(&self, principal: &str) -> Result<Option<String>, CoreError> {
+        self.inner.party_of(principal).await
+    }
+}
+
+/// `T-038-03` (`F-038` §3, `REQ-CS-7`, `INV-18`): a row answered ambiguous in one round (it may
+/// have run) and unavailable in the next keeps its feed sequence: nothing gives it back, so a
+/// reservation logged meanwhile cannot take that sequence ahead of it. Every input is fed at one
+/// sequence only, and the row that may have run is decided before the reservation.
+#[tokio::test(flavor = "multi_thread")]
+async fn t_038_03_a_row_once_ambiguous_keeps_its_feed_sequence() {
+    let journal = MemJournal::new();
+    let inner = InProcessCore::in_memory(genesis(T0), journal.clone()).with_clerk(test_clerk());
+    inner.start().unwrap();
+    let founded = inner.founded().unwrap();
+    let core = Scripted {
+        inner,
+        fed: Arc::default(),
+        step: Arc::default(),
+        holding: Arc::default(),
+        release: Arc::default(),
+        armed: Arc::default(),
+    };
+    let mut d = Deployment::assemble(
+        MemStore::new(Duration::from_millis(50)),
+        fast_config("ingress-0"),
+        core.clone(),
+        founded,
+        journal,
+    )
+    .await;
+    let alice = d.party("alice", 10_000).await;
+    let bob = d.party("bob", 0).await;
+    d.drive_ticks();
+    let d = Arc::new(d);
+    assert!(d.quiesce(Duration::from_secs(30)).await);
+    core.step.store(1, Ordering::SeqCst);
+    let (s, r) = d
+        .call(
+            "POST",
+            "/v1/transfers",
+            Some(&alice.token),
+            &[("client-key", "maybe-ran")],
+            Some(json!({ "legs": [{ "from": alice.account, "to": bob.account, "asset": USD, "amount": "1" }] })),
+        )
+        .await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{r}");
+    let start = Instant::now();
+    while !core.holding.load(Ordering::SeqCst) {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the second round"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    // While the second round is in flight, a reservation is logged: reservations go first
+    // (`T-009-04`), but not ahead of a row that may have run.
+    let reserve = {
+        let d = Arc::clone(&d);
+        let body = json!({ "payer": alice.account, "asset": USD, "amount": "1" });
+        let token = alice.token.clone();
+        tokio::spawn(async move {
+            d.call("POST", "/v1/reservations", Some(&token), &[], Some(body))
+                .await
+        })
+    };
+    let start = Instant::now();
+    while !d.store.rows().await.unwrap().iter().any(|r| r.new.reserves) {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the reservation is logged"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    core.release.store(true, Ordering::SeqCst);
+    let (s, _) = reserve.await.unwrap();
+    assert_eq!(s, StatusCode::ACCEPTED);
+    assert!(
+        d.quiesce(Duration::from_secs(30)).await,
+        "every row decided"
+    );
+    let mut seq_of: std::collections::HashMap<InputKey, u64> = Default::default();
+    for (seq, key) in core.fed.lock().unwrap().iter().flatten() {
+        assert_eq!(
+            *seq_of.entry(*key).or_insert(*seq),
+            *seq,
+            "an input fed at two sequences: one that may have run gave its sequence back"
+        );
+    }
+    // The rows of the ambiguous round are decided before the reservation.
+    let ambiguous: Vec<InputKey> = core.fed.lock().unwrap()[core.armed.load(Ordering::SeqCst)]
+        .iter()
+        .map(|(_, k)| *k)
+        .collect();
+    let rows = d.store.rows().await.unwrap();
+    let reserved = rows
+        .iter()
+        .find(|r| r.new.reserves)
+        .and_then(|r| r.core_input_seq)
+        .unwrap();
+    for r in rows.iter().filter(|r| ambiguous.contains(&r.new.op_ref)) {
+        assert!(
+            r.core_input_seq.unwrap() < reserved,
+            "a row that may have run is decided first"
+        );
+    }
+}

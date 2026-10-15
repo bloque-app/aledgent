@@ -716,6 +716,10 @@ async fn forward<S: Store, C: Core>(
         return Ok(());
     }
     let mut from = 0;
+    // Past the last row any round answered ambiguous: it, and every row before it, may have run,
+    // whatever a later round answers (`F-038` §3). An ambiguous row answered unavailable next
+    // still keeps its sequence; only the rows from here on are ever given back.
+    let mut ambiguous_to = 0;
     loop {
         if shared.feeds() != Some(epoch) {
             return Err("the feed lease moved".into());
@@ -745,7 +749,9 @@ async fn forward<S: Store, C: Core>(
         let in_flight = answers
             .iter()
             .rposition(|a| *a == Err(CoreError::Ambiguous))
-            .map_or(0, |i| from + i + 1);
+            .map_or(0, |i| from + i + 1)
+            .max(ambiguous_to);
+        ambiguous_to = in_flight;
         let mut replies = Vec::new();
         for answer in answers {
             let Ok(reply) = answer else { break };
