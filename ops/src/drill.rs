@@ -67,6 +67,11 @@ pub struct Check {
     pub detail: String,
 }
 
+/// How many of a failing check's findings its detail lists. A check that fails over a whole
+/// archive can fail on tens of thousands of items (the 2026-10-15 restore drill's report was 3.4 MB
+/// for one `NFR-4` run); the count says how many, and these say what kind.
+pub const MAX_EXAMPLES: usize = 20;
+
 fn check(name: &str, findings: Vec<String>) -> Check {
     Check {
         name: name.to_owned(),
@@ -75,11 +80,21 @@ fn check(name: &str, findings: Vec<String>) -> Check {
         } else {
             Verdict::Failed
         },
-        detail: if findings.is_empty() {
-            "none found".to_owned()
-        } else {
-            findings.join("; ")
-        },
+        detail: findings_detail(&findings),
+    }
+}
+
+/// A failing check's detail: the count, and at most [`MAX_EXAMPLES`] of the findings.
+fn findings_detail(findings: &[String]) -> String {
+    match findings {
+        [] => "none found".to_owned(),
+        all if all.len() <= MAX_EXAMPLES => format!("{} found: {}", all.len(), all.join("; ")),
+        all => format!(
+            "{} found, the first {MAX_EXAMPLES}: {}; and {} more",
+            all.len(),
+            all[..MAX_EXAMPLES].join("; "),
+            all.len() - MAX_EXAMPLES
+        ),
     }
 }
 
@@ -416,5 +431,52 @@ pub fn size_of<S: LeafStore, V: VaultBackend>(
         kernel_accounts: log_accounts(store).map_or(0, |a| a.len() as u64),
         rows: rows as u64,
         export_bytes,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn found(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("Missing({i})")).collect()
+    }
+
+    #[test]
+    fn a_check_with_no_findings_passes() {
+        let c = check("NFR-4", Vec::new());
+        assert_eq!(
+            (c.verdict, c.detail.as_str()),
+            (Verdict::Passed, "none found")
+        );
+    }
+
+    #[test]
+    fn a_failing_check_lists_every_finding_up_to_the_limit() {
+        let c = check("NFR-4", found(MAX_EXAMPLES));
+        assert_eq!(c.verdict, Verdict::Failed);
+        assert!(
+            c.detail.starts_with("20 found: Missing(0); "),
+            "{}",
+            c.detail
+        );
+        assert!(c.detail.ends_with("Missing(19)"), "{}", c.detail);
+    }
+
+    /// The 2026-10-15 drill's `NFR-4` listed 63,947 items: the detail is the count and 20 of them.
+    #[test]
+    fn a_failing_check_prints_the_count_and_at_most_twenty_examples() {
+        let c = check("NFR-4", found(63_947));
+        assert_eq!(c.verdict, Verdict::Failed);
+        assert!(
+            c.detail
+                .starts_with("63947 found, the first 20: Missing(0); Missing(1); "),
+            "{}",
+            c.detail
+        );
+        assert!(c.detail.contains("Missing(19)"), "{}", c.detail);
+        assert!(!c.detail.contains("Missing(20)"), "{}", c.detail);
+        assert!(c.detail.ends_with("and 63927 more"), "{}", c.detail);
+        assert!(c.detail.len() < 1_000, "{} bytes", c.detail.len());
     }
 }
