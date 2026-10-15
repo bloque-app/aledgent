@@ -184,7 +184,7 @@ async fn deployment(h: &Host, a: &Instance, name: &str) -> Deployment<MemStore, 
         MemStore::new(cfg.lease),
         cfg,
         a.hub.clone(),
-        h.founded.clone(),
+        h.founded,
         MemJournal::new(),
     )
     .await
@@ -297,6 +297,46 @@ async fn decided_in_feed_order(store: &MemStore) {
 }
 
 // --- the tests ---
+
+/// `T-038-01`: a core that speaks no version this ingress speaks is refused before any call, and
+/// one that does is welcomed with the version both speak.
+#[tokio::test(flavor = "multi_thread")]
+async fn t_038_01_a_core_speaking_no_common_version_is_refused() {
+    let a = instance("ingress-a").await;
+    for (versions, expect) in [
+        (
+            json!([99]),
+            json!({ "greeting": "refused", "reason": "version" }),
+        ),
+        (
+            json!([1, 99]),
+            json!({ "greeting": "welcome", "version": 1, "instance": "ingress-a" }),
+        ),
+    ] {
+        let tcp = tokio::net::TcpStream::connect(a.addr).await.unwrap();
+        let name = rustls_pki_types::ServerName::try_from("ingress.test").unwrap();
+        let mut s = tls("core")
+            .connector()
+            .unwrap()
+            .connect(name, tcp)
+            .await
+            .unwrap();
+        let hello = serde_json::to_vec(
+            &json!({ "versions": versions, "core": "c", "partitions": ["book"] }),
+        )
+        .unwrap();
+        s.write_all(&(hello.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        s.write_all(&hello).await.unwrap();
+        let mut len = [0u8; 4];
+        s.read_exact(&mut len).await.unwrap();
+        let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
+        s.read_exact(&mut body).await.unwrap();
+        let greeting: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(greeting, expect);
+    }
+}
 
 /// `T-038-02` (`NFR-7`, `DEC-27` (c)): a core host gets a stream only with a client certificate
 /// from the operator's CA, and on a Unix socket only with the link's token and a listed user id;
@@ -506,8 +546,9 @@ async fn dec_27_e_a_go_away_hands_the_feed_over_with_nothing_decided_twice_or_ou
     let (rb, router_b) = replica(&d, b.hub.clone(), config("ingress-b", ingress_key()));
     let first = d.replica.shared.feeds().expect("a feeds");
 
-    let send = |router: Router, i: usize| {
-        let (token, from, to) = (alice.token.clone(), from.clone(), to.clone());
+    let owned = (alice.token.clone(), from.clone(), to.clone());
+    let send = move |router: Router, i: usize| {
+        let (token, from, to) = owned.clone();
         async move {
             let (s, v) = call(
                 &router,
@@ -533,20 +574,28 @@ async fn dec_27_e_a_go_away_hands_the_feed_over_with_nothing_decided_twice_or_ou
     let went = Instant::now();
     ingress::service::drain(&d.replica.shared, Duration::from_secs(5)).await;
     a.hub.go_away("release");
-    for i in 20..40 {
-        let r = if i % 2 == 0 {
-            d.router.clone()
-        } else {
-            router_b.clone()
-        };
-        send(r, i).await;
-    }
+    // Commands keep coming to both instances while the feed moves.
+    let during = tokio::spawn({
+        let (a_router, b_router) = (d.router.clone(), router_b.clone());
+        let send = send.clone();
+        async move {
+            for i in 20..40 {
+                let r = if i % 2 == 0 {
+                    a_router.clone()
+                } else {
+                    b_router.clone()
+                };
+                send(r, i).await;
+            }
+        }
+    });
     until("b feeds", || rb.shared.feeds().is_some()).await;
     let took = went.elapsed();
     assert!(
         took < Duration::from_secs(1),
         "decisions resumed in {took:?}"
     );
+    during.await.unwrap();
     assert!(rb.shared.feeds().unwrap() > first, "a new epoch");
     assert!(d.quiesce(PATIENCE).await, "every row decided");
     if let Err((numbers, n)) = d
