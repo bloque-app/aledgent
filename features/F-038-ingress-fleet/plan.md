@@ -72,7 +72,9 @@ Unix-socket link's do (`ingress::remote`); the core host calls the dialing end.
   before any frame. This listener is for cores only, never the client API's.
 - **A Unix socket on the same host** (`unix:<path>`), for one machine (`DEC-27` (h′)): the peer's user id
   from the socket's credentials, and a token whose SHA-256 ingress lists, compared in constant time, as the
-  socket link does today (`F-035`). Over TLS the certificate is the authentication and no token is sent.
+  socket link does today (`F-035`). The core host checks the other way too: it sends its token only to a
+  socket whose peer runs as one of `stream.dial.peer_uids`, so a process that took the socket's path gets
+  nothing. Over TLS the certificate is the authentication and no token is sent.
 - Private keys and certificates are read from files named in the configuration; a TLS listener without its
   CA, certificate or key does not start.
 
@@ -95,7 +97,9 @@ the next **feed sequence**.
 - Rows the core certainly did not run (answered unavailable, or never sent) give their sequences back, the
   partition's tail, under the lease (`Store::unfeed`), and return to the queue: a reservation logged
   meanwhile still goes before them (`T-009-04`, `T-031-18`), and the next row sent takes the first of those
-  sequences again. The core host expects exactly that sequence, since nothing at or past it ran.
+  sequences again. The core host expects exactly that sequence, since nothing at or past it ran. A row
+  answered ambiguous in any round of a send stays in flight even if a later round answers it
+  unavailable: sequences are never given back below the highest position ever answered ambiguous.
 - Today the book has one writer, the core Agent, so there is one partition, `book`. The sharded profile
   routes each row to its payer's partition; that routing is `T-038-22`'s, and the lease and the sequencer
   are per partition already.
@@ -121,18 +125,23 @@ the core input's JSON exactly as signed. The host's sequencer, in front of the A
    gap to fill, then refused (`Gap { expected }`), nothing run;
 4. hands the rest to the core as one batch (`apply_batch`, `T-031-04`), and answers each item.
 
-One mutex per partition serialises feeds from every stream and the socket. Once the host has seen a
-sequenced feed, it refuses an unsequenced `apply` or `apply_batch` (an ingress of an earlier release) as
-unavailable: nothing runs out of order during a mixed rollout.
+One mutex per partition serialises feeds from every stream and the socket. A host with `ingress_keys`
+refuses every unsequenced `apply` or `apply_batch` (an ingress of an earlier release, or anything unsigned)
+as unavailable from the moment it starts, with no window before a first feed and none after a restart.
+Production requires the keys (§5). Without them (development only), the host refuses unsequenced inputs
+once it has seen a sequenced feed: nothing runs out of order during a mixed rollout.
 
 ### 5. Ingress signs what it forwards
 
 Each item carries ingress's Ed25519 signature over `SHA-256("aledgent/ingress-feed/v1" ‖ partition ‖
-seq ‖ input)`, made through the signer service (`F-035`, key `stream.feed_key`); a key from a file is
-accepted only in the development profile. The core host checks it against `stream.ingress_keys` (two
-during a rotation) before the Agent sees the input. mTLS says which peer is connected; the signature says
-the command is the one ingress recorded at that position. On the socket link the host checks it whenever
-`ingress_keys` is configured, so both links carry signed feeds during the transition.
+epoch ‖ seq ‖ input)`, made through the signer service (`F-035`, key `stream.feed_key`); a key from a file
+is accepted only in the development profile. The epoch is signed (feeds are signed afresh on every send),
+so a captured item replayed under a higher epoch fails the check instead of fencing the real feeder. The
+core host checks it against `stream.ingress_keys` (two during a rotation) before the Agent sees the input.
+mTLS says which peer is connected; the signature says the command is the one ingress recorded at that
+position. The host checks it on every link it serves. In production `ingress_keys` is required: the core
+host refuses to start without it, and so does an ingress forwarding over `core_endpoint` without
+`stream.feed_key`, so both links carry signed feeds during the transition (§12).
 
 ### 6. Reads ride the stream
 
@@ -152,7 +161,8 @@ landed on, and queries elsewhere answer unavailable until `T-038-21` lets a core
 answered: an API key's hash, a passkey's encoded key (public key, credential handle, `rpId`, backup flag,
 sign count), a `key` credential's public key. Public material only (`REQ-AU-8`).
 
-- Every answer the book gives refreshes the entry; an answer of "no working credential" deletes it.
+- Every answer the book gives refreshes the entry; an answer of "no working credential" deletes it, on
+  whichever instance reads it, whoever copied the entry (another instance, or this one before a restart).
 - The copy is read only when no core answers. A proof is checked against a verifier the book admitted, never
   accepted for its form alone: an unknown API key, or an assertion from a passkey the book never admitted,
   fails as it does today.
@@ -203,7 +213,8 @@ One file for both processes (`DeploymentConfig`), as today:
   development profile only, `stream.development_feed_key` (a file); `keepalive_ms`, `dead_after_ms`,
   `drain_ms`.
 - `stream.dial` (core host): `connect` (addresses), `server_name`, `tls`, `partitions` (default
-  `["book"]`), the token from `ALEDGENT_CORE_STREAM_TOKEN` for a Unix socket; `stream.ingress_keys` (hex).
+  `["book"]`), for a Unix socket the token from `ALEDGENT_CORE_STREAM_TOKEN` and `peer_uids` (ingress's user
+  ids, required); `stream.ingress_keys` (hex, required in production).
 - `readiness_listen` (ingress).
 
 An ingress with `stream.listen` serves the stream instead of dialing `core_endpoint`; one with

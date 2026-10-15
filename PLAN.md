@@ -1027,8 +1027,12 @@ the writer of its own partitions. *Decision:*
   removed while no core answered is acknowledged and then refused under its named condition. No credential
   joins a set while no core answers: that is a decision of the book. The copy also holds `key` verifiers
   (the public key). A `key` proof is not a way to call ingress: it travels inside a command (a reclaim, a
-  recovery approval) from a caller already authenticated. Ingress checks it against the copy and refuses a
-  forged or mismatched proof at the door instead of acknowledging it; the core still verifies it at decision.
+  recovery approval) from a caller already authenticated. A reclaim's proof binds the account's custody
+  epoch, which is book state: ingress checks it at the door against the credential's verifier and the
+  epoch it reads from the book, and refuses a forged or mismatched proof instead of acknowledging it; with
+  no core answering, it cannot read the epoch, so the reclaim (answered with its decision) is answered
+  `ERR-DecisionUnavailable` at the door, not checked against the copy. A recovery approval's proof is
+  verified by the core only, at decision. The core verifies every proof at decision either way.
   One rule for every scheme: ingress refuses at the door what the book would certainly refuse for the
   credential, as of its last read. Configured service tokens and passkey sessions already authenticate
   without the core.
