@@ -9,12 +9,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use core_archive::archive::{Archive, ArchiveSource as _};
+use core_archive::archive::{Archive, ArchiveSource};
 use core_archive::native::{STATE_FILE, SavingPort, decode_rows};
 use core_archive::record::decode_segment;
 use core_archive::store::{FsStore, ObjectStore, Put, StoreError};
 use core_archive::{
-    ArchiveStatus, Archiver, ArchiverConfig, ArchivingLog, STATUS_FILE, book_of, fetch, lay_out,
+    ArchiveStatus, Archiver, ArchiverConfig, ArchivingLog, Fetched, STATUS_FILE, book_of, fetch,
+    fetch_with, lay_out,
 };
 use core_binding::core::{AgentCore, FileLog, Founding, HostLog as _, roll_forward_agent};
 use core_binding::host::{NativePort, ReplicaStores};
@@ -319,4 +320,166 @@ async fn inv_25_another_history_never_writes_to_the_archive() {
     assert!(status.conflict.is_some(), "{status:?}");
     assert!(status.lag_inputs > 0 || status.pending_bytes > 0);
     drop((d1, d2));
+}
+
+/// An archive whose segments arrive out of order: each read waits a time that does not grow with
+/// its number, so later segments often come back before earlier ones. It can also lose, garble or
+/// fail to read one segment.
+struct OutOfOrder {
+    inner: Archive,
+    vanish: Option<u64>,
+    garble: Option<u64>,
+    fail: Option<u64>,
+    arrived: std::sync::Mutex<Vec<u64>>,
+}
+
+impl OutOfOrder {
+    fn new(sink: &Path) -> OutOfOrder {
+        OutOfOrder {
+            inner: Archive::new(Box::new(FsStore::open(sink).unwrap())),
+            vanish: None,
+            garble: None,
+            fail: None,
+            arrived: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl ArchiveSource for OutOfOrder {
+    fn segments(&self) -> Result<Vec<u64>, StoreError> {
+        self.inner.segments()
+    }
+    fn checkpoints(&self) -> Result<Vec<u64>, StoreError> {
+        self.inner.checkpoints()
+    }
+    fn get_segment(&self, n: u64) -> Result<Option<Vec<u8>>, StoreError> {
+        std::thread::sleep(Duration::from_millis((n * 7919) % 13));
+        self.arrived.lock().unwrap().push(n);
+        if self.fail == Some(n) {
+            return Err(StoreError::Unavailable("injected".into()));
+        }
+        if self.vanish == Some(n) {
+            return Ok(None);
+        }
+        let mut rec = self.inner.get_segment(n)?;
+        if self.garble == Some(n)
+            && let Some(r) = rec.as_mut()
+        {
+            let last = r.len() - 1;
+            r[last] ^= 0xff;
+        }
+        Ok(rec)
+    }
+    fn get_checkpoint(&self, n: u64) -> Result<Option<Vec<u8>>, StoreError> {
+        self.inner.get_checkpoint(n)
+    }
+}
+
+/// What a read checked and kept, to compare two reads of one archive.
+fn outcome(f: Result<Fetched, String>) -> Result<String, String> {
+    use sha2::{Digest as _, Sha256};
+    f.map(|f| {
+        format!(
+            "{} {} {:?} {:?} {} {} {} {} {:?}",
+            f.book,
+            f.segments,
+            f.point,
+            f.notes,
+            f.damaged,
+            hex::encode(Sha256::digest(&f.archive)),
+            hex::encode(Sha256::digest(&f.replies)),
+            f.entries.len(),
+            f.checkpoint.as_ref().map(|c| c.header.n),
+        )
+    })
+}
+
+/// `T-005-16`, `NFR-4` (the 2026-10-15 restore drill, item 8): segments read many at once, and
+/// arriving out of order, are checked exactly as when read one at a time: the same segments in
+/// the same order, the same point, the same notes. A missing, garbled or unreadable segment ends
+/// the read, or fails it, exactly as sequentially, whatever was read past it.
+#[tokio::test(flavor = "multi_thread")]
+async fn t_005_16_a_parallel_read_checks_in_order_whatever_order_segments_arrive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (dir, sink) = (tmp.path().join("node"), tmp.path().join("sink"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let small = ArchiverConfig {
+        max_segment_bytes: 700,
+        ..config()
+    };
+    let (d, _core, archiver) = node(&dir, Box::new(FsStore::open(&sink).unwrap()), small).await;
+    workload(&d, "a", 6).await;
+    archiver.stop();
+    drop(d);
+    let book = book_of(&founding().op);
+    let reads = |src: &OutOfOrder| {
+        (
+            outcome(fetch_with(src, Some(&book), 1)),
+            outcome(fetch_with(src, Some(&book), 8)),
+            outcome(fetch_with(src, Some(&book), 4096)),
+        )
+    };
+
+    // Healthy: one read, whatever the concurrency; and the segments did arrive out of order.
+    let src = OutOfOrder::new(&sink);
+    let segments = src.segments().unwrap().len();
+    assert!(segments >= 8, "enough segments to overlap: {segments}");
+    let (one, many, more) = reads(&src);
+    let one = one.expect("a healthy archive reads");
+    assert_eq!(Ok(&one), many.as_ref());
+    assert_eq!(Ok(&one), more.as_ref());
+    let arrived = src.arrived.lock().unwrap().clone();
+    let parallel = &arrived[segments..];
+    assert!(
+        parallel.windows(2).any(|w| w[1] < w[0]),
+        "the segments arrived out of order: {parallel:?}"
+    );
+    let full = fetch_with(&src, Some(&book), 8).unwrap();
+    assert!(!full.damaged, "{:?}", full.notes);
+
+    let mid = segments as u64 / 2;
+    // A garbled segment, a vanished one: the archive ends before it, the same way.
+    for (garble, vanish) in [(Some(mid), None), (None, Some(mid))] {
+        let src = OutOfOrder {
+            garble,
+            vanish,
+            ..OutOfOrder::new(&sink)
+        };
+        let (one, many, more) = reads(&src);
+        let one = one.expect("a damaged archive reads to before the damage");
+        assert_eq!(Ok(&one), many.as_ref());
+        assert_eq!(Ok(&one), more.as_ref());
+        let f = fetch_with(&src, Some(&book), 8).unwrap();
+        assert!(f.damaged && f.segments < mid, "{:?}", f.notes);
+        assert!(
+            f.notes
+                .iter()
+                .any(|n| n.starts_with(&format!("segment {mid} "))),
+            "{:?}",
+            f.notes
+        );
+    }
+
+    // An unreadable segment fails the read, with the same error.
+    let src = OutOfOrder {
+        fail: Some(mid),
+        ..OutOfOrder::new(&sink)
+    };
+    let (one, many, more) = reads(&src);
+    let err = one.expect_err("a store error fails the read");
+    assert!(err.starts_with(&format!("segment {mid}: ")), "{err}");
+    assert_eq!(Err(&err), many.as_ref());
+    assert_eq!(Err(&err), more.as_ref());
+
+    // A garbled segment before an unreadable one: the read ends at the first, as it does
+    // sequentially; the error read past it, out of order, changes nothing.
+    let src = OutOfOrder {
+        garble: Some(mid),
+        fail: Some(mid + 1),
+        ..OutOfOrder::new(&sink)
+    };
+    let (one, many, more) = reads(&src);
+    let one = one.expect("the damage comes first");
+    assert_eq!(Ok(&one), many.as_ref());
+    assert_eq!(Ok(&one), more.as_ref());
 }

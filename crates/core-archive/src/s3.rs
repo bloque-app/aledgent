@@ -155,6 +155,9 @@ pub struct S3Store {
 /// The largest listing page S3 returns.
 const LIST_PAGE: usize = 1000;
 
+/// Idle connections the agent keeps, to the one endpoint it talks to.
+const IDLE_CONNECTIONS: usize = 64;
+
 impl S3Store {
     /// A store over `config`, with credentials from `source`.
     pub fn new(config: S3Config, source: CredentialSource) -> S3Store {
@@ -162,6 +165,10 @@ impl S3Store {
             ureq::Agent::config_builder()
                 .http_status_as_error(false)
                 .timeout_global(Some(Duration::from_secs(60)))
+                // A restore reads many segments at once (`fetch::DEFAULT_CONCURRENCY`): keep a
+                // connection for each reader, not ureq's default three, so none opens TLS anew.
+                .max_idle_connections(IDLE_CONNECTIONS)
+                .max_idle_connections_per_host(IDLE_CONNECTIONS)
                 .build(),
         );
         S3Store {
