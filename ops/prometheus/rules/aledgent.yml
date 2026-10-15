@@ -374,6 +374,16 @@ groups:
         annotations:
           summary: The settlement adapter is not serving; external legs are refused.
           runbook: ops/runbooks/release/settlement-adapter-outage.md
+      # F-027 NOTES decision 52: the layer refused the format on a new runtime, or answered "not
+      # now" to its first transaction `not_now_alert_after` times in a row (about 20 s). Either way
+      # nothing is broadcast on it, and a withdrawal waits unsigned about four minutes before it
+      # ends as never signed, an hour before the oldest-operation page could fire. No `for`.
+      - alert: AledgentAdapterRuntimeUnconfirmed
+        expr: aledgent_adapter_alerts{kind="runtime"} > 0
+        labels: { severity: page, owner: settlement-operations, signal: settlement-adapter }
+        annotations:
+          summary: The settlement layer has not confirmed its runtime; nothing is broadcast on it.
+          runbook: ops/runbooks/release/settlement-adapter-outage.md
       # Blocks come and finality does not: Kreivo's finality follows Kusama's.
       - alert: AledgentFinalityStalled
         expr: aledgent_finality_lag_blocks > 20

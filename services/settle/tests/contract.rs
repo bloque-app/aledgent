@@ -894,6 +894,113 @@ async fn ac_e4_4_t_027_12_a_transient_validity_error_broadcasts_nothing_until_co
     assert_eq!(k.chain.validations(), 3);
 }
 
+/// `AC-E4.4`, `T-027-12`, `REQ-SA-9`, `F-027` NOTES decision 52: "not now" answers that persist
+/// raise the runtime's alert, which pages. `not_now_alert_after` − 1 answers in a row raise
+/// nothing; the next one raises `runtime:<spec_version>`, naming the last answer; the runtime's
+/// confirmation clears it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ac_e4_4_t_027_12_repeated_not_now_answers_raise_the_runtime_alert_until_confirmed() {
+    let mut k = serving_kit(KitOptions::default()).await;
+    let after = k.adapter.config().not_now_alert_after as usize;
+    assert_eq!(after, 10, "the default");
+    let alice = k.d.party("alice", 1_000).await;
+    k.chain
+        .answer_validations(Some(Validity::NotNow("Invalid(Stale)".into())));
+    let op = k.withdrawal(&alice, 10, "held").await;
+    for asked in 1..after {
+        k.step().await.unwrap();
+        assert_eq!(k.chain.validations(), asked, "one answer a step");
+        assert!(
+            !alert_open(&k, "runtime:133").await,
+            "{asked} answers raise nothing"
+        );
+        k.chain.advance(1);
+    }
+    k.chain
+        .answer_validations(Some(Validity::NotNow("Invalid(Payment)".into())));
+    let r = k.step().await.unwrap();
+    assert_eq!((r.signed, r.broadcast), (0, 0), "still nothing goes out");
+    assert_eq!(k.chain.validations(), after);
+    let alerts = k.store.alerts().await.unwrap();
+    let raised = alerts
+        .iter()
+        .find(|a| a.key == "runtime:133" && a.cleared_at.is_none())
+        .expect("raised at the threshold");
+    assert!(
+        raised.detail.contains("Invalid(Payment)") && raised.detail.contains("10 times"),
+        "names the last answer: {}",
+        raised.detail
+    );
+    assert!(
+        k.adapter.status().0,
+        "an alert, not a refusal: {:?}",
+        k.adapter.status()
+    );
+    assert!(served(&k).await.is_empty(), "not confirmed");
+    // The layer confirms: the withdrawal goes out and the alert clears.
+    k.chain.advance(1);
+    k.chain.answer_validations(None);
+    until_all(&mut k, &alice, std::slice::from_ref(&op), "Settled", 5).await;
+    assert_eq!(served(&k).await, vec![(133, "kreivo-133".to_owned())]);
+    assert!(
+        !alert_open(&k, "runtime:133").await,
+        "cleared by the confirmation"
+    );
+}
+
+/// `F-027` NOTES decision 52: a runtime held by "not now" answers and then upgraded away from is
+/// never confirmed itself; the next runtime's confirmation clears its alert, since nothing waits on
+/// it any more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_027_12_a_runtime_upgraded_away_from_has_its_not_now_alert_cleared() {
+    let mut k = serving_kit(KitOptions::default()).await;
+    let after = k.adapter.config().not_now_alert_after as usize;
+    let alice = k.d.party("alice", 1_000).await;
+    k.chain
+        .answer_validations(Some(Validity::NotNow("Invalid(Future)".into())));
+    let op = k.withdrawal(&alice, 10, "upgraded").await;
+    for _ in 0..after {
+        k.step().await.unwrap();
+        k.chain.advance(1);
+    }
+    assert!(alert_open(&k, "runtime:133").await);
+    k.chain.set_spec_version(134);
+    k.chain.answer_validations(None);
+    k.chain.advance(1);
+    until_all(&mut k, &alice, std::slice::from_ref(&op), "Settled", 5).await;
+    assert_eq!(served(&k).await, vec![(134, "kreivo-133".to_owned())]);
+    assert!(!alert_open(&k, "runtime:133").await);
+    assert!(!alert_open(&k, "runtime:134").await);
+}
+
+/// `F-027` NOTES decision 52: a confirmation stored before its alert was cleared (a store error or
+/// a crash in between) leaves `runtime:<spec_version>` open; every later step finds the runtime
+/// confirmed and returns early. The next process clears it once, on its first transaction for the
+/// runtime, instead of paging until another runtime is confirmed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_027_12_an_alert_left_open_by_a_stored_confirmation_is_cleared() {
+    let mut k = serving_kit(KitOptions::default()).await;
+    let alice = k.d.party("alice", 1_000).await;
+    let first = k.withdrawal(&alice, 10, "confirms").await;
+    until_all(&mut k, &alice, std::slice::from_ref(&first), "Settled", 5).await;
+    assert_eq!(served(&k).await, vec![(133, "kreivo-133".to_owned())]);
+    // The crash between storing the confirmation and clearing the alert, recreated.
+    let now = k.now();
+    assert!(
+        k.store
+            .raise("runtime:133", "left open", now)
+            .await
+            .unwrap()
+    );
+    k.restart();
+    let second = k.withdrawal(&alice, 10, "after the restart").await;
+    until_all(&mut k, &alice, std::slice::from_ref(&second), "Settled", 5).await;
+    assert!(
+        !alert_open(&k, "runtime:133").await,
+        "cleared on the next transaction for the confirmed runtime"
+    );
+}
+
 /// `AC-E4.3`, `T-027-12`, `REQ-SA-9`, `F-027` NOTES decision 51: Kreivo upgrades (133 to 134, its
 /// surface unchanged) in a block produced after the step read its best head and before it read the
 /// runtime it signs for. The batch is signed for 134 and validated at the block 134 was read at,
