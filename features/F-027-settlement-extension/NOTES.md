@@ -890,10 +890,11 @@ and 134 give the same surface digest, `2da44f41…`; spec 132 gives `08ee0c93…
 
 ### Open (T-027-12)
 
-- **Not run against a live runtime.** The validation probe's request and the decoding of its answer
-  are written from `sp-runtime`'s `TransactionValidity` and tested against hand-built bytes; the
-  light client's answer to `TaggedTransactionQueue_validate_transaction` was not observed. A
-  validation runs the extensions' `validate`, not the call, so the missing child-trie proof entries
+- **Run against a live runtime, once (2026-10-15, on test).** The validation probe's request and the
+  decoding of its answer are written from `sp-runtime`'s `TransactionValidity` and were tested against
+  hand-built bytes. After Kreivo's runtime upgrade to spec 134, the adapter on test validated a
+  transaction through the runtime, logged that it confirmed the format on `spec_version` 134
+  (format `kreivo-133`), and the next anchor was signed and included. A validation runs the extensions' `validate`, not the call, so the missing child-trie proof entries
   of decisions 36 and 42 should not arise; the zombienet suite is where it can be seen. A probe that
   fails to answer (`ChainError::Unavailable`) ends the step, as a dry run's failure did before decision
   35, and nothing is signed or stored by it.
