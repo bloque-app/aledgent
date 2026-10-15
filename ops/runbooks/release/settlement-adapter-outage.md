@@ -59,7 +59,14 @@ settlement-operations.
      extension's `Custom` error, bytes it cannot decode). The format changed in a way the metadata
      does not show, such as the order of the PASS device's message. Nothing was broadcast. Deploy the
      build with the right format, or name it in `adapter.formats`; a restart asks the layer again. A
-     restart alone with nothing changed is refused again.
+     restart alone with nothing changed is refused again. An upgrade enacted while a step was signing
+     does not cause it: the transaction is validated by the runtime it was signed for, and a refusal
+     from any other runtime is not taken as one (the step signs again). So `unconfirmed` right after
+     an upgrade is still a real format change, not a race to restart away.
+   - **Neither** (no alert, the `warn` log "neither confirmed nor refused", withdrawals acknowledged but
+     not signed): the layer found the first transaction signed on a new runtime invalid *for now* (a
+     nonce, fees, the era), which neither confirms the runtime nor refuses it. Nothing goes out on that runtime until it confirms; each step asks
+     again. If it lasts, check the lane's fees and nonce (step 8) before anything else.
 6. **Database.** If the adapter cannot reach `aledgent_settle`, follow the database server's own failover.
    The adapter resumes from its cursor.
 7. **Keys.** If signing fails, read the signer's log: a signer that cannot log in to Vault or read its

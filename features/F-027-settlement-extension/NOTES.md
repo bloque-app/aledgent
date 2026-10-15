@@ -756,7 +756,8 @@ and 134 give the same surface digest, `2da44f41…`; spec 132 gives `08ee0c93…
     location) stops the adapter until a release or the operator's mapping (decision 49) covers it.
     A false stop was preferred to a false start; the confirmation alone could not tell a type change
     that happens to validate from one that does not.
-47. **The layer's confirmation before the first broadcast on a runtime.** A runtime is its
+47. **The layer's confirmation before the first broadcast on a runtime.** (Where it validates, how a
+    failed call is read, and what a "not now" answer does: amended by decision 51.) A runtime is its
     `spec_version`, its surface's fingerprint and the format chosen. Before the first transaction
     signed on a runtime the store does not record as served is broadcast, on every path that
     broadcasts something newly signed (lane batches, anchors, bindings), the runtime validates it:
@@ -805,6 +806,55 @@ and 134 give the same surface digest, `2da44f41…`; spec 132 gives `08ee0c93…
     `upgrade_to(spec, format)` one to another format, `upgrade(f)` any change. `Chain::validate`
     checks a transaction as the runtime would (decode, challenge and signature in its order, then
     nonce and fees), or answers what a test says (`answer_validations`).
+51. **Validated by the runtime it was signed for; a failed call read by its kind; nothing out until
+    confirmed** (review of PR #13, three findings).
+    - **F1, where the validation runs.** The step read the best head at its start, but the runtime a
+      transaction is signed for was read later (`Chain::runtime`, in `submit`, `anchor` and `binds`),
+      at a newer best head. If Kreivo upgraded between the two reads (133 → 134), the transaction was
+      signed for 134 and validated by 133 at the older head; 133 answered `BadSigner` or `BadProof`
+      (`pallet-pass` answers `BadSigner` for any failed authentication, and the `spec_version` is in
+      the challenge), and the check before refusing compared the runtime *now* (134) with the one
+      chosen (134), found them equal, and refused with `Unconfirmed` until a restart. Now
+      `RuntimeInfo::at` is the block `runtime()` read (hash and number), the chosen runtime carries
+      it, and the validation runs at that block: the runtime that validates is the one signed for.
+      Before a refusal is taken as one of the format, the runtime's version at that block
+      (`Chain::version`, `state_getRuntimeVersion` at its hash) must equal the `spec_version` and
+      `transaction_version` signed for; if not, nothing is confirmed, refused or broadcast, and the
+      next step signs again. The check against the runtime *now* is gone: an upgrade after the
+      validated block says nothing of what that block's runtime answered.
+    - **F2, how a failed validation call is read.** An undecodable transaction was recognised by the
+      text "Bad input data provided" in the error, which a Substrate node's answer carries but the
+      light client's does not: live Kreivo over smoldot answers it as a bare wasm trap. It became
+      `ChainError::Unavailable` on every step, with no refusal, no alert, and the step aborted
+      before anchors and bindings. Now the failure is classed by its kind (`rpc::call_failure`):
+      a transport error of the RPC client (unreachable, connection lost, a timeout) is
+      `Transport`; an answer that the call was not run (a JSON-RPC protocol error, or a server error
+      other than an execution failure: a call proof no peer served, a block it does not know, a
+      runtime it could not load) is `NotRun`; an answer that the runtime ran the call and failed is
+      `Executed`, recognised by each client's own name for that error variant (smoldot's
+      `RuntimeCallError::Execution`, "Error during the execution of the runtime"; a Substrate node's
+      `sp_blockchain::Error::Execution`, "Execution failed"), never by the trap's or the panic's
+      text. `Executed` on a transaction the adapter built is `Refused` (a runtime fails
+      `validate_transaction` only when it cannot decode its arguments: a wrong format); the other
+      two stay `Unavailable` (`rpc::validation_failure`). Trade-off, stated plainly: the variant's
+      name is still text, and a client that names an execution failure otherwise reads as
+      `NotRun`, so `Unavailable`: the old failure mode, for that client only. The other way round, a
+      network failure classed as an execution would be a false stop until restart, which is worse
+      on the light client, whose call proofs fail routinely.
+    - **F3, a "not now" answer.** `Stale`, `Future`, `Payment`, `ExhaustsResources`,
+      `AncientBirthBlock` and every `UnknownTransaction` used to let the first transaction go out
+      under a runtime nobody had confirmed. `REQ-SA-9` says the adapter does not serve until the
+      layer confirms. Now any answer that neither confirms nor refuses broadcasts nothing: nothing
+      is stored, no nonce moves, the calls stay acknowledged and unsigned, and the next step
+      rebuilds the transaction (a new nonce, era and challenge) and asks again. A runtime already
+      confirmed is unchanged: later transactions on it are not validated. Trade-off, stated
+      plainly: a "not now" that persists (a lane short of fees on a new runtime, say) holds every
+      withdrawal on that runtime with no alert of its own, only a `warn` log each step; the lane's
+      fee alert, if it is short, is the signal. The runbook says so.
+    The fake layer now keeps the runtime in each block's state: an upgrade applies to the best block
+    from when it is made and to every block produced after, a block produced before keeps its own,
+    and `validate(at)` checks against the runtime *at `at`*. `before_next_runtime_read` and
+    `before_next_validation` let a test act at a precise point of a step.
 
 ### Tests (T-027-12)
 
@@ -815,13 +865,20 @@ and 134 give the same surface digest, `2da44f41…`; spec 132 gives `08ee0c93…
   by name too, and any changed part (`transaction_version` 14, nine extensions, other types, no types,
   132's surface under 13) selects none; the validation's arguments, and every `InvalidTransaction`
   and `UnknownTransaction` classed. (`config`): `spec_versions` optional, old lists parse, `formats`
-  with an unknown name reported.
+  with an unknown name reported. (`chain::rpc`, decision 51): a validation the runtime ran and failed
+  is `Refused`, smoldot's bare trap and a Substrate node's answer with or without the panic's text;
+  one the client did not run (a call proof not served, an unknown block, a JSON-RPC protocol error)
+  and every transport failure (a timeout, a lost connection) are `Unavailable`, even one whose text
+  reads like an execution failure.
 - **`tests/contract.rs`**: `AC-E4.3` 133 → 134 keeps serving with no configuration and no format entry
   for 134, one validation per runtime, none after a restart; `AC-E4.4` an unchanged surface whose
   validation answers `BadProof`: nothing stored or broadcast, `Unconfirmed`, `runtime:134` alert,
   `ERR-SettlementLayerUnavailable` once declared; an order flipped under 133's surface is refused
   by the (fake) layer itself, and the operator's mapping to `kreivo-132` then settles after
-  confirmation; a transient answer goes out, confirms nothing, and the next batch confirms; a runtime
+  confirmation; a transient answer broadcasts, stores and signs nothing, twice, and the transaction
+  goes out once the layer confirms (decision 51); an upgrade between the step's start and its signing
+  is validated by the new runtime and confirmed, not refused; a refusal by another runtime than the
+  one signed for refuses nothing, and the next step confirms and broadcasts; a runtime
   with unknown types is refused until mapped, then served only after the layer confirms. `T-027-07`'s
   three tests carry over (`upgrade_to` instead of `set_spec_version`; `signed_in` lists formats).
 - **`tests/flow.rs`**: an unknown `transaction_version` and other extensions refuse with

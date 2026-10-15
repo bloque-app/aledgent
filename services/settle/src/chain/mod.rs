@@ -79,6 +79,20 @@ pub struct RuntimeInfo {
     pub pallet: bool,
     /// `System::BlockHashCount`: the longest a mortal era can be.
     pub block_hash_count: u64,
+    /// The block it was read at: the best head when it was read. A transaction signed for this
+    /// runtime is validated at this block, whose runtime it was signed for, never at a head read
+    /// earlier or later (`F-027` NOTES, decision 51).
+    pub at: BlockRef,
+}
+
+/// The version of the runtime at a block: what a transaction's `CheckSpecVersion` and
+/// `CheckTxVersion` implicit data must equal for it to verify there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuntimeVersion {
+    /// Its `spec_version`.
+    pub spec_version: u32,
+    /// Its `transaction_version`.
+    pub transaction_version: u32,
 }
 
 /// A deployment, as its contract stores it: its registration's keys and its head.
@@ -584,8 +598,13 @@ pub type ChainResult<T> = Result<T, ChainError>;
 
 /// The settlement layer. See the module documentation.
 pub trait Chain: Send + Sync + 'static {
-    /// What the runtime is, at the best head.
+    /// What the runtime is, at the best head, and that head ([`RuntimeInfo::at`]): what is read
+    /// of it is read at that one block.
     fn runtime(&self) -> impl Future<Output = ChainResult<RuntimeInfo>> + Send;
+
+    /// The runtime's version at block `at` (`F-027` NOTES, decision 51): checked before the
+    /// layer's refusal of a transaction validated at `at` is taken as a refusal of its format.
+    fn version(&self, at: &BlockRef) -> impl Future<Output = ChainResult<RuntimeVersion>> + Send;
 
     /// The finalized head.
     fn finalized(&self) -> impl Future<Output = ChainResult<BlockRef>> + Send;
@@ -704,7 +723,9 @@ pub trait Chain: Send + Sync + 'static {
     /// Have the runtime validate `extrinsic` at block `at` without including it
     /// (`TaggedTransactionQueue_validate_transaction`, as a transaction from the network): the
     /// layer's own confirmation of a format before the first transaction signed in it on a runtime
-    /// is broadcast (`T-027-12`, `REQ-SA-9`). Nothing is broadcast.
+    /// is broadcast (`T-027-12`, `REQ-SA-9`). Nothing is broadcast. `at` is the block the runtime
+    /// it was signed for was read at ([`RuntimeInfo::at`]), and the runtime that validates it is
+    /// the one at `at`.
     fn validate(
         &self,
         at: &BlockRef,

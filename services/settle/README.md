@@ -178,15 +178,17 @@ and pinned (`services/settle/kreivo-pin*`).
 
 **The layer confirms each runtime before anything is broadcast on it.** The first transaction signed
 on a runtime not served before (its `spec_version`, surface and format) is validated by the runtime
-itself, at the best head, without being included (`TaggedTransactionQueue_validate_transaction`,
-over the light client). Valid: the runtime is recorded as served in the store
-(`migrations/0005_runtimes.sql`, so a restart does not ask again) and the batch goes out. Invalid
-for what it carries (a proof or signer that does not verify, an origin no extension authorised,
-bytes the runtime cannot decode): nothing is stored or broadcast, a `runtime:<spec_version>` alert is
-raised, and the adapter refuses to serve on that runtime (`unconfirmed`) until it restarts or the
-runtime changes. Invalid for now (a nonce, fees, the block's resources): the batch goes out as any
-does, and the next one is validated again. This is what catches a format change the metadata does
-not show, such as the device message's order.
+itself, without being included (`TaggedTransactionQueue_validate_transaction`, over the light
+client), at the block the runtime was read at: the runtime that validates it is the one it was
+signed for, even when an upgrade lands in between. Valid: the runtime is recorded as served in the
+store (`migrations/0005_runtimes.sql`, so a restart does not ask again) and the batch goes out.
+Invalid for what it carries (a proof or signer that does not verify, an origin no extension
+authorised, bytes the runtime cannot decode, which the runtime reports as a failed call): nothing is
+stored or broadcast, a `runtime:<spec_version>` alert is raised, and the adapter refuses to serve on
+that runtime (`unconfirmed`) until it restarts or the runtime changes. Anything else (invalid for
+now: a nonce, fees, the era, the block's resources): nothing is stored or broadcast either, the calls
+wait unsigned, and the next step signs and asks again. This is what catches a format change the
+metadata does not show, such as the device message's order.
 
 `spec_versions`, in a file that still has it, is **informational**: it is accepted, logged at
 start-up, and gates nothing. An operator may instead name the format for a runtime whose surface

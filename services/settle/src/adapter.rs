@@ -17,8 +17,9 @@
 //!    `spec_version` alone decides nothing. So a runtime upgrade the layer reports switches the
 //!    format from the next batch on, and one that changes nothing a transaction carries keeps it.
 //!    **The first transaction signed on a runtime not served before is validated by the runtime
-//!    itself** at the best head (`TaggedTransactionQueue_validate_transaction`) before anything
-//!    is broadcast (`Adapter::confirmed`); the runtime is recorded as served once it is valid.
+//!    itself** (`TaggedTransactionQueue_validate_transaction`), at the block whose runtime it was
+//!    signed for, before anything is broadcast (`Adapter::confirmed`); the runtime is recorded as
+//!    served once it is valid, and nothing goes out on it before (`F-027` NOTES, decision 51).
 //!    Then, while serving, **attest** each bound asset location (`DEC-20`): what the layer's
 //!    metadata states about it at the finalized head, when it changed or half the status lease
 //!    has passed. The core registers assets at those decimals and holds any asset whose location
@@ -318,6 +319,9 @@ struct Chosen {
     /// The runtime, as its confirmation is recorded: `spec_version`, the surface's fingerprint
     /// and the format's name.
     key: String,
+    /// The block the runtime was read at ([`RuntimeInfo::at`]): what is signed for it is
+    /// validated there (`F-027` NOTES, decision 51).
+    at: BlockRef,
 }
 
 /// What a step read that the next one would act on: the finalized and best heads' hashes, and the
@@ -667,30 +671,34 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             },
             surface: runtime.surface.clone(),
             key,
+            at: runtime.at,
         })
     }
 
     /// Whether `ext`, just signed for `chosen`, may be broadcast (`T-027-12`, `REQ-SA-9`): **the
     /// layer's confirmation before the first transaction signed under rules not served before**.
     ///
-    /// On a runtime the store records as served, yes. Otherwise the runtime validates `ext` at the
-    /// best head `best`, as a transaction from the network, without including it:
+    /// On a runtime the store records as served, yes. Otherwise the runtime validates `ext`, as a
+    /// transaction from the network, without including it, **at the block whose runtime `ext` was
+    /// signed for** (`chosen.at`, `F-027` NOTES decision 51): never at a head read before or after
+    /// that runtime was, which an upgrade between the two reads would make another runtime.
     ///
     /// - **valid**: the runtime is recorded as served (it survives a restart) and `ext` goes out;
     /// - **invalid for what it carries** (a proof or signer that does not verify, an origin no
     ///   extension authorised, bytes it cannot decode): nothing is broadcast and the adapter
     ///   refuses to serve on that runtime ([`Refusing::Unconfirmed`], an alert
-    ///   `runtime:<spec_version>`), unless the runtime changed since `ext` was signed, which is
-    ///   then what made it invalid;
-    /// - **invalid for now** (a nonce, fees, the block's resources): no evidence either way. `ext`
-    ///   goes out as any transaction does, and the runtime is neither recorded nor refused: the
-    ///   next transaction signed on it is validated again.
-    async fn confirmed(
-        &mut self,
-        chosen: &Chosen,
-        ext: &SignedExtrinsic,
-        best: &BlockRef,
-    ) -> StepResult<bool> {
+    ///   `runtime:<spec_version>`), once it has checked that the runtime at `chosen.at` is the one
+    ///   `ext` was signed for. If it is not, the refusal is of a transaction signed for another
+    ///   runtime and says nothing of the format: nothing is broadcast, nothing refused, and the
+    ///   next step signs again;
+    /// - **anything else** (invalid for now: a nonce, fees, the era, the block's resources; or an
+    ///   answer it cannot class): neither a confirmation nor a refusal, so nothing is broadcast
+    ///   (`REQ-SA-9`: no service until the layer confirms). Nothing is stored and no nonce moves;
+    ///   the calls stay acknowledged and unsigned, and the next step rebuilds the transaction and
+    ///   asks again.
+    ///
+    /// `false` means `ext` is dropped: the caller stores nothing and puts its calls back.
+    async fn confirmed(&mut self, chosen: &Chosen, ext: &SignedExtrinsic) -> StepResult<bool> {
         if self
             .store
             .runtimes()
@@ -704,7 +712,7 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
         let spec_version = chosen.signing.spec_version;
         let format = chosen.signing.format.name;
         let alert = format!("runtime:{spec_version}");
-        match self.chain.validate(best, ext).await? {
+        match self.chain.validate(&chosen.at, ext).await? {
             Validity::Valid => {
                 self.store
                     .confirm_runtime(&RuntimeRow {
@@ -733,19 +741,26 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                     format,
                     why = %why,
                     "the settlement layer's runtime neither confirmed nor refused the format; \
-                     the transaction goes out, and the next one is validated again"
+                     nothing is broadcast, and the next step signs and asks again"
                 );
-                Ok(true)
+                Ok(false)
             }
             Validity::Refused(why) => {
-                let now_runtime = self.chain.runtime().await?;
-                if self.chosen(&now_runtime).map(|c| c.key).as_ref() != Ok(&chosen.key) {
+                // Decision 51: a refusal is of the format only if the runtime that validated
+                // `ext` is the one it was signed for.
+                let validated = self.chain.version(&chosen.at).await?;
+                if (validated.spec_version, validated.transaction_version)
+                    != (spec_version, chosen.signing.transaction_version)
+                {
                     tracing::warn!(
                         spec_version,
                         format,
+                        validated_spec_version = validated.spec_version,
+                        at = chosen.at.number,
                         why = %why,
-                        "a transaction signed for a runtime that has since changed was refused; \
-                         nothing is broadcast"
+                        "a transaction was validated by another runtime than the one it was \
+                         signed for, and refused; nothing is broadcast or refused, and the next \
+                         step signs again"
                     );
                     return Ok(false);
                 }
@@ -1417,7 +1432,7 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             )
             .await?;
         // T-027-12: the layer's confirmation before the first broadcast on a runtime.
-        if !self.confirmed(&chosen, &signed, best).await? {
+        if !self.confirmed(&chosen, &signed).await? {
             return Ok(());
         }
         // REQ-SA-6: stored before it is broadcast.
@@ -1696,7 +1711,7 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             )
             .await?;
         // T-027-12: the layer's confirmation before the first broadcast on a runtime.
-        if !self.confirmed(&chosen, &signed, best).await? {
+        if !self.confirmed(&chosen, &signed).await? {
             return Ok(());
         }
         // REQ-SA-6: stored before it is broadcast.
@@ -2795,7 +2810,7 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                 .await?;
             // T-027-12: the layer's confirmation before the first broadcast on a runtime. Refused,
             // the batch is never stored: its calls wait, and nothing more is signed.
-            if !self.confirmed(&chosen, &ext, best).await? {
+            if !self.confirmed(&chosen, &ext).await? {
                 for r in batch.into_iter().rev() {
                     ready.push_front(r);
                 }
