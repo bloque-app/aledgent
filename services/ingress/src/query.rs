@@ -27,77 +27,101 @@ use serde::{Deserialize, Serialize};
 
 use crate::wire::{OperationReply, ShownBody};
 
-/// The query string of `balances` and `movements`: exactly one of `account` and `identity`.
+/// Reads the balances of one subject, from one view. Name exactly one subject: `account` for one
+/// account, or `identity` for every account of that identity the caller reaches. Naming both, or
+/// neither, is refused as `ERR-QueryUnbounded`. `asset` narrows the answer to one asset; without it, a row
+/// comes back for every asset the account has held. A parameter this route does not know is
+/// refused as `ERR-NotAuthorised`, never ignored.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BalancesParams {
-    /// One account.
+    /// The subject: one account, as a `did:aledgent:acct:` identifier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
-    /// Every account of one identity the caller reaches.
+    /// The subject: one identity, as a `did:aledgent:id:` identifier. Every account of it the
+    /// caller reaches is read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<String>,
-    /// One asset; every asset held if absent.
+    /// One asset, by its symbol; every asset held if absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asset: Option<String>,
 }
 
-/// The query string of `movements`.
+/// Lists the entries made against a subject's accounts, oldest first, one page at a time. Name
+/// exactly one subject: `account` or `identity`. Naming both, or neither, is refused as
+/// `ERR-QueryUnbounded`. `limit` is required, from 1 to 1000; a
+/// request without it, or past it, is refused the same way. `from` and `to` come together, in
+/// milliseconds since the Unix epoch: `from` is inclusive and `to` is exclusive, and `from` may
+/// not be after `to`. A parameter this route does not know is refused as `ERR-NotAuthorised`,
+/// never ignored. A page may hold fewer movements than `limit` and still carry `next`: keep
+/// passing `next` back as `cursor` until a page comes without one.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MovementsParams {
-    /// The subject: one account.
+    /// The subject: one account, as a `did:aledgent:acct:` identifier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
-    /// The subject: one identity.
+    /// The subject: one identity, as a `did:aledgent:id:` identifier. Every account of it the
+    /// caller reaches is read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<String>,
-    /// Only movements on this account (within an identity's).
+    /// Only movements on this account, which must be one of the subject's (useful when the
+    /// subject is an identity).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_account: Option<String>,
-    /// Only this asset.
+    /// Only this asset, by its symbol.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asset: Option<String>,
-    /// Only `debit` or `credit`.
+    /// Only `debit` or `credit`; any other value is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direction: Option<String>,
-    /// Only against this counterparty.
+    /// Only against this counterparty: the ledger account on the other side of the movement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub counterparty: Option<String>,
-    /// From this time, inclusive.
+    /// From this time, in milliseconds since the Unix epoch. Inclusive: a movement at exactly
+    /// this time is returned. Send it together with `to`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<Time>,
-    /// To this time, inclusive.
+    /// Up to this time, in milliseconds since the Unix epoch. Exclusive: a movement at exactly
+    /// this time is not returned. Send it together with `from`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<Time>,
-    /// The page size. Required: an unbounded page is refused.
+    /// The page size, from 1 to 1000. Required: an unbounded page is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
-    /// The previous page's cursor, hex.
+    /// The previous page's `next`, passed back unchanged. It belongs to the request that made
+    /// it: a cursor sent with other filters is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
 }
 
-/// The query string of `statement`.
+/// Reads one account's statement in one asset for a period, with its opening and closing
+/// balances. `account`, `asset`, `from` and `to` are all required; without `from` or `to` the request is refused as `ERR-QueryUnbounded`, and so is `from` after
+/// `to`, an `as_of` the book has not reached, and a period of more than 1000 movements (ask for a
+/// shorter one, or page through `movements`). A parameter this route does not know is refused as
+/// `ERR-QueryUnbounded` too.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StatementParams {
-    /// The account.
+    /// The account, as a `did:aledgent:acct:` identifier.
     pub account: String,
-    /// The asset.
+    /// The asset, by its symbol.
     pub asset: String,
-    /// The period's start. Required.
+    /// The period's start, in milliseconds since the Unix epoch. Inclusive. Required.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<Time>,
-    /// The period's end. Required.
+    /// The period's end, in milliseconds since the Unix epoch. Exclusive. Required.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<Time>,
-    /// Read at this view (a posting sequence number), for a statement that must not move.
+    /// Read at this view, for a statement that must not move: the `view` of an earlier balances
+    /// or movements read. A view the book has not reached is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub as_of: Option<u64>,
 }
 
-/// The query string of `trial_balance` and `can_spend`.
+/// The query string of `trial_balance` and `can_spend`. `trial_balance` reads only `asset`, which
+/// narrows the check to one asset; it accepts `amount` and ignores it. `can_spend` needs both. Any
+/// other parameter is refused as `ERR-NotAuthorised`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AssetParams {

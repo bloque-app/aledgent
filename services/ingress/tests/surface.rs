@@ -406,6 +406,195 @@ async fn t_009_09_the_queries_of_f_011_reach_the_core_through_ingress() {
         .await;
     assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
     assert!(is_refusal(&u, Refusal::QueryUnbounded), "{u}");
+    // Both subjects, or none, are refused the same way.
+    let (s, u) = d
+        .call(
+            "GET",
+            &format!("/v1/movements?account={a}&identity={a}&limit=2"),
+            t,
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(is_refusal(&u, Refusal::QueryUnbounded), "{u}");
+    let (s, u) = d.call("GET", "/v1/movements?limit=2", t, &[], None).await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(is_refusal(&u, Refusal::QueryUnbounded), "{u}");
+    // A parameter the route does not know is refused, not ignored.
+    let (s, u) = d
+        .call(
+            "GET",
+            &format!("/v1/movements?account={a}&limit=2&acount={a}"),
+            t,
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert!(is_refusal(&u, Refusal::NotAuthorised), "{u}");
+    let (s, u) = d
+        .call(
+            "GET",
+            &format!("/v1/balances?account={a}&since=0"),
+            t,
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert!(is_refusal(&u, Refusal::NotAuthorised), "{u}");
+    // Values the route cannot read are refused at the surface, with the status the guide gives.
+    let b = bob.account.clone().unwrap();
+    let refused = [
+        // A value that does not parse, and a direction that is neither: `ERR-NotAuthorised`.
+        (
+            format!("/v1/movements?account={a}&limit=ten"),
+            StatusCode::FORBIDDEN,
+            Refusal::NotAuthorised,
+        ),
+        (
+            format!("/v1/movements?account={a}&limit=2&direction=sideways"),
+            StatusCode::FORBIDDEN,
+            Refusal::NotAuthorised,
+        ),
+        (
+            "/v1/balances?identity=nobody".to_string(),
+            StatusCode::FORBIDDEN,
+            Refusal::NotAuthorised,
+        ),
+        // The page bounds, a half or reversed range, and a cursor that is not ours: unbounded.
+        (
+            format!("/v1/movements?account={a}&limit=0"),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Refusal::QueryUnbounded,
+        ),
+        (
+            format!("/v1/movements?account={a}&limit=1001"),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Refusal::QueryUnbounded,
+        ),
+        (
+            format!("/v1/movements?account={a}&limit=2&from=0"),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Refusal::QueryUnbounded,
+        ),
+        (
+            format!("/v1/movements?account={a}&limit=2&to=9"),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Refusal::QueryUnbounded,
+        ),
+        (
+            format!("/v1/movements?account={a}&limit=2&from=9&to=3"),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Refusal::QueryUnbounded,
+        ),
+        (
+            format!("/v1/movements?account={a}&limit=2&cursor=zz"),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Refusal::QueryUnbounded,
+        ),
+        // A statement value that does not parse is unbounded too.
+        (
+            format!("/v1/statements?account={a}&asset=USD&from=abc&to=9"),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Refusal::QueryUnbounded,
+        ),
+        (
+            format!("/v1/statements?account={a}&asset=USD&from=9&to=3"),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Refusal::QueryUnbounded,
+        ),
+        // An `on_account` outside the subject's accounts is an unknown account.
+        (
+            format!("/v1/movements?account={a}&limit=2&on_account={b}"),
+            StatusCode::NOT_FOUND,
+            Refusal::UnknownAccount,
+        ),
+    ];
+    for (path, status, refusal) in refused {
+        let (s, r) = d.call("GET", &path, t, &[], None).await;
+        assert_eq!(s, status, "{path}: {r}");
+        assert!(is_refusal(&r, refusal), "{path}: {r}");
+    }
+    // A cursor made for one subject is refused for another.
+    let foreign = p1["next"].as_str().unwrap();
+    let (s, r) = d
+        .call(
+            "GET",
+            &format!("/v1/movements?account={b}&limit=2&cursor={foreign}"),
+            Some(bob.token.as_str()),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{r}");
+    assert!(is_refusal(&r, Refusal::QueryUnbounded), "{r}");
+    // `to` is exclusive over HTTP: a movement exactly at `to` is left out, one a millisecond
+    // earlier is in. The ends are read off the whole list, so no clock is assumed.
+    let (s, all) = d
+        .call(
+            "GET",
+            &format!("/v1/movements?account={a}&limit=100"),
+            t,
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{all}");
+    let ats: Vec<u64> = all["movements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["at"].as_u64().unwrap())
+        .collect();
+    let last = *ats.iter().max().unwrap();
+    for (to, expect) in [
+        (last, ats.iter().filter(|&&x| x < last).count()),
+        (last + 1, ats.len()),
+    ] {
+        let (s, r) = d
+            .call(
+                "GET",
+                &format!("/v1/movements?account={a}&limit=100&from=0&to={to}"),
+                t,
+                &[],
+                None,
+            )
+            .await;
+        assert_eq!(s, StatusCode::OK, "{r}");
+        assert_eq!(r["movements"].as_array().unwrap().len(), expect, "to={to}");
+    }
+    // `from` is inclusive: a range that starts at `last` keeps what is at `last`.
+    let (s, r) = d
+        .call(
+            "GET",
+            &format!(
+                "/v1/movements?account={a}&limit=100&from={last}&to={}",
+                last + 1
+            ),
+            t,
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{r}");
+    assert_eq!(
+        r["movements"].as_array().unwrap().len(),
+        ats.iter().filter(|&&x| x == last).count()
+    );
+    // A statement refuses an unknown parameter as unbounded.
+    let (s, st) = d
+        .call(
+            "GET",
+            &format!("/v1/statements?account={a}&asset=USD&from=0&to=9999999999999&acount={a}"),
+            t,
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(is_refusal(&st, Refusal::QueryUnbounded), "{st}");
     let (s, st) = d
         .call(
             "GET",
