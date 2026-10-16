@@ -50,6 +50,19 @@ fn inline<T: JsonSchema>() -> Value {
     .unwrap_or_default()
 }
 
+/// What `trial_balance` does and which parameters it takes. `amount` is `can_spend`'s: the two
+/// routes share `AssetParams`, so `trial_balance` accepts it and ignores it.
+const TRIAL_BALANCE_DESCRIPTION: &str = "Checks that the book adds up, from one view. It is the \
+    operator's: any other caller is refused as `ERR-NotAuthorised`. `asset` narrows the check to \
+    one asset. The route also accepts `amount`, which belongs to `can_spend`, and ignores it. Any \
+    other parameter is refused as `ERR-NotAuthorised`.";
+
+/// What `can_spend` does and which parameters it takes.
+const CAN_SPEND_DESCRIPTION: &str = "Says whether a spend of `amount` minor units of `asset` from \
+    the account would pass the checks before the kernel, and names the reason if it would not. \
+    Both parameters are required: a missing one is refused as `ERR-QueryUnbounded`. Any other \
+    parameter is refused as `ERR-NotAuthorised`.";
+
 /// The OpenAPI version the document declares.
 pub const OPENAPI_VERSION: &str = "3.1.0";
 
@@ -261,17 +274,19 @@ fn operation(route: &crate::surface::Route) -> Value {
                 QueryRoute::IdentityGrants => (None, "IdentityGrantsBody", false),
             };
             if let Some(s) = params_schema {
-                // The parameters' own doc comment is the operation's description, so the rules
-                // that span several parameters (exactly one subject, the bounds) are written once.
-                let described = matches!(
-                    q,
-                    QueryRoute::Balances
-                        | QueryRoute::Movements
-                        | QueryRoute::Statement
-                        | QueryRoute::TrialBalance
-                        | QueryRoute::CanSpend
-                );
-                if let (true, Some(d)) = (described, s["description"].as_str()) {
+                // For the routes with a struct of their own, the parameters' doc comment is the
+                // operation's description, so the rules that span several parameters (exactly one
+                // subject, the bounds) are written once. The two that share `AssetParams` say
+                // their own.
+                let described: Option<&str> = match q {
+                    QueryRoute::Balances | QueryRoute::Movements | QueryRoute::Statement => {
+                        s["description"].as_str()
+                    }
+                    QueryRoute::TrialBalance => Some(TRIAL_BALANCE_DESCRIPTION),
+                    QueryRoute::CanSpend => Some(CAN_SPEND_DESCRIPTION),
+                    _ => None,
+                };
+                if let Some(d) = described {
                     op.insert("description".into(), json!(d));
                 }
                 let required: Vec<Value> = s["required"].as_array().cloned().unwrap_or_default();

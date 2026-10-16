@@ -27,9 +27,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::wire::{OperationReply, ShownBody};
 
-/// The query string of `balances`. Name exactly one subject: `account` for one account, or
-/// `identity` for every account of that identity the caller reaches. Naming both, or neither, is
-/// refused as `ERR-QueryUnbounded`. `asset` narrows the answer to one asset; without it, a row
+/// Reads the balances of one subject, from one view. Name exactly one subject: `account` for one
+/// account, or `identity` for every account of that identity the caller reaches. Naming both, or
+/// neither, is refused as `ERR-QueryUnbounded`. `asset` narrows the answer to one asset; without it, a row
 /// comes back for every asset the account has held. A parameter this route does not know is
 /// refused as `ERR-NotAuthorised`, never ignored.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -47,8 +47,9 @@ pub struct BalancesParams {
     pub asset: Option<String>,
 }
 
-/// The query string of `movements`. Name exactly one subject: `account` or `identity`. Naming
-/// both, or neither, is refused as `ERR-QueryUnbounded`. `limit` is required, from 1 to 1000; a
+/// Lists the entries made against a subject's accounts, oldest first, one page at a time. Name
+/// exactly one subject: `account` or `identity`. Naming both, or neither, is refused as
+/// `ERR-QueryUnbounded`. `limit` is required, from 1 to 1000; a
 /// request without it, or past it, is refused the same way. `from` and `to` come together, in
 /// milliseconds since the Unix epoch: `from` is inclusive and `to` is exclusive, and `from` may
 /// not be after `to`. A parameter this route does not know is refused as `ERR-NotAuthorised`,
@@ -94,8 +95,8 @@ pub struct MovementsParams {
     pub cursor: Option<String>,
 }
 
-/// The query string of `statement`. `account`, `asset`, `from` and `to` are all required;
-/// without `from` or `to` the request is refused as `ERR-QueryUnbounded`, and so is `from` after
+/// Reads one account's statement in one asset for a period, with its opening and closing
+/// balances. `account`, `asset`, `from` and `to` are all required; without `from` or `to` the request is refused as `ERR-QueryUnbounded`, and so is `from` after
 /// `to`, an `as_of` the book has not reached, and a period of more than 1000 movements (ask for a
 /// shorter one, or page through `movements`). A parameter this route does not know is refused as
 /// `ERR-QueryUnbounded` too.
@@ -112,15 +113,15 @@ pub struct StatementParams {
     /// The period's end, in milliseconds since the Unix epoch. Exclusive. Required.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<Time>,
-    /// Read at this view (a posting sequence number, the `view` an earlier read returned), for
-    /// a statement that must not move.
+    /// Read at this view, for a statement that must not move: the `view` of an earlier balances
+    /// or movements read. A view the book has not reached is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub as_of: Option<u64>,
 }
 
 /// The query string of `trial_balance` and `can_spend`. `trial_balance` reads only `asset`, which
-/// narrows the check to one asset; `can_spend` needs both. A parameter this route does not know is
-/// refused as `ERR-NotAuthorised`, never ignored.
+/// narrows the check to one asset; it accepts `amount` and ignores it. `can_spend` needs both. Any
+/// other parameter is refused as `ERR-NotAuthorised`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AssetParams {
