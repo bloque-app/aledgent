@@ -1483,39 +1483,34 @@ impl<S: LeafStore, V: VaultBackend> Running<S, V> {
             return found.unwrap_or_else(refused);
         }
         if let Query::Grants { account } = query {
-            let found = AccountId::parse(account)
-                .map_err(|_| Refusal::UnknownAccount)
-                .and_then(|a| {
-                    self.ledger.grants_on(&caller, &a, now).map(|gs| {
-                        QueryReply::Grants(crate::wire::GrantsBody {
-                            account: a.to_did(),
-                            items: gs.iter().map(command::grant_view_body).collect(),
-                        })
+            let found = q::account(account).and_then(|a| {
+                self.ledger.grants_on(&caller, &a, now).map(|gs| {
+                    QueryReply::Grants(crate::wire::GrantsBody {
+                        account: a.to_did(),
+                        items: gs.iter().map(command::grant_view_body).collect(),
                     })
-                });
+                })
+            });
             return found.unwrap_or_else(refused);
         }
         if let Query::Account { account } = query {
-            let found = AccountId::parse(account)
-                .map_err(|_| Refusal::UnknownAccount)
+            let found = q::account(account)
                 .and_then(|a| self.ledger.account_view(&caller, &a, now))
                 .map(|a| QueryReply::Account(command::account_view_body(&a)));
             return found.unwrap_or_else(refused);
         }
         // The caller's grants over an identity (amendment 0026).
         if let Query::IdentityGrants { identity } = query {
-            let found = IdentityId::parse(identity)
-                .map_err(|_| Refusal::NotAuthorised)
-                .and_then(|i| {
-                    self.ledger
-                        .grants_over_identity(&caller, &i, now)
-                        .map(|gs| {
-                            QueryReply::IdentityGrants(crate::wire::IdentityGrantsBody {
-                                identity: i.to_did(),
-                                items: gs.iter().map(command::grant_view_body).collect(),
-                            })
+            let found = q::identity(identity).and_then(|i| {
+                self.ledger
+                    .grants_over_identity(&caller, &i, now)
+                    .map(|gs| {
+                        QueryReply::IdentityGrants(crate::wire::IdentityGrantsBody {
+                            identity: i.to_did(),
+                            items: gs.iter().map(command::grant_view_body).collect(),
                         })
-                });
+                    })
+            });
             return found.unwrap_or_else(refused);
         }
         // The operational signals (`F-018`): counts and ages, the operator's.
@@ -1565,7 +1560,7 @@ impl<S: LeafStore, V: VaultBackend> Running<S, V> {
                     &view.trial_balance(&caller, q::asset_id(a.asset.as_deref())?)?,
                 )),
                 Query::CanSpend { account, params } => {
-                    let account = AccountId::parse(account).map_err(|_| Refusal::UnknownAccount)?;
+                    let account = q::account(account)?;
                     let asset =
                         q::asset_id(params.asset.as_deref())?.ok_or(Refusal::QueryUnbounded)?;
                     let amount =
@@ -1593,13 +1588,13 @@ impl<S: LeafStore, V: VaultBackend> Running<S, V> {
                     ))
                 }
                 Query::RecoveryMechanisms { account } => {
-                    let account = AccountId::parse(account).map_err(|_| Refusal::UnknownAccount)?;
+                    let account = q::account(account)?;
                     QueryReply::RecoveryMechanisms(crate::custody::mechanisms_body(
                         &self.ledger.recovery_mechanisms(&caller, &account, now)?,
                     ))
                 }
                 Query::Custody { account } => {
-                    let account = AccountId::parse(account).map_err(|_| Refusal::UnknownAccount)?;
+                    let account = q::account(account)?;
                     QueryReply::Custody(crate::custody::view_body(
                         &self.ledger.custody_view(&caller, &account, now)?,
                     ))

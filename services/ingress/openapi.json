@@ -6034,7 +6034,7 @@
     },
     "/v1/accounts/{account}/can-spend": {
       "get": {
-        "description": "Says whether a spend of `amount` minor units of `asset` from the account would pass the checks before the kernel, and names the reason if it would not. Both parameters are required: a missing one is refused as `ERR-QueryUnbounded`. Any other parameter is refused as `ERR-NotAuthorised`.",
+        "description": "Says whether a spend of `amount` minor units of `asset` from the account would pass the checks before the kernel, and names the reason if it would not. Both parameters are required: a missing one is refused as `ERR-QueryUnbounded`. Any other parameter, and an `amount` that is not a count of minor units, is refused as `ERR-MalformedCommand`.",
         "operationId": "can_spend",
         "parameters": [
           {
@@ -6913,7 +6913,7 @@
     },
     "/v1/balances": {
       "get": {
-        "description": "Reads the balances of one subject, from one view. Name exactly one subject: `account` for one\naccount, or `identity` for every account of that identity the caller reaches. Naming both, or\nneither, is refused as `ERR-QueryUnbounded`. `asset` narrows the answer to one asset; without it, a row\ncomes back for every asset the account has held. A parameter this route does not know is\nrefused as `ERR-NotAuthorised`, never ignored.",
+        "description": "Reads the balances of one subject, from one view. Name exactly one subject: `account` for one\naccount, or `identity` for every account of that identity the caller reaches. Naming both, or\nneither, is refused as `ERR-QueryUnbounded`. `asset` narrows the answer to one asset; without it, a row\ncomes back for every asset the account has held. A parameter this route does not know, or an\n`account` or `identity` that is not a valid identifier, is refused as `ERR-MalformedCommand`\n(amendment 0032, `REQ-ER-3`), never ignored.",
         "operationId": "balances",
         "parameters": [
           {
@@ -7752,7 +7752,7 @@
             "name": "direction",
             "required": false,
             "schema": {
-              "description": "Only `debit` or `credit`; any other value is refused.",
+              "description": "Only `debit` or `credit`; any other value is refused as `ERR-MalformedCommand`.",
               "type": [
                 "string",
                 "null"
@@ -7790,8 +7790,8 @@
             "name": "limit",
             "required": false,
             "schema": {
-              "description": "The page size, from 1 to 1000. Required: an unbounded page is refused.",
-              "format": "uint32",
+              "description": "The page size, from 1 to 1000. Required: an unbounded page is refused. A count above\n1000 is a count outside the bound (`ERR-QueryUnbounded`), whatever its size; a value that\nis not a non-negative integer is a shape fault (`ERR-MalformedCommand`).",
+              "format": "uint64",
               "minimum": 0,
               "type": [
                 "integer",
@@ -11657,7 +11657,7 @@
     },
     "/v1/statements": {
       "get": {
-        "description": "Reads one account's statement in one asset for a period, with its opening and closing\nbalances. `account`, `asset`, `from` and `to` are all required; without `from` or `to` the request is refused as `ERR-QueryUnbounded`, and so is `from` after\n`to`, an `as_of` the book has not reached, and a period of more than 1000 movements (ask for a\nshorter one, or page through `movements`). A parameter this route does not know is refused as\n`ERR-QueryUnbounded` too.",
+        "description": "Reads one account's statement in one asset for a period, with its opening and closing\nbalances. `account`, `asset`, `from` and `to` are all required; without any of them the request\nis refused as `ERR-QueryUnbounded`, and so is `from` after `to`, an `as_of` the book has not\nreached, and a period of more than 1000 movements (ask for a shorter one, or page through\n`movements`). A parameter this route does not know, a value that does not parse (`from=abc`)\nand an `account` that is not a valid identifier are refused as `ERR-MalformedCommand`\n(amendment 0032, `REQ-ER-3`).",
         "operationId": "statement",
         "parameters": [
           {
@@ -11665,8 +11665,11 @@
             "name": "account",
             "required": true,
             "schema": {
-              "description": "The account, as a `did:aledgent:acct:` identifier.",
-              "type": "string"
+              "description": "The account, as a `did:aledgent:acct:` identifier. Required: a missing one is\n`ERR-QueryUnbounded` (`REQ-CS-5`).",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           {
@@ -11688,8 +11691,11 @@
             "name": "asset",
             "required": true,
             "schema": {
-              "description": "The asset, by its symbol.",
-              "type": "string"
+              "description": "The asset, by its symbol. Required, as `account` is.",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           {
@@ -11847,7 +11853,7 @@
     },
     "/v1/trial-balance": {
       "get": {
-        "description": "Checks that the book adds up, from one view. It is the operator's: any other caller is refused as `ERR-NotAuthorised`. `asset` narrows the check to one asset. The route also accepts `amount`, which belongs to `can_spend`, and ignores it. Any other parameter is refused as `ERR-NotAuthorised`.",
+        "description": "Checks that the book adds up, from one view. It is the operator's: any other caller is refused as `ERR-NotAuthorised`. `asset` narrows the check to one asset. The route also accepts `amount`, which belongs to `can_spend`, and ignores it. Any other parameter is refused as `ERR-MalformedCommand`.",
         "operationId": "trial_balance",
         "parameters": [
           {

@@ -30,8 +30,9 @@ use crate::wire::{OperationReply, ShownBody};
 /// Reads the balances of one subject, from one view. Name exactly one subject: `account` for one
 /// account, or `identity` for every account of that identity the caller reaches. Naming both, or
 /// neither, is refused as `ERR-QueryUnbounded`. `asset` narrows the answer to one asset; without it, a row
-/// comes back for every asset the account has held. A parameter this route does not know is
-/// refused as `ERR-NotAuthorised`, never ignored.
+/// comes back for every asset the account has held. A parameter this route does not know, or an
+/// `account` or `identity` that is not a valid identifier, is refused as `ERR-MalformedCommand`
+/// (amendment 0032, `REQ-ER-3`), never ignored.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BalancesParams {
@@ -72,7 +73,7 @@ pub struct MovementsParams {
     /// Only this asset, by its symbol.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asset: Option<String>,
-    /// Only `debit` or `credit`; any other value is refused.
+    /// Only `debit` or `credit`; any other value is refused as `ERR-MalformedCommand`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direction: Option<String>,
     /// Only against this counterparty: the ledger account on the other side of the movement.
@@ -86,9 +87,11 @@ pub struct MovementsParams {
     /// this time is not returned. Send it together with `from`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<Time>,
-    /// The page size, from 1 to 1000. Required: an unbounded page is refused.
+    /// The page size, from 1 to 1000. Required: an unbounded page is refused. A count above
+    /// 1000 is a count outside the bound (`ERR-QueryUnbounded`), whatever its size; a value that
+    /// is not a non-negative integer is a shape fault (`ERR-MalformedCommand`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<u32>,
+    pub limit: Option<u64>,
     /// The previous page's `next`, passed back unchanged. It belongs to the request that made
     /// it: a cursor sent with other filters is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -96,17 +99,22 @@ pub struct MovementsParams {
 }
 
 /// Reads one account's statement in one asset for a period, with its opening and closing
-/// balances. `account`, `asset`, `from` and `to` are all required; without `from` or `to` the request is refused as `ERR-QueryUnbounded`, and so is `from` after
-/// `to`, an `as_of` the book has not reached, and a period of more than 1000 movements (ask for a
-/// shorter one, or page through `movements`). A parameter this route does not know is refused as
-/// `ERR-QueryUnbounded` too.
+/// balances. `account`, `asset`, `from` and `to` are all required; without any of them the request
+/// is refused as `ERR-QueryUnbounded`, and so is `from` after `to`, an `as_of` the book has not
+/// reached, and a period of more than 1000 movements (ask for a shorter one, or page through
+/// `movements`). A parameter this route does not know, a value that does not parse (`from=abc`)
+/// and an `account` that is not a valid identifier are refused as `ERR-MalformedCommand`
+/// (amendment 0032, `REQ-ER-3`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StatementParams {
-    /// The account, as a `did:aledgent:acct:` identifier.
-    pub account: String,
-    /// The asset, by its symbol.
-    pub asset: String,
+    /// The account, as a `did:aledgent:acct:` identifier. Required: a missing one is
+    /// `ERR-QueryUnbounded` (`REQ-CS-5`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// The asset, by its symbol. Required, as `account` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset: Option<String>,
     /// The period's start, in milliseconds since the Unix epoch. Inclusive. Required.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<Time>,
@@ -121,7 +129,8 @@ pub struct StatementParams {
 
 /// The query string of `trial_balance` and `can_spend`. `trial_balance` reads only `asset`, which
 /// narrows the check to one asset; it accepts `amount` and ignores it. `can_spend` needs both. Any
-/// other parameter is refused as `ERR-NotAuthorised`.
+/// other parameter, and an `amount` that is not a count of minor units, are refused as
+/// `ERR-MalformedCommand` (amendment 0032, `REQ-ER-3`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AssetParams {
@@ -631,17 +640,23 @@ pub fn operation(v: &OperationView) -> OperationReply {
     }
 }
 
-fn account(s: &str) -> Result<AccountId, Refusal> {
-    AccountId::parse(s).map_err(|_| Refusal::UnknownAccount)
+/// An account identifier a read names, in a parameter or in the path. One that does not parse is
+/// a shape fault, `ERR-MalformedCommand`; a well-formed one the caller does not reach is
+/// `ERR-UnknownAccount`, which the core decides (amendment 0032, `REQ-ER-3`).
+pub fn account(s: &str) -> Result<AccountId, Refusal> {
+    AccountId::parse(s).map_err(|_| Refusal::MalformedCommand)
+}
+
+/// An identity identifier a read names: as [`account`].
+pub fn identity(s: &str) -> Result<IdentityId, Refusal> {
+    IdentityId::parse(s).map_err(|_| Refusal::MalformedCommand)
 }
 
 /// The subject of a query: exactly one of an account and an identity, else unbounded.
-pub fn subject(account_: Option<&str>, identity: Option<&str>) -> Result<Subject, Refusal> {
-    match (account_, identity) {
+pub fn subject(account_: Option<&str>, identity_: Option<&str>) -> Result<Subject, Refusal> {
+    match (account_, identity_) {
         (Some(a), None) => Ok(Subject::Account(account(a)?)),
-        (None, Some(i)) => Ok(Subject::Identity(
-            IdentityId::parse(i).map_err(|_| Refusal::NotAuthorised)?,
-        )),
+        (None, Some(i)) => Ok(Subject::Identity(identity(i)?)),
         _ => Err(Refusal::QueryUnbounded),
     }
 }
@@ -651,14 +666,15 @@ pub fn asset_id(s: Option<&str>) -> Result<Option<AssetId>, Refusal> {
     s.map(AssetId::parse).transpose()
 }
 
-/// An amount in minor units.
+/// An amount in minor units, as a query parameter: digits only. A value that is not a count of
+/// minor units does not parse, `ERR-MalformedCommand` (amendment 0032, `REQ-ER-3`).
 pub fn minor(s: &str) -> Result<Minor, Refusal> {
     if s.is_empty() || !s.bytes().all(|c| c.is_ascii_digit()) {
-        return Err(Refusal::PrecisionExceeded);
+        return Err(Refusal::MalformedCommand);
     }
     s.parse::<u64>()
         .map(Minor::new)
-        .map_err(|_| Refusal::PrecisionExceeded)
+        .map_err(|_| Refusal::MalformedCommand)
 }
 
 /// `movements`' request.
@@ -677,16 +693,17 @@ pub fn movements_request(p: &MovementsParams) -> Result<MovementsRequest, Refusa
                 None => None,
                 Some("debit") => Some(Direction::Debit),
                 Some("credit") => Some(Direction::Credit),
-                Some(_) => return Err(Refusal::NotAuthorised),
+                Some(_) => return Err(Refusal::MalformedCommand),
             },
             counterparty: p.counterparty.as_deref().map(account).transpose()?,
             time,
         },
-        limit: p.limit,
+        // A count past `u32` is past 1000 all the same: the core refuses it as unbounded.
+        limit: p.limit.map(|l| u32::try_from(l).unwrap_or(u32::MAX)),
         cursor: match &p.cursor {
             None => None,
             Some(c) => Some(Cursor::from_bytes(
-                hex::decode(c).map_err(|_| Refusal::QueryUnbounded)?,
+                hex::decode(c).map_err(|_| Refusal::MalformedCommand)?,
             )),
         },
     })
@@ -695,17 +712,82 @@ pub fn movements_request(p: &MovementsParams) -> Result<MovementsRequest, Refusa
 /// `statement`'s request.
 pub fn statement_request(p: &StatementParams) -> Result<StatementRequest, Refusal> {
     Ok(StatementRequest {
-        account: account(&p.account)?,
-        asset: AssetId::parse(&p.asset)?,
+        account: account(p.account.as_deref().ok_or(Refusal::QueryUnbounded)?)?,
+        asset: AssetId::parse(p.asset.as_deref().ok_or(Refusal::QueryUnbounded)?)?,
         from: p.from,
         to: p.to,
         as_of: p.as_of,
     })
 }
 
-/// An operation reference.
+/// An operation reference. One that does not parse is a shape fault, `ERR-MalformedCommand`; a
+/// well-formed one the caller does not reach is `ERR-UnknownOperation`.
 pub fn reference(s: &str) -> Result<OperationId, Refusal> {
-    OperationId::parse(s).map_err(|_| Refusal::UnknownOperation)
+    OperationId::parse(s).map_err(|_| Refusal::MalformedCommand)
+}
+
+/// The shape of a query as the surface decides it, before the core is asked anything
+/// (amendment 0032, `REQ-ER-3`): every identifier parses, `direction` is one of its two values,
+/// `cursor` is hex, and `amount` is a count of minor units. What is *absent* or *conflicting* is
+/// not a shape fault and is left to the bounds (`ERR-QueryUnbounded`, `REQ-CS-5`); so is what
+/// parses but names nothing the caller reaches (`ERR-UnknownAccount`, `ERR-UnknownAsset`).
+pub fn shape(q: &crate::boundary::Query) -> Result<(), Refusal> {
+    use crate::boundary::Query;
+    let each = |ids: &[Option<&str>]| {
+        ids.iter()
+            .flatten()
+            .try_for_each(|s| account(s).map(|_| ()))
+    };
+    match q {
+        Query::Balances(p) => {
+            each(&[p.account.as_deref()])?;
+            p.identity.as_deref().map(identity).transpose()?;
+        }
+        Query::Movements(p) => {
+            each(&[
+                p.account.as_deref(),
+                p.on_account.as_deref(),
+                p.counterparty.as_deref(),
+            ])?;
+            p.identity.as_deref().map(identity).transpose()?;
+            if !matches!(p.direction.as_deref(), None | Some("debit" | "credit")) {
+                return Err(Refusal::MalformedCommand);
+            }
+            if let Some(c) = &p.cursor {
+                hex::decode(c).map_err(|_| Refusal::MalformedCommand)?;
+            }
+        }
+        Query::Statement(p) => each(&[p.account.as_deref()])?,
+        Query::Operation { reference: r } => {
+            reference(r)?;
+        }
+        Query::CanSpend { account: a, params } => {
+            account(a)?;
+            params.amount.as_deref().map(minor).transpose()?;
+        }
+        Query::RecoveryTerms { identity: i } | Query::IdentityGrants { identity: i } => {
+            identity(i)?;
+        }
+        Query::RecoveryMechanisms { account: a }
+        | Query::Custody { account: a }
+        | Query::Grants { account: a }
+        | Query::Account { account: a } => {
+            account(a)?;
+        }
+        Query::Assets
+        | Query::TrialBalance(_)
+        | Query::Undelivered
+        | Query::Instructions
+        | Query::Calls
+        | Query::Evidence
+        | Query::Anchor
+        | Query::VerifyDisclosure { .. }
+        | Query::Anchoring
+        | Query::Signals
+        | Query::IntegratingParties
+        | Query::Alias { .. } => {}
+    }
+    Ok(())
 }
 
 #[cfg(test)]

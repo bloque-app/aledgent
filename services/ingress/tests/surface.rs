@@ -410,7 +410,10 @@ async fn t_009_09_the_queries_of_f_011_reach_the_core_through_ingress() {
     let (s, u) = d
         .call(
             "GET",
-            &format!("/v1/movements?account={a}&identity={a}&limit=2"),
+            &format!(
+                "/v1/movements?account={a}&identity={}&limit=2",
+                alice.identity
+            ),
             t,
             &[],
             None,
@@ -421,7 +424,8 @@ async fn t_009_09_the_queries_of_f_011_reach_the_core_through_ingress() {
     let (s, u) = d.call("GET", "/v1/movements?limit=2", t, &[], None).await;
     assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
     assert!(is_refusal(&u, Refusal::QueryUnbounded), "{u}");
-    // A parameter the route does not know is refused, not ignored.
+    // A parameter the route does not know is refused, not ignored: a shape fault, 400
+    // (amendment 0032, `REQ-ER-3`), not a permissions problem.
     let (s, u) = d
         .call(
             "GET",
@@ -431,8 +435,8 @@ async fn t_009_09_the_queries_of_f_011_reach_the_core_through_ingress() {
             None,
         )
         .await;
-    assert_eq!(s, StatusCode::FORBIDDEN);
-    assert!(is_refusal(&u, Refusal::NotAuthorised), "{u}");
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(is_refusal(&u, Refusal::MalformedCommand), "{u}");
     let (s, u) = d
         .call(
             "GET",
@@ -442,81 +446,161 @@ async fn t_009_09_the_queries_of_f_011_reach_the_core_through_ingress() {
             None,
         )
         .await;
-    assert_eq!(s, StatusCode::FORBIDDEN);
-    assert!(is_refusal(&u, Refusal::NotAuthorised), "{u}");
-    // Values the route cannot read are refused at the surface, with the status the guide gives.
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(is_refusal(&u, Refusal::MalformedCommand), "{u}");
+    // Every read's shape fault is `ERR-MalformedCommand` (400); what is missing or conflicting
+    // is `ERR-QueryUnbounded` (422); what parses but names nothing keeps its own condition
+    // (amendment 0032, `REQ-ER-3`, `REQ-CS-5`). Each row of the mapping, over HTTP, for
+    // balances, movements and statements.
     let b = bob.account.clone().unwrap();
+    let bad = (StatusCode::BAD_REQUEST, Refusal::MalformedCommand);
+    let unbounded = (StatusCode::UNPROCESSABLE_ENTITY, Refusal::QueryUnbounded);
+    let unknown_account = (StatusCode::NOT_FOUND, Refusal::UnknownAccount);
     let refused = [
-        // A value that does not parse, and a direction that is neither: `ERR-NotAuthorised`.
+        // A parameter the route does not know, or a repeated one.
+        (format!("/v1/balances?account={a}&acount={a}"), bad),
+        (format!("/v1/movements?account={a}&limit=2&since=0"), bad),
+        (format!("/v1/movements?account={a}&limit=2&limit=3"), bad),
         (
-            format!("/v1/movements?account={a}&limit=ten"),
-            StatusCode::FORBIDDEN,
-            Refusal::NotAuthorised,
+            format!("/v1/statements?account={a}&asset=USD&from=0&to=9&since=0"),
+            bad,
         ),
+        // A value that does not parse into its type.
+        (format!("/v1/movements?account={a}&limit=ten"), bad),
+        (format!("/v1/movements?account={a}&limit=-1"), bad),
+        (format!("/v1/movements?account={a}&limit="), bad),
         (
-            format!("/v1/movements?account={a}&limit=2&direction=sideways"),
-            StatusCode::FORBIDDEN,
-            Refusal::NotAuthorised,
+            format!("/v1/movements?account={a}&limit=2&from=abc&to=9"),
+            bad,
         ),
-        (
-            "/v1/balances?identity=nobody".to_string(),
-            StatusCode::FORBIDDEN,
-            Refusal::NotAuthorised,
-        ),
-        // The page bounds, a half or reversed range, and a cursor that is not ours: unbounded.
-        (
-            format!("/v1/movements?account={a}&limit=0"),
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Refusal::QueryUnbounded,
-        ),
-        (
-            format!("/v1/movements?account={a}&limit=1001"),
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Refusal::QueryUnbounded,
-        ),
-        (
-            format!("/v1/movements?account={a}&limit=2&from=0"),
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Refusal::QueryUnbounded,
-        ),
-        (
-            format!("/v1/movements?account={a}&limit=2&to=9"),
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Refusal::QueryUnbounded,
-        ),
-        (
-            format!("/v1/movements?account={a}&limit=2&from=9&to=3"),
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Refusal::QueryUnbounded,
-        ),
-        (
-            format!("/v1/movements?account={a}&limit=2&cursor=zz"),
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Refusal::QueryUnbounded,
-        ),
-        // A statement value that does not parse is unbounded too.
         (
             format!("/v1/statements?account={a}&asset=USD&from=abc&to=9"),
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Refusal::QueryUnbounded,
+            bad,
+        ),
+        (
+            format!("/v1/statements?account={a}&asset=USD&from=0&to=9&as_of=soon"),
+            bad,
+        ),
+        // An enumerated value outside its set.
+        (
+            format!("/v1/movements?account={a}&limit=2&direction=sideways"),
+            bad,
+        ),
+        // An account or identity that does not parse, as a subject or as a filter.
+        ("/v1/balances?identity=nobody".to_string(), bad),
+        ("/v1/balances?account=nobody".to_string(), bad),
+        ("/v1/movements?identity=nobody&limit=2".to_string(), bad),
+        ("/v1/movements?account=nobody&limit=2".to_string(), bad),
+        (
+            format!("/v1/movements?account={a}&limit=2&on_account=x"),
+            bad,
+        ),
+        (
+            format!("/v1/movements?account={a}&limit=2&counterparty=x"),
+            bad,
+        ),
+        (
+            "/v1/statements?account=nobody&asset=USD&from=0&to=9".to_string(),
+            bad,
+        ),
+        // A cursor that is not hex.
+        (format!("/v1/movements?account={a}&limit=2&cursor=zz"), bad),
+        // A shape fault is found before a bound: a bad value and a missing limit.
+        (format!("/v1/movements?account={a}&direction=sideways"), bad),
+        // The bounds. No subject, or two; a page size outside 1 to 1000, however large.
+        (format!("/v1/movements?account={a}&limit=0"), unbounded),
+        (format!("/v1/movements?account={a}&limit=1001"), unbounded),
+        (
+            format!("/v1/movements?account={a}&limit=5000000000"),
+            unbounded,
+        ),
+        (
+            format!("/v1/movements?account={a}&limit=99999999999999999999"),
+            bad,
+        ),
+        ("/v1/balances".to_string(), unbounded),
+        (
+            format!("/v1/balances?account={a}&identity={}", alice.identity),
+            unbounded,
+        ),
+        // A half or reversed time range.
+        (
+            format!("/v1/movements?account={a}&limit=2&from=0"),
+            unbounded,
+        ),
+        (format!("/v1/movements?account={a}&limit=2&to=9"), unbounded),
+        (
+            format!("/v1/movements?account={a}&limit=2&from=9&to=3"),
+            unbounded,
+        ),
+        // A cursor that is hex but is not one issued for this request.
+        (
+            format!("/v1/movements?account={a}&limit=2&cursor=00ff"),
+            unbounded,
+        ),
+        // A statement without its account, asset or period, or over its bounds.
+        ("/v1/statements".to_string(), unbounded),
+        (
+            "/v1/statements?asset=USD&from=0&to=9".to_string(),
+            unbounded,
+        ),
+        (format!("/v1/statements?account={a}&from=0&to=9"), unbounded),
+        (
+            format!("/v1/statements?account={a}&asset=USD&to=9"),
+            unbounded,
+        ),
+        (
+            format!("/v1/statements?account={a}&asset=USD&from=0"),
+            unbounded,
         ),
         (
             format!("/v1/statements?account={a}&asset=USD&from=9&to=3"),
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Refusal::QueryUnbounded,
+            unbounded,
         ),
-        // An `on_account` outside the subject's accounts is an unknown account.
+        (
+            format!("/v1/statements?account={a}&asset=USD&from=0&to=9&as_of=999999999"),
+            unbounded,
+        ),
+        // A well-formed account the caller does not reach, and an `on_account` outside the
+        // subject's, keep their own condition.
         (
             format!("/v1/movements?account={a}&limit=2&on_account={b}"),
-            StatusCode::NOT_FOUND,
-            Refusal::UnknownAccount,
+            unknown_account,
         ),
+        (format!("/v1/balances?account={b}"), unknown_account),
+        // The routes that name an identifier in the path, and `can_spend`'s amount.
+        (
+            "/v1/accounts/nobody/can-spend?asset=USD&amount=1".to_string(),
+            bad,
+        ),
+        (
+            format!("/v1/accounts/{a}/can-spend?asset=USD&amount=12x"),
+            bad,
+        ),
+        (
+            format!("/v1/accounts/{a}/can-spend?asset=USD&amount=1&x=1"),
+            bad,
+        ),
+        (format!("/v1/accounts/{a}/can-spend?asset=USD"), unbounded),
+        ("/v1/operations/nobody".to_string(), bad),
     ];
-    for (path, status, refusal) in refused {
+    for (path, (status, refusal)) in refused {
         let (s, r) = d.call("GET", &path, t, &[], None).await;
         assert_eq!(s, status, "{path}: {r}");
         assert!(is_refusal(&r, refusal), "{path}: {r}");
     }
+    // The operator's trial balance reads an unknown parameter the same way.
+    let (s, r) = d
+        .call(
+            "GET",
+            "/v1/trial-balance?since=0",
+            Some(&d.operator.token),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{r}");
+    assert!(is_refusal(&r, Refusal::MalformedCommand), "{r}");
     // A cursor made for one subject is refused for another.
     let foreign = p1["next"].as_str().unwrap();
     let (s, r) = d
@@ -583,7 +667,7 @@ async fn t_009_09_the_queries_of_f_011_reach_the_core_through_ingress() {
         r["movements"].as_array().unwrap().len(),
         ats.iter().filter(|&&x| x == last).count()
     );
-    // A statement refuses an unknown parameter as unbounded.
+    // A statement refuses an unknown parameter as a shape fault, as every read does.
     let (s, st) = d
         .call(
             "GET",
@@ -593,8 +677,8 @@ async fn t_009_09_the_queries_of_f_011_reach_the_core_through_ingress() {
             None,
         )
         .await;
-    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
-    assert!(is_refusal(&st, Refusal::QueryUnbounded), "{st}");
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(is_refusal(&st, Refusal::MalformedCommand), "{st}");
     let (s, st) = d
         .call(
             "GET",
@@ -615,6 +699,7 @@ async fn t_009_09_the_queries_of_f_011_reach_the_core_through_ingress() {
             None,
         )
         .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{st}");
     assert!(is_refusal(&st, Refusal::QueryUnbounded), "{s} {st}");
     let (s, assets) = d.call("GET", "/v1/assets", t, &[], None).await;
     assert_eq!(s, StatusCode::OK);
