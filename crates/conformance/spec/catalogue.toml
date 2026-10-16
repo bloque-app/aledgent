@@ -304,7 +304,7 @@ condition = "A query was submitted without bounds that aledgent can serve (`REQ-
 
 [[error]]
 id = "ERR-MalformedCommand"
-condition = "The request does not have a shape aledgent accepts: a field unknown, missing or of the wrong type, a value that does not parse, or a body over its bound (`REQ-ER-3`)"
+condition = "The request does not have a shape aledgent accepts: a field unknown or of the wrong type, a field a command requires and lacks, a value that does not parse, or a body over its bound (`REQ-ER-3`)"
 
 [[error]]
 id = "ERR-InitialStateNotSealed"

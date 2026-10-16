@@ -2943,7 +2943,7 @@ and the book can never disagree about whether value moved:
 | `ERR-NotDisclosable` | The subject has not authorised this disclosure, and no legal obligation applies |
 | `ERR-AnchorNotFinal` | An anchor was cited whose publication has not reached finality (`REQ-PR-8`) |
 | `ERR-QueryUnbounded` | A query was submitted without bounds that aledgent can serve (`REQ-CS-5`) |
-| `ERR-MalformedCommand` | The request does not have a shape aledgent accepts: a field unknown, missing or of the wrong type, a value that does not parse, or a body over its bound (`REQ-ER-3`) |
+| `ERR-MalformedCommand` | The request does not have a shape aledgent accepts: a field unknown or of the wrong type, a field a command requires and lacks, a value that does not parse, or a body over its bound (`REQ-ER-3`) |
 | `ERR-InitialStateNotSealed` | The initial state committed at the book's genesis is not yet in place and checked, and the book takes no command until it is sealed (`REQ-RC-6`) |
 | `ERR-IdentifierArchived` | The identifier is one a prior system issued that the book's initial state deliberately left out: it names no ledger account and never will (`REQ-RC-7`) |
 | `ERR-Internal` | An unexpected fault inside aledgent. No detail is returned to the caller, and an incident is raised (`REQ-ER-2`) |
@@ -2969,17 +2969,22 @@ command. Two things are not shape faults, and keep their own conditions:
   multi-leg submission over the published maximum is `ERR-BatchTooLarge` (`REQ-CS-10`).
 - **A proof of possession that does not verify, or does not decode,** is `ERR-CredentialInvalid`. So is
   anything sent to the routes that authenticate by what their body carries: they deny by default (`NFR-7`).
+
 A read's shape is held to the same rule. A read, on the query surface or the operator surface, whose shape
-aledgent does not accept MUST be refused with `ERR-MalformedCommand`, and nothing is read: a parameter the
-route does not know, or one that is repeated; a value that does not parse into the type of its parameter; an
-enumerated value outside its set; an account, identity or operation identifier, in a parameter or in the
-path, that does not parse; and a cursor that is not hex. A parameter that is **missing**, or bounds that
-**conflict**, are not shape faults. They keep `ERR-QueryUnbounded` (`REQ-CS-5`): no subject, or two; no
+aledgent does not accept MUST be refused with `ERR-MalformedCommand`, and nothing is read. A shape fault is
+found before anything is read, as it is for a command. It is: a parameter the route does not know, or one
+that is repeated; a value that does not parse into the type of its parameter, where any value made of digits
+is a count; an enumerated value outside its set; an account, identity or operation identifier, in a
+parameter or in the path, that does not parse; an asset symbol that is not 2 to 12 ASCII letters and digits;
+an alias source that cannot be one; and a cursor that is not hex. A parameter that is **missing**, or bounds
+that **conflict**, are not shape faults. They keep `ERR-QueryUnbounded` (`REQ-CS-5`): no subject, or two; no
 page size, or one outside 1 to 1000, however large; half a time range, or one reversed; a cursor issued for
-other filters; a statement without its account, asset or period; a statement period over its bound; a view
-the book has not reached. A value that parses but names nothing the caller may read keeps the condition for
-that (`ERR-UnknownAccount`, `ERR-UnknownAsset`, `ERR-UnknownOperation`, `ERR-NotAuthorised`).
-*Proposed; waits for the owner (amendment 0032).*
+other filters; a statement without its account, asset, `from` or `to`; a statement period over its bound; an
+`as_of` the book has not reached. A value that parses but names nothing the caller may read keeps the
+condition for that (`ERR-UnknownAccount`, `ERR-UnknownAsset`, `ERR-UnknownOperation`, `ERR-NotAuthorised`).
+One read keeps a condition of its own: a disclosure to verify that is missing, or is not hex, is
+`ERR-DisclosureUnsupported`, because aledgent cannot make the assertion. This paragraph is about reads. It
+changes nothing for commands. *Proposed; waits for the owner (amendment 0032).*
 
 A shape refusal names no field and quotes nothing the caller sent (`REQ-AU-8`).
 
