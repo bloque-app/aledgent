@@ -261,6 +261,19 @@ fn operation(route: &crate::surface::Route) -> Value {
                 QueryRoute::IdentityGrants => (None, "IdentityGrantsBody", false),
             };
             if let Some(s) = params_schema {
+                // The parameters' own doc comment is the operation's description, so the rules
+                // that span several parameters (exactly one subject, the bounds) are written once.
+                let described = matches!(
+                    q,
+                    QueryRoute::Balances
+                        | QueryRoute::Movements
+                        | QueryRoute::Statement
+                        | QueryRoute::TrialBalance
+                        | QueryRoute::CanSpend
+                );
+                if let (true, Some(d)) = (described, s["description"].as_str()) {
+                    op.insert("description".into(), json!(d));
+                }
                 let required: Vec<Value> = s["required"].as_array().cloned().unwrap_or_default();
                 if let Some(props) = s["properties"].as_object() {
                     for (name, schema) in props {

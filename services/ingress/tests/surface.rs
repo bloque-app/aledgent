@@ -406,6 +406,56 @@ async fn t_009_09_the_queries_of_f_011_reach_the_core_through_ingress() {
         .await;
     assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
     assert!(is_refusal(&u, Refusal::QueryUnbounded), "{u}");
+    // Both subjects, or none, are refused the same way.
+    let (s, u) = d
+        .call(
+            "GET",
+            &format!("/v1/movements?account={a}&identity={a}&limit=2"),
+            t,
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(is_refusal(&u, Refusal::QueryUnbounded), "{u}");
+    let (s, u) = d.call("GET", "/v1/movements?limit=2", t, &[], None).await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(is_refusal(&u, Refusal::QueryUnbounded), "{u}");
+    // A parameter the route does not know is refused, not ignored.
+    let (s, u) = d
+        .call(
+            "GET",
+            &format!("/v1/movements?account={a}&limit=2&acount={a}"),
+            t,
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert!(is_refusal(&u, Refusal::NotAuthorised), "{u}");
+    let (s, u) = d
+        .call(
+            "GET",
+            &format!("/v1/balances?account={a}&since=0"),
+            t,
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert!(is_refusal(&u, Refusal::NotAuthorised), "{u}");
+    // A statement refuses an unknown parameter as unbounded.
+    let (s, st) = d
+        .call(
+            "GET",
+            &format!("/v1/statements?account={a}&asset=USD&from=0&to=9999999999999&acount={a}"),
+            t,
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(is_refusal(&st, Refusal::QueryUnbounded), "{st}");
     let (s, st) = d
         .call(
             "GET",
