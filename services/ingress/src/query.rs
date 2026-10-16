@@ -27,11 +27,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::wire::{OperationReply, ShownBody};
 
+/// A count in a query string: digits only, and saturating, so that a count past what a `u64`
+/// holds is still a count, and one past the bound (`ERR-QueryUnbounded`), not a shape fault.
+/// Anything that is not made of digits does not parse (`ERR-MalformedCommand`).
+fn count<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    let Some(s) = Option::<String>::deserialize(d)? else {
+        return Ok(None);
+    };
+    if s.is_empty() || !s.bytes().all(|c| c.is_ascii_digit()) {
+        return Err(serde::de::Error::custom("not a count"));
+    }
+    Ok(Some(s.parse::<u64>().unwrap_or(u64::MAX)))
+}
+
 /// Reads the balances of one subject, from one view. Name exactly one subject: `account` for one
 /// account, or `identity` for every account of that identity the caller reaches. Naming both, or
 /// neither, is refused as `ERR-QueryUnbounded`. `asset` narrows the answer to one asset; without it, a row
 /// comes back for every asset the account has held. A parameter this route does not know, or an
-/// `account` or `identity` that is not a valid identifier, is refused as `ERR-MalformedCommand`
+/// `account`, `identity` or `asset` that is not a valid identifier or symbol, is refused as `ERR-MalformedCommand`
 /// (amendment 0032, `REQ-ER-3`), never ignored.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -53,8 +66,10 @@ pub struct BalancesParams {
 /// `ERR-QueryUnbounded`. `limit` is required, from 1 to 1000; a
 /// request without it, or past it, is refused the same way. `from` and `to` come together, in
 /// milliseconds since the Unix epoch: `from` is inclusive and `to` is exclusive, and `from` may
-/// not be after `to`. A parameter this route does not know is refused as `ERR-NotAuthorised`,
-/// never ignored. A page may hold fewer movements than `limit` and still carry `next`: keep
+/// not be after `to`. A parameter this route does not know, a value that does not parse
+/// (`limit=ten`), a `direction` that is neither `debit` nor `credit`, an account, identity or
+/// asset that is not a valid identifier or symbol, and a `cursor` that is not hex are refused as
+/// `ERR-MalformedCommand` (amendment 0032, `REQ-ER-3`), never ignored. A page may hold fewer movements than `limit` and still carry `next`: keep
 /// passing `next` back as `cursor` until a page comes without one.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -87,10 +102,15 @@ pub struct MovementsParams {
     /// this time is not returned. Send it together with `from`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<Time>,
-    /// The page size, from 1 to 1000. Required: an unbounded page is refused. A count above
-    /// 1000 is a count outside the bound (`ERR-QueryUnbounded`), whatever its size; a value that
-    /// is not a non-negative integer is a shape fault (`ERR-MalformedCommand`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The page size, from 1 to 1000. Required: an unbounded page is refused. Any value made of
+    /// digits is a count, and one above 1000 is outside the bound (`ERR-QueryUnbounded`),
+    /// however many digits it has; a value that is not made of digits is a shape fault
+    /// (`ERR-MalformedCommand`).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "count"
+    )]
     pub limit: Option<u64>,
     /// The previous page's `next`, passed back unchanged. It belongs to the request that made
     /// it: a cursor sent with other filters is refused.
@@ -103,7 +123,7 @@ pub struct MovementsParams {
 /// is refused as `ERR-QueryUnbounded`, and so is `from` after `to`, an `as_of` the book has not
 /// reached, and a period of more than 1000 movements (ask for a shorter one, or page through
 /// `movements`). A parameter this route does not know, a value that does not parse (`from=abc`)
-/// and an `account` that is not a valid identifier are refused as `ERR-MalformedCommand`
+/// and an `account` or `asset` that is not a valid identifier or symbol are refused as `ERR-MalformedCommand`
 /// (amendment 0032, `REQ-ER-3`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -129,8 +149,8 @@ pub struct StatementParams {
 
 /// The query string of `trial_balance` and `can_spend`. `trial_balance` reads only `asset`, which
 /// narrows the check to one asset; it accepts `amount` and ignores it. `can_spend` needs both. Any
-/// other parameter, and an `amount` that is not a count of minor units, are refused as
-/// `ERR-MalformedCommand` (amendment 0032, `REQ-ER-3`).
+/// other parameter, an `asset` that is not a valid symbol and an `amount` that is not a count of
+/// minor units are refused as `ERR-MalformedCommand` (amendment 0032, `REQ-ER-3`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AssetParams {
@@ -661,9 +681,13 @@ pub fn subject(account_: Option<&str>, identity_: Option<&str>) -> Result<Subjec
     }
 }
 
-/// An optional asset.
+/// An optional asset, by its symbol. A symbol that cannot be one (not 2 to 12 ASCII letters and
+/// digits) is a shape fault, `ERR-MalformedCommand`; the grammar is [`AssetId::parse`]'s, which is
+/// left as it is for commands. A well-formed symbol that is not in the registry is
+/// `ERR-UnknownAsset`, which the core decides (amendment 0032, `REQ-ER-3`).
 pub fn asset_id(s: Option<&str>) -> Result<Option<AssetId>, Refusal> {
-    s.map(AssetId::parse).transpose()
+    s.map(|s| AssetId::parse(s).map_err(|_| Refusal::MalformedCommand))
+        .transpose()
 }
 
 /// An amount in minor units, as a query parameter: digits only. A value that is not a count of
@@ -713,7 +737,7 @@ pub fn movements_request(p: &MovementsParams) -> Result<MovementsRequest, Refusa
 pub fn statement_request(p: &StatementParams) -> Result<StatementRequest, Refusal> {
     Ok(StatementRequest {
         account: account(p.account.as_deref().ok_or(Refusal::QueryUnbounded)?)?,
-        asset: AssetId::parse(p.asset.as_deref().ok_or(Refusal::QueryUnbounded)?)?,
+        asset: asset_id(p.asset.as_deref())?.ok_or(Refusal::QueryUnbounded)?,
         from: p.from,
         to: p.to,
         as_of: p.as_of,
@@ -728,7 +752,7 @@ pub fn reference(s: &str) -> Result<OperationId, Refusal> {
 
 /// The shape of a query as the surface decides it, before the core is asked anything
 /// (amendment 0032, `REQ-ER-3`): every identifier parses, `direction` is one of its two values,
-/// `cursor` is hex, and `amount` is a count of minor units. What is *absent* or *conflicting* is
+/// `cursor` is hex, `amount` is a count of minor units, and an asset is a symbol. What is *absent* or *conflicting* is
 /// not a shape fault and is left to the bounds (`ERR-QueryUnbounded`, `REQ-CS-5`); so is what
 /// parses but names nothing the caller reaches (`ERR-UnknownAccount`, `ERR-UnknownAsset`).
 pub fn shape(q: &crate::boundary::Query) -> Result<(), Refusal> {
@@ -742,6 +766,7 @@ pub fn shape(q: &crate::boundary::Query) -> Result<(), Refusal> {
         Query::Balances(p) => {
             each(&[p.account.as_deref()])?;
             p.identity.as_deref().map(identity).transpose()?;
+            asset_id(p.asset.as_deref())?;
         }
         Query::Movements(p) => {
             each(&[
@@ -750,6 +775,7 @@ pub fn shape(q: &crate::boundary::Query) -> Result<(), Refusal> {
                 p.counterparty.as_deref(),
             ])?;
             p.identity.as_deref().map(identity).transpose()?;
+            asset_id(p.asset.as_deref())?;
             if !matches!(p.direction.as_deref(), None | Some("debit" | "credit")) {
                 return Err(Refusal::MalformedCommand);
             }
@@ -757,12 +783,19 @@ pub fn shape(q: &crate::boundary::Query) -> Result<(), Refusal> {
                 hex::decode(c).map_err(|_| Refusal::MalformedCommand)?;
             }
         }
-        Query::Statement(p) => each(&[p.account.as_deref()])?,
+        Query::Statement(p) => {
+            each(&[p.account.as_deref()])?;
+            asset_id(p.asset.as_deref())?;
+        }
+        Query::TrialBalance(p) => {
+            asset_id(p.asset.as_deref())?;
+        }
         Query::Operation { reference: r } => {
             reference(r)?;
         }
         Query::CanSpend { account: a, params } => {
             account(a)?;
+            asset_id(params.asset.as_deref())?;
             params.amount.as_deref().map(minor).transpose()?;
         }
         Query::RecoveryTerms { identity: i } | Query::IdentityGrants { identity: i } => {
@@ -775,7 +808,6 @@ pub fn shape(q: &crate::boundary::Query) -> Result<(), Refusal> {
             account(a)?;
         }
         Query::Assets
-        | Query::TrialBalance(_)
         | Query::Undelivered
         | Query::Instructions
         | Query::Calls

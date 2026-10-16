@@ -456,6 +456,7 @@ async fn t_009_09_the_queries_of_f_011_reach_the_core_through_ingress() {
     let bad = (StatusCode::BAD_REQUEST, Refusal::MalformedCommand);
     let unbounded = (StatusCode::UNPROCESSABLE_ENTITY, Refusal::QueryUnbounded);
     let unknown_account = (StatusCode::NOT_FOUND, Refusal::UnknownAccount);
+    let unknown_asset = (StatusCode::NOT_FOUND, Refusal::UnknownAsset);
     let refused = [
         // A parameter the route does not know, or a repeated one.
         (format!("/v1/balances?account={a}&acount={a}"), bad),
@@ -505,6 +506,27 @@ async fn t_009_09_the_queries_of_f_011_reach_the_core_through_ingress() {
         ),
         // A cursor that is not hex.
         (format!("/v1/movements?account={a}&limit=2&cursor=zz"), bad),
+        // An asset that cannot be a symbol (not 2 to 12 ASCII letters and digits), empty or
+        // not: a shape fault. A missing statement asset stays unbounded (below), and a symbol
+        // that is well formed and not in the registry keeps `ERR-UnknownAsset`.
+        (format!("/v1/balances?account={a}&asset=US$"), bad),
+        (format!("/v1/balances?account={a}&asset="), bad),
+        (format!("/v1/balances?account={a}&asset=U"), bad),
+        (format!("/v1/balances?account={a}&asset=ABCDEFGHIJKLM"), bad),
+        (format!("/v1/movements?account={a}&limit=2&asset=US$"), bad),
+        (
+            format!("/v1/statements?account={a}&asset=US$&from=0&to=9"),
+            bad,
+        ),
+        (
+            format!("/v1/accounts/{a}/can-spend?asset=US$&amount=1"),
+            bad,
+        ),
+        (format!("/v1/balances?account={a}&asset=ZZZ"), unknown_asset),
+        (
+            format!("/v1/statements?account={a}&asset=ZZZ&from=0&to=9"),
+            unknown_asset,
+        ),
         // A shape fault is found before a bound: a bad value and a missing limit.
         (format!("/v1/movements?account={a}&direction=sideways"), bad),
         // The bounds. No subject, or two; a page size outside 1 to 1000, however large.
@@ -514,9 +536,10 @@ async fn t_009_09_the_queries_of_f_011_reach_the_core_through_ingress() {
             format!("/v1/movements?account={a}&limit=5000000000"),
             unbounded,
         ),
+        // Any value made of digits is a count, however many: past the bound, not unparseable.
         (
             format!("/v1/movements?account={a}&limit=99999999999999999999"),
-            bad,
+            unbounded,
         ),
         ("/v1/balances".to_string(), unbounded),
         (
@@ -583,9 +606,68 @@ async fn t_009_09_the_queries_of_f_011_reach_the_core_through_ingress() {
         ),
         (format!("/v1/accounts/{a}/can-spend?asset=USD"), unbounded),
         ("/v1/operations/nobody".to_string(), bad),
+        // Every read that names an account or an identity in the path: a malformed one is a
+        // shape fault, and so is an unknown parameter.
+        ("/v1/accounts/nobody".to_string(), bad),
+        ("/v1/accounts/nobody/grants".to_string(), bad),
+        ("/v1/accounts/nobody/custody".to_string(), bad),
+        ("/v1/accounts/nobody/recovery-mechanisms".to_string(), bad),
+        ("/v1/identities/nobody/grants".to_string(), bad),
+        ("/v1/identities/nobody/recovery-terms".to_string(), bad),
+        (format!("/v1/accounts/{a}?x=1"), bad),
+        (format!("/v1/accounts/{a}/custody?x=1"), bad),
+        // An identity where an account is wanted, and the reverse, is a shape fault too.
+        (format!("/v1/accounts/{}", alice.identity), bad),
+        (format!("/v1/identities/{a}/grants"), bad),
+        // A well-formed account the caller does not reach keeps `ERR-UnknownAccount`.
+        (format!("/v1/accounts/{b}"), unknown_account),
+        (format!("/v1/accounts/{b}/custody"), unknown_account),
+        (
+            format!("/v1/accounts/{b}/recovery-mechanisms"),
+            unknown_account,
+        ),
+        (
+            format!("/v1/accounts/{b}/can-spend?asset=USD&amount=1"),
+            unknown_account,
+        ),
     ];
     for (path, (status, refusal)) in refused {
         let (s, r) = d.call("GET", &path, t, &[], None).await;
+        assert_eq!(s, status, "{path}: {r}");
+        assert!(is_refusal(&r, refusal), "{path}: {r}");
+    }
+    // The operator's reads: aliases and disclosure verification, and the trial balance's asset.
+    let op = Some(d.operator.token.as_str());
+    let bad_source = "x".repeat(17);
+    let operator_reads = [
+        ("/v1/aliases?source=system-role&name=x&x=1".to_string(), bad),
+        (format!("/v1/aliases?source={bad_source}&name=x"), bad),
+        // A malformed source is a shape fault, found before the missing name.
+        (format!("/v1/aliases?source={bad_source}"), bad),
+        ("/v1/aliases?source=".to_string(), bad),
+        ("/v1/aliases?source=system-role".to_string(), unbounded),
+        ("/v1/aliases?name=x".to_string(), unbounded),
+        ("/v1/trial-balance?asset=US$".to_string(), bad),
+        // `disclosures/verify` keeps `ERR-DisclosureUnsupported` for a disclosure that is
+        // missing or not hex (a deliberate exception); an unknown parameter is a shape fault.
+        (
+            "/v1/disclosures/verify".to_string(),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Refusal::DisclosureUnsupported,
+            ),
+        ),
+        (
+            "/v1/disclosures/verify?disclosure=zz".to_string(),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Refusal::DisclosureUnsupported,
+            ),
+        ),
+        ("/v1/disclosures/verify?disclosure=00&x=1".to_string(), bad),
+    ];
+    for (path, (status, refusal)) in operator_reads {
+        let (s, r) = d.call("GET", &path, op, &[], None).await;
         assert_eq!(s, status, "{path}: {r}");
         assert!(is_refusal(&r, refusal), "{path}: {r}");
     }

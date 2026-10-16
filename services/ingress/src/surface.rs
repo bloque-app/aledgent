@@ -1965,6 +1965,12 @@ fn query_unchecked(
         }
         QueryRoute::Alias => {
             let p: AliasParams = params(raw)?;
+            // A source that cannot be one is a shape fault, found before a missing name is
+            // (amendment 0032).
+            p.source
+                .as_deref()
+                .map(crate::operator::alias_source)
+                .transpose()?;
             Query::Alias {
                 source: p.source.ok_or(Refusal::QueryUnbounded)?,
                 name: p.name.ok_or(Refusal::QueryUnbounded)?,

@@ -55,14 +55,15 @@ fn inline<T: JsonSchema>() -> Value {
 const TRIAL_BALANCE_DESCRIPTION: &str = "Checks that the book adds up, from one view. It is the \
     operator's: any other caller is refused as `ERR-NotAuthorised`. `asset` narrows the check to \
     one asset. The route also accepts `amount`, which belongs to `can_spend`, and ignores it. Any \
-    other parameter is refused as `ERR-MalformedCommand`.";
+    other parameter, and an `asset` that is not a valid symbol, is refused as \
+    `ERR-MalformedCommand`.";
 
 /// What `can_spend` does and which parameters it takes.
 const CAN_SPEND_DESCRIPTION: &str = "Says whether a spend of `amount` minor units of `asset` from \
     the account would pass the checks before the kernel, and names the reason if it would not. \
     Both parameters are required: a missing one is refused as `ERR-QueryUnbounded`. Any other \
-    parameter, and an `amount` that is not a count of minor units, is refused as \
-    `ERR-MalformedCommand`.";
+    parameter, an `asset` that is not a valid symbol and an `amount` that is not a count of \
+    minor units are refused as `ERR-MalformedCommand`.";
 
 /// The OpenAPI version the document declares.
 pub const OPENAPI_VERSION: &str = "3.1.0";

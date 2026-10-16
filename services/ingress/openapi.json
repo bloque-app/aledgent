@@ -4323,7 +4323,7 @@
             "additionalProperties": false,
             "properties": {
               "description": {
-                "const": "The request does not have a shape aledgent accepts: a field unknown, missing or of the wrong type, a value that does not parse, or a body over its bound (`REQ-ER-3`)"
+                "const": "The request does not have a shape aledgent accepts: a field unknown or of the wrong type, a field a command requires and lacks, a value that does not parse, or a body over its bound (`REQ-ER-3`)"
               },
               "error": {
                 "const": "ERR-MalformedCommand"
@@ -6034,7 +6034,7 @@
     },
     "/v1/accounts/{account}/can-spend": {
       "get": {
-        "description": "Says whether a spend of `amount` minor units of `asset` from the account would pass the checks before the kernel, and names the reason if it would not. Both parameters are required: a missing one is refused as `ERR-QueryUnbounded`. Any other parameter, and an `amount` that is not a count of minor units, is refused as `ERR-MalformedCommand`.",
+        "description": "Says whether a spend of `amount` minor units of `asset` from the account would pass the checks before the kernel, and names the reason if it would not. Both parameters are required: a missing one is refused as `ERR-QueryUnbounded`. Any other parameter, an `asset` that is not a valid symbol and an `amount` that is not a count of minor units are refused as `ERR-MalformedCommand`.",
         "operationId": "can_spend",
         "parameters": [
           {
@@ -6913,7 +6913,7 @@
     },
     "/v1/balances": {
       "get": {
-        "description": "Reads the balances of one subject, from one view. Name exactly one subject: `account` for one\naccount, or `identity` for every account of that identity the caller reaches. Naming both, or\nneither, is refused as `ERR-QueryUnbounded`. `asset` narrows the answer to one asset; without it, a row\ncomes back for every asset the account has held. A parameter this route does not know, or an\n`account` or `identity` that is not a valid identifier, is refused as `ERR-MalformedCommand`\n(amendment 0032, `REQ-ER-3`), never ignored.",
+        "description": "Reads the balances of one subject, from one view. Name exactly one subject: `account` for one\naccount, or `identity` for every account of that identity the caller reaches. Naming both, or\nneither, is refused as `ERR-QueryUnbounded`. `asset` narrows the answer to one asset; without it, a row\ncomes back for every asset the account has held. A parameter this route does not know, or an\n`account`, `identity` or `asset` that is not a valid identifier or symbol, is refused as `ERR-MalformedCommand`\n(amendment 0032, `REQ-ER-3`), never ignored.",
         "operationId": "balances",
         "parameters": [
           {
@@ -7696,7 +7696,7 @@
     },
     "/v1/movements": {
       "get": {
-        "description": "Lists the entries made against a subject's accounts, oldest first, one page at a time. Name\nexactly one subject: `account` or `identity`. Naming both, or neither, is refused as\n`ERR-QueryUnbounded`. `limit` is required, from 1 to 1000; a\nrequest without it, or past it, is refused the same way. `from` and `to` come together, in\nmilliseconds since the Unix epoch: `from` is inclusive and `to` is exclusive, and `from` may\nnot be after `to`. A parameter this route does not know is refused as `ERR-NotAuthorised`,\nnever ignored. A page may hold fewer movements than `limit` and still carry `next`: keep\npassing `next` back as `cursor` until a page comes without one.",
+        "description": "Lists the entries made against a subject's accounts, oldest first, one page at a time. Name\nexactly one subject: `account` or `identity`. Naming both, or neither, is refused as\n`ERR-QueryUnbounded`. `limit` is required, from 1 to 1000; a\nrequest without it, or past it, is refused the same way. `from` and `to` come together, in\nmilliseconds since the Unix epoch: `from` is inclusive and `to` is exclusive, and `from` may\nnot be after `to`. A parameter this route does not know, a value that does not parse\n(`limit=ten`), a `direction` that is neither `debit` nor `credit`, an account, identity or\nasset that is not a valid identifier or symbol, and a `cursor` that is not hex are refused as\n`ERR-MalformedCommand` (amendment 0032, `REQ-ER-3`), never ignored. A page may hold fewer movements than `limit` and still carry `next`: keep\npassing `next` back as `cursor` until a page comes without one.",
         "operationId": "movements",
         "parameters": [
           {
@@ -7790,7 +7790,7 @@
             "name": "limit",
             "required": false,
             "schema": {
-              "description": "The page size, from 1 to 1000. Required: an unbounded page is refused. A count above\n1000 is a count outside the bound (`ERR-QueryUnbounded`), whatever its size; a value that\nis not a non-negative integer is a shape fault (`ERR-MalformedCommand`).",
+              "description": "The page size, from 1 to 1000. Required: an unbounded page is refused. Any value made of\ndigits is a count, and one above 1000 is outside the bound (`ERR-QueryUnbounded`),\nhowever many digits it has; a value that is not made of digits is a shape fault\n(`ERR-MalformedCommand`).",
               "format": "uint64",
               "minimum": 0,
               "type": [
@@ -11657,7 +11657,7 @@
     },
     "/v1/statements": {
       "get": {
-        "description": "Reads one account's statement in one asset for a period, with its opening and closing\nbalances. `account`, `asset`, `from` and `to` are all required; without any of them the request\nis refused as `ERR-QueryUnbounded`, and so is `from` after `to`, an `as_of` the book has not\nreached, and a period of more than 1000 movements (ask for a shorter one, or page through\n`movements`). A parameter this route does not know, a value that does not parse (`from=abc`)\nand an `account` that is not a valid identifier are refused as `ERR-MalformedCommand`\n(amendment 0032, `REQ-ER-3`).",
+        "description": "Reads one account's statement in one asset for a period, with its opening and closing\nbalances. `account`, `asset`, `from` and `to` are all required; without any of them the request\nis refused as `ERR-QueryUnbounded`, and so is `from` after `to`, an `as_of` the book has not\nreached, and a period of more than 1000 movements (ask for a shorter one, or page through\n`movements`). A parameter this route does not know, a value that does not parse (`from=abc`)\nand an `account` or `asset` that is not a valid identifier or symbol are refused as `ERR-MalformedCommand`\n(amendment 0032, `REQ-ER-3`).",
         "operationId": "statement",
         "parameters": [
           {
@@ -11853,7 +11853,7 @@
     },
     "/v1/trial-balance": {
       "get": {
-        "description": "Checks that the book adds up, from one view. It is the operator's: any other caller is refused as `ERR-NotAuthorised`. `asset` narrows the check to one asset. The route also accepts `amount`, which belongs to `can_spend`, and ignores it. Any other parameter is refused as `ERR-MalformedCommand`.",
+        "description": "Checks that the book adds up, from one view. It is the operator's: any other caller is refused as `ERR-NotAuthorised`. `asset` narrows the check to one asset. The route also accepts `amount`, which belongs to `can_spend`, and ignores it. Any other parameter, and an `asset` that is not a valid symbol, is refused as `ERR-MalformedCommand`.",
         "operationId": "trial_balance",
         "parameters": [
           {
