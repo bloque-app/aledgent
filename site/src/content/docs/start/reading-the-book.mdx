@@ -1,0 +1,261 @@
+---
+title: Reading the book
+description: Balances, filtered and paged movements, statements and the trial balance, with a request and a reply for each.
+sidebar:
+  order: 2
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Everything you can ask the book is a `GET` on ingress, with your bearer token. A read never changes
+anything and never enters the log of commands. Each read is answered from **one consistent view** of
+the book, and the answer says which: the `view` field is the sequence number of the last posting the
+answer includes.
+
+The examples below use three shell variables: `$INGRESS` (the service's address), `$TOKEN` (your
+bearer token) and `$ACCOUNT` (a `did:aledgent:acct:` identifier you can reach). Amounts are
+decimal-integer strings of minor units, and times are milliseconds since the Unix epoch.
+
+You see only what your credential reaches. An account outside that reach is refused as
+`ERR-UnknownAccount`, exactly as if it did not exist.
+
+## Balances
+
+`GET /v1/balances` answers "how much is there, and in what state". Name **exactly one subject**:
+`account` for one account, or `identity` for every account of that identity you reach. `asset`
+narrows the answer to one asset; without it you get a row for every asset the account has held.
+
+```sh
+curl -G "$INGRESS/v1/balances" \
+  -H "Authorization: Bearer $TOKEN" \
+  --data-urlencode "account=$ACCOUNT" \
+  --data-urlencode "asset=USD"
+```
+
+```json
+{
+  "view": 4181,
+  "rows": [
+    {
+      "account": "did:aledgent:acct:…",
+      "asset": "USD",
+      "available": "970",
+      "reserved": "0",
+      "encumbered": "0",
+      "total": "970"
+    }
+  ]
+}
+```
+
+Each kind of balance is labelled, and `total` is their sum. Only `available` decides whether a spend
+passes. `reserved` is value held for open reservations, and `encumbered` is held under standing rules
+(always zero for now). A treasury account may be below zero, so each figure is a *signed* string.
+
+Reference: [`balances`](../../api/operations/balances/).
+
+## Movements
+
+`GET /v1/movements` lists the entries made against an account, oldest first, a page at a time. A
+movement is one entry against one account: a transfer between two accounts shows as a debit on one
+and a credit on the other.
+
+**Subject (required, exactly one).** `account`, or `identity` for every account of it you reach.
+
+**Filters (all optional, and they combine).**
+
+| Parameter | Keeps only |
+| --- | --- |
+| `on_account` | Movements on this account. It must be one of the subject's, so it is most useful when the subject is an identity |
+| `asset` | Movements in this asset, by its symbol |
+| `direction` | `debit` or `credit`. Any other value is refused |
+| `counterparty` | Movements against this ledger account, the one on the other side |
+| `from`, `to` | Movements in a period, in milliseconds since the Unix epoch. **`from` is inclusive and `to` is exclusive**, so a movement exactly at `to` is not returned, and consecutive periods that share a boundary never overlap. Send both or neither |
+
+**Page (`limit` required).** `limit` is the page size, from 1 to 1000. There is no default and no
+way to ask for everything.
+
+```sh
+curl -G "$INGRESS/v1/movements" \
+  -H "Authorization: Bearer $TOKEN" \
+  --data-urlencode "account=$ACCOUNT" \
+  --data-urlencode "asset=USD" \
+  --data-urlencode "direction=debit" \
+  --data-urlencode "from=1760000000000" \
+  --data-urlencode "to=1760600000000" \
+  --data-urlencode "limit=2"
+```
+
+```json
+{
+  "view": 4181,
+  "movements": [
+    {
+      "seq": 4102,
+      "at": 1760021840112,
+      "kind": "transfer",
+      "status": "completed",
+      "operation": "did:aledgent:op:…",
+      "account": "did:aledgent:acct:…",
+      "balance": "available",
+      "asset": "USD",
+      "direction": "debit",
+      "amount": "10",
+      "counterparty": "did:aledgent:acct:…",
+      "authorities": [
+        {
+          "kind": "owner",
+          "principal": "did:aledgent:id:…",
+          "credential": "did:aledgent:cred:…"
+        }
+      ],
+      "reference": { "invoice": "inv-8812" }
+    }
+  ],
+  "next": "9c41…"
+}
+```
+
+`status` is `held`, `completed`, `returned`, `reversed` or `opening`. `balance` says which kind of
+balance the entry moved: `available`, `reserved` or `encumbered`. `authorities` names who caused the
+entry and under what grant. `counterparty` is absent where there is no account on the other side.
+`reference` is the pass-through data its operation was submitted with, exactly as sent. It is shown
+only to principals of the integrating party that submitted it.
+
+### Paging
+
+When more movements match, the reply carries `next`. Pass it back **unchanged** as `cursor`, with the
+same subject and filters, to get the following page. Keep going until a reply comes **without**
+`next`.
+
+```sh
+cursor=""
+while :; do
+  page=$(curl -s -G "$INGRESS/v1/movements" \
+    -H "Authorization: Bearer $TOKEN" \
+    --data-urlencode "account=$ACCOUNT" \
+    --data-urlencode "limit=100" \
+    ${cursor:+--data-urlencode "cursor=$cursor"})
+  echo "$page" | jq -c '.movements[]'
+  cursor=$(echo "$page" | jq -r '.next // empty')
+  [ -z "$cursor" ] && break
+done
+```
+
+- Every page of one list is read at the **first page's view**, so postings committed while you page
+  never shift or duplicate what you have not read yet.
+- A page can hold **fewer movements than `limit` and still carry `next`**. A page reads a bounded
+  number of postings, so with a sparse filter it may stop early. The end of the list is a reply
+  without `next`, not a short page.
+- A cursor belongs to the request that produced it. Change the subject or any filter and the cursor
+  is refused. The page size may change between pages.
+
+Reference: [`movements`](../../api/operations/movements/).
+
+## Statements
+
+`GET /v1/statements` answers "what happened on this account, in this asset, over this period, and
+what were the balances either side of it". Unlike `movements`, it returns the whole period in one
+reply, with the opening and closing balances.
+
+All of `account`, `asset`, `from` and `to` are required. `from` is inclusive and `to` is exclusive,
+in milliseconds since the Unix epoch.
+
+```sh
+curl -G "$INGRESS/v1/statements" \
+  -H "Authorization: Bearer $TOKEN" \
+  --data-urlencode "account=$ACCOUNT" \
+  --data-urlencode "asset=USD" \
+  --data-urlencode "from=1760000000000" \
+  --data-urlencode "to=1760600000000"
+```
+
+```json
+{
+  "account": "did:aledgent:acct:…",
+  "asset": "USD",
+  "from": 1760000000000,
+  "to": 1760600000000,
+  "from_seq": 4090,
+  "to_seq": 4181,
+  "closed": true,
+  "opening": { "available": "1000", "reserved": "0", "encumbered": "0" },
+  "movements": [ { "seq": 4102, "…": "same shape as in a page of movements" } ],
+  "closing": { "available": "970", "reserved": "0", "encumbered": "0" }
+}
+```
+
+The closing balances are the opening balances plus the movements, so a statement balances by
+construction. `closed` says whether the period is over, so that no posting can still enter it.
+
+To get a statement that **must not move**, pass `as_of`: a view, that is, the `view` an earlier read
+returned. The statement is then computed as the book stood at that view, and asking again with the
+same `as_of` returns the same statement byte for byte. A view the book has not reached is refused.
+
+A period with more than 1000 movements is refused rather than truncated. Ask for a shorter period, or
+page through [movements](#movements) instead.
+
+Reference: [`statement`](../../api/operations/statement/).
+
+## Trial balance
+
+`GET /v1/trial-balance` checks that the book adds up. It is the **operator's**: any other caller is
+refused as `ERR-NotAuthorised`. `asset` narrows the check to one asset.
+
+```sh
+curl -G "$INGRESS/v1/trial-balance" -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+{
+  "view": 4181,
+  "accounts": 212,
+  "unbalanced": [],
+  "rows": [ { "asset": "USD", "openings": "0" } ]
+}
+```
+
+It makes two checks, and both should say zero. `unbalanced` lists every currency and layer whose
+accounts do not sum to zero, and is empty when the book balances. `rows` gives, per asset, the signed
+sum of the opening entries, which is `"0"` when they balance. `accounts` is how many underlying
+accounts the first check summed.
+
+Reference: [`trial_balance`](../../api/operations/trial_balance/).
+
+## What a refused read looks like
+
+A refused read has the same shape as any other refusal: a `error` code from the closed list and its
+fixed description, with the status the code carries. Nothing is partly answered.
+
+```json
+{
+  "error": "ERR-QueryUnbounded",
+  "description": "A query was submitted without bounds that aledgent can serve (`REQ-CS-5`)"
+}
+```
+
+| You sent | Refused as | Status |
+| --- | --- | --- |
+| `movements` with no `limit`, or `limit=0`, or a `limit` above 1000 | `ERR-QueryUnbounded` | 422 |
+| `balances` or `movements` with both `account` and `identity`, or with neither | `ERR-QueryUnbounded` | 422 |
+| `movements` with only one of `from` and `to`, or `from` after `to` | `ERR-QueryUnbounded` | 422 |
+| `movements` with a `cursor` that is not hex, or that came from a different subject or filter | `ERR-QueryUnbounded` | 422 |
+| `statements` with no `from` or no `to`, or with `from` after `to` | `ERR-QueryUnbounded` | 422 |
+| `statements` with a missing `account` or `asset`, or any parameter the route does not know | `ERR-QueryUnbounded` | 422 |
+| `balances`, `movements` or `trial-balance` with a parameter the route does not know, a value that does not parse (`limit=ten`), or a `direction` that is neither `debit` nor `credit` | `ERR-NotAuthorised` | 403 |
+| An account you cannot reach, or one that is not a valid account identifier | `ERR-UnknownAccount` | 404 |
+| An asset that is not in the registry | `ERR-UnknownAsset` | 404 |
+
+<Aside type="caution" title="An unknown parameter is refused, not ignored">
+A misspelt parameter (`acount=…`, `since=…`) fails the whole request instead of being dropped, so
+that a filter that did not apply can never pass for one that did. On `balances` and `movements` the
+refusal is `ERR-NotAuthorised` with status 403, which can look like a permissions problem: when you
+get it on a read you have the rights to make, check the parameter names first.
+</Aside>
+
+## Next
+
+- [Getting started](../getting-started/): authenticate and send a transfer.
+- [The operation lifecycle](../../concepts/operation-lifecycle/): how the entries you read here come
+  to exist.
+- [API reference](../../api/): every route and every parameter.
