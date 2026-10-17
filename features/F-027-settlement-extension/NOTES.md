@@ -701,3 +701,311 @@ The light-client probe (decision 42; one peer, script driver, step 4 skipped):
   a batch included meanwhile, cannot walk back to it (`find_extrinsic` needs the bodies): the step stops
   and retries, deciding nothing and releasing nothing. Deciding inclusion from the inbox and the nonce
   alone would remove the dependency.
+
+## The format by the runtime's surface, confirmed by the layer (T-027-12, amendment 0031, 2026-10-14)
+
+On 2026-10-14 at 21:01Z Kreivo mainnet enacted release `0.17.1`, spec 134. Its transaction extensions,
+their types, its `transaction_version` (13) and its PASS crates are spec 133's, yet the adapter stopped:
+`spec_versions` did not list 134 and `TxFormat::of(134)` had no entry. PR #7 added both as a stopgap.
+Amendment 0031 (`REQ-SA-9`, `AC-E4.3`, `AC-E4.4`) makes the rule a requirement: decide from what an
+instruction must carry, never from a version number alone, and have the layer confirm before the first
+broadcast under rules not served before.
+
+Read from mainnet's own metadata (`Metadata_metadata_at_version(15)` over `https://kreivo.io`, read
+only, at blocks #38 653 511 (spec 132), #39 643 511 (spec 133) and #39 650 511 (spec 134)): specs 133
+and 134 give the same surface digest, `2da44f41…`; spec 132 gives `08ee0c93…`, with
+`transaction_version` 12 and no `DynamicMaxBlockWeight`.
+
+### Decisions (T-027-12)
+
+44. **The format is chosen by the runtime's transaction surface.** `kreivo::Surface` is three things
+    read from live metadata on every step (`RpcChain::runtime`): the `transaction_version`, the
+    identifiers of the transaction extensions of extension version 0 in order, and a digest of the
+    types of what a transaction carries (`chain::surface`). `TxFormat` names the surface it applies
+    to (`kreivo-132`: 12, `EXTENSIONS_132`, `TYPES_132`; `kreivo-133`: 13, `EXTENSIONS_133`,
+    `TYPES_133`) besides the Kreivo revision it is pinned against (`kreivo-pin`, `kreivo-pin-132`,
+    unchanged), and `TxFormat::by_surface` selects. The `spec_version` plays no part, so 134 needs
+    no entry: PR #7's stopgap is removed, and `kreivo-133` covers 133 and 134. Signing takes the
+    format chosen (`kreivo::sign(signer, format, …)`, `Chain::sign_batch(…, &Signing)`), with the
+    `spec_version` and `transaction_version` of the runtime the step checked; `sign` no longer
+    selects or refuses anything. A surface with no format is refused (`Refusing::UnknownSurface`,
+    which replaces `SpecVersion`, `TxFormat` and `Extensions`).
+45. **What the digest covers.** Each extension's identifier, its explicit type and its implicit
+    type; the contracts pallet's index and its `call` call's index; and `call`'s arguments, names
+    and types. A type's digest is its shape as SCALE encodes it: composites by field, in order;
+    variants by index, with their names and fields; sequences, arrays with their length, tuples,
+    primitives, compacts and bit sequences; field and variant names included; type paths, type
+    parameters and docs excluded. Recursive types get a fixed marker. **What it does not cover**:
+    anything the runtime does with the bytes rather than how they are typed, such as the order of
+    the message a PASS device signs (the 132 → 133 change, decision 23), how an extension computes
+    its implicit data, or what the contract does with `execute`; and the rest of the metadata
+    (other calls, storage, events). Those are the confirmation's (decision 47).
+46. **Not subxt's validation hash.** The brief preferred subxt's own mechanism
+    (`subxt_metadata::utils::validation`) over a hand-written digest. It is not usable here: it
+    XORs a composite's field hashes, on purpose (subxt encodes by field name, so field order does
+    not matter to it), which makes it blind to two fields swapped, and so to a change of every byte
+    the positional encoder in `kreivo.rs` writes. The digest is this crate's own
+    (`chain/surface.rs`, about a hundred lines over `scale-info`'s registry), which also keeps the
+    pinned values independent of subxt's releases. They are pinned in code and derived from reduced
+    fixtures of mainnet's metadata (`services/settle/fixtures/surface-{132,133,134}.json`: the type
+    registry cut down to the types the digest reads, renumbered; `SurfaceTypes::reduced` checks the
+    reduced registry digests as the full one does). The ignored test
+    `t_027_12_write_surface_fixtures` rewrites them from saved metadata when a format is added.
+    Trade-off, stated plainly: field and variant names are in the digest, so a rename that moves no
+    byte (or a variant added to a type the adapter encodes as `None`, such as the fee asset's
+    location) stops the adapter until a release or the operator's mapping (decision 49) covers it.
+    A false stop was preferred to a false start; the confirmation alone could not tell a type change
+    that happens to validate from one that does not.
+47. **The layer's confirmation before the first broadcast on a runtime.** (Where it validates, how a
+    failed call is read, and what a "not now" answer does: amended by decision 51.) A runtime is its
+    `spec_version`, its surface's fingerprint and the format chosen. Before the first transaction
+    signed on a runtime the store does not record as served is broadcast, on every path that
+    broadcasts something newly signed (lane batches, anchors, bindings), the runtime validates it:
+    `TaggedTransactionQueue_validate_transaction(External, extrinsic, best block hash)` through
+    `state_call` at the step's best head, over the adapter's own client (the light client by
+    default; never `dry_run_endpoint`'s node, which is trusted for batch sizes only).
+    `kreivo::transaction_validity` reads the answer:
+    - **Valid**: the runtime is recorded as served (`settle_runtimes`, migration
+      `0005_runtimes.sql`; `Store::confirm_runtime`, never removed), so a restart does not ask again,
+      and the transaction is stored, recorded with the core and broadcast as before.
+    - **Invalid for what it carries** (`BadProof`, `BadSigner`, `UnknownOrigin`,
+      `IndeterminateImplicit`, `Call`, `Custom(_)`, `BadMandatory`, `MandatoryValidation`, or a
+      runtime that cannot decode the bytes, which panics in the API's argument decoding): nothing
+      is stored or broadcast, the calls stay acknowledged and unsigned, a `runtime:<spec_version>`
+      alert is raised, and the adapter refuses to serve on that runtime
+      (`Refusing::Unconfirmed { spec_version, format, error }`). The refusal is held in memory: a
+      restart asks again, which is how a fix (a release, or the operator's mapping) is taken up.
+      Before refusing, the runtime is read again: if it changed since the transaction was signed
+      (whose `spec_version` is in its implicit data, so any upgrade makes it a `BadProof`), nothing
+      is broadcast and nothing is refused; the next step signs for the new runtime.
+    - **Invalid for now** (`Payment`, `Future`, `Stale`, `AncientBirthBlock`, `ExhaustsResources`,
+      any `UnknownTransaction`): no evidence either way. The transaction goes out as any does (the
+      pool validates it again), and the runtime is neither recorded nor refused: the next
+      transaction signed on it is validated again.
+    `Custom(_)` is classed with the refusals because it cannot be told which extension raised it
+    and `PassAuthenticate` raises its own; that leans to a false stop, as decision 46 does.
+    **What the confirmation catches that the surface does not**: a device message in another order
+    (shown by the fake layer: a runtime with 133's surface whose authenticator verifies 132's order
+    is refused with `BadProof`), a wrong `CheckSpecVersion`/`CheckTxVersion`/`CheckGenesis` implicit,
+    a call the runtime cannot decode. **What it does not**: anything the runtime checks only on
+    dispatch, after validation (the contract's own refusals are recorded per call in its inbox, as
+    before).
+48. **`spec_versions` gates nothing.** `AdapterConfig::spec_versions` is optional and
+    informational: a file that has it still parses, and the adapter logs the list at start-up
+    ("informational … gates nothing"). The README's example and the canary's template drop it.
+    Start-up no longer checks it.
+49. **The operator's mapping.** `adapter.formats` maps a `spec_version` to a known format's name
+    (`{ "135": "kreivo-133" }`). The named format is used for that `spec_version` whatever its surface
+    (explicit beats inferred), and the confirmation is still required before anything signed in it
+    is broadcast (amendment 0031). A name the adapter does not know stops it at start-up
+    (`AdapterConfig::unknown_formats`).
+50. **The fake layer** runs Kreivo spec 133 in `kreivo-133` by default, now with its real
+    `transaction_version` (13, not 1) and surface; `FakeConfig::order` is the order its
+    authenticator actually verifies, independent of its surface, so a test can flip it under an
+    unchanged surface. `set_spec_version` is an upgrade that changes nothing a transaction carries,
+    `upgrade_to(spec, format)` one to another format, `upgrade(f)` any change. `Chain::validate`
+    checks a transaction as the runtime would (decode, challenge and signature in its order, then
+    nonce and fees), or answers what a test says (`answer_validations`).
+51. **Validated by the runtime it was signed for; a failed call read by its kind; nothing out until
+    confirmed** (review of PR #13, three findings).
+    - **F1, where the validation runs.** The step read the best head at its start, but the runtime a
+      transaction is signed for was read later (`Chain::runtime`, in `submit`, `anchor` and `binds`),
+      at a newer best head. If Kreivo upgraded between the two reads (133 → 134), the transaction was
+      signed for 134 and validated by 133 at the older head; 133 answered `BadSigner` or `BadProof`
+      (`pallet-pass` answers `BadSigner` for any failed authentication, and the `spec_version` is in
+      the challenge), and the check before refusing compared the runtime *now* (134) with the one
+      chosen (134), found them equal, and refused with `Unconfirmed` until a restart. Now
+      `RuntimeInfo::at` is the block `runtime()` read (hash and number), the chosen runtime carries
+      it, and the validation runs at that block: the runtime that validates is the one signed for.
+      Before a refusal is taken as one of the format, the runtime's version at that block
+      (`Chain::version`, `state_getRuntimeVersion` at its hash) must equal the `spec_version` and
+      `transaction_version` signed for; if not, nothing is confirmed, refused or broadcast, and the
+      next step signs again. The check against the runtime *now* is gone: an upgrade after the
+      validated block says nothing of what that block's runtime answered.
+    - **F2, how a failed validation call is read.** An undecodable transaction was recognised by the
+      text "Bad input data provided" in the error, which a Substrate node's answer carries but the
+      light client's does not: live Kreivo over smoldot answers it as a bare wasm trap. It became
+      `ChainError::Unavailable` on every step, with no refusal, no alert, and the step aborted
+      before anchors and bindings. Now the failure is classed by its kind (`rpc::call_failure`):
+      a transport error of the RPC client (unreachable, connection lost, a timeout) is
+      `Transport`; an answer that the call was not run (a JSON-RPC protocol error, or a server error
+      other than an execution failure: a call proof no peer served, a block it does not know, a
+      runtime it could not load) is `NotRun`; an answer that the runtime ran the call and failed is
+      `Executed`, recognised by each client's own name for that error variant (smoldot's
+      `RuntimeCallError::Execution`, "Error during the execution of the runtime"; a Substrate node's
+      `sp_blockchain::Error::Execution`, "Execution failed"), never by the trap's or the panic's
+      text. `Executed` on a transaction the adapter built is `Refused` (a runtime fails
+      `validate_transaction` only when it cannot decode its arguments: a wrong format); the other
+      two stay `Unavailable` (`rpc::validation_failure`). Trade-off, stated plainly: the variant's
+      name is still text, and a client that names an execution failure otherwise reads as
+      `NotRun`, so `Unavailable`: the old failure mode, for that client only. The other way round, a
+      network failure classed as an execution would be a false stop until restart, which is worse
+      on the light client, whose call proofs fail routinely.
+    - **F3, a "not now" answer.** `Stale`, `Future`, `Payment`, `ExhaustsResources`,
+      `AncientBirthBlock` and every `UnknownTransaction` used to let the first transaction go out
+      under a runtime nobody had confirmed. `REQ-SA-9` says the adapter does not serve until the
+      layer confirms. Now any answer that neither confirms nor refuses broadcasts nothing: nothing
+      is stored, no nonce moves, the calls stay acknowledged and unsigned, and the next step
+      rebuilds the transaction (a new nonce, era and challenge) and asks again. A runtime already
+      confirmed is unchanged: later transactions on it are not validated. Trade-off, stated
+      plainly: a "not now" that persists (a lane short of fees on a new runtime, say) holds every
+      withdrawal on that runtime with no alert of its own, only a `warn` log each step; the lane's
+      fee alert, if it is short, is the signal. The runbook says so.
+    The fake layer now keeps the runtime in each block's state: an upgrade applies to the best block
+    from when it is made and to every block produced after, a block produced before keeps its own,
+    and `validate(at)` checks against the runtime *at `at`*. `before_next_runtime_read` and
+    `before_next_validation` let a test act at a precise point of a step.
+
+### Tests (T-027-12)
+
+- **Unit** (`chain::surface`): the fixtures' digests are the pinned `TYPES_132` and `TYPES_133`, 133 and
+  134 identical, 132 different in all three parts, `Contracts::call` at (80, 6); the digest changes
+  with two call arguments swapped (which subxt's hash would not see), a call or pallet index, an
+  extension renamed, reordered or retyped. (`chain::kreivo`): each known surface selects its format,
+  by name too, and any changed part (`transaction_version` 14, nine extensions, other types, no types,
+  132's surface under 13) selects none; the validation's arguments, and every `InvalidTransaction`
+  and `UnknownTransaction` classed. (`config`): `spec_versions` optional, old lists parse, `formats`
+  with an unknown name reported. (`chain::rpc`, decision 51): a validation the runtime ran and failed
+  is `Refused`, smoldot's bare trap and a Substrate node's answer with or without the panic's text;
+  one the client did not run (a call proof not served, an unknown block, a JSON-RPC protocol error)
+  and every transport failure (a timeout, a lost connection) are `Unavailable`, even one whose text
+  reads like an execution failure.
+- **`tests/contract.rs`**: `AC-E4.3` 133 → 134 keeps serving with no configuration and no format entry
+  for 134, one validation per runtime, none after a restart; `AC-E4.4` an unchanged surface whose
+  validation answers `BadProof`: nothing stored or broadcast, `Unconfirmed`, `runtime:134` alert,
+  `ERR-SettlementLayerUnavailable` once declared; an order flipped under 133's surface is refused
+  by the (fake) layer itself, and the operator's mapping to `kreivo-132` then settles after
+  confirmation; a transient answer broadcasts, stores and signs nothing, twice, and the transaction
+  goes out once the layer confirms (decision 51); an upgrade between the step's start and its signing
+  is validated by the new runtime and confirmed, not refused; a refusal by another runtime than the
+  one signed for refuses nothing, and the next step confirms and broadcasts; a runtime
+  with unknown types is refused until mapped, then served only after the layer confirms. `T-027-07`'s
+  three tests carry over (`upgrade_to` instead of `set_spec_version`; `signed_in` lists formats).
+- **`tests/flow.rs`**: an unknown `transaction_version` and other extensions refuse with
+  `UnknownSurface`; a `spec_versions` list gates nothing either way; an upgrade to an unknown surface
+  stops submission and signing until the surface is known again.
+- **`tests/anchoring.rs`**: an anchor the layer does not confirm is neither stored nor broadcast.
+- **Conformance** (`crates/conformance`, `F-016`): `AC-E4.3` and `AC-E4.4` registered as service cases;
+  `AC-E4.2` keeps the wrong genesis, and `ERR-SettlementLayerUnavailable` uses an unknown surface.
+
+### Open (T-027-12)
+
+- **Run against a live runtime, once (2026-10-15, on test).** The validation probe's request and the
+  decoding of its answer are written from `sp-runtime`'s `TransactionValidity` and were tested against
+  hand-built bytes. After Kreivo's runtime upgrade to spec 134, the adapter on test validated a
+  transaction through the runtime, logged that it confirmed the format on `spec_version` 134
+  (format `kreivo-133`), and the next anchor was signed and included. A validation runs the extensions' `validate`, not the call, so the missing child-trie proof entries
+  of decisions 36 and 42 should not arise; the zombienet suite is where it can be seen. A probe that
+  fails to answer (`ChainError::Unavailable`) ends the step, as a dry run's failure did before decision
+  35, and nothing is signed or stored by it.
+- **The aledgent driver** (`e2e/aledgent-driver`) still sets `spec_versions`, now informational. A local
+  Kreivo built from a revision whose types differ from mainnet's (an asset location type, say) has
+  another surface digest and is refused until its format is mapped (`adapter.formats`) or pinned.
+
+## Follow-ups from T-027-12's review (2026-10-15)
+
+Three findings of PR #13's review that did not block it: a "not now" that persists raised nothing
+(decision 51, F3); nobody had compared how long a withdrawal waits unsigned with the page that was
+meant to catch it; and the light client names a failure to start the runtime as it names a runtime
+that ran and failed.
+
+### Decisions
+
+52. **A "not now" that persists pages, because the expiry comes long before the oldest-operation
+    page.** The numbers, and where each comes from:
+    - **The expiry.** `submit_outbound` gives a withdrawal's instruction the expiry *last finalized
+      height the core holds + `expiry_window`* (`crates/ledger-core/src/ledger/settlement.rs`);
+      `expiry_window` is the settlement configuration's, **150 heights** in
+      `deploy/templates/settlement.json`, with `block_time` 2 000 ms. Kreivo mainnet's block time
+      is 2.0 s at p50 (mean 2.1 s) and its finality lag 31.8 s at p50, 49.5 s at p99 (about 16 and
+      25 blocks; `features/F-032-stress/NOTES-withdrawals.md`, 2026-10-04). When the core
+      instructs, the best head is already a finality lag above the height the expiry counts from.
+    - **The last moment to sign.** The adapter signs only an era that ends at or before the expiry
+      and leaves a block above the best head (`REQ-SL-4`; `Mortality::within`, `born_at_finalized`).
+      Once the best head is within a few blocks of the expiry no era fits, and the adapter
+      tombstones the call (`NotExecuted::NeverSigned`, reported to the core as never signed).
+      `max_era` (64) and `challenge_window` (256) bound how long a *signed* transaction lives; they
+      do not shorten the unsigned wait. So a withdrawal can wait unsigned for about **150 − 16 =
+      134 blocks, 4.5 minutes** (about 4.2 minutes at a p99 finality lag, 4.7 at the mean block
+      time).
+    - **Its end.** Once the finalized head passes the expiry, the core holds the non-inclusion
+      proven (never signed, so no nonce to consume) and releases the reservation: the operation
+      ends **`Released`, about 150 blocks (5 minutes) after it was instructed**. That is terminal
+      and is not `Needs-Review`: the deadline the core requires is later still (after now +
+      150 × 2 000 ms + `finality_margin` 120 000 ms = 7 minutes), so the review queue is never
+      reached.
+    - **The page.** `AledgentOldestNonTerminalOverServiceLevel` (`NFR-11`, `REQ-OP-8`) pages when
+      the oldest non-terminal operation is over **3 600 000 ms for 5 minutes: 65 minutes**
+      (`ops/prometheus/rules/aledgent.yml`). A withdrawal held by a "not now" is terminal after 5,
+      so that page **never fires** for it; nor does `AledgentAdapterNotServing` (the adapter still
+      serves), and `AledgentAnchorLag` (anchors held the same way) waits two hours. Every
+      withdrawal on the runtime would end released, one after another, with nobody paged.
+    So the "not now" answers now raise an alert of their own, and it pages. After
+    `adapter.not_now_alert_after` (default **10**) "not now" answers in a row to the first
+    transaction on a runtime not yet confirmed, the adapter raises that runtime's
+    `runtime:<spec_version>` alert (`Adapter::confirmed`), the same key a refusal raises, its detail
+    naming the count and the answer at that point (`Invalid(Payment)`, say; later answers are in the
+    `warn` log, which counts them). The runtime's confirmation clears it, and with it any other
+    runtime's `runtime:*` alert this process has not refused (one held by "not now" and upgraded
+    away from, perhaps before a restart: nothing waits on it any more). A refusal of the runtime
+    replaces a "not now" alert's detail with its own. The count is in memory, so a restart counts
+    again from zero; an alert already raised is in the store and stays open. The new rule
+    `AledgentAdapterRuntimeUnconfirmed` (`aledgent_adapter_alerts{kind="runtime"} > 0`, no `for`;
+    `runtime` is now exported at zero) pages settlement-operations; it also pages a refusal
+    (`Unconfirmed`) at once, five minutes before `AledgentAdapterNotServing` would.
+    **Why 10.** At least one validation a step while calls wait (one per signing path with
+    something to sign: each lane's batch, the anchor, a binding), and a step at least every
+    `interval` (2 000 ms in `deploy/templates/settle.json`; 1 000 by default), sooner on news; a
+    step itself takes about 0.4 s. Ten answers is then at most about 24 s, plus a scrape and an
+    evaluation, against 4.5 minutes of signable window: the page comes with about four minutes to
+    spare. Fewer would page on the odd transient (a `Future` nonce once), more would eat the
+    window. **The ordering to keep**: `not_now_alert_after` × (`interval` + 0.4 s) + the scrape and
+    evaluation interval must stay well under (`expiry_window` − the finality lag in blocks) ×
+    the block time. An operator who lengthens `interval` or shortens `expiry_window` must check it;
+    nothing checks it at start-up, since the adapter does not read the core's settlement
+    configuration. Trade-off, stated plainly: the page tells someone within a minute, but the
+    withdrawals instructed before it is fixed still end released when their expiry passes;
+    nothing is held past it (`REQ-SL-4`), and nothing can be.
+
+53. **The light client's failure to start the runtime reads as a refusal: documented, not told
+    apart.** smoldot's `RuntimeCallError::Execution` carries three cases
+    (`RuntimeCallExecutionError`): `Execution` (the runtime ran and trapped or panicked: what
+    decision 51 means by a refusal), `Start` (the virtual machine could not start the function:
+    `FunctionNotFound`, `NotAFunction`, `SignatureNotSupported`, `InvalidParameters`, or
+    `DataSizeOverflow`) and `ForbiddenHostFunction` (the runtime called an off-chain host function,
+    which a light client does not provide). Over `state_call` all three reach the adapter alike: a
+    JSON-RPC server error, code -32000, whose message is the error's display, "Error during the
+    execution of the runtime: …" (`light-base/src/json_rpc_service/background.rs`, at the pinned
+    fork). No code, field or structured value tells them apart; only the text after the colon
+    does. Decision 51 recognises the prefix and nothing else (`rpc::call_failure`), and matching
+    the inner texts as well would tie the classification to wording smoldot does not promise, so
+    it is not done. **The case**: `validate_transaction` on a new runtime answered with `Start` or
+    `ForbiddenHostFunction` is classed `Refused`: the adapter refuses that runtime
+    (`Unconfirmed`), raises `runtime:<spec_version>`, and pages. **How to recognise it**: the
+    alert's detail and the `error` log "did not confirm the transaction format on its runtime"
+    carry the client's message after "the runtime failed validating it (it cannot decode it):";
+    a format the runtime cannot decode reads "Error during the execution of the runtime: Runtime
+    has trapped: …" (or "Runtime has aborted: …"), whereas this case reads "Error during the
+    execution of the runtime: " followed by one of "Function to start was not found.", "Symbol to
+    start is not a function.", "Function to start uses unsupported signature.", "The types of the
+    provided parameters don't match the signature.", "DataSizeOverflow" or
+    "ForbiddenHostFunction". **What clears it**: a restart. The refusal is held in memory, the
+    runtime is not recorded as served, and the restarted process asks the layer again; when the
+    cause was the light client's, the runtime confirms then. If the same answer comes back after a
+    restart, the light client cannot run that runtime's validation, which no restart fixes: record
+    it as a finding, and the explicit fallback is a node's RPC (`"connection": "rpc"`, README),
+    which validates in a node's executor. Trade-off, stated plainly: a false stop until restart,
+    which decision 51 already preferred to a false start.
+
+### Tests
+
+- **`tests/contract.rs`**: `ac_e4_4_t_027_12_repeated_not_now_answers_raise_the_runtime_alert_until_confirmed`:
+  nine "not now" answers (`Invalid(Stale)`) raise nothing; the tenth (`Invalid(Payment)`) raises
+  `runtime:133` naming it and the count, with nothing broadcast and the adapter still serving; the
+  confirmation clears it and the withdrawal settles.
+  `t_027_12_a_runtime_upgraded_away_from_has_its_not_now_alert_cleared`: an alert raised on 133 is
+  cleared by 134's confirmation.
+- **`ops/tests/alerts.rs`**: `AledgentAdapterRuntimeUnconfirmed` pages the test route with an open
+  `runtime` alert, and a healthy deployment (`runtime` at zero) pages no one.
+- Decision 53 changes no code, so it has no test of its own; decision 51's tests of
+  `rpc::call_failure` stand.

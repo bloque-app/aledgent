@@ -1,7 +1,7 @@
 ---
 name: aledgent — implementation plan
 plan_version: 0.8.9
-status: approved by the owner, 2026-09-22; DEC-4 ruled 2026-09-23 (#38); settlement venue ruled 2026-09-24 (DEC-17, DEC-18); amendments 0006 and 0007 applied 2026-09-29; credential schemes ruled 2026-10-02 (DEC-19, F-028, amendment 0010); book-only assets and their binding, and the single-stage rollout, ruled 2026-10-02 (DEC-20, DEC-21, F-029, amendment 0011); core throughput and the Shared book, ruled 2026-10-03 (DEC-22, F-031, amendment 0012); the book's Agents and aledgent's runtime, ruled 2026-10-03 (DEC-23, F-033, amendment 0014); the consistent cut for anchors and binds, proposed 2026-10-03 (DEC-23, amendment 0015); ephemeral horizontal scaling as a requirement, ruled 2026-10-04 (NFR-21, amendment 0016, binding DEC-22, DEC-23, F-021); VOS changes within JAM's host calls only, ruled 2026-10-04 (DEC-16, DEC-23); completion to inclusion for an external leg and the answering setting's record, ruled 2026-10-04 (amendment 0018), with the burst gate against sharded capacity (§5) and the checkpoint archive as an S3 sink first (DEC-22, DEP-11, F-021), ruled the same day; key custody: NFR-8 is the requirement, KMS is not (keys from Vault, KMS opt-in for secp256k1 lane and anchor keys), ruled 2026-10-04 (`key-custody-opt-in-kms`, F-035, M-3); the compact state commitment, v2 from genesis, and a checkpoint that names its construction, ruled 2026-10-05 (DEC-25, amendment 0019, REQ-PR-10); v1 roots kept as a supported, documented opt-in beside v2, ruled 2026-10-05 (`cs-q04`, DEC-25); R-03, messages between the book's Agents checked in report mode with the relay isolated and one voter's key as the root of an Agent's messages, ruled 2026-10-05 (rq-01 to rq-06, F-033, F-035; trims checked before go-live, the rest post-freeze in §4); code history and upgrades, ruled 2026-10-08 (DEC-26, F-037, amendment 0023, `a0023-q1` to `a0023-q9`)
+status: approved by the owner, 2026-09-22; DEC-4 ruled 2026-09-23 (#38); settlement venue ruled 2026-09-24 (DEC-17, DEC-18); amendments 0006 and 0007 applied 2026-09-29; credential schemes ruled 2026-10-02 (DEC-19, F-028, amendment 0010); book-only assets and their binding, and the single-stage rollout, ruled 2026-10-02 (DEC-20, DEC-21, F-029, amendment 0011); core throughput and the Shared book, ruled 2026-10-03 (DEC-22, F-031, amendment 0012); the book's Agents and aledgent's runtime, ruled 2026-10-03 (DEC-23, F-033, amendment 0014); the consistent cut for anchors and binds, proposed 2026-10-03 (DEC-23, amendment 0015); ephemeral horizontal scaling as a requirement, ruled 2026-10-04 (NFR-21, amendment 0016, binding DEC-22, DEC-23, F-021); VOS changes within JAM's host calls only, ruled 2026-10-04 (DEC-16, DEC-23); completion to inclusion for an external leg and the answering setting's record, ruled 2026-10-04 (amendment 0018), with the burst gate against sharded capacity (§5) and the checkpoint archive as an S3 sink first (DEC-22, DEP-11, F-021), ruled the same day; key custody: NFR-8 is the requirement, KMS is not (keys from Vault, KMS opt-in for secp256k1 lane and anchor keys), ruled 2026-10-04 (`key-custody-opt-in-kms`, F-035, M-3); the compact state commitment, v2 from genesis, and a checkpoint that names its construction, ruled 2026-10-05 (DEC-25, amendment 0019, REQ-PR-10); v1 roots kept as a supported, documented opt-in beside v2, ruled 2026-10-05 (`cs-q04`, DEC-25); R-03, messages between the book's Agents checked in report mode with the relay isolated and one voter's key as the root of an Agent's messages, ruled 2026-10-05 (rq-01 to rq-06, F-033, F-035; trims checked before go-live, the rest post-freeze in §4); code history and upgrades, ruled 2026-10-08 (DEC-26, F-037, amendment 0023, `a0023-q1` to `a0023-q9`); the code history made independent of the platform, so that a later change of runtime is an upgrade, ruled 2026-10-17 (DEC-26, F-036, F-037, amendment 0033)
 date: 2026-10-08
 binds: SPEC.md v0.4.16
 stack: CipherClerk e9a7b08 (kernel) · VOS saga/agents 7bae926 (host) · aledgent runtime (ours, on VOS: `agents/aledgent-runtime`, `DEC-23`) · a settlement pallet on Kreivo (ours, in frame-contrib)
@@ -924,17 +924,35 @@ construction named, and the old one kept checkable (`REQ-PR-10`).
 Traces: `REQ-RT-3`, `REQ-PR-2`, `REQ-PR-3`, `REQ-PR-4`, `REQ-PR-10`, `INV-2`, `INV-19`, `NFR-18`.
 
 **`DEC-26` Code history and upgrades: the code is book state, an upgrade is an input, and every code version
-is kept.** *Ruled by the owner on 2026-10-08 (amendment 0023, `a0023-q1` to `a0023-q9`).* The full text,
-with the code as verified on `main` at `a3cb28b`, is `amendments/0023-code-history-and-upgrades.md`.
+is kept.** *Ruled by the owner on 2026-10-08 (amendment 0023, `a0023-q1` to `a0023-q9`); made independent of
+the platform, ruled 2026-10-17 (amendment 0033).* The full text, with the code as verified on `main` at
+`a3cb28b`, is `amendments/0023-code-history-and-upgrades.md`. Amendment 0033
+(`amendments/0033-code-history-independent-of-the-platform.md`) amends (a), (b), (b′), (d) and (g) and adds
+(i) and (j), so that the book can later move from VOS `saga/agents` to VOS `vos-core` by an upgrade, with no
+new genesis.
 *Decision:*
 
 - **(a) `:code` in hot state.** A **code version** *H* is `blake2b-256` of a canonical manifest
-  (`aledgent/code/v1`) that lists, for one writer kind, each artefact that decides a transition (`package`,
-  `runtime`, and `native-decide` wherever a host decides natively) with its unkeyed `blake2b-256`, length,
-  VOS `ProgramId` and **build profile** (target, toolchain, `opt-level`, features, source revision,
-  `Cargo.lock` digest), the kernel's identity, the constructions it reads and the message formats it accepts
-  and emits. The hot row gains `code`, `construction`, `upgrade: Option<(H, n)>`, `authority` (the mode's
-  digest) and `authority_next`; each ring entry gains the `code` that executed it, covered by the log hash.
+  (`aledgent/code/v1`) that names its **platform** (name and revision, e.g. `vos-saga@c54fc1ff`) and lists,
+  for one writer kind, its **code generation** (`generation: u64`) and each artefact that decides a
+  transition (`package`, optionally `runtime`, and `native-decide` wherever a host decides natively) with
+  its unkeyed `blake2b-256`, length, **identities** on the platform (VOS `ProgramId` today; on `vos-core`
+  the ELF's hash, the derived program's hash and the transpiler's version) and **build profile** (target,
+  toolchain, `opt-level`, features, source revision, `Cargo.lock` digest), the kernel's identity, the
+  constructions it reads and the message formats it accepts and emits (amendment 0033). Every package is
+  built with a `GENERATION` constant equal to the manifest's `generation`: a 16-byte record (`ALGGEN01` and a
+  little-endian `u64`) in its own ELF section, `.aledgent.generation`, exported as
+  `ALEDGENT_CODE_GENERATION`; the symbol is that record, defined once by a `ledger-core` macro, and the fence
+  reads that very static, so there is no second constant to compare. One reader, `ledger_core::code::generation_of`, reads it in `check-code`
+  ([`T-038-25`](features/F-038-ingress-fleet/tasks.md)), which fails the build when it differs, in staging, and in the host's checks at start and
+  before a switch. The digest check binds the constant to *H*.
+  The replayer is **not** in the manifest: each range's replayer is a separate code-archive entry,
+  `replayer/<hex H>`, so a host rebuild is not a code upgrade. **Nothing of the platform is hashed** outside
+  the manifest (`REQ-RT-19`): `driver` (the writer's authorised submitter) and `observed_slot` (a
+  diagnostic) are the host-local fields of `SPEC.md` §2 **Writer state**, set at founding, never carried by
+  a snapshot or a continuation, and never in a root, a log hash, a checkpoint or an anchor. The hot row
+  gains `code`, `generation`, `construction`, `upgrade: Option<(H, n)>`, `authority` (the mode's digest) and
+  `authority_next`; each ring entry gains the `code` that executed it, covered by the log hash.
   Checkpoints carry `construction` and `code`, and `consistent` uses the checkpoint's own construction.
   **One `v3` for amendments 0022 and 0023** (`a0023-q3`):
   `H("aledgent/anchor/v3" ‖ construction ‖ genesis ‖ code ‖ authority ‖ instance ‖ number ‖ entry_sequence ‖ kernel_root)`,
@@ -942,13 +960,45 @@ with the code as verified on `main` at `a3cb28b`, is `amendments/0023-code-histo
   genesis code *H₀*, built with the core at opt-level `s` (`a0023-q9`), the construction and the initial mode.
 - **(b) The upgrade.** The operator publishes *H* to the code archive and submits `Upgrade { code: H, from: n }`
   through `CTR-OPS`; ingress and the author host refuse it unless every artefact is fetched and matches; the
-  writer commits `upgrade = Some((H, n))`; before input `n` the host switches the Agent's program (VOS's
-  registry upgrade, a compare-and-swap on the old program hash); input `n` runs under *H* and moves `upgrade`
-  into `code`. The handler must be in *H₀*.
+  host has staged *H* first (fetched, every digest checked, the manifest's `generation` the writer's plus
+  one, and the package's compiled `GENERATION` equal to it); the writer commits `upgrade = Some((H, n))`;
+  while it is scheduled the host ends its batches at `n − 1`, so a restore point and a checkpoint land
+  there; before input `n` the host takes one operation, `switch(H, n)`, installing only the staged bytes
+  (VOS's registry upgrade on `saga`, a compare-and-swap on the old program hash signed with the core's
+  package key through the signer, "already switched" read as success; an install into the same instance on
+  `vos-core`, the install record checked before and after, and the instance's rows surviving a re-install
+  an assumption until the spike shows it; the founding of a continuation across platforms, (j)); input `n` runs under *H* and
+  moves `upgrade` into `code` and `generation`. **The switch is symmetric:** before each input the host
+  installs the code version the code map names for it (*H* from `n`, or *g* again after a way-out input),
+  each install a `switch` signed through the signer, whose grant covers them all. **The artefact check:** at
+  start and at every switch the host checks every artefact it runs for the writer (on `saga`, the runtime it
+  hands to `Runtime::create` as well as the package) against the code version the code map names for the
+  next input, by digest, installs that version where any differs, and refuses to drive the writer only if
+  it cannot; the in-book fence cannot see a runtime the host supplies apart from the package. **The fence**
+  (`REQ-RT-20`), checked at every input: code takes an input only when its compiled `GENERATION` is the hot
+  row's `generation` *g*, or *g* + 1 for an input at or after a scheduled `from`; any other code refuses it
+  with nothing written and its number not taken (a new outcome, added as a new call-format version, which
+  the continuation's scoped refusal shares; a refused command is audited at the execution node, in its log
+  and the audit store, never in the book). A
+  missed switch, or a stale package after one, halts the writer instead of running an input under the wrong
+  code; on `vos-core`, which has no compare-and-swap and no way for an actor to read its program's hash, the
+  fence is the only in-book check. The fence identifies code up to its generation; byte identity within a
+  generation is the host's staging check. **The way out:** `RescheduleUpgrade { from: m }` (`m` later than
+  its own number) and `CancelUpgrade`, authorised under the mode in force (an unauthorised one is refused),
+  are the only inputs the fenced code takes; they take their numbers like any input and are decided the
+  same by code of either generation (the upgrade does not take effect, `generation` stays *g*), after which
+  the host reinstalls *g*'s staged package if it had switched. The `code-history` gate decides every way-out
+  fixture input under each staged *H* and under *g* and requires the same committed state. The code map derives from the `Upgrade`,
+  `RescheduleUpgrade` and `CancelUpgrade` inputs alone, and native replay takes each input's generation from
+  it. `aledgent_writer_fenced_seconds` alerts past `fence_alert_after` (a deployment setting, default five
+  minutes; `NFR-11`). The handler, the fence and the way out must be in *H₀*.
 - **(b′) The upgrade-authority mode** (`a0023-q2`). A closed enum: `Single { principal }` (the genesis mode
   today), `ProposeApprove`, `Threshold { members, k }`, each with an optional delay counted in inputs.
   `SetAuthority { mode, from }` is authorised under the mode in force, validated deterministically by the
-  writer, cancels pending proposals and leaves a scheduled upgrade standing.
+  writer, cancels pending proposals and leaves a scheduled upgrade standing. The mode is the only authority
+  over a writer's code: the host takes `switch` only for an upgrade the writer has committed, and both
+  platforms' install authorities (the core's package key on `saga`, the node's admin token on `vos-core`)
+  are host keys held through `F-035`, never authorities (`REQ-RT-20`).
 - **(c) The code archive.** One S3 object per digest under Object Lock; "kept forever" is an S3 **legal
   hold** (`a0023-q5`) on code, input segments, anchored checkpoints and the chainspec, over the 400-day
   compliance floor. Only a break-glass role may remove a hold, and every use of it alerts. The code map is
@@ -957,24 +1007,195 @@ with the code as verified on `main` at `a3cb28b`, is `amendments/0023-code-histo
   loaded by digest and isolated in `aledgent-code-fetch` by default (`a0023-q7`); `kreivo-preimage` in the
   open-source distribution (`a0023-q8`). The fetcher, never the source, checks every artefact's length and
   digest; bytes that do not match are never used.
-- **(d) Restore and replay per range.** `roll_forward_agent` splits the archive at the code map's boundaries
-  and switches programs as the live upgrade did. **The host spec is frozen** (`a0023-q6`): call formats are
-  versioned, a change only adds a version, and every host applies every earlier version exactly; a range
-  that cannot keep this names a native host build in its manifest, with the owner's approval each time.
+- **(d) Restore and replay per range, native first.** `roll_forward_agent` splits the archive at the code
+  map's boundaries. The book side of every range is replayed natively under the range's generation, read
+  from the code map, and needs no platform; the Agent side (re-sending each input and requiring the
+  archived log hash) runs each range under its replayer, the host image at `replayer/<hex H>` in the code
+  archive, switched by `switch` as the live upgrade did. **The host spec is
+  frozen** (`a0023-q6`): call formats are versioned, a change only adds a version, and every host applies
+  every earlier version exactly; a range that cannot keep this names a native host build in its manifest,
+  with the owner's approval each time. A replayer per range uses that fallback's form for the Agent side
+  only, kept beside the code version and not in it, approved for every range on 2026-10-17 (amendment 0033).
 - **(e) A construction migration.** `MigrateConstruction { to }` recomputes inner nodes only; the checkpoint
   at its input is a **bridge anchor** that binds both roots. The settlement contract is unchanged.
 - **(f) The `code-history` CI gate** replays a fixture archive across every release's boundary, and a
   deployment's archive read-only on each release, on CI and bench runners.
-- **(g) Fast and full resync.** Fast: the latest anchor-verified snapshot (with leaf chunks) and the inputs
-  since; full: the chainspec and every input. Both reach the same roots. Per-shard warp sync follows from it.
+- **(g) Fast and full resync.** Fast: the latest anchor-verified snapshot and the inputs since; full: the
+  chainspec and every input. Both reach the same roots. Per-shard warp sync follows from it. **Checkpoints and
+  snapshots are rows and leaf chunks** (`REQ-RT-19`): an archived checkpoint, and a snapshot sent to another
+  node, hold the writer state of `SPEC.md` §2 (every hot-row field but the host-local `driver` and
+  `observed_slot`, the configuration, every record, the unarchived ring, the outbox) as a sorted key-value
+  list in aledgent's encoding, plus content-addressed leaf chunks. `agent.state` stays the core host's local
+  cache, never archived or sent; checkpoints already written as `agent.state` stay readable by a converter
+  that keeps `saga`'s codec. One archive restores onto either runtime.
 - **(h) Retention** as `NFR-22` lists it.
+- **(i) Per runtime** (amendment 0033). On `saga`: `ProgramId` identities, `switch` is the registry
+  compare-and-swap signed with the core's package key through the signer, and the fence backs it. On `vos-core`: ELF, derived-program and transpiler identities,
+  the node's default agent program under `platform`, `switch` is an install into the same instance with the
+  install record checked before and after, and the fence is the safety. Checkpoints are rows and leaf chunks
+  on both.
+- **(j) The continuation** (`REQ-RT-21`, amendment 0033). Beside `F-036`'s `StateGenesis`, which stays as it
+  is, a second founding envelope, `Continuation { genesis, predecessor, at: n, log_head, writer state at
+  n − 1 }`, built from the predecessor's checkpoint at `n − 1` once its committed `inputs` is `n − 1`, and
+  checked field by field against it (all but `continued_at = n`, a committed writer-state field the
+  founding sets). No founding is made while the next queued input is a way-out input. The founding record
+  is written **last**, after every check (staging, no claim at `n`, the predecessor at `n − 1` with
+  `upgrade = Some((H, n))` both before and after the build, state equality, roots), and **once**, as the
+  claim of input `n`, naming the build attempt and instance that passed; each attempt's instance is recorded
+  in a write-once `instance/<…n>/<attempt>` object (never node-local state), its id derived from (claim key,
+  attempt) on both runtimes (`saga`: `create_with`'s creation nonce, today a one-byte discriminator; `vos-core`:
+  the install's `instance`); a retry by any lease holder reads the latest attempt, adopts its instance if it
+  passes the post-checks, and otherwise tears it down and builds attempt + 1 under a fresh name: archived under `claim/<hex blake2b-256(genesis ‖ logical writer ‖ n)>` with a conditional
+  create under the archive's Object Lock, before input `n` is sent anywhere. The predecessor's archiver
+  creates its own claim at that key before archiving its entry at `n`; both claims are fixed functions of
+  (genesis, logical writer, `n`, side) and the inputs before `n`, so a claim that finds its own side's
+  identical record resumes and one that finds the other side's has lost; a founding that loses founds
+  nothing. The feed routes input `n` and later only to the recorded instance; an instance from a failed or
+  abandoned build never receives an input and is torn down by the runbook. Segments name the instance that
+  wrote them, and the archive accepts a continuation-side entry at a claimed `n` only if the claim is a
+  founding record and the instance is the one recorded for the attempt the record names. Once a founding record
+  exists the upgrade is final: a way-out input for the upgrade scheduled from `continued_at` is refused with
+  `ERR-InvalidTransition`, fence-style (nothing written, number not taken), by the continuation as the
+  authority and by the feed as a fast path; one for a later upgrade is taken as usual. A failed check writes no record; a create that finds the
+  same bytes is a resume and succeeds, one that finds different bytes is refused; replay refuses a log with
+  two founding records at one `n`; feeding stays with one core through `F-038`'s feed lease and epoch. The
+  archive accepts each input number of a **logical writer** once (segments created conditionally, keyed by
+  the logical writer, never the Agent instance, and first input, each starting at the last archived input
+  plus one), and the feed reads the claim before sending anything numbered `n` or later to the predecessor,
+  so a reschedule or cancel in flight from a former lease holder that commits there is never archived or
+  acknowledged. Replay refuses a log with both a founding record and a predecessor entry at one `n`. The code map's boundary comes from
+  the `Upgrade`; the founding record is evidence replay checks against it. A move to `vos-core` is an `Upgrade`
+  whose code version names `vos-core` from `n`, the predecessor fenced at `n`, `Continuation` on `vos-core`,
+  and input `n` sent there: no new genesis, no bridge anchor, no change of construction. A continuation onto
+  a fresh Agent of the same runtime is how the gate rehearses it before `vos-core` is ready.
 
 *Alternatives:* export and re-import for every upgrade (`F-014`), which is unproven at volume and loses the
 history's replayability; keeping one build forever. *Why:* replay (`REQ-RT-3`) is only meaningful if the
 book says which code ran each input and that code is still there. *Cost:* about 150 bytes of hot state and
-32 bytes a ring entry (+13 %); a code archive kept forever; a frozen call format. *Reversibility:* low once
-the first upgrade is taken. Traces: `REQ-RT-3`, `REQ-RT-15`–`REQ-RT-18`, `REQ-PR-10`, `REQ-PR-11`,
-`REQ-OS-2`, `NFR-22`, `US-K7`.
+32 bytes a ring entry (+13 %); a code archive kept forever; a frozen call format; a checkpoint format of
+aledgent's own, a generation compiled into every package, and a replayer image kept per range (amendment
+0033).
+*Reversibility:* low once the first upgrade is taken. Traces: `REQ-RT-3`, `REQ-RT-15`–`REQ-RT-21`,
+`REQ-PR-10`, `REQ-PR-11`, `REQ-OS-2`, `NFR-22`, `US-K7`.
+
+**`DEC-27` Ingress is a fleet of its own, and each core connects out to it.** *Proposed 2026-10-15; waits
+for the owner.* Today ingress and the core are separate processes on one node, and ingress pushes each
+command to the core host over a Unix socket that authenticates by the peer's user id. A reboot of that node
+on 2026-10-14 (applying a node configuration, 21:36–21:38Z) refused 36 requests with 502 and 504 from the
+load balancer, because ingress went down with the node. `NFR-5`, `NFR-17` (no change may need a maintenance
+period, an upgrade included) and `NFR-21(b)` (any execution node is replaceable while every command is still
+acknowledged within `NFR-1`) forbid that. The shape also does not extend to cores in several regions, each
+the writer of its own partitions. *Decision:*
+
+- **(a) Ingress runs apart from every execution node**, as at least two instances in different failure
+  domains, holding no state of its own outside its database (the received log, client keys, challenges,
+  passkey counters). An ingress release goes out blue/green: the new set is healthy before the old one
+  drains, so no request is refused. A core's restart, replacement or loss never takes ingress with it.
+- **(b) The acknowledgement needs no core.** Ingress acknowledges a command once it is durable in the
+  received log (`NFR-1`, `REQ-CS-2`), whether or not any core is connected. The received log's database is
+  the durable copy `NFR-21(c)` counts, so it runs replicated across failure domains. Ingress is its only
+  owner: no core reads or writes it.
+- **(c) Each core host connects out to ingress** over one long-lived stream, authenticated both ways with
+  mutual TLS under the operator's own certificate authority, on a listener for cores only (never the client
+  API's). Ingress sends down the stream the commands of the partitions that core writes, in the received
+  log's order; the core sends back each reply and decision, which ingress records on the row. A core host
+  listens on no network port, as today. A regional core connects to the nearest ingress instance and
+  receives only its own partitions.
+- **(d) The feed follows the connection, and the core keeps the order.** The core always dials; ingress
+  never dials a core, so only ingress needs a stable address. Any ingress instance takes a client's command
+  and writes it to the received log. The instance holding a core's stream holds the lease to feed that
+  core's partitions: it reads their new rows and sends them down. The core tracks the next sequence it
+  expects per partition: it drops a duplicate and holds an early arrival, so ordering comes from the
+  received log, never from which stream or instance a command arrived on.
+- **(e) A switch reconnects without refusing.** An ingress instance that is leaving sends its cores a
+  go-away (as HTTP/2's), and each core reconnects to the stable address and lands on a live instance, which
+  takes the lease over. If an instance crashes, the core notices through keepalives within seconds, and
+  the lease expires. A command sent on the old stream and not yet answered is sent again by the new feeder
+  and dropped by the core if it was already taken. Decisions pause for the reconnect: well under a second
+  for a planned switch, a few seconds for a crash. Acknowledgements never pause.
+- **(e′) Ingress's reads ride the same stream.** Ingress also reads from the book: a caller's credentials
+  and grants from the principals role (the single core Agent today, `aledgent-principals` in the sharded
+  profile), cached at most `NFR-20` old, and the queries it serves. Those reads go up the stream the core
+  host that holds the principals role (or the queried state) opened, and their answers come back down it,
+  as commands do. No core is ever dialed for a read either. *Every instance reads* (the owner's ruling
+  of 2026-10-15, option (b)): each region's cores are deployed beside that region's own
+  set of ingress instances, which hold the region's partitions, so a core only ever dials its own
+  region's instances. Each instance advertises, in ingress's database, an address its region's cores
+  reach it at (configured, or detected from its listener): a roster of live instances, renewed every few
+  seconds and withdrawn on drain. A core host dials the fleet's stable name as before, takes the roster
+  from that greeting, then dials every instance in it directly, over the same mutual TLS, and keeps one
+  stream to each; it reads the roster again on every go-away (and ingress sends it down every stream
+  when it changes), and drops the streams of instances that left. Every instance then answers credentials,
+  ties and queries from the core over its own stream; one with no stream to a core yet answers
+  `ERR-DecisionUnavailable` (503 with `Retry-After`) at once, never a request held open. Commands stay
+  single-fed: only the feed lease's holder feeds a partition, and the core host binds the lease's
+  (signed) epoch to the stream that brought it, so any other stream only reads. When the feeding
+  instance goes, the lease moves to an instance that already has a stream: no reconnect on the way.
+  Reclaims are unchanged. *Why (b) over a relay between instances (option (a)):* a relay adds an
+  ingress-to-ingress trust relationship and a hop on every read, and still leaves the reader depending
+  on whichever instance holds the core's one stream; with regional fleets beside their cores, the roster
+  adds neither, and the operator's only requirement is the one it already meets, that a region's cores
+  reach that region's ingress instances. On one machine the roster is the local instances.
+- **(e″) Ingress authenticates while no core answers.** Ingress keeps, in its own database, a durable copy
+  of the verifiers it last read from the book for the schemes it checks: an API key's hash (`api-key`) and a
+  passkey's public key, credential handle, `rpId` and backup flag (`webauthn-es256`). Public material only
+  (`REQ-AU-8`). It refreshes an entry on every read the book answers, as the cache does today, and falls back
+  to the copy only when no core answers. A proof is checked against a verifier the book admitted, never
+  accepted for its form alone: an unknown API key, or an assertion from a passkey the book never admitted,
+  fails as it does today. The copy only lets ingress acknowledge. The core still checks, at decision, that
+  the credential is in its identity's set and covers what it asks (`REQ-AU-3`, `REQ-AU-20`), so a credential
+  removed while no core answered is acknowledged and then refused under its named condition. No credential
+  joins a set while no core answers: that is a decision of the book. The copy also holds `key` verifiers
+  (the public key). A `key` proof is not a way to call ingress: it travels inside a command (a reclaim, a
+  recovery approval) from a caller already authenticated. A reclaim's proof binds the account's custody
+  epoch, which is book state: ingress checks it at the door against the credential's verifier and the
+  epoch it reads from the book, and refuses a forged or mismatched proof instead of acknowledging it; with
+  no core answering, it cannot read the epoch, so the reclaim (answered with its decision) is answered
+  `ERR-DecisionUnavailable` at the door, not checked against the copy. A recovery approval's proof is
+  verified by the core only, at decision. The core verifies every proof at decision either way.
+  One rule for every scheme: ingress refuses at the door what the book would certainly refuse for the
+  credential, as of its last read. Configured service tokens and passkey sessions already authenticate
+  without the core.
+- **(f) Ingress signs what it forwards.** Each command carries ingress's signature over its received row
+  (through the signer, `F-035`), and the core host checks it before the Agent sees the input. mTLS says
+  which peer is connected; the signature says the command is the one ingress recorded.
+- **(g) A command answered with its decision** (`REQ-CS-8`) waits for the decision on its row. If no core
+  decides within `NFR-16` (no core connected, or a handover in progress), ingress answers
+  `ERR-DecisionUnavailable` (`REQ-CS-7`). What is forbidden is a 5xx with nothing behind it: no instance
+  answering, a bare 502 or 504 from a load balancer. A 503 from ingress carrying the named error is
+  allowed (the owner's ruling of 2026-10-15): it keeps HTTP 503, with a `Retry-After` of one
+  second, `NFR-16`'s bound and the order of a planned hand-over, so a client retrying with the same client
+  key usually finds a core deciding again. A command that moves value is acknowledged and decided once a
+  core takes it.
+- **(h) Portable by construction.** Nothing here needs a particular provider. Ingress needs a stable
+  internal address (a DNS name, a Kubernetes Service, a proxy) and certificates from the operator's CA; a
+  core needs outbound access to that address; the database is any PostgreSQL. The drain, the reconnect, the
+  leases and the de-duplication live in the binaries, so blue/green is whatever the operator's orchestrator
+  does (an ECS deployment, Kubernetes' rolling update with a readiness check and a drain hook, two
+  systemd or podman units behind a proxy). Bloque's AWS deployment is one reference; a provider-neutral one
+  (Kubernetes, or podman quadlets as the node runs today) ships beside it.
+- **(h′) One machine is a supported shape.** Ingress, a core and PostgreSQL on one machine run the same
+  binaries and the same protocol: the core connects to ingress locally, over mutual TLS on the loopback
+  interface or over a Unix socket with peer credentials (today's link, kept as the same-host transport).
+  An ingress release on one machine is a second instance on another port and a local proxy that switches
+  to it before the old one drains. What one machine cannot give is surviving its own reboot or the loss of
+  its disk; such a deployment states it in its assurance level (`REQ-AR-5`) and does not claim `NFR-21`.
+- **(i) The Agent is unchanged.** Commands reach it as the same inputs, and the host's calls into it keep
+  their formats (`DEC-26(d)`). The change is in ingress and the core host. The genesis check does not
+  verify the host's own binary on a restart with a replica (`F-036`), but the image must carry the genesis
+  package and runtime bytes exactly, copied from the pinned image, until `DEC-26`'s upgrades exist.
+
+*Alternatives:* (1) cores read the received log from the database themselves: every core holds database
+credentials, could read every command and write a false reply, the schema becomes an interface between two
+services, and a regional core pays a cross-continent round trip on every command; (2) ingress pushes to a
+port on each core: every core opens an inbound port, and ingress must know where each partition's writer
+is; (3) a second ingress on another node pushing to the same core over a Unix socket: impossible across
+machines. *Why:* the requirement is that ingress never stops taking commands, and connecting out keeps the
+core's surface as small as the Unix socket made it. *Cost:* a stream protocol with leases, go-away and
+de-duplication; a signature per command; certificates to issue and rotate; ingress's database becomes the
+hand-off point and must be replicated across failure domains. *Reversibility:* medium: the received log
+already holds what the stream needs. Traces: `NFR-1`, `NFR-5`, `NFR-16`, `NFR-17`, `NFR-21`, `REQ-AR-7`,
+`REQ-CS-2`, `REQ-CS-7`, `REQ-CS-8`, `NFR-7`.
 
 ---
 
@@ -1037,8 +1258,10 @@ Each feature names its exit criterion by spec identifier. If a feature's tests d
 | `F-033` | **aledgent's runtime and the book's Agents** (`DEC-23`, amendment 0014). The runtime: VOS's standard one with composite invocations (atomic and isolated steps over the Agent's own actors, order keys, numbered streams applied exactly once), its rules, an optional lean public I/O; then deadline ticks and a lean result window. The core host's composite batches; the relay over streams; the settlement and anchor Agents; online splits. Measured against VOS's runtime on one hosted runner | `REQ-RT-1`, `RT-10`, `RT-11`, `RT-13`, `REQ-AT-2`, `INV-18`, `INV-19`, `NFR-18`–`NFR-20` | The conformance suite passes through the core Agent under the runtime; its gas and ops/s against the standard runtime's recorded; a property test of streams (duplicates, reordering, gaps) and order keys shows each message once and every payer's commands in order |
 | `F-032` | **Stress suite** (an operations requirement before the first production window). A harness that drives ingress with a realistic mix at a planned rate (transfers, purchases with fees, reserve then capture or release, onboarding, a client's issuance, API keys and passkeys, hot accounts), a throwaway deployment with fault injection, a workflow for GitHub-hosted runners and the zombienet fleet, and the batch curve of the core Agent. Targets as multiples of a reference load: 10 × its peak hour sustained, 50 × its peak minute as a burst, 2 × its peak hour for four hours. A throughput design with each step's ceiling (`features/F-032-stress/throughput.md`) | `NFR-1`, `NFR-2`, `NFR-4`, `NFR-5`, `NFR-11`, `NFR-15`, `NFR-16`, `INV-5` | The stress gate of §5: every scenario run and its numbers recorded; the gate itself passes before the window |
 | `F-035` | **The key boundary** (guardrail 13, the `M-3` exit's "no key material in the book's process"). `aledgent-signer`: a process that holds every key the operator holds and no book state, on a Unix socket with peer credentials and a token per caller, grants per key and revocation on the next request. Its keys rest in Vault, which it reads itself at start under Vault's AWS IAM auth (no secret in its environment); AWS KMS is an opt-in, per key, for the secp256k1 lane and anchor keys only (owner ruling `key-custody-opt-in-kms`, 2026-10-04). Holders' passkeys (P-256) are theirs, out of its scope. The core host asks it for every kernel key, signature and blinding and passes the Agent the answers, never a key; the adapter signs its lanes and anchors through it. The ingress–core link authenticated by a token and the peer's user id. Supersedes `F-005` NOTES decisions 15–16 and the `KmsSigner` stub | `REQ-AR-3`, `NFR-8`, `REQ-SA-8`, `REQ-AU-8`, `REQ-RT-6` | Signing round trips for every scheme and backend; unauthenticated and ungranted callers refused; online rotation; the book runs over the core Agent with its keys in another process and loads no root |
-| `F-036` | **Seeded genesis: aledgent's chainspec** [PENDING AMENDMENT 0022-A1] (`REQ-RC-6`; owner rulings of 2026-10-08: one operator-held verifier for many identities, `seed-history-commitment`, `genesis-chainspec`). The book's first state is defined by a chainspec (identities, delegated accounts, aliases, opening balances with their reconciliation, the operator's grants, the history's root) whose digest genesis carries, and **built natively** with the same library code, as a Substrate chain's genesis state is (`aledgent-core-host build-spec`). The core host builds it in its replica before the Agent's first input, refuses to start unless its roots are the reviewed manifest's, and founds the Agent on them in one invocation (`StateGenesis`); replay and restore rebuild it from the chainspec kept beside the archive. `verify-genesis` executes it chunk by chunk inside the PVM, and the book takes no traffic until it passes (ruling `a0022-q2`). The chainspec's header names its genesis code with amendment 0023's manifest (H₀: package, runtime and the host executable that builds it, with their build profiles), and the core host refuses to build or found the genesis under other binaries. A re-founded book continues the settlement contract's anchor sequence (amendment 0022, option (e)) | `REQ-RC-6`, `REQ-RC-4`, `REQ-RT-3`, `DEC-4`, `INV-17`, `NFR-17` | The built genesis equals the book the same records make as commands; a genesis whose roots are not the chainspec's is refused; a restore rebuilds it; `verify-genesis` reaches the same roots; binaries other than the genesis code are refused; the full-size synthetic book builds natively in under a minute (`F-036`) |
-| `F-037` | **Code history and upgrades** (`DEC-26`, amendment 0023, ruled 2026-10-08). The hot-row and ring-entry fields and checkpoint `v3`; the `Upgrade`, `MigrateConstruction` and `SetAuthority` inputs and the modes; `CodeSource` with `fs`, `s3`, `https`, `exec`, C-ABI plugins (`aledgent-code-fetch`) and, in the open-source distribution, `kreivo-preimage`; per-range restore under the frozen call format; snapshots with leaf chunks and the per-shard archive; the `code-history` gate; the legal hold and the break-glass role. After `F-036` (the chainspec names *H₀* and the initial mode), before `F-021` (warp sync admits a fresh replica) | `REQ-RT-3`, `REQ-RT-15`–`REQ-RT-18`, `REQ-PR-11`, `NFR-22`, `US-K7` | `AC-K7.1`–`AC-K7.8` pass; the `code-history` gate replays a fixture archive across an upgrade and a construction migration from genesis, at every input; a fast and a full resync reach the same roots |
+| `F-036` | **Seeded genesis: aledgent's chainspec** [PENDING AMENDMENT 0022-A1] (`REQ-RC-6`; owner rulings of 2026-10-08: one operator-held verifier for many identities, `seed-history-commitment`, `genesis-chainspec`). The book's first state is defined by a chainspec (identities, delegated accounts, aliases, opening balances with their reconciliation, the operator's grants, the history's root) whose digest genesis carries, and **built natively** with the same library code, as a Substrate chain's genesis state is (`aledgent-core-host build-spec`). The core host builds it in its replica before the Agent's first input, refuses to start unless its roots are the reviewed manifest's, and founds the Agent on them in one invocation (`StateGenesis`); replay and restore rebuild it from the chainspec kept beside the archive. `verify-genesis` executes it chunk by chunk inside the PVM, and the book takes no traffic until it passes (ruling `a0022-q2`). The chainspec's header names its genesis code with amendment 0023's manifest (H₀: package, runtime and the host executable that builds it, with their build profiles), and the core host refuses to build or found the genesis under other binaries. A re-founded book continues the settlement contract's anchor sequence (amendment 0022, option (e)). `F-037` adds a second founding envelope, `Continuation`, beside `StateGenesis`, which founds a writer from a predecessor at input *n* with its log head (`DEC-26` (j), amendment 0033); nothing of `F-036` changes | `REQ-RC-6`, `REQ-RC-4`, `REQ-RT-3`, `DEC-4`, `INV-17`, `NFR-17` | The built genesis equals the book the same records make as commands; a genesis whose roots are not the chainspec's is refused; a restore rebuilds it; `verify-genesis` reaches the same roots; binaries other than the genesis code are refused; the full-size synthetic book builds natively in under a minute (`F-036`) |
+| `F-037` | **Code history and upgrades** (`DEC-26`, amendment 0023, ruled 2026-10-08; independent of the platform, amendment 0033, ruled 2026-10-17). The manifest with its platform, identities, optional runtime and code generation; the hot-row and ring-entry fields, with nothing of the platform hashed, and checkpoint `v3`; the one `switch` operation, the fence and its way out; the `Upgrade`, `MigrateConstruction` and `SetAuthority` inputs and the modes; `CodeSource` with `fs`, `s3`, `https`, `exec`, C-ABI plugins (`aledgent-code-fetch`) and, in the open-source distribution, `kreivo-preimage`; checkpoints as rows and leaf chunks; per-range restore, native first, with a replayer per range kept beside each code version, under the frozen call format; the continuation, founded once per input number; snapshots and the per-shard archive; the `code-history` gate; the legal hold and the break-glass role (`features/F-037-code-history/plan.md`). After `F-036` (the chainspec names *H₀* and the initial mode), before `F-021` (warp sync admits a fresh replica) | `REQ-RT-3`, `REQ-RT-15`–`REQ-RT-21`, `REQ-PR-11`, `NFR-22`, `US-K7` | `AC-K7.1`–`AC-K7.20` pass; the `code-history` gate replays a fixture archive across an upgrade, a construction migration and a continuation from genesis, at every input; a fast and a full resync reach the same roots; a checkpoint restores with no VOS crate linked |
+| `F-038` | **Ingress fleet and the core stream** (`DEC-27`, proposed). Ingress as at least two instances across failure domains, released blue/green; the acknowledgement on the received log alone; core hosts connecting out over mutual TLS and receiving their partitions' commands in log order; one feeder lease per partition, a go-away drain and de-duplication by sequence; ingress's signature on every forwarded command, checked by the core host; `ERR-DecisionUnavailable` (a 503 with its named body and `Retry-After`) instead of a bare gateway error when no core decides in time; every ingress instance reading from its region's cores over a stream of its own (the roster); a provider-neutral reference deployment beside Bloque's; an operator's deployment guide in the documentation site's Operate section, one page for AWS (the shape Bloque runs, with no Bloque names or accounts) and one for a single machine, each written from what was applied and verified. The Agent and its genesis bytes are unchanged | `NFR-1`, `NFR-5`, `NFR-16`, `NFR-17`, `NFR-21`, `REQ-AR-7`, `REQ-CS-7` | A node reboot, a core restart and an ingress blue/green release, each under the stress suite's load, refuse no request and acknowledge every command within `NFR-1`; no command is decided twice or out of order across a handover; a command answered with its decision gets its decision or `ERR-DecisionUnavailable`, never a 5xx with nothing behind it; a forwarded command without a valid ingress signature never reaches the Agent |
+| `F-039` | **Documentation** (`M-3D`, proposed). The documentation site's Concepts, Integrate and Operate sections as `M-3D` lists them, written from `SPEC.md`, `PLAN.md` and what is built, each page citing the identifiers it explains; an error catalogue generated from §10 and kept in sync by CI; the one-machine walkthrough as a CI job. Operator-neutral: no page names an operator's accounts, hosts or internal tools | `NFR-11`, `REQ-AR-5`, §10, every epic | `M-3D`'s gate |
 
 ### Track C: the settlement pallet
 
@@ -1082,7 +1305,8 @@ flowchart LR
     M0["M-0 · Foundations<br/>F-001 F-002 F-015"] --> M1["M-1 · The book, in a process<br/>F-003 F-004 F-007 F-008 F-010 F-011 F-013 F-012 F-014"]
     M1 --> M2["M-2 · On VOS, end to end<br/>F-005 F-006 F-009 F-016 F-017 F-025 F-026 F-027"]
     M2 --> M3["M-3 · Production V0<br/>F-018 · F-028 · F-029 · F-032 · one window"]
-    M3 --> M4["M-4 · Replicated<br/>F-021 F-031"]
+    M3 --> M3D["M-3D · Documented<br/>F-039 · F-038's guides"]
+    M3D --> M4["M-4 · Replicated<br/>F-021 F-031"]
 ```
 
 | Milestone | Claim that becomes true | Gate |
@@ -1091,6 +1315,7 @@ flowchart LR
 | `M-1` The book, in a process | Every V0 story except those needing VOS or the settlement layer passes against the library in a plain process | Conformance suite green for Epics A (except A8), B, C, F, G, H, K, and for `INV-1`–`INV-9`, `INV-14`–`INV-18`, `INV-20`–`INV-25` |
 | `M-2` On VOS, end to end | A deposit and a withdrawal complete through the settlement contract on a local Kreivo (zombienet) and on the Kreivo testnet, with the core on a Local Agent | `AC-D1.*`, `AC-E1.*`, `AC-J1.*` pass end to end. `NFR-1` (acknowledgement), `NFR-16` (the decided reply) and `NFR-15` (completion) measured |
 | `M-3` Production V0 | The first production deployment runs on aledgent, every asset at once, after one window (`DEC-21`). The old book stays readable | Three reconciliation axes at zero divergence for the stated period. `REQ-RC-4` gate met for every asset in the window. `NFR-1` met, `NFR-16` met (1 s at p99, confirmed by amendment 0011), and `NFR-15`'s 30 s ceiling met (its 19 s target tracked; for a withdrawal, to its leg's inclusion, with finality reported apart, amendment 0018). No key material in the book's process, and none readable from a process environment (`NFR-8`): the disclosure key and the key-ring root behind the signer (`F-035`; ruling 2026-09-24 as amended by `key-custody-opt-in-kms`, 2026-10-04: KMS is not required) |
+| `M-3D` Documented | An integrator, an operator and an auditor can each do their job from the documentation site alone, with no access to an operator's internal documents or to the code. *Proposed 2026-10-15; waits for the owner* | **Concepts:** a page for each subject a reader must understand, each tracing to its `SPEC.md` identifiers: identities and credentials (the schemes, `DEC-19`, and how a scheme is added), custody modes and authority, operations and their lifecycle, reservations, assets and the settlement layer, anchoring and disclosures, partitions and shards, and what keeps working while the settlement layer is unavailable (`REQ-PR-9`). **Integrate:** every `ERR-*` has a page with its cause and the caller's action; the SDK's flows end to end. **Operate:** `F-038`'s deployment guides (a cloud provider, one machine), a public version of every runbook, upgrades (`F-037`, once built), `NFR-11`'s signals. **Proven:** a walkthrough in CI brings up a fresh one-machine deployment by the guide's own commands and makes a deposit and a transfer through the documented API. The site's strict checks pass, and no page names an operator's accounts or internal hosts |
 | `M-4` Replicated | The core survives a node loss without a restore, and scales by adding shards and ephemeral replicas (`DEC-22`, `NFR-21`) | `DEP-3`, `DEP-11` resolved; `F-021`, `F-031` |
 
 **Build order inside each milestone.** Computed from each feature's declared dependencies; a feature
@@ -1103,6 +1328,7 @@ the same step can run in parallel.
 | M-1 | `F-003` | `F-004` | `F-007` | `F-008`, `F-010`, `F-013` | `F-011` | `F-012`, `F-014` |
 | M-2 | `F-006`, `F-025`, `F-026` | `F-005` | `F-009` | `F-016`, `F-027` | `F-017` | |
 | M-3 | `F-018`, `F-028`, `F-029` | `F-032` | | | | |
+| M-3D | `F-039` | `F-038`'s guides | | | | |
 
 A test that needs a later feature closes with that later feature: `AC-A1.3` and the repeat half of
 `AC-C2.1` close with `F-007`, `AC-A2.2` with `F-008`, and the pallet's end-to-end run with `F-016`.
@@ -1170,6 +1396,7 @@ Ordering is by dependency, not by date. No dates are given.
 - `M-0` and `M-1` can start now and depend on nobody.
 - `M-2` depends on the pallet's review. @olanod answered the first three binding questions on 2026-09-23. `F-005` depends on `F-025`'s compaction change: without it an Agent refuses its 65th invocation.
 - `M-3` depends on extracting the operator's existing book, and on the pallet's production deployment.
+- `M-3D` depends on `M-3`, and its operator gate on `F-038`'s guides.
 - `M-4` depends on `DEP-3`.
 
 ---

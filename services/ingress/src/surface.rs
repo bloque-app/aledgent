@@ -821,9 +821,26 @@ struct Logged {
     route: &'static str,
 }
 
-/// A refusal as the surface sends it.
+/// The `Retry-After` an `ERR-DecisionUnavailable` carries, in seconds (`DEC-27` (g), the owner's
+/// ruling on `T-038-23`): one second. It is `NFR-16`'s bound on a decision, and the order of a
+/// planned hand-over of the feed to another ingress instance (well under a second, `F-038` §9), so
+/// a client retrying with the same client key after it usually finds a core deciding again. A
+/// crashed instance takes a few seconds (`dead_after` and the lease), which a retry after one
+/// second answers again with this same condition, never with a different outcome.
+pub const DECISION_RETRY_AFTER_SECS: u64 = 1;
+
+/// A refusal as the surface sends it. `ERR-DecisionUnavailable` is a 503 with its named body and a
+/// `Retry-After` ([`DECISION_RETRY_AFTER_SECS`]): ingress answering, with nothing decided yet,
+/// never a bare gateway error.
 pub fn refusal(r: Refusal) -> Response {
-    (status_of(r), axum::Json(r)).into_response()
+    let mut resp = (status_of(r), axum::Json(r)).into_response();
+    if r == Refusal::DecisionUnavailable {
+        resp.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            HeaderValue::from(DECISION_RETRY_AFTER_SECS),
+        );
+    }
+    resp
 }
 
 fn logged(mut resp: Response, who: Option<&Authenticated>, route: &'static str) -> Response {
@@ -1240,7 +1257,9 @@ async fn answer<S: Store, C: Core>(
     // deployment's `decision_wait`, or a principal's answering wait for its transfers and
     // reservations (`REQ-CS-9`, amendment 0013), which never exceeds it. Past it the command is
     // kept, and a retry under the same client key gets the decision once it is made
-    // (`REQ-CS-7`, `ERR-DecisionUnavailable`, amendment 0006 item 8).
+    // (`REQ-CS-7`, `ERR-DecisionUnavailable`, amendment 0006 item 8). While no replica holds a
+    // live feed lease (no core connected, or a handover), at most `NFR-16` (`F-038` §8).
+    let wait = shared.decision_wait(wait);
     shared.wake.notify_one();
     let waited = tokio::time::timeout(wait, async {
         loop {
@@ -1430,44 +1449,53 @@ async fn command_reply<S: Store, C: Core>(
         }
     }
     let mut issued = None;
-    let (command, canonical) = match pending {
-        None => (command, canonical),
-        Some(p) => {
-            // A repeat: its stored reply, without verifying anything again.
-            match shared
-                .store
-                .find(&domain, command.surface(), &client_key)
-                .await
-            {
-                Ok(Some(row)) if row.new.body_digest != digest.0 => {
-                    return refusal(Refusal::ClientKeyReused);
+    // F-038 §7: a `key` proof is checked at the door, like a passkey's.
+    let door = credentials::has_key_proof(&body);
+    let (command, canonical) = if pending.is_none() && !door {
+        (command, canonical)
+    } else {
+        // A repeat: its stored reply, without verifying anything again.
+        match shared
+            .store
+            .find(&domain, command.surface(), &client_key)
+            .await
+        {
+            Ok(Some(row)) if row.new.body_digest != digest.0 => {
+                return refusal(Refusal::ClientKeyReused);
+            }
+            Ok(Some(row)) => {
+                return answer(
+                    shared,
+                    &who.principal,
+                    row,
+                    None,
+                    shared.config.decision_wait,
+                )
+                .await;
+            }
+            Ok(None) => {}
+            Err(_) => return refusal(Refusal::DecisionUnavailable),
+        }
+        if door && let Err(r) = credentials::check_key_proof(shared, who, &body).await {
+            return refusal(r);
+        }
+        match pending {
+            None => (command, canonical),
+            Some(p) => {
+                match credentials::prepare(shared, who, obo.as_ref(), &mut body, p).await {
+                    Ok(secret) => issued = secret,
+                    Err(r) => return refusal(r),
                 }
-                Ok(Some(row)) => {
-                    return answer(
-                        shared,
-                        &who.principal,
-                        row,
-                        None,
-                        shared.config.decision_wait,
-                    )
-                    .await;
+                let c = match Command::parse(&body) {
+                    Ok(c) => c,
+                    Err(r) => return refusal(r),
+                };
+                let canonical = c.canonical();
+                if canonical.len() > MAX_COMMAND_BYTES {
+                    return refusal(too_large(route));
                 }
-                Ok(None) => {}
-                Err(_) => return refusal(Refusal::DecisionUnavailable),
+                (c, canonical)
             }
-            match credentials::prepare(shared, who, obo.as_ref(), &mut body, p).await {
-                Ok(secret) => issued = secret,
-                Err(r) => return refusal(r),
-            }
-            let c = match Command::parse(&body) {
-                Ok(c) => c,
-                Err(r) => return refusal(r),
-            };
-            let canonical = c.canonical();
-            if canonical.len() > MAX_COMMAND_BYTES {
-                return refusal(too_large(route));
-            }
-            (c, canonical)
         }
     };
     let intake = command.intake();
@@ -1565,7 +1593,10 @@ async fn command_reply<S: Store, C: Core>(
     reply
 }
 
-/// Ask the core, holding the request open while it is down.
+/// Ask the core, retrying while it does not answer, for at most `NFR-16`; then the answer is
+/// `ERR-DecisionUnavailable` (a 503 with `Retry-After`), never a request held open: an instance with
+/// no stream to a core yet, or a core restarting, answers at once and the caller retries
+/// (`DEC-27` (e′), (g), `T-038-21`).
 async fn ask<S: Store, C: Core>(
     shared: &Shared<S, C>,
     who: &Authenticated,
@@ -1573,10 +1604,16 @@ async fn ask<S: Store, C: Core>(
 ) -> QueryReply {
     let caller = who.caller(None);
     let mut wait = shared.config.retry_base;
+    let until = tokio::time::Instant::now() + crate::answering::NFR_16;
     loop {
         match shared.core.query(&caller, query, shared.clock.now()).await {
             Ok(r) => return r,
             Err(CoreError::Unavailable | CoreError::Ambiguous) => {
+                if tokio::time::Instant::now() + wait > until {
+                    return QueryReply::Refused {
+                        error: Refusal::DecisionUnavailable,
+                    };
+                }
                 tokio::time::sleep(wait).await;
                 wait = (wait * 2).min(shared.config.retry_max);
             }
@@ -1641,8 +1678,10 @@ async fn operation_reply<S: Store, C: Core>(
     who: &Authenticated,
     reference: &str,
 ) -> Response {
+    // A reference that does not parse is a shape fault (amendment 0032, `REQ-ER-3`); a
+    // well-formed one the caller does not reach is `ERR-UnknownOperation` below.
     let Ok(op) = OperationId::parse(reference) else {
-        return refusal(Refusal::UnknownOperation);
+        return refusal(Refusal::MalformedCommand);
     };
     // The received-log first: a command the core has not decided is `Received`, whether or not
     // the core is up (REQ-CS-7), to the principal that sent it, and to a principal that reaches
@@ -1829,26 +1868,36 @@ pub struct AliasParams {
     pub name: Option<String>,
 }
 
+/// A read's query string, parsed. A parameter the route does not know, a repeated one and a value
+/// that does not parse into its type are shape faults, `ERR-MalformedCommand` (amendment 0032,
+/// `REQ-ER-3`), on every route. A parameter that is absent is not: it is `Option` in every
+/// parameter struct, and the bounds (`ERR-QueryUnbounded`, `REQ-CS-5`) decide it.
 fn params<T: DeserializeOwned + Default>(raw: Option<&str>) -> Result<T, Refusal> {
     match raw {
         None | Some("") => Ok(T::default()),
-        Some(q) => serde_urlencoded::from_str(q).map_err(|_| Refusal::NotAuthorised),
+        Some(q) => serde_urlencoded::from_str(q).map_err(|_| Refusal::MalformedCommand),
     }
 }
 
+/// A read's request, from its path parameter and query string. Every shape fault is
+/// `ERR-MalformedCommand` and is found here, before the core is asked (`crate::query::shape`).
 fn query_of(route: QueryRoute, param: Option<String>, raw: Option<&str>) -> Result<Query, Refusal> {
+    let query = query_unchecked(route, param, raw)?;
+    crate::query::shape(&query)?;
+    Ok(query)
+}
+
+fn query_unchecked(
+    route: QueryRoute,
+    param: Option<String>,
+    raw: Option<&str>,
+) -> Result<Query, Refusal> {
     Ok(match route {
         QueryRoute::Balances => Query::Balances(params(raw)?),
         QueryRoute::Movements => Query::Movements(params(raw)?),
-        QueryRoute::Statement => {
-            let p: Option<StatementParams> = match raw {
-                None | Some("") => None,
-                Some(q) => {
-                    Some(serde_urlencoded::from_str(q).map_err(|_| Refusal::QueryUnbounded)?)
-                }
-            };
-            Query::Statement(p.ok_or(Refusal::QueryUnbounded)?)
-        }
+        // A statement with no query string, or without an `account` or `asset`, is unbounded:
+        // `statement_request` decides it, with the rest of the bounds.
+        QueryRoute::Statement => Query::Statement(params::<StatementParams>(raw)?),
         QueryRoute::Assets => {
             let _: AssetParams = params(raw)?;
             Query::Assets
@@ -1916,6 +1965,12 @@ fn query_of(route: QueryRoute, param: Option<String>, raw: Option<&str>) -> Resu
         }
         QueryRoute::Alias => {
             let p: AliasParams = params(raw)?;
+            // A source that cannot be one is a shape fault, found before a missing name is
+            // (amendment 0032).
+            p.source
+                .as_deref()
+                .map(crate::operator::alias_source)
+                .transpose()?;
             Query::Alias {
                 source: p.source.ok_or(Refusal::QueryUnbounded)?,
                 name: p.name.ok_or(Refusal::QueryUnbounded)?,

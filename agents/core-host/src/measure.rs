@@ -5,7 +5,7 @@
 //!
 //! One Local Agent under the standard runtime, driven through the ABI as `serve` drives it. The
 //! book is founded, an issuance grant, two identities and two funded accounts are opened, then
-//! `--warmup` operations are run unrecorded and `--n` recorded. Two workloads (`--mix`):
+//! `--warmup` operations are run unrecorded and `--n` recorded. The workloads (`--mix`):
 //!
 //! - `reserve` (the default, `T-005-10`): reservations on one account, left open;
 //! - `mixed` (`T-005-14`): in turn, a reservation and its capture into the other account, a
@@ -20,6 +20,15 @@
 //!   operations: before the fix, the tick read the deadline index whole, and past a few hundred
 //!   open operations the Agent panicked on it (out of its 256 KiB heap). The run fails (exit 1)
 //!   if any input does not commit.
+//! - `open` (profiling): in turn, the operator opens an identity and its owner opens a delegated
+//!   account, each its own input, batched as ingress forwards them. With `--batch` above 1 each
+//!   round also prints a `PROFROUND` line to stderr (the inputs before it, its gas, bytes and
+//!   times, as fields `key=value`), and at the end the service tree's leaves by kind
+//!   (`leaves: kind K: N`, `leaves: total N`). It measures what opening identities and accounts
+//!   costs as the book grows, nothing else.
+//! - `custody`, `head`, `positions` (finding F18's class): see the `reads` module below.
+//!
+//! The runner's CPU model (from `/proc/cpuinfo`, where there is one) goes to stderr first.
 //!
 //! Each recorded invocation is timed at three points:
 //!
@@ -175,15 +184,22 @@ pub fn measure(args: &[String]) {
     let warmup = arg(args, "--warmup", 5);
     let batch = arg(args, "--batch", 1).max(1);
     let mix = arg_str(args, "--mix", "reserve");
+    if let Ok(cpu) = std::fs::read_to_string("/proc/cpuinfo") {
+        if let Some(l) = cpu.lines().find(|l| l.starts_with("model name")) {
+            eprintln!("CPU {l}");
+        }
+    }
     let (mixed, tick) = match mix {
         "reserve" => (false, false),
         "mixed" => (true, false),
         "card" | "transfers" => (false, false),
         "tick" => (false, true),
+        // Profiling: identities and accounts opened, nothing else.
+        "open" => (false, false),
         // The F18 class (`reads`): each grows one collection and measures the path that read it.
         "custody" | "head" | "positions" => (false, false),
         other => panic!(
-            "--mix {other}: reserve, mixed, card, transfers, tick, custody, head or positions"
+            "--mix {other}: reserve, mixed, card, transfers, tick, open, custody, head or positions"
         ),
     };
     let tick_every = arg(args, "--tick-every", 250).max(1);
@@ -323,6 +339,46 @@ pub fn measure(args: &[String]) {
                     }),
                 ));
             }
+            return steps;
+        }
+        if mix == "open" {
+            // One identity (the operator opens it) and its delegated account (the person opens
+            // it), each its own input, as the canary's ingress forwards them.
+            let who = std::rc::Rc::new(std::cell::Cell::new(None));
+            let w2 = who.clone();
+            steps.push((
+                "open_identity",
+                Box::new(move |bk: &mut Book| {
+                    let c = bk.ctx(operator);
+                    let mut key = vec![0u8; 32];
+                    key[..8].copy_from_slice(&(i + 1).to_be_bytes());
+                    let o = bk
+                        .replica
+                        .open_identity(&c, IdentityKind::Person, None, Verifier::new(key))
+                        .expect("identity")
+                        .value;
+                    w2.set(Some(Caller::new(o.identity, o.credential)));
+                }),
+            ));
+            steps.push((
+                "open_account",
+                Box::new(move |bk: &mut Book| {
+                    let person = who.get().expect("the identity just opened");
+                    let c = bk.ctx(person);
+                    bk.replica
+                        .open_account(
+                            &c,
+                            OpenAccount {
+                                owner: person.principal,
+                                kind: AccountKind::Customer,
+                                custody: Custody::Delegated,
+                                treasury_limits: BTreeMap::new(),
+                                acknowledged: None,
+                            },
+                        )
+                        .expect("account");
+                }),
+            ));
             return steps;
         }
         if transfers {
@@ -606,6 +662,17 @@ pub fn measure(args: &[String]) {
             h.limits.budget
         );
     }
+    if mix == "open" {
+        // The service tree's leaves, by kind (profiling).
+        let st = book.replica.state();
+        let mut total = 0usize;
+        for k in st.leaf_kinds() {
+            let n = st.leaf_keys(k).map(|v| v.len()).unwrap_or(0);
+            total += n;
+            println!("leaves: kind {k}: {n}");
+        }
+        println!("leaves: total {total}");
+    }
     // The tick workload checks that every input commits (finding F18).
     if tick && failed {
         std::process::exit(1);
@@ -686,11 +753,27 @@ fn batched<'a>(
                 order.push(row);
                 sample += 1;
             }
+            static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let before = SEEN.fetch_add(*staged, std::sync::atomic::Ordering::Relaxed);
             eprintln!(
                 "round of {staged}: {} ms, {} invocations, actor gas {} M",
                 us / 1000,
                 samples.len(),
                 samples.iter().map(|s| s.actor_gas).sum::<u64>() / 1_000_000
+            );
+            eprintln!(
+                "PROFROUND before={before} inputs={staged} invocations={} actor_gas={} invoke_gas={} ack_gas={} blob_bytes={} message_bytes={} invoke_input_bytes={} caller_us={} exec_us={} invoke_us={} ack_us={} round_us={us}",
+                samples.len(),
+                samples.iter().map(|s| s.actor_gas).sum::<u64>(),
+                samples.iter().map(|s| s.invoke.gas_used).sum::<u64>(),
+                samples.iter().map(|s| s.ack.gas_used).sum::<u64>(),
+                samples.iter().map(|s| s.blob_bytes).sum::<u64>(),
+                samples.iter().map(|s| s.message_bytes).sum::<u64>(),
+                samples.iter().map(|s| s.invoke.input_bytes).sum::<u64>(),
+                samples.iter().map(|s| s.caller_us).sum::<u64>(),
+                samples.iter().map(|s| s.invoke.execution_us).sum::<u64>(),
+                samples.iter().map(|s| s.invoke.elapsed_us).sum::<u64>(),
+                samples.iter().map(|s| s.ack.elapsed_us).sum::<u64>(),
             );
         }
         *size = book.driver.port().runtime().state_bytes() as u64;

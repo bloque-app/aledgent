@@ -110,7 +110,7 @@ pub enum Refusal {
     AnchorNotFinal,
     /// `ERR-QueryUnbounded`: A query was submitted without bounds that aledgent can serve (`REQ-CS-5`).
     QueryUnbounded,
-    /// `ERR-MalformedCommand`: The request does not have a shape aledgent accepts: a field unknown, missing or of the wrong type, a value that does not parse, or a body over its bound (`REQ-ER-3`).
+    /// `ERR-MalformedCommand`: The request does not have a shape aledgent accepts: a field unknown or of the wrong type, a field a command requires and lacks, a value that does not parse, or a body over its bound (`REQ-ER-3`).
     MalformedCommand,
     /// `ERR-InitialStateNotSealed`: The initial state committed at the book's genesis is not yet in place and checked, and the book takes no command until it is sealed (`REQ-RC-6`).
     InitialStateNotSealed,
@@ -304,7 +304,7 @@ impl Refusal {
                 "A query was submitted without bounds that aledgent can serve (`REQ-CS-5`)"
             }
             Refusal::MalformedCommand => {
-                "The request does not have a shape aledgent accepts: a field unknown, missing or of the wrong type, a value that does not parse, or a body over its bound (`REQ-ER-3`)"
+                "The request does not have a shape aledgent accepts: a field unknown or of the wrong type, a field a command requires and lacks, a value that does not parse, or a body over its bound (`REQ-ER-3`)"
             }
             Refusal::InitialStateNotSealed => {
                 "The initial state committed at the book's genesis is not yet in place and checked, and the book takes no command until it is sealed (`REQ-RC-6`)"

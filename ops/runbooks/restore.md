@@ -18,7 +18,12 @@ archive, and its restore is `opsctl restore core --from <archive>` then `opsctl 
 (`release/total-loss-recovery.md`, path B; `release/core-archive.md`). The
 steps below are the in-process core's; steps 1, 2 and 5 apply to both.
 
-**A chainspec book** (`F-036`): `aledgent-core-host restore --archive <spec>` lays out the chainspec and the
+Both run from the core image, which carries `opsctl` beside `aledgent-core-host` and the Agent's programs
+(`--entrypoint /usr/local/bin/opsctl`; `deploy/docker/core.Dockerfile`).
+
+**A chainspec book** (`F-036`): `opsctl restore core --from` reads the chainspec from the archive by the
+digest the genesis commits (`--chainspec <file>` overrides it), and with `--core-host` passes `--archive`
+on: `aledgent-core-host restore --archive <spec>` lays out the chainspec and the
 book's `verify-genesis` report from the archive, where `install-verified --archive` kept them (`T-036-25`).
 A restored book whose report was never archived takes no command (`ERR-InitialStateNotSealed`) until it is
 installed again: `aledgent-core-host install-verified --config <file> --state <dir> --report <the window's
@@ -92,6 +97,15 @@ state wherever the restored log holds its sequence: the anchors before the backu
 against the layer only; `--anchors-rpc` names the node to read), and `NFR-4`
 (every acknowledged operation present). Recovery time and the data-loss window are recorded with the
 result; the exporter reads the latest drill record (`aledgent_drill_passed`, `aledgent_drill_last_age_ms`).
+
+**`--anchors-rpc` must be an archive node.** `INV-19` reads the anchors' state at the block each was
+anchored in, which can be long ago. A node that prunes state (the public Kreivo RPC endpoints do)
+answers "State already discarded" for those blocks, and `INV-19` then fails for the older anchors with a
+message that reads like a fault of the book. It is the node, not the book: name a node that keeps every
+block's state and run the check again.
+
+A failing check's detail in the report (and on the console) is the count of what it found and at most 20
+examples, not every item: the count says how widespread it is, the examples say what kind.
 
 ## Cadence (accepted proposal)
 

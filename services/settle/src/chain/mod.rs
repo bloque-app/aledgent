@@ -27,6 +27,8 @@ pub mod kreivo;
 pub mod light;
 #[cfg(feature = "rpc")]
 pub mod rpc;
+#[cfg(feature = "rpc")]
+pub mod surface;
 
 use std::future::Future;
 
@@ -69,13 +71,28 @@ pub struct RuntimeInfo {
     pub genesis: [u8; 32],
     /// The runtime's `spec_version`.
     pub spec_version: u32,
-    /// Its transaction extensions, as its metadata names them for extension version 0, in order
-    /// (`T-027-07`: checked against the format [`kreivo::TxFormat::of`] the `spec_version` selects).
-    pub extensions: Vec<String>,
+    /// What its transactions must carry (`T-027-12`, `REQ-SA-9`): its `transaction_version`, its
+    /// transaction extensions in order, and the digest of their types and of `Contracts::call`'s.
+    /// It selects the format a transaction is signed in ([`kreivo::TxFormat::by_surface`]).
+    pub surface: kreivo::Surface,
     /// Whether the venue's pallet (`Contracts`) is in the metadata.
     pub pallet: bool,
     /// `System::BlockHashCount`: the longest a mortal era can be.
     pub block_hash_count: u64,
+    /// The block it was read at: the best head when it was read. A transaction signed for this
+    /// runtime is validated at this block, whose runtime it was signed for, never at a head read
+    /// earlier or later (`F-027` NOTES, decision 51).
+    pub at: BlockRef,
+}
+
+/// The version of the runtime at a block: what a transaction's `CheckSpecVersion` and
+/// `CheckTxVersion` implicit data must equal for it to verify there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuntimeVersion {
+    /// Its `spec_version`.
+    pub spec_version: u32,
+    /// Its `transaction_version`.
+    pub transaction_version: u32,
 }
 
 /// A deployment, as its contract stores it: its registration's keys and its head.
@@ -542,6 +559,21 @@ impl std::fmt::Display for BatchFailure {
     }
 }
 
+/// What the runtime said of a signed transaction it was asked to validate, without including it
+/// (`T-027-12`, `REQ-SA-9`): the layer's confirmation of a format, or not.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Validity {
+    /// Valid: the layer confirms a transaction built and signed in the format.
+    Valid,
+    /// Invalid for what the transaction carries: its proof, its signer, an origin no extension
+    /// authorised, its call, an extension's own error, or bytes the runtime cannot decode
+    /// ([`kreivo::transaction_validity`]). Evidence that the format is not the runtime's.
+    Refused(String),
+    /// Invalid for now, for a reason that says nothing of the format: its nonce, its fees, its
+    /// era, the block's resources.
+    NotNow(String),
+}
+
 /// Why the chain did not answer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChainError {
@@ -566,8 +598,13 @@ pub type ChainResult<T> = Result<T, ChainError>;
 
 /// The settlement layer. See the module documentation.
 pub trait Chain: Send + Sync + 'static {
-    /// What the runtime is, at the best head.
+    /// What the runtime is, at the best head, and that head ([`RuntimeInfo::at`]): what is read
+    /// of it is read at that one block.
     fn runtime(&self) -> impl Future<Output = ChainResult<RuntimeInfo>> + Send;
+
+    /// The runtime's version at block `at` (`F-027` NOTES, decision 51): checked before the
+    /// layer's refusal of a transaction validated at `at` is taken as a refusal of its format.
+    fn version(&self, at: &BlockRef) -> impl Future<Output = ChainResult<RuntimeVersion>> + Send;
 
     /// The finalized head.
     fn finalized(&self) -> impl Future<Output = ChainResult<BlockRef>> + Send;
@@ -667,6 +704,9 @@ pub trait Chain: Send + Sync + 'static {
     /// **The era is born at `context`**, the finalized head ([`Mortality::born_at_finalized`]):
     /// its birth hash is `context.hash`, never a block looked up by number. An era born anywhere
     /// else is refused ([`ChainError::Invalid`]).
+    ///
+    /// **It is signed for `runtime`** (`T-027-12`): the `spec_version` and `transaction_version`
+    /// its implicit data carries, and the format the adapter chose for the runtime's surface.
     #[allow(clippy::too_many_arguments)]
     fn sign_batch(
         &self,
@@ -677,7 +717,20 @@ pub trait Chain: Send + Sync + 'static {
         era: &Mortality,
         context: &BlockRef,
         limits: &kreivo::CallLimits,
+        runtime: &kreivo::Signing,
     ) -> impl Future<Output = ChainResult<SignedExtrinsic>> + Send;
+
+    /// Have the runtime validate `extrinsic` at block `at` without including it
+    /// (`TaggedTransactionQueue_validate_transaction`, as a transaction from the network): the
+    /// layer's own confirmation of a format before the first transaction signed in it on a runtime
+    /// is broadcast (`T-027-12`, `REQ-SA-9`). Nothing is broadcast. `at` is the block the runtime
+    /// it was signed for was read at ([`RuntimeInfo::at`]), and the runtime that validates it is
+    /// the one at `at`.
+    fn validate(
+        &self,
+        at: &BlockRef,
+        extrinsic: &SignedExtrinsic,
+    ) -> impl Future<Output = ChainResult<Validity>> + Send;
 
     /// Broadcast `extrinsic`. Broadcasting the same bytes again is harmless.
     fn submit(&self, extrinsic: &SignedExtrinsic) -> impl Future<Output = ChainResult<()>> + Send;

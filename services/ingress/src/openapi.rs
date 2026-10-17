@@ -50,6 +50,21 @@ fn inline<T: JsonSchema>() -> Value {
     .unwrap_or_default()
 }
 
+/// What `trial_balance` does and which parameters it takes. `amount` is `can_spend`'s: the two
+/// routes share `AssetParams`, so `trial_balance` accepts it and ignores it.
+const TRIAL_BALANCE_DESCRIPTION: &str = "Checks that the book adds up, from one view. It is the \
+    operator's: any other caller is refused as `ERR-NotAuthorised`. `asset` narrows the check to \
+    one asset. The route also accepts `amount`, which belongs to `can_spend`, and ignores it. Any \
+    other parameter, and an `asset` that is not a valid symbol, is refused as \
+    `ERR-MalformedCommand`.";
+
+/// What `can_spend` does and which parameters it takes.
+const CAN_SPEND_DESCRIPTION: &str = "Says whether a spend of `amount` minor units of `asset` from \
+    the account would pass the checks before the kernel, and names the reason if it would not. \
+    Both parameters are required: a missing one is refused as `ERR-QueryUnbounded`. Any other \
+    parameter, an `asset` that is not a valid symbol and an `amount` that is not a count of \
+    minor units are refused as `ERR-MalformedCommand`.";
+
 /// The OpenAPI version the document declares.
 pub const OPENAPI_VERSION: &str = "3.1.0";
 
@@ -227,7 +242,12 @@ fn operation(route: &crate::surface::Route) -> Value {
                 QueryRoute::Balances => (Some(inline::<BalancesParams>()), "BalancesBody", false),
                 QueryRoute::Movements => (Some(inline::<MovementsParams>()), "PageBody", false),
                 QueryRoute::Statement => {
-                    (Some(inline::<StatementParams>()), "StatementBody", false)
+                    // `account` and `asset` are `Option` in the struct, so that a missing one is
+                    // `ERR-QueryUnbounded` and not a shape fault (amendment 0032): the document
+                    // still says they are required.
+                    let mut schema = inline::<StatementParams>();
+                    schema["required"] = json!(["account", "asset"]);
+                    (Some(schema), "StatementBody", false)
                 }
                 QueryRoute::Assets => (None, "AssetBody", true),
                 QueryRoute::TrialBalance => {
@@ -261,6 +281,21 @@ fn operation(route: &crate::surface::Route) -> Value {
                 QueryRoute::IdentityGrants => (None, "IdentityGrantsBody", false),
             };
             if let Some(s) = params_schema {
+                // For the routes with a struct of their own, the parameters' doc comment is the
+                // operation's description, so the rules that span several parameters (exactly one
+                // subject, the bounds) are written once. The two that share `AssetParams` say
+                // their own.
+                let described: Option<&str> = match q {
+                    QueryRoute::Balances | QueryRoute::Movements | QueryRoute::Statement => {
+                        s["description"].as_str()
+                    }
+                    QueryRoute::TrialBalance => Some(TRIAL_BALANCE_DESCRIPTION),
+                    QueryRoute::CanSpend => Some(CAN_SPEND_DESCRIPTION),
+                    _ => None,
+                };
+                if let Some(d) = described {
+                    op.insert("description".into(), json!(d));
+                }
                 let required: Vec<Value> = s["required"].as_array().cloned().unwrap_or_default();
                 if let Some(props) = s["properties"].as_object() {
                     for (name, schema) in props {
@@ -355,8 +390,10 @@ fn operation(route: &crate::surface::Route) -> Value {
     }
     responses.insert("4XX".into(), refusals());
     // `ERR-DecisionUnavailable` (503) and `ERR-Internal` (500): the same body, a server status
-    // (amendment 0006 item 8).
-    responses.insert("5XX".into(), refusals());
+    // (amendment 0006 item 8). The 503 carries `Retry-After` (`DEC-27` (g), `T-038-23`).
+    let mut server = refusals();
+    server["headers"] = json!({ "Retry-After": { "$ref": "#/components/headers/RetryAfter" } });
+    responses.insert("5XX".into(), server);
     if !params.is_empty() {
         op.insert("parameters".into(), Value::Array(params));
     }
@@ -504,6 +541,13 @@ pub fn document() -> Value {
         },
         "components": {
             "securitySchemes": { "bearer": { "type": "http", "scheme": "bearer" } },
+            "headers": {
+                "RetryAfter": {
+                    "description": "On ERR-DecisionUnavailable (503): seconds to wait before \
+                                    retrying with the same client key (DEC-27 (g)).",
+                    "schema": { "type": "integer", "minimum": 0 }
+                }
+            },
             "schemas": schemas(),
         }
     })

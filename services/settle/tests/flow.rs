@@ -259,48 +259,69 @@ async fn ac_e4_2_a_wrong_genesis_stops_service() {
     unavailable(&k).await;
 }
 
+/// `AC-E4.4`, `REQ-SA-9`: a runtime whose `transaction_version` is none the adapter has a format
+/// for is refused, whatever its `spec_version`: nothing is signed for it rather than guessed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ac_e4_2_an_unlisted_spec_version_stops_service() {
+async fn ac_e4_4_a_runtime_with_an_unknown_transaction_version_stops_service() {
     let options = KitOptions {
         fake: FakeConfig {
             spec_version: 135,
+            transaction_version: 14,
             ..FakeConfig::default()
         },
         ..KitOptions::default()
     };
     let (k, why) = refuses_with(options, |_| {}).await;
+    let f = settle::chain::kreivo::FORMAT_133;
     assert_eq!(
         why,
-        vec![
-            Refusing::SpecVersion { found: 135 },
-            Refusing::TxFormat { found: 135 }
-        ]
+        vec![Refusing::UnknownSurface {
+            spec_version: 135,
+            transaction_version: 14,
+            extensions: f.extensions.iter().map(|e| (*e).to_owned()).collect(),
+            types: hex::encode(f.types),
+        }]
     );
     unavailable(&k).await;
+    assert!(k.store.extrinsics().await.unwrap().is_empty());
+    assert_eq!(k.chain.validations(), 0, "nothing was signed to validate");
 }
 
-/// `T-027-07`, `REQ-SA-2`: a runtime the allow-list names but the adapter has no transaction
-/// format for is refused: nothing is signed for it rather than guessed.
+/// `T-027-12`, `REQ-SA-9`: a `spec_versions` list from an older configuration gates nothing,
+/// either way. A runtime it does not name is served when its surface is known (the next tests),
+/// and one it names is refused when its surface is not.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn t_027_07_req_sa_2_an_allowed_runtime_with_no_known_format_stops_service() {
+async fn t_027_12_spec_versions_listed_in_the_configuration_gate_nothing() {
     let options = KitOptions {
         fake: FakeConfig {
             spec_version: 135,
+            types: Some([7; 32]),
             ..FakeConfig::default()
         },
         ..KitOptions::default()
     };
     let (k, why) = refuses_with(options, |k| k.reconfigure(|c| c.spec_versions.push(135))).await;
-    assert_eq!(why, vec![Refusing::TxFormat { found: 135 }]);
+    assert!(
+        matches!(
+            why[..],
+            [Refusing::UnknownSurface {
+                spec_version: 135,
+                ..
+            }]
+        ),
+        "{why:?}"
+    );
     unavailable(&k).await;
-    assert!(k.store.extrinsics().await.unwrap().is_empty());
+    let mut k = serving_kit(KitOptions::default()).await;
+    k.reconfigure(|c| c.spec_versions = vec![1, 2]);
+    assert!(k.step().await.unwrap().serving, "{:?}", k.adapter.status());
 }
 
-/// `T-027-07`, `REQ-SA-2`: a runtime whose transaction extensions are not the ones its
-/// `spec_version`'s format was pinned with is refused (here, spec 133 without
-/// `DynamicMaxBlockWeight`, as spec 132 names them).
+/// `T-027-07`, `T-027-12`, `AC-E4.4`: a runtime whose transaction extensions are none a format
+/// was pinned with is refused (here, spec 133's `transaction_version` and types with spec 132's
+/// extensions, without `DynamicMaxBlockWeight`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn t_027_07_req_sa_2_a_runtime_with_other_extensions_stops_service() {
+async fn t_027_07_ac_e4_4_a_runtime_with_other_extensions_stops_service() {
     let found: Vec<String> = settle::chain::kreivo::EXTENSIONS_132
         .iter()
         .map(|e| (*e).to_owned())
@@ -308,7 +329,7 @@ async fn t_027_07_req_sa_2_a_runtime_with_other_extensions_stops_service() {
     let options = KitOptions {
         fake: FakeConfig {
             spec_version: 133,
-            extensions: Some(found.clone()),
+            extensions: found.clone(),
             ..FakeConfig::default()
         },
         ..KitOptions::default()
@@ -316,9 +337,11 @@ async fn t_027_07_req_sa_2_a_runtime_with_other_extensions_stops_service() {
     let (k, why) = refuses_with(options, |_| {}).await;
     assert_eq!(
         why,
-        vec![Refusing::Extensions {
+        vec![Refusing::UnknownSurface {
             spec_version: 133,
-            found
+            transaction_version: 13,
+            extensions: found,
+            types: hex::encode(settle::chain::kreivo::TYPES_133),
         }]
     );
     unavailable(&k).await;
@@ -605,14 +628,20 @@ async fn ac_f5_2_a_location_that_does_not_describe_the_asset_in_its_fields_is_re
     assert_eq!(tsta_binding(&k).await, "book_only");
 }
 
+/// `AC-E4.4`, `AC-E4.2`: an upgrade to a runtime whose surface the adapter has no format for
+/// (here, a new `transaction_version`) stops submission and signing; back on a known surface, it
+/// serves again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ac_e4_2_an_upgrade_to_an_unlisted_runtime_stops_submission_and_signing() {
+async fn ac_e4_4_an_upgrade_to_an_unknown_surface_stops_submission_and_signing() {
     let mut k = serving_kit(KitOptions::default()).await;
     let alice = k.d.party("alice", 1_000).await;
     let (s, v) = k.withdraw(&alice, 10, "w").await;
     assert_eq!(s, 200, "{v}");
     let op = v["operation_reference"].as_str().unwrap().to_owned();
-    k.chain.set_spec_version(200);
+    k.chain.upgrade(|c| {
+        c.spec_version = 200;
+        c.transaction_version = 14;
+    });
     let r = k.step().await.unwrap();
     assert!(!r.serving);
     // Reserved, not handed over: submission is refused, and nothing is signed.
@@ -624,8 +653,8 @@ async fn ac_e4_2_an_upgrade_to_an_unlisted_runtime_stops_submission_and_signing(
     );
     assert!(k.store.extrinsics().await.unwrap().is_empty());
     assert!(!open_alerts(&k, "refusing").await.is_empty());
-    // Back on an allowed runtime: served again.
-    k.chain.set_spec_version(133);
+    // Back on a known surface: served again.
+    k.chain.upgrade_to(201, &settle::chain::kreivo::FORMAT_133);
     assert!(k.step().await.unwrap().serving);
     // A new request (the refused one keeps its answer under its client key, REQ-OP-11).
     let (s, v) =

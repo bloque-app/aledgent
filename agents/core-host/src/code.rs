@@ -21,6 +21,12 @@
 //! | `serve` and `restore`, founding (no replica yet) | checked | checked |
 //! | `serve`, restart (a replica) | checked: no upgrade exists yet, so the Agent still runs *H₀* | not checked: its one decision, the genesis, is checked against the manifest's roots and the Agent's |
 //! | `verify-genesis` | checked | not checked: the genesis is executed inside the PVM |
+//! | `check-code` ([`check_code`]) | checked, against a chainspec or a manifest file | not checked: a core image on a deployment's genesis bytes carries a newer host (`DEC-27` (i)) |
+//!
+//! `check-code` is what builds a core image with the current host and a deployment's genesis package
+//! and runtime, copied from its pinned image (`deploy/docker/core.Dockerfile`, target
+//! `core-on-genesis`; `F-038` §12 step 0): the build fails unless the copied bytes are the ones the
+//! genesis code names.
 //!
 //! A chainspec whose header names no code is refused unless `--unnamed-code` is given: tests and
 //! stress books, never a deployment's.
@@ -360,6 +366,117 @@ pub fn check(
     Ok(Some(code.version()))
 }
 
+/// Refuse unless `actor` and `runtime` are the package and runtime `manifest` names, for a core
+/// whose genesis code it is and in this build's construction: the check a restart runs ([`check`]
+/// with [`Check::Agent`]), from a manifest file instead of a chainspec's header. This executable is
+/// not checked: a core image on a deployment's genesis bytes carries a newer host by design
+/// (`DEC-27` (i)).
+pub fn check_agent(manifest: &CodeManifest, actor: &[u8], runtime: &[u8]) -> Result<(), String> {
+    if manifest.writer != WriterKind::Core {
+        return Err(format!(
+            "the manifest is a {:?} writer's code, not the core's",
+            manifest.writer
+        ));
+    }
+    let ours = ledger_core::anchor::construction();
+    if !manifest.constructions.contains(&ours) {
+        return Err(format!(
+            "the manifest's code reads constructions {:?}, this build's is {ours}: build the host \
+             with the genesis's roots",
+            manifest.constructions
+        ));
+    }
+    for role in [Role::Package, Role::Runtime] {
+        if manifest.artefact(role).is_none() {
+            return Err(format!("the manifest names no {role:?} artefact"));
+        }
+    }
+    let subset = CodeManifest {
+        artefacts: manifest
+            .artefacts
+            .iter()
+            .filter(|a| matches!(a.role, Role::Package | Role::Runtime))
+            .cloned()
+            .collect(),
+        ..manifest.clone()
+    };
+    subset
+        .check(&[(Role::Package, actor), (Role::Runtime, runtime)])
+        .map_err(|e| {
+            format!(
+                "the package and runtime are not the genesis code {} ({e:?}): copy them from the \
+                 deployment's pinned core image",
+                hex::encode(manifest.version())
+            )
+        })
+}
+
+/// `check-code --actor <vos> --runtime <pvm> (--chainspec <file> | --manifest <file>) [--code <hex>]
+/// [--write-manifest <file>] [--out <file>]`: refuse unless the package and the runtime are the
+/// genesis code's, as a restart checks them ([`Check::Agent`]), without starting anything. The
+/// genesis code is the chainspec header's or an `aledgent/code/v1` manifest file's; `--code` also
+/// requires its version to be *H₀*. `--write-manifest` writes the manifest it checked against (a
+/// chainspec's, extracted); `--out` writes the report it prints. A core image on a deployment's
+/// genesis bytes is built with it (`deploy/docker/core.Dockerfile`, target `core-on-genesis`;
+/// `F-038` §12 step 0).
+pub fn check_code(args: &[String]) -> Result<(), String> {
+    let read = |name: &str| -> Result<Vec<u8>, String> {
+        let p = arg(args, name).ok_or_else(|| format!("missing {name}"))?;
+        fs::read(&p).map_err(|e| format!("{p}: {e}"))
+    };
+    let actor = read("--actor")?;
+    let runtime = read("--runtime")?;
+    let (manifest, from) = match (arg(args, "--chainspec"), arg(args, "--manifest")) {
+        (Some(p), None) => {
+            let bytes = fs::read(&p).map_err(|e| format!("{p}: {e}"))?;
+            let spec =
+                ChainSpec::from_bytes(&bytes).map_err(|e| format!("chainspec {p}: {e:?}"))?;
+            // No `--unnamed-code` here: a chainspec that names no code has nothing to check.
+            check(&[], &spec, Some(&actor), Some(&runtime), Check::Agent)?;
+            let code = spec
+                .header()
+                .code
+                .as_ref()
+                .ok_or("the chainspec names no genesis code")?;
+            (code.manifest.clone(), format!("chainspec {p}"))
+        }
+        (None, Some(p)) => {
+            let bytes = fs::read(&p).map_err(|e| format!("{p}: {e}"))?;
+            let m = CodeManifest::from_bytes(&bytes).map_err(|e| format!("{p}: {e:?}"))?;
+            check_agent(&m, &actor, &runtime)?;
+            (m, format!("manifest {p}"))
+        }
+        _ => return Err("exactly one of --chainspec <file> or --manifest <file>".into()),
+    };
+    let version = manifest.version();
+    if let Some(want) = arg(args, "--code")
+        && hex32(&want, "--code")? != version
+    {
+        return Err(format!(
+            "the genesis code is {}, not --code {want}",
+            hex::encode(version)
+        ));
+    }
+    if let Some(out) = arg(args, "--write-manifest") {
+        fs::write(&out, manifest.to_bytes()).map_err(|e| format!("{out}: {e}"))?;
+    }
+    let report = serde_json::json!({
+        "code": hex::encode(version),
+        "from": from,
+        "checked": ["package", "runtime"],
+        "native_decide": "not checked: this host is not the genesis's (DEC-27 (i)); on a restart \
+                          the genesis is checked against the manifest's roots and the Agent's",
+        "construction": ledger_core::anchor::construction(),
+        "manifest": describe(&manifest),
+    });
+    let text = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
+    if let Some(out) = arg(args, "--out") {
+        fs::write(&out, format!("{text}\n")).map_err(|e| format!("{out}: {e}"))?;
+    }
+    println!("{text}");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,5 +498,64 @@ mod tests {
         assert_eq!(b.features, vec!["a".to_string(), "b".to_string()]);
         assert_eq!(b.cargo_lock, artefact_digest(b"lock"));
         fs::remove_dir_all(&dir).ok();
+    }
+
+    fn manifest(package: &[u8], runtime: &[u8], constructions: Vec<u8>) -> CodeManifest {
+        let profile = BuildProfile {
+            target: "riscv64em-vos".into(),
+            toolchain: "nightly-2026-03-20".into(),
+            opt_level: "s".into(),
+            features: Vec::new(),
+            source_revision: "abc".into(),
+            cargo_lock: [0; 32],
+        };
+        let artefact = |role, bytes: &[u8]| Artefact {
+            role,
+            digest: artefact_digest(bytes),
+            len: bytes.len() as u64,
+            program_id: None,
+            profile: profile.clone(),
+        };
+        CodeManifest {
+            writer: WriterKind::Core,
+            artefacts: vec![
+                artefact(Role::Package, package),
+                artefact(Role::Runtime, runtime),
+                artefact(Role::NativeDecide, b"the genesis host"),
+            ],
+            kernel: KernelIdentity {
+                revision: "e9a7b08".into(),
+                checksum: None,
+            },
+            constructions,
+            messages: Vec::new(),
+        }
+    }
+
+    /// `F-038` §12 step 0, `DEC-27` (i): the genesis package and runtime pass under a newer host
+    /// (the manifest's native-decide artefact is the genesis host's, and is not checked); a changed
+    /// byte, swapped roles, a missing role, another writer or another construction is refused.
+    #[test]
+    fn dec_27_i_the_genesis_bytes_pass_and_a_tampered_copy_is_refused() {
+        let ours = ledger_core::anchor::construction();
+        let m = manifest(b"core.vos", b"agent_runtime.pvm", vec![ours]);
+        // As a manifest file gives it.
+        let m = CodeManifest::from_bytes(&m.to_bytes()).unwrap();
+        check_agent(&m, b"core.vos", b"agent_runtime.pvm").unwrap();
+        assert!(check_agent(&m, b"core.vOs", b"agent_runtime.pvm").is_err());
+        assert!(check_agent(&m, b"core.vos", b"agent_runtime.pvm\0").is_err());
+        assert!(check_agent(&m, b"agent_runtime.pvm", b"core.vos").is_err());
+        let mut other = m.clone();
+        other.writer = WriterKind::Shard;
+        assert!(check_agent(&other, b"core.vos", b"agent_runtime.pvm").is_err());
+        let mut no_runtime = m.clone();
+        no_runtime.artefacts.retain(|a| a.role != Role::Runtime);
+        assert!(check_agent(&no_runtime, b"core.vos", b"agent_runtime.pvm").is_err());
+        let elsewhere = manifest(
+            b"core.vos",
+            b"agent_runtime.pvm",
+            vec![ours.wrapping_add(1)],
+        );
+        assert!(check_agent(&elsewhere, b"core.vos", b"agent_runtime.pvm").is_err());
     }
 }

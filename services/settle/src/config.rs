@@ -60,10 +60,21 @@ pub struct AdapterConfig {
     pub holder: String,
     /// The settlement layer the deployment declares: its genesis hash, hex (`REQ-SA-2`).
     pub genesis: String,
-    /// The runtime `spec_version`s the adapter was checked against. Each must be one the adapter
-    /// has a Kreivo transaction format for (`T-027-07`: 132 and 133), or the adapter does not
-    /// start.
+    /// **Informational only, and optional** (`T-027-12`, amendment 0031): the runtime
+    /// `spec_version`s a deployment was checked against. Since `REQ-SA-9` a `spec_version` gates
+    /// nothing: the adapter signs for any runtime whose transaction surface it has a format for,
+    /// once the layer confirms it. A file that still lists them is accepted, and the list is
+    /// logged at start-up and otherwise ignored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spec_versions: Vec<u32>,
+    /// The operator's mapping from a runtime `spec_version` to the name of a known format
+    /// (`kreivo-132`, `kreivo-133`), for a runtime whose surface would otherwise match none, or
+    /// another (`T-027-12`, `REQ-SA-9`: "an operator MAY name in configuration the format to use
+    /// for a set of rules"). The named format is used for that `spec_version` whatever its
+    /// surface, and the layer's confirmation is still required before anything signed in it is
+    /// broadcast. A name the adapter does not know is refused at start-up. Default: none.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub formats: std::collections::BTreeMap<u32, String>,
     /// The deployment's instance on the settlement layer.
     pub instance: u32,
     /// The assets it supports.
@@ -110,6 +121,15 @@ pub struct AdapterConfig {
     /// again for that.
     #[serde(default = "default_batch_gas_margin_percent")]
     pub batch_gas_margin_percent: u64,
+    /// After how many consecutive "not now" answers of the layer (`Stale`, `Future`, `Payment`,
+    /// `ExhaustsResources`, `AncientBirthBlock`, an unknown validity) to the first transaction
+    /// signed on a runtime not yet confirmed the adapter raises that runtime's
+    /// `runtime:<spec_version>` alert, which pages (`F-027` NOTES, decision 52). Default 10: at
+    /// least one answer a step while calls wait, and a step at least every `interval` (2 s in the
+    /// deployment template), so about 20 s, well inside the four minutes or so a withdrawal can wait
+    /// unsigned before it ends as never signed. 0 is taken as 1.
+    #[serde(default = "default_not_now_alert_after")]
+    pub not_now_alert_after: u32,
 }
 
 /// [`ProcessConfig::wake_poll`]'s default, in milliseconds.
@@ -120,6 +140,11 @@ pub fn default_wake_poll() -> Time {
 /// [`AdapterConfig::challenge_window`]'s default.
 pub fn default_challenge_window() -> u64 {
     256
+}
+
+/// [`AdapterConfig::not_now_alert_after`]'s default.
+pub fn default_not_now_alert_after() -> u32 {
+    10
 }
 
 /// [`AdapterConfig::batch_gas_margin_percent`]'s default: half again.
@@ -135,13 +160,13 @@ impl AdapterConfig {
             .and_then(|v| v.try_into().ok())
     }
 
-    /// The allowed `spec_version`s for which no Kreivo transaction format is known (`T-027-07`):
-    /// a configuration listing one is refused at start-up, since nothing could be signed for it.
-    pub fn spec_versions_without_format(&self) -> Vec<u32> {
-        self.spec_versions
-            .iter()
-            .copied()
-            .filter(|v| crate::chain::kreivo::TxFormat::of(*v).is_none())
+    /// The format names in [`AdapterConfig::formats`] the adapter does not know (`T-027-12`): a
+    /// configuration naming one is refused at start-up, since nothing could be signed in it.
+    pub fn unknown_formats(&self) -> Vec<String> {
+        self.formats
+            .values()
+            .filter(|name| crate::chain::kreivo::TxFormat::named(name).is_none())
+            .cloned()
             .collect()
     }
 
@@ -539,16 +564,28 @@ mod tests {
         assert!(c.contracts().is_err(), "a contract is 32 bytes");
     }
 
+    /// `T-027-12`, `REQ-SA-9`: no `spec_version` list is needed; one from an older file still
+    /// parses, gating nothing; the operator's `formats` names known formats only.
     #[test]
-    fn t_027_07_an_allowed_runtime_needs_a_known_transaction_format() {
-        // The README's allow-list is mainnet's runtime and the release after it.
+    fn t_027_12_spec_versions_are_optional_and_formats_name_known_ones() {
         let c: ProcessConfig = serde_json::from_value(readme_example()).unwrap();
-        assert_eq!(c.adapter.spec_versions, vec![132, 133]);
-        assert!(c.adapter.spec_versions_without_format().is_empty());
+        assert!(c.adapter.spec_versions.is_empty() && c.adapter.formats.is_empty());
+        assert!(c.adapter.unknown_formats().is_empty());
+        // An older file's list, numbers the adapter has no format for included.
         let c = with(|m| {
             m["adapter"]["spec_versions"] = serde_json::json!([132, 135, 133, 1]);
         });
-        assert_eq!(c.adapter.spec_versions_without_format(), vec![135, 1]);
+        assert_eq!(c.adapter.spec_versions, vec![132, 135, 133, 1]);
+        assert!(c.adapter.unknown_formats().is_empty());
+        // The operator's mapping: JSON's keys are strings.
+        let c = with(|m| {
+            m["adapter"]["formats"] = serde_json::json!({ "135": "kreivo-133", "136": "kreivo-9" });
+        });
+        assert_eq!(
+            c.adapter.formats.get(&135).map(String::as_str),
+            Some("kreivo-133")
+        );
+        assert_eq!(c.adapter.unknown_formats(), vec!["kreivo-9".to_owned()]);
     }
 
     #[test]
@@ -606,7 +643,7 @@ mod tests {
 
     /// The canary's template (`deploy/templates/settle.json`), its `<FILL …>` strings left as they
     /// are: it parses, it connects through the light client and dry-runs there too, it takes
-    /// every secret from the environment, it allows Kreivo 0.17.0's runtime only, and it declares
+    /// every secret from the environment, it names no runtime list (T-027-12), and it declares
     /// the genesis its Kreivo chain spec (`deploy/templates/chain-specs/kreivo.json`) describes.
     #[test]
     fn the_canary_template_parses_names_its_secrets_and_declares_its_chain_specs_genesis() {
@@ -654,8 +691,8 @@ mod tests {
             timeout_ms: None,
         });
         assert_eq!(production.check_key_sources(), Ok(true));
-        assert_eq!(c.adapter.spec_versions, vec![133, 134]);
-        assert!(c.adapter.spec_versions_without_format().is_empty());
+        // T-027-12: no runtime list; the format follows the runtime's surface.
+        assert!(c.adapter.spec_versions.is_empty() && c.adapter.formats.is_empty());
         // The chain spec: Kreivo's verified light spec, 12 boot nodes (the single boot node is
         // lifted), and a genesis state root whose genesis block is the one the
         // adapter declares (REQ-SA-2).

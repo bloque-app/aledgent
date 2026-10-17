@@ -91,6 +91,9 @@ pub struct Metrics {
     pub oldest_undelivered_ms: AtomicU64,
     /// Commands answered `ERR-DecisionUnavailable` (`REQ-CS-7`).
     pub decisions_unavailable: AtomicU64,
+    /// Credentials checked against the durable verifier copy because no core answered (`F-038`
+    /// §7, `DEC-27` (e″)).
+    pub verifier_copy_used: AtomicU64,
     /// Reply stamps not written to the received-log: the queue was full or the store refused the
     /// batch (`T-009-25`). Each is a row whose `replied_at` stays NULL.
     pub reply_stamps_dropped: AtomicU64,
@@ -281,6 +284,12 @@ impl Metrics {
             "Commands answered ERR-DecisionUnavailable (REQ-CS-7).",
             "counter",
             get(&self.decisions_unavailable),
+        );
+        line(
+            "aledgent_ingress_verifier_copy_used_total",
+            "Credentials checked against the durable verifier copy: no core answered (F-038).",
+            "counter",
+            get(&self.verifier_copy_used),
         );
         line(
             "aledgent_ingress_reply_stamps_dropped_total",

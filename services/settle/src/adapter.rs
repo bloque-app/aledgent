@@ -9,10 +9,17 @@
 //! 2. **Status.** Re-run the start-up assertions (`REQ-SA-2`, `REQ-AS-2`) and declare the result
 //!    to the core when it changed or half its lease has passed. While refusing, nothing else
 //!    runs: a network that is not the declared one is not read, and nothing is signed for it.
-//!    Among them (`F-027` T-027-07): the runtime's `spec_version` selects the Kreivo transaction
-//!    format every batch of the step is signed in, and a runtime with no known format, or whose
-//!    transaction extensions are not its format's, is refused. So a runtime upgrade the layer
-//!    reports switches the format from the next batch on.
+//!    Among them (`F-027` T-027-07, T-027-12, `REQ-SA-9`): the runtime's **transaction surface**
+//!    (its `transaction_version`, its transaction extensions and the digest of what a transaction
+//!    carries, read from its metadata) selects the Kreivo transaction format every batch of the
+//!    step is signed in, unless the operator names one for its `spec_version`; a surface with no
+//!    format is refused, and so is a runtime on which the layer did not confirm the format. Its
+//!    `spec_version` alone decides nothing. So a runtime upgrade the layer reports switches the
+//!    format from the next batch on, and one that changes nothing a transaction carries keeps it.
+//!    **The first transaction signed on a runtime not served before is validated by the runtime
+//!    itself** (`TaggedTransactionQueue_validate_transaction`), at the block whose runtime it was
+//!    signed for, before anything is broadcast (`Adapter::confirmed`); the runtime is recorded as
+//!    served once it is valid, and nothing goes out on it before (`F-027` NOTES, decision 51).
 //!    Then, while serving, **attest** each bound asset location (`DEC-20`): what the layer's
 //!    metadata states about it at the finalized head, when it changed or half the status lease
 //!    has passed. The core registers assets at those decimals and holds any asset whose location
@@ -87,7 +94,8 @@ use serde::Serialize;
 use crate::chain::kreivo;
 use crate::chain::{
     AccountId32, AnchorCall, BatchCall, BatchFailure, BindCall, BlockRef, Chain, ChainAsset,
-    ChainError, InboxEntry, InboxEvent, InboxRead, Mortality, WithdrawCall,
+    ChainError, InboxEntry, InboxEvent, InboxRead, Mortality, RuntimeInfo, SignedExtrinsic,
+    Validity, WithdrawCall,
 };
 use crate::config::AdapterConfig;
 use crate::link::{Answer, CoreLink, LinkError, Transport};
@@ -95,7 +103,7 @@ use crate::signer::Signer;
 use crate::store::{
     AnchorExtrinsic, AnchorRow, BindRow, ExtrinsicRow, ExtrinsicStatus, GapRow, Inserted,
     InstructionRow, InstructionState, LaneRow, NotExecuted, ObservationRow, ParkReason, ReportRow,
-    Store, StoreError,
+    RuntimeRow, Store, StoreError,
 };
 
 /// The chain's operation reference of a book operation: the call envelope's reference, its 16
@@ -189,24 +197,30 @@ pub enum Refusing {
         /// What the network reports, hex.
         found: String,
     },
-    /// The runtime's `spec_version` is not on the allow-list.
-    SpecVersion {
-        /// What the runtime reports.
-        found: u32,
-    },
-    /// No Kreivo transaction format is known for the runtime's `spec_version` (`T-027-07`):
-    /// nothing is signed for it rather than guessed.
-    TxFormat {
-        /// What the runtime reports.
-        found: u32,
-    },
-    /// The runtime's transaction extensions are not the ones its `spec_version`'s format was
-    /// pinned with (`T-027-07`).
-    Extensions {
+    /// The runtime's transaction surface is none the adapter has a Kreivo transaction format for,
+    /// and the operator names no format for its `spec_version` (`T-027-12`, `REQ-SA-9`,
+    /// `AC-E4.4`): nothing is signed for it rather than guessed.
+    UnknownSurface {
         /// The runtime's `spec_version`.
         spec_version: u32,
+        /// Its `transaction_version`.
+        transaction_version: u32,
         /// The extensions its metadata names, in order.
-        found: Vec<String>,
+        extensions: Vec<String>,
+        /// The digest of the types of what a transaction carries, hex; empty when its metadata
+        /// has no `Contracts::call` to read.
+        types: String,
+    },
+    /// The layer did not confirm a transaction signed in the format chosen for the runtime: it
+    /// found it invalid for what it carries (`T-027-12`, `REQ-SA-9`, `AC-E4.4`). Nothing more is
+    /// signed for that runtime until the adapter restarts or the runtime changes.
+    Unconfirmed {
+        /// The runtime's `spec_version`.
+        spec_version: u32,
+        /// The format the transaction was signed in.
+        format: String,
+        /// The runtime's answer.
+        error: String,
     },
     /// The settlement pallet is not in the metadata.
     NoPallet,
@@ -290,6 +304,35 @@ pub struct Adapter<C: Chain, S: Store, T: Transport> {
     /// What the last step read (`NFR-15`): the heads and the calls waiting for intake, against
     /// which [`Adapter::news`] says whether a step is due before the interval ends.
     last_seen: Option<Seen>,
+    /// The runtimes on which the layer refused a transaction signed in the format chosen for
+    /// them (`T-027-12`), by [`Chosen::key`]: refused until the process restarts.
+    refused: BTreeMap<String, Refusing>,
+    /// Consecutive "not now" answers to the first transaction on each runtime not yet confirmed,
+    /// by [`Chosen::key`] (`F-027` NOTES, decision 52): at
+    /// [`AdapterConfig::not_now_alert_after`] the runtime's alert is raised. Held in memory: a
+    /// restart counts again; an alert already raised is in the store, and stays open until a
+    /// runtime is confirmed.
+    not_now: BTreeMap<String, u32>,
+    /// The confirmed runtimes, by [`Chosen::key`], whose `runtime:<spec_version>` alert this
+    /// process has made sure is cleared (decision 52): a confirmation stored before its alert was
+    /// cleared (a store error, a crash in between) would otherwise leave the alert open, paging,
+    /// since every later step finds the runtime confirmed and never reaches the clearing.
+    alert_settled: BTreeSet<String>,
+}
+
+/// The format the adapter signs in on a runtime, and that runtime's identity (`T-027-12`).
+#[derive(Clone, Debug)]
+struct Chosen {
+    /// What a transaction is signed for.
+    signing: kreivo::Signing,
+    /// The runtime's surface.
+    surface: kreivo::Surface,
+    /// The runtime, as its confirmation is recorded: `spec_version`, the surface's fingerprint
+    /// and the format's name.
+    key: String,
+    /// The block the runtime was read at ([`RuntimeInfo::at`]): what is signed for it is
+    /// validated there (`F-027` NOTES, decision 51).
+    at: BlockRef,
 }
 
 /// What a step read that the next one would act on: the finalized and best heads' hashes, and the
@@ -432,6 +475,9 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             unregistered: std::collections::BTreeSet::new(),
             declared_support: Vec::new(),
             last_seen: None,
+            refused: BTreeMap::new(),
+            not_now: BTreeMap::new(),
+            alert_settled: BTreeSet::new(),
         }
     }
 
@@ -569,30 +615,12 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             // Nothing else on a network that is not the declared one is worth reading.
             return out;
         }
-        if !self.config.spec_versions.contains(&runtime.spec_version) {
-            out.push(Refusing::SpecVersion {
-                found: runtime.spec_version,
-            });
-        }
-        // T-027-07: the transaction format follows the runtime, checked on every step, so a
-        // runtime upgrade the layer reports switches the format of the next batch signed.
-        match crate::chain::kreivo::TxFormat::of(runtime.spec_version) {
-            None => out.push(Refusing::TxFormat {
-                found: runtime.spec_version,
-            }),
-            Some(f)
-                if runtime
-                    .extensions
-                    .iter()
-                    .map(String::as_str)
-                    .ne(f.extensions.iter().copied()) =>
-            {
-                out.push(Refusing::Extensions {
-                    spec_version: runtime.spec_version,
-                    found: runtime.extensions.clone(),
-                });
-            }
-            Some(_) => {}
+        // T-027-12 (REQ-SA-9): the transaction format follows the runtime's surface, checked on
+        // every step, so a runtime upgrade the layer reports switches the format of the next batch
+        // signed, and one that changes nothing a transaction carries keeps it. The `spec_version`
+        // gates nothing.
+        if let Err(r) = self.chosen(&runtime) {
+            out.push(r);
         }
         if !runtime.pallet {
             out.push(Refusing::NoPallet);
@@ -619,6 +647,244 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
         // this configuration. The adapter attests each location's metadata to the core
         // (`Adapter::attest_assets`), which checks it against the registry, asset by asset.
         out
+    }
+
+    /// The format the adapter signs in on `runtime` (`T-027-12`, `REQ-SA-9`): the one the
+    /// operator names for its `spec_version` (`formats`), else the one whose surface is the
+    /// runtime's ([`kreivo::TxFormat::by_surface`]). Refused if there is none, or if the layer
+    /// already refused a transaction signed in it on this runtime.
+    fn chosen(&self, runtime: &RuntimeInfo) -> Result<Chosen, Refusing> {
+        let named = self
+            .config
+            .formats
+            .get(&runtime.spec_version)
+            .and_then(|name| kreivo::TxFormat::named(name));
+        let Some(format) = named.or_else(|| kreivo::TxFormat::by_surface(&runtime.surface)) else {
+            return Err(Refusing::UnknownSurface {
+                spec_version: runtime.spec_version,
+                transaction_version: runtime.surface.transaction_version,
+                extensions: runtime.surface.extensions.clone(),
+                types: runtime.surface.types.map(hex::encode).unwrap_or_default(),
+            });
+        };
+        let key = format!(
+            "{}:{}:{}",
+            runtime.spec_version,
+            hex::encode(runtime.surface.fingerprint()),
+            format.name
+        );
+        if let Some(r) = self.refused.get(&key) {
+            return Err(r.clone());
+        }
+        Ok(Chosen {
+            signing: kreivo::Signing {
+                spec_version: runtime.spec_version,
+                transaction_version: runtime.surface.transaction_version,
+                format,
+            },
+            surface: runtime.surface.clone(),
+            key,
+            at: runtime.at,
+        })
+    }
+
+    /// Whether `ext`, just signed for `chosen`, may be broadcast (`T-027-12`, `REQ-SA-9`): **the
+    /// layer's confirmation before the first transaction signed under rules not served before**.
+    ///
+    /// On a runtime the store records as served, yes. Otherwise the runtime validates `ext`, as a
+    /// transaction from the network, without including it, **at the block whose runtime `ext` was
+    /// signed for** (`chosen.at`, `F-027` NOTES decision 51): never at a head read before or after
+    /// that runtime was, which an upgrade between the two reads would make another runtime.
+    ///
+    /// - **valid**: the runtime is recorded as served (it survives a restart) and `ext` goes out;
+    /// - **invalid for what it carries** (a proof or signer that does not verify, an origin no
+    ///   extension authorised, bytes it cannot decode): nothing is broadcast and the adapter
+    ///   refuses to serve on that runtime ([`Refusing::Unconfirmed`], an alert
+    ///   `runtime:<spec_version>`), once it has checked that the runtime at `chosen.at` is the one
+    ///   `ext` was signed for. If it is not, the refusal is of a transaction signed for another
+    ///   runtime and says nothing of the format: nothing is broadcast, nothing refused, and the
+    ///   next step signs again;
+    /// - **anything else** (invalid for now: a nonce, fees, the era, the block's resources; or an
+    ///   answer it cannot class): neither a confirmation nor a refusal, so nothing is broadcast
+    ///   (`REQ-SA-9`: no service until the layer confirms). Nothing is stored and no nonce moves;
+    ///   the calls stay acknowledged and unsigned, and the next step rebuilds the transaction and
+    ///   asks again. After [`AdapterConfig::not_now_alert_after`] such answers in a row on the
+    ///   runtime, its `runtime:<spec_version>` alert is raised, naming the last answer (`F-027`
+    ///   NOTES, decision 52); the runtime's confirmation clears it.
+    ///
+    /// `false` means `ext` is dropped: the caller stores nothing and puts its calls back.
+    async fn confirmed(&mut self, chosen: &Chosen, ext: &SignedExtrinsic) -> StepResult<bool> {
+        if self
+            .store
+            .runtimes()
+            .await?
+            .iter()
+            .any(|r| r.key == chosen.key)
+        {
+            // Once a process: an alert left open by a confirmation that was stored before its
+            // alert was cleared is cleared now (unless this process refused that runtime).
+            if !self.alert_settled.contains(&chosen.key) {
+                let alert = format!("runtime:{}", chosen.signing.spec_version);
+                let refused = self.refused.values().any(|r| {
+                    matches!(r, Refusing::Unconfirmed { spec_version, .. }
+                        if *spec_version == chosen.signing.spec_version)
+                });
+                if !refused
+                    && self
+                        .store
+                        .alerts()
+                        .await?
+                        .iter()
+                        .any(|a| a.key == alert && a.cleared_at.is_none())
+                {
+                    self.store.clear(&alert, self.now()).await?;
+                }
+                self.alert_settled.insert(chosen.key.clone());
+            }
+            return Ok(true);
+        }
+        let now = self.now();
+        let spec_version = chosen.signing.spec_version;
+        let format = chosen.signing.format.name;
+        let alert = format!("runtime:{spec_version}");
+        match self.chain.validate(&chosen.at, ext).await? {
+            Validity::Valid => {
+                self.store
+                    .confirm_runtime(&RuntimeRow {
+                        key: chosen.key.clone(),
+                        spec_version,
+                        transaction_version: chosen.surface.transaction_version,
+                        extensions: chosen.surface.extensions.clone(),
+                        types: chosen.surface.types.map(hex::encode).unwrap_or_default(),
+                        format: format.to_owned(),
+                        extrinsic: hex::encode(ext.hash),
+                        confirmed_at: now,
+                    })
+                    .await?;
+                // Decision 52: the runtime's alert clears, and so does any other runtime's this
+                // process has not refused (one a "not now" held, upgraded away from since, maybe
+                // before a restart): nothing waits on it any more.
+                let refused: BTreeSet<String> = self
+                    .refused
+                    .values()
+                    .filter_map(|r| match r {
+                        Refusing::Unconfirmed { spec_version, .. } => {
+                            Some(format!("runtime:{spec_version}"))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                for open in self.store.alerts().await? {
+                    if open.cleared_at.is_none()
+                        && open.key.starts_with("runtime:")
+                        && (open.key == alert || !refused.contains(&open.key))
+                    {
+                        self.store.clear(&open.key, now).await?;
+                    }
+                }
+                self.not_now.clear();
+                self.alert_settled.insert(chosen.key.clone());
+                tracing::info!(
+                    spec_version,
+                    format,
+                    hash = %hex::encode(ext.hash),
+                    "the settlement layer confirmed the transaction format on its runtime"
+                );
+                Ok(true)
+            }
+            Validity::NotNow(why) => {
+                let answers = self.not_now.entry(chosen.key.clone()).or_insert(0);
+                *answers = answers.saturating_add(1);
+                let answers = *answers;
+                tracing::warn!(
+                    spec_version,
+                    format,
+                    why = %why,
+                    answers,
+                    "the settlement layer's runtime neither confirmed nor refused the format; \
+                     nothing is broadcast, and the next step signs and asks again"
+                );
+                // Decision 52: a "not now" that persists holds every withdrawal on the runtime
+                // until it ends as never signed, long before the oldest-operation page could
+                // fire. From the threshold on, the runtime's alert is open, and it pages.
+                if answers >= self.config.not_now_alert_after.max(1)
+                    && self
+                        .store
+                        .raise(
+                            &alert,
+                            &format!(
+                                "the settlement layer answered \"not now\" {answers} times in a \
+                                 row to a transaction signed in format {format} on spec_version \
+                                 {spec_version}, last: {why}; nothing is broadcast on it until it \
+                                 confirms"
+                            ),
+                            now,
+                        )
+                        .await?
+                {
+                    tracing::error!(
+                        spec_version,
+                        format,
+                        why = %why,
+                        answers,
+                        "the settlement layer has not confirmed the runtime after repeated \
+                         \"not now\" answers; withdrawals on it wait unsigned"
+                    );
+                }
+                Ok(false)
+            }
+            Validity::Refused(why) => {
+                // Decision 51: a refusal is of the format only if the runtime that validated
+                // `ext` is the one it was signed for.
+                let validated = self.chain.version(&chosen.at).await?;
+                if (validated.spec_version, validated.transaction_version)
+                    != (spec_version, chosen.signing.transaction_version)
+                {
+                    tracing::warn!(
+                        spec_version,
+                        format,
+                        validated_spec_version = validated.spec_version,
+                        at = chosen.at.number,
+                        why = %why,
+                        "a transaction was validated by another runtime than the one it was \
+                         signed for, and refused; nothing is broadcast or refused, and the next \
+                         step signs again"
+                    );
+                    return Ok(false);
+                }
+                let refusing = Refusing::Unconfirmed {
+                    spec_version,
+                    format: format.to_owned(),
+                    error: why.clone(),
+                };
+                // An alert the "not now" answers raised would keep their detail: the refusal's
+                // replaces it.
+                if self.not_now.remove(&chosen.key).is_some() {
+                    self.store.clear(&alert, now).await?;
+                }
+                self.store
+                    .raise(
+                        &alert,
+                        &format!(
+                            "the settlement layer refused a transaction signed in format {format} \
+                             on spec_version {spec_version}: {why}; nothing is signed for it"
+                        ),
+                        now,
+                    )
+                    .await?;
+                tracing::error!(
+                    spec_version,
+                    format,
+                    why = %why,
+                    "the settlement layer did not confirm the transaction format on its runtime; \
+                     refusing to serve"
+                );
+                self.refused.insert(chosen.key.clone(), refusing.clone());
+                self.serving = false;
+                self.refusing.push(refusing);
+                Ok(false)
+            }
+        }
     }
 
     fn support(&self) -> Vec<AdapterLegBody> {
@@ -1180,6 +1446,10 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
         }
         self.store.clear(&format!("fees:{key}"), now).await?;
         let runtime = self.chain.runtime().await?;
+        // T-027-12: the runtime the step's assertions passed, unless it changed since.
+        let Ok(chosen) = self.chosen(&runtime) else {
+            return Ok(());
+        };
         let max_era = self.config.max_era.min(runtime.block_hash_count).max(4);
         // An anchor has no expiry; its era, born at the finalized head, still ends within the PASS
         // challenge's window.
@@ -1251,8 +1521,13 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                 &era,
                 fin,
                 &limits,
+                &chosen.signing,
             )
             .await?;
+        // T-027-12: the layer's confirmation before the first broadcast on a runtime.
+        if !self.confirmed(&chosen, &signed).await? {
+            return Ok(());
+        }
         // REQ-SA-6: stored before it is broadcast.
         row.extrinsic = Some(AnchorExtrinsic {
             lane: key,
@@ -1457,6 +1732,10 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             return Ok(());
         }
         let runtime = self.chain.runtime().await?;
+        // T-027-12: the runtime the step's assertions passed, unless it changed since.
+        let Ok(chosen) = self.chosen(&runtime) else {
+            return Ok(());
+        };
         let max_era = self.config.max_era.min(runtime.block_hash_count).max(4);
         let Some(era) = Mortality::born_at_finalized(
             fin.number,
@@ -1521,8 +1800,13 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                 &era,
                 fin,
                 &limits,
+                &chosen.signing,
             )
             .await?;
+        // T-027-12: the layer's confirmation before the first broadcast on a runtime.
+        if !self.confirmed(&chosen, &signed).await? {
+            return Ok(());
+        }
         // REQ-SA-6: stored before it is broadcast.
         row.extrinsic = Some(AnchorExtrinsic {
             lane: key,
@@ -2421,6 +2705,9 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
         let now = self.now();
         let instance = self.config.instance;
         let runtime = self.chain.runtime().await?;
+        // T-027-12: the runtime the step's assertions passed, unless it changed since; if it did,
+        // nothing new is signed this step.
+        let chosen = self.chosen(&runtime).ok();
         let max_era = self.config.max_era.min(runtime.block_hash_count).max(4);
         let extrinsics = self.store.extrinsics().await?;
         let signed_ops: BTreeSet<String> = extrinsics.iter().map(|e| e.operation.clone()).collect();
@@ -2532,6 +2819,9 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             if ready.is_empty() {
                 break;
             }
+            let Some(chosen) = chosen.clone() else {
+                break;
+            };
             let key = Self::lane_key(l.as_ref());
             let lane = self.store.lane(&key).await?;
             if lane.as_ref().is_some_and(|x| x.in_flight.is_some()) {
@@ -2600,8 +2890,25 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                 batch.iter().map(|r| BatchCall::withdraw(&r.call)).collect();
             let ext = self
                 .chain
-                .sign_batch(instance, &calls, l.as_ref(), nonce, &era, fin, &limits)
+                .sign_batch(
+                    instance,
+                    &calls,
+                    l.as_ref(),
+                    nonce,
+                    &era,
+                    fin,
+                    &limits,
+                    &chosen.signing,
+                )
                 .await?;
+            // T-027-12: the layer's confirmation before the first broadcast on a runtime. Refused,
+            // the batch is never stored: its calls wait, and nothing more is signed.
+            if !self.confirmed(&chosen, &ext).await? {
+                for r in batch.into_iter().rev() {
+                    ready.push_front(r);
+                }
+                break;
+            }
             self.fault(CrashPoint::AfterSign)?;
             let ops: Vec<String> = batch.iter().map(|r| r.operation.clone()).collect();
             let ext_rows: Vec<ExtrinsicRow> = batch

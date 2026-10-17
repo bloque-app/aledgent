@@ -105,8 +105,9 @@ in-process implementation is already the native one, and needs the durable servi
    condition: an account `ERR-UnknownAccount`, an operation `ERR-UnknownOperation`, an asset
    `ERR-UnknownAsset`, an amount `ERR-PrecisionExceeded` (as `F-003` refuses a decimal it cannot
    represent). A transfer over the limit is `ERR-BatchTooLarge` (`REQ-CS-10`). A proof that does not
-   decode stays `ERR-CredentialInvalid`, the no-bearer routes stay deny-by-default, and queries keep
-   their own conditions.
+   decode stays `ERR-CredentialInvalid`, the no-bearer routes stay deny-by-default. Queries followed
+   later: amendment 0032 (ruled 2026-10-17) gives a read's shape faults the same condition, and
+   leaves what is missing or conflicting to `ERR-QueryUnbounded` (`T-009-28`).
 5. **Amounts on the wire are decimal-integer strings of minor units**, as planned. So ingress never
    needs the registry to convert them; `F-003`'s `Ledger::parse_amount` stays the one decimal
    boundary for any surface that takes decimals.

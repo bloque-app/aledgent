@@ -19,7 +19,7 @@ required-features = ["postgres", "http"]
 default = ["postgres", "http"]
 # The PostgreSQL received-log (accepted proposal of F-009): several replicas share one log and
 # one uniqueness constraint.
-postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:tokio-postgres-rustls", "dep:rustls", "dep:webpki-roots"]
+postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:tokio-postgres-rustls", "dep:webpki-roots"]
 # Notification delivery over HTTPS to configured endpoints.
 http = ["dep:reqwest"]
 # v1 roots (CipherClerk's full-depth tree): a supported opt-in beside the default v2 (DEC-25,
@@ -63,7 +63,13 @@ deadpool-postgres = { version = "0.14", optional = true }
 # TLS to PostgreSQL, as the connection string's `sslmode` asks (store/pg.rs, `tls`): rustls on ring,
 # the provider the rest of the workspace already builds, so no C toolchain beyond ring's.
 tokio-postgres-rustls = { version = "0.14", default-features = false, features = ["ring"], optional = true }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
+# TLS to PostgreSQL, and the core stream's mutual TLS (F-038): rustls on ring, always built, since
+# the core host (which builds ingress without default features) dials the stream with it.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pki-types = { version = "1", features = ["std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+# F-038: ingress's signature on every forwarded input, and the core host's check of it.
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"] }
 webpki-roots = { version = "1", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
 

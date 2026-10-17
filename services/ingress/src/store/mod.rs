@@ -184,6 +184,9 @@ pub struct Row {
     /// starts here (owner ruling on PR #235). `None` for every other row, and for a withdrawal
     /// not yet submitted.
     pub submitted_at: Option<Time>,
+    /// Its feed sequence in its partition (`F-038`, [`Store::mark_fed`]): given the first time the
+    /// forwarder sends it under the feed lease, and carried by every resend. `None` until then.
+    pub feed_seq: Option<u64>,
 }
 
 /// The core's reply to one row, for [`Store::mark_decided_many`].
@@ -310,6 +313,22 @@ impl std::fmt::Display for StoreError {
 
 impl std::error::Error for StoreError {}
 
+/// What a [`StoreError`] from [`Store::mark_fed`] says when the caller no longer holds the feed
+/// lease under its epoch (`F-038`).
+pub const FENCED: &str = "fenced: the feed lease is another holder's or another epoch's";
+
+impl StoreError {
+    /// The error of a fenced feeder.
+    pub fn fenced() -> StoreError {
+        StoreError(FENCED.to_owned())
+    }
+
+    /// Whether this is [`StoreError::fenced`].
+    pub fn is_fenced(&self) -> bool {
+        self.0 == FENCED
+    }
+}
+
 /// The ingress store. Every method is one transaction.
 pub trait Store: Clone + Send + Sync + 'static {
     /// Append a row, committed before this returns. A command whose (domain, surface, client key)
@@ -399,12 +418,14 @@ pub trait Store: Clone + Send + Sync + 'static {
         party: &str,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
-    /// The next row to forward: undecided, reservations first, then in arrival order.
+    /// The next row to forward: an undecided row already given a feed sequence (`F-038`), lowest
+    /// first; else undecided, reservations first, then in arrival order.
     fn next_undecided(&self) -> impl Future<Output = Result<Option<Row>, StoreError>> + Send;
 
     /// Up to `n` rows to forward, in the order successive calls of [`Store::next_undecided`]
-    /// would give them: undecided reservations in arrival order, then the other undecided rows
-    /// in arrival order (`T-031-04`). The default gives the one `next_undecided` gives.
+    /// would give them: undecided rows in flight (given a feed sequence) by that sequence
+    /// (`F-038`), then undecided reservations in arrival order, then the other undecided rows in
+    /// arrival order (`T-031-04`). The default gives the one `next_undecided` gives.
     fn next_undecided_batch(
         &self,
         n: usize,
@@ -545,4 +566,78 @@ pub trait Store: Clone + Send + Sync + 'static {
 
     /// Stop leading, as `replica`.
     fn resign(&self, replica: &str) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// Take or renew the feed lease of `partition` as `holder`, for `lease` on the store's clock
+    /// (`F-038` §3): its epoch, or `None` while another holder's lease runs. The epoch rises every
+    /// time the lease changes holder or lapses, never on a renewal.
+    fn try_feed(
+        &self,
+        partition: &str,
+        holder: &str,
+        lease: std::time::Duration,
+    ) -> impl Future<Output = Result<Option<u64>, StoreError>> + Send;
+
+    /// Expire `holder`'s feed lease of `partition`, if it holds it: on drain, so the next holder
+    /// takes it at once.
+    fn release_feed(
+        &self,
+        partition: &str,
+        holder: &str,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// Whether anyone holds a live feed lease of `partition`.
+    fn feed_live(&self, partition: &str) -> impl Future<Output = Result<bool, StoreError>> + Send;
+
+    /// [`Store::mark_forwarded_many`] under the feed lease `holder` holds at `epoch`, giving every
+    /// undecided row without one its feed sequence, gapless, in the order given, in one
+    /// transaction (`F-038` §3). [`StoreError::fenced`] if the lease is not `holder`'s at `epoch`
+    /// now: nothing is marked. The rows, in order.
+    fn mark_fed(
+        &self,
+        partition: &str,
+        holder: &str,
+        epoch: u64,
+        op_refs: &[InputKey],
+        at: Time,
+    ) -> impl Future<Output = Result<Vec<Row>, StoreError>> + Send;
+
+    /// Give back the feed sequences from `from` on (`F-038` §3): the rows holding them were sent
+    /// and certainly did not run, so they go back to the queue without a sequence, and the next
+    /// row sent takes `from` again. Only under the lease `holder` holds at `epoch` (else
+    /// [`StoreError::fenced`], and nothing changes); only the partition's tail, every row of
+    /// which is undecided.
+    fn unfeed(
+        &self,
+        partition: &str,
+        holder: &str,
+        epoch: u64,
+        from: u64,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// Keep what the book answered for `credential` (`F-038` §7, `DEC-27` (e″)): its public
+    /// material, or, for `None` (no working credential), forget it.
+    fn copy_verifier(
+        &self,
+        credential: &str,
+        found: Option<&crate::boundary::CredentialBody>,
+        at: Time,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// What the book last answered for `credential`, if it named a working credential.
+    fn copied_verifier(
+        &self,
+        credential: &str,
+    ) -> impl Future<Output = Result<Option<crate::boundary::CredentialBody>, StoreError>> + Send;
+
+    /// Advertise `instance` at `address` in the fleet's roster for `ttl` on the store's clock
+    /// (`T-038-21`, `DEC-27` (e′)), and return the live roster, this instance included, by name.
+    fn advertise(
+        &self,
+        instance: &str,
+        address: &str,
+        ttl: std::time::Duration,
+    ) -> impl Future<Output = Result<Vec<crate::stream::RosterEntry>, StoreError>> + Send;
+
+    /// Take `instance` out of the roster: on drain, so the cores drop its stream.
+    fn withdraw(&self, instance: &str) -> impl Future<Output = Result<(), StoreError>> + Send;
 }

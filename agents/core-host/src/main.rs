@@ -10,13 +10,18 @@
 //! aledgent-core-host restore --config <file> --runtime <runtime.pvm> --actor <actor.vos> --state <dir> [--budget <bytes>]
 //!                                    finish a restore `opsctl restore core --from` laid out: the Agent
 //!                                    re-sent every archived input after its checkpoint (T-005-16)
-//! aledgent-core-host measure <runtime.pvm> <actor.vos> <out.csv> [--n N] [--warmup W] [--mix reserve|mixed] [--batch N] [--mapped]
+//! aledgent-core-host measure <runtime.pvm> <actor.vos> <out.csv> [--n N] [--warmup W] [--mix reserve|mixed|card|transfers|tick|open|custody|head|positions] [--batch N] [--mapped]
 //!                                    the reservation path, or reservations, captures and
 //!                                    transfers, through the Agent (T-005-10, T-005-14), N
-//!                                    inputs per invocation (T-031-05)
+//!                                    inputs per invocation (T-031-05); `--mix open` opens
+//!                                    identities and accounts (profiling, measure.rs)
 //! aledgent-core-host code-manifest --actor <vos> --runtime <pvm> --profile <json> --out <file>
 //!                                    the genesis code's manifest (amendment 0023's `aledgent/code/v1`)
 //!                                    of this host, package and runtime (F-036, code.rs)
+//! aledgent-core-host check-code --actor <vos> --runtime <pvm> (--chainspec <file> | --manifest <file>) [--code <hex>] [--write-manifest <file>] [--out <file>]
+//!                                    refuse unless the package and runtime are the genesis code's,
+//!                                    as a restart checks them; for a core image on a deployment's
+//!                                    genesis bytes (F-038 §12 step 0, DEC-27 (i), code.rs)
 //! aledgent-core-host build-spec --config <file> --chainspec <file> --actor <vos> --runtime <pvm> --out <dir> [--unnamed-code]
 //!                                    a chainspec's genesis state, built natively: the leaf store
 //!                                    and its manifest (F-036, chainspec.rs)
@@ -84,10 +89,11 @@ fn usage() -> ! {
         "usage:\n  aledgent-core-host serve --config <file> --runtime <runtime.pvm> --actor <actor.vos> --state <dir> [--chainspec <file> [--genesis-manifest <file>] [--unnamed-code] [--unverified-genesis]] [--budget <bytes>] [--batch N] [--archive <spec> [--archive-interval-ms MS] [--checkpoint-every N] [--checkpoint-every-secs S]]\n  \
          aledgent-core-host restore --config <file> --runtime <runtime.pvm> --actor <actor.vos> --state <dir> [--budget <bytes>]\n  \
          aledgent-core-host code-manifest --actor <vos> --runtime <pvm> --profile <json> --out <file>\n  \
+         aledgent-core-host check-code --actor <vos> --runtime <pvm> (--chainspec <file> | --manifest <file>) [--code <hex>] [--write-manifest <file>] [--out <file>]\n  \
          aledgent-core-host build-spec --config <file> --chainspec <file> --actor <vos> --runtime <pvm> --out <dir> [--unnamed-code] [--max-memory <bytes>]\n  \
          aledgent-core-host verify-genesis --config <file> --chainspec <file> --manifest <file> --runtime <pvm> --actor <vos> [--unnamed-code] [--segments K] [--engine interpreter|recompiler] [--out <report>]\n  \
          aledgent-core-host install-verified --config <file> --state <dir> --report <file> [--genesis-manifest <file>] [--archive <spec>]\n  \
-         aledgent-core-host measure <runtime.pvm> <actor.vos> <out.csv> [--n N] [--warmup W] [--mix reserve|mixed] [--batch N] [--mapped]\n  \
+         aledgent-core-host measure <runtime.pvm> <actor.vos> <out.csv> [--n N] [--warmup W] [--mix reserve|mixed|card|transfers|tick|open|custody|head|positions] [--batch N] [--mapped]\n  \
          aledgent-core-host batch-curve <runtime.pvm> <actor.vos> <out.csv> [--sizes ...] [--rounds R] [--accounts A]\n  \
          aledgent-core-host shards <runtime.pvm> <shard.vos> <out.csv> [--counts 1,2,4,8] [--accounts A] [--ops M] [--batch B]\n  \
          aledgent-core-host fleet <runtime.pvm> <shard.vos> <out.csv> --index I --nodes N --peers F --port P --key K [--per-node K] [--phases ...]\n  \
@@ -178,6 +184,12 @@ fn main() {
         Some("code-manifest") => {
             if let Err(e) = code::code_manifest(&args) {
                 eprintln!("aledgent-core-host: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some("check-code") => {
+            if let Err(e) = code::check_code(&args) {
+                eprintln!("aledgent-core-host: check-code: {e}");
                 std::process::exit(1);
             }
         }

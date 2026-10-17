@@ -309,7 +309,8 @@ mod tests {
     }
 
     /// The deployment template (`deploy/templates/signer.json`), its numbers filled: it checks,
-    /// and it holds the core's four keys, which the template's ingress.json names.
+    /// and it holds the core's four keys and ingress's feed key, which the template's ingress.json
+    /// names.
     #[test]
     fn the_canary_template_checks() {
         let text = include_str!("../../../deploy/templates/signer.json");
@@ -323,7 +324,9 @@ mod tests {
         }
         filled.push_str(rest);
         let mut c: Config = serde_json::from_str(&filled).unwrap();
-        c.clients[0].token_sha256 = vec![hex::encode([0u8; 32])];
+        for client in &mut c.clients {
+            client.token_sha256 = vec![hex::encode([0u8; 32])];
+        }
         assert_eq!(c.check(), Ok(()));
         // Owner ruling `key-custody-opt-in-kms`: the keys come from Vault, read by the signer
         // under AWS IAM auth; nothing is a development key.
@@ -340,8 +343,17 @@ mod tests {
         let ids: Vec<&str> = c.keys.iter().map(|k| k.id.as_str()).collect();
         assert_eq!(
             ids,
-            ["keyring", "clerk", "agent-authority", "agent-package"]
+            [
+                "keyring",
+                "clerk",
+                "agent-authority",
+                "agent-package",
+                "ingress-feed"
+            ]
         );
+        // F-038 §5: ingress signs its feeds with its own key, the only one its client may use.
+        let ingress = c.clients.iter().find(|c| c.name == "ingress").unwrap();
+        assert_eq!(ingress.keys, ["ingress-feed"]);
     }
 
     #[test]

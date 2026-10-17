@@ -18,7 +18,9 @@ use ingress::testkit::Party;
 use settle::chain::fake::{
     CALL_REFUSED, ENTRY_DEPOSIT, EXECUTE_BASE, OUT_OF_GAS, WITHDRAWAL_APPLIED,
 };
-use settle::chain::kreivo::{CallLimits, MAX_CALLS, NORMAL_EXTRINSIC_MAX_0_16_9, Weight};
+use settle::chain::kreivo::{
+    CallLimits, FORMAT_133, MAX_CALLS, NORMAL_EXTRINSIC_MAX_0_16_9, Signing, Weight,
+};
 use settle::chain::{BatchCall, BlockRef, Chain, ChainError, Mortality};
 use settle::store::{ExtrinsicStatus, InstructionState, Store};
 use settle::testkit::{INSTANCE, Kit, KitOptions, PAYEE, chain_usd};
@@ -34,6 +36,15 @@ async fn until(k: &mut Kit, p: &Party, op: &str, want: &str, n: usize) -> String
         k.step().await.unwrap_or_else(|e| panic!("a step: {e}"));
     }
     k.state(p, op).await
+}
+
+/// What the fake layer's default runtime (Kreivo spec 133) is signed for (`T-027-12`).
+fn spec_133() -> Signing {
+    Signing {
+        spec_version: 133,
+        transaction_version: FORMAT_133.transaction_version,
+        format: FORMAT_133,
+    }
 }
 
 async fn serving_kit(options: KitOptions) -> Kit {
@@ -147,6 +158,7 @@ async fn t_027_08_req_sl_4_a_batch_born_at_the_finalized_head_survives_a_reorgan
             &era,
             &best,
             &CallLimits::default(),
+            &spec_133(),
         )
         .await
         .unwrap();
@@ -181,6 +193,7 @@ async fn t_027_08_an_era_is_signed_only_at_the_block_it_is_born_at() {
             &Mortality::at(16, fin.number - 1),
             &fin,
             &CallLimits::default(),
+            &spec_133(),
         )
         .await;
     assert!(matches!(r, Err(ChainError::Invalid(_))), "{r:?}");

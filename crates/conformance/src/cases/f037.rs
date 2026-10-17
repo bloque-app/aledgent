@@ -1,11 +1,12 @@
 // Copyright (c) 2026 Pagos Cube LLC
 // SPDX-License-Identifier: Apache-2.0 OR MIT
-//! `F-037` — code history and upgrades (amendment 0023, `US-K7`, `REQ-RT-15` to `REQ-RT-18`,
-//! `REQ-PR-11`, `NFR-22`). Its registered cases (`F-015` §6, §7).
+//! `F-037` — code history and upgrades (amendments 0023 and 0033, `US-K7`, `REQ-RT-15` to
+//! `REQ-RT-21`, `REQ-PR-11`, `NFR-22`). Its registered cases (`F-015` §6, §7).
 //!
-//! All eight are pending, registered when the amendment was applied, before `F-037` is built
+//! All twenty are pending, registered when each amendment was applied, before `F-037` is built
 //! (amendment 0013's practice). They need the code version in each writer's state, the upgrade and
-//! mode inputs, the code archive and per-range replay.
+//! mode inputs, the code archive, per-range replay, the code generation and the fence with its way
+//! out, checkpoints as rows and leaf chunks, the replayer, and the continuation founded once.
 
 use crate::case::{Case, Feature, Layer};
 
@@ -66,5 +67,89 @@ pub const CASES: &[Case] = &[
         Layer::Service,
         Feature::F037,
         &["REQ-RT-18"],
+    ),
+    Case::pending(
+        "AC-K7.9",
+        "ac_k7_9_an_input_from_n_is_refused_until_the_code_is_switched__service",
+        Layer::Service,
+        Feature::F037,
+        &["REQ-RT-20"],
+    ),
+    Case::pending(
+        "AC-K7.10",
+        "ac_k7_10_a_continuation_keeps_the_book_and_its_log_chain__service",
+        Layer::Service,
+        Feature::F037,
+        &["REQ-RT-21", "REQ-RT-17"],
+    ),
+    Case::pending(
+        "AC-K7.11",
+        "ac_k7_11_a_checkpoint_restores_under_another_platform__service",
+        Layer::Service,
+        Feature::F037,
+        &["REQ-RT-19"],
+    ),
+    Case::pending(
+        "AC-K7.12",
+        "ac_k7_12_a_fenced_writer_takes_a_reschedule_or_cancel_and_alerts__service",
+        Layer::Service,
+        Feature::F037,
+        &["REQ-RT-20"],
+    ),
+    Case::pending(
+        "AC-K7.13",
+        "ac_k7_13_every_upgrade_raises_the_generation_so_a_missed_switch_is_fenced__service",
+        Layer::Service,
+        Feature::F037,
+        &["REQ-RT-20"],
+    ),
+    Case::pending(
+        "AC-K7.14",
+        "ac_k7_14_one_continuation_per_input_and_a_mismatch_founds_nothing__service",
+        Layer::Service,
+        Feature::F037,
+        &["REQ-RT-21"],
+    ),
+    Case::pending(
+        "AC-K7.15",
+        "ac_k7_15_a_range_checks_under_its_replayer_outside_the_code_version__service",
+        Layer::Service,
+        Feature::F037,
+        &["REQ-RT-19"],
+    ),
+    Case::pending(
+        "AC-K7.16",
+        "ac_k7_16_a_stale_package_or_a_wrong_generation_is_refused__service",
+        Layer::Service,
+        Feature::F037,
+        &["REQ-RT-20"],
+    ),
+    Case::pending(
+        "AC-K7.17",
+        "ac_k7_17_an_unauthorised_reschedule_or_cancel_is_refused__service",
+        Layer::Service,
+        Feature::F037,
+        &["REQ-RT-20", "REQ-RT-18"],
+    ),
+    Case::pending(
+        "AC-K7.18",
+        "ac_k7_18_input_n_is_decided_the_same_by_either_generation__service",
+        Layer::Service,
+        Feature::F037,
+        &["REQ-RT-20", "REQ-RT-17"],
+    ),
+    Case::pending(
+        "AC-K7.19",
+        "ac_k7_19_the_archive_takes_each_input_number_once__service",
+        Layer::Service,
+        Feature::F037,
+        &["REQ-RT-21"],
+    ),
+    Case::pending(
+        "AC-K7.20",
+        "ac_k7_20_a_founding_for_an_upgrade_no_longer_scheduled_writes_nothing__service",
+        Layer::Service,
+        Feature::F037,
+        &["REQ-RT-21"],
     ),
 ];

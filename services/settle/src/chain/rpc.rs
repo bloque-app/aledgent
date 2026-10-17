@@ -53,7 +53,8 @@ use parity_scale_codec::{Decode, Encode};
 use super::kreivo::{self, CallLimits, TxParams};
 use super::{
     AccountId32, BatchCall, BlockRef, Chain, ChainAsset, ChainError, ChainResult, DryRun,
-    InboxRead, Included, InstanceView, Mortality, RuntimeInfo, SignedExtrinsic,
+    InboxRead, Included, InstanceView, Mortality, RuntimeInfo, RuntimeVersion, SignedExtrinsic,
+    Validity,
 };
 use crate::signer::Signer;
 
@@ -151,6 +152,66 @@ fn unavailable(e: impl std::fmt::Display) -> ChainError {
 
 fn invalid(e: impl std::fmt::Display) -> ChainError {
     ChainError::Invalid(e.to_string())
+}
+
+/// How a runtime call through the client failed, by the kind of error (`F-027` NOTES, decision
+/// 51), never by the runtime's own message (a panic's text is not in every client's answer: the
+/// light client reports a runtime that cannot decode its arguments as a bare trap).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallFailure {
+    /// No answer to use: the transport failed (the client unreachable, a connection lost and
+    /// reconnecting, a timeout, an insecure URL), or what came back was not a response the RPC
+    /// client could read.
+    Transport,
+    /// The client answered that it **did not run** the call: a JSON-RPC protocol error (parse,
+    /// request, method or parameters; codes -32700 and -32603 to -32600), or a server error other
+    /// than an execution failure: a call proof no peer served, a block it does not know or whose
+    /// header it could not read, a runtime it could not load, a crash.
+    NotRun,
+    /// The client answered that **the runtime ran the call and failed**: a trap or a panic. Each
+    /// client names that kind of error by its own variant, which is what is recognised: the light
+    /// client's (smoldot) `RuntimeCallError::Execution`, "Error during the execution of the
+    /// runtime: …", and a Substrate node's `sp_blockchain::Error::Execution`, "Execution failed:
+    /// …" (code 4003, "Client error: …"). Whatever the trap's own text.
+    Executed,
+}
+
+/// smoldot's display of `RuntimeCallError::Execution`, which starts each such error's message.
+const SMOLDOT_EXECUTION: &str = "Error during the execution of the runtime";
+/// A Substrate node's display of `sp_blockchain::Error::Execution`, inside its state RPC's
+/// "Client error: …".
+const SUBSTRATE_EXECUTION: &str = "Execution failed";
+
+/// The kind of a runtime call's failure ([`CallFailure`]).
+pub fn call_failure(e: &subxt::ext::subxt_rpcs::Error) -> CallFailure {
+    use subxt::ext::subxt_rpcs::Error as E;
+    match e {
+        E::User(u) if (-32700..=-32600).contains(&u.code) => CallFailure::NotRun,
+        E::User(u)
+            if u.message.starts_with(SMOLDOT_EXECUTION)
+                || u.message.contains(SUBSTRATE_EXECUTION) =>
+        {
+            CallFailure::Executed
+        }
+        E::User(_) => CallFailure::NotRun,
+        _ => CallFailure::Transport,
+    }
+}
+
+/// What a failed `TaggedTransactionQueue_validate_transaction` of a transaction the adapter built
+/// says (`T-027-12`, `REQ-SA-9`, `F-027` NOTES decision 51). **The rule**: the runtime ran the
+/// validation and failed ([`CallFailure::Executed`]) on bytes the adapter built and signed, which
+/// it does only when it cannot decode them (`impl_runtime_apis!` panics on arguments it cannot
+/// decode): a wrong format, so [`Validity::Refused`]. The call not run, or no answer
+/// ([`CallFailure::NotRun`], [`CallFailure::Transport`]): nothing is known of the format, so
+/// [`ChainError::Unavailable`], and the step tries again.
+pub fn validation_failure(e: &subxt::ext::subxt_rpcs::Error) -> ChainResult<Validity> {
+    match call_failure(e) {
+        CallFailure::Executed => Ok(Validity::Refused(format!(
+            "the runtime failed validating it (it cannot decode it): {e}"
+        ))),
+        CallFailure::NotRun | CallFailure::Transport => Err(unavailable(e)),
+    }
 }
 
 /// Parse a configured asset into the runtime value it names.
@@ -431,6 +492,9 @@ impl Chain for RpcChain {
             .await
             .map_err(unavailable)?
             .ok_or_else(|| unavailable("no best block"))?;
+        // F-027 NOTES, decision 51: the block it is read at, at which what is signed for it is
+        // validated.
+        let at = self.block(best).await?;
         let version = self
             .rpc
             .state_get_runtime_version(Some(best))
@@ -450,16 +514,18 @@ impl Chain for RpcChain {
             tracing::info!(
                 from = known.spec_version,
                 to = version.spec_version,
-                format = ?kreivo::TxFormat::of(version.spec_version).map(|f| f.kreivo),
+                transaction_version = version.transaction_version,
                 "the settlement layer's runtime changed; its metadata is reloaded"
             );
         }
         let metadata = self.client.metadata();
+        // T-027-12: what a transaction must carry, as this runtime's metadata describes it.
         let extensions = metadata
             .extrinsic()
             .transaction_extensions_by_version(kreivo::EXTENSION_VERSION)
             .map(|it| it.map(|e| e.identifier().to_owned()).collect())
             .unwrap_or_default();
+        let types = super::surface::fingerprint(&metadata, &self.names.contracts);
         let block_hash_count = self
             .client
             .constants()
@@ -472,9 +538,26 @@ impl Chain for RpcChain {
         Ok(RuntimeInfo {
             genesis: self.client.genesis_hash().0,
             spec_version: version.spec_version,
-            extensions,
+            surface: kreivo::Surface {
+                transaction_version: version.transaction_version,
+                extensions,
+                types,
+            },
             pallet: metadata.pallet_by_name(&self.names.contracts).is_some(),
             block_hash_count,
+            at,
+        })
+    }
+
+    async fn version(&self, at: &BlockRef) -> ChainResult<RuntimeVersion> {
+        let v = self
+            .rpc
+            .state_get_runtime_version(Some(H256(at.hash)))
+            .await
+            .map_err(unavailable)?;
+        Ok(RuntimeVersion {
+            spec_version: v.spec_version,
+            transaction_version: v.transaction_version,
         })
     }
 
@@ -753,6 +836,7 @@ impl Chain for RpcChain {
         era: &Mortality,
         context: &BlockRef,
         limits: &CallLimits,
+        runtime: &kreivo::Signing,
     ) -> ChainResult<SignedExtrinsic> {
         // Born at the context, the finalized head: its hash is the birth hash, read from nothing.
         if era.birth != context.number {
@@ -769,15 +853,13 @@ impl Chain for RpcChain {
             .map_err(invalid)?;
         let call = kreivo::contracts_call(&contract, limits, &kreivo::execute_data(&envelopes));
         let birth_hash = H256(context.hash);
-        let version = self
-            .rpc
-            .state_get_runtime_version(None)
-            .await
-            .map_err(unavailable)?;
+        // The runtime the adapter checked and chose the format for (T-027-12), not one read again
+        // here: should the runtime change in between, the transaction is not valid on the new one
+        // and the next step signs for it.
         let p = TxParams {
             genesis: self.client.genesis_hash().0,
-            spec_version: version.spec_version,
-            transaction_version: version.transaction_version,
+            spec_version: runtime.spec_version,
+            transaction_version: runtime.transaction_version,
             era: *era,
             birth_hash: birth_hash.0,
             nonce: u32::try_from(nonce).map_err(|_| invalid("a nonce past Kreivo's u32"))?,
@@ -787,7 +869,28 @@ impl Chain for RpcChain {
             u32::try_from(context.number).map_err(|_| invalid("a block past Kreivo's u32"))?,
             context.hash,
         );
-        Ok(kreivo::sign(signer, &call, &p, context).await?)
+        Ok(kreivo::sign(signer, &runtime.format, &call, &p, context).await?)
+    }
+
+    /// Over this client (the light client by default): the layer's own answer, never the dry-run
+    /// node's. A runtime that cannot decode the bytes fails the call (it panics in its API's
+    /// argument decoding, which the light client reports as a bare trap): that is the format
+    /// refused too, told from a client that could not run the call by the error's kind
+    /// ([`validation_failure`]).
+    async fn validate(&self, at: &BlockRef, extrinsic: &SignedExtrinsic) -> ChainResult<Validity> {
+        let args = kreivo::validate_transaction_args(&extrinsic.bytes, &at.hash);
+        match self
+            .rpc
+            .state_call(
+                kreivo::VALIDATE_TRANSACTION,
+                Some(&args),
+                Some(H256(at.hash)),
+            )
+            .await
+        {
+            Ok(bytes) => kreivo::transaction_validity(&bytes).map_err(invalid),
+            Err(e) => validation_failure(&e),
+        }
     }
 
     /// Submit and keep watching until the client reports the transaction's end (finalized,
@@ -957,5 +1060,99 @@ mod tests {
         assert_eq!(names.instance_of(&[1; 32]), Some(1));
         assert_eq!(names.contract_of(3), None);
         assert_eq!(names.instance_of(&[3; 32]), None);
+    }
+
+    fn answered(code: i32, message: &str) -> subxt::ext::subxt_rpcs::Error {
+        subxt::ext::subxt_rpcs::Error::User(subxt::ext::subxt_rpcs::UserError {
+            code,
+            message: message.into(),
+            data: None,
+        })
+    }
+
+    /// `T-027-12`, `REQ-SA-9`, `F-027` NOTES decision 51: a validation the runtime ran and failed
+    /// is the format refused, whatever the trap says; the light client's bare trap (live Kreivo's
+    /// answer to bytes it cannot decode) included, with no "Bad input data" in it.
+    #[test]
+    fn t_027_12_a_validation_the_runtime_ran_and_failed_is_refused() {
+        for e in [
+            // smoldot, the light client: a bare trap.
+            answered(
+                -32000,
+                "Error during the execution of the runtime: Runtime has trapped: wasm trap: \
+                 wasm `unreachable` instruction executed",
+            ),
+            // A Substrate node, with the panic's text or without it.
+            answered(
+                4003,
+                "Client error: Execution failed: Execution aborted due to trap: wasm trap: wasm \
+                 `unreachable` instruction executed",
+            ),
+            answered(
+                4003,
+                "Client error: Execution failed: Bad input data provided to \
+                 validate_transaction: Could not decode",
+            ),
+        ] {
+            assert_eq!(call_failure(&e), CallFailure::Executed, "{e}");
+            assert!(
+                matches!(validation_failure(&e), Ok(Validity::Refused(ref why)) if why.contains("trap") || why.contains("Bad input")),
+                "{e}"
+            );
+        }
+    }
+
+    /// `T-027-12`, `F-027` NOTES decision 51: a client that could not run the validation, or no
+    /// answer at all, says nothing of the format: the layer is unavailable, and the step tries
+    /// again. Never a refusal.
+    #[test]
+    fn t_027_12_a_validation_the_client_could_not_run_is_unavailable() {
+        let not_run = [
+            // smoldot: no peer served the call proof; a block it could not read.
+            answered(
+                -32000,
+                "Error trying to access the storage required for the runtime call",
+            ),
+            answered(-32000, "invalid block header"),
+            answered(-32000, "Failed to decode block header: bad length"),
+            // A Substrate node: a block it does not know, or pruned.
+            answered(4003, "Client error: UnknownBlock: State already discarded"),
+            // JSON-RPC protocol errors: the method not served, bad parameters, internal.
+            answered(-32601, "Method not found"),
+            answered(-32602, "Invalid params"),
+            answered(-32603, "Internal error"),
+        ];
+        for e in &not_run {
+            assert_eq!(call_failure(e), CallFailure::NotRun, "{e}");
+            assert!(
+                matches!(validation_failure(e), Err(ChainError::Unavailable(_))),
+                "{e}"
+            );
+        }
+        let transport = [
+            subxt::ext::subxt_rpcs::Error::Client(Box::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "request timed out",
+            ))),
+            subxt::ext::subxt_rpcs::Error::Client(Box::new(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "the light client stopped",
+            ))),
+            subxt::ext::subxt_rpcs::Error::DisconnectedWillReconnect("closed".into()),
+            subxt::ext::subxt_rpcs::Error::InsecureUrl("ws://x".into()),
+        ];
+        for e in &transport {
+            assert_eq!(call_failure(e), CallFailure::Transport, "{e}");
+            assert!(
+                matches!(validation_failure(e), Err(ChainError::Unavailable(_))),
+                "{e}"
+            );
+        }
+        // Not the message: a transport error that happens to carry an execution's text is still
+        // the transport's.
+        let e = subxt::ext::subxt_rpcs::Error::Client(Box::new(std::io::Error::other(
+            "Error during the execution of the runtime",
+        )));
+        assert_eq!(call_failure(&e), CallFailure::Transport);
     }
 }

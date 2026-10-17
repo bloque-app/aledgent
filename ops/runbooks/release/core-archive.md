@@ -60,7 +60,7 @@ that only while the received-log survives. The archive bounds the double loss an
   `s3:GetObjectRetention` and `s3:ListBucket` only.
 - [ ] The exporter's `[records] core_archive` names `<state>/archive.status.json`. The core's backup age
   is then the archive's (`aledgent_backup_last_age_ms{store="core"}`).
-- [ ] `opsctl archive verify --from <spec> --config <deployment config> --anchors-rpc <node URL>` passes.
+- [ ] `opsctl archive verify --from <spec> --config <deployment config> --anchors-rpc <archive node URL>` passes.
 
 ## Alerts
 

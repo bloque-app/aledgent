@@ -37,9 +37,12 @@ The production-class drill below still runs by hand, on the deployment's own arc
 
 - [ ] An **isolated host** with no network path to production, of the production instance class.
 - [ ] The latest verified backups: the core's archive (`opsctl archive verify --from <spec> --config
-  <deployment config> --anchors-rpc <node URL>`), audit, ingress and adapter (base backup and WAL, `opsctl
+  <deployment config> --anchors-rpc <archive node URL>`), audit, ingress and adapter (base backup and WAL, `opsctl
   backup verify`).
 - [ ] A read-only role on the archive's bucket, and `kms:Decrypt` on its key.
+- [ ] The Kreivo node for `--anchors-rpc` is an **archive node**: `INV-19` reads each anchor's state at
+  the block it was anchored in, and a node that prunes state (the public RPC endpoints do) answers "State
+  already discarded". The drill then fails `INV-19` for the older anchors although the book is intact.
 - [ ] The keys for the drill come from Vault's own backup into the drill's signer only, never an
   environment.
 
@@ -49,9 +52,11 @@ The production-class drill below still runs by hand, on the deployment's own arc
    the latest archived point, then the core, then the adapter.
    - **Agent core:** from its off-node archive, as [total-loss-recovery](total-loss-recovery.md) path B
      does: `opsctl restore core --from <spec> … --report <drills dir> --core-host aledgent-core-host …`,
-     then the core host on the restored directory, then `opsctl restore core-tail`. The report is the
-     drill's record (`aledgent_drill_passed`, `aledgent_drill_last_age_ms`).
-   - Record the archive's point, the replayed tail and the restore time.
+     run from the core image (`--entrypoint /usr/local/bin/opsctl`), then the core host on the restored
+     directory, then `opsctl restore core-tail`. The report is the drill's record
+     (`aledgent_drill_passed`, `aledgent_drill_last_age_ms`).
+   - Record the archive's point, the replayed tail and the restore time, and the archive's read time
+     (`read and checked … segments in … ms`).
 2. **The keys.** Restore the signer's Vault secrets (the key-ring root, the clerk key, the Agent's keys;
    `F-035`) from Vault's backup into a staging Vault, and the backups' sealing key, and start the signer
    on them. A restore that uses them succeeds. Do this at least once before the deployment's first

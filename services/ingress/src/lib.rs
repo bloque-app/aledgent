@@ -31,6 +31,11 @@
 //! - [`probe`]: the image's health check, one `GET` to the process's own listener (no shell).
 //! - [`remote`]: the core in another process (`F-005`): the client ingress uses to reach the
 //!   core Agent's host, and the server the host answers with.
+//! - [`feed`]: sequenced, signed feeds of the received log, and the core host's sequencer
+//!   (`F-038`).
+//! - [`stream`]: the core stream (`F-038`, `DEC-27`): ingress's listener the core hosts dial out to,
+//!   over mutual TLS or a Unix socket, and the dialing end the core host runs.
+//! - [`readiness`]: the readiness listener, apart from the client surface (`F-038`).
 //! - [`store`]: the received-log, delivery attempts, recipients and leadership; in memory and in
 //!   PostgreSQL.
 //! - [`service`]: one replica: leadership, the forwarder, the ticker and the delivery worker.
@@ -56,6 +61,7 @@ pub mod config;
 pub mod credentials;
 pub mod custody;
 pub mod delivery;
+pub mod feed;
 pub mod gate;
 pub mod inprocess;
 pub mod metrics;
@@ -64,10 +70,12 @@ pub mod operator;
 pub mod pass_through;
 pub mod probe;
 pub mod query;
+pub mod readiness;
 pub mod remote;
 pub mod service;
 pub mod settlement;
 pub mod store;
+pub mod stream;
 pub mod surface;
 pub mod testkit;
 pub mod wire;

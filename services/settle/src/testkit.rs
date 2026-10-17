@@ -132,7 +132,8 @@ pub fn adapter_config(genesis: [u8; 32]) -> AdapterConfig {
     AdapterConfig {
         holder: "settle-0".into(),
         genesis: hex::encode(genesis),
-        spec_versions: vec![132, 133],
+        spec_versions: Vec::new(),
+        formats: Default::default(),
         instance: INSTANCE,
         assets: vec![AssetBinding {
             asset: USD.into(),
@@ -150,6 +151,7 @@ pub fn adapter_config(genesis: [u8; 32]) -> AdapterConfig {
         anchor_key: None,
         batch_gas_cap: None,
         batch_gas_margin_percent: crate::config::default_batch_gas_margin_percent(),
+        not_now_alert_after: crate::config::default_not_now_alert_after(),
     }
 }
 

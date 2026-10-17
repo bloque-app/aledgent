@@ -9,8 +9,10 @@ name: Release
 # members' entries in the lock files, and CHANGELOG.md, from the conventional-commit subjects merged
 # since the last release (a squash merge's subject is its pull request's title, which
 # .github/workflows/release-checks.yml requires to be conventional). Merging it tags `vX.Y.Z` and
-# creates the GitHub release, marked latest. GitHub starts no workflow for a pull request that
-# GITHUB_TOKEN opened or updated, so a maintainer closes and reopens the release pull request to run
+# creates the GitHub release, marked latest. release-please acts as the GitHub App
+# `aledgent-release`, so GitHub starts the release pull request's checks. Without the App's secrets
+# it falls back to GITHUB_TOKEN, and GitHub starts no workflow for a pull request that token opened
+# or updated: a warning says so, and a maintainer closes and reopens the release pull request to run
 # its checks before merging it.
 #
 # develop, pre-releases. Every push tags `vX.Y.Z-dev+<sha7>` and creates a GitHub pre-release, never
@@ -30,7 +32,8 @@ name: Release
 # Then bloque-app/bloque-ledgent, the private deployment repository, gets a `repository_dispatch`
 # (`aledgent-release` or `aledgent-prerelease`) whose payload is the tag, the commit and the SHA-256
 # of images.json (`client_payload`: `version`, `commit`, `images_json_sha256`), under a token of the
-# GitHub App `aledgent-release` (installed on that repository only), from the secrets
+# GitHub App `aledgent-release` (installed on bloque-ledgent for this, and on this repository for
+# release-please above, each token limited to the one repository it is for), from the secrets
 # ALEDGENT_RELEASE_APP_ID and ALEDGENT_RELEASE_APP_KEY of the environment `release`. Only main and
 # develop may use that environment: nothing here runs on a tag, and a tag that anyone with write
 # access can push must not reach the App's key (tools/release/protect-branches.sh removes the
@@ -70,11 +73,38 @@ jobs:
       tag: ${{ steps.rp.outputs.tag_name }}
       # The released commit: a run queued behind another may run at a later head of main.
       sha: ${{ steps.rp.outputs.sha }}
+    # The App's credentials live in the `release` environment (main and develop only). A pull
+    # request opened with the workflow's own token starts no workflow, so the release pull
+    # request's required checks would never run (owner ruling v0w-release-please-token,
+    # 2026-10-14): release-please acts as the aledgent-release App instead.
+    environment: release
+    env:
+      HAS_APP: ${{ secrets.ALEDGENT_RELEASE_APP_ID != '' && secrets.ALEDGENT_RELEASE_APP_KEY != '' }}
     steps:
+      - name: Release pull request without the App
+        if: env.HAS_APP != 'true'
+        run: |
+          echo "::warning::ALEDGENT_RELEASE_APP_ID or ALEDGENT_RELEASE_APP_KEY is not set in the environment 'release': release-please falls back to GITHUB_TOKEN, and the release pull request it opens or updates will not start its checks (close and reopen it to run them)."
+      - name: The aledgent-release App's token
+        id: app
+        if: env.HAS_APP == 'true'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.ALEDGENT_RELEASE_APP_ID }}
+          private-key: ${{ secrets.ALEDGENT_RELEASE_APP_KEY }}
+          owner: bloque-app
+          repositories: aledgent
+          permission-contents: write
+          # Pull requests write also covers the release pull request's labels
+          # (`autorelease: pending`, `autorelease: tagged`); the App has no Issues
+          # permission, and asking for one would fail the mint.
+          permission-pull-requests: write
       - id: rp
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # Without the App (its secrets unset in the environment) the workflow's token still
+          # works, and the step above warns: the release pull request then starts no checks.
+          token: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 

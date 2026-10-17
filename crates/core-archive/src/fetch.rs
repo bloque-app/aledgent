@@ -21,9 +21,11 @@
 //! and the restore plan into an empty directory: what `aledgent-core-host restore` brings the
 //! Agent forward from.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Write as _;
 use std::path::Path;
+use std::sync::{Condvar, Mutex, MutexGuard};
 
 use core_binding::core::{ARCHIVE_FILE, REPLIES_FILE};
 use core_binding::envelope::decode;
@@ -33,6 +35,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::archive::{ArchiveSource, contiguous_end};
 use crate::record::{Checkpoint, Point, decode_checkpoint, decode_segment};
+use crate::store::StoreError;
 
 /// The restore plan's file in a laid-out state directory.
 pub const RESTORE_FILE: &str = "restore.json";
@@ -72,9 +75,32 @@ struct ReplyLine {
     reply: CoreReply,
 }
 
-/// Read and check the archive (module documentation). `book`, when given, is the genesis
-/// operation reference the deployment's configuration names; every segment must be of it.
+/// How many segments [`fetch`] reads at once (`opsctl restore core --fetch-concurrency`). Each
+/// read is one object-store request: 86 ms a segment from S3 with the CLI, one at a time, was about
+/// 90 minutes for 64.8k segments (the 2026-10-15 restore drill, item 8).
+pub const DEFAULT_CONCURRENCY: usize = 32;
+
+/// Read and check the archive (module documentation), [`DEFAULT_CONCURRENCY`] segments at once.
+/// `book`, when given, is the genesis operation reference the deployment's configuration names;
+/// every segment must be of it.
 pub fn fetch(source: &dyn ArchiveSource, book: Option<&str>) -> Result<Fetched, String> {
+    fetch_with(source, book, DEFAULT_CONCURRENCY)
+}
+
+/// [`fetch`], reading up to `concurrency` segments at once (1: one at a time, on this thread).
+///
+/// Only the reading is concurrent. The check takes the segments one by one in their order, from 1,
+/// exactly as a sequential read does: each record against itself and its predecessor, the book,
+/// the offsets, then the chain. A segment that arrives early waits for the ones before it, and is
+/// never looked at before them. The first segment that is missing, does not read or does not
+/// continue its predecessor ends the archive there, as it does sequentially, and a store error on a
+/// segment is the error it would be sequentially; whatever was read beyond it is dropped unread.
+/// At most `2 × concurrency` segments are held ahead of the check.
+pub fn fetch_with(
+    source: &dyn ArchiveSource,
+    book: Option<&str>,
+    concurrency: usize,
+) -> Result<Fetched, String> {
     let numbers = source.segments().map_err(|e| e.to_string())?;
     let end = contiguous_end(&numbers);
     let mut notes = Vec::new();
@@ -90,69 +116,27 @@ pub fn fetch(source: &dyn ArchiveSource, book: Option<&str>) -> Result<Fetched, 
     if end == 0 {
         return Err("the archive holds no segment".into());
     }
-    let mut archive = Vec::new();
-    let mut replies = Vec::new();
-    let mut prev = String::new();
-    let mut the_book: Option<String> = book.map(str::to_owned);
-    // The last restore point, and how much of each log and of the chain it covers.
-    let mut point: Option<(u64, Point, usize, usize, String)> = None;
-    for n in 1..=end {
-        let rec = match source.get_segment(n) {
-            Ok(Some(r)) => r,
-            Ok(None) => {
-                damaged = true;
-                notes.push(format!("segment {n} vanished: the archive ends before it"));
-                break;
+    let Read {
+        mut archive,
+        mut replies,
+        the_book,
+        point,
+    } = if concurrency <= 1 {
+        read_segments(end, book, &mut notes, &mut damaged, &mut |n| {
+            source.get_segment(n)
+        })?
+    } else {
+        let ahead = Ahead::new(end, concurrency);
+        std::thread::scope(|s| {
+            // Stops the readers however the check ends, before the scope waits for them; taken
+            // before any reader starts, so a reader that fails to spawn stops those already running.
+            let _stop = StopOnDrop(&ahead);
+            for _ in 0..concurrency.min(usize::try_from(end).unwrap_or(usize::MAX)) {
+                s.spawn(|| ahead.work(source));
             }
-            Err(e) => return Err(format!("segment {n}: {e}")),
-        };
-        let s = match decode_segment(&rec) {
-            Ok(s) => s,
-            Err(e) => {
-                damaged = true;
-                notes.push(format!(
-                    "segment {n} does not read ({e}): the archive ends before it"
-                ));
-                break;
-            }
-        };
-        let h = &s.header;
-        let joins = h.n == n
-            && h.prev == prev
-            && h.archive.start == archive.len() as u64
-            && h.replies.start == replies.len() as u64;
-        if !joins {
-            damaged = true;
-            notes.push(format!(
-                "segment {n} does not continue segment {}: the archive ends before it",
-                n - 1
-            ));
-            break;
-        }
-        match &the_book {
-            Some(b) if *b != h.book => {
-                return Err(format!(
-                    "segment {n} is of book {}, not {b}: another deployment's archive",
-                    h.book
-                ));
-            }
-            Some(_) => {}
-            None => the_book = Some(h.book.clone()),
-        }
-        archive.extend_from_slice(&s.archive);
-        replies.extend_from_slice(&s.replies);
-        prev = s.digest.clone();
-        if h.cut {
-            let p = h
-                .point
-                .clone()
-                .ok_or_else(|| format!("segment {n} is a restore point without its point"))?;
-            if p.archive_bytes != archive.len() as u64 || p.replies_bytes != replies.len() as u64 {
-                return Err(format!("segment {n}: its point is not its end"));
-            }
-            point = Some((n, p, archive.len(), replies.len(), s.digest));
-        }
-    }
+            read_segments(end, book, &mut notes, &mut damaged, &mut |n| ahead.take(n))
+        })?
+    };
     let (segments, point, a_len, r_len, digest) =
         point.ok_or("the archive has no restore point")?;
     if (archive.len(), replies.len()) != (a_len, r_len) {
@@ -261,6 +245,195 @@ pub fn fetch(source: &dyn ArchiveSource, book: Option<&str>) -> Result<Fetched, 
         notes,
         damaged,
     })
+}
+
+/// What the segments gave, up to where they end (the check's first part).
+struct Read {
+    archive: Vec<u8>,
+    replies: Vec<u8>,
+    the_book: Option<String>,
+    /// The last restore point: its segment, the point, how much of each log it covers, its digest.
+    point: Option<(u64, Point, usize, usize, String)>,
+}
+
+/// Segments `1..=end`, taken in order from `take` and checked one by one (module documentation).
+fn read_segments(
+    end: u64,
+    book: Option<&str>,
+    notes: &mut Vec<String>,
+    damaged: &mut bool,
+    take: &mut dyn FnMut(u64) -> Result<Option<Vec<u8>>, StoreError>,
+) -> Result<Read, String> {
+    let mut archive = Vec::new();
+    let mut replies = Vec::new();
+    let mut prev = String::new();
+    let mut the_book: Option<String> = book.map(str::to_owned);
+    // The last restore point, and how much of each log and of the chain it covers.
+    let mut point: Option<(u64, Point, usize, usize, String)> = None;
+    for n in 1..=end {
+        let rec = match take(n) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                *damaged = true;
+                notes.push(format!("segment {n} vanished: the archive ends before it"));
+                break;
+            }
+            Err(e) => return Err(format!("segment {n}: {e}")),
+        };
+        let s = match decode_segment(&rec) {
+            Ok(s) => s,
+            Err(e) => {
+                *damaged = true;
+                notes.push(format!(
+                    "segment {n} does not read ({e}): the archive ends before it"
+                ));
+                break;
+            }
+        };
+        let h = &s.header;
+        let joins = h.n == n
+            && h.prev == prev
+            && h.archive.start == archive.len() as u64
+            && h.replies.start == replies.len() as u64;
+        if !joins {
+            *damaged = true;
+            notes.push(format!(
+                "segment {n} does not continue segment {}: the archive ends before it",
+                n - 1
+            ));
+            break;
+        }
+        match &the_book {
+            Some(b) if *b != h.book => {
+                return Err(format!(
+                    "segment {n} is of book {}, not {b}: another deployment's archive",
+                    h.book
+                ));
+            }
+            Some(_) => {}
+            None => the_book = Some(h.book.clone()),
+        }
+        archive.extend_from_slice(&s.archive);
+        replies.extend_from_slice(&s.replies);
+        prev = s.digest.clone();
+        if h.cut {
+            let p = h
+                .point
+                .clone()
+                .ok_or_else(|| format!("segment {n} is a restore point without its point"))?;
+            if p.archive_bytes != archive.len() as u64 || p.replies_bytes != replies.len() as u64 {
+                return Err(format!("segment {n}: its point is not its end"));
+            }
+            point = Some((n, p, archive.len(), replies.len(), s.digest));
+        }
+    }
+    Ok(Read {
+        archive,
+        replies,
+        the_book,
+        point,
+    })
+}
+
+/// One read of a segment.
+type Got = Result<Option<Vec<u8>>, StoreError>;
+
+/// Segments read ahead of the check by a pool of readers ([`fetch_with`]): each reader takes the
+/// next number not yet taken, at most `window` past the one the check waits for, and leaves what it
+/// read by number. The check takes them in order.
+struct Ahead {
+    end: u64,
+    window: u64,
+    state: Mutex<AheadState>,
+    moved: Condvar,
+}
+
+struct AheadState {
+    /// The next number a reader takes.
+    next: u64,
+    /// The number the check waits for.
+    want: u64,
+    /// Read, not yet taken by the check.
+    ready: BTreeMap<u64, Got>,
+    /// The check is over: readers stop.
+    stop: bool,
+}
+
+impl Ahead {
+    fn new(end: u64, concurrency: usize) -> Ahead {
+        Ahead {
+            end,
+            window: (concurrency as u64).saturating_mul(2),
+            state: Mutex::new(AheadState {
+                next: 1,
+                want: 1,
+                ready: BTreeMap::new(),
+                stop: false,
+            }),
+            moved: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, AheadState> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn wait<'a>(&self, g: MutexGuard<'a, AheadState>) -> MutexGuard<'a, AheadState> {
+        self.moved.wait(g).unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// A reader: until the check is over or every segment is taken.
+    fn work(&self, source: &dyn ArchiveSource) {
+        loop {
+            let n = {
+                let mut st = self.lock();
+                loop {
+                    if st.stop || st.next > self.end {
+                        return;
+                    }
+                    if st.next < st.want.saturating_add(self.window) {
+                        break;
+                    }
+                    st = self.wait(st);
+                }
+                st.next += 1;
+                st.next - 1
+            };
+            // A reader that panics still leaves an answer, or the check would wait forever.
+            let got =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| source.get_segment(n)))
+                    .unwrap_or_else(|_| {
+                        Err(StoreError::Unavailable(format!(
+                            "the read of segment {n} panicked"
+                        )))
+                    });
+            self.lock().ready.insert(n, got);
+            self.moved.notify_all();
+        }
+    }
+
+    /// Segment `n`'s read, once it is there. The check calls it with `1, 2, …`, in order.
+    fn take(&self, n: u64) -> Got {
+        let mut st = self.lock();
+        st.want = n;
+        self.moved.notify_all();
+        loop {
+            if let Some(got) = st.ready.remove(&n) {
+                return got;
+            }
+            st = self.wait(st);
+        }
+    }
+}
+
+/// Ends the readers when the check ends, however it ends.
+struct StopOnDrop<'a>(&'a Ahead);
+
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.lock().stop = true;
+        self.0.moved.notify_all();
+    }
 }
 
 /// The restore plan `aledgent-core-host restore` follows.

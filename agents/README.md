@@ -7,7 +7,12 @@ SPDX-License-Identifier: CC-BY-4.0
 
 Everything here links VOS and is **AGPL-3.0-or-later**. The rest of aledgent is Apache-2.0 OR MIT
 and never links it: `tools/ci/check-no-vos.sh` fails the build if a manifest outside `agents/` and
-`spikes/` names a VOS crate. ingress reaches the core over a local socket (`ingress::remote`).
+`spikes/` names a VOS crate. ingress reaches the core over a local socket (`ingress::remote`), or
+the core host dials out to ingress over the core stream (`ingress::stream`, `F-038`): mutual TLS
+under the operator's CA, or a Unix socket on one machine. Both links reach the core through one
+sequencer (`ingress::feed::Sequencer`) that checks ingress's signature on every forwarded input
+against `stream.ingress_keys`, fences a stale feeder's epoch and keeps the received log's order.
+The Agent and the host's calls into it do not change for either link.
 `features/F-005-core-agent-binding/NOTES.md` records the licensing boundary, and
 `docs/oss/LICENSING.md` the licence of every part.
 
@@ -54,9 +59,14 @@ anywhere with the toolchain and `rust-src`.
     aledgent-core-host measure agent_runtime.pvm core.vos reserve.csv --n 100 --warmup 3
     # reservations, captures and transfers: the Agent's state and gas against the book's size
     aledgent-core-host measure agent_runtime.pvm core.vos mixed.csv --n 1000 --warmup 4 --mix mixed
+    # identities and accounts opened, 24 inputs an invocation: per-round figures (PROFROUND) to
+    # stderr, the service tree's leaves by kind at the end (profiling)
+    aledgent-core-host measure agent_runtime.pvm core.vos open.csv --n 12000 --warmup 0 --batch 24 --mix open
 
-    # Serve boundary::Core on the deployment's core_endpoint (the same file ingress reads),
-    # streaming every decision to the off-node archive (T-005-15; ops/runbooks/release/core-archive.md)
+    # Serve boundary::Core on the deployment's core_endpoint (the same file ingress reads), and/or
+    # dial ingress's core listener with stream.dial (F-038; a Unix-socket address reads its token
+    # from ALEDGENT_CORE_STREAM_TOKEN), streaming every decision to the off-node archive (T-005-15;
+    # ops/runbooks/release/core-archive.md)
     ALEDGENT_CORE_ROOT=… ALEDGENT_CORE_AGENT_KEY=… ALEDGENT_CORE_PACKAGE_KEY=… \
       aledgent-core-host serve --config deployment.json --runtime agent_runtime.pvm \
         --actor core.vos --state <dir> \
@@ -64,7 +74,9 @@ anywhere with the toolchain and `rust-src`.
     #   (Object Lock defaults to compliance, 400 days)
 
     # A fresh node from the archive (T-005-16): opsctl checks it and lays it out, then the Agent is
-    # re-sent every archived input after its checkpoint (opsctl runs this with --core-host)
+    # re-sent every archived input after its checkpoint (opsctl runs this with --core-host). The core
+    # image carries opsctl too (--entrypoint /usr/local/bin/opsctl); a chainspec book's chainspec comes
+    # from the archive unless --chainspec names it; segments are read --fetch-concurrency (32) at once
     opsctl restore core --from <archive> --config deployment.json --state <empty dir> --anchors-rpc <node>
     aledgent-core-host restore --config deployment.json --runtime agent_runtime.pvm --actor core.vos --state <dir>
 
@@ -74,6 +86,44 @@ measurements in `notes/MEASUREMENTS-F005.md` used `MAX_RUNTIME_PROGRAM_BYTES` an
 `MAX_EXECUTION_PROGRAM_BYTES` at 2 560 KiB, through a `[patch]` of the VOS crates onto a local
 copy (`--config` with a `[patch."https://codeberg.org/pandres95/VOS.git"]` table). The change is
 drafted as `proposals/vos/0003`.
+
+## A new host on a deployment's genesis bytes (`F-038` §12 step 0)
+
+A deployment's core image is pinned by digest and never updated in place: its chainspec's genesis
+code names the package (`core.vos`) and the runtime (`agent_runtime.pvm`) byte for byte, and a
+rebuild from source need not reproduce them. To give such a deployment a newer host (the stream
+link of `F-038`, for one), build an image of the **current host with the package and the runtime
+copied from the deployment's pinned image** (`DEC-27` (i)). The Agent does not change; the host's
+own binary is not checked on a restart with a replica (`code.rs`).
+
+1. **The genesis code.** The manifest the chainspec was built with (`code.bin`, the file
+   `migrate chainspec build --code` took), or one taken from the chainspec, with the genesis bytes
+   copied out of the pinned image and a current core image's host:
+
+        id=$(docker create <pinned core image>@sha256:<digest>)
+        docker cp "$id:/usr/share/aledgent" genesis && docker rm "$id"
+        docker run --rm --user "$(id -u)" -v "$PWD:/w" <a current aledgent-core image> check-code \
+          --chainspec /w/chainspec.bin --actor /w/genesis/core.vos \
+          --runtime /w/genesis/agent_runtime.pvm --write-manifest /w/code.bin
+
+   `check-code` prints the genesis code's version *H₀* and refuses bytes that are not its. A book
+   founded without a chainspec has no genesis code to give: a manifest written by the pinned image's
+   own host (`code-manifest`) proves only that the bytes are that image's, which the digest already
+   does. The CI workflow below needs *H₀*, so such a book cannot be rebuilt through CI; it can only
+   be rebuilt locally (the Dockerfile's target, below), with the code hash known by other means.
+2. **The image.** A manual dispatch of `.github/workflows/images.yml` from `main` or `develop` with
+   `genesis_image` (`ghcr.io/bloque-app/aledgent-core@sha256:…`), `genesis_manifest`
+   (`xxd -p code.bin | tr -d '\n'`) and `genesis_code` (*H₀*, 64 hex, either case), which is
+   required: the run stops at its first step without it. It builds this repository's
+   host with the genesis image's roots, copies the two programs from that image, and fails unless
+   `check-code` passes; nothing else is built. The result is pushed as
+   `ghcr.io/bloque-app/aledgent-core:host-<commit>-on-genesis-<the genesis digest's first 12 hex>`,
+   never as `sha-<commit>` or a version, so it is never taken for a core built from source; it
+   carries the check's report in `/usr/share/aledgent/genesis-code.json` and the genesis image in
+   the label `app.aledgent.genesis.image`. Outside CI the same build is
+   `deploy/docker/core.Dockerfile`'s target `core-on-genesis` (its header).
+3. **The deployment** pins the new image by digest, as it pinned the old one; on its first restart
+   the host checks the package and the runtime against the chainspec again, as every restart does.
 
 ## aledgent's runtime (`F-033`)
 

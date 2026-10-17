@@ -6,7 +6,8 @@ SPDX-License-Identifier: CC-BY-4.0
 # Code history, code sources and node roles
 
 **Status:** describes amendment 0023 (`amendments/0023-code-history-and-upgrades.md`), which the owner
-ruled on 2026-10-08. **Nothing here is built yet.** `F-037` builds it, and this page becomes the operator's
+ruled on 2026-10-08, as amended by amendment 0033
+(`amendments/0033-code-history-independent-of-the-platform.md`), ruled on 2026-10-17. **Nothing here is built yet.** `F-037` builds it, and this page becomes the operator's
 reference when it lands.
 
 ## The trust model, first
@@ -51,6 +52,41 @@ Two builds of the same source with different settings are two code versions.
 - **Checkpoints and anchors** name the code version and the construction of the state commitment, so a
   verifier holding an anchor knows what produced the anchored state and how it is committed. A change of
   construction is itself an input (a migration), and its checkpoint binds both roots.
+
+## Independent of the runtime
+
+The code history is shaped so that the book can later move to another runtime as one more upgrade, with
+no new genesis (amendment 0033).
+
+- **A code version names its platform**, and lists each artefact's identities on that platform beside its
+  own digest. Nothing the platform supplies (its clock, its slot, its identities, its encoding of state)
+  enters a root, a log hash, a checkpoint or an anchor.
+- **A code generation counts the upgrades.** Each writer holds the generation of its code: 0 at genesis, one
+  more after every upgrade. Every package is built with its generation compiled in, and the manifest's digest
+  binds that constant to the code version.
+- **The switch of code is one host operation**, taken between two inputs, installing only bytes fetched and
+  checked before the upgrade was accepted. The code also fences itself, at every input: code whose
+  generation is not the writer's (or, from a scheduled upgrade's input *n*, the next one) refuses the input,
+  with nothing written. A missed switch, or a stale package after one, halts the writer; it never runs an
+  input under the wrong generation. Within a generation, the bytes are checked by digest before they are
+  installed, and the node checks every artefact it runs, the runtime included, when it starts and at every
+  switch, installing whatever the code map names for the next input.
+- **The fence has a way out.** While it holds, the old code still takes an input that moves the upgrade to a
+  later input or cancels it, under the upgrade-authority mode. Either generation decides that input the same
+  way, so the outcome never depends on whether the switch was already made. An alert fires when a writer stays fenced longer
+  than the deployment's bound (five minutes by default).
+- **Only the book's upgrade-authority mode authorises an upgrade.** A runtime's own authority to install
+  programs is a host key, never an authority over the book's code.
+- **Checkpoints are the writer's state and the book's leaves**, in aledgent's own format, so one archive
+  restores onto either runtime. A node's local cache can be in any format; it is never archived or sent.
+- **Replay is native first.** The book's state replays from the inputs with aledgent's own code, without the
+  runtime. Each range's host image (its replayer) is kept in the code archive beside the code version, not in
+  it, so the runtime's execution can be checked too, and rebuilding the host is not an upgrade.
+- **A writer can be continued by another at input *n***, carrying its whole state and log head after input
+  *n* − 1. The founding is written once per input number, only after every check has passed, as the claim
+  of that number, and the archive takes each input number of a logical writer once. A first writer and its
+  continuation therefore can never both hold an input. Once a continuation is founded, the upgrade is final. A
+  move of runtime is an upgrade naming the new runtime, followed by a continuation on it.
 
 ## Code sources
 
