@@ -893,6 +893,8 @@ impl Canonical for Checkpoint {
             instance,
             entry_sequence,
             kernel_root,
+            construction,
+            binding,
             commitment,
             created_at,
             status,
@@ -904,6 +906,8 @@ impl Canonical for Checkpoint {
             .put(instance)
             .put(entry_sequence)
             .put(kernel_root)
+            .put(construction)
+            .put(binding)
             .put(commitment)
             .put(created_at)
             .put(status)
@@ -917,12 +921,27 @@ impl Canonical for Checkpoint {
             instance: d.get()?,
             entry_sequence: d.get()?,
             kernel_root: d.get()?,
+            construction: d.get()?,
+            binding: d.get()?,
             commitment: d.get()?,
             created_at: d.get()?,
             status: d.get()?,
             coordinate: d.get()?,
             venue: d.get()?,
             height: d.get()?,
+        })
+    }
+}
+
+impl Canonical for crate::anchor::CodeBinding {
+    fn encode(&self, e: &mut Enc) {
+        e.put(&self.genesis).put(&self.code).put(&self.authority);
+    }
+    fn decode(d: &mut Dec<'_>) -> Result<Self, DecodeError> {
+        Ok(crate::anchor::CodeBinding {
+            genesis: d.get()?,
+            code: d.get()?,
+            authority: d.get()?,
         })
     }
 }

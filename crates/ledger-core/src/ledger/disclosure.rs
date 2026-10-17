@@ -565,7 +565,9 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                         entry_sequence: c.entry_sequence,
                         kernel_root: c.kernel_root,
                         commitment: c.commitment,
-                        construction: crate::anchor::construction(),
+                        // The checkpoint's own construction and code binding (`T-037-03`).
+                        construction: c.construction,
+                        binding: c.binding,
                     },
                     assurance: verify::Assurance {
                         declaration_digest: assurance.digest,

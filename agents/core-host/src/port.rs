@@ -333,7 +333,9 @@ impl AgentPort for VosPort {
         if b.is_empty() {
             return Ok(None);
         }
-        decode::<Hot>(&b).map(Some).map_err(PortError::Unavailable)
+        core_binding::hot::decode_hot(&b)
+            .map(Some)
+            .map_err(PortError::Unavailable)
     }
 
     fn entry(&mut self, seq: u64) -> Result<Option<RingEntry>, PortError> {

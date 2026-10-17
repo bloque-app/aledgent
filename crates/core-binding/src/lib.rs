@@ -60,3 +60,7 @@ pub mod core;
 pub mod host;
 #[cfg(feature = "ingress")]
 pub mod verified;
+
+/// The library, for the guest shell (`agents/core`), which links this crate alone: it defines
+/// its compiled code generation with `ledger_core::code_generation!` (`T-037-01`).
+pub use ledger_core;

@@ -193,6 +193,15 @@ const SURFACE: &[(&str, &str)] = &[
     // book: they turn the recorder on and hand back what it holds.
     ("record_calls", "turns call recording on or off (F-005)"),
     ("take_calls", "takes the recorded calls (F-005)"),
+    // T-037-03: the writer's code version and mode, from its hot row. It sets what the next
+    // checkpoint record binds (a service leaf, under the service root, and anchored): the content of
+    // that record, never a balance or any other record. An unauthenticated writer-side setter: no
+    // command reaches it (`calls::apply` has no variant for it), and only `core-binding` calls it,
+    // from the Agent's hot row, the founding, and each archived entry's code.
+    (
+        "set_code",
+        "sets the code version and mode the next checkpoint record binds (T-037-03)",
+    ),
     // T-031-19: when the kernel's leaves are committed, not what is written. Every command still
     // decides alone, through the command surface; these only group the kernel's commits.
     (

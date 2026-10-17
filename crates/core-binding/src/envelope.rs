@@ -135,6 +135,32 @@ pub struct Pack<'a> {
     pub blobs: Vec<(BlobKey, &'a [u8])>,
 }
 
+/// The code a writer is founded under (`T-037-02`, `REQ-RT-15`, `REQ-RT-18`): the founder's word,
+/// as the driver is. The generation is 0 and the construction the build's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FoundingCode {
+    /// The genesis code version *H₀*: the chainspec's, which the host checked its binaries against
+    /// (`F-036`); zeros for a book whose code is not named (tests, stress books).
+    pub code: [u8; 32],
+    /// The digest of the initial upgrade-authority mode; zeros until modes exist (`T-037-05`).
+    pub authority: [u8; 32],
+}
+
+impl FoundingCode {
+    /// The code a host founds a book under: the genesis code its chainspec names, if the host has
+    /// the chainspec, else none.
+    pub fn of(genesis: &Genesis) -> FoundingCode {
+        FoundingCode {
+            code: genesis
+                .spec
+                .as_deref()
+                .and_then(|s| s.header().code.as_ref())
+                .map_or([0; 32], |c| c.version()),
+            authority: [0; 32],
+        }
+    }
+}
+
 /// The founding invocation.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct GenesisEnvelope {
@@ -150,6 +176,8 @@ pub struct GenesisEnvelope {
     pub witness: BlobKey,
     /// The private inputs (the key-ring root).
     pub private: BlobKey,
+    /// The code it is founded under.
+    pub code: FoundingCode,
 }
 
 /// The founding invocation of a chainspec book (`F-036`, owner ruling `genesis-chainspec`).
@@ -174,6 +202,8 @@ pub struct StateGenesisEnvelope {
     pub limits: crate::hot::Limits,
     /// The genesis state's roots and counters.
     pub state: GenesisState,
+    /// The code it is founded under.
+    pub code: FoundingCode,
 }
 
 /// What the Agent's hot row holds after a genesis state (`StateGenesisEnvelope`).

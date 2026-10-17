@@ -88,9 +88,9 @@ use ledger_kernel::vault::{LayerSums, RowKey, Undo, VaultBackend, VaultError, Va
 use std::sync::Arc;
 
 use crate::envelope::{
-    AgentRefusal, BatchEnvelope, BlobKey, ClerkAnswers, Committed, Envelope, GenesisEnvelope,
-    GenesisState, InputEnvelope, MAX_BATCH_INPUTS, MAX_BATCH_PACKS, Pack, Private, Reply, Roots,
-    StateGenesisEnvelope, decode, encode,
+    AgentRefusal, BatchEnvelope, BlobKey, ClerkAnswers, Committed, Envelope, FoundingCode,
+    GenesisEnvelope, GenesisState, InputEnvelope, MAX_BATCH_INPUTS, MAX_BATCH_PACKS, Pack, Private,
+    Reply, Roots, StateGenesisEnvelope, decode, encode,
 };
 use crate::hot::{Hot, Limits, RingEntry};
 use crate::mapped::{Mapped, MappedGenesis, MappedInput, ServiceKeys};
@@ -525,6 +525,12 @@ pub struct Driver<P: AgentPort> {
     /// The roots of the book's genesis, as this host's replica computed them: from the chainspec
     /// for a chainspec book (`F-036`), which the core checks against the deployment's manifest.
     genesis: Roots,
+    /// The code version that executes the Agent's next input, as its hot row holds it
+    /// (`T-037-02`): each ring entry the replica computes names it.
+    code: [u8; 32],
+    /// The digest of the Agent's upgrade-authority mode, as its hot row holds it: with
+    /// [`Driver::code`], what the replica's checkpoints bind (`T-037-03`).
+    authority: [u8; 32],
 }
 
 /// A clerk shared between threads: what the executor signs disclosures with.
@@ -1138,6 +1144,7 @@ impl<P: AgentPort> Driver<P> {
         prefix: Option<(&ledger_core::chainspec::ChainSpec, u32)>,
     ) -> Result<(Self, Replica, Founded), DriveError> {
         let rep = |e: &dyn core::fmt::Debug| DriveError::Replica(format!("{e:?}"));
+        let code = FoundingCode::of(&genesis);
         let view = store.view().map_err(|e| rep(&e))?;
         let (recorder, ring) = Recorder::new(&keys);
         let book = Book::bootstrap(RecStore::new(store), RecVault::new(vault), ring)
@@ -1147,6 +1154,7 @@ impl<P: AgentPort> Driver<P> {
         if let Some((spec, start)) = prefix {
             apply_spec_prefix(&mut replica, &founded, spec, start)?;
         }
+        replica.set_code(code.code, code.authority);
         replica.record_calls(true);
         let service = ServiceStore::of_in(stores, replica.state())?;
         let mut driver = Driver {
@@ -1166,6 +1174,8 @@ impl<P: AgentPort> Driver<P> {
             last_entry: None,
             mapped,
             genesis: Roots::default(),
+            code: code.code,
+            authority: code.authority,
         };
         // Bootstrap writes the book's one journal without loading it: witness it absent.
         let mut keys = replica.book().store().take_keys();
@@ -1192,6 +1202,7 @@ impl<P: AgentPort> Driver<P> {
                 lifecycle: genesis.lifecycle.clone(),
                 limits,
                 state: genesis_state_of(&replica, &driver.service)?,
+                code,
             }));
             driver.send(&envelope, Vec::new())?
         } else if mapped {
@@ -1201,6 +1212,7 @@ impl<P: AgentPort> Driver<P> {
                 at,
                 limits,
                 private: driver.port.blob_key(&private),
+                code,
             })));
             driver.send(&envelope, vec![private])?
         } else {
@@ -1212,6 +1224,7 @@ impl<P: AgentPort> Driver<P> {
                 limits,
                 witness: driver.port.blob_key(&witness),
                 private: driver.port.blob_key(&private),
+                code,
             }));
             driver.send(&envelope, vec![witness, private])?
         };
@@ -1250,6 +1263,11 @@ impl<P: AgentPort> Driver<P> {
     /// The port, mutably.
     pub fn port_mut(&mut self) -> &mut P {
         &mut self.port
+    }
+
+    /// The code version that executes the Agent's next input (`T-037-02`).
+    pub fn code(&self) -> [u8; 32] {
+        self.code
     }
 
     /// The last input number the Agent committed.
@@ -1433,6 +1451,7 @@ impl<P: AgentPort> Driver<P> {
             let (roots, next_posting) = replica_roots(replica, &self.service)?;
             let entry = RingEntry {
                 seq,
+                code: self.code,
                 calls,
                 deliveries,
                 roots,
@@ -1469,6 +1488,7 @@ impl<P: AgentPort> Driver<P> {
         };
         let entry = RingEntry {
             seq,
+            code: self.code,
             calls,
             deliveries,
             roots,
@@ -1719,9 +1739,11 @@ impl<P: AgentPort> Driver<P> {
             })?;
             archive.push(entry);
         }
-        let (replica, service, recorder, genesis) =
+        let (mut replica, service, recorder, genesis) =
             replay_with(stores, &keys, genesis, op, at, archive, audit_floor, prefix)?;
         recorder.clear();
+        // From here the replica runs the Agent's next inputs, under its hot row's code and mode.
+        replica.set_code(hot.code, hot.authority);
         let (roots, next_posting) = replica_roots(&replica, &service)?;
         if roots != hot.roots() || next_posting != hot.next_posting {
             return Err(DriveError::Diverged(format!(
@@ -1749,6 +1771,8 @@ impl<P: AgentPort> Driver<P> {
             last_entry: archive.last().cloned(),
             mapped: hot.layout == crate::mapped::LAYOUT_MAPPED,
             genesis,
+            code: hot.code,
+            authority: hot.authority,
         };
         driver.pin(&replica)?;
         Ok((driver, replica))
@@ -1785,6 +1809,10 @@ impl<P: AgentPort> Driver<P> {
                         e.seq
                     )));
                 }
+                // The code that executed it, as the Agent's ring names it (`T-037-02`), is what
+                // its checkpoints bind (`T-037-03`).
+                self.code = e.code;
+                replica.set_code(self.code, self.authority);
                 for c in &e.calls {
                     let clerk = clerk.as_deref().map(|c| c as &dyn ClerkSigner);
                     crate::calls::apply(replica, c, clerk);
@@ -1935,6 +1963,9 @@ fn replay_with(
         }
     };
     let rep = |e: &dyn core::fmt::Debug| DriveError::Replica(format!("{e:?}"));
+    // The mode a replay's checkpoints bind: the founding's, since no input changes it yet
+    // (`T-037-05` gives the mode its inputs).
+    let authority = FoundingCode::of(&genesis).authority;
     let (store, vault) = stores.book()?;
     let (recorder, ring) = Recorder::new(keys);
     let book =
@@ -1962,6 +1993,8 @@ fn replay_with(
                 e.seq
             )));
         }
+        // Each input under the code its entry names (`T-037-02`): what its checkpoints bind.
+        replica.set_code(e.code, authority);
         for c in &e.calls {
             let clerk = clerk.as_deref().map(|c| c as &dyn ClerkSigner);
             crate::calls::apply(&mut replica, c, clerk);
@@ -2096,7 +2129,7 @@ impl AgentPort for NativePort {
         use crate::transition::Rows as _;
         self.rows
             .get(crate::hot::HOT)
-            .map(|b| decode::<Hot>(&b).map_err(PortError::Unavailable))
+            .map(|b| crate::hot::decode_hot(&b).map_err(PortError::Unavailable))
             .transpose()
     }
 
@@ -2246,7 +2279,7 @@ impl AgentPort for RemotePort {
     fn hot(&mut self) -> Result<Option<Hot>, PortError> {
         match self.call(&RawRequest::Hot)? {
             RawResponse::Hot(h) => h
-                .map(|b| decode::<Hot>(&b).map_err(PortError::Ambiguous))
+                .map(|b| crate::hot::decode_hot(&b).map_err(PortError::Ambiguous))
                 .transpose(),
             RawResponse::Failed(e) => Err(e),
             other => Err(PortError::Ambiguous(format!("unexpected {other:?}"))),

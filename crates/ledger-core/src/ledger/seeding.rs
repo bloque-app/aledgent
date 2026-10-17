@@ -177,13 +177,14 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                     return Err(Refusal::MalformedCommand);
                 }
                 accounts = self.spec_header(p, &h)?;
+                let code = h.genesis_code();
                 progress.header = Some(HeaderFacts {
                     genesis_op: h.genesis_op,
                     at: h.at,
                     counts: h.counts,
                     opening: h.opening,
                     history: h.history,
-                    code: h.code.as_ref().map(|c| (c.version(), c.construction)),
+                    code,
                     settlement: h.settlement,
                 });
             }
@@ -249,7 +250,9 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
         p: &Principal,
         h: &chainspec::SpecHeader,
     ) -> Result<Vec<crate::id::AccountId>, Refusal> {
-        if h.version != chainspec::SPEC_VERSION {
+        // Either readable format (`chainspec::readable`): a book founded on format 4 replays its
+        // genesis as it was built. Only the core host refuses to drive one.
+        if !chainspec::readable(h.version) {
             return Err(Refusal::MalformedCommand);
         }
         let roles = self.roles()?;
