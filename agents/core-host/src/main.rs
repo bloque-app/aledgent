@@ -171,9 +171,10 @@ fn main() {
             let pkg = package::actor_package(&elf, None, &key).expect("package");
             let pvm = package::link(&elf).expect("link");
             // T-037-01: the build-time check of the compiled code generation. The ELF's record
-            // (`.aledgent.generation`, `ALEDGENT_CODE_GENERATION`) must be there once, and must
-            // survive linking: the package, which keeps no sections, carries the same one record.
-            let generation = match package::generation(&elf, &pkg) {
+            // (`ALEDGENT_CODE_GENERATION`) must be there once, and must survive linking: the
+            // program the package carries, which keeps no sections, holds the same one record in
+            // its read-only data.
+            let generation = match package::generation(&elf, &pvm) {
                 Ok(g) => g,
                 Err(e) => {
                     eprintln!("aledgent-core-host: package: {e}");

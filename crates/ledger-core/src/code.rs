@@ -222,10 +222,12 @@ impl CodeManifest {
         self.artefacts.iter().find(|a| a.role == role)
     }
 
-    /// Refuse unless `package` carries this manifest's generation compiled in (D1, D13): the
-    /// build-time check (`check-code`), staging and the execution node's checks run it.
-    pub fn check_generation(&self, package: &[u8]) -> Result<(), CodeMismatch> {
-        let compiled = generation_of(package).map_err(CodeMismatch::Generation)?;
+    /// Refuse unless the package's code carries this manifest's generation compiled in (D1, D13):
+    /// the build-time check (`check-code`), staging and the execution node's checks run it. `code`
+    /// is what [`generation_of`] reads: the package's ELF, or the standard program it carries (a
+    /// host reads it out of a VOS3 package first).
+    pub fn check_generation(&self, code: &[u8]) -> Result<(), CodeMismatch> {
+        let compiled = generation_of(code).map_err(CodeMismatch::Generation)?;
         if compiled != self.generation {
             return Err(CodeMismatch::GenerationDiffers {
                 manifest: self.generation,
@@ -236,8 +238,9 @@ impl CodeManifest {
     }
 
     /// Check running code against the manifest: every artefact it names must be given, as bytes
-    /// whose digest and length are the manifest's, and the package must carry the manifest's
-    /// generation. Roles the manifest does not name are ignored.
+    /// whose digest and length are the manifest's. Roles the manifest does not name are ignored.
+    /// The package's compiled generation is [`CodeManifest::check_generation`]'s, on the program
+    /// the package carries.
     pub fn check(&self, given: &[(Role, &[u8])]) -> Result<(), CodeMismatch> {
         for a in &self.artefacts {
             let bytes = given
@@ -248,11 +251,95 @@ impl CodeManifest {
             if bytes.len() as u64 != a.len || artefact_digest(bytes) != a.digest {
                 return Err(CodeMismatch::Digest(a.role));
             }
-            if a.role == Role::Package {
-                self.check_generation(bytes)?;
-            }
         }
         Ok(())
+    }
+}
+
+/// Amendment 0023's first manifest layout (before amendment 0033): one VOS `ProgramId` per
+/// artefact, no platform and no code generation. Format-4 chainspecs carry it (the books founded
+/// before amendment 0033), and this build still **reads** it, so that every component that only
+/// reads a chainspec (ingress, `opsctl`) loads those books. Nothing drives a writer under it: the
+/// core host founds and drives only books whose chainspec names a [`CodeManifest`]
+/// (`chainspec::SPEC_VERSION`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManifestV4 {
+    /// The writer it runs.
+    pub writer: WriterKind,
+    /// Its artefacts, at most one per role, in role order.
+    pub artefacts: Vec<ArtefactV4>,
+    /// The kernel's identity.
+    pub kernel: KernelIdentity,
+    /// The constructions of the state commitment it reads.
+    pub constructions: Vec<u8>,
+    /// The message formats it accepts and emits.
+    pub messages: Vec<String>,
+}
+
+/// One artefact of a [`ManifestV4`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtefactV4 {
+    /// What it is.
+    pub role: Role,
+    /// [`artefact_digest`] of its bytes.
+    pub digest: [u8; 32],
+    /// Its length.
+    pub len: u64,
+    /// VOS's `ProgramId` of the program, where it has one.
+    pub program_id: Option<[u8; 32]>,
+    /// How it was built.
+    pub profile: BuildProfile,
+}
+
+impl ManifestV4 {
+    /// Its code version: `blake2b-256` of the magic and its canonical bytes, as it was computed
+    /// when it was written.
+    pub fn version(&self) -> [u8; 32] {
+        let mut e = Enc::new();
+        e.raw(MAGIC).put(self);
+        artefact_digest(&e.into_bytes())
+    }
+}
+
+impl Canonical for ArtefactV4 {
+    fn encode(&self, e: &mut Enc) {
+        e.put(&self.role)
+            .put(&self.digest)
+            .put(&self.len)
+            .put(&self.program_id)
+            .put(&self.profile);
+    }
+    fn decode(d: &mut Dec<'_>) -> Result<Self, DecodeError> {
+        Ok(ArtefactV4 {
+            role: d.get()?,
+            digest: d.get()?,
+            len: d.get()?,
+            program_id: d.get()?,
+            profile: d.get()?,
+        })
+    }
+}
+
+impl Canonical for ManifestV4 {
+    fn encode(&self, e: &mut Enc) {
+        e.put(&self.writer)
+            .put(&self.artefacts)
+            .put(&self.kernel)
+            .put(&self.constructions)
+            .put(&self.messages);
+    }
+    fn decode(d: &mut Dec<'_>) -> Result<Self, DecodeError> {
+        let m = ManifestV4 {
+            writer: d.get()?,
+            artefacts: d.get()?,
+            kernel: d.get()?,
+            constructions: d.get()?,
+            messages: d.get()?,
+        };
+        if m.artefacts.windows(2).any(|w| w[0].role >= w[1].role) {
+            return Err(DecodeError("artefacts not in role order, or a role twice"));
+        }
+        Ok(m)
     }
 }
 
@@ -425,11 +512,11 @@ mod tests {
         }
     }
 
-    /// A package of these bytes with generation `g` compiled in.
+    /// A program of these bytes with generation `g` compiled in.
     pub(crate) fn package(bytes: &[u8], g: u64) -> Vec<u8> {
-        let mut p = bytes.to_vec();
-        p.extend_from_slice(&generation_record(g));
-        p
+        let mut ro = bytes.to_vec();
+        ro.extend_from_slice(&generation_record(g));
+        generation::tests::program(&ro, b"", b"code")
     }
 
     /// A manifest naming these bytes as its artefacts, on `vos-saga`, generation 0.
@@ -533,18 +620,14 @@ mod tests {
         m.generation = 1;
         assert_eq!(m.check_generation(&one), Ok(()));
         assert_eq!(
-            m.check_generation(b"pkg"),
+            m.check_generation(&generation::tests::program(b"pkg", b"", b"")),
             Err(CodeMismatch::Generation(GenerationError::Missing))
         );
-        let twice = package(&one, 1);
+        let mut two = generation_record(1).to_vec();
+        two.extend_from_slice(&generation_record(1));
+        let twice = generation::tests::program(&two, b"", b"");
         assert_eq!(
             m.check_generation(&twice),
-            Err(CodeMismatch::Generation(GenerationError::Duplicated(2)))
-        );
-        // `check` reads it from the package it is given.
-        let m = manifest(&twice, b"rt", b"host");
-        assert_eq!(
-            m.check(&[(Role::Package, &twice[..]), (Role::Runtime, &b"rt"[..])]),
             Err(CodeMismatch::Generation(GenerationError::Duplicated(2)))
         );
     }

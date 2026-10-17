@@ -19,18 +19,24 @@
 //! - **An ELF.** The record is the one [`SECTION`] holds, which must be exactly one record, and
 //!   the symbol [`SYMBOL`], where the symbol table has it, must name that section's record and
 //!   nothing else. A linker script may instead place the section's contents inside another
-//!   read-only output section (the core's `agents/core/pvm.ld` puts it first in `.rodata`,
-//!   because VOS's PVM linker carries only `.rodata*`, `.srodata` and `.data.rel.ro*` into the
-//!   program): then the record is the 16 bytes the symbol names. An ELF with neither the section
-//!   nor the symbol (stripped) is read as a package format that keeps no sections.
-//! - **A package that keeps no sections** (a VOS3 package, whose program is the PVM the ELF was
-//!   linked into): the record is the single occurrence of the tag in its bytes.
+//!   read-only output section: the core's `agents/core/pvm.ld` puts it first in `.rodata`, because
+//!   VOS's PVM linker carries only `.rodata*`, `.srodata` and `.data.rel.ro*` into the program.
+//!   Then the record is the 16 bytes the symbol names, still the one record the macro defines
+//!   (D18). An ELF with neither the section nor the symbol (stripped) is read by its single tagged
+//!   record in its loaded data.
+//! - **A program that keeps no sections**: a standard PVM program (JAM's program blob, the code the
+//!   ELF is linked into, which a VOS3 package carries as its program): the record is the single
+//!   occurrence of the tag in its read-only and read-write data. Its code is never scanned.
 //!
-//! In every case the tag must occur exactly once in the data the package loads (for an ELF, its
-//! allocated sections that are not code; otherwise, all of its bytes). No occurrence is a record
-//! folded away ([`GenerationError::Missing`]); more than one, a second constant
-//! ([`GenerationError::Duplicated`]): a package whose fence reads a record of its own, beside the
-//! section's, is refused this way.
+//! Any other format is refused ([`GenerationError::UnknownFormat`]): a host holding a package that
+//! wraps its program (a VOS3 package) reads the program out of it first.
+//!
+//! In every case the tag must occur exactly once in the data the package loads that is not code
+//! (for an ELF, its allocated sections that are not code; for a program, its read-only and
+//! read-write data). No occurrence is a record folded away ([`GenerationError::Missing`]); more
+//! than one, a second constant ([`GenerationError::Duplicated`]): a package whose fence reads a
+//! record of its own, beside the section's, is refused this way. A tag a host or guest carries as
+//! an immediate in its code is not counted.
 //!
 //! The tag is held here as a `u64` ([`TAG`]) and never as eight contiguous bytes in this module's
 //! data, so that a program that links this reader (a host, a test) does not carry a second
@@ -81,6 +87,9 @@ pub enum GenerationError {
     NotTheSection,
     /// The bytes are an ELF this reader cannot read.
     Malformed(&'static str),
+    /// The bytes are neither an ELF nor a standard program: a container (a VOS3 package) must have
+    /// its program read out of it first.
+    UnknownFormat,
 }
 
 /// Define the package's code generation (module documentation): the record
@@ -120,41 +129,72 @@ macro_rules! code_generation {
     };
 }
 
-/// The code generation compiled into a package (module documentation).
+/// The code generation compiled into a package (module documentation): `bytes` is its ELF, or the
+/// standard program it was linked into.
 pub fn generation_of(bytes: &[u8]) -> Result<u64, GenerationError> {
-    if bytes.starts_with(b"\x7fELF")
-        && let Some(found) = elf::record(bytes)?
-    {
-        let record: [u8; RECORD_LEN] = found
-            .record
+    if bytes.starts_with(b"\x7fELF") {
+        let found = elf::record(bytes)?;
+        let data: alloc::vec::Vec<&[u8]> = found.loaded.iter().map(|r| &bytes[r.clone()]).collect();
+        let Some(record) = found.record else {
+            return single_record(&data);
+        };
+        let record: [u8; RECORD_LEN] = record
             .try_into()
             .map_err(|_| GenerationError::NotTheSection)?;
         if read_u64(&record[..8]) != TAG {
             return Err(GenerationError::NotTheSection);
         }
-        let n = found
-            .loaded
-            .iter()
-            .map(|range| occurrences(&bytes[range.clone()]))
-            .sum();
-        match n {
+        return match data.iter().map(|d| occurrences(d)).sum() {
             // The record is not in anything the package loads.
-            0 => return Err(GenerationError::Missing),
-            1 => {}
-            n => return Err(GenerationError::Duplicated(n)),
-        }
-        return Ok(record_generation(&record));
+            0 => Err(GenerationError::Missing),
+            1 => Ok(record_generation(&record)),
+            n => Err(GenerationError::Duplicated(n)),
+        };
     }
-    match occurrences(bytes) {
+    match standard_program(bytes) {
+        Some((ro, rw)) => single_record(&[ro, rw]),
+        None => Err(GenerationError::UnknownFormat),
+    }
+}
+
+/// The read-only and read-write data of a standard PVM program (the Gray Paper's program blob:
+/// `E3(|o|) ‖ E3(|w|) ‖ E2(z) ‖ E3(s) ‖ o ‖ w ‖ E4(|c|) ‖ c`, the code running to the end), or
+/// `None` if `b` is not one.
+fn standard_program(b: &[u8]) -> Option<(&[u8], &[u8])> {
+    let le = |at: usize, n: usize| -> Option<usize> {
+        let s = b.get(at..at.checked_add(n)?)?;
+        Some(
+            s.iter()
+                .rev()
+                .fold(0usize, |v, x| (v << 8) | usize::from(*x)),
+        )
+    };
+    let (ro, rw) = (le(0, 3)?, le(3, 3)?);
+    let ro_end = 11usize.checked_add(ro)?;
+    let rw_end = ro_end.checked_add(rw)?;
+    let code = le(rw_end, 4)?;
+    if rw_end.checked_add(4)?.checked_add(code)? != b.len() {
+        return None;
+    }
+    Some((b.get(11..ro_end)?, b.get(ro_end..rw_end)?))
+}
+
+/// The one tagged record in `data`, counted across every region.
+fn single_record(data: &[&[u8]]) -> Result<u64, GenerationError> {
+    match data.iter().map(|d| occurrences(d)).sum() {
         0 => Err(GenerationError::Missing),
         1 => {
-            let at = (0..=bytes.len() - 8)
-                .find(|&i| read_u64(&bytes[i..i + 8]) == TAG)
+            let record = data
+                .iter()
+                .find_map(|d| {
+                    (0..d.len().saturating_sub(7))
+                        .find(|&i| read_u64(&d[i..i + 8]) == TAG)
+                        .map(|at| d.get(at..at + RECORD_LEN))
+                })
+                .flatten()
                 .ok_or(GenerationError::Missing)?;
-            let record: [u8; RECORD_LEN] = bytes
-                .get(at..at + RECORD_LEN)
-                .and_then(|r| r.try_into().ok())
-                .ok_or(GenerationError::Missing)?;
+            let record: [u8; RECORD_LEN] =
+                record.try_into().map_err(|_| GenerationError::Missing)?;
             Ok(record_generation(&record))
         }
         n => Err(GenerationError::Duplicated(n)),
@@ -197,8 +237,9 @@ mod elf {
 
     /// What an ELF says about its record.
     pub(super) struct Found<'a> {
-        /// The record's bytes, as the section or the symbol names them.
-        pub(super) record: &'a [u8],
+        /// The record's bytes, as the section or the symbol names them; `None` when the ELF has
+        /// neither (stripped).
+        pub(super) record: Option<&'a [u8]>,
         /// The file ranges of the data it loads that is not code.
         pub(super) loaded: Vec<Range<usize>>,
     }
@@ -278,8 +319,8 @@ mod elf {
         Ok(start..end)
     }
 
-    /// The record an ELF names, or `None` if it has neither the section nor the symbol.
-    pub(super) fn record(b: &[u8]) -> Result<Option<Found<'_>>, GenerationError> {
+    /// The record an ELF names, and the data it loads.
+    pub(super) fn record(b: &[u8]) -> Result<Found<'_>, GenerationError> {
         let wide = match b.get(4) {
             Some(1) => false,
             Some(2) => true,
@@ -349,7 +390,7 @@ mod elf {
         }
         let symbol = symbols.first().copied();
         let record = match (own, symbol) {
-            (None, None) => return Ok(None),
+            (None, None) => None,
             (Some(s), symbol) => {
                 if s.size != RECORD_LEN as u64 {
                     return Err(GenerationError::NotTheSection);
@@ -359,7 +400,7 @@ mod elf {
                 {
                     return Err(GenerationError::NotTheSection);
                 }
-                &b[range(s, b.len())?]
+                Some(&b[range(s, b.len())?])
             }
             (None, Some((value, size, shndx))) => {
                 if size != RECORD_LEN as u64 {
@@ -376,15 +417,15 @@ mod elf {
                     return Err(GenerationError::NotTheSection);
                 }
                 let at = range(s, b.len())?.start + within as usize;
-                &b[at..at + RECORD_LEN]
+                Some(&b[at..at + RECORD_LEN])
             }
         };
-        Ok(Some(Found { record, loaded }))
+        Ok(Found { record, loaded })
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use alloc::vec;
     use alloc::vec::Vec;
@@ -456,6 +497,20 @@ mod tests {
         out
     }
 
+    /// A standard PVM program with this read-only data, read-write data and code.
+    pub(crate) fn program(ro: &[u8], rw: &[u8], code: &[u8]) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&(ro.len() as u32).to_le_bytes()[..3]);
+        p.extend_from_slice(&(rw.len() as u32).to_le_bytes()[..3]);
+        p.extend_from_slice(&[0, 0]);
+        p.extend_from_slice(&[0, 0, 4]);
+        p.extend_from_slice(ro);
+        p.extend_from_slice(rw);
+        p.extend_from_slice(&(code.len() as u32).to_le_bytes());
+        p.extend_from_slice(code);
+        p
+    }
+
     const RO: u64 = 0x2;
     const CODE: u64 = 0x2 | 0x4;
 
@@ -503,8 +558,13 @@ mod tests {
     fn t037_01_a_folded_away_or_duplicated_record_is_refused() {
         // No record anywhere.
         assert_eq!(
-            generation_of(b"a package with no record"),
+            generation_of(&program(b"no record", b"", b"code")),
             Err(GenerationError::Missing)
+        );
+        // A format this reader does not know (a VOS3 package, unopened) is refused, not scanned.
+        assert_eq!(
+            generation_of(b"a package with no record"),
+            Err(GenerationError::UnknownFormat)
         );
         let b = elf(&[(".rodata", RO, 0x2000, b"nothing")], None);
         assert_eq!(generation_of(&b), Err(GenerationError::Missing));
@@ -512,7 +572,15 @@ mod tests {
         let mut two = generation_record(1).to_vec();
         two.extend_from_slice(b"..");
         two.extend_from_slice(&generation_record(1));
-        assert_eq!(generation_of(&two), Err(GenerationError::Duplicated(2)));
+        assert_eq!(
+            generation_of(&program(&two, b"", b"code")),
+            Err(GenerationError::Duplicated(2))
+        );
+        // A second record in the read-write data counts too.
+        assert_eq!(
+            generation_of(&program(&generation_record(1), &generation_record(1), b"")),
+            Err(GenerationError::Duplicated(2))
+        );
         // The section's record and a second constant in `.rodata`: the fence would read another
         // number than the section's.
         let rec = generation_record(2);
@@ -546,13 +614,24 @@ mod tests {
     /// D13: a package format that keeps no sections, the single tagged record in its bytes.
     #[test]
     fn d13_a_package_without_sections_is_read_from_its_single_record() {
-        let mut pkg = b"VOS3 header ... ro data: ".to_vec();
-        pkg.extend_from_slice(&generation_record(9));
-        pkg.extend_from_slice(b" ... code");
-        assert_eq!(generation_of(&pkg), Ok(9));
-        // A tag at the very end, with no generation after it.
+        let mut ro = b"ro data: ".to_vec();
+        ro.extend_from_slice(&generation_record(9));
+        assert_eq!(generation_of(&program(&ro, b"rw", b"code")), Ok(9));
+        // The code is never scanned: a tag carried there as an immediate is not a second record.
+        let mut code = b"code ".to_vec();
+        code.extend_from_slice(b"ALGGEN01");
+        code.extend_from_slice(&[0; 8]);
+        assert_eq!(generation_of(&program(&ro, b"rw", &code)), Ok(9));
+        // A tag at the very end of the data, with no generation after it.
         let mut cut = b"....".to_vec();
         cut.extend_from_slice(b"ALGGEN01");
-        assert_eq!(generation_of(&cut), Err(GenerationError::Missing));
+        assert_eq!(
+            generation_of(&program(&cut, b"", b"")),
+            Err(GenerationError::Missing)
+        );
+        // Not a program: its code does not run to the end.
+        let mut bad = program(&ro, b"", b"code");
+        bad.push(0);
+        assert_eq!(generation_of(&bad), Err(GenerationError::UnknownFormat));
     }
 }

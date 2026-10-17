@@ -39,7 +39,7 @@
 use std::fs;
 use std::path::Path;
 
-use ledger_core::chainspec::ChainSpec;
+use ledger_core::chainspec::{ChainSpec, SPEC_VERSION};
 use ledger_core::code::{
     Artefact, BuildProfile, CodeManifest, Identity, KernelIdentity, Platform, Role, WriterKind,
     artefact_digest, generation_of,
@@ -78,9 +78,23 @@ pub fn check_platform(manifest: &CodeManifest) -> Result<(), String> {
     Ok(())
 }
 
-/// The code generation `actor` carries compiled in (`ledger_core::code::generation_of`).
+/// The program a VOS3 actor package carries: the standard PVM program its manifest names, which is
+/// what `ledger_core::code::generation_of` reads (its read-only data, never its code).
+pub fn program_of(actor: &[u8]) -> Result<Vec<u8>, String> {
+    let pkg = crate::package::admit_actor(actor).map_err(|e| format!("actor package: {e:?}"))?;
+    let program = &pkg.manifest().program;
+    pkg.envelope()
+        .artifacts
+        .iter()
+        .find(|a| &a.identity == program)
+        .map(|a| a.bytes.clone())
+        .ok_or_else(|| "actor package: no artefact is its program".into())
+}
+
+/// The code generation `actor` carries compiled in: its program's record
+/// (`ledger_core::code::generation_of`).
 pub fn package_generation(actor: &[u8]) -> Result<u64, String> {
-    generation_of(actor).map_err(|e| {
+    generation_of(&program_of(actor)?).map_err(|e| {
         format!(
             "the package's compiled code generation ({e:?}): its record `ALEDGENT_CODE_GENERATION` \
              in `.aledgent.generation` must be there, once (amendment 0033, D13)"
@@ -382,6 +396,7 @@ pub fn check(
     runtime: Option<&[u8]>,
     which: Check,
 ) -> Result<Option<[u8; 32]>, String> {
+    check_format(spec.header().version)?;
     let Some(code) = &spec.header().code else {
         if args.iter().any(|a| a == "--unnamed-code") {
             eprintln!(
@@ -441,14 +456,32 @@ pub fn check(
             ));
         }
     }
-    subset.check(&given).map_err(|e| {
+    let unlike = |e: ledger_core::code::CodeMismatch| {
         format!(
             "the running binaries are not the chainspec's genesis code {} ({e:?}): build or \
              fetch the artefacts its manifest names",
             hex::encode(code.version())
         )
-    })?;
+    };
+    subset.check(&given).map_err(unlike)?;
+    if let Some(a) = actor {
+        manifest.check_generation(&program_of(a)?).map_err(unlike)?;
+    }
     Ok(Some(code.version()))
+}
+
+/// Refuse a chainspec of another format than [`SPEC_VERSION`]: this host founds and drives only
+/// books whose chainspec names amendment 0033's manifest. A book founded on format 4 is driven by
+/// the host it was founded with until it is re-founded; ingress and `opsctl` still read it.
+pub fn check_format(version: u16) -> Result<(), String> {
+    if version != SPEC_VERSION {
+        return Err(format!(
+            "the chainspec is format {version}; this host founds and drives only books founded on \
+             format {SPEC_VERSION} (amendment 0033's code manifest, T-037-01). A book founded on \
+             format {version} is driven by the host it was founded with until it is re-founded"
+        ));
+    }
+    Ok(())
 }
 
 /// Refuse unless `actor` and `runtime` are the package and runtime `manifest` names, for a core
@@ -457,6 +490,16 @@ pub fn check(
 /// not checked: a core image on a deployment's genesis bytes carries a newer host by design
 /// (`DEC-27` (i)).
 pub fn check_agent(manifest: &CodeManifest, actor: &[u8], runtime: &[u8]) -> Result<(), String> {
+    check_agent_program(manifest, actor, runtime, &program_of(actor)?)
+}
+
+/// [`check_agent`], with the program `actor` carries already read out of it.
+fn check_agent_program(
+    manifest: &CodeManifest,
+    actor: &[u8],
+    runtime: &[u8],
+    program: &[u8],
+) -> Result<(), String> {
     if manifest.writer != WriterKind::Core {
         return Err(format!(
             "the manifest is a {:?} writer's code, not the core's",
@@ -486,15 +529,17 @@ pub fn check_agent(manifest: &CodeManifest, actor: &[u8], runtime: &[u8]) -> Res
             .collect(),
         ..manifest.clone()
     };
+    let unlike = |e: ledger_core::code::CodeMismatch| {
+        format!(
+            "the package and runtime are not the genesis code {} ({e:?}): copy them from the \
+             deployment's pinned core image",
+            hex::encode(manifest.version())
+        )
+    };
     subset
         .check(&[(Role::Package, actor), (Role::Runtime, runtime)])
-        .map_err(|e| {
-            format!(
-                "the package and runtime are not the genesis code {} ({e:?}): copy them from the \
-                 deployment's pinned core image",
-                hex::encode(manifest.version())
-            )
-        })
+        .map_err(unlike)?;
+    manifest.check_generation(program).map_err(unlike)
 }
 
 /// `check-code --actor <vos> --runtime <pvm> (--chainspec <file> | --manifest <file>) [--code <hex>]
@@ -595,10 +640,16 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// A package of these bytes, built as generation `g`.
-    fn package(bytes: &[u8], g: u64) -> Vec<u8> {
-        let mut p = bytes.to_vec();
-        p.extend_from_slice(&ledger_core::code::generation_record(g));
+    /// A standard program built as generation `g`: what a package carries.
+    fn program(g: u64) -> Vec<u8> {
+        let mut ro = b"ro data ".to_vec();
+        ro.extend_from_slice(&ledger_core::code::generation_record(g));
+        let mut p = Vec::new();
+        p.extend_from_slice(&(ro.len() as u32).to_le_bytes()[..3]);
+        p.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+        p.extend_from_slice(&ro);
+        p.extend_from_slice(&4u32.to_le_bytes());
+        p.extend_from_slice(b"code");
         p
     }
 
@@ -642,24 +693,23 @@ mod tests {
     #[test]
     fn dec_27_i_the_genesis_bytes_pass_and_a_tampered_copy_is_refused() {
         let ours = ledger_core::anchor::construction();
-        let core = package(b"core.vos", 0);
+        let (core, p) = (b"core.vos".to_vec(), program(0));
         let m = manifest(&core, b"agent_runtime.pvm", vec![ours]);
         // As a manifest file gives it.
         let m = CodeManifest::from_bytes(&m.to_bytes()).unwrap();
-        check_agent(&m, &core, b"agent_runtime.pvm").unwrap();
-        let mut tampered = core.clone();
-        tampered[3] ^= 1;
-        assert!(check_agent(&m, &tampered, b"agent_runtime.pvm").is_err());
-        assert!(check_agent(&m, &core, b"agent_runtime.pvm\0").is_err());
-        assert!(check_agent(&m, b"agent_runtime.pvm", &core).is_err());
+        let check = |m: &CodeManifest, a: &[u8], r: &[u8]| check_agent_program(m, a, r, &p);
+        check(&m, &core, b"agent_runtime.pvm").unwrap();
+        assert!(check(&m, b"core.vOs", b"agent_runtime.pvm").is_err());
+        assert!(check(&m, &core, b"agent_runtime.pvm\0").is_err());
+        assert!(check(&m, b"agent_runtime.pvm", &core).is_err());
         let mut other = m.clone();
         other.writer = WriterKind::Shard;
-        assert!(check_agent(&other, &core, b"agent_runtime.pvm").is_err());
+        assert!(check(&other, &core, b"agent_runtime.pvm").is_err());
         let mut no_runtime = m.clone();
         no_runtime.artefacts.retain(|a| a.role != Role::Runtime);
-        assert!(check_agent(&no_runtime, &core, b"agent_runtime.pvm").is_err());
+        assert!(check(&no_runtime, &core, b"agent_runtime.pvm").is_err());
         let elsewhere = manifest(&core, b"agent_runtime.pvm", vec![ours.wrapping_add(1)]);
-        assert!(check_agent(&elsewhere, &core, b"agent_runtime.pvm").is_err());
+        assert!(check(&elsewhere, &core, b"agent_runtime.pvm").is_err());
     }
 
     /// T-037-01: the build check refuses a package whose compiled generation is not the
@@ -668,33 +718,41 @@ mod tests {
     #[test]
     fn t037_01_check_code_refuses_another_generation_platform_or_record() {
         let ours = ledger_core::anchor::construction();
-        let one = package(b"core.vos", 1);
+        let core = b"core.vos".to_vec();
+        let m = manifest(&core, b"agent_runtime.pvm", vec![ours]);
         // The manifest says 0, the package was built as 1.
-        let m = manifest(&one, b"agent_runtime.pvm", vec![ours]);
-        let e = check_agent(&m, &one, b"agent_runtime.pvm").unwrap_err();
+        let e = check_agent_program(&m, &core, b"agent_runtime.pvm", &program(1)).unwrap_err();
         assert!(e.contains("GenerationDiffers"), "{e}");
         // Folded away: no record at all.
-        let m = manifest(b"core.vos", b"agent_runtime.pvm", vec![ours]);
-        let e = check_agent(&m, b"core.vos", b"agent_runtime.pvm").unwrap_err();
+        let mut none = program(0);
+        let at = none.len() - 4 - 4 - 16;
+        none[at] ^= 0xFF;
+        let e = check_agent_program(&m, &core, b"agent_runtime.pvm", &none).unwrap_err();
         assert!(e.contains("Missing"), "{e}");
-        // Duplicated.
-        let twice = package(&package(b"core.vos", 0), 0);
-        let m = manifest(&twice, b"agent_runtime.pvm", vec![ours]);
-        let e = check_agent(&m, &twice, b"agent_runtime.pvm").unwrap_err();
-        assert!(e.contains("Duplicated"), "{e}");
+        // A package this reader cannot open is refused, not scanned.
+        let e = check_agent_program(&m, &core, b"agent_runtime.pvm", &core).unwrap_err();
+        assert!(e.contains("UnknownFormat"), "{e}");
         // Another platform, or another revision of this one.
-        let zero = package(b"core.vos", 0);
-        let mut m = manifest(&zero, b"agent_runtime.pvm", vec![ours]);
-        check_agent(&m, &zero, b"agent_runtime.pvm").unwrap();
+        let p = program(0);
+        let mut m = manifest(&core, b"agent_runtime.pvm", vec![ours]);
+        check_agent_program(&m, &core, b"agent_runtime.pvm", &p).unwrap();
         m.platform.revision = "b74eeef8".into();
-        assert!(check_agent(&m, &zero, b"agent_runtime.pvm").is_err());
+        assert!(check_agent_program(&m, &core, b"agent_runtime.pvm", &p).is_err());
         m.platform = Platform {
             name: "vos-core".into(),
             revision: PLATFORM_REVISION.into(),
             identities: Vec::new(),
         };
-        assert!(check_agent(&m, &zero, b"agent_runtime.pvm").is_err());
-        assert_eq!(package_generation(&zero), Ok(0));
+        assert!(check_agent_program(&m, &core, b"agent_runtime.pvm", &p).is_err());
+    }
+
+    /// Review of #36: this host founds and drives only format-5 chainspecs, and refuses a
+    /// format-4 one (a book founded before amendment 0033) with an error naming the format.
+    #[test]
+    fn t037_01_the_host_refuses_to_drive_a_format_4_chainspec() {
+        check_format(SPEC_VERSION).unwrap();
+        let e = check_format(ledger_core::chainspec::SPEC_VERSION_V4).unwrap_err();
+        assert!(e.contains("format 4") && e.contains("format 5"), "{e}");
     }
 
     /// The platform this host names is the VOS it links.

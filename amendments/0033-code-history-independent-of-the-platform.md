@@ -175,11 +175,14 @@ D8 to D14 on the same day, under the same approval.
 - **D13 — Where the generation lives.** The constant is a 16-byte record: the tag `ALGGEN01` followed by the
   generation as a little-endian `u64`. It sits in a dedicated section of the package's ELF,
   `.aledgent.generation`, kept by the linker and exported as the symbol `ALEDGENT_CODE_GENERATION`, so the
-  optimiser cannot fold it away. One reader reads it, in `check-code`, in the host's staging and in the
-  pre-switch check:
-  - from that section, in an ELF;
+  optimiser cannot fold it away. A linker script may place that section first in the ELF's `.rodata`
+  instead of as a section of its own, where a platform's program linker keeps only `.rodata` (the core's,
+  on the runtime of today, `T-037-01`); the record is then the one the symbol names. This is within D18:
+  the symbol is still the record, defined once. One reader reads it, in `check-code`, in the host's
+  staging and in the pre-switch check:
+  - from that section, or from the record the symbol names, in an ELF;
   - in a package format that keeps no sections, as the one occurrence of the tagged record in its read-only
-    data. No occurrence, or more than one, is refused.
+    data, its code never scanned. No occurrence, or more than one, is refused.
 - **D14 — More acceptance criteria.** Added: a stale package refused after a switch, and an upgrade naming the
   wrong generation refused (`AC-K7.16`); an unauthorised move or cancellation refused (`AC-K7.17`); input *n*
   decided the same by either generation (`AC-K7.18`); a second archive entry at one input number refused
@@ -575,12 +578,14 @@ Everything below is plan-level and names technology. It changes amendment 0023's
   - Every package is built with a `GENERATION` constant equal to the manifest's `generation`.
   - The constant is a 16-byte record: the tag `ALGGEN01`, then the generation as a little-endian `u64`.
   - It is a `#[used]` static in its own ELF section, `.aledgent.generation`, exported as the symbol
-    `ALEDGENT_CODE_GENERATION`, so the optimiser cannot fold it away. The symbol is that section's record
+    `ALEDGENT_CODE_GENERATION`, so the optimiser cannot fold it away. A linker script may place that
+    section first in `.rodata` (D13), and the record is then the one the symbol names. The symbol is that section's record
     and nothing else. It is defined once, by a macro in `ledger-core`, and the fence reads that very static
     through the layout `generation_of` uses (D18). No second constant exists for the comparison.
-  - One reader, `ledger_core::code::generation_of(bytes)`, returns it. It reads the section from an ELF. From
-    a package format that keeps no sections, it reads the single occurrence of the tagged record in the
-    read-only data, and refuses a package with none or with more than one.
+  - One reader, `ledger_core::code::generation_of(bytes)`, returns it. It reads the section, or the record
+    the symbol names, from an ELF. From a package format that keeps no sections, it reads the single
+    occurrence of the tagged record in the read-only data, never in the code, and refuses a package with
+    none or with more than one.
   - The same reader runs in the build-time check (`check-code`, `T-038-25`), in `Upgrade` staging, and in the
     execution node's checks at start and before a switch. The build fails when the constant differs from the
     manifest.

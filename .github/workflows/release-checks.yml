@@ -20,7 +20,10 @@ name: Release checks
 #   checked is the one the release would have with this pull request merged (its title counted), as
 #   tools/release/next-version.sh computes it, so a breaking change passes only under a title that
 #   says so (`feat!:`, or a `BREAKING CHANGE:` footer in a commit already merged), or a `feat` before
-#   1.0.0.
+#   1.0.0. Before 1.0.0, a minor release is the one that may break (Cargo's reading of 0.y.z), so
+#   next-version.sh answers `major` for it, the release type at which cargo-semver-checks allows a
+#   break: before 1.0.0 this job therefore refuses a breaking change only when the pending release is
+#   a patch release. The versions released are unchanged (`--print version`).
 #
 # It reads the title, the code and the history; it holds no secret and writes nothing, so it runs
 # on pull requests from forks as on any other.

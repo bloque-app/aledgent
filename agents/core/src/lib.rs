@@ -19,16 +19,19 @@
 //! from the private input's root.
 //!
 //! **The code generation** (`T-037-01`; amendment 0033, D1, D13): the package is built as
-//! [`GENERATION`], its record `ALEDGENT_CODE_GENERATION` in the section `.aledgent.generation`
-//! (kept first in `.rodata` by `pvm.ld`), defined once by `ledger_core::code_generation!`. The
+//! `GENERATION`, its record `ALEDGENT_CODE_GENERATION` in the section `.aledgent.generation`
+//! (kept first in `.rodata` by `pvm.ld`), defined once by `ledger_core::code_generation!`.
+//! `GENERATION` is private, and only the macro reads it, so the record is the one copy anything
+//! in the guest can read: through `code_generation()`. The
 //! manifest that names this package must name the same generation: `check-code` and the
 //! `package` step refuse it otherwise. *H₀* is generation 0; every upgrade's package is built
 //! with this constant raised by one.
 
 use core_binding::envelope::BlobKey;
 
-/// The code generation this package is built as (module documentation).
-pub const GENERATION: u64 = 0;
+/// The code generation this package is built as (module documentation). Private: only the record
+/// the macro defines from it is read.
+const GENERATION: u64 = 0;
 
 core_binding::ledger_core::code_generation!(GENERATION);
 use core_binding::transition::{Invocation, Rows, transition};

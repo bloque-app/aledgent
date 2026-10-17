@@ -941,7 +941,8 @@ new genesis.
   toolchain, `opt-level`, features, source revision, `Cargo.lock` digest), the kernel's identity, the
   constructions it reads and the message formats it accepts and emits (amendment 0033). Every package is
   built with a `GENERATION` constant equal to the manifest's `generation`: a 16-byte record (`ALGGEN01` and a
-  little-endian `u64`) in its own ELF section, `.aledgent.generation`, exported as
+  little-endian `u64`) in its own ELF section, `.aledgent.generation` (or that section placed first in
+  `.rodata` where the platform's program linker keeps only `.rodata`, found by the symbol), exported as
   `ALEDGENT_CODE_GENERATION`; the symbol is that record, defined once by a `ledger-core` macro, and the fence
   reads that very static, so there is no second constant to compare. One reader, `ledger_core::code::generation_of`, reads it in `check-code`
   (`T-038-25`), which fails the build when it differs, in staging, and in the host's checks at start and
