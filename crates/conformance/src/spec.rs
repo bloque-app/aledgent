@@ -554,10 +554,10 @@ mod tests {
         // AC-C6.1 to AC-C6.4 and AC-M6.1 to AC-M6.4, and amendment 0016
         // AC-K6.1 to AC-K6.3, and amendment 0020 AC-B3.4, AC-M7.1 to AC-M7.4,
         // AC-M8.1 to AC-M8.4, and amendment 0019 AC-J1.5, and amendment 0022 (draft) AC-N2.1 to
-        // AC-N2.5, and amendment 0023 AC-K7.1 to AC-K7.8, and amendment 0031 AC-E4.3 and AC-E4.4),
-        // less the 12 of US-C5, US-G4, US-I2,
+        // AC-N2.5, and amendment 0023 AC-K7.1 to AC-K7.8, and amendment 0031 AC-E4.3 and AC-E4.4,
+        // and amendment 0033 AC-K7.9 to AC-K7.20), less the 12 of US-C5, US-G4, US-I2,
         // US-I3 and US-J2, which §15 puts beyond V0.
-        assert_eq!(c.acceptance.len(), 167);
+        assert_eq!(c.acceptance.len(), 179);
         for beyond in ["US-C5", "US-F2", "US-G4", "US-I2", "US-I3", "US-J2"] {
             assert!(c.acceptance.iter().all(|a| a.story != beyond), "{beyond}");
         }
