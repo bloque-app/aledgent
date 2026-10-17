@@ -135,7 +135,7 @@ fn blob(inv: &Invocation<'_>, key: &BlobKey, what: &str) -> Result<Vec<u8>, Agen
 
 fn read_hot(rows: &dyn Rows) -> Result<Option<Hot>, AgentRefusal> {
     rows.get(HOT)
-        .map(|b| decode::<Hot>(&b).map_err(AgentRefusal::Malformed))
+        .map(|b| hot::decode_hot(&b).map_err(AgentRefusal::Malformed))
         .transpose()
 }
 

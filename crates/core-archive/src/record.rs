@@ -25,8 +25,10 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-/// The format this build writes and reads.
-pub const FORMAT: u32 = 1;
+/// The format this build writes and reads. Format 2: segments carry ring entries that name their
+/// code, under the log domain `aledgent/core-agent/log/v2` (`T-037-02`); an archive of format 1 is
+/// refused by this check, by name.
+pub const FORMAT: u32 = 2;
 
 /// The most bytes of payload one segment carries.
 pub const MAX_SEGMENT_PAYLOAD: u64 = 64 * 1024 * 1024;
@@ -324,5 +326,25 @@ mod tests {
         assert_eq!(number_of(&segment_name(0x2a)), Some(0x2a));
         assert_eq!(number_of(&checkpoint_name(7)), Some(7));
         assert_eq!(number_of("segments/2a.seg"), None);
+    }
+
+    /// `T-037-02`, review of #37: an archive written before the ring entries named their code
+    /// (format 1) is refused at the format check, by name, not at an entry that no longer decodes.
+    #[test]
+    fn t037_02_an_archive_of_format_1_is_refused_by_its_format() {
+        let h = SegmentHeader {
+            format: 1,
+            book: "ab".into(),
+            n: 3,
+            prev: "00".into(),
+            archive: span(10, b"entries"),
+            replies: span(20, b"replies\n"),
+            cut: true,
+            point: None,
+            taken_at: 7,
+        };
+        let rec = encode_segment(&h, b"entries", b"replies\n");
+        let e = decode_segment(&rec).unwrap_err();
+        assert!(format!("{e:?}").contains("format 1 is not 2"), "{e:?}");
     }
 }

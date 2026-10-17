@@ -34,9 +34,16 @@
 //!
 //! **Host-local fields** (`SPEC.md` §2 **Writer state**). [`Hot::driver`] (the principal the
 //! platform accepts the writer's inputs from) and [`Hot::observed_slot`] (a diagnostic the platform
-//! reports) are the only two. They are set at founding from the invocation, never carried by a
-//! snapshot or a continuation, and never enter a root, a ring entry, a log hash, a checkpoint or an
-//! anchor (`REQ-RT-19`). Every other field is writer state.
+//! reports) are the only two. They are set at founding from the invocation, and never enter a
+//! root, a ring entry, a log hash, an anchor checkpoint or an anchor (`REQ-RT-19`). Every other
+//! field is writer state. Today's archive checkpoint is still the Agent's runtime state as the host
+//! saved it (`agent.state`, `core-archive`), which holds this row, these two fields included, and
+//! its digest covers them; once `T-037-16` makes archived checkpoints and snapshots the writer
+//! state as rows, they will not be carried by a snapshot or a continuation.
+//!
+//! **Versions.** [`LAYOUT`] stamps the hot row, and [`LOG_DOMAIN`] every ring entry's log hash: an
+//! Agent's rows or an archive written in an earlier layout fail at that check, with an error naming
+//! the layout ([`decode_hot`]), not at a field.
 
 use alloc::vec::Vec;
 
@@ -47,11 +54,29 @@ use serde::{Deserialize, Serialize};
 use crate::envelope::Roots;
 
 /// The layout's version: a change of layout is an upgrade through `F-014` (`REQ-RT-8`). Version 2
-/// keeps the service store as leaves, not as an image in the Agent's rows.
-pub const LAYOUT: u32 = 2;
+/// keeps the service store as leaves, not as an image in the Agent's rows. Version 4 adds the
+/// writer's code to the hot row and to each ring entry (`T-037-02`).
+pub const LAYOUT: u32 = 4;
 
-/// The layout of an Agent whose book is in its committed maps (`F-031` lever 2, `crate::mapped`).
-pub const LAYOUT_MAPPED: u32 = 3;
+/// The layout of an Agent whose book is in its committed maps (`F-031` lever 2, `crate::mapped`):
+/// 3 before the writer's code, 5 with it (`T-037-02`).
+pub const LAYOUT_MAPPED: u32 = 5;
+
+/// The hot row, decoded only if it is of a layout this build reads ([`LAYOUT`],
+/// [`LAYOUT_MAPPED`]). The layout is the row's first field: an Agent founded in an earlier layout is
+/// refused here, by name, and not by a field that no longer decodes.
+pub fn decode_hot(bytes: &[u8]) -> Result<Hot, alloc::string::String> {
+    let (layout, _) = postcard::take_from_bytes::<u32>(bytes)
+        .map_err(|e| alloc::format!("the hot row's layout: {e}"))?;
+    if layout != LAYOUT && layout != LAYOUT_MAPPED {
+        return Err(alloc::format!(
+            "the hot row is layout {layout}; this build reads layouts {LAYOUT} and \
+             {LAYOUT_MAPPED} (the writer's code, T-037-02): an Agent founded before is driven by \
+             the host it was founded with until the book is re-founded"
+        ));
+    }
+    crate::envelope::decode(bytes)
+}
 
 /// The hot row's key.
 pub const HOT: &[u8] = b"h";
@@ -260,7 +285,9 @@ pub struct RingEntry {
     pub prev: [u8; 32],
 }
 
-const LOG_DOMAIN: &[u8] = b"aledgent/core-agent/log/v1";
+/// The domain of a ring entry's log hash: version 2 since the entry names its code (`T-037-02`), so
+/// that one domain never hashes two entry layouts.
+pub const LOG_DOMAIN: &[u8] = b"aledgent/core-agent/log/v2";
 
 impl RingEntry {
     /// Its log hash: `blake2b-256(domain ‖ encoding)`, which chains through `prev`.

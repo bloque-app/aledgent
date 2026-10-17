@@ -2112,7 +2112,7 @@ impl AgentPort for NativePort {
         use crate::transition::Rows as _;
         self.rows
             .get(crate::hot::HOT)
-            .map(|b| decode::<Hot>(&b).map_err(PortError::Unavailable))
+            .map(|b| crate::hot::decode_hot(&b).map_err(PortError::Unavailable))
             .transpose()
     }
 
@@ -2262,7 +2262,7 @@ impl AgentPort for RemotePort {
     fn hot(&mut self) -> Result<Option<Hot>, PortError> {
         match self.call(&RawRequest::Hot)? {
             RawResponse::Hot(h) => h
-                .map(|b| decode::<Hot>(&b).map_err(PortError::Ambiguous))
+                .map(|b| crate::hot::decode_hot(&b).map_err(PortError::Ambiguous))
                 .transpose(),
             RawResponse::Failed(e) => Err(e),
             other => Err(PortError::Ambiguous(format!("unexpected {other:?}"))),

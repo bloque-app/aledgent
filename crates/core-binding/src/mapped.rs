@@ -193,7 +193,7 @@ fn load_service(rows: &dyn Rows, keys: &ServiceKeys) -> Result<Vec<LeafEntry>, A
 
 fn read_hot(rows: &dyn Rows) -> Result<Option<Hot>, AgentRefusal> {
     rows.get(HOT)
-        .map(|b| decode::<Hot>(&b).map_err(AgentRefusal::Malformed))
+        .map(|b| crate::hot::decode_hot(&b).map_err(AgentRefusal::Malformed))
         .transpose()
 }
 

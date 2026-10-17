@@ -150,6 +150,39 @@ fn t037_02_the_hot_row_stays_bounded() {
     assert!(after.bytes() <= after.limits.budget);
 }
 
+/// Review of #37: the hot row and the log hash carry their layout. A row of an earlier layout is
+/// refused by its layout, by the host and by the Agent, before any field is decoded; a ring
+/// entry's log hash is under `aledgent/core-agent/log/v2`.
+#[test]
+fn t037_02_an_earlier_layout_is_refused_by_its_layout() {
+    let (mut fx, _) = named();
+    let _ = fx.person();
+    // The log domain is version 2.
+    let entry = fx.archive[0].clone();
+    assert_eq!(core_binding::hot::LOG_DOMAIN, b"aledgent/core-agent/log/v2");
+    assert_eq!(
+        entry.log_hash(),
+        cipher_clerk::crypto::blake2b_256(b"aledgent/core-agent/log/v2", &[&encode(&entry)])
+    );
+    let mut old = hot(&mut fx);
+    assert_eq!(old.layout, core_binding::hot::LAYOUT);
+    old.layout = 2;
+    assert!(core_binding::hot::decode_hot(&encode(&old)).is_err());
+    // A layout-2 row: its first field, then whatever followed it then.
+    let mut bytes = encode(&2u32);
+    bytes.extend_from_slice(b"an earlier row's fields");
+    let e = core_binding::hot::decode_hot(&bytes).unwrap_err();
+    assert!(e.contains("layout 2"), "{e}");
+    // The Agent refuses an input over such a row, naming the layout.
+    fx.driver.port_mut().rows.0.insert(HOT.to_vec(), bytes);
+    let ctx = fx.ctx(fx.operator());
+    let _ = fx
+        .replica
+        .open_identity(&ctx, IdentityKind::Person, None, Verifier::new(vec![2]));
+    let e = format!("{:?}", fx.sync().unwrap_err());
+    assert!(e.contains("layout 2"), "{e}");
+}
+
 /// The book the host-local test drives: a funded account, a settlement configuration, and an
 /// on-demand checkpoint. Answers the archive and the checkpoint.
 fn drive(port: NativePort) -> (Vec<RingEntry>, Checkpoint, Hot) {
