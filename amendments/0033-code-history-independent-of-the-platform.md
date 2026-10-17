@@ -7,8 +7,9 @@ SPDX-License-Identifier: CC-BY-4.0
 
 **Status:** **ruled by the owner on 2026-10-17** ("the briefing is good enough, you have my okay"), on the
 briefing this amendment writes down. The design decisions in §"The architect's decisions" were taken on the
-same day under that approval, after four independent reviews of the draft (#35): D1 to D7 after the
-first, D8 to D14 after the second, D15 to D18 after the third, D19 to D22 after the fourth. **Applied** to `SPEC.md` **v0.4.27**, to `PLAN.md` `DEC-26`, and to
+same day under that approval, after five independent reviews of the draft (#35): D1 to D7 after the
+first, D8 to D14 after the second, D15 to D18 after the third, D19 to D22 after the fourth, D23 to D25 after
+the fifth. **Applied** to `SPEC.md` **v0.4.27**, to `PLAN.md` `DEC-26`, and to
 `F-036` and `F-037`, in the same pass. The new acceptance criteria are registered as pending
 (`crates/conformance/src/cases/f037.rs`), as amendment 0023's were.
 **Target:** `SPEC.md` v0.4.26 as on `develop` (amendment 0032 applied).
@@ -250,6 +251,31 @@ the same day, under the same approval.
     then the next input that is not refused, and the upgrade takes effect at it.
   - The feed's refusal is only a fast path with the same effect. The continuation's is the authority.
 
+The fifth review found no blocker and no fork, and three low findings. The architect took D23 to D25 on the
+same day, under the same approval.
+
+- **D23 — The instance is recorded beside the claim, never in local state.** D21's fallback kept an
+  assigned instance id in one node's state directory. A new lease holder, which starts with no local state,
+  would then build a second instance and write a different record. Decided:
+  - the fallback is dropped, and the claim record stays a fixed function of (genesis, logical writer, *n*,
+    side, the inputs before *n*);
+  - the continuation's instance is recorded in a separate write-once object beside the claim,
+    `instance/<…n>`, created by the first build, whose content is the instance id;
+  - any retry, by any lease holder, reads that object first and adopts the instance it names;
+  - both current platforms let the host name the instance, so its id is derived from the claim key, and the
+    object records that derived id. On the runtime of today, the host chooses the Agent's creation nonce,
+    from which the Agent id is derived (`agents/core-host/src/driver.rs:213-217`). On the new runtime, the
+    install takes the instance as an argument (vos-core `node/host/src/node/api.rs:172-177`).
+- **D24 — The archive checks the continuation's instance.** An instance the record does not name could still
+  reach the archive first and take the key at *n*. Decided: every segment carries the instance that wrote it.
+  The archive accepts a continuation-side entry at a claimed *n* only if two things hold: the claim there is
+  a founding record, and the entry's instance is the one `instance/<…n>` records. Any other is refused
+  (`AC-K7.19`).
+- **D25 — The scoped refusal is the fence's kind of outcome, audited outside the book.**
+  - The continuation's refusal shares the fence's new call-format version; there is no second version.
+  - A refused command, whether refused by the fence or by this rule, is audited at the execution node, in its
+    log and in the audit store. It is never committed to the book.
+
 ## What does not change
 
 - `REQ-RT-15`, `REQ-RT-17`, `REQ-RT-18`, `REQ-PR-11` and `NFR-22` stand as amendment 0023 applied them.
@@ -398,17 +424,21 @@ After "A change of build settings alone is an upgrade":
 >   A founding that fails a check writes no record and founds nothing, and the first writer continues.
 > - A founding MUST NOT be made while the next input queued for the writer moves or cancels the upgrade.
 >   The founding waits until the first writer has decided that input.
-> - The founding record MUST name the continuation's instance, and be written before input *n* is sent to
->   either writer. From then on, every input from *n* goes to that instance alone. An instance whose founding
->   failed or was abandoned MUST never receive an input. Before it sends an input numbered *n* or later to the
->   first writer, the execution node MUST check that no founding record exists at *n*.
+> - The founding record MUST be written before input *n* is sent to either writer. The continuation's
+>   instance MUST be recorded once, in a write-once record of its own beside the founding record. Every retry
+>   of the founding, by any execution node, MUST read it first and adopt the instance it names. It MUST NOT be
+>   kept only in one node's own state. Where the platform lets the instance be named, its name MUST be derived from
+>   the founding record's key. From then on, every input from *n* goes to that instance alone. An instance
+>   whose founding failed or was abandoned MUST never receive an input. Before it sends an input numbered *n*
+>   or later to the first writer, the execution node MUST check that no founding record exists at *n*.
 > - Once founded, the upgrade the continuation was founded for is final. The continuation's writer state
 >   records the input number it was continued at (§2). An input that moves or cancels the upgrade scheduled
 >   from that number MUST be refused with `ERR-InvalidTransition`. The refusal changes nothing and does not
 >   take the input's number, like the fence's, so the upgrade takes effect at the next input that is not
 >   refused. The continuation's refusal is the authority. The execution node MAY refuse such an input before
->   sending it, with the same effect, as a fast path. A move or cancellation of a later upgrade is taken as
->   usual.
+>   sending it, with the same effect, as a fast path. A refused input, by this rule or by the fence, is
+>   recorded by the execution node outside the book and is never part of it. A move or cancellation of a
+>   later upgrade is taken as usual.
 > - The input number it was continued at is the one field of the continuation's writer state that the first
 >   writer's state does not have. Equality covers every other field.
 > - There MUST be at most one continuation of a writer at an input number. Its founding record MUST be written
@@ -428,6 +458,8 @@ After "A change of build settings alone is an upgrade":
 >   claim that finds the same side's identical claim is a resume and succeeds. One that finds the other side's
 >   claim has lost and MUST be refused. A founding refused this way founds nothing, and the first writer
 >   continues.
+> - The archive MUST accept an entry of a continuation at or after a claimed input number only if the claim
+>   there is a founding record and the entry comes from the instance recorded beside it.
 > - A replay MUST refuse a log that holds both a founding record and a first writer's entry at one input
 >   number.
 > - The continuation's first input is *n*, and its log entry MUST chain to the log head of input *n* − 1. The
@@ -486,7 +518,9 @@ After "A change of build settings alone is an upgrade":
 >   the archive, Then it is refused; and Given an upgrade scheduled from *n*, When a move or cancellation
 >   committed at the first writer and a continuation's founding both claim *n*, Then whichever claims first
 >   stands and the other is refused, whether the first writer's entry reaches the archive before or after the
->   continuation's first segment; and a log holding both is refused by replay (`REQ-RT-21`).
+>   continuation's first segment; When an entry at *n* reaches the archive from a continuation instance that
+>   is not the one recorded beside the founding record, or at an *n* whose claim is not a founding record,
+>   Then it is refused; and a log holding both is refused by replay (`REQ-RT-21`).
 > - `AC-K7.20` Given a founding being made for an upgrade scheduled from *n*, When a move or cancellation of
 >   that upgrade commits at the first writer before the founding's checks, before or after the build, have
 >   passed, Then no founding record is written, nothing is founded, and the first writer continues
@@ -591,7 +625,8 @@ input, whether or not an upgrade is scheduled.
   numbered *n* or later.
 - Any other code refuses the input. The refusal is an outcome of its own, added as a new version of the call
   format: nothing is written, `inputs` does not move, and the host reads it as "install the range's code
-  first".
+  first". The continuation's scoped refusal, (j), uses the same outcome and the same version. A refused
+  command is audited at the execution node, in its log and the audit store, never in the book (D25).
 - The new runtime consumes a failed step, but the book's input number is aledgent's, so nothing of the book
   is consumed.
 - Code of generation *g* refuses input *n* and later, except a way-out input. Code of generation *g* + 1
@@ -681,13 +716,20 @@ The operator's runbook never installs a package except through `switch`.
   - The founding record is archived under `claim/<hex blake2b-256(genesis ‖ logical writer ‖ n)>`, with a
     conditional create (`If-None-Match: *`) under the archive's Object Lock. The logical writer is the id of
     the writer the book's genesis founded, which every continuation keeps.
-  - The record is a deterministic encoding of the predecessor's state and of the continuation's instance
-    (D20, D21). The instance id is derived from the claim key. Where a platform assigns ids itself, the host
-    records the assignment at the first build, in its state directory, and every retry reuses that instance.
-    A create that finds the same bytes at the key is a resume of the same founding, and succeeds. One that
-    finds different bytes is refused.
-  - The feed routes input *n* and later only to the instance the record names. An instance from a failed or
-    abandoned build never receives an input, and the runbook tears it down.
+  - The record is a deterministic encoding of (genesis, logical writer, *n*, side = continuation) and the
+    predecessor's state, so it holds no instance (D20, D23). A create that finds the same bytes at the key is
+    a resume of the same founding, and succeeds. One that finds different bytes is refused.
+  - **The instance** (D23) is recorded in `instance/<hex blake2b-256(genesis ‖ logical writer ‖ n)>`, a
+    write-once object created conditionally by the first build, whose content is the instance id.
+    - Every retry, by any lease holder, reads it first and adopts the instance it names. Nothing about it is
+      kept in a node's local state.
+    - On both runtimes the host names the instance, so the id is derived from the claim key: on `saga`
+      through the Agent's creation nonce (`driver.rs:213-217`, `AgentId::derive`), and on `vos-core` through
+      the install's `instance` argument.
+    - A platform that assigns ids itself would build first and then create the object. A build that finds an
+      object naming another instance abandons its own.
+  - The feed routes input *n* and later only to the recorded instance. An instance from a failed or abandoned
+    build never receives an input, and the runbook tears it down.
   - Replay refuses a log with two founding records at one *n*.
   - Feeding stays with one core at a time, through `F-038`'s feed lease and its epoch, so a retried founding
     cannot run in parallel.
@@ -713,6 +755,13 @@ The operator's runbook never installs a package except through `switch`.
       *n* under *H*.
     - A way-out input for a later upgrade of the continuation is taken as usual.
     - `continued_at` is the one field the equality check leaves out.
+  - **The archive checks the instance** (D24). Every segment's header names the instance that wrote it. At a
+    claimed *n*, a continuation-side segment is accepted only if `claim/<…n>` holds a founding record and the
+    segment's instance is the one `instance/<…n>` records. Otherwise it is refused, and nothing in it is
+    acknowledged.
+  - **The refusal's form** (D25). The scoped refusal is the same outcome as the fence's, in the same new
+    call-format version. A refused command, from the fence or from this rule, is audited at the execution
+    node, in its log and the audit store, and never committed to the book.
   - Replay refuses a log that holds both a founding record and a predecessor entry at one *n*.
 - The code map's boundary at *n* comes from the `Upgrade`. The founding record is evidence that replay checks
   against it.
@@ -758,5 +807,5 @@ The operator's runbook never installs a package except through `switch`.
 - **The owner: apply as briefed.** The owner approved the briefing this amendment writes down: the six
   recommendations, as requirements and as the plan's binding above. That includes a replayer recorded for
   every range under ruling `a0023-q6`'s fallback.
-- **The architect: D1 to D22**, taken under that approval after the four reviews of #35. They are recorded in
+- **The architect: D1 to D25**, taken under that approval after the five reviews of #35. They are recorded in
   §"The architect's decisions".

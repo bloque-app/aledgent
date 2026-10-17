@@ -821,17 +821,21 @@ founded from the first writer's writer state (§2) after input *n* − 1, with i
   A founding that fails a check writes no record and founds nothing, and the first writer continues.
 - A founding MUST NOT be made while the next input queued for the writer moves or cancels the upgrade.
   The founding waits until the first writer has decided that input.
-- The founding record MUST name the continuation's instance, and be written before input *n* is sent to
-  either writer. From then on, every input from *n* goes to that instance alone. An instance whose founding
-  failed or was abandoned MUST never receive an input. Before it sends an input numbered *n* or later to the
-  first writer, the execution node MUST check that no founding record exists at *n*.
+- The founding record MUST be written before input *n* is sent to either writer. The continuation's
+  instance MUST be recorded once, in a write-once record of its own beside the founding record. Every retry
+  of the founding, by any execution node, MUST read it first and adopt the instance it names. It MUST NOT be
+  kept only in one node's own state. Where the platform lets the instance be named, its name MUST be derived from
+  the founding record's key. From then on, every input from *n* goes to that instance alone. An instance
+  whose founding failed or was abandoned MUST never receive an input. Before it sends an input numbered *n*
+  or later to the first writer, the execution node MUST check that no founding record exists at *n*.
 - Once founded, the upgrade the continuation was founded for is final. The continuation's writer state
   records the input number it was continued at (§2). An input that moves or cancels the upgrade scheduled
   from that number MUST be refused with `ERR-InvalidTransition`. The refusal changes nothing and does not
   take the input's number, like the fence's, so the upgrade takes effect at the next input that is not
   refused. The continuation's refusal is the authority. The execution node MAY refuse such an input before
-  sending it, with the same effect, as a fast path. A move or cancellation of a later upgrade is taken as
-  usual.
+  sending it, with the same effect, as a fast path. A refused input, by this rule or by the fence, is
+  recorded by the execution node outside the book and is never part of it. A move or cancellation of a
+  later upgrade is taken as usual.
 - The input number it was continued at is the one field of the continuation's writer state that the first
   writer's state does not have. Equality covers every other field.
 - There MUST be at most one continuation of a writer at an input number. Its founding record MUST be written
@@ -851,6 +855,8 @@ founded from the first writer's writer state (§2) after input *n* − 1, with i
   claim that finds the same side's identical claim is a resume and succeeds. One that finds the other side's
   claim has lost and MUST be refused. A founding refused this way founds nothing, and the first writer
   continues.
+- The archive MUST accept an entry of a continuation at or after a claimed input number only if the claim
+  there is a founding record and the entry comes from the instance recorded beside it.
 - A replay MUST refuse a log that holds both a founding record and a first writer's entry at one input
   number.
 - The continuation's first input is *n*, and its log entry MUST chain to the log head of input *n* − 1. The
@@ -2348,7 +2354,9 @@ can still replay all of it, under the code that ran each part.
   the archive, Then it is refused; and Given an upgrade scheduled from *n*, When a move or cancellation
   committed at the first writer and a continuation's founding both claim *n*, Then whichever claims first
   stands and the other is refused, whether the first writer's entry reaches the archive before or after the
-  continuation's first segment; and a log holding both is refused by replay (`REQ-RT-21`).
+  continuation's first segment; When an entry at *n* reaches the archive from a continuation instance that
+  is not the one recorded beside the founding record, or at an *n* whose claim is not a founding record,
+  Then it is refused; and a log holding both is refused by replay (`REQ-RT-21`).
 - `AC-K7.20` Given a founding being made for an upgrade scheduled from *n*, When a move or cancellation of
   that upgrade commits at the first writer before the founding's checks, before or after the build, have
   passed, Then no founding record is written, nothing is founded, and the first writer continues

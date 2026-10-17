@@ -977,7 +977,9 @@ new genesis.
   it cannot; the in-book fence cannot see a runtime the host supplies apart from the package. **The fence**
   (`REQ-RT-20`), checked at every input: code takes an input only when its compiled `GENERATION` is the hot
   row's `generation` *g*, or *g* + 1 for an input at or after a scheduled `from`; any other code refuses it
-  with nothing written and its number not taken (a new outcome, added as a new call-format version). A
+  with nothing written and its number not taken (a new outcome, added as a new call-format version, which
+  the continuation's scoped refusal shares; a refused command is audited at the execution node, in its log
+  and the audit store, never in the book). A
   missed switch, or a stale package after one, halts the writer instead of running an input under the wrong
   code; on `vos-core`, which has no compare-and-swap and no way for an actor to read its program's hash, the
   fence is the only in-book check. The fence identifies code up to its generation; byte identity within a
@@ -1039,14 +1041,17 @@ new genesis.
   founding sets). No founding is made while the next queued input is a way-out input. The founding record
   is written **last**, after every check (staging, no claim at `n`, the predecessor at `n − 1` with
   `upgrade = Some((H, n))` both before and after the build, state equality, roots), and **once**, as the
-  claim of input `n`, naming the continuation's instance (derived from the claim key, or recorded at the
-  first build and reused on retry): archived under `claim/<hex blake2b-256(genesis ‖ logical writer ‖ n)>` with a conditional
+  claim of input `n`; the continuation's instance is recorded in a write-once `instance/<…n>` object beside
+  it, which every retry by any lease holder reads first and adopts (never node-local state), its id derived
+  from the claim key on both runtimes (`saga`'s creation nonce, `vos-core`'s install `instance`): archived under `claim/<hex blake2b-256(genesis ‖ logical writer ‖ n)>` with a conditional
   create under the archive's Object Lock, before input `n` is sent anywhere. The predecessor's archiver
   creates its own claim at that key before archiving its entry at `n`; both claims are fixed functions of
   (genesis, logical writer, `n`, side) and the inputs before `n`, so a claim that finds its own side's
   identical record resumes and one that finds the other side's has lost; a founding that loses founds
-  nothing. The feed routes input `n` and later only to the instance the record names; an instance from a
-  failed or abandoned build never receives an input and is torn down by the runbook. Once a founding record
+  nothing. The feed routes input `n` and later only to the recorded instance; an instance from a failed or
+  abandoned build never receives an input and is torn down by the runbook. Segments name the instance that
+  wrote them, and the archive accepts a continuation-side entry at a claimed `n` only if the claim is a
+  founding record and the instance is the recorded one. Once a founding record
   exists the upgrade is final: a way-out input for the upgrade scheduled from `continued_at` is refused with
   `ERR-InvalidTransition`, fence-style (nothing written, number not taken), by the continuation as the
   authority and by the feed as a fast path; one for a later upgrade is taken as usual. A failed check writes no record; a create that finds the

@@ -1216,7 +1216,7 @@ text = "Given an upgrade scheduled from input *n* and an authorised input that m
 id = "AC-K7.19"
 story = "US-K7"
 epic = "K"
-text = "Given a logical writer whose input *n* is archived, When a second entry numbered *n* reaches the archive, Then it is refused; and Given an upgrade scheduled from *n*, When a move or cancellation committed at the first writer and a continuation's founding both claim *n*, Then whichever claims first stands and the other is refused, whether the first writer's entry reaches the archive before or after the continuation's first segment; and a log holding both is refused by replay (`REQ-RT-21`)."
+text = "Given a logical writer whose input *n* is archived, When a second entry numbered *n* reaches the archive, Then it is refused; and Given an upgrade scheduled from *n*, When a move or cancellation committed at the first writer and a continuation's founding both claim *n*, Then whichever claims first stands and the other is refused, whether the first writer's entry reaches the archive before or after the continuation's first segment; When an entry at *n* reaches the archive from a continuation instance that is not the one recorded beside the founding record, or at an *n* whose claim is not a founding record, Then it is refused; and a log holding both is refused by replay (`REQ-RT-21`)."
 
 [[acceptance]]
 id = "AC-K7.20"
