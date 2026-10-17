@@ -564,9 +564,15 @@ Everything below is plan-level and names technology. It changes amendment 0023's
 
 ### (a) The manifest names its platform and its generation
 
-- The manifest (`aledgent/code/v1`; not yet built, so its first version takes these fields) gains
-  `platform`: the platform's name and revision (for example `vos-saga@c54fc1ff`, later
-  `vos-core@<revision>`).
+- The manifest (`aledgent/code/v1`) gains `platform`: the platform's name and revision (for example
+  `vos-saga@c54fc1ff`, later `vos-core@<revision>`). *Correction (`T-037-01`, review of #36): the manifest
+  was already built when this amendment was written: `F-036` puts amendment 0023's first layout in the
+  chainspec header, and the books running today were founded on it. The layout changes under the same
+  magic, and the chainspec format that carries it moves from 4 to 5. This build still reads a format-4
+  chainspec, with its digest and H₀ as they were computed, and its core host founds and drives only
+  format 5. With `T-037-02` and `T-037-03`, nothing else of those books is read: an archive segment of
+  format 1 and an export of format 11 are refused by name, so a book founded before this change is restored with the `opsctl` inside its own
+  pinned core image, the image its core host runs.*
 - It gains `generation: u64`, the code generation it runs as (D1).
 - Each artefact gains `identities`, a list of `(kind, value)` pairs, in place of the single VOS
   `ProgramId` field:
