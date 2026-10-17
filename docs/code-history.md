@@ -61,17 +61,25 @@ no new genesis (amendment 0033).
 - **A code version names its platform**, and lists each artefact's identities on that platform beside its
   own digest. Nothing the platform supplies (its clock, its slot, its identities, its encoding of state)
   enters a root, a log hash, a checkpoint or an anchor.
-- **The switch of code is one host operation**, taken between two inputs. The old code also fences it: while
-  an upgrade to a version from input *n* is pending, any other code refuses input *n* and later, with nothing
-  written. A missed switch halts the writer; it never runs an input under the wrong code.
+- **A code generation counts the upgrades.** Each writer holds the generation of its code: 0 at genesis, one
+  more after every upgrade. Every package is built with its generation compiled in, and the manifest's digest
+  binds that constant to the code version.
+- **The switch of code is one host operation**, taken between two inputs, installing only bytes fetched and
+  checked before the upgrade was accepted. The old code also fences it: while an upgrade to a version from
+  input *n* is scheduled, code of any other generation refuses input *n* and later, with nothing written. A
+  missed switch halts the writer; it never runs an input under the wrong code.
+- **The fence has a way out.** While it holds, the old code still takes an input that moves the upgrade to a
+  later input or cancels it, under the upgrade-authority mode. An alert fires when a writer stays fenced longer
+  than the deployment's bound (five minutes by default).
 - **Only the book's upgrade-authority mode authorises an upgrade.** A runtime's own authority to install
   programs is a host key, never an authority over the book's code.
-- **Checkpoints are the writer's rows and the book's leaves**, in aledgent's own format, so one archive
-  restores onto either runtime.
+- **Checkpoints are the writer's state and the book's leaves**, in aledgent's own format, so one archive
+  restores onto either runtime. A node's local cache can be in any format; it is never archived or sent.
 - **Replay is native first.** The book's state replays from the inputs with aledgent's own code, without the
-  runtime. Each range's host image is kept in the code archive, so the runtime's execution can be checked
-  too.
-- **A writer can be continued by another at input *n***, from its state and log head after input *n* − 1. A
+  runtime. Each range's host image (its replayer) is kept in the code archive beside the code version, not in
+  it, so the runtime's execution can be checked too, and rebuilding the host is not an upgrade.
+- **A writer can be continued by another at input *n***, carrying its whole state and log head after input
+  *n* − 1. The founding is written once per input number, so two continuations of one writer cannot exist. A
   move of runtime is an upgrade naming the new runtime, followed by a continuation on it.
 
 ## Code sources

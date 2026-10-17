@@ -3,10 +3,10 @@
 //! `F-037` — code history and upgrades (amendments 0023 and 0033, `US-K7`, `REQ-RT-15` to
 //! `REQ-RT-21`, `REQ-PR-11`, `NFR-22`). Its registered cases (`F-015` §6, §7).
 //!
-//! All eleven are pending, registered when each amendment was applied, before `F-037` is built
+//! All fifteen are pending, registered when each amendment was applied, before `F-037` is built
 //! (amendment 0013's practice). They need the code version in each writer's state, the upgrade and
-//! mode inputs, the code archive, per-range replay, the fence, checkpoints as rows and leaf chunks,
-//! and the continuation.
+//! mode inputs, the code archive, per-range replay, the code generation and the fence with its way
+//! out, checkpoints as rows and leaf chunks, the replayer, and the continuation founded once.
 
 use crate::case::{Case, Feature, Layer};
 
@@ -85,6 +85,34 @@ pub const CASES: &[Case] = &[
     Case::pending(
         "AC-K7.11",
         "ac_k7_11_a_checkpoint_restores_under_another_platform__service",
+        Layer::Service,
+        Feature::F037,
+        &["REQ-RT-19"],
+    ),
+    Case::pending(
+        "AC-K7.12",
+        "ac_k7_12_a_fenced_writer_takes_a_reschedule_or_cancel_and_alerts__service",
+        Layer::Service,
+        Feature::F037,
+        &["REQ-RT-20"],
+    ),
+    Case::pending(
+        "AC-K7.13",
+        "ac_k7_13_every_upgrade_raises_the_generation_so_a_missed_switch_is_fenced__service",
+        Layer::Service,
+        Feature::F037,
+        &["REQ-RT-20"],
+    ),
+    Case::pending(
+        "AC-K7.14",
+        "ac_k7_14_one_continuation_per_input_and_a_mismatch_founds_nothing__service",
+        Layer::Service,
+        Feature::F037,
+        &["REQ-RT-21"],
+    ),
+    Case::pending(
+        "AC-K7.15",
+        "ac_k7_15_a_range_checks_under_its_replayer_outside_the_code_version__service",
         Layer::Service,
         Feature::F037,
         &["REQ-RT-19"],

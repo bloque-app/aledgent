@@ -6,7 +6,8 @@ SPDX-License-Identifier: CC-BY-4.0
 # Amendment 0033 — Code history that does not depend on the platform
 
 **Status:** **ruled by the owner on 2026-10-17** ("the briefing is good enough, you have my okay"), on the
-briefing this amendment writes down. **Applied** to `SPEC.md` **v0.4.27**, to `PLAN.md` `DEC-26`, and to
+briefing this amendment writes down. The design decisions in §"The architect's decisions" were taken on the
+same day under that approval, after the independent review of the first draft (#35). **Applied** to `SPEC.md` **v0.4.27**, to `PLAN.md` `DEC-26`, and to
 `F-036` and `F-037`, in the same pass. The new acceptance criteria are registered as pending
 (`crates/conformance/src/cases/f037.rs`), as amendment 0023's were.
 **Target:** `SPEC.md` v0.4.26 as on `develop` (amendment 0032 applied).
@@ -47,12 +48,12 @@ The facts below are the ones the requirements rest on. Each one says where it wa
 |---|---|---|
 | P1 | The book's decisions do not depend on the runtime. The transition is written against a table of rows, and runs the same inside the runtime and natively. The roots, the log hash chain and the archive are aledgent's own formats. | `crates/core-binding/src/transition.rs:1-13`; `crates/core-binding/src/hot.rs:196-222`; `crates/core-archive/src/record.rs:1-23` |
 | P2 | The writer's own state is small: the hot row, the configuration and the unarchived ring entries. It is kept inside the runtime's own encoding of state. An archive checkpoint is that encoding, saved as one file, so a checkpoint can only be restored by the runtime that wrote it. | `crates/core-archive/src/record.rs:17-20`; `agents/core-host/src/serve.rs:148-242` (`ALGCORE1`) |
-| P3 | Two values in the hot row come from the runtime: the principal the writer takes inputs from (`driver`), and the slot the runtime observed (`observed_slot`, a diagnostic). Neither enters a ring entry, the log hash or the anchor commitment today. | `crates/core-binding/src/hot.rs:104-105`, `:139-141`, `:196-222` |
+| P3 | Two values in the hot row come from the runtime: the principal the writer takes inputs from (`driver`), and the slot the runtime observed (`observed_slot`, a diagnostic). Neither enters a ring entry, the log hash or the anchor commitment today. | `crates/core-binding/src/hot.rs:105-106`, `:139-141`, `:196-222` |
 | P4 | The new runtime names a program differently. A package is the ELF the actor's crate builds. Installing it derives the program, and the install record keeps the derived program's hash, the transpiler's version and the ELF's hash. The derived hash is the program's identity, and it changes with the transpiler's version. There is no runtime program per agent: the node runs its own default agent program. | vos-core `docs/design/core-model.md` §6.4; `docs/design/slice-4-jam.md`, "The install record" and "Identity"; `agent/default` |
-| P5 | The new runtime upgrades an actor by installing a package again into the same instance. The install writes the instance's record unconditionally: there is no compare-and-swap on the old program. An actor cannot read its own program's hash: the self-identity call answers only the instance and the agent. Migration of state on upgrade is an open question. | vos-core `agent/default/src/refine/admin.rs:25-48`; `agent/wire/src/abi.rs:232-233` (`SelfId`); `docs/design/core-model.md` §18, question 11 |
+| P5 | The new runtime upgrades an actor by installing a package again into the same instance. The install writes the instance's record unconditionally: there is no compare-and-swap on the old program. An actor cannot read its own program's hash: the self-identity call answers only the instance and the agent. Migration of state on upgrade is an open question. That a re-install keeps the instance's state rows is plausible but not shown by the cited code: the install writes only its record. It is an assumption until a spike shows it. | vos-core `agent/default/src/refine/admin.rs:25-48`; `agent/wire/src/abi.rs:232-233` (`SelfId`); `docs/design/core-model.md` §18, question 11 |
 | P6 | On the new runtime, the authority to install a package is the node operator's admin token. It is not anything the book holds. | vos-core `node/host/src/client/operator.rs:1-11`; `node/host/src/node/open.rs:33` |
 | P7 | The new runtime keeps each agent's state as rows in its own store, and compacts each agent's log after about a thousand entries. It keeps no history of inputs, and it has no counterpart of the one-file image of P2. | vos-core `docs/design/core-model.md` §9.3, §9.5; `node/host/src/node/config.rs:79-85` |
-| P8 | The runtime of today upgrades through its registry, with a compare-and-swap on the old program hash and the installation's revision. The book's writer does not use it yet. | VOS `c54fc1ff` `vos/src/registry.rs:1043-1100`, as amendment 0023 cites it |
+| P8 | The runtime of today upgrades through its registry, with a compare-and-swap on the old program hash and the installation's revision. It is a signed registry mutation: the signed bytes include the expected revision and the old program hash. The book's writer does not use it yet. | VOS `c54fc1ff` `vos/src/registry.rs:1043-1100`, as amendment 0023 cites it |
 | P9 | Replay of the book is native first today. The host applies each archived input with its own copy of the library, then re-sends it to the writer in the runtime and requires the archived log hash. The re-send needs the runtime and the exact program bytes of each range. A restore rehearsal on a test deployment on 2026-10-15 needed the genesis program bytes copied from the old image for that reason. | `crates/core-binding/src/core.rs:427-524`; `crates/core-binding/src/host.rs:1771-1817`; `PLAN.md` `DEC-27` (i) |
 | P10 | The new runtime supplies its own clock to a step (the batch time). The book takes time only from its inputs. | vos-core `agent/wire/src/abi.rs` (`Now`); `SPEC.md` `REQ-RT-7` |
 
@@ -61,38 +62,105 @@ The facts below are the ones the requirements rest on. Each one says where it wa
 | # | Recommendation of the comparison | Requirement | Plan | Rests on |
 |---|---|---|---|---|
 | 1 | The code version names its platform, and each artefact lists every identity a platform gives it; the runtime artefact becomes optional | §2 **Platform**, **Code version**; `REQ-RT-19` (first point); `REQ-RT-16` (a change of platform is an upgrade) | `DEC-26` (a) | P4 |
-| 2 | One host operation switches the program, and the old code refuses input *n* while an upgrade to *n* is pending | `REQ-RT-20` | `DEC-26` (b), (i) | P5, P8 |
-| 3 | Checkpoints are the writer's rows and the book's leaves, not the runtime's image | `REQ-RT-19` (third point) | `DEC-26` (g) | P2, P7 |
-| 4 | A writer can be founded as the continuation of another at input *n*, with its log head, so that moving is an upgrade | §2 **Continuation**; `REQ-RT-21` | `DEC-26` (j); `F-036` | P1, P7 |
+| 2 | One host operation switches the program, and the old code refuses input *n* while an upgrade to *n* is pending | §2 **Code generation**; `REQ-RT-20` | `DEC-26` (b), (i) | P5, P8 |
+| 3 | Checkpoints are the writer's rows and the book's leaves, not the runtime's image | §2 **Writer state**; `REQ-RT-19` (third point) | `DEC-26` (g) | P2, P7 |
+| 4 | A writer can be founded as the continuation of another at input *n*, with its log head, so that moving is an upgrade | §2 **Continuation**, **Writer state**; `REQ-RT-21` | `DEC-26` (j); `F-036` | P1, P7 |
 | 5 | Replay is native first for every range, and each range's host is kept in the code archive as its replayer | `REQ-RT-19` (fourth point) | `DEC-26` (d) | P9 |
-| 6 | Nothing specific to a platform enters anything hashed, and the upgrade-authority mode is enforced inside the book | `REQ-RT-19` (second point); `REQ-RT-20` (last point) | `DEC-26` (a), (b′) | P3, P6, P10 |
+| 6 | Nothing specific to a platform enters anything hashed, and the upgrade-authority mode is enforced inside the book | §2 **Writer state** (host-local fields); `REQ-RT-19` (second point); `REQ-RT-20` (last point) | `DEC-26` (a), (b′) | P3, P6, P10 |
+
+## The architect's decisions (2026-10-17)
+
+The independent review of the first draft (#35) found that the fence and the continuation were not sound as
+written. The architect took the decisions below on 2026-10-17, under the owner's approval of the briefing
+the same day. Each says what the review found and what was decided.
+
+- **D1 — A code generation, not a self-identity.** The draft had each package carry a self-identity derived
+  from its build profile. A package cannot know the digest of the manifest that names it, so the writer had
+  no way to tell which self-identity an upgrade expects. A self-identity derived from the build profile also
+  stays the same when only another artefact changes, so the fence could miss a switch. Decided:
+  - the writer's state holds its **code generation**: 0 at genesis, one more after each upgrade;
+  - every package is built with its generation as a constant, and the manifest lists it;
+  - an upgrade names *H* and *n*, and so, implicitly, the next generation;
+  - the fetcher refuses a code version whose generation is not the next one, and the host refuses to switch
+    to bytes that do not carry it, after checking those bytes against the manifest's digest;
+  - the fence compares the generation compiled into the running code with the scheduled upgrade's;
+  - every upgrade raises the generation, even one that changes only the runtime or another artefact, so that
+    the fence always sees a missed switch;
+  - native replay takes each range's generation from the code map.
+
+  A package cannot claim another generation: its bytes, and so the constant, are the ones the manifest's
+  digest names.
+- **D2 — A way out of the fence.** The draft's fence refused every input from *n*, and a scheduled upgrade
+  could not be cancelled, so a switch that failed for good halted the writer with no way out. Decided:
+  - while the fence holds, the old code still takes one kind of input: a move of the scheduled upgrade to a
+    strictly later input, or its cancellation, authorised under the mode in force and decided by the old
+    code, taking its input number like any other input;
+  - the host fetches and checks *H*'s artefacts before the upgrade can commit, and switches only to those
+    checked bytes;
+  - an alert is raised when a writer has been fenced longer than a bound each deployment sets (five minutes
+    unless it says otherwise).
+- **D3 — One continuation per input number.** Nothing stopped two continuations from the same *n*, which
+  would fork the log. Decided:
+  - the founding record is written once, under a key derived from the book's genesis, the writer and *n*,
+    with a create that fails if the key exists, under the archive's lock;
+  - a second founding at the same *n* is refused, and replay refuses a log with two founding records at one
+    *n*;
+  - feeding stays with one execution node at a time, through the feed lease and its epoch (`F-038`), so a
+    retried founding cannot run beside the first;
+  - founding is deterministic: the same committed state gives the same record.
+- **D4 — What a continuation carries.** The draft listed the carried state three different ways, none
+  complete. Decided: the continuation carries the writer's complete committed state after *n* − 1. That is
+  every field of the writer's hot state, every record, the unarchived log, pending deliveries and the state of
+  its message streams. Equality is defined over all of it, except the fields the specification lists as
+  host-local. One definition, **Writer state** in §2, is referenced from the checkpoint, the continuation and
+  the equality check.
+- **D5 — Tasks.** `T-037-14` (switch) and `T-037-04` (the upgrade input) come before `T-037-15` (the fence).
+  When an upgrade is pending, the host cuts its batch so that a restore point lands exactly at *n* − 1. A
+  done-when exercises the replayer. `T-037-14` says that the registry upgrade on the runtime of today is signed
+  with the core's package key through the signer.
+- **D6 — The replayer is outside the code version.** The draft listed the replayer as an artefact of the
+  manifest, so every rebuild of the host would have been a code upgrade. Decided: each range's replayer is
+  kept in the code archive in an entry of its own, indexed by the code version. A code version covers only
+  what decides a transition.
+- **D7 — Wording.**
+  - Only archived and transferred snapshots must be in aledgent's format; a node's local cache need not be.
+  - "A host" becomes "the execution node that drives the writer".
+  - The code map derives from the upgrade inputs; the founding record is evidence that replay checks against
+    them.
+  - `Continuation` is a second founding envelope beside `StateGenesis`, which stays as it is.
+  - A citation off by one line is corrected.
 
 ## What does not change
 
-- `REQ-RT-15` to `REQ-RT-18`, `REQ-PR-11` and `NFR-22` stand as amendment 0023 applied them. This amendment
-  adds to them and does not reword them, except for one point added to `REQ-RT-16`.
+- `REQ-RT-15`, `REQ-RT-17`, `REQ-RT-18`, `REQ-PR-11` and `NFR-22` stand as amendment 0023 applied them.
+  `REQ-RT-16` gains one point. `REQ-RT-18`'s rule that a change of mode leaves a scheduled upgrade standing
+  is unchanged. Moving or cancelling an upgrade (`REQ-RT-20`) is a separate input, authorised under the mode
+  in force.
 - The anchor `v3` commitment, its fields and its order (`DEC-26` (a), ruling `a0023-q3`). An anchor is still a
   number and 32 opaque bytes (ruling `a0023-q4`).
 - The state commitment's construction. A move of platform is not a migration of construction (`REQ-PR-11`).
 - Retrieval through `CodeSource`, the legal hold, the plugins and the Kreivo preimages (rulings `a0023-q5`,
   `a0023-q7`, `a0023-q8`).
 - The frozen host spec (ruling `a0023-q6`). This amendment uses the fallback of that ruling for one purpose
-  only, stated in (d) below.
+  only, stated in (d) below. The fence's refusal, and the inputs that move or cancel an upgrade, are added
+  as a new version of the call format; no existing version changes.
 - `SPEC.md` still names no runtime, product or network. The requirements speak of a **platform**.
 - No error condition is added (`REQ-ER-1`), and no identifier is withdrawn, renumbered or reused.
 
 ---
 
-## R1 — glossary (§2): one row changed, two added
+## R1 — glossary (§2): one row changed, four added
 
-The **Code version** row gains one sentence, at its end:
+The **Code version** row gains two sentences, at its end:
 
-> | **Code version** | The identity of everything that decides a writer's transitions: a digest of each executable artefact, together with the settings it was built with. Two builds of the same source with different settings are two code versions. It names the platform its artefacts are built for, and each artefact's identities on that platform (`REQ-RT-19`). |
+> | **Code version** | The identity of everything that decides a writer's transitions: a digest of each executable artefact, together with the settings it was built with. Two builds of the same source with different settings are two code versions. It names the platform its artefacts are built for, each artefact's identities on that platform, and its code generation (`REQ-RT-19`, `REQ-RT-20`). What only replays a range, and decides nothing, is not part of it. |
 
-Two rows are added after **Code archive**:
+Four rows are added after **Code archive**:
 
-> | **Platform** | The execution environment a writer's code runs on: the runtime that executes it and the host that drives it, named with their versions. The capabilities of §4.4 are requirements of a platform. Two platforms that both meet them are interchangeable for the book (`REQ-RT-19`). |
-> | **Continuation** | A writer founded to take over another writer's sequence at an input number, from the other's committed state and log head, so that the book's inputs and their hash chain go on unbroken (`REQ-RT-21`). |
+> | **Code generation** | The count of a writer's upgrades: 0 at genesis, and one more after each upgrade. A writer holds the generation of its code in force. Each code version names one generation, and the code that decides its transitions carries that generation in its own bytes (`REQ-RT-20`). |
+> | **Platform** | The execution environment a writer's code runs on: the runtime that executes it and the software on the execution node that drives it, named with their versions. The capabilities of §4.4 are requirements of a platform. Two platforms that both meet them are interchangeable for the book (`REQ-RT-19`). |
+> | **Writer state** | Everything a writer has committed after an input. That is its code version and code generation, the construction of its state commitment, its upgrade-authority mode and any scheduled change of it, and any scheduled upgrade. It also includes its configuration and bounds, every record it holds, its counters and log head, its committed inputs not yet archived, the deliveries and notifications it has not yet recorded as made (`REQ-RT-4`), and, for each other writer, the messages it has enqueued, applied, sent and had acknowledged (`REQ-RT-13`, `REQ-RT-14`). Exactly two kinds of field are **host-local** and are not part of it: the identity under which the platform accepts the writer's inputs from the execution node that drives it, and a diagnostic that the platform reports to the writer about an input (such as the slot it observed). No other field is host-local. |
+> | **Continuation** | A writer founded to take over another writer's sequence at an input number, from the other's writer state and log head, so that the book's inputs and their hash chain go on unbroken (`REQ-RT-21`). |
 
 ## R2 — `REQ-RT-16`: one point added
 
@@ -113,16 +181,18 @@ After "A change of build settings alone is an upgrade":
 > - A value that a platform supplies MUST NOT enter anything that a root, a log hash, a checkpoint or an
 >   anchor covers, except through the code version that names the platform. Such values include the
 >   platform's clock, its slot or block number, its identities for principals and programs, and its encoding
->   of state. Time enters the book only in inputs (`REQ-RT-7`).
-> - A checkpoint, and every snapshot kept to restore a writer, MUST hold the writer's state in a form that
->   aledgent defines and that no platform defines: the writer's own records and the book's leaves. A snapshot
->   taken on one platform MUST restore a writer on any platform that a later code version of that writer
->   names.
+>   of state. The host-local fields of a writer (§2, **Writer state**) are such values. Time enters the book
+>   only in inputs (`REQ-RT-7`).
+> - A checkpoint, and every snapshot that is archived or transferred to restore a writer elsewhere, MUST hold
+>   the writer state (§2) and the book's leaves, in a form that aledgent defines and that no platform defines.
+>   A copy that an execution node keeps only for itself, to restart faster, need not. A snapshot taken on one
+>   platform MUST restore a writer on any platform that a later code version of that writer names.
 > - Replaying the book's state (`REQ-RT-3`) MUST NOT need the platform that executed an input. For every range
->   of the code map, the book's transitions MUST be reproducible from the inputs by aledgent's own code.
->   Where a replay also checks that the platform executed each input as archived, the code archive MUST keep,
->   for that range, everything the check needs to run it as it ran, by digest, like any artefact
->   (`REQ-RT-17`).
+>   of the code map, the book's transitions MUST be reproducible from the inputs by aledgent's own code,
+>   under the range's code generation. Where a replay also checks that the platform executed each input as
+>   archived, the code archive MUST keep, for that range, everything the check needs to run the range as it
+>   ran (its **replayer**), retrievable by digest and indexed by the range's code version (`REQ-RT-17`). A
+>   replayer is not part of the code version: replacing it changes no code version.
 
 > **Trade-off, stated plainly.** Keeping the code history free of the platform costs a little now, for a
 > move that may never be made. Checkpoints need a format of aledgent's own instead of the runtime's image,
@@ -132,51 +202,76 @@ After "A change of build settings alone is an upgrade":
 
 ## R4 — `REQ-RT-20` (new): one switch, fenced by the code it replaces
 
-> **`REQ-RT-20`** **The switch of code is one step, and the old code fences it.** When an upgrade names code
-> version *H* from input *n* (`REQ-RT-16`):
+> **`REQ-RT-20`** **The switch of code is one step, and the old code fences it.** Each writer holds, in its
+> writer state, the code generation in force. When an upgrade names code version *H* from input *n*
+> (`REQ-RT-16`):
 >
+> - *H* MUST name the generation one more than the writer's. Every upgrade MUST raise the generation, and so
+>   change the bytes of the code that carries it, even an upgrade made to change only another of its
+>   artefacts, such as the runtime that executes that code. An upgrade whose code version names another
+>   generation, or whose code does not carry *H*'s generation in its bytes, MUST be refused with nothing
+>   changed, when its artefacts are checked (`REQ-RT-16`).
+> - Before the upgrade is taken, the execution node that drives the writer MUST have fetched *H*'s artefacts
+>   and checked them against their digests and *H*'s generation. The switch MUST install only those checked
+>   bytes.
 > - The code that executes a writer's inputs MUST change from the old code version to *H* in one step, taken
 >   after input *n* − 1 has committed and before input *n* is executed. A step that fails leaves the old code
 >   in force, and is retried.
-> - Until that step is taken, the code version in force MUST refuse input *n* and every later input. It
->   changes nothing, and does not take the input's number, so that the same input runs under *H* once the
->   step is taken. This MUST hold whatever the platform checks or does not check when the code changes.
->   Each code version MUST therefore be able to tell from its own build whether it is the version an upgrade
->   names.
+> - **The fence.** While the upgrade is scheduled, code whose own generation is not *H*'s MUST refuse input *n*
+>   and every later input. It changes nothing, and does not take the input's number, so that the same input
+>   runs under *H* once the step is taken. This MUST hold whatever the platform checks or does not check when
+>   the code changes. Code whose own generation is *H*'s MUST take input *n*, and its first effect is to make
+>   *H* and its generation the ones in force.
+> - **The way out.** A scheduled upgrade MAY be moved to a strictly later input, or cancelled, by an input of
+>   its own, authorised under the upgrade-authority mode in force (`REQ-RT-18`). While the fence holds, that
+>   input is the only one the old code takes. The old code decides it, and it takes its input number like
+>   any other input.
+> - How long a writer has been fenced MUST be continuously observable (`NFR-11`), and an alert MUST be raised
+>   when it exceeds a bound that the deployment states.
 > - The authority that decides an upgrade MUST be the writer's upgrade-authority mode, checked by the writer
 >   in its own order (`REQ-RT-18`). Whatever authority a platform has to install or replace programs MUST NOT
->   by itself authorise an upgrade. A host MUST take the step only towards the code version an authorised
->   upgrade names, and only at the input it names.
+>   by itself authorise an upgrade. The execution node that drives the writer MUST take the step only towards
+>   the code version an authorised upgrade names, and only at the input it names.
 
 > **Limits, stated plainly.** Someone who holds a platform's own authority to install programs can still
 > install other code than the book names. The book cannot stop that. What it guarantees is that every input
 > is executed by the code the code map names, or is refused, and that replay under the code map shows any
 > input whose archived outcome other code produced. The operator keeps the platform's install authority as
-> it keeps its other keys (`NFR-8`).
+> it keeps its other keys (`NFR-8`). The fence fails closed: a switch that cannot be made stops the writer
+> until it is made, or until the upgrade is moved or cancelled.
 
 ## R5 — `REQ-RT-21` (new): a writer continued on another platform
 
 > **`REQ-RT-21`** **A continuation.** A writer MAY be continued by another at input *n*: a **continuation**,
-> founded from the first writer's committed state after input *n* − 1, its log head among it.
+> founded from the first writer's writer state (§2) after input *n* − 1, with its log head.
 >
 > - The continuation MUST be preceded by an upgrade of the first writer that names the continuation's code
 >   version from input *n* (`REQ-RT-16`). The first writer's own code is never switched, so it refuses input
->   *n* and every later one for good (`REQ-RT-20`).
-> - The continuation's state when it is founded MUST equal the first writer's committed state after input
->   *n* − 1: its roots, its counters, its code and its upgrade-authority mode. It MUST be checked to be so
->   before the continuation takes input *n*, and every replay checks it again.
+>   *n* and every later one (`REQ-RT-20`).
+> - The continuation MUST be founded only from a first writer whose last committed input is *n* − 1. Its
+>   founding record MUST be written before input *n* is sent to either writer. From then on, every input from
+>   *n* goes to the continuation alone, and the first writer MUST NOT take an input numbered *n* or later, a
+>   move or cancellation of the upgrade included.
+> - The continuation's writer state when it is founded MUST equal the first writer's after input *n* − 1, field
+>   by field. It MUST be checked to be so before the continuation takes input *n*, and every replay checks it
+>   again. A founding that fails the check founds nothing.
+> - There MUST be at most one continuation of a writer at an input number. Its founding record MUST be written
+>   once, under a key derived from the book's genesis, the writer and *n*, and a second founding at the same
+>   *n* MUST be refused. A replay MUST refuse a log with two founding records at one *n*. Founding MUST be
+>   deterministic: the same writer state gives the same founding record. Only one execution node may feed a
+>   writer's inputs at a time, so that a retried founding cannot run beside the first.
 > - The continuation's first input is *n*, and its log entry MUST chain to the log head of input *n* − 1. The
 >   book keeps its genesis, its construction and its anchor sequence. A continuation is not a new genesis
 >   (`REQ-RC-6`), not a migration of construction (`REQ-PR-11`), and not an export and import (`REQ-RC-3`).
-> - The continuation's founding MUST be archived with the inputs, so that the code map shows the boundary
->   and replay crosses it (`REQ-RT-17`).
+> - The code map is derived from the upgrade inputs (`REQ-RT-17`). The founding record is archived with the
+>   inputs, as evidence that replay checks against the upgrade that named it.
 
 *`REQ-RT-19` to `REQ-RT-21` ruled by the owner on 2026-10-17 (amendment 0033).*
 
-## R6 — `US-K7`: three acceptance criteria added
+## R6 — `US-K7`: seven acceptance criteria added
 
 > - `AC-K7.9` Given an upgrade naming code version *H* from input *n*, When input *n* reaches a writer whose
->   code has not yet been switched to *H*, Then it is refused, nothing changes, its number is not taken, and
+>   code is not of *H*'s code generation, Then it is refused, nothing changes, its number is not taken, and
 >   once the code is switched the same input runs under *H* (`REQ-RT-20`).
 > - `AC-K7.10` Given a writer continued at input *n*, Then the book keeps its genesis and its construction,
 >   input *n*'s log entry chains to input *n* − 1's, the first writer refuses every input from *n*, and a
@@ -185,6 +280,19 @@ After "A change of build settings alone is an upgrade":
 > - `AC-K7.11` Given a checkpoint, When a writer is restored from it under a code version that names a
 >   different platform than the one it was taken on, and the inputs after it are replayed, Then the writer
 >   reaches the checkpoint's roots and every archived root after it (`REQ-RT-19`).
+> - `AC-K7.12` Given a writer fenced at input *n*, When an input that moves the upgrade to a later input or
+>   cancels it, authorised under the mode in force, reaches it, Then the old code takes it as input *n*; and
+>   When the writer stays fenced longer than the deployment's bound, Then an alert is raised (`REQ-RT-20`).
+> - `AC-K7.13` Given an upgrade made to change only the runtime that executes a writer's code, Then the new
+>   code version still raises the code generation and carries it in its code's bytes, and a writer whose
+>   switch was missed refuses input *n* (`REQ-RT-20`).
+> - `AC-K7.14` Given a continuation founded at input *n*, When a second founding at the same *n* is attempted,
+>   Then it is refused and nothing is founded; When a founding's writer state differs from the first
+>   writer's after *n* − 1 in any field that is not host-local, Then nothing is founded; and When a log holds
+>   two founding records at one *n*, Then its replay is refused (`REQ-RT-21`).
+> - `AC-K7.15` Given a range whose replayer the code archive holds, When the platform's execution of that
+>   range is checked with it, Then every input reaches its archived log hash; and When that replayer is
+>   replaced, Then no code version changes (`REQ-RT-19`).
 
 ## R7 — §15 traceability
 
@@ -197,75 +305,112 @@ Epic K's row cites `REQ-RT-15`–`REQ-RT-21`.
 Everything below is plan-level and names technology. It changes amendment 0023's (a), (b), (b′), (d) and
 (g), and adds (i) and (j). "The runtime of today" is VOS `saga/agents`; "the new runtime" is VOS `vos-core`.
 
-### (a) The manifest names its platform
+### (a) The manifest names its platform and its generation
 
 - The manifest (`aledgent/code/v1`; not yet built, so its first version takes these fields) gains
   `platform`: the platform's name and revision (for example `vos-saga@c54fc1ff`, later
   `vos-core@<revision>`).
+- It gains `generation: u64`, the code generation it runs as (D1).
 - Each artefact gains `identities`, a list of `(kind, value)` pairs, in place of the single VOS
   `ProgramId` field:
   - on the runtime of today: the VOS `ProgramId`;
   - on the new runtime: the ELF's hash, the derived program's hash and the transpiler's version (P4).
 - The `runtime` role is optional. The new runtime has no runtime program per agent. Its node's default
   agent program is named under `platform`, with its hash as an identity.
-- Each package carries a **self-identity**: 32 bytes compiled into the package, derived from the canonical
-  build profile, and listed in the manifest as `self_id`. Two builds with different settings have two
-  self-identities (`AC-K7.6`). It is how a code version tells from its own build whether it is the one an
-  upgrade names (`REQ-RT-20`), on a runtime where an actor cannot read its own program's hash (P5).
-- New role `replayer`: a host image that can re-send a range's inputs to its platform, by digest ((d)).
+- **The generation is compiled in.** Every package is built with a `GENERATION` constant equal to the
+  manifest's `generation`. A build-time check, like `check-code` (`T-038-25`), reads the constant from the
+  built bytes and fails the build when it differs from the manifest. The digest check then binds the
+  constant to the code version. A package cannot claim another generation without changing its bytes, and
+  so its digest.
+- **No replayer in the manifest** (D6). *H* covers only what decides a transition. Each range's replayer is a
+  separate code-archive entry, `replayer/<hex H>`, holding the digest of the host image that drives that
+  range's platform. The image itself is stored by its digest like any artefact. Rebuilding the host is
+  therefore not a code upgrade.
 - **Nothing of the platform is hashed** outside the manifest (`REQ-RT-19`, P3, P10):
-  - `driver` becomes the writer's **authorised submitter**: the runtime's principal today, the core host's
-    session key on the new runtime. It is set when a writer is founded, never carried by a continuation or
-    a snapshot, and never enters a root, a log hash, a checkpoint or an anchor;
-  - `observed_slot` stays a diagnostic under the same rule;
+  - `driver` is the writer's authorised submitter: the runtime's principal today, the core host's session
+    key on the new runtime;
+  - `observed_slot` stays a diagnostic;
+  - these two are the host-local fields of §2 **Writer state**, and no other field is. Both are set when a
+    writer is founded, are never carried by a snapshot or a continuation, and never enter a root, a log
+    hash, a checkpoint or an anchor;
   - the anchor `v3` commitment is unchanged, and every field of it is aledgent's.
+- The hot row gains `generation: u64` beside 0023's `code`, `construction`, `upgrade`, `authority` and
+  `authority_next`. Native replay passes the range's generation, read from the code map, to the transition.
 
-### (b) The switch, behind one host operation
+### (b) The switch, behind one host operation, and the fence
 
-Step 4 of amendment 0023's upgrade becomes one operation of the core host, `switch(H, n)`, taken after input
-*n* − 1 has committed and before input *n* is sent:
+**Staging.** The host fetches *H*'s manifest and artefacts through `CodeSource`. It checks each digest, that
+the manifest's `generation` is the writer's plus one, and that the package's compiled `GENERATION` is that
+number. Only then does it submit `Upgrade { code: H, from: n }`. The checked bytes are kept in the host's code
+cache. The switch installs those bytes and nothing else.
+
+**The cut at *n* − 1.** While an upgrade is scheduled, the host ends its batch at *n* − 1. A restore point
+and a checkpoint therefore land exactly at *n* − 1 (`T-005-15`'s restore points are decision boundaries).
+
+**`switch(H, n)`.** Step 4 of amendment 0023's upgrade becomes one operation of the core host, taken after
+input *n* − 1 has committed and before input *n* is sent:
 
 - on the runtime of today: VOS's registry upgrade, a compare-and-swap on the old program hash and the
-  installation's revision (P8);
+  installation's revision (P8). It is a signed registry mutation, signed with the core's package key through
+  the signer (`F-035`). The host treats "already switched to *H*" as success, not as a stale compare-and-swap;
 - on the new runtime: an install of *H*'s package into the same instance (P5). The new runtime offers no
-  compare-and-swap, so the host checks the instance's install record before and after;
+  compare-and-swap, so the host checks the instance's install record before and after. That the instance's
+  rows survive a re-install is an assumption (P5), to be shown by the spike before this form is used;
 - across platforms: the founding of a continuation on the new platform ((j)).
 
-Before input *n*, the host asks the switched program for its self-identity, and stops if it is not *H*'s.
 A host that crashes between the switch and input *n* resumes from the writer's committed state, as before.
 
-**The fence** (`REQ-RT-20`). The upgrade handler is in *H₀*, and so is this rule. A writer whose hot row holds
-`upgrade = Some((H, n))` refuses an input numbered *n* or later unless its own self-identity is *H*'s. The
-refusal is an outcome of its own: nothing is written, `inputs` stays at *n* − 1, and the host takes it as
-"switch first". The new runtime consumes a failed step, but the book's input number is aledgent's, so
-nothing of the book is consumed. Input *n* under *H* moves `upgrade` into `code`, as before.
+**The fence** (`REQ-RT-20`). The upgrade handler and this rule are in *H₀*.
+
+- A writer whose hot row holds `upgrade = Some((H, n))`, with `generation = g`, refuses an input numbered *n*
+  or later when its compiled `GENERATION` is not *g* + 1.
+- The refusal is an outcome of its own, added as a new version of the call format: nothing is written,
+  `inputs` stays at *n* − 1, and the host reads it as "switch first".
+- The new runtime consumes a failed step, but the book's input number is aledgent's, so nothing of the book
+  is consumed.
+- Code whose `GENERATION` is *g* + 1 takes input *n*, and its first effect is to move `upgrade` into `code`
+  and set `generation = g + 1`.
+
+**The way out** (D2). `RescheduleUpgrade { from: m }`, with *m* later than its own input number, and
+`CancelUpgrade` are new inputs on `CTR-OPS`. They are authorised under the mode in force, like `Upgrade`. The
+old code takes them while the fence holds, and they take their input numbers like any input. A cancel clears
+`upgrade`; the generation does not change.
+
+**The alarm.** The host exports `aledgent_writer_fenced_seconds`, per writer. An alert fires when it exceeds
+`fence_alert_after`, a deployment setting whose default is five minutes (`NFR-11`).
 
 ### (b′) The mode is enforced in the book
 
 The upgrade-authority mode stays the only authority over a writer's code (`REQ-RT-18`, `REQ-RT-20`). The host
-takes `switch` only for an upgrade the writer has committed. On the new runtime, the node's admin token
-(P6) is held like the core host's other keys (`F-035`, `NFR-8`), and the operator's runbook never installs
-a package except through `switch`.
+takes `switch` only for an upgrade the writer has committed. Both platforms' install authorities are host
+keys, never authorities over the book:
+
+- on the runtime of today, the core's package key, held by the signer (`F-035`);
+- on the new runtime, the node's admin token (P6), held like the core host's other keys (`F-035`, `NFR-8`).
+
+The operator's runbook never installs a package except through `switch`.
 
 ### (d) Replay per range: native first, with a replayer per range
 
 - The book side of every range is replayed natively, under the frozen host spec, as ruling `a0023-q6` (a)
-  decided. It needs no platform (P1, P9).
-- The writer side (re-sending each input to the platform and requiring the archived log hash) runs each range
-  under that range's `replayer`: the host image that drove it, kept in the code archive by digest.
-- This is ruling `a0023-q6`'s fallback form, a host build per range named in the manifest, used for the
-  writer-side check only. The owner's approval of 2026-10-17 covers recording a replayer for every range.
-  The book side never uses it.
+  decided. Each range runs under its generation, read from the code map. It needs no platform (P1, P9).
+- The writer side re-sends each input to the platform and requires the archived log hash. It runs each
+  range under that range's replayer: the host image found at `replayer/<hex H>` in the code archive.
+- This is ruling `a0023-q6`'s fallback form, a host build per range, used for the writer-side check only. It
+  is kept beside the code version, not in it (D6). The owner's approval of 2026-10-17 covers recording a
+  replayer for every range. The book side never uses it.
 - An auditor without the old platform can replay a range natively, through the transition over rows in
-  memory, and check the platform's execution only where they hold its replayer.
+  memory. They check the platform's execution only where they hold its replayer.
 
 ### (g) Checkpoints as rows and leaf chunks
 
-- An archive checkpoint holds the writer's rows (the hot row, the configuration and the unarchived ring
-  entries) as a sorted list of key and value, in aledgent's encoding, plus the leaf chunks amendment 0023
-  (g) already required for fast resync.
-- The platform-bound fields of (a) are not in it.
-- `agent.state` stays the core host's local cache on the runtime of today, never an archive format.
+- An archive checkpoint holds the writer state (§2): every hot-row field but `driver` and `observed_slot`,
+  the configuration, every record, the unarchived ring entries and the outbox. It holds them as a sorted
+  list of key and value, in aledgent's encoding, plus the leaf chunks amendment 0023 (g) already required
+  for fast resync.
+- A snapshot sent to another node for warp sync has the same format.
+- `agent.state` stays the core host's local cache on the runtime of today. It is never archived and never
+  sent.
 - Checkpoints already written as `agent.state` stay readable by a converter that keeps the runtime of
   today's codec.
 - The same archive restores a writer onto either runtime (P2, P7).
@@ -275,56 +420,75 @@ a package except through `switch`.
 | Step | Runtime of today | New runtime |
 |---|---|---|
 | Identity of the code | `ProgramId` of the package and the runtime program | The ELF's hash, the derived program's hash, the transpiler's version; the node's default agent program under `platform` |
-| `switch(H, n)` | Registry compare-and-swap | Install into the same instance, the record checked before and after |
+| `switch(H, n)` | Registry compare-and-swap, signed with the core's package key through the signer | Install into the same instance, the record checked before and after |
 | Safety when the switch is missed | The compare-and-swap, and the fence | The fence alone |
-| Who may switch | The writer's mode; the host switches only for a committed upgrade | The same; the admin token is the host's key, never an authority |
+| Who may switch | The writer's mode; the host switches only for a committed upgrade | The same; the admin token is a host key, never an authority |
 | Checkpoint | Rows and leaf chunks; `agent.state` a local cache | Rows and leaf chunks |
 
-### (j) The continuation founding (`F-036`'s `StateGenesis`, generalised)
+### (j) The continuation founding (`Continuation`, beside `StateGenesis`)
 
-- `StateGenesis` founds a writer from a chainspec. A second envelope, `Continuation`, founds it from a
-  predecessor at input *n*. It carries the genesis digest, the predecessor's writer, `at = n`, the log head
-  of input *n* − 1, and the hot state of input *n* − 1 (roots, counters, `code`, `construction`,
-  `authority`, `upgrade`).
-- The host builds it from the predecessor's checkpoint at *n* − 1 ((g)). It checks the predecessor's committed
-  hot row and log head against the checkpoint before founding, and the continuation's roots against its own
-  rebuilt replica after.
-- The founding is archived as a record of its own, beside the segments, and the code map's boundary at *n*
-  points to it.
-- A move to the new runtime is then: an `Upgrade` naming a code version whose `platform` is the new runtime,
-  from *n*; the predecessor fenced at *n*; `Continuation` on the new runtime; input *n* sent there. No new
-  genesis, no bridge anchor, no change of construction. The next anchor names the new code version.
-- It also serves on one platform: a continuation onto a fresh Agent of the same runtime is how the gate
+- `StateGenesis` founds a writer from a chainspec, and stays as it is. A second founding envelope,
+  `Continuation`, founds a writer from a predecessor at input *n*. It carries the genesis digest, the
+  predecessor's writer id, `at = n`, the log head of input *n* − 1, and the writer state after *n* − 1
+  (§2, as (g) encodes it).
+- The host builds it from the predecessor's checkpoint at *n* − 1 ((b)'s cut). It checks that the
+  predecessor's committed `inputs` is *n* − 1 and that its hot row and log head equal the checkpoint's. After
+  founding, it checks the continuation's writer state against the checkpoint, field by field, and its roots
+  against its own rebuilt replica. A founding that fails a check founds nothing.
+- **Write once** (D3).
+  - The founding record is archived under `continuation/<hex blake2b-256(genesis ‖ writer ‖ n)>`. It is
+    written with a conditional create (`If-None-Match: *`) under the archive's Object Lock, before input *n*
+    is sent anywhere.
+  - A second founding at the same *n* finds the key and is refused.
+  - Replay refuses a log with two founding records at one *n*.
+  - The record is a deterministic encoding of the predecessor's state, so a retry writes the same bytes.
+  - Feeding stays with one core at a time, through `F-038`'s feed lease and its epoch, so a retried founding
+    cannot run in parallel.
+- Once the record exists, the host sends nothing numbered *n* or later to the predecessor. That includes a
+  `RescheduleUpgrade` or `CancelUpgrade`: the record decides which writer input *n* belongs to.
+- The code map's boundary at *n* comes from the `Upgrade`. The founding record is evidence that replay
+  checks against it.
+- A move to the new runtime is then:
+  1. an `Upgrade` whose code version names the new runtime, from *n*;
+  2. the predecessor fenced at *n*;
+  3. `Continuation` founded on the new runtime;
+  4. input *n* sent there.
+
+  There is no new genesis, no bridge anchor and no change of construction. The next anchor names the new
+  code version.
+- It also serves on one platform. A continuation onto a fresh Agent of the same runtime is how the gate
   rehearses the move before the new runtime exists.
 
 ## Carried to the plan
 
 - `PLAN.md` `DEC-26`: (a), (b), (b′), (d) and (g) amended; (i) and (j) added; the status names this amendment.
-- `PLAN.md` `F-036`: `StateGenesis` is generalised by `F-037`'s continuation; nothing of `F-036` changes.
+- `PLAN.md` `F-036`: `StateGenesis` is unchanged, and `F-037` adds `Continuation` beside it.
 - `PLAN.md` `F-037`, and `features/F-037-code-history/plan.md` (new) and `tasks.md`:
   - `T-037-01` to `T-037-03` take the platform field, the identities, the optional runtime role, the
-    self-identity, the platform-bound fields kept out of every hash, and a commitment built from aledgent's
-    fields alone;
+    generation, the host-local fields kept out of every hash, and a commitment built from aledgent's fields
+    alone;
   - `T-037-04`, `T-037-05`, `T-037-09`, `T-037-11` and `T-037-12` follow (b), (b′), (d) and (g);
-  - four new tasks: `T-037-14` the `switch` operation, `T-037-15` the fence, `T-037-16` checkpoints as rows
-    and leaf chunks, `T-037-17` the continuation;
-  - the table is reordered to build order.
-- `crates/conformance`: `AC-K7.9` to `AC-K7.11` registered as pending.
+  - four new tasks: `T-037-14` the `switch` operation, `T-037-15` the fence and the way out, `T-037-16`
+    checkpoints as rows and leaf chunks, and `T-037-17` the continuation;
+  - the table is reordered to build order, with `T-037-14` and `T-037-04` before `T-037-15` (D5).
+- `crates/conformance`: `AC-K7.9` to `AC-K7.15` registered as pending.
 - `docs/code-history.md`: a section on what keeps the code history independent of the runtime.
-- Upstream: nothing is proposed to VOS by this amendment. A compare-and-swap on install and a way for an actor
-  to read its own program's hash would each make the new runtime's switch safer, but the fence does not
+- Upstream: nothing is proposed to VOS by this amendment. A compare-and-swap on install, and a way for an actor
+  to read its own program's hash, would each make the new runtime's switch safer, but the fence does not
   depend on them.
 
 ## Identifier ledger
 
 | Action | Identifiers |
 |---|---|
-| New | `REQ-RT-19`, `REQ-RT-20`, `REQ-RT-21`; `AC-K7.9`, `AC-K7.10`, `AC-K7.11`; glossary rows **Platform** and **Continuation**; `T-037-14`, `T-037-15`, `T-037-16`, `T-037-17` |
-| Changed | The glossary row **Code version** (one sentence added); `REQ-RT-16` (one point added); §15, Epic K; `DEC-26` (a), (b), (b′), (d), (g), and (i), (j) added; `T-037-01` to `T-037-05`, `T-037-09`, `T-037-11`, `T-037-12` |
+| New | `REQ-RT-19`, `REQ-RT-20`, `REQ-RT-21`; `AC-K7.9` to `AC-K7.15`; glossary rows **Code generation**, **Platform**, **Writer state** and **Continuation**; `T-037-14`, `T-037-15`, `T-037-16`, `T-037-17` |
+| Changed | The glossary row **Code version** (two sentences added); `REQ-RT-16` (one point added); §15, Epic K; `DEC-26` (a), (b), (b′), (d), (g), and (i), (j) added; `T-037-01` to `T-037-05`, `T-037-09`, `T-037-11` to `T-037-13` |
 | Withdrawn | None |
 
-## Ruling (the owner, 2026-10-17)
+## Ruling and decisions (2026-10-17)
 
-- **Apply as briefed.** The owner approved the briefing this amendment writes down: the six recommendations,
-  as requirements and as the plan's binding above, including a replayer recorded for every range under ruling
-  `a0023-q6`'s fallback.
+- **The owner: apply as briefed.** The owner approved the briefing this amendment writes down: the six
+  recommendations, as requirements and as the plan's binding above. That includes a replayer recorded for
+  every range under ruling `a0023-q6`'s fallback.
+- **The architect: D1 to D7**, taken under that approval after the review of #35. They are recorded in §"The
+  architect's decisions".
