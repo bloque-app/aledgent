@@ -5,9 +5,10 @@ SPDX-License-Identifier: CC-BY-4.0
 
 # Amendment 0032 — A read whose shape aledgent does not accept is `ERR-MalformedCommand`
 
-**Status:** **proposed** on 2026-10-16, on the owner's direction ("a misspelled query parameter should be
-400; a missing one 422"). Applied to `SPEC.md` **v0.4.26** as proposed, and it waits for the owner's
-approval. Until then the change is a proposal carried by its pull request.
+**Status:** **ruled by the owner on 2026-10-17.** Proposed on 2026-10-16, on the owner's direction ("a
+misspelled query parameter should be 400; a missing one 422"), and applied to `SPEC.md` **v0.4.26** as
+proposed. The owner approved it on 2026-10-17; `SPEC.md` **v0.4.27** marks it ruled (with amendment 0033), and
+the text is unchanged.
 **Target:** `SPEC.md` v0.4.25 as on `develop`.
 **Date:** 2026-10-16
 **Rationale in one line:** on the reads, a request that is the wrong shape is one condition on every route,
@@ -53,7 +54,8 @@ conflicts with the rule this amendment states for reads, where a missing paramet
 The bullet "A query's parameters keep the conditions of the query surface" is removed from the list of what
 is not a shape fault. The two bullets that remain are renumbered from "Three things" to "Two things". After
 the list, and before the closing sentence of `REQ-ER-3` ("A shape refusal names no field…"), `SPEC.md`
-v0.4.26 carries this paragraph. It is quoted here exactly as it stands there:
+v0.4.26 carries this paragraph. It is quoted here as it stands there; since v0.4.27 its last sentence reads
+"*Ruled by the owner on 2026-10-17 (amendment 0032).*":
 
 > A read's shape is held to the same rule. A read, on the query surface or the operator surface, whose shape
 > aledgent does not accept MUST be refused with `ERR-MalformedCommand`, and nothing is read. A shape fault is

@@ -1,11 +1,12 @@
 // Copyright (c) 2026 Pagos Cube LLC
 // SPDX-License-Identifier: Apache-2.0 OR MIT
-//! `F-037` — code history and upgrades (amendment 0023, `US-K7`, `REQ-RT-15` to `REQ-RT-18`,
-//! `REQ-PR-11`, `NFR-22`). Its registered cases (`F-015` §6, §7).
+//! `F-037` — code history and upgrades (amendments 0023 and 0033, `US-K7`, `REQ-RT-15` to
+//! `REQ-RT-21`, `REQ-PR-11`, `NFR-22`). Its registered cases (`F-015` §6, §7).
 //!
-//! All eight are pending, registered when the amendment was applied, before `F-037` is built
+//! All eleven are pending, registered when each amendment was applied, before `F-037` is built
 //! (amendment 0013's practice). They need the code version in each writer's state, the upgrade and
-//! mode inputs, the code archive and per-range replay.
+//! mode inputs, the code archive, per-range replay, the fence, checkpoints as rows and leaf chunks,
+//! and the continuation.
 
 use crate::case::{Case, Feature, Layer};
 
@@ -66,5 +67,26 @@ pub const CASES: &[Case] = &[
         Layer::Service,
         Feature::F037,
         &["REQ-RT-18"],
+    ),
+    Case::pending(
+        "AC-K7.9",
+        "ac_k7_9_an_input_from_n_is_refused_until_the_code_is_switched__service",
+        Layer::Service,
+        Feature::F037,
+        &["REQ-RT-20"],
+    ),
+    Case::pending(
+        "AC-K7.10",
+        "ac_k7_10_a_continuation_keeps_the_book_and_its_log_chain__service",
+        Layer::Service,
+        Feature::F037,
+        &["REQ-RT-21", "REQ-RT-17"],
+    ),
+    Case::pending(
+        "AC-K7.11",
+        "ac_k7_11_a_checkpoint_restores_under_another_platform__service",
+        Layer::Service,
+        Feature::F037,
+        &["REQ-RT-19"],
     ),
 ];

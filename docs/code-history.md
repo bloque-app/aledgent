@@ -6,7 +6,8 @@ SPDX-License-Identifier: CC-BY-4.0
 # Code history, code sources and node roles
 
 **Status:** describes amendment 0023 (`amendments/0023-code-history-and-upgrades.md`), which the owner
-ruled on 2026-10-08. **Nothing here is built yet.** `F-037` builds it, and this page becomes the operator's
+ruled on 2026-10-08, as amended by amendment 0033
+(`amendments/0033-code-history-independent-of-the-platform.md`), ruled on 2026-10-17. **Nothing here is built yet.** `F-037` builds it, and this page becomes the operator's
 reference when it lands.
 
 ## The trust model, first
@@ -51,6 +52,27 @@ Two builds of the same source with different settings are two code versions.
 - **Checkpoints and anchors** name the code version and the construction of the state commitment, so a
   verifier holding an anchor knows what produced the anchored state and how it is committed. A change of
   construction is itself an input (a migration), and its checkpoint binds both roots.
+
+## Independent of the runtime
+
+The code history is shaped so that the book can later move to another runtime as one more upgrade, with
+no new genesis (amendment 0033).
+
+- **A code version names its platform**, and lists each artefact's identities on that platform beside its
+  own digest. Nothing the platform supplies (its clock, its slot, its identities, its encoding of state)
+  enters a root, a log hash, a checkpoint or an anchor.
+- **The switch of code is one host operation**, taken between two inputs. The old code also fences it: while
+  an upgrade to a version from input *n* is pending, any other code refuses input *n* and later, with nothing
+  written. A missed switch halts the writer; it never runs an input under the wrong code.
+- **Only the book's upgrade-authority mode authorises an upgrade.** A runtime's own authority to install
+  programs is a host key, never an authority over the book's code.
+- **Checkpoints are the writer's rows and the book's leaves**, in aledgent's own format, so one archive
+  restores onto either runtime.
+- **Replay is native first.** The book's state replays from the inputs with aledgent's own code, without the
+  runtime. Each range's host image is kept in the code archive, so the runtime's execution can be checked
+  too.
+- **A writer can be continued by another at input *n***, from its state and log head after input *n* − 1. A
+  move of runtime is an upgrade naming the new runtime, followed by a continuation on it.
 
 ## Code sources
 

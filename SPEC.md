@@ -1,9 +1,9 @@
 ---
 name: aledgent
 summary: A private, provable ledger of record — identities that own accounts, value that moves between them instantly and confidentially, and one settlement layer through which value enters, leaves, and is anchored.
-spec_version: 0.4.26
+spec_version: 0.4.27
 status: draft
-date: 2026-10-16
+date: 2026-10-17
 ---
 
 # aledgent — System Specification
@@ -279,9 +279,11 @@ One canonical name per concept. This document uses each term only in the sense g
 | **Operation reference** | The identity of an operation, derived by the service and unique forever. Never supplied by a caller, never parsed, and never carries status. |
 | **Anchor** | A commitment published on the settlement layer to a state of the book at a point in time. |
 | **Checkpoint** | The book state an anchor commits to. |
-| **Code version** | The identity of everything that decides a writer's transitions: a digest of each executable artefact, together with the settings it was built with. Two builds of the same source with different settings are two code versions. |
+| **Code version** | The identity of everything that decides a writer's transitions: a digest of each executable artefact, together with the settings it was built with. Two builds of the same source with different settings are two code versions. It names the platform its artefacts are built for, and each artefact's identities on that platform (`REQ-RT-19`). |
 | **Code map** | For each of the book's writers, the ranges of its inputs and the code version that executed each range, derived from the book's own inputs (`REQ-RT-16`). |
 | **Code archive** | Where every code version that has executed an input is kept, by its digest (`REQ-RT-17`). |
+| **Platform** | The execution environment a writer's code runs on: the runtime that executes it and the host that drives it, named with their versions. The capabilities of §4.4 are requirements of a platform. Two platforms that both meet them are interchangeable for the book (`REQ-RT-19`). |
+| **Continuation** | A writer founded to take over another writer's sequence at an input number, from the other's committed state and log head, so that the book's inputs and their hash chain go on unbroken (`REQ-RT-21`). |
 | **Disclosure** | A statement about ledger facts, addressed to a named recipient. The recipient can verify it without aledgent's continued cooperation, and without learning anything the statement does not assert. |
 | **Verifier** | The recipient of a disclosure: an auditor, a regulator, a counterparty. |
 | **Assurance level** | The declaration of which §9 invariants a deployment enforces rather than attests. |
@@ -667,6 +669,8 @@ input number from which it applies.
 - It MUST be refused, with nothing changed, unless the new code version's artefacts are retrievable and
   match their digests at the time it is taken.
 - A change of build settings alone is an upgrade (§2, **Code version**).
+- A change of the platform that executes a writer is an upgrade too, and it MAY be made by founding a
+  continuation of the writer on the new platform (`REQ-RT-21`). *Amendment 0033.*
 - It is made online (`NFR-17`), and it preserves the book in place (`REQ-RT-8`), without an export.
 - Where an upgrade changes what the writers exchange (`REQ-RT-13`), each receiver MUST accept the new form
   before any sender emits it.
@@ -711,6 +715,72 @@ change of mode.
 > revoked approver is refused within `NFR-20`'s bound, not at once. A lost key under "one principal" blocks
 > upgrades until that principal's credentials are recovered (`REQ-AU-15`). There is no bypass, by design
 > (guardrail 7).
+
+**`REQ-RT-19`** **The code history does not depend on the platform.** A book MUST be able to change the
+platform its writers run on through upgrades alone, with no new genesis and no export (`REQ-RT-8`). To that
+end:
+
+- A code version MUST name the platform it runs on, and list, for each of its artefacts, every identity
+  under which that platform knows the artefact, beside the artefact's own digest. An artefact that one
+  platform needs and another provides itself MAY be absent from a code version.
+- A value that a platform supplies MUST NOT enter anything that a root, a log hash, a checkpoint or an
+  anchor covers, except through the code version that names the platform. Such values include the
+  platform's clock, its slot or block number, its identities for principals and programs, and its encoding
+  of state. Time enters the book only in inputs (`REQ-RT-7`).
+- A checkpoint, and every snapshot kept to restore a writer, MUST hold the writer's state in a form that
+  aledgent defines and that no platform defines: the writer's own records and the book's leaves. A snapshot
+  taken on one platform MUST restore a writer on any platform that a later code version of that writer
+  names.
+- Replaying the book's state (`REQ-RT-3`) MUST NOT need the platform that executed an input. For every range
+  of the code map, the book's transitions MUST be reproducible from the inputs by aledgent's own code.
+  Where a replay also checks that the platform executed each input as archived, the code archive MUST keep,
+  for that range, everything the check needs to run it as it ran, by digest, like any artefact
+  (`REQ-RT-17`).
+
+> **Trade-off, stated plainly.** Keeping the code history free of the platform costs a little now, for a
+> move that may never be made. Checkpoints need a format of aledgent's own instead of the runtime's image,
+> and every code version carries a list of identities where one would do today. The gain is that a later
+> change of runtime is an upgrade, which the book records and replay crosses, instead of a new genesis and a
+> second book.
+
+**`REQ-RT-20`** **The switch of code is one step, and the old code fences it.** When an upgrade names code
+version *H* from input *n* (`REQ-RT-16`):
+
+- The code that executes a writer's inputs MUST change from the old code version to *H* in one step, taken
+  after input *n* − 1 has committed and before input *n* is executed. A step that fails leaves the old code
+  in force, and is retried.
+- Until that step is taken, the code version in force MUST refuse input *n* and every later input. It
+  changes nothing, and does not take the input's number, so that the same input runs under *H* once the
+  step is taken. This MUST hold whatever the platform checks or does not check when the code changes.
+  Each code version MUST therefore be able to tell from its own build whether it is the version an upgrade
+  names.
+- The authority that decides an upgrade MUST be the writer's upgrade-authority mode, checked by the writer
+  in its own order (`REQ-RT-18`). Whatever authority a platform has to install or replace programs MUST NOT
+  by itself authorise an upgrade. A host MUST take the step only towards the code version an authorised
+  upgrade names, and only at the input it names.
+
+> **Limits, stated plainly.** Someone who holds a platform's own authority to install programs can still
+> install other code than the book names. The book cannot stop that. What it guarantees is that every input
+> is executed by the code the code map names, or is refused, and that replay under the code map shows any
+> input whose archived outcome other code produced. The operator keeps the platform's install authority as
+> it keeps its other keys (`NFR-8`).
+
+**`REQ-RT-21`** **A continuation.** A writer MAY be continued by another at input *n*: a **continuation**,
+founded from the first writer's committed state after input *n* − 1, its log head among it.
+
+- The continuation MUST be preceded by an upgrade of the first writer that names the continuation's code
+  version from input *n* (`REQ-RT-16`). The first writer's own code is never switched, so it refuses input
+  *n* and every later one for good (`REQ-RT-20`).
+- The continuation's state when it is founded MUST equal the first writer's committed state after input
+  *n* − 1: its roots, its counters, its code and its upgrade-authority mode. It MUST be checked to be so
+  before the continuation takes input *n*, and every replay checks it again.
+- The continuation's first input is *n*, and its log entry MUST chain to the log head of input *n* − 1. The
+  book keeps its genesis, its construction and its anchor sequence. A continuation is not a new genesis
+  (`REQ-RC-6`), not a migration of construction (`REQ-PR-11`), and not an export and import (`REQ-RC-3`).
+- The continuation's founding MUST be archived with the inputs, so that the code map shows the boundary
+  and replay crosses it (`REQ-RT-17`).
+
+*`REQ-RT-19` to `REQ-RT-21` ruled by the owner on 2026-10-17 (amendment 0033).*
 
 #### (c) The settlement layer
 
@@ -2153,6 +2223,16 @@ can still replay all of it, under the code that ran each part.
   the audit trail and in the next anchor (`REQ-RT-18`).
 - `AC-K7.8` Given a mode change that is not authorised under the mode in force, or that names a principal
   who does not exist, Then it is refused and the mode does not change (`REQ-RT-18`).
+- `AC-K7.9` Given an upgrade naming code version *H* from input *n*, When input *n* reaches a writer whose
+  code has not yet been switched to *H*, Then it is refused, nothing changes, its number is not taken, and
+  once the code is switched the same input runs under *H* (`REQ-RT-20`).
+- `AC-K7.10` Given a writer continued at input *n*, Then the book keeps its genesis and its construction,
+  input *n*'s log entry chains to input *n* − 1's, the first writer refuses every input from *n*, and a
+  replay from genesis crosses the boundary and reaches the archived roots and log at every input
+  (`REQ-RT-21`, `REQ-RT-17`).
+- `AC-K7.11` Given a checkpoint, When a writer is restored from it under a code version that names a
+  different platform than the one it was taken on, and the inputs after it are replayed, Then the writer
+  reaches the checkpoint's roots and every archived root after it (`REQ-RT-19`).
 
 ### Epic N — Migration
 
@@ -2984,7 +3064,7 @@ other filters; a statement without its account, asset, `from` or `to`; a stateme
 condition for that (`ERR-UnknownAccount`, `ERR-UnknownAsset`, `ERR-UnknownOperation`, `ERR-NotAuthorised`).
 One read keeps a condition of its own: a disclosure to verify that is missing, or is not hex, is
 `ERR-DisclosureUnsupported`, because aledgent cannot make the assertion. This paragraph is about reads. It
-changes nothing for commands. *Proposed; waits for the owner (amendment 0032).*
+changes nothing for commands. *Ruled by the owner on 2026-10-17 (amendment 0032).*
 
 A shape refusal names no field and quotes nothing the caller sent (`REQ-AU-8`).
 
@@ -3144,7 +3224,7 @@ invalid. This specification MUST NOT contain a requirement that serves no story.
 | H — Querying | `US-H1`–`US-H5` | `REQ-QR-1`–`REQ-QR-7`, `REQ-BA-5`, `REQ-PO-1`–`REQ-PO-5` | `INV-6`, `INV-20` |
 | I — Privacy and disclosure | `US-I1`–`US-I4` | `REQ-PV-1`–`REQ-PV-7`, `REQ-DS-1`–`REQ-DS-5` | `INV-16`, `INV-17` |
 | J — Provability | `US-J1`–`US-J3` | `REQ-PR-1`–`REQ-PR-11`, `REQ-AR-5`, `REQ-SL-1`, `REQ-SL-5` | `INV-5`, `INV-19` |
-| K — Operations and recovery | `US-K1`–`US-K7` | `REQ-RC-1`–`REQ-RC-5`, `REQ-AT-1`–`REQ-AT-3`, `REQ-OS-1`–`REQ-OS-4`, `REQ-RT-15`–`REQ-RT-18`, `NFR-22` | `INV-2`, `INV-15`, `INV-18` |
+| K — Operations and recovery | `US-K1`–`US-K7` | `REQ-RC-1`–`REQ-RC-5`, `REQ-AT-1`–`REQ-AT-3`, `REQ-OS-1`–`REQ-OS-4`, `REQ-RT-15`–`REQ-RT-21`, `NFR-22` | `INV-2`, `INV-15`, `INV-18` |
 | M — Integration | `US-M2`–`US-M8` | `REQ-EV-1`–`REQ-EV-9`, `REQ-CS-1`–`REQ-CS-10`, `REQ-PO-5` | `INV-8` |
 | N — Migration | `US-N1`, `US-N2` | `REQ-MG-7`, `REQ-MG-8`, `REQ-RC-4`, `REQ-RC-6`, `REQ-RC-7` | `INV-17`, `INV-18`, `INV-20`, `INV-22` |
 
