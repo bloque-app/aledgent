@@ -2,7 +2,7 @@
 # CI regenerates this file and fails on any difference (F-015 §1).
 # 25 invariants (§9), 41 errors (§10), 167 V0 acceptance criteria (§6, §15).
 
-spec_version = "0.4.25"
+spec_version = "0.4.26"
 
 [[invariant]]
 id = "INV-1"
@@ -304,7 +304,7 @@ condition = "A query was submitted without bounds that aledgent can serve (`REQ-
 
 [[error]]
 id = "ERR-MalformedCommand"
-condition = "The request does not have a shape aledgent accepts: a field unknown, missing or of the wrong type, a value that does not parse, or a body over its bound (`REQ-ER-3`)"
+condition = "The request does not have a shape aledgent accepts: a field unknown or of the wrong type, a field a command requires and lacks, a value that does not parse, or a body over its bound (`REQ-ER-3`)"
 
 [[error]]
 id = "ERR-InitialStateNotSealed"

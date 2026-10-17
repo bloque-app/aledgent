@@ -55,13 +55,15 @@ fn inline<T: JsonSchema>() -> Value {
 const TRIAL_BALANCE_DESCRIPTION: &str = "Checks that the book adds up, from one view. It is the \
     operator's: any other caller is refused as `ERR-NotAuthorised`. `asset` narrows the check to \
     one asset. The route also accepts `amount`, which belongs to `can_spend`, and ignores it. Any \
-    other parameter is refused as `ERR-NotAuthorised`.";
+    other parameter, and an `asset` that is not a valid symbol, is refused as \
+    `ERR-MalformedCommand`.";
 
 /// What `can_spend` does and which parameters it takes.
 const CAN_SPEND_DESCRIPTION: &str = "Says whether a spend of `amount` minor units of `asset` from \
     the account would pass the checks before the kernel, and names the reason if it would not. \
     Both parameters are required: a missing one is refused as `ERR-QueryUnbounded`. Any other \
-    parameter is refused as `ERR-NotAuthorised`.";
+    parameter, an `asset` that is not a valid symbol and an `amount` that is not a count of \
+    minor units are refused as `ERR-MalformedCommand`.";
 
 /// The OpenAPI version the document declares.
 pub const OPENAPI_VERSION: &str = "3.1.0";
@@ -240,7 +242,12 @@ fn operation(route: &crate::surface::Route) -> Value {
                 QueryRoute::Balances => (Some(inline::<BalancesParams>()), "BalancesBody", false),
                 QueryRoute::Movements => (Some(inline::<MovementsParams>()), "PageBody", false),
                 QueryRoute::Statement => {
-                    (Some(inline::<StatementParams>()), "StatementBody", false)
+                    // `account` and `asset` are `Option` in the struct, so that a missing one is
+                    // `ERR-QueryUnbounded` and not a shape fault (amendment 0032): the document
+                    // still says they are required.
+                    let mut schema = inline::<StatementParams>();
+                    schema["required"] = json!(["account", "asset"]);
+                    (Some(schema), "StatementBody", false)
                 }
                 QueryRoute::Assets => (None, "AssetBody", true),
                 QueryRoute::TrialBalance => {

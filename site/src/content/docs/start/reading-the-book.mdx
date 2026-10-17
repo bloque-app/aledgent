@@ -278,25 +278,33 @@ fixed description, with the status the code carries. Nothing is partly answered.
 
 | You sent | Refused as | Status |
 | --- | --- | --- |
-| `movements` with no `limit`, or `limit=0`, or a `limit` above 1000 | `ERR-QueryUnbounded` | 422 |
+| A parameter the route does not know or repeats, on any read | `ERR-MalformedCommand` | 400 |
+| A value that does not parse (`limit=ten`, `from=abc`, a negative number) | `ERR-MalformedCommand` | 400 |
+| An `asset` that is not 2 to 12 letters and digits (`asset=US$`), or an alias `source` that cannot be one | `ERR-MalformedCommand` | 400 |
+| A `direction` that is neither `debit` nor `credit` | `ERR-MalformedCommand` | 400 |
+| An account, identity or operation identifier that is not valid, in a parameter or in the path | `ERR-MalformedCommand` | 400 |
+| `movements` with a `cursor` that is not hex | `ERR-MalformedCommand` | 400 |
 | `balances` or `movements` with both `account` and `identity`, or with neither | `ERR-QueryUnbounded` | 422 |
+| `movements` with no `limit`, or `limit=0`, or a `limit` above 1000 (however many digits it has) | `ERR-QueryUnbounded` | 422 |
 | `movements` with only one of `from` and `to`, or `from` after `to` | `ERR-QueryUnbounded` | 422 |
-| `movements` with a `cursor` that is not hex, or that came from a different subject or filter | `ERR-QueryUnbounded` | 422 |
-| `statements` with no `from` or no `to`, or with `from` after `to` | `ERR-QueryUnbounded` | 422 |
-| `statements` with a missing `account` or `asset`, any parameter the route does not know, or a value that does not parse (`from=abc`) | `ERR-QueryUnbounded` | 422 |
-| `balances`, `movements` or `trial-balance` with a parameter the route does not know, a value that does not parse (`limit=ten`), or a `direction` that is neither `debit` nor `credit` | `ERR-NotAuthorised` | 403 |
-| `balances` or `movements` with an `identity` that is not a valid identity identifier | `ERR-NotAuthorised` | 403 |
-| An account you cannot reach, or one that is not a valid account identifier | `ERR-UnknownAccount` | 404 |
+| `movements` with a hex `cursor` that came from a different subject or filter | `ERR-QueryUnbounded` | 422 |
+| `statements` with no `account`, `asset`, `from` or `to`, or with `from` after `to` | `ERR-QueryUnbounded` | 422 |
+| `statements` over more than 1000 movements, or with an `as_of` the book has not reached | `ERR-QueryUnbounded` | 422 |
+| A valid account you cannot reach | `ERR-UnknownAccount` | 404 |
 | `movements` with an `on_account` that is not one of the subject's accounts | `ERR-UnknownAccount` | 404 |
-| An asset that is not in the registry | `ERR-UnknownAsset` | 404 |
+| A valid asset symbol that is not in the registry | `ERR-UnknownAsset` | 404 |
+| `disclosures/verify` with a missing or non-hex `disclosure` | `ERR-DisclosureUnsupported` | 422 |
+
+The rule behind the table: a request that is the **wrong shape** is `ERR-MalformedCommand`, whichever
+read it is sent to, and a request that is **missing** something or whose bounds conflict is
+`ERR-QueryUnbounded`. A valid identifier that names nothing you may read keeps its own condition.
 
 <Aside type="caution" title="An unknown parameter is refused, not ignored">
 A misspelt parameter (`acount=…`, `since=…`) fails the whole request instead of being dropped, so
-that a filter that did not apply can never pass for one that did. The one exception is `amount` on
-`trial-balance`, which is accepted and ignored because the route shares its parameters with
-`can_spend`. On `balances` and `movements` the
-refusal is `ERR-NotAuthorised` with status 403, which can look like a permissions problem: when you
-get it on a read you have the rights to make, check the parameter names first.
+that a filter that did not apply can never pass for one that did. The refusal is
+`ERR-MalformedCommand` with status 400 on every read, never a permissions error. The one exception is
+`amount` on `trial-balance`, which is accepted and ignored because the route shares its parameters
+with `can_spend`.
 </Aside>
 
 ## Next

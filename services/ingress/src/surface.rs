@@ -1678,8 +1678,10 @@ async fn operation_reply<S: Store, C: Core>(
     who: &Authenticated,
     reference: &str,
 ) -> Response {
+    // A reference that does not parse is a shape fault (amendment 0032, `REQ-ER-3`); a
+    // well-formed one the caller does not reach is `ERR-UnknownOperation` below.
     let Ok(op) = OperationId::parse(reference) else {
-        return refusal(Refusal::UnknownOperation);
+        return refusal(Refusal::MalformedCommand);
     };
     // The received-log first: a command the core has not decided is `Received`, whether or not
     // the core is up (REQ-CS-7), to the principal that sent it, and to a principal that reaches
@@ -1866,26 +1868,36 @@ pub struct AliasParams {
     pub name: Option<String>,
 }
 
+/// A read's query string, parsed. A parameter the route does not know, a repeated one and a value
+/// that does not parse into its type are shape faults, `ERR-MalformedCommand` (amendment 0032,
+/// `REQ-ER-3`), on every route. A parameter that is absent is not: it is `Option` in every
+/// parameter struct, and the bounds (`ERR-QueryUnbounded`, `REQ-CS-5`) decide it.
 fn params<T: DeserializeOwned + Default>(raw: Option<&str>) -> Result<T, Refusal> {
     match raw {
         None | Some("") => Ok(T::default()),
-        Some(q) => serde_urlencoded::from_str(q).map_err(|_| Refusal::NotAuthorised),
+        Some(q) => serde_urlencoded::from_str(q).map_err(|_| Refusal::MalformedCommand),
     }
 }
 
+/// A read's request, from its path parameter and query string. Every shape fault is
+/// `ERR-MalformedCommand` and is found here, before the core is asked (`crate::query::shape`).
 fn query_of(route: QueryRoute, param: Option<String>, raw: Option<&str>) -> Result<Query, Refusal> {
+    let query = query_unchecked(route, param, raw)?;
+    crate::query::shape(&query)?;
+    Ok(query)
+}
+
+fn query_unchecked(
+    route: QueryRoute,
+    param: Option<String>,
+    raw: Option<&str>,
+) -> Result<Query, Refusal> {
     Ok(match route {
         QueryRoute::Balances => Query::Balances(params(raw)?),
         QueryRoute::Movements => Query::Movements(params(raw)?),
-        QueryRoute::Statement => {
-            let p: Option<StatementParams> = match raw {
-                None | Some("") => None,
-                Some(q) => {
-                    Some(serde_urlencoded::from_str(q).map_err(|_| Refusal::QueryUnbounded)?)
-                }
-            };
-            Query::Statement(p.ok_or(Refusal::QueryUnbounded)?)
-        }
+        // A statement with no query string, or without an `account` or `asset`, is unbounded:
+        // `statement_request` decides it, with the rest of the bounds.
+        QueryRoute::Statement => Query::Statement(params::<StatementParams>(raw)?),
         QueryRoute::Assets => {
             let _: AssetParams = params(raw)?;
             Query::Assets
@@ -1953,6 +1965,12 @@ fn query_of(route: QueryRoute, param: Option<String>, raw: Option<&str>) -> Resu
         }
         QueryRoute::Alias => {
             let p: AliasParams = params(raw)?;
+            // A source that cannot be one is a shape fault, found before a missing name is
+            // (amendment 0032).
+            p.source
+                .as_deref()
+                .map(crate::operator::alias_source)
+                .transpose()?;
             Query::Alias {
                 source: p.source.ok_or(Refusal::QueryUnbounded)?,
                 name: p.name.ok_or(Refusal::QueryUnbounded)?,
