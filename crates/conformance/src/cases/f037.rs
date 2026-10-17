@@ -3,7 +3,7 @@
 //! `F-037` — code history and upgrades (amendments 0023 and 0033, `US-K7`, `REQ-RT-15` to
 //! `REQ-RT-21`, `REQ-PR-11`, `NFR-22`). Its registered cases (`F-015` §6, §7).
 //!
-//! All nineteen are pending, registered when each amendment was applied, before `F-037` is built
+//! All twenty are pending, registered when each amendment was applied, before `F-037` is built
 //! (amendment 0013's practice). They need the code version in each writer's state, the upgrade and
 //! mode inputs, the code archive, per-range replay, the code generation and the fence with its way
 //! out, checkpoints as rows and leaf chunks, the replayer, and the continuation founded once.
@@ -141,6 +141,13 @@ pub const CASES: &[Case] = &[
     Case::pending(
         "AC-K7.19",
         "ac_k7_19_the_archive_takes_each_input_number_once__service",
+        Layer::Service,
+        Feature::F037,
+        &["REQ-RT-21"],
+    ),
+    Case::pending(
+        "AC-K7.20",
+        "ac_k7_20_a_founding_for_an_upgrade_no_longer_scheduled_writes_nothing__service",
         Layer::Service,
         Feature::F037,
         &["REQ-RT-21"],
