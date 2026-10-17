@@ -54,7 +54,7 @@ use ledger_kernel::posting::OperationRef;
 use crate::account::{AccountKind, Time};
 use crate::asset::{AssetBinding, AssetId, AssetRegistry};
 use crate::authority::{GrantKind, OperationKind, Subject, Window};
-use crate::code::CodeManifest;
+use crate::code::{CodeManifest, ManifestV4};
 use crate::export::canon::{self, Canonical, Dec, DecodeError, Enc};
 use crate::id::{AccountId, CredentialId, GrantId, IdentityId, OperationId};
 use crate::identity::IdentityKind;
@@ -81,7 +81,26 @@ pub type SpecRef = alloc::rc::Rc<ChainSpec>;
 /// (`merges_sha256`, `excluded_sha256`: the account unification, rulings `au-8` and `au-19`).
 /// Version 4 adds the reconciliation journal's SHA-256 (`reconcile_sha256`: every adjustment that
 /// sets a chain-bound asset's openings equal to the chain, ruling `chain-balance-authority`).
-pub const SPEC_VERSION: u16 = 4;
+/// Version 5 names the genesis code in amendment 0033's manifest ([`CodeManifest`]: its platform,
+/// its code generation, each artefact's identities; `T-037-01`).
+///
+/// This build writes version 5 and reads versions 4 and 5 ([`readable`]): a version-4 chainspec,
+/// whose header names its code in amendment 0023's first layout ([`GenesisCodeV4`]), still loads
+/// wherever a chainspec is only read (ingress, which still serves those books; `opsctl`; the book's
+/// own genesis replay), with its digest and *H₀* as they were computed. Only the core host's
+/// founding and driving path requires version 5: a book founded on version 4 is driven by the host
+/// it was founded with until it is re-founded, and restored with the `opsctl` in that host's image,
+/// since this line refuses its archives and exports by their format.
+pub const SPEC_VERSION: u16 = 5;
+
+/// The chainspec format before amendment 0033's manifest, still read ([`SPEC_VERSION`]).
+pub const SPEC_VERSION_V4: u16 = 4;
+
+/// Whether this build reads a chainspec of format `version`: [`SPEC_VERSION`] and
+/// [`SPEC_VERSION_V4`].
+pub const fn readable(version: u16) -> bool {
+    version == SPEC_VERSION || version == SPEC_VERSION_V4
+}
 
 const SEED_DOMAIN: &[u8] = b"aledgent/chainspec/v1";
 const CHUNK_DOMAIN: &[u8] = b"aledgent/chainspec/chunk/v1";
@@ -213,6 +232,23 @@ impl GenesisCode {
     }
 }
 
+/// The genesis code of a format-4 chainspec ([`SPEC_VERSION_V4`]): amendment 0023's first manifest
+/// layout. Read, never written, and never driven by this build's core host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenesisCodeV4 {
+    /// The manifest; *H₀* is its [`ManifestV4::version`].
+    pub manifest: ManifestV4,
+    /// The construction of the state commitment the genesis is built in.
+    pub construction: u8,
+}
+
+impl GenesisCodeV4 {
+    /// *H₀*, as it was computed when the chainspec was written.
+    pub fn version(&self) -> [u8; 32] {
+        self.manifest.version()
+    }
+}
+
 /// Where the settlement contract stands when the chainspec is built (amendment 0022, option (e)):
 /// read from its `head()`, so that a re-founded book continues its anchor sequence. Carried and
 /// committed; the anchor store and the adapter read it in `T-036-15`/`T-036-16`.
@@ -244,9 +280,14 @@ pub struct SpecHeader {
     pub opening: Option<OpeningCommit>,
     /// The pre-cutover history (`seed-history-commitment`).
     pub history: Option<HistoryCommit>,
-    /// The genesis code (format 2): what builds and runs this genesis. A chainspec without it names
-    /// no code, and the core host refuses it unless told the code is not checked (tests, stress).
+    /// The genesis code (format 2; in amendment 0033's manifest since format 5): what builds and
+    /// runs this genesis. A chainspec without it names no code, and the core host refuses it unless
+    /// told the code is not checked (tests, stress). Always `None` in a format-4 header, which
+    /// carries [`SpecHeader::code_v4`] in its place.
     pub code: Option<GenesisCode>,
+    /// A format-4 header's genesis code, in amendment 0023's first manifest layout: read, never
+    /// written by this build ([`SPEC_VERSION`]). Always `None` in a format-5 header.
+    pub code_v4: Option<GenesisCodeV4>,
     /// The settlement contract's head (format 2).
     pub settlement: Option<SettlementBase>,
     /// The SHA-256 of the identifier map `migrate chainspec build` writes beside the chainspec
@@ -264,6 +305,18 @@ pub struct SpecHeader {
     /// evidence, and the chain's balances at the window block (ruling `chain-balance-authority`,
     /// format 4).
     pub reconcile_sha256: Option<[u8; 32]>,
+}
+
+impl SpecHeader {
+    /// The genesis code version *H₀* and its construction, as the header names them in either
+    /// format's manifest layout.
+    pub fn genesis_code(&self) -> Option<([u8; 32], u8)> {
+        match (&self.code, &self.code_v4) {
+            (Some(c), _) => Some((c.version(), c.construction)),
+            (None, Some(c)) => Some((c.version(), c.construction)),
+            (None, None) => None,
+        }
+    }
 }
 
 /// One record (module documentation). Its `Debug` names its section only: a verifier has no place
@@ -386,11 +439,11 @@ pub fn chunk_leaf(index: u32, bytes: &[u8]) -> [u8; 32] {
     blake2b_256(CHUNK_DOMAIN, &[&index.to_be_bytes(), bytes])
 }
 
-/// The seed digest of a tree of `chunks` leaves with this root.
-pub fn spec_digest(chunks: u32, root: &[u8; 32]) -> [u8; 32] {
+/// The seed digest of a format-`version` tree of `chunks` leaves with this root.
+pub fn spec_digest(version: u16, chunks: u32, root: &[u8; 32]) -> [u8; 32] {
     blake2b_256(
         SEED_DOMAIN,
-        &[&SPEC_VERSION.to_be_bytes(), &chunks.to_be_bytes(), root],
+        &[&version.to_be_bytes(), &chunks.to_be_bytes(), root],
     )
 }
 
@@ -409,7 +462,12 @@ pub fn chunk_in_spec(
         u64::from(commitment.chunks),
         path,
     )
-    .is_some_and(|root| spec_digest(commitment.chunks, &root) == commitment.digest)
+    .is_some_and(|root| {
+        // The commitment does not name its format: either readable one may have made it.
+        [SPEC_VERSION, SPEC_VERSION_V4]
+            .iter()
+            .any(|v| spec_digest(*v, commitment.chunks, &root) == commitment.digest)
+    })
 }
 
 /// The header of a committed seed, checked against genesis's commitment: what a history proof is
@@ -550,7 +608,7 @@ pub enum SpecError {
     NotInSeed,
     /// The limits cannot hold one record.
     Limits,
-    /// The genesis code's construction is not one its manifest reads.
+    /// The genesis code's construction is not one its manifest reads, or its generation is not 0.
     Code,
     /// An imported credential set that is empty, too large, repeats a verifier or holds one not
     /// well formed.
@@ -602,6 +660,7 @@ impl ChainSpec {
             opening,
             history,
             code: None,
+            code_v4: None,
             settlement: None,
             ids_sha256: None,
             merges_sha256: None,
@@ -737,7 +796,7 @@ impl ChainSpec {
     /// The seed digest.
     pub fn digest(&self) -> [u8; 32] {
         let root = merkle::root(NODE_DOMAIN, &self.leaves()).unwrap_or([0; 32]);
-        spec_digest(self.chunk_count(), &root)
+        spec_digest(self.header.version, self.chunk_count(), &root)
     }
 
     /// What genesis carries.
@@ -799,10 +858,21 @@ impl ChainSpec {
     /// The seed's own consistency: version, order, counts, the opening commitment against the
     /// rows and aliases, and the reconciliation against its digest.
     pub fn check(&self) -> Result<(), SpecError> {
-        if self.header.version != SPEC_VERSION {
+        if !readable(self.header.version) {
             return Err(SpecError::Version);
         }
+        // Each format names its code in its own manifest layout, and only there.
+        let v4 = self.header.version == SPEC_VERSION_V4;
+        if (v4 && self.header.code.is_some()) || (!v4 && self.header.code_v4.is_some()) {
+            return Err(SpecError::Code);
+        }
+        // The genesis code is *H₀*: generation 0 (amendment 0033, D1), in a construction it reads.
         if let Some(c) = &self.header.code
+            && (!c.manifest.constructions.contains(&c.construction) || c.manifest.generation != 0)
+        {
+            return Err(SpecError::Code);
+        }
+        if let Some(c) = &self.header.code_v4
             && !c.manifest.constructions.contains(&c.construction)
         {
             return Err(SpecError::Code);
@@ -1427,24 +1497,42 @@ impl Canonical for SpecHeader {
             .put(&self.assets)
             .put(&self.counts)
             .put(&self.opening)
-            .put(&self.history)
-            .put(&self.code)
-            .put(&self.settlement)
+            .put(&self.history);
+        // The code's slot holds the layout of the header's own format.
+        if self.version == SPEC_VERSION_V4 {
+            e.put(&self.code_v4);
+        } else {
+            e.put(&self.code);
+        }
+        e.put(&self.settlement)
             .put(&self.ids_sha256)
             .put(&self.merges_sha256)
             .put(&self.excluded_sha256)
             .put(&self.reconcile_sha256);
     }
     fn decode(d: &mut Dec<'_>) -> Result<Self, DecodeError> {
+        let version: u16 = d.get()?;
+        let genesis_op = d.get()?;
+        let at = d.get()?;
+        let assets = d.get()?;
+        let counts = d.get()?;
+        let opening = d.get()?;
+        let history = d.get()?;
+        let (code, code_v4) = if version == SPEC_VERSION_V4 {
+            (None, d.get()?)
+        } else {
+            (d.get()?, None)
+        };
         Ok(SpecHeader {
-            version: d.get()?,
-            genesis_op: d.get()?,
-            at: d.get()?,
-            assets: d.get()?,
-            counts: d.get()?,
-            opening: d.get()?,
-            history: d.get()?,
-            code: d.get()?,
+            version,
+            genesis_op,
+            at,
+            assets,
+            counts,
+            opening,
+            history,
+            code,
+            code_v4,
             settlement: d.get()?,
             ids_sha256: d.get()?,
             merges_sha256: d.get()?,
@@ -1524,6 +1612,18 @@ impl Canonical for GenesisCode {
     }
 }
 
+impl Canonical for GenesisCodeV4 {
+    fn encode(&self, e: &mut Enc) {
+        e.put(&self.manifest).put(&self.construction);
+    }
+    fn decode(d: &mut Dec<'_>) -> Result<Self, DecodeError> {
+        Ok(GenesisCodeV4 {
+            manifest: d.get()?,
+            construction: d.get()?,
+        })
+    }
+}
+
 impl Canonical for SettlementBase {
     fn encode(&self, e: &mut Enc) {
         e.put(&self.instance)
@@ -1562,6 +1662,8 @@ impl Canonical for SpecProgress {
     }
 }
 
+#[cfg(test)]
+mod fixture_v4;
 #[cfg(test)]
 pub(crate) mod testing;
 #[cfg(test)]

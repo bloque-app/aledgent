@@ -100,6 +100,23 @@ pub fn link_runtime(elf: &[u8], gray_paper_only: bool) -> Result<Vec<u8>, Packag
     Ok(pvm)
 }
 
+/// The code generation an actor's ELF and the program it was linked into carry compiled in
+/// (`T-037-01`; amendment 0033, D13): read from each by `ledger_core::code::generation_of`, which
+/// refuses a record that is missing (folded away) or duplicated, and never counts code. They must
+/// agree: a record the linker dropped would leave the guest's fence reading nothing.
+pub fn generation(elf: &[u8], program: &[u8]) -> Result<u64, PackageError> {
+    let of_elf = ledger_core::code::generation_of(elf)
+        .map_err(|e| err(format!("the ELF's code generation record: {e:?}")))?;
+    let of_program = ledger_core::code::generation_of(program)
+        .map_err(|e| err(format!("the program's code generation record: {e:?}")))?;
+    if of_elf != of_program {
+        return Err(err(format!(
+            "the ELF is built as code generation {of_elf}, its program carries {of_program}"
+        )));
+    }
+    Ok(of_elf)
+}
+
 /// The signed VOS3 package of an actor ELF (see the module documentation).
 pub fn actor_package(
     elf: &[u8],

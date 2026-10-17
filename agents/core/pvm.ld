@@ -12,13 +12,20 @@
  * Read-only and read-write data occupy distinct GP zones. The read-write
  * base follows the complete read-only image instead of assuming a fixed
  * maximum size.
+ *
+ * The code generation's record (`.aledgent.generation`, T-037-01, amendment
+ * 0033 D13) is kept (KEEP) and placed first in `.rodata`: VOS's PVM linker
+ * (pvm/compiler/src/linker.rs, link_elf_spi) carries only `.rodata*`,
+ * `.srodata` and `.data.rel.ro*` into the program's read-only data, so a
+ * section of its own would be dropped and the guest would read nothing there.
+ * The record stays the one the exported symbol ALEDGENT_CODE_GENERATION names.
  */
 
 ENTRY(_start)
 
 SECTIONS
 {
-    .rodata 0x40000 : { *(.rodata .rodata.* .srodata .srodata.*) }
+    .rodata 0x40000 : { KEEP(*(.aledgent.generation)) *(.rodata .rodata.* .srodata .srodata.*) }
     .data (0x50000 + ((SIZEOF(.rodata) + 0xffff) & ~0xffff)) :
         { *(.data .data.* .sdata .sdata.*) }
     .bss ALIGN(0x1000) : { *(.bss .bss.* .sbss .sbss.* COMMON) }
