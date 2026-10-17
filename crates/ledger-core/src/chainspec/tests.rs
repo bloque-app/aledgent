@@ -245,8 +245,21 @@ fn a0023_the_header_names_the_genesis_code() {
         a.seed
             .clone()
             .with_code(GenesisCode {
-                manifest,
+                manifest: manifest.clone(),
                 construction: 1,
+            })
+            .unwrap_err(),
+        SpecError::Code
+    );
+    // T-037-01: the genesis code is H₀, generation 0; a later generation is not a genesis's.
+    let mut later = manifest;
+    later.generation = 1;
+    assert_eq!(
+        a.seed
+            .clone()
+            .with_code(GenesisCode {
+                manifest: later,
+                construction: 2,
             })
             .unwrap_err(),
         SpecError::Code

@@ -48,7 +48,9 @@ name: Images
 # On a pull request the same job is the test: the current release's core image is the genesis
 # (its manifest written by its own host's `code-manifest`), whose build must pass, and a copy of it
 # with one byte of `core.vos` changed (in a registry on the runner), and a genesis named by tag,
-# must each fail it. Without `genesis_image`, nothing above changes.
+# must each fail it. A release from before amendment 0033 (`T-037-01`: no platform in its manifest
+# and no code generation compiled into its package) cannot be a genesis for this host: then the test
+# is that the build refuses it. Without `genesis_image`, nothing above changes.
 
 on:
   pull_request:
@@ -600,6 +602,13 @@ jobs:
               --profile /w/profile.json --out /w/code.bin | tee "$RUNNER_TEMP/manifest.json"
             GENESIS_CODE=$(jq -er .version "$RUNNER_TEMP/manifest.json")
             rm "$code/profile.json" "$code/Cargo.lock"
+            # A release from before amendment 0033 (T-037-01) writes a manifest with no platform and
+            # no code generation, for a package that carries none compiled in: this host must refuse
+            # it (the next genesis's H0 is built with them), and the test below checks that instead.
+            if ! jq -e 'has("generation")' "$RUNNER_TEMP/manifest.json" > /dev/null; then
+              echo "before_0033=true" >> "$GITHUB_OUTPUT"
+              echo "::notice::release $tag's genesis predates amendment 0033 (no code generation): this host must refuse it" | tee -a "$GITHUB_STEP_SUMMARY"
+            fi
           else
             if ! [[ "$GENESIS_MANIFEST" =~ ^([0-9a-fA-F]{2})+$ ]]; then
               echo "::error::genesis_manifest: the deployment's genesis code manifest (aledgent/code/v1), in hex, is required"
@@ -632,7 +641,7 @@ jobs:
       # in the registry on the runner, so that the build pulls it by digest as it would a real one.
       - name: A tampered copy of the genesis
         id: tampered
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && steps.genesis.outputs.before_0033 != 'true'
         env:
           GENESIS: ${{ steps.genesis.outputs.image }}
         run: |
@@ -671,7 +680,11 @@ jobs:
 
       # Steps 1 to 3 of core.Dockerfile (the host), then the genesis bytes, checked. The host's
       # layers are the core job's (scope `core`) where nothing before them changed.
+      # Before amendment 0033 the genesis must fail this build (the last steps check it), so the
+      # step may fail then; its host layers stay in the builder's cache either way.
       - name: Build core on genesis
+        id: build
+        continue-on-error: ${{ steps.genesis.outputs.before_0033 == 'true' }}
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
@@ -692,6 +705,7 @@ jobs:
           tags: aledgent-core-on-genesis:ci
 
       - name: The image carries the genesis bytes and the current host
+        if: steps.genesis.outputs.before_0033 != 'true'
         env:
           GENESIS: ${{ steps.genesis.outputs.image }}
           ROOTS_GENESIS: ${{ steps.genesis.outputs.roots }}
@@ -729,7 +743,7 @@ jobs:
       # The pull request's refusals, from the builder's cache (the host is built): the tampered
       # copy fails the manifest check, and a genesis named by tag fails before it.
       - name: A tampered genesis, and one named by tag, fail the build
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && steps.genesis.outputs.before_0033 != 'true'
         env:
           TAMPERED: ${{ steps.tampered.outputs.image }}
           ROOTS_GENESIS: ${{ steps.genesis.outputs.roots }}
@@ -757,6 +771,34 @@ jobs:
           grep -F "by digest (<image>@sha256:<64 hex>), not '$by_tag'" "$RUNNER_TEMP/by-tag.log" \
             || { tail -100 "$RUNNER_TEMP/by-tag.log"; exit 1; }
           echo "- refused: a tampered genesis (\`$TAMPERED\`) and a genesis named by tag" >> "$GITHUB_STEP_SUMMARY"
+
+      # T-037-01: a genesis from before amendment 0033 has no code generation compiled in, and its
+      # manifest names no platform: this host refuses to build a core on it.
+      - name: A genesis from before amendment 0033 fails the build
+        if: github.event_name == 'pull_request' && steps.genesis.outputs.before_0033 == 'true'
+        env:
+          GENESIS: ${{ steps.genesis.outputs.image }}
+          ROOTS_GENESIS: ${{ steps.genesis.outputs.roots }}
+          CONTEXT: ${{ steps.genesis.outputs.context }}
+          CODE: ${{ steps.genesis.outputs.code }}
+          BUILD: ${{ steps.build.outcome }}
+        run: |
+          set -euo pipefail
+          if [ "$BUILD" != failure ]; then
+            echo "::error::a genesis from before amendment 0033 built (the build step's outcome: $BUILD)"; exit 1
+          fi
+          # Again, from the builder's cache (the host is built), for the refusal's own line.
+          if docker buildx build -f deploy/docker/core.Dockerfile --target core-on-genesis \
+              --platform linux/amd64 --progress plain \
+              --build-arg ROOTS="$ROOTS_GENESIS" --build-arg GENESIS_IMAGE="$GENESIS" \
+              --build-arg GENESIS_CODE="$CODE" \
+              --build-context genesis-code="$CONTEXT" . > "$RUNNER_TEMP/before-0033.log" 2>&1; then
+            cat "$RUNNER_TEMP/before-0033.log"
+            echo "::error::a genesis from before amendment 0033 built"; exit 1
+          fi
+          grep -F "not a code manifest of amendment 0033's format" "$RUNNER_TEMP/before-0033.log" \
+            || { tail -100 "$RUNNER_TEMP/before-0033.log"; exit 1; }
+          echo "- refused: a genesis from before amendment 0033 (\`$GENESIS\`), which carries no code generation" >> "$GITHUB_STEP_SUMMARY"
 
       # A dispatch from main or develop: pushed as `host-<commit>-on-genesis-<short>` only.
       - name: Push core on genesis

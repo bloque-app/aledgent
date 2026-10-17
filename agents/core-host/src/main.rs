@@ -170,8 +170,22 @@ fn main() {
             let key = ed25519_dalek::SigningKey::from_bytes(&[0x71; 32]);
             let pkg = package::actor_package(&elf, None, &key).expect("package");
             let pvm = package::link(&elf).expect("link");
+            // T-037-01: the build-time check of the compiled code generation. The ELF's record
+            // (`.aledgent.generation`, `ALEDGENT_CODE_GENERATION`) must be there once, and must
+            // survive linking: the package, which keeps no sections, carries the same one record.
+            let generation = match package::generation(&elf, &pkg) {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("aledgent-core-host: package: {e}");
+                    std::process::exit(1);
+                }
+            };
             std::fs::write(&args[3], &pkg).expect("write");
-            println!("package {} B, program {} B", pkg.len(), pvm.len());
+            println!(
+                "package {} B, program {} B, code generation {generation}",
+                pkg.len(),
+                pvm.len()
+            );
         }
         Some("smoke") if args.len() == 4 => smoke(&args[2], &args[3]),
         Some("measure") if args.len() >= 5 => measure::measure(&args),

@@ -550,7 +550,7 @@ pub enum SpecError {
     NotInSeed,
     /// The limits cannot hold one record.
     Limits,
-    /// The genesis code's construction is not one its manifest reads.
+    /// The genesis code's construction is not one its manifest reads, or its generation is not 0.
     Code,
     /// An imported credential set that is empty, too large, repeats a verifier or holds one not
     /// well formed.
@@ -802,8 +802,9 @@ impl ChainSpec {
         if self.header.version != SPEC_VERSION {
             return Err(SpecError::Version);
         }
+        // The genesis code is *H₀*: generation 0 (amendment 0033, D1), in a construction it reads.
         if let Some(c) = &self.header.code
-            && !c.manifest.constructions.contains(&c.construction)
+            && (!c.manifest.constructions.contains(&c.construction) || c.manifest.generation != 0)
         {
             return Err(SpecError::Code);
         }
