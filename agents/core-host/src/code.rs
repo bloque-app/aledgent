@@ -472,7 +472,8 @@ pub fn check(
 
 /// Refuse a chainspec of another format than [`SPEC_VERSION`]: this host founds and drives only
 /// books whose chainspec names amendment 0033's manifest. A book founded on format 4 is driven by
-/// the host it was founded with until it is re-founded; ingress and `opsctl` still read it.
+/// the host it was founded with until it is re-founded, and restored with the `opsctl` in that
+/// host's image; ingress still serves it, and `opsctl` from this line reads its chainspec.
 pub fn check_format(version: u16) -> Result<(), String> {
     if version != SPEC_VERSION {
         return Err(format!(

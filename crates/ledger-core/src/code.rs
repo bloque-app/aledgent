@@ -258,10 +258,11 @@ impl CodeManifest {
 
 /// Amendment 0023's first manifest layout (before amendment 0033): one VOS `ProgramId` per
 /// artefact, no platform and no code generation. Format-4 chainspecs carry it (the books founded
-/// before amendment 0033), and this build still **reads** it, so that every component that only
-/// reads a chainspec (ingress, `opsctl`) loads those books. Nothing drives a writer under it: the
-/// core host founds and drives only books whose chainspec names a [`CodeManifest`]
-/// (`chainspec::SPEC_VERSION`).
+/// before amendment 0033), and this build still **reads** it, so that ingress still serves those books
+/// and `opsctl` reads their chainspec. Nothing drives a writer under it: the core host founds and
+/// drives only books whose chainspec names a [`CodeManifest`] (`chainspec::SPEC_VERSION`). Nothing
+/// else of those books is read: their archives and exports are refused by their format, so they
+/// are restored with the `opsctl` inside their own pinned core image.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ManifestV4 {
     /// The writer it runs.

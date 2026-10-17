@@ -86,10 +86,11 @@ pub type SpecRef = alloc::rc::Rc<ChainSpec>;
 ///
 /// This build writes version 5 and reads versions 4 and 5 ([`readable`]): a version-4 chainspec,
 /// whose header names its code in amendment 0023's first layout ([`GenesisCodeV4`]), still loads
-/// in everything that only reads a chainspec (ingress, `opsctl`, the book's own genesis replay),
-/// with its digest and *H₀* as they were computed. Only the core host's founding and driving path
-/// requires version 5: a book founded on version 4 is driven by the host it was founded with until
-/// it is re-founded.
+/// wherever a chainspec is only read (ingress, which still serves those books; `opsctl`; the book's
+/// own genesis replay), with its digest and *H₀* as they were computed. Only the core host's
+/// founding and driving path requires version 5: a book founded on version 4 is driven by the host
+/// it was founded with until it is re-founded, and restored with the `opsctl` in that host's image,
+/// since this line refuses its archives and exports by their format.
 pub const SPEC_VERSION: u16 = 5;
 
 /// The chainspec format before amendment 0033's manifest, still read ([`SPEC_VERSION`]).
