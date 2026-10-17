@@ -10,7 +10,8 @@
 #
 #   version        (the default) `X.Y.Z`, the next release
 #   release-type   `major`, `minor` or `patch`: how the next release differs from the last, which
-#                  cargo-semver-checks takes as `--release-type` (.github/workflows/release-checks.yml)
+#                  cargo-semver-checks takes as `--release-type` (.github/workflows/release-checks.yml);
+#                  a minor release before 1.0.0 is given as `major`, the one that may break
 #   baseline       the last release's tag, or the configuration's `bootstrap-sha` before the first:
 #                  what cargo-semver-checks compares with (`--baseline-rev`)
 #
@@ -88,9 +89,17 @@ elif [ "$breaking" = 1 ] || [ "$feat" = 1 ]; then
 else
   next="$major.$minor.$((patch + 1))" type=patch
 fi
-# cargo-semver-checks reads a 0.y.z release as Cargo does: a minor bump there may break, so a
-# breaking change before 1.0.0 is a `minor` release-type, as release-please makes it.
+# Before 1.0.0 a minor release is the one that may break, as Cargo reads 0.y.z and release-please
+# makes it. cargo-semver-checks takes `--release-type minor` literally, as a release that may not
+# break (it refused a `feat` that changed ledger-core's API, #36), so the release-type it is given
+# for a minor release before 1.0.0 is `major`: what the header of release-checks.yml promises, "or a
+# `feat` before 1.0.0". A patch release is still checked as one.
+if [ "$type" = minor ] && [ "$major" = 0 ]; then
+  checked=major
+else
+  checked="$type"
+fi
 case "$print" in
   version) echo "$next" ;;
-  release-type) echo "$type" ;;
+  release-type) echo "$checked" ;;
 esac
