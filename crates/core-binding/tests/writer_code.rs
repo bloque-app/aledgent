@@ -7,6 +7,9 @@
 //! - The hot row stays bounded: the code fields add at most `MAX_CODE_BYTES`.
 //! - `driver` and `observed_slot` are host-local: a book driven under another principal and
 //!   another slot reaches the same roots, log hashes and anchor commitment.
+//! - `T-037-03`: a checkpoint made through the Agent binds the book's genesis, the hot row's code
+//!   and mode, and its construction (`v3`), and a host that rebuilds its replica from the archive
+//!   makes the same.
 
 mod common;
 use common::*;
@@ -61,14 +64,19 @@ fn named() -> (Fx<NativePort>, [u8; 32]) {
     named_on(NativePort::new())
 }
 
-fn named_on(port: NativePort) -> (Fx<NativePort>, [u8; 32]) {
-    let mut g = genesis();
-    let spec = spec_of(op(0), 1, g.assets.clone(), 4, ChunkLimits::DEFAULT)
+/// The chainspec of [`named`]'s book.
+fn spec() -> ledger_core::chainspec::ChainSpec {
+    spec_of(op(0), 1, genesis().assets, 4, ChunkLimits::DEFAULT)
         .with_code(GenesisCode {
             manifest: manifest(),
             construction: ledger_core::anchor::construction(),
         })
-        .unwrap();
+        .unwrap()
+}
+
+fn named_on(port: NativePort) -> (Fx<NativePort>, [u8; 32]) {
+    let mut g = genesis();
+    let spec = spec();
     let h0 = manifest().version();
     g.chainspec = Some(spec.commitment());
     g.spec = Some(std::sync::Arc::new(spec));
@@ -183,9 +191,66 @@ fn t037_02_an_earlier_layout_is_refused_by_its_layout() {
     assert!(e.contains("layout 2"), "{e}");
 }
 
+/// `T-037-03`, `REQ-RT-15`: a checkpoint the Agent makes binds the book's genesis (its chainspec's
+/// seed digest), the code version and the mode its hot row holds, and its construction; its anchor
+/// commitment is the `v3` one over them, and a disclosure verifier recomputes it. A host that
+/// rebuilds its replica from the archive (`Driver::recover`, each input under the code its entry
+/// names) stands where the Agent does.
+#[test]
+fn t037_03_a_checkpoint_through_the_agent_binds_code_construction_and_mode() {
+    let (archive, c, h) = drive(NativePort::new());
+    let (_, h0) = named();
+    let b = c.binding.expect("a v3 checkpoint");
+    assert_eq!(b.code, h0);
+    assert_eq!(b.code, h.code);
+    assert_eq!(b.authority, h.authority);
+    assert_eq!(b.genesis, spec().commitment().digest);
+    assert_eq!(c.construction, h.construction);
+    assert!(c.consistent());
+    assert_eq!(
+        c.commitment,
+        ledger_core::anchor::commitment_v3(
+            c.construction,
+            &b,
+            c.instance,
+            c.number,
+            c.entry_sequence,
+            &c.kernel_root
+        )
+    );
+    assert!(!archive.is_empty());
+    // A host that lost its replica rebuilds it from the archive, each input under the code its
+    // entry names: it reaches the Agent's roots (the checkpoint's leaf among them) and the same
+    // checkpoint, and runs the next inputs under the hot row's code.
+    let (fx, made) = drive_book(NativePort::new());
+    let mut archive = fx.archive.clone();
+    let mut g = genesis();
+    let s = spec();
+    g.chainspec = Some(s.commitment());
+    g.spec = Some(std::sync::Arc::new(s));
+    let port = fx.driver.into_port();
+    let (driver, replica) =
+        core_binding::host::Driver::recover(port, keys(), g, op(0), 1, &mut archive).unwrap();
+    assert_eq!(driver.code(), h0);
+    assert_eq!(replica.code_binding(), b);
+    let rebuilt = replica
+        .state()
+        .anchoring()
+        .checkpoint(made.number)
+        .copied()
+        .unwrap();
+    assert_eq!(rebuilt, made);
+}
+
 /// The book the host-local test drives: a funded account, a settlement configuration, and an
 /// on-demand checkpoint. Answers the archive and the checkpoint.
 fn drive(port: NativePort) -> (Vec<RingEntry>, Checkpoint, Hot) {
+    let (mut fx, c) = drive_book(port);
+    let h = hot(&mut fx);
+    (fx.archive, c, h)
+}
+
+fn drive_book(port: NativePort) -> (Fx<NativePort>, Checkpoint) {
     let (mut fx, _) = named_on(port);
     let _ = fx.funded(500);
     let ctx = fx.ctx(fx.operator());
@@ -237,8 +302,7 @@ fn drive(port: NativePort) -> (Vec<RingEntry>, Checkpoint, Hot) {
         .value
         .expect("a checkpoint");
     fx.synced();
-    let h = hot(&mut fx);
-    (fx.archive, c, h)
+    (fx, c)
 }
 
 /// T-037-02, `REQ-RT-19`: `driver` and `observed_slot` are the only host-local fields. A book

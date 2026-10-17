@@ -5,8 +5,10 @@
 //!
 //! The assembler ([`crate::cut::Assembler`]) picks one record per shard and the registry's at a
 //! consistent cut; the anchor commits to all of them: a binary Merkle tree whose leaves are, in
-//! shard order, `blake2b-256("aledgent/anchor/shard/v2" ‖ shard ‖ seq ‖ commit ‖ root ‖ heads)`
-//! (the shard's audit sequence, kernel commit and root, and the digest of its stream heads), then
+//! shard order, `blake2b-256("aledgent/anchor/shard/v3" ‖ shard ‖ seq ‖ commit ‖ root ‖ heads ‖
+//! construction ‖ code ‖ authority)` (the shard's audit sequence, kernel commit and root, the
+//! digest of its stream heads, and, since `v3` (`T-037-03`, `DEC-26` (a)), the construction of its
+//! state commitment, its code version and its upgrade-authority mode's digest), then
 //! `blake2b-256("aledgent/anchor/registry/v1" ‖ seq ‖ version ‖ digest)`, padded with the zero
 //! hash to a power of two, nodes `blake2b-256("aledgent/anchor/node/v1" ‖ left ‖ right)`. A
 //! disclosure proves a fact against its shard's root (CipherClerk's tree) and that root against
@@ -19,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::ShardId;
 
-const SHARD: &[u8] = b"aledgent/anchor/shard/v2";
+const SHARD: &[u8] = b"aledgent/anchor/shard/v3";
 const REGISTRY: &[u8] = b"aledgent/anchor/registry/v1";
 const NODE: &[u8] = b"aledgent/anchor/node/v1";
 
@@ -36,6 +38,12 @@ pub struct ShardRoot {
     pub root: [u8; 32],
     /// The digest of its stream heads at that commit ([`crate::cut::Heads::digest`]).
     pub heads: [u8; 32],
+    /// The construction of its state commitment (`REQ-PR-10`, `T-037-03`).
+    pub construction: u8,
+    /// Its code version (`REQ-RT-15`, `T-037-03`).
+    pub code: [u8; 32],
+    /// The digest of its upgrade-authority mode (`REQ-RT-18`, `T-037-03`).
+    pub authority: [u8; 32],
 }
 
 /// The registry's state at the cut: the principals Agent's version, and the digest of its feed
@@ -69,6 +77,9 @@ fn leaf(l: &Leaf) -> [u8; 32] {
                 &r.commit.to_be_bytes(),
                 &r.root,
                 &r.heads,
+                &[r.construction],
+                &r.code,
+                &r.authority,
             ],
         ),
         Leaf::Registry(r) => blake2b_256(
@@ -145,6 +156,9 @@ mod tests {
                     commit: u64::from(i) * 3,
                     root: [i as u8; 32],
                     heads: [0xA0 | i as u8; 32],
+                    construction: 2,
+                    code: [0xC0 | i as u8; 32],
+                    authority: [0xD0; 32],
                 })
             })
             .collect();
@@ -187,5 +201,27 @@ mod tests {
             r.heads[0] ^= 1;
         }
         assert_ne!(anchor(&l), anchor(&s));
+    }
+
+    /// `T-037-03`: a shard's leaf binds its code, construction and mode, so the anchor over every
+    /// shard does: another code, construction or mode for one shard is another anchor, and its
+    /// leaf does not prove against the first.
+    #[test]
+    fn t037_03_the_shard_leaf_binds_code_construction_and_mode() {
+        let l = leaves(4);
+        let a = anchor(&l);
+        let p = prove(&l, 2);
+        for f in [
+            |r: &mut ShardRoot| r.code[0] ^= 1,
+            |r: &mut ShardRoot| r.construction ^= 3,
+            |r: &mut ShardRoot| r.authority[0] ^= 1,
+        ] {
+            let mut s = l.clone();
+            if let Leaf::Shard(r) = &mut s[2] {
+                f(r);
+            }
+            assert_ne!(anchor(&s), a);
+            assert!(!verify(&a, &s[2], &p));
+        }
     }
 }

@@ -193,6 +193,13 @@ const SURFACE: &[(&str, &str)] = &[
     // book: they turn the recorder on and hand back what it holds.
     ("record_calls", "turns call recording on or off (F-005)"),
     ("take_calls", "takes the recorded calls (F-005)"),
+    // T-037-03: the writer's code version and mode, from its hot row, which a checkpoint binds.
+    // Not service state and no write: it changes what the next checkpoint's commitment binds,
+    // never a balance, a record or a leaf.
+    (
+        "set_code",
+        "names the writer's code version and mode a checkpoint binds (T-037-03)",
+    ),
     // T-031-19: when the kernel's leaves are committed, not what is written. Every command still
     // decides alone, through the command surface; these only group the kernel's commits.
     (

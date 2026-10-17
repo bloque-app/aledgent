@@ -33,7 +33,7 @@ use super::{Accepted, Ctx, Ledger};
 use crate::account::Time;
 use crate::anchor::{
     AnchorIncident, AnchorOutbox, AnchorWrite, Checkpoint, CheckpointStatus, Comparison,
-    PositionCut, PositionRow, commitment,
+    PositionCut, PositionRow, commitment_v3,
 };
 use crate::asset::{AssetId, Minor};
 use crate::audit::AuditSubject;
@@ -81,18 +81,17 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
         // Read in the same state as `last`: nothing is written between the two reads.
         let kernel_root = self.book.root().map_err(|_| Refusal::NotAuthorised)?;
         let number = store.latest().map_or(1, |c| c.number + 1);
+        // `v3` (`T-037-03`): the genesis, the code and the mode, beside the construction.
+        let construction = crate::anchor::construction();
+        let binding = self.code_binding();
         Ok(Some(Checkpoint {
             number,
             instance,
             entry_sequence: last,
             kernel_root,
-            commitment: commitment(
-                crate::anchor::construction(),
-                instance,
-                number,
-                last,
-                &kernel_root,
-            ),
+            construction,
+            binding: Some(binding),
+            commitment: commitment_v3(construction, &binding, instance, number, last, &kernel_root),
             created_at: now,
             status: CheckpointStatus::Pending,
             coordinate: None,

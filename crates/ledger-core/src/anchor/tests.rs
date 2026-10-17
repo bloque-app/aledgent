@@ -14,6 +14,8 @@ fn cp(number: u64, entry_sequence: u64) -> Checkpoint {
         instance: 1,
         entry_sequence,
         kernel_root,
+        construction: super::construction(),
+        binding: None,
         commitment: commitment(
             super::construction(),
             1,

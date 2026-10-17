@@ -28,6 +28,12 @@
 //! Version 3 (`REQ-PR-10`, `DEC-25`) names the construction of the checkpoint's state commitment, one
 //! byte right after the checkpoint's commitment. Versions 1 and 2 have no such field: their
 //! checkpoints are construction 1 (CipherClerk's full-depth trees).
+//!
+//! Version 4 (`T-037-03`, `REQ-RT-15`) names the checkpoint's code binding right after the
+//! construction: a presence byte, then the book's genesis, the code version and the
+//! upgrade-authority mode's digest ([`crate::CodeBinding`]), which a `v3` commitment binds
+//! ([`crate::commitment_v3`]). A checkpoint without one is a `v2` checkpoint, whose commitment is the
+//! `v2` form. Versions 1 to 3 have no such field, and their checkpoints are all `v2` (or `v1`).
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -38,8 +44,11 @@ use crate::source::Venue;
 /// The bytes every disclosure starts with.
 pub const MAGIC: &[u8] = b"aledgent-disclosure";
 
-/// The envelope version this crate writes. It also reads [`VERSION_1`] and [`VERSION_2`].
-pub const VERSION: u8 = 3;
+/// The envelope version this crate writes. It also reads [`VERSION_1`] to [`VERSION_3`].
+pub const VERSION: u8 = 4;
+
+/// The third envelope version: a construction, no code binding (a `v2` checkpoint).
+pub const VERSION_3: u8 = 3;
 
 /// The second envelope version: a venue, no construction (construction 1).
 pub const VERSION_2: u8 = 2;
@@ -195,6 +204,24 @@ pub struct CheckpointRef {
     /// The construction of the state commitment (`REQ-PR-10`): [`crate::CONSTRUCTION_V1`] or
     /// [`crate::CONSTRUCTION_V2`]. Bound by the commitment.
     pub construction: u8,
+    /// What a `v3` checkpoint binds beside: the book's genesis, the code version and the mode
+    /// (`T-037-03`). `None` for a `v2` checkpoint, and in envelopes before version 4.
+    pub binding: Option<crate::CodeBinding>,
+}
+
+impl CheckpointRef {
+    /// The commitment its fields produce, under the deployment's `instance`, in the form it names
+    /// ([`crate::checkpoint_commitment`]).
+    pub fn recomputed(&self, instance: u32) -> [u8; 32] {
+        crate::checkpoint_commitment(
+            self.construction,
+            self.binding.as_ref(),
+            instance,
+            self.number,
+            self.entry_sequence,
+            &self.kernel_root,
+        )
+    }
 }
 
 /// What kind of proof a disclosure is (`REQ-PR-6`, `REQ-AR-6`).
@@ -423,8 +450,18 @@ impl Disclosure {
             .u64(c.entry_sequence)
             .raw(&c.kernel_root)
             .raw(&c.commitment);
-        if self.version >= VERSION {
+        if self.version >= VERSION_3 {
             w.u8(c.construction);
+        }
+        if self.version >= VERSION {
+            match &c.binding {
+                None => {
+                    w.u8(0);
+                }
+                Some(b) => {
+                    w.u8(1).raw(&b.genesis).raw(&b.code).raw(&b.authority);
+                }
+            }
         }
         let a = &self.assurance;
         w.raw(&a.declaration_digest).text(&a.summary);
@@ -462,7 +499,7 @@ impl Disclosure {
         }
         r.0 = &r.0[MAGIC.len()..];
         let version = r.u8()?;
-        if version != VERSION && version != VERSION_2 && version != VERSION_1 {
+        if !(VERSION_1..=VERSION).contains(&version) {
             return Err(FormatError("unknown version"));
         }
         let instance = r.u32()?;
@@ -488,9 +525,21 @@ impl Disclosure {
             kernel_root: r.take()?,
             commitment: r.take()?,
             construction: crate::CONSTRUCTION_V1,
+            binding: None,
         };
-        if version >= VERSION {
+        if version >= VERSION_3 {
             checkpoint.construction = r.u8()?;
+        }
+        if version >= VERSION {
+            checkpoint.binding = match r.u8()? {
+                0 => None,
+                1 => Some(crate::CodeBinding {
+                    genesis: r.take()?,
+                    code: r.take()?,
+                    authority: r.take()?,
+                }),
+                _ => return Err(FormatError("code binding")),
+            };
         }
         let declaration_digest = r.take()?;
         let summary = r.text()?;
@@ -556,6 +605,11 @@ pub(crate) mod tests {
                 kernel_root: [1; 32],
                 commitment: [2; 32],
                 construction: crate::CONSTRUCTION_V2,
+                binding: Some(crate::CodeBinding {
+                    genesis: [0x0A; 32],
+                    code: [0x0B; 32],
+                    authority: [0x0C; 32],
+                }),
             },
             assurance: Assurance {
                 declaration_digest: [4; 32],
@@ -586,10 +640,10 @@ pub(crate) mod tests {
             Err(FormatError("trailing bytes"))
         );
         assert!(Disclosure::from_bytes(&b[..b.len() - 1]).is_err());
-        let mut v4 = b.clone();
-        v4[MAGIC.len()] = 4;
+        let mut v5 = b.clone();
+        v5[MAGIC.len()] = 5;
         assert_eq!(
-            Disclosure::from_bytes(&v4),
+            Disclosure::from_bytes(&v5),
             Err(FormatError("unknown version"))
         );
         assert!(Disclosure::from_bytes(b"not a disclosure").is_err());
@@ -623,8 +677,9 @@ pub(crate) mod tests {
             ..sample()
         };
         v1.checkpoint.construction = crate::CONSTRUCTION_V1;
+        v1.checkpoint.binding = None;
         let bytes = v1.to_bytes();
-        assert_eq!(bytes.len(), b.len() - 34);
+        assert_eq!(bytes.len(), b.len() - 34 - 97);
         let back = Disclosure::from_bytes(&bytes).unwrap();
         assert_eq!(back, v1);
         assert_eq!(back.to_bytes(), bytes);
@@ -645,10 +700,48 @@ pub(crate) mod tests {
             ..sample()
         };
         v2.checkpoint.construction = crate::CONSTRUCTION_V1;
+        v2.checkpoint.binding = None;
         let bytes = v2.to_bytes();
-        assert_eq!(bytes.len(), b.len() - 1);
+        assert_eq!(bytes.len(), b.len() - 1 - 97);
         let back = Disclosure::from_bytes(&bytes).unwrap();
         assert_eq!(back, v2);
         assert_eq!(back.to_bytes(), bytes);
+    }
+
+    /// `T-037-03`: version 4 names the checkpoint's code binding after its construction, a `v2`
+    /// checkpoint names none, and version 3 still reads, as a `v2` checkpoint, to its own bytes.
+    #[test]
+    fn t037_03_the_envelope_names_the_code_binding_and_still_reads_version_3() {
+        let d = sample();
+        let b = d.to_bytes();
+        assert_eq!(Disclosure::from_bytes(&b), Ok(d.clone()));
+        let none = Disclosure {
+            checkpoint: CheckpointRef {
+                binding: None,
+                ..d.checkpoint
+            },
+            ..sample()
+        };
+        let nb = none.to_bytes();
+        assert_eq!(nb.len(), b.len() - 96);
+        assert_eq!(Disclosure::from_bytes(&nb), Ok(none.clone()));
+        // The presence byte is where the two encodings first differ; neither 0 nor 1 is refused.
+        let at = b.iter().zip(&nb).position(|(x, y)| x != y).unwrap();
+        assert_eq!((b[at], nb[at]), (1, 0));
+        let mut bad = nb.clone();
+        bad[at] = 2;
+        assert_eq!(
+            Disclosure::from_bytes(&bad),
+            Err(FormatError("code binding"))
+        );
+        let v3 = Disclosure {
+            version: VERSION_3,
+            ..none
+        };
+        let v3b = v3.to_bytes();
+        assert_eq!(v3b.len(), nb.len() - 1);
+        let back = Disclosure::from_bytes(&v3b).unwrap();
+        assert_eq!(back, v3);
+        assert_eq!(back.to_bytes(), v3b);
     }
 }

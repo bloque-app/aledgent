@@ -12,7 +12,7 @@ use crate::anchor::disclosure::{
     Assertion, BalanceKind, Bound, DisclosureRequest, FlowDirection, Recipient,
 };
 use crate::anchor::{
-    AnchorIncident, AnchorWrite, CheckpointStatus, PositionCut, SIGNED_ASSERTION_LABEL,
+    AnchorIncident, AnchorWrite, Checkpoint, CheckpointStatus, PositionCut, SIGNED_ASSERTION_LABEL,
 };
 use crate::audit::{AuditClass, AuditSubject};
 use crate::export::Leaves;
@@ -286,8 +286,11 @@ proptest! {
         let c = ax.fx.ledger.state().anchoring().checkpoint(1).copied().unwrap();
         let leaves = leaves_through(&ax.fx, c.entry_sequence);
         prop_assert_eq!(leaves.root(), c.kernel_root);
+        // `v3` (`T-037-03`): the binding is the ledger's, and the commitment its fields' own.
+        let binding = c.binding.unwrap();
+        prop_assert_eq!(binding, ax.fx.ledger.code_binding());
         prop_assert_eq!(
-            verify::commitment(crate::anchor::construction(), 1, 1, c.entry_sequence, &leaves.root()),
+            verify::commitment_v3(crate::anchor::construction(), &binding, 1, 1, c.entry_sequence, &leaves.root()),
             c.commitment
         );
         // Any change to an entry up to S changes the root and the commitment.
@@ -296,7 +299,7 @@ proptest! {
             let t = changed.transfers.get_mut(&seq).unwrap();
             t.entries[0].amount.0[0] ^= 1;
             prop_assert_ne!(changed.root(), c.kernel_root);
-            prop_assert_ne!(verify::commitment(crate::anchor::construction(), 1, 1, c.entry_sequence, &changed.root()), c.commitment);
+            prop_assert_ne!(verify::commitment_v3(crate::anchor::construction(), &binding, 1, 1, c.entry_sequence, &changed.root()), c.commitment);
         }
         // Entries after S change nothing the checkpoint holds.
         for (a, amount) in after {
@@ -326,6 +329,96 @@ fn req_rt_1_a_checkpoint_and_its_instruction_commit_together() {
     assert_eq!(out.instruction, Some((c.instruction(), false)));
     assert!(c.consistent());
     assert_eq!(c.status, CheckpointStatus::Pending);
+}
+
+/// `T-037-03`, `REQ-RT-15`: a checkpoint and its anchor bind the code, the construction and the
+/// mode. Each checkpoint carries the writer's code version and mode as [`Ledger::set_code`] gave
+/// them, with the book's genesis and its own construction; its commitment is the `v3` one over
+/// exactly those; it is consistent in its own construction; and a disclosure resting on it names
+/// them, and verifies offline, while one naming another code does not.
+#[test]
+fn t037_03_a_checkpoint_and_its_anchor_bind_code_construction_and_mode() {
+    let mut ax = Ax::new();
+    let (h0, mode) = ([0xC0; 32], [0xA0; 32]);
+    ax.fx.ledger.set_code(h0, mode);
+    funded(&mut ax.fx, 100);
+    assert_eq!(ax.tick(50), Some(1));
+    let c = ax
+        .fx
+        .ledger
+        .state()
+        .anchoring()
+        .checkpoint(1)
+        .copied()
+        .unwrap();
+    let b = c.binding.expect("a v3 checkpoint");
+    assert_eq!((b.code, b.authority), (h0, mode));
+    // A book founded without a chainspec has no seed digest to bind.
+    assert_eq!(b.genesis, [0; 32]);
+    assert_eq!(c.construction, crate::anchor::construction());
+    assert!(c.consistent());
+    assert_eq!(
+        c.commitment,
+        verify::commitment_v3(
+            c.construction,
+            &b,
+            c.instance,
+            1,
+            c.entry_sequence,
+            &c.kernel_root
+        )
+    );
+    // Not the `v2` commitment of the same checkpoint.
+    assert_ne!(
+        c.commitment,
+        verify::commitment(
+            c.construction,
+            c.instance,
+            1,
+            c.entry_sequence,
+            &c.kernel_root
+        )
+    );
+    // Its fields bind it: another code, mode or construction is inconsistent.
+    for f in [
+        |c: &mut Checkpoint| c.binding.as_mut().unwrap().code[0] ^= 1,
+        |c: &mut Checkpoint| c.binding.as_mut().unwrap().authority[0] ^= 1,
+        |c: &mut Checkpoint| c.binding.as_mut().unwrap().genesis[0] ^= 1,
+        |c: &mut Checkpoint| c.construction ^= 3,
+        |c: &mut Checkpoint| c.binding = None,
+    ] {
+        let mut t = c;
+        f(&mut t);
+        assert!(!t.consistent());
+    }
+    // A `v2` checkpoint, as one made before `v3`, still checks in its own form.
+    let v2 = Checkpoint {
+        binding: None,
+        commitment: verify::commitment(
+            c.construction,
+            c.instance,
+            1,
+            c.entry_sequence,
+            &c.kernel_root,
+        ),
+        ..c
+    };
+    assert!(v2.consistent());
+    // The next checkpoint binds the code in force when it is made.
+    ax.fx.ledger.set_code([0xC1; 32], mode);
+    ax.finalise(1);
+    funded(&mut ax.fx, 7);
+    assert_eq!(ax.tick(10_000_000), Some(2));
+    let c2 = ax
+        .fx
+        .ledger
+        .state()
+        .anchoring()
+        .checkpoint(2)
+        .copied()
+        .unwrap();
+    assert_eq!(c2.binding.unwrap().code, [0xC1; 32]);
+    assert!(c2.consistent());
 }
 
 #[test]
