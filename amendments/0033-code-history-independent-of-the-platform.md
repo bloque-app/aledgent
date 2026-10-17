@@ -7,8 +7,8 @@ SPDX-License-Identifier: CC-BY-4.0
 
 **Status:** **ruled by the owner on 2026-10-17** ("the briefing is good enough, you have my okay"), on the
 briefing this amendment writes down. The design decisions in §"The architect's decisions" were taken on the
-same day under that approval, after two independent reviews of the draft (#35): D1 to D7 after the
-first, D8 to D14 after the second. **Applied** to `SPEC.md` **v0.4.27**, to `PLAN.md` `DEC-26`, and to
+same day under that approval, after three independent reviews of the draft (#35): D1 to D7 after the
+first, D8 to D14 after the second, D15 to D18 after the third. **Applied** to `SPEC.md` **v0.4.27**, to `PLAN.md` `DEC-26`, and to
 `F-036` and `F-037`, in the same pass. The new acceptance criteria are registered as pending
 (`crates/conformance/src/cases/f037.rs`), as amendment 0023's were.
 **Target:** `SPEC.md` v0.4.26 as on `develop` (amendment 0032 applied).
@@ -184,6 +184,44 @@ D8 to D14 on the same day, under the same approval.
   decided the same by either generation (`AC-K7.18`); a second archive entry at one input number refused
   (`AC-K7.19`). `AC-K7.13` and `AC-K7.14` gain the runtime check, the resume and the failed check.
 
+The third review found four places where these rules met each other badly. A continuation had its own writer
+identity, so "each input number once" could miss its entries. A way-out input queued at the founding could
+trap the continuation on a platform with no older code. The reinstall after a way-out input was not covered
+by the switch's own rules. And the fence's number was not tied to the section's. The architect took D15 to
+D18 on the same day, under the same approval.
+
+- **D15 — Entries are keyed by the logical writer, and the boundary is claimed once.**
+  - Archive entries are keyed by the **logical writer**, never by the instance that runs it. The logical
+    writer is the same identity the founding key uses. A first writer and its continuation therefore share
+    one key space per input number.
+  - The input number *n* at which an upgrade is scheduled is **claimed** once, by a conditional create of
+    one key per (genesis, logical writer, *n*). The founding record is written as that claim. The first
+    writer's archiver creates its own claim at the same key before it archives the first writer's entry at
+    *n*.
+  - Whichever create lands first wins. If the first writer's claim landed first, the founding finds it,
+    writes nothing and founds nothing, and the first writer continues. If the founding landed first, the
+    first writer's entry at *n* is refused, and so never acknowledged.
+  - A replay that finds both a founding record and a first writer's entry at one *n* refuses the log. If these
+    rules hold, that cannot happen.
+- **D16 — No founding over a queued way-out input; after it, the upgrade is final.**
+  - No founding is made while the next input queued for the writer is a way-out input. The founding waits
+    until the first writer has decided that input.
+  - Once a founding record exists, a way-out input is refused everywhere, with `ERR-InvalidTransition`. The
+    feed refuses it before sending it. The continuation's code refuses it too, because its writer state
+    records that it was founded as a continuation at *n*. The upgrade is final.
+- **D17 — The switch rule is symmetric.**
+  - Before each input, the execution node installs the code version that the code map names for that input.
+    That is a newer generation after an upgrade, and generation *g* again after a way-out input at *n*.
+  - The start check does the same: it installs what the code map names instead of refusing, and refuses only
+    when it cannot.
+  - The signer's grant covers every such install, the reinstall included.
+- **D18 — One number, and the way-out rule checked before it runs.**
+  - The fence compares the exact value in `.aledgent.generation`. The exported symbol is that section's
+    record, defined once in `ledger-core`, and the guest reads it through the same layout as
+    `generation_of`.
+  - The `code-history` gate checks, for every staged *H*, that *H* decides each way-out input exactly as
+    generation *g* does, on fixture inputs. A deviation is caught in staging and CI, not only by replay.
+
 ## What does not change
 
 - `REQ-RT-15`, `REQ-RT-17`, `REQ-RT-18`, `REQ-PR-11` and `NFR-22` stand as amendment 0023 applied them.
@@ -271,6 +309,9 @@ After "A change of build settings alone is an upgrade":
 > - The code that executes a writer's inputs MUST change from the old code version to *H* in one step, taken
 >   after input *n* − 1 has committed and before input *n* is executed. A step that fails leaves the old code
 >   in force, and is retried.
+> - **The switch is symmetric.** Before each input, the execution node MUST have installed the code version
+>   that the code map, as derived from the inputs committed so far, names for that input. That is *H* from
+>   *n* after an upgrade, and the old code version again after a move or cancellation at *n*.
 > - **The fence.** Code MUST refuse every input unless its own generation equals the writer's generation in
 >   force, or, for an input numbered at or after a scheduled upgrade's *n*, equals that generation plus one.
 >   The rule holds at every input, whether or not an upgrade is scheduled. A refused input changes nothing and
@@ -288,15 +329,18 @@ After "A change of build settings alone is an upgrade":
 > - The code map MUST be derived from the upgrade inputs and the inputs that move or cancel them, alone
 >   (`REQ-RT-17`), so that replay gives every input the generation that decided it.
 > - **What the fence cannot see.** When it starts, and at every switch, the execution node that drives a writer
->   MUST check that every artefact it runs for the writer is the one the code version of the current range
->   names, by digest, and MUST refuse to drive the writer otherwise. This covers any part of the code that the
->   platform supplies apart from the code that carries the generation, such as the runtime that executes it.
+>   MUST check every artefact it runs for the writer, by digest, against the code version the code map names
+>   for the next input. Where any differs, it MUST install that code version, and it MUST NOT drive the writer
+>   with anything else. If it cannot install it, it MUST refuse to drive the writer. This covers any part of
+>   the code that the platform supplies apart from the code that carries the generation, such as the runtime
+>   that executes it.
 > - How long a writer has been fenced MUST be continuously observable (`NFR-11`), and an alert MUST be raised
 >   when it exceeds a bound that the deployment states.
 > - The authority that decides an upgrade MUST be the writer's upgrade-authority mode, checked by the writer
 >   in its own order (`REQ-RT-18`). Whatever authority a platform has to install or replace programs MUST NOT
->   by itself authorise an upgrade. The execution node that drives the writer MUST take the step only towards
->   the code version an authorised upgrade names, and only at the input it names.
+>   by itself authorise an upgrade. The execution node that drives the writer MUST install only the code
+>   version that the code map names for the next input, so that every install follows from an input the
+>   writer committed under that mode.
 
 > **Limits, stated plainly.** Someone who holds a platform's own authority to install programs can still
 > install other code than the book names. The book cannot stop that. What it guarantees is that every input
@@ -304,7 +348,9 @@ After "A change of build settings alone is an upgrade":
 > input whose archived outcome other code produced. The operator keeps the platform's install authority as
 > it keeps its other keys (`NFR-8`). The fence identifies code up to its generation only: two builds of one
 > generation look the same to it. That the bytes running are the code version's own is the execution node's
-> check, by digest, before the switch and when it starts. The fence fails closed: a switch that cannot be
+> check, by digest, before the switch and when it starts. That a new code version decides a move or
+> cancellation exactly as the old one does is a property of its code. It is checked on fixture inputs before
+> the version is staged, and replay shows any deviation. The fence fails closed: a switch that cannot be
 > made stops the writer until it is made, or until the upgrade is moved or cancelled.
 
 ## R5 — `REQ-RT-21` (new): a writer continued on another platform
@@ -320,18 +366,31 @@ After "A change of build settings alone is an upgrade":
 >   writer state when it is founded MUST equal the first writer's after input *n* − 1, field by field. Every
 >   check of the founding MUST pass before its founding record is written, and every replay checks it again.
 >   A founding that fails a check writes no record and founds nothing.
+> - A founding MUST NOT be made while the next input queued for the writer moves or cancels the upgrade.
+>   The founding waits until the first writer has decided that input.
 > - The founding record MUST be written before input *n* is sent to either writer. From then on, every input
->   from *n* goes to the continuation alone. Before it sends an input numbered *n* or later to the first
->   writer, the execution node MUST check that no founding record exists at *n*.
+>   from *n* goes to the continuation alone, and the upgrade is final: an input that moves or cancels it MUST
+>   be refused with `ERR-InvalidTransition`, by the execution node before it is sent and by the continuation
+>   if it reaches it. Before it sends an input numbered *n* or later to the first writer, the execution node
+>   MUST check that no founding record exists at *n*.
+> - The continuation's writer state records that it was founded as a continuation at *n*. That record is the
+>   one field the first writer's state does not have, and equality covers every other field.
 > - There MUST be at most one continuation of a writer at an input number. Its founding record MUST be written
 >   once, under a key derived from the book's genesis, the writer and *n*. A write that finds the same record
 >   there, byte for byte, is a resume of the same founding and succeeds. One that finds a different record
 >   MUST be refused. A replay MUST refuse a log with two founding records at one *n*. Founding MUST be
 >   deterministic: the same writer state gives the same founding record. Only one execution node may feed a
 >   writer's inputs at a time, so that a retried founding cannot run beside the first.
-> - The archive of a writer's inputs MUST accept each input number once: an entry at a number it already holds
->   MUST be refused. Two entries at one input number, at the first writer and at the continuation, therefore
->   cannot both be archived.
+> - The archive MUST key a writer's inputs by the **logical writer**, the identity the founding key uses, never
+>   by the instance that runs it, so that a first writer and its continuation share one sequence of input
+>   numbers. It MUST accept each input number of a logical writer once: an entry at a number it already holds
+>   MUST be refused.
+> - The input number at which an upgrade is scheduled MUST be claimed once, for one writer. The founding
+>   record is the continuation's claim. The first writer's archive entry at that number MUST be preceded by the
+>   first writer's claim at the same key. Whichever claim is made first stands, and the other MUST be refused.
+>   A founding refused this way founds nothing, and the first writer continues.
+> - A replay MUST refuse a log that holds both a founding record and a first writer's entry at one input
+>   number.
 > - The continuation's first input is *n*, and its log entry MUST chain to the log head of input *n* − 1. The
 >   book keeps its genesis, its construction and its anchor sequence. A continuation is not a new genesis
 >   (`REQ-RC-6`), not a migration of construction (`REQ-PR-11`), and not an export and import (`REQ-RC-3`).
@@ -363,8 +422,10 @@ After "A change of build settings alone is an upgrade":
 >   different record is attempted, Then it is refused and nothing is founded; When a founding's writer state
 >   differs from the first writer's after *n* − 1 in any field that is not host-local, Then no record is
 >   written, nothing is founded, and a corrected founding can still be made; When a founding is retried after
->   a crash and finds its own record, byte for byte, Then it resumes; and When a log holds two founding
->   records at one *n*, Then its replay is refused (`REQ-RT-21`).
+>   a crash and finds its own record, byte for byte, Then it resumes; When the next queued input moves or
+>   cancels the upgrade, Then no founding is made until the first writer has decided it; When a founding
+>   record exists, Then an input that moves or cancels the upgrade is refused with `ERR-InvalidTransition`;
+>   and When a log holds two founding records at one *n*, Then its replay is refused (`REQ-RT-21`).
 > - `AC-K7.15` Given a range whose replayer the code archive holds, When the platform's execution of that
 >   range is checked with it, Then every input reaches its archived log hash; and When that replayer is
 >   replaced, Then no code version changes (`REQ-RT-19`).
@@ -380,9 +441,11 @@ After "A change of build settings alone is an upgrade":
 >   the switch was already made, Then both commit the same outcome: the upgrade does not take effect at *n*
 >   and the generation stays the old one; and a replay assigns every input the generation the code map,
 >   read from the inputs alone, names (`REQ-RT-20`, `REQ-RT-17`).
-> - `AC-K7.19` Given a writer whose input *n* is archived, When a second entry numbered *n* reaches the
->   archive, among them a move or cancellation committed at a first writer after its continuation took *n*,
->   Then it is refused (`REQ-RT-21`).
+> - `AC-K7.19` Given a logical writer whose input *n* is archived, When a second entry numbered *n* reaches
+>   the archive, Then it is refused; and Given an upgrade scheduled from *n*, When a move or cancellation
+>   committed at the first writer and a continuation's founding both claim *n*, Then whichever claims first
+>   stands and the other is refused, whether the first writer's entry reaches the archive before or after the
+>   continuation's first segment; and a log holding both is refused by replay (`REQ-RT-21`).
 
 ## R7 — §15 traceability
 
@@ -411,7 +474,9 @@ Everything below is plan-level and names technology. It changes amendment 0023's
   - Every package is built with a `GENERATION` constant equal to the manifest's `generation`.
   - The constant is a 16-byte record: the tag `ALGGEN01`, then the generation as a little-endian `u64`.
   - It is a `#[used]` static in its own ELF section, `.aledgent.generation`, exported as the symbol
-    `ALEDGENT_CODE_GENERATION`, so the optimiser cannot fold it away.
+    `ALEDGENT_CODE_GENERATION`, so the optimiser cannot fold it away. The symbol is that section's record
+    and nothing else. It is defined once, by a macro in `ledger-core`, and the fence reads that very static
+    through the layout `generation_of` uses (D18). No second constant exists for the comparison.
   - One reader, `ledger_core::code::generation_of(bytes)`, returns it. It reads the section from an ELF. From
     a package format that keeps no sections, it reads the single occurrence of the tagged record in the
     read-only data, and refuses a package with none or with more than one.
@@ -460,11 +525,18 @@ input *n* − 1 has committed and before input *n* is sent:
 
 A host that crashes between the switch and input *n* resumes from the writer's committed state, as before.
 
-**The artefact check** (D9). When the host starts, and at every switch, it checks every artefact it runs for
-the writer against the code version of the current range, by digest. On the runtime of today, that is the
-runtime program it hands to `Runtime::create` as well as the package. If any artefact differs, the host
-refuses to drive the writer. The in-book fence cannot see the runtime there, because the host supplies it
+**The artefact check** (D9, D17). When the host starts, and at every switch, it checks every artefact it runs
+for the writer against the code version the code map names for the next input, by digest. On the runtime of
+today, that means the runtime program it hands to `Runtime::create` as well as the package. Where any artefact
+differs, the host installs the code map's version, through `switch`, from its staged copy. It refuses to drive
+the writer only if it cannot. The in-book fence cannot see the runtime there, because the host supplies it
 apart from the package that the registry upgrades.
+
+**The switch is symmetric** (D17). Before each input, the host installs the code version the code map names
+for it. That is *H* from *n*, or generation *g* again after a way-out input at *n*. Each install is the same
+`switch`, signed through the signer on the runtime of today. The signer's grant covers every install the code
+map names, the reinstall included. A crash between a way-out input's commit and the reinstall is resolved at
+start, by the same rule.
 
 **The fence** (`REQ-RT-20`, D8). The upgrade handler and this rule are in *H₀*. The rule is checked at every
 input, whether or not an upgrade is scheduled.
@@ -488,7 +560,9 @@ input, whether or not an upgrade is scheduled.
 - Code of both generations decides them the same: the upgrade does not take effect at that input, a cancel
   clears `upgrade`, a reschedule moves `from`, and `generation` stays *g*.
 - If the host had already switched to *H*, it installs generation *g*'s staged package again before the next
-  input.
+  input, by the symmetric switch.
+- `T-037-12`'s gate decides every way-out fixture input under each staged *H* and under generation *g*, and
+  requires the same committed state (D18).
 
 **The alarm.** The host exports `aledgent_writer_fenced_seconds`, per writer. An alert fires when it exceeds
 `fence_alert_after`, a deployment setting whose default is five minutes (`NFR-11`).
@@ -546,32 +620,41 @@ The operator's runbook never installs a package except through `switch`.
   predecessor's writer id, `at = n`, the log head of input *n* − 1, and the writer state after *n* − 1
   (§2, as (g) encodes it).
 - **Order** (D12):
-  1. Pre-checks: *H* is staged, the predecessor's committed `inputs` is *n* − 1, and its hot row and log head
-     equal its checkpoint at *n* − 1 ((b)'s cut).
+  1. Pre-checks: *H* is staged; the next queued input is not a way-out input (D16); no claim exists at *n*;
+     the predecessor's committed `inputs` is *n* − 1; and its hot row and log head equal its checkpoint at
+     *n* − 1 ((b)'s cut).
   2. Build the continuation from that checkpoint.
   3. Post-checks: the continuation's writer state equals the checkpoint's, field by field, and its roots
      equal the host's rebuilt replica.
-  4. Write the founding record.
+  4. Write the founding record, as the claim at *n* (D15).
   5. Send input *n* to the continuation.
 
   A failed check at step 1 or 3 writes no record and founds nothing, so the founding can be corrected and
   made again.
 - **Write once** (D3, D12).
-  - The founding record is archived under `continuation/<hex blake2b-256(genesis ‖ writer ‖ n)>`, with a
-    conditional create (`If-None-Match: *`) under the archive's Object Lock.
+  - The founding record is archived under `claim/<hex blake2b-256(genesis ‖ logical writer ‖ n)>`, with a
+    conditional create (`If-None-Match: *`) under the archive's Object Lock. The logical writer is the id of
+    the writer the book's genesis founded, which every continuation keeps.
   - The record is a deterministic encoding of the predecessor's state. A create that finds the same bytes at
     the key is a resume of the same founding, and succeeds. One that finds different bytes is refused.
   - Replay refuses a log with two founding records at one *n*.
   - Feeding stays with one core at a time, through `F-038`'s feed lease and its epoch, so a retried founding
     cannot run in parallel.
-- **One entry per input number** (D11).
-  - The archive accepts each input number of a writer once. Segments are created conditionally, under keys
-    named by the writer and their first input number. The archiver refuses a segment whose first input is
-    not the last archived input plus one.
-  - Before the feed sends anything numbered *n* or later to the predecessor, it reads the archive for a
-    founding record at *n*, and sends nothing once one exists.
-  - A move or cancellation in flight from a former lease holder may still commit at the predecessor as
-    input *n*. Its archive entry is then refused, and so it is never acknowledged.
+- **One entry per input number, one claim per boundary** (D11, D15).
+  - The archive accepts each input number of a logical writer once. Segments are created conditionally, under
+    keys named by the logical writer (never the Agent instance) and their first input number. The archiver
+    refuses a segment whose first input is not the last archived input plus one. Because of (b)'s cut at
+    *n* − 1, a segment starts at *n* on either side of a boundary.
+  - Before the predecessor's archiver writes the segment that holds its entry at a scheduled *n*, it creates
+    `claim/<…n>` with its own claim record. If it finds a founding record there, it refuses the segment, and
+    the entry is never acknowledged. If the founding finds the predecessor's claim there, it writes nothing,
+    founds nothing, and the predecessor continues with its way-out input.
+  - Before the feed sends anything numbered *n* or later to the predecessor, it reads `claim/<…n>`, and sends
+    nothing once a founding record is there.
+  - Once a founding record exists, the feed refuses a `RescheduleUpgrade` or `CancelUpgrade` with
+    `ERR-InvalidTransition`. The continuation refuses one too: its writer state's founding row, `continued_at
+    = n`, makes the upgrade final (D16). That row is the one field the equality check leaves out.
+  - Replay refuses a log that holds both a founding record and a predecessor entry at one *n*.
 - The code map's boundary at *n* comes from the `Upgrade`. The founding record is evidence that replay checks
   against it.
 - A move to the new runtime is then:

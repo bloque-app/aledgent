@@ -38,9 +38,10 @@ on today, so that a later move to another runtime is one more upgrade, with no n
 ## Design
 
 `DEC-26` holds the design: (a) to (h) from amendment 0023, amended by amendment 0033, and (i), (j) from 0033.
-Amendment 0033's §"The architect's decisions" (D1 to D14) records why the fence uses a code generation and is
+Amendment 0033's §"The architect's decisions" (D1 to D18) records why the fence uses a code generation and is
 always on, why it has a way out decided the same by either generation, why the execution node checks the
-runtime, and why a continuation is founded once per input number with its record written last. In build order:
+runtime and installs what the code map names, and why a continuation is founded once per input number, as
+the claim of that number, with its record written last. In build order:
 
 1. **The manifest** (`aledgent/code/v1`): platform, `generation`, artefacts with digest, length, identities
    and build profile, the optional runtime. *H* is its digest. Each package is built with a `GENERATION`
@@ -54,8 +55,9 @@ runtime, and why a continuation is founded once per input number with its record
    committed. It is the registry's compare-and-swap on `saga`, signed with the core's package key through
    the signer. It is an install into the same instance on `vos-core`, and the founding of a continuation
    across platforms. While an upgrade is scheduled, the host ends its batches at *n* − 1. At start and at
-   every switch, the host checks every artefact it runs, the runtime included, against the range's code
-   version by digest.
+   every switch, the host checks every artefact it runs, the runtime included, against the code version the
+   code map names for the next input, by digest, and installs that version where any differs. The switch is
+   symmetric: it installs a newer generation after an upgrade and the old one again after a way-out input.
 5. **The inputs**: `Upgrade`, with the staging check (digests, the next generation, the compiled constant).
 6. **The fence, always on, and the way out**: code whose `GENERATION` is neither the state's nor, from a
    scheduled `from`, the next one refuses the input, with nothing written. `RescheduleUpgrade` and
@@ -68,8 +70,9 @@ runtime, and why a continuation is founded once per input number with its record
 10. **Per-range replay**: native first for the book, under each range's generation; the Agent side under
     each range's replayer, `replayer/<hex H>` in the code archive.
 11. **The continuation**: `Continuation` beside `StateGenesis`; the writer state carried and compared field
-    by field; the founding record written last and once per (genesis, writer, *n*); each input number
-    archived once; the code map's boundary from the `Upgrade`.
+    by field; no founding over a queued way-out input; the founding record written last, once, as the claim
+    of *n* per (genesis, logical writer, *n*); each input number of a logical writer archived once; the
+    upgrade final once founded; the code map's boundary from the `Upgrade`.
 12. **Migration of construction**, **fast and full resync**, the per-shard archive.
 13. **The `code-history` gate** and **the legal hold**.
 

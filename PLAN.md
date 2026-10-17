@@ -942,7 +942,8 @@ new genesis.
   constructions it reads and the message formats it accepts and emits (amendment 0033). Every package is
   built with a `GENERATION` constant equal to the manifest's `generation`: a 16-byte record (`ALGGEN01` and a
   little-endian `u64`) in its own ELF section, `.aledgent.generation`, exported as
-  `ALEDGENT_CODE_GENERATION`. One reader, `ledger_core::code::generation_of`, reads it in `check-code`
+  `ALEDGENT_CODE_GENERATION`; the symbol is that record, defined once by a `ledger-core` macro, and the fence
+  reads that very static, so there is no second constant to compare. One reader, `ledger_core::code::generation_of`, reads it in `check-code`
   (`T-038-25`), which fails the build when it differs, in staging, and in the host's checks at start and
   before a switch. The digest check binds the constant to *H*.
   The replayer is **not** in the manifest: each range's replayer is a separate code-archive entry,
@@ -967,10 +968,13 @@ new genesis.
   package key through the signer, "already switched" read as success; an install into the same instance on
   `vos-core`, the install record checked before and after, and the instance's rows surviving a re-install
   an assumption until the spike shows it; the founding of a continuation across platforms, (j)); input `n` runs under *H* and
-  moves `upgrade` into `code` and `generation`. **The artefact check:** at start and at every switch the
-  host checks every artefact it runs for the writer (on `saga`, the runtime it hands to `Runtime::create` as
-  well as the package) against the current range's code version, by digest, and refuses to drive the writer
-  otherwise; the in-book fence cannot see a runtime the host supplies apart from the package. **The fence**
+  moves `upgrade` into `code` and `generation`. **The switch is symmetric:** before each input the host
+  installs the code version the code map names for it (*H* from `n`, or *g* again after a way-out input),
+  each install a `switch` signed through the signer, whose grant covers them all. **The artefact check:** at
+  start and at every switch the host checks every artefact it runs for the writer (on `saga`, the runtime it
+  hands to `Runtime::create` as well as the package) against the code version the code map names for the
+  next input, by digest, installs that version where any differs, and refuses to drive the writer only if
+  it cannot; the in-book fence cannot see a runtime the host supplies apart from the package. **The fence**
   (`REQ-RT-20`), checked at every input: code takes an input only when its compiled `GENERATION` is the hot
   row's `generation` *g*, or *g* + 1 for an input at or after a scheduled `from`; any other code refuses it
   with nothing written and its number not taken (a new outcome, added as a new call-format version). A
@@ -981,7 +985,8 @@ new genesis.
   its own number) and `CancelUpgrade`, authorised under the mode in force (an unauthorised one is refused),
   are the only inputs the fenced code takes; they take their numbers like any input and are decided the
   same by code of either generation (the upgrade does not take effect, `generation` stays *g*), after which
-  the host reinstalls *g*'s staged package if it had switched. The code map derives from the `Upgrade`,
+  the host reinstalls *g*'s staged package if it had switched. The `code-history` gate decides every way-out
+  fixture input under each staged *H* and under *g* and requires the same committed state. The code map derives from the `Upgrade`,
   `RescheduleUpgrade` and `CancelUpgrade` inputs alone, and native replay takes each input's generation from
   it. `aledgent_writer_fenced_seconds` alerts past `fence_alert_after` (a deployment setting, default five
   minutes; `NFR-11`). The handler, the fence and the way out must be in *H₀*.
@@ -1030,16 +1035,21 @@ new genesis.
 - **(j) The continuation** (`REQ-RT-21`, amendment 0033). Beside `F-036`'s `StateGenesis`, which stays as it
   is, a second founding envelope, `Continuation { genesis, predecessor, at: n, log_head, writer state at
   n − 1 }`, built from the predecessor's checkpoint at `n − 1` once its committed `inputs` is `n − 1`, and
-  checked field by field against it. The founding record is written **last**, after every check (staging,
-  the predecessor at `n − 1`, state equality, roots), and **once**: archived under
-  `continuation/<hex blake2b-256(genesis ‖ writer ‖ n)>` with a conditional create under the archive's
-  Object Lock, before input `n` is sent anywhere. A failed check writes no record; a create that finds the
+  checked field by field against it (all but its `continued_at = n` founding row). No founding is made
+  while the next queued input is a way-out input. The founding record is written **last**, after every check
+  (staging, no claim at `n`, the predecessor at `n − 1`, state equality, roots), and **once**, as the claim
+  of input `n`: archived under `claim/<hex blake2b-256(genesis ‖ logical writer ‖ n)>` with a conditional
+  create under the archive's Object Lock, before input `n` is sent anywhere. The predecessor's archiver
+  creates its own claim at that key before archiving its entry at `n`; whichever lands first stands, and a
+  founding that finds the predecessor's claim founds nothing. Once a founding record exists the upgrade is
+  final: a way-out input is refused with `ERR-InvalidTransition`, by the feed and by the continuation. A failed check writes no record; a create that finds the
   same bytes is a resume and succeeds, one that finds different bytes is refused; replay refuses a log with
   two founding records at one `n`; feeding stays with one core through `F-038`'s feed lease and epoch. The
-  archive accepts each input number once (segments created conditionally, keyed by writer and first input,
-  each starting at the last archived input plus one), and the feed reads the archive for a founding record
-  before sending anything numbered `n` or later to the predecessor, so a reschedule or cancel in flight from
-  a former lease holder that commits there is never archived or acknowledged. The code map's boundary comes from
+  archive accepts each input number of a **logical writer** once (segments created conditionally, keyed by
+  the logical writer, never the Agent instance, and first input, each starting at the last archived input
+  plus one), and the feed reads the claim before sending anything numbered `n` or later to the predecessor,
+  so a reschedule or cancel in flight from a former lease holder that commits there is never archived or
+  acknowledged. Replay refuses a log with both a founding record and a predecessor entry at one `n`. The code map's boundary comes from
   the `Upgrade`; the founding record is evidence replay checks against it. A move to `vos-core` is an `Upgrade`
   whose code version names `vos-core` from `n`, the predecessor fenced at `n`, `Continuation` on `vos-core`,
   and input `n` sent there: no new genesis, no bridge anchor, no change of construction. A continuation onto

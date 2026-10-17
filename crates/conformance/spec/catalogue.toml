@@ -1186,7 +1186,7 @@ text = "Given an upgrade made to change only the runtime that executes a writer'
 id = "AC-K7.14"
 story = "US-K7"
 epic = "K"
-text = "Given a continuation founded at input *n*, When a second founding at the same *n* with a different record is attempted, Then it is refused and nothing is founded; When a founding's writer state differs from the first writer's after *n* − 1 in any field that is not host-local, Then no record is written, nothing is founded, and a corrected founding can still be made; When a founding is retried after a crash and finds its own record, byte for byte, Then it resumes; and When a log holds two founding records at one *n*, Then its replay is refused (`REQ-RT-21`)."
+text = "Given a continuation founded at input *n*, When a second founding at the same *n* with a different record is attempted, Then it is refused and nothing is founded; When a founding's writer state differs from the first writer's after *n* − 1 in any field that is not host-local, Then no record is written, nothing is founded, and a corrected founding can still be made; When a founding is retried after a crash and finds its own record, byte for byte, Then it resumes; When the next queued input moves or cancels the upgrade, Then no founding is made until the first writer has decided it; When a founding record exists, Then an input that moves or cancels the upgrade is refused with `ERR-InvalidTransition`; and When a log holds two founding records at one *n*, Then its replay is refused (`REQ-RT-21`)."
 
 [[acceptance]]
 id = "AC-K7.15"
@@ -1216,7 +1216,7 @@ text = "Given an upgrade scheduled from input *n* and an authorised input that m
 id = "AC-K7.19"
 story = "US-K7"
 epic = "K"
-text = "Given a writer whose input *n* is archived, When a second entry numbered *n* reaches the archive, among them a move or cancellation committed at a first writer after its continuation took *n*, Then it is refused (`REQ-RT-21`)."
+text = "Given a logical writer whose input *n* is archived, When a second entry numbered *n* reaches the archive, Then it is refused; and Given an upgrade scheduled from *n*, When a move or cancellation committed at the first writer and a continuation's founding both claim *n*, Then whichever claims first stands and the other is refused, whether the first writer's entry reaches the archive before or after the continuation's first segment; and a log holding both is refused by replay (`REQ-RT-21`)."
 
 [[acceptance]]
 id = "AC-N1.1"

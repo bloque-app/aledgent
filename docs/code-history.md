@@ -70,7 +70,7 @@ no new genesis (amendment 0033).
   with nothing written. A missed switch, or a stale package after one, halts the writer; it never runs an
   input under the wrong generation. Within a generation, the bytes are checked by digest before they are
   installed, and the node checks every artefact it runs, the runtime included, when it starts and at every
-  switch.
+  switch, installing whatever the code map names for the next input.
 - **The fence has a way out.** While it holds, the old code still takes an input that moves the upgrade to a
   later input or cancels it, under the upgrade-authority mode. Either generation decides that input the same
   way, so the outcome never depends on whether the switch was already made. An alert fires when a writer stays fenced longer
@@ -83,8 +83,9 @@ no new genesis (amendment 0033).
   runtime. Each range's host image (its replayer) is kept in the code archive beside the code version, not in
   it, so the runtime's execution can be checked too, and rebuilding the host is not an upgrade.
 - **A writer can be continued by another at input *n***, carrying its whole state and log head after input
-  *n* − 1. The founding is written once per input number, only after every check has passed, and the
-  archive takes each input number once, so two continuations of one writer cannot both hold an input. A
+  *n* − 1. The founding is written once per input number, only after every check has passed, as the claim
+  of that number, and the archive takes each input number of a logical writer once. A first writer and its
+  continuation therefore can never both hold an input. Once a continuation is founded, the upgrade is final. A
   move of runtime is an upgrade naming the new runtime, followed by a continuation on it.
 
 ## Code sources
