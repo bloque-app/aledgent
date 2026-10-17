@@ -88,9 +88,9 @@ use ledger_kernel::vault::{LayerSums, RowKey, Undo, VaultBackend, VaultError, Va
 use std::sync::Arc;
 
 use crate::envelope::{
-    AgentRefusal, BatchEnvelope, BlobKey, ClerkAnswers, Committed, Envelope, GenesisEnvelope,
-    GenesisState, InputEnvelope, MAX_BATCH_INPUTS, MAX_BATCH_PACKS, Pack, Private, Reply, Roots,
-    StateGenesisEnvelope, decode, encode,
+    AgentRefusal, BatchEnvelope, BlobKey, ClerkAnswers, Committed, Envelope, FoundingCode,
+    GenesisEnvelope, GenesisState, InputEnvelope, MAX_BATCH_INPUTS, MAX_BATCH_PACKS, Pack, Private,
+    Reply, Roots, StateGenesisEnvelope, decode, encode,
 };
 use crate::hot::{Hot, Limits, RingEntry};
 use crate::mapped::{Mapped, MappedGenesis, MappedInput, ServiceKeys};
@@ -525,6 +525,9 @@ pub struct Driver<P: AgentPort> {
     /// The roots of the book's genesis, as this host's replica computed them: from the chainspec
     /// for a chainspec book (`F-036`), which the core checks against the deployment's manifest.
     genesis: Roots,
+    /// The code version that executes the Agent's next input, as its hot row holds it
+    /// (`T-037-02`): each ring entry the replica computes names it.
+    code: [u8; 32],
 }
 
 /// A clerk shared between threads: what the executor signs disclosures with.
@@ -1138,6 +1141,7 @@ impl<P: AgentPort> Driver<P> {
         prefix: Option<(&ledger_core::chainspec::ChainSpec, u32)>,
     ) -> Result<(Self, Replica, Founded), DriveError> {
         let rep = |e: &dyn core::fmt::Debug| DriveError::Replica(format!("{e:?}"));
+        let code = FoundingCode::of(&genesis);
         let view = store.view().map_err(|e| rep(&e))?;
         let (recorder, ring) = Recorder::new(&keys);
         let book = Book::bootstrap(RecStore::new(store), RecVault::new(vault), ring)
@@ -1166,6 +1170,7 @@ impl<P: AgentPort> Driver<P> {
             last_entry: None,
             mapped,
             genesis: Roots::default(),
+            code: code.code,
         };
         // Bootstrap writes the book's one journal without loading it: witness it absent.
         let mut keys = replica.book().store().take_keys();
@@ -1192,6 +1197,7 @@ impl<P: AgentPort> Driver<P> {
                 lifecycle: genesis.lifecycle.clone(),
                 limits,
                 state: genesis_state_of(&replica, &driver.service)?,
+                code,
             }));
             driver.send(&envelope, Vec::new())?
         } else if mapped {
@@ -1201,6 +1207,7 @@ impl<P: AgentPort> Driver<P> {
                 at,
                 limits,
                 private: driver.port.blob_key(&private),
+                code,
             })));
             driver.send(&envelope, vec![private])?
         } else {
@@ -1212,6 +1219,7 @@ impl<P: AgentPort> Driver<P> {
                 limits,
                 witness: driver.port.blob_key(&witness),
                 private: driver.port.blob_key(&private),
+                code,
             }));
             driver.send(&envelope, vec![witness, private])?
         };
@@ -1250,6 +1258,11 @@ impl<P: AgentPort> Driver<P> {
     /// The port, mutably.
     pub fn port_mut(&mut self) -> &mut P {
         &mut self.port
+    }
+
+    /// The code version that executes the Agent's next input (`T-037-02`).
+    pub fn code(&self) -> [u8; 32] {
+        self.code
     }
 
     /// The last input number the Agent committed.
@@ -1433,6 +1446,7 @@ impl<P: AgentPort> Driver<P> {
             let (roots, next_posting) = replica_roots(replica, &self.service)?;
             let entry = RingEntry {
                 seq,
+                code: self.code,
                 calls,
                 deliveries,
                 roots,
@@ -1469,6 +1483,7 @@ impl<P: AgentPort> Driver<P> {
         };
         let entry = RingEntry {
             seq,
+            code: self.code,
             calls,
             deliveries,
             roots,
@@ -1749,6 +1764,7 @@ impl<P: AgentPort> Driver<P> {
             last_entry: archive.last().cloned(),
             mapped: hot.layout == crate::mapped::LAYOUT_MAPPED,
             genesis,
+            code: hot.code,
         };
         driver.pin(&replica)?;
         Ok((driver, replica))

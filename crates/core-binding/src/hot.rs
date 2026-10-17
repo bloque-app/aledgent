@@ -9,7 +9,7 @@
 //!
 //! | Row | Key | Holds |
 //! |---|---|---|
-//! | hot | `h` | [`Hot`]: the kernel's six sub-roots, the last commit, the next posting number, the service root, the audit chain's head, the input number, the log head, the ring's bounds, the driver's principal, the budget, and the outbox's counters |
+//! | hot | `h` | [`Hot`]: the kernel's six sub-roots, the last commit, the next posting number, the service root, the audit chain's head, the input number, the log head, the ring's bounds, the driver's principal, the budget, the outbox's counters, and the writer's code: its code version, generation and construction, any scheduled upgrade, its upgrade-authority mode and any scheduled change of it, and where it was continued (`T-037-02`) |
 //! | configuration | `c` | The lifecycle configuration genesis took |
 //! | delta ring | `d` ‖ input number | One [`RingEntry`] per committed input, until the driver archives it |
 //!
@@ -23,6 +23,20 @@
 //!
 //! **Budget `H`.** The Agent refuses a transition that would take its state over its budget
 //! (set at genesis, at most [`MAX_BUDGET`]) with nothing written, well before VOS's own refusal.
+//!
+//! **The writer's code** (`T-037-02`, `REQ-RT-15`, `REQ-RT-19`, `DEC-26` (a); amendment 0033). The
+//! hot row holds the code version that executes the writer's next input ([`Hot::code`]), its code
+//! generation, the construction of its state commitment, the scheduled upgrade, the digest of its
+//! upgrade-authority mode and any scheduled change of it, and the input number it was continued at:
+//! [`MAX_CODE_BYTES`] at most, so the row stays bounded (`DEC-4`). Each ring entry names the code
+//! that executed it ([`RingEntry::code`]), and the log hash covers it, so every archived entry names
+//! its code.
+//!
+//! **Host-local fields** (`SPEC.md` §2 **Writer state**). [`Hot::driver`] (the principal the
+//! platform accepts the writer's inputs from) and [`Hot::observed_slot`] (a diagnostic the platform
+//! reports) are the only two. They are set at founding from the invocation, never carried by a
+//! snapshot or a continuation, and never enter a root, a ring entry, a log hash, a checkpoint or an
+//! anchor (`REQ-RT-19`). Every other field is writer state.
 
 use alloc::vec::Vec;
 
@@ -97,12 +111,20 @@ impl Limits {
     };
 }
 
+/// The most bytes the writer's code fields add to the hot row's encoding (`T-037-02`, `DEC-4`):
+/// [`Hot::code`], [`Hot::generation`], [`Hot::construction`], [`Hot::upgrade`],
+/// [`Hot::authority`], [`Hot::authority_next`] and [`Hot::continued_at`], each at its widest
+/// (postcard: a varint `u64` takes at most 10 bytes, an option one byte more).
+pub const MAX_CODE_BYTES: u64 = 32 + 10 + 1 + (1 + 32 + 10) + 32 + (1 + 32 + 10) + (1 + 10);
+
 /// The hot row (module documentation).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hot {
     /// [`LAYOUT`].
     pub layout: u32,
-    /// The only VOS principal the Agent takes invocations from (`T-005-03`).
+    /// The only VOS principal the Agent takes invocations from (`T-005-03`). **Host-local**
+    /// (module documentation): the platform's identity for the execution node that drives the
+    /// writer, in no root, log hash, checkpoint or anchor.
     pub driver: [u8; 32],
     /// The kernel's six sub-roots.
     pub subroots: [[u8; 32]; 6],
@@ -137,8 +159,30 @@ pub struct Hot {
     /// The configuration row's size.
     pub config_len: u64,
     /// The last slot VOS observed for a committed input (diagnostics; `OQ-36` is open and the
-    /// library takes time from the calls).
+    /// library takes time from the calls). **Host-local** (module documentation): in no root,
+    /// log hash, checkpoint or anchor.
     pub observed_slot: u64,
+    /// The code version that executes the next input (`REQ-RT-15`): the digest of its manifest
+    /// (`ledger_core::code`). *H₀* at founding; zeros for a book founded with no named code
+    /// (tests, stress books).
+    pub code: [u8; 32],
+    /// The code generation in force (`REQ-RT-20`, amendment 0033 D1): 0 at genesis, one more after
+    /// each upgrade.
+    pub generation: u64,
+    /// The construction of the state commitment (`REQ-PR-10`, `DEC-25`): the build's at founding;
+    /// it changes only by a migration (`REQ-PR-11`).
+    pub construction: u8,
+    /// The scheduled upgrade, if any: the code version *H* and the input number `n` it applies
+    /// from (`REQ-RT-16`). Its first input moves it into [`Hot::code`] (`T-037-04`).
+    pub upgrade: Option<([u8; 32], u64)>,
+    /// The digest of the upgrade-authority mode in force (`REQ-RT-18`); the mode itself is a
+    /// record in the service tree. Zeros until modes exist (`T-037-05`).
+    pub authority: [u8; 32],
+    /// A scheduled change of mode: the new mode's digest and the input number it applies from.
+    pub authority_next: Option<([u8; 32], u64)>,
+    /// The input number at which this writer was founded as a continuation (`REQ-RT-21`), if it
+    /// was (`T-037-17`).
+    pub continued_at: Option<u64>,
 }
 
 impl Hot {
@@ -201,6 +245,9 @@ pub fn ring_key(seq: u64) -> Vec<u8> {
 pub struct RingEntry {
     /// The input number.
     pub seq: u64,
+    /// The code version that executed it (`T-037-02`, `REQ-RT-17`): every archived entry names its
+    /// code, so the code map reads off the archive, and the log hash covers it.
+    pub code: [u8; 32],
     /// The calls, in order.
     pub calls: Vec<Call>,
     /// The deliveries recorded.
