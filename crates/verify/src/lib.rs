@@ -29,8 +29,12 @@
 //!
 //! ## Map
 //!
-//! - [`commitment()`]: the anchor commitment, `blake2b-256("aledgent/anchor/v1" ‖ instance ‖
-//!   number ‖ entry sequence ‖ kernel root)`.
+//! - [`commitment()`]: the anchor commitment of a `v1` or `v2` checkpoint, `blake2b-256("aledgent/
+//!   anchor/v1" ‖ instance ‖ number ‖ entry sequence ‖ kernel root)` and its `v2` form; and
+//!   [`commitment_v3()`], the `v3` form that also binds the book's genesis, its code version and its
+//!   upgrade-authority mode ([`CodeBinding`]; `REQ-RT-15`, `T-037-03`). [`checkpoint_commitment()`]
+//!   is either, as a checkpoint names it. All are aledgent's fields alone: nothing of a platform
+//!   (`REQ-RT-19`).
 //! - [`schnorr`]: the clerk's signature: CipherClerk's Schnorr over Ristretto255.
 //! - [`claim`]: CipherClerk's four disclosure claims, parsed from their wire form.
 //! - [`envelope`]: the disclosure envelope and its one canonical encoding.
@@ -72,6 +76,11 @@ pub const COMMITMENT_DOMAIN: &[u8] = b"aledgent/anchor/v1";
 /// The domain of the anchor commitment of every later construction (`REQ-PR-10`): the
 /// construction's number is the first byte it hashes.
 pub const COMMITMENT_DOMAIN_V2: &[u8] = b"aledgent/anchor/v2";
+
+/// The domain of the `v3` anchor commitment (`T-037-03`, `DEC-26` (a), rulings `a0023-q3` and
+/// `a0023-q4`): it binds the construction, the book's genesis, the code version and the
+/// upgrade-authority mode beside what `v2` binds.
+pub const COMMITMENT_DOMAIN_V3: &[u8] = b"aledgent/anchor/v3";
 
 /// Construction 1 of the state commitment: CipherClerk's full-depth sparse Merkle trees.
 pub const CONSTRUCTION_V1: u8 = 1;
@@ -130,9 +139,146 @@ pub fn commitment(
     )
 }
 
+/// What a `v3` checkpoint binds beside a `v2` one (`REQ-RT-15`, `REQ-RT-18`, `T-037-03`): the
+/// book's genesis (amendment 0022's seed digest), the code version that produced the anchored
+/// state, and the digest of the upgrade-authority mode in force. Every field is aledgent's own: a
+/// digest aledgent computes, never a platform's identity, slot or encoding (`REQ-RT-19`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct CodeBinding {
+    /// The book's genesis: its chainspec's seed digest; zeros for a book founded without one.
+    pub genesis: [u8; 32],
+    /// The code version: the digest of the writer's code manifest (`aledgent/code/v1`).
+    pub code: [u8; 32],
+    /// The digest of the upgrade-authority mode in force.
+    pub authority: [u8; 32],
+}
+
+/// The `v3` anchor commitment (`DEC-26` (a)):
+/// `blake2b-256("aledgent/anchor/v3" ‖ construction ‖ genesis ‖ code ‖ authority ‖ instance ‖
+/// number ‖ entry_sequence ‖ kernel_root)`, the integers big-endian. Still 32 bytes, and still
+/// revealing nothing of the book (`REQ-PR-2`, ruling `a0023-q4`).
+pub fn commitment_v3(
+    construction: u8,
+    binding: &CodeBinding,
+    instance: u32,
+    number: u64,
+    entry_sequence: u64,
+    kernel_root: &[u8; 32],
+) -> [u8; 32] {
+    blake2b_256(
+        COMMITMENT_DOMAIN_V3,
+        &[
+            &[construction],
+            &binding.genesis,
+            &binding.code,
+            &binding.authority,
+            &instance.to_be_bytes(),
+            &number.to_be_bytes(),
+            &entry_sequence.to_be_bytes(),
+            kernel_root,
+        ],
+    )
+}
+
+/// A checkpoint's commitment, in the form it names: `v3` ([`commitment_v3()`]) when it carries a
+/// [`CodeBinding`], else the `v1` or `v2` form ([`commitment()`]), so that every earlier anchor
+/// still checks (`REQ-PR-10`).
+pub fn checkpoint_commitment(
+    construction: u8,
+    binding: Option<&CodeBinding>,
+    instance: u32,
+    number: u64,
+    entry_sequence: u64,
+    kernel_root: &[u8; 32],
+) -> [u8; 32] {
+    match binding {
+        Some(b) => commitment_v3(
+            construction,
+            b,
+            instance,
+            number,
+            entry_sequence,
+            kernel_root,
+        ),
+        None => commitment(construction, instance, number, entry_sequence, kernel_root),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `T-037-03`: the `v3` commitment binds the code, the construction and the mode, and the
+    /// genesis, beside every field `v2` binds; a checkpoint without a binding keeps its `v2` form.
+    #[test]
+    fn t037_03_the_v3_commitment_binds_code_construction_and_mode() {
+        let b = CodeBinding {
+            genesis: [1; 32],
+            code: [2; 32],
+            authority: [3; 32],
+        };
+        let base = commitment_v3(CONSTRUCTION_V2, &b, 1, 2, 3, &[4; 32]);
+        let other = |f: &dyn Fn(&mut CodeBinding)| {
+            let mut x = b;
+            f(&mut x);
+            commitment_v3(CONSTRUCTION_V2, &x, 1, 2, 3, &[4; 32])
+        };
+        assert_ne!(base, other(&|x| x.genesis[0] ^= 1));
+        assert_ne!(base, other(&|x| x.code[0] ^= 1));
+        assert_ne!(base, other(&|x| x.authority[0] ^= 1));
+        assert_ne!(base, commitment_v3(CONSTRUCTION_V1, &b, 1, 2, 3, &[4; 32]));
+        assert_ne!(base, commitment_v3(CONSTRUCTION_V2, &b, 9, 2, 3, &[4; 32]));
+        assert_ne!(base, commitment_v3(CONSTRUCTION_V2, &b, 1, 9, 3, &[4; 32]));
+        assert_ne!(base, commitment_v3(CONSTRUCTION_V2, &b, 1, 2, 9, &[4; 32]));
+        assert_ne!(base, commitment_v3(CONSTRUCTION_V2, &b, 1, 2, 3, &[9; 32]));
+        // Its own domain: never a `v2` commitment of the same checkpoint.
+        assert_ne!(base, commitment(CONSTRUCTION_V2, 1, 2, 3, &[4; 32]));
+        assert_eq!(
+            checkpoint_commitment(CONSTRUCTION_V2, Some(&b), 1, 2, 3, &[4; 32]),
+            base
+        );
+        // `v2` anchors still check: no binding is the `v2` form, unchanged.
+        for c in [CONSTRUCTION_V1, CONSTRUCTION_V2] {
+            assert_eq!(
+                checkpoint_commitment(c, None, 1, 2, 3, &[4; 32]),
+                commitment(c, 1, 2, 3, &[4; 32])
+            );
+        }
+        // The layout, spelled out.
+        let theirs = cipher_clerk::crypto::blake2b_256(
+            b"aledgent/anchor/v3",
+            &[
+                &[CONSTRUCTION_V2],
+                &[1; 32],
+                &[2; 32],
+                &[3; 32],
+                &1u32.to_be_bytes(),
+                &2u64.to_be_bytes(),
+                &3u64.to_be_bytes(),
+                &[4; 32],
+            ],
+        );
+        assert_eq!(base, theirs);
+    }
+
+    /// `T-037-03`: the commitment is computed in a crate that links no VOS crate. This crate
+    /// depends on no aledgent crate and no runtime; the root workspace, which it belongs to, links
+    /// no VOS crate at all (`tools/ci/check-no-vos.sh` gates the manifests).
+    #[test]
+    fn t037_03_the_commitment_links_no_vos_crate() {
+        let lock = include_str!("../../../Cargo.lock");
+        assert!(lock.contains("name = \"verify\""));
+        assert!(
+            !lock.contains("name = \"vos"),
+            "a VOS crate is in the workspace that builds the commitment"
+        );
+        let manifest = include_str!("../Cargo.toml");
+        assert!(
+            !manifest.lines().any(|l| l.trim_start().starts_with("vos")),
+            "this crate names a VOS crate"
+        );
+    }
 
     #[test]
     fn the_commitment_binds_every_field() {

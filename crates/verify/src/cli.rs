@@ -198,6 +198,7 @@ mod tests {
                 kernel_root: root,
                 commitment: commitment(crate::CONSTRUCTION_V2, 1, 4, 20, &root),
                 construction: crate::CONSTRUCTION_V2,
+                binding: None,
             },
             assurance: Assurance {
                 declaration_digest: [9; 32],

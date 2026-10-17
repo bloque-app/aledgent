@@ -432,6 +432,8 @@ fn input(
     )
     .map_err(AgentRefusal::Malformed)?;
     let mut ledger = Ledger::from_parts(book, state, config);
+    // What a checkpoint this input creates binds (`T-037-03`): the hot row's code and mode.
+    ledger.set_code(hot.code, hot.authority);
     let clerk_ref = private.clerk.as_ref().map(|c| c as &dyn ClerkSigner);
     let mut summaries = Vec::with_capacity(i.calls.len());
     for c in &i.calls {

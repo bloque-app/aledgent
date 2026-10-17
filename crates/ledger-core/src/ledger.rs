@@ -244,6 +244,10 @@ pub struct Ledger<S: LeafStore, V: VaultBackend> {
     fault: Option<lifecycle::FaultAt>,
     /// The calls recorded while recording is on (`crate::call`, `F-005`).
     pub(crate) calls: Option<crate::call::CallLog>,
+    /// The writer's code version and the digest of its upgrade-authority mode, as its hot row
+    /// holds them (`T-037-02`): what a checkpoint binds beside the book's genesis (`T-037-03`). Not
+    /// service state: whoever runs the ledger as a writer sets it ([`Ledger::set_code`]).
+    code: ([u8; 32], [u8; 32]),
 }
 
 fn policy_used(p: &Principal) -> AuthorityUsed {
@@ -360,6 +364,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             config,
             fault: None,
             calls: None,
+            code: ([0; 32], [0; 32]),
         };
         if let Some(sp) = spec {
             ledger.build_genesis_state(&founded, &sp)?;
@@ -406,6 +411,30 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             config,
             fault: None,
             calls: None,
+            code: ([0; 32], [0; 32]),
+        }
+    }
+
+    /// The writer's code version and its upgrade-authority mode's digest, as its hot row holds
+    /// them (`T-037-02`): every checkpoint created from here binds them ([`Ledger::code_binding`],
+    /// `T-037-03`). The core Agent sets them from its hot row before each input, and the host's
+    /// replica from the code each entry names. A ledger whose writer names no code binds zeros.
+    pub fn set_code(&mut self, code: [u8; 32], authority: [u8; 32]) {
+        self.code = (code, authority);
+    }
+
+    /// What a checkpoint created now binds beside a `v2` one (`T-037-03`, `REQ-RT-15`): the book's
+    /// genesis (its chainspec's seed digest, or zeros for a book founded without one), and the code
+    /// version and mode [`Ledger::set_code`] gave. All of them aledgent's own values (`REQ-RT-19`).
+    pub fn code_binding(&self) -> crate::anchor::CodeBinding {
+        crate::anchor::CodeBinding {
+            genesis: self
+                .state
+                .chainspec()
+                .progress()
+                .map_or([0; 32], |p| p.commitment.digest),
+            code: self.code.0,
+            authority: self.code.1,
         }
     }
 

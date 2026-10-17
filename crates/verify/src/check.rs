@@ -12,7 +12,7 @@ use crate::envelope::{
     Assertion, AssuranceKind, BalanceKind, Bound, Disclosure, FlowDirection, FormatError, Recipient,
 };
 use crate::source::AnchorSource;
-use crate::{SIGNED_ASSERTION_LABEL, commitment, schnorr};
+use crate::{SIGNED_ASSERTION_LABEL, schnorr};
 
 /// Why nothing could be checked at all.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -141,6 +141,15 @@ impl Report {
             c.construction,
             hex(&c.commitment)
         ));
+        match &c.binding {
+            Some(b) => out.push_str(&format!(
+                "code: {} (genesis {}, upgrade-authority mode {}), anchor commitment v3\n",
+                hex(&b.code),
+                hex(&b.genesis),
+                hex(&b.authority)
+            )),
+            None => out.push_str("code: not named (a v2 checkpoint)\n"),
+        }
         out.push_str(&format!(
             "venue: {}\n",
             match d.venue {
@@ -404,14 +413,10 @@ pub fn verify(
     };
     // 4. The commitment, recomputed.
     // The construction must be one this verifier knows (`REQ-PR-10`); the commitment binds it.
-    let commitment_recomputed = crate::construction_known(c.construction)
-        && commitment(
-            c.construction,
-            d.instance,
-            c.number,
-            c.entry_sequence,
-            &c.kernel_root,
-        ) == c.commitment;
+    // A `v3` checkpoint's commitment also binds its genesis, code and mode (`T-037-03`); a `v2`
+    // checkpoint's is recomputed in its own form, so earlier anchors still check.
+    let commitment_recomputed =
+        crate::construction_known(c.construction) && c.recomputed(d.instance) == c.commitment;
     // 5. The label.
     let labelled = d.assurance.kind == AssuranceKind::SignedAssertion
         && d.assurance.summary.contains(SIGNED_ASSERTION_LABEL);
@@ -435,9 +440,17 @@ mod tests {
     use crate::claim::{Filter, SignedClaim};
     use crate::envelope::{Assurance, CheckpointRef, VERSION};
     use crate::source::{MemAnchors, PublicAnchor};
+    use crate::{CodeBinding, commitment, commitment_v3};
     use alloc::string::ToString;
     use alloc::vec;
     use cipher_clerk::crypto::SecretKey;
+
+    /// The fixture's code binding: a `v3` checkpoint's genesis, code and mode.
+    const BINDING: CodeBinding = CodeBinding {
+        genesis: [0x0A; 32],
+        code: [0x0B; 32],
+        authority: [0x0C; 32],
+    };
 
     fn sign(sk: &SecretKey, msg: &[u8]) -> [u8; 64] {
         let s = sk.sign(msg, &mut rand_core::OsRng);
@@ -467,8 +480,9 @@ mod tests {
                 number: 4,
                 entry_sequence: 20,
                 kernel_root: root,
-                commitment: commitment(crate::CONSTRUCTION_V2, 1, 4, 20, &root),
+                commitment: commitment_v3(crate::CONSTRUCTION_V2, &BINDING, 1, 4, 20, &root),
                 construction: crate::CONSTRUCTION_V2,
+                binding: Some(BINDING),
             },
             assurance: Assurance {
                 declaration_digest: [9; 32],
@@ -666,6 +680,44 @@ mod tests {
             t.signature = sign(&sk, &t.signed_bytes());
             let r = verify(&t.to_bytes(), Some(pk), &chain(&d)).unwrap();
             assert!(!r.commitment_recomputed && !r.passed(), "construction {c}");
+        }
+        // `T-037-03`: a checkpoint and its anchor bind the code, the construction and the mode.
+        // The same checkpoint naming another code, mode or genesis does not recompute.
+        for f in [
+            |b: &mut CodeBinding| b.code[0] ^= 1,
+            |b: &mut CodeBinding| b.authority[0] ^= 1,
+            |b: &mut CodeBinding| b.genesis[0] ^= 1,
+        ] {
+            let mut t = d.clone();
+            f(t.checkpoint.binding.as_mut().unwrap());
+            t.signature = sign(&sk, &t.signed_bytes());
+            let r = verify(&t.to_bytes(), Some(pk), &chain(&d)).unwrap();
+            assert!(!r.commitment_recomputed && !r.passed());
+        }
+        // Nor does it with the binding dropped: a `v3` anchor is not a `v2` one.
+        let mut t = d.clone();
+        t.checkpoint.binding = None;
+        t.signature = sign(&sk, &t.signed_bytes());
+        let r = verify(&t.to_bytes(), Some(pk), &chain(&d)).unwrap();
+        assert!(!r.commitment_recomputed && !r.passed());
+    }
+
+    /// `T-037-03`: earlier `v2` anchors still check. A disclosure resting on a `v2` checkpoint, in
+    /// a version-4 envelope with no binding or in a version-3 envelope, verifies.
+    #[test]
+    fn t037_03_a_v2_anchor_still_checks() {
+        let sk = SecretKey::from_bytes([5; 32]).unwrap();
+        let pk = sk.public_key().0;
+        let mut d = holds(&sk);
+        let c = &mut d.checkpoint;
+        c.binding = None;
+        c.commitment = commitment(crate::CONSTRUCTION_V2, 1, c.number, 20, &c.kernel_root);
+        for version in [VERSION, crate::envelope::VERSION_3] {
+            let mut t = d.clone();
+            t.version = version;
+            t.signature = sign(&sk, &t.signed_bytes());
+            let r = verify(&t.to_bytes(), Some(pk), &chain(&t)).unwrap();
+            assert!(r.commitment_recomputed && r.passed(), "version {version}");
         }
     }
 

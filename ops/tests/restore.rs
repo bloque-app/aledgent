@@ -194,14 +194,19 @@ async fn ac_k5_1_a_restore_to_an_older_backup_and_replay_yield_the_pre_failure_r
     let root = tmp.path().join("backups");
     let (core_backup, m) = k.backup_core(&root, "b1").await.unwrap();
     let (audit_backup, _, _) = backup::audit::take(&k.audit_dir, &root, "a1", 1).unwrap();
-    // Export format 11 (F-017's six anchoring sections, the signing records of the owner's ruling
+    // Export format 12 (F-017's six anchoring sections, the signing records of the owner's ruling
     // of 2026-09-24, F-027's anchor venues, amendment 0006's resolution cases, F-028's
     // credential schemes, amendment 0011's integrating parties and notification anchor, F-029's
-    // asset bindings and attestations, and F-031's kernel accounts placed in partitions): the
-    // anchoring sections, filled, cross the backup.
+    // asset bindings and attestations, F-031's kernel accounts placed in partitions, and
+    // T-037-03's checkpoint construction and code binding): the anchoring sections, filled, cross
+    // the backup.
     let bundle =
         backup::core::read(&core_backup, &SealingKey::from_bytes(TEST_SEALING_KEY)).unwrap();
-    assert_eq!(bundle.export.manifest.version, 11);
+    assert_eq!(
+        bundle.export.manifest.version,
+        ledger_core::export::FORMAT_VERSION
+    );
+    assert_eq!(bundle.export.manifest.version, 12);
     let anchoring: Vec<_> = bundle
         .export
         .manifest

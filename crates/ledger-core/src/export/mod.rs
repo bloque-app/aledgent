@@ -66,9 +66,10 @@ pub use kernel::{Leaves, Openings};
 /// 10: `DEC-20`: every asset's binding to the settlement layer in the registry; the settlement
 /// section's attestations and asset binds (`F-029`). 11: a kernel account's placement in a
 /// partition other than its subject's, after its balance rule (`REQ-RT-9`, `F-031`); kernel
-/// account ids and transfer ids carry their partition. As for every version, this build reads only
-/// its own.
-pub const FORMAT_VERSION: u32 = 11;
+/// account ids and transfer ids carry their partition. 12: a checkpoint names its construction and
+/// its code binding (the book's genesis, the code version and the upgrade-authority mode; anchor
+/// commitment `v3`, `T-037-03`). As for every version, this build reads only its own.
+pub const FORMAT_VERSION: u32 = 12;
 
 /// The bytes every export starts with.
 pub const MAGIC: &[u8; 16] = b"aledgent-export\0";
