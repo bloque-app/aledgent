@@ -1041,9 +1041,11 @@ new genesis.
   founding sets). No founding is made while the next queued input is a way-out input. The founding record
   is written **last**, after every check (staging, no claim at `n`, the predecessor at `n − 1` with
   `upgrade = Some((H, n))` both before and after the build, state equality, roots), and **once**, as the
-  claim of input `n`; the continuation's instance is recorded in a write-once `instance/<…n>` object beside
-  it, which every retry by any lease holder reads first and adopts (never node-local state), its id derived
-  from the claim key on both runtimes (`saga`'s creation nonce, `vos-core`'s install `instance`): archived under `claim/<hex blake2b-256(genesis ‖ logical writer ‖ n)>` with a conditional
+  claim of input `n`, naming the build attempt and instance that passed; each attempt's instance is recorded
+  in a write-once `instance/<…n>/<attempt>` object (never node-local state), its id derived from (claim key,
+  attempt) on both runtimes (`saga`: `create_with`'s creation nonce, today a one-byte discriminator; `vos-core`:
+  the install's `instance`); a retry by any lease holder reads the latest attempt, adopts its instance if it
+  passes the post-checks, and otherwise tears it down and builds attempt + 1 under a fresh name: archived under `claim/<hex blake2b-256(genesis ‖ logical writer ‖ n)>` with a conditional
   create under the archive's Object Lock, before input `n` is sent anywhere. The predecessor's archiver
   creates its own claim at that key before archiving its entry at `n`; both claims are fixed functions of
   (genesis, logical writer, `n`, side) and the inputs before `n`, so a claim that finds its own side's
@@ -1051,7 +1053,7 @@ new genesis.
   nothing. The feed routes input `n` and later only to the recorded instance; an instance from a failed or
   abandoned build never receives an input and is torn down by the runbook. Segments name the instance that
   wrote them, and the archive accepts a continuation-side entry at a claimed `n` only if the claim is a
-  founding record and the instance is the recorded one. Once a founding record
+  founding record and the instance is the one recorded for the attempt the record names. Once a founding record
   exists the upgrade is final: a way-out input for the upgrade scheduled from `continued_at` is refused with
   `ERR-InvalidTransition`, fence-style (nothing written, number not taken), by the continuation as the
   authority and by the feed as a fast path; one for a later upgrade is taken as usual. A failed check writes no record; a create that finds the

@@ -821,13 +821,16 @@ founded from the first writer's writer state (§2) after input *n* − 1, with i
   A founding that fails a check writes no record and founds nothing, and the first writer continues.
 - A founding MUST NOT be made while the next input queued for the writer moves or cancels the upgrade.
   The founding waits until the first writer has decided that input.
-- The founding record MUST be written before input *n* is sent to either writer. The continuation's
-  instance MUST be recorded once, in a write-once record of its own beside the founding record. Every retry
-  of the founding, by any execution node, MUST read it first and adopt the instance it names. It MUST NOT be
-  kept only in one node's own state. Where the platform lets the instance be named, its name MUST be derived from
-  the founding record's key. From then on, every input from *n* goes to that instance alone. An instance
-  whose founding failed or was abandoned MUST never receive an input. Before it sends an input numbered *n*
-  or later to the first writer, the execution node MUST check that no founding record exists at *n*.
+- The founding record MUST be written before input *n* is sent to either writer. Each attempt to build the
+  continuation MUST be numbered, from 0, and its instance recorded once, in a write-once record of its own
+  beside the founding record. No such record may be kept only in one node's own state. Every retry of the
+  founding, by any execution node, MUST read the latest attempt first. It adopts that attempt's instance if
+  the instance passes the founding's checks. Otherwise it MUST discard that instance and build a new attempt
+  under a new name, never reusing a name. Where the platform lets the instance be named, its name MUST be
+  derived from the founding record's key and the attempt. The founding record MUST name the attempt and the
+  instance that succeeded. From then on, every input from *n* goes to that instance alone. An instance whose
+  founding failed or was abandoned MUST never receive an input. Before it sends an input numbered *n* or
+  later to the first writer, the execution node MUST check that no founding record exists at *n*.
 - Once founded, the upgrade the continuation was founded for is final. The continuation's writer state
   records the input number it was continued at (§2). An input that moves or cancels the upgrade scheduled
   from that number MUST be refused with `ERR-InvalidTransition`. The refusal changes nothing and does not
@@ -851,7 +854,8 @@ founded from the first writer's writer state (§2) after input *n* − 1, with i
 - The input number at which an upgrade is scheduled MUST be claimed once, for one writer. The founding
   record is the continuation's claim. The first writer's archive entry at that number MUST be preceded by the
   first writer's claim at the same key. Each side's claim MUST be a fixed function of the book's genesis,
-  the logical writer, the input number, the side, and the book's committed inputs before that number. A
+  the logical writer, the input number, the side, and the book's committed inputs before that number, and,
+  for the continuation's, of the build attempt that succeeded, which is itself recorded once. A
   claim that finds the same side's identical claim is a resume and succeeds. One that finds the other side's
   claim has lost and MUST be refused. A founding refused this way founds nothing, and the first writer
   continues.

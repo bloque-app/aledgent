@@ -38,7 +38,7 @@ on today, so that a later move to another runtime is one more upgrade, with no n
 ## Design
 
 `DEC-26` holds the design: (a) to (h) from amendment 0023, amended by amendment 0033, and (i), (j) from 0033.
-Amendment 0033's §"The architect's decisions" (D1 to D25) records why the fence uses a code generation and is
+Amendment 0033's §"The architect's decisions" (D1 to D26) records why the fence uses a code generation and is
 always on, why it has a way out decided the same by either generation, why the execution node checks the
 runtime and installs what the code map names, and why a continuation is founded once per input number, as
 the claim of that number, with its record written last. In build order:
@@ -72,7 +72,8 @@ the claim of that number, with its record written last. In build order:
 11. **The continuation**: `Continuation` beside `StateGenesis`; the writer state carried and compared field
     by field; no founding over a queued way-out input or for an upgrade no longer scheduled; the founding
     record written last, once, as the claim of *n* per (genesis, logical writer, *n*); the continuation's
-    instance in a write-once object beside it, adopted by every retry and checked by the archive; fixed claims on both sides; each input number of a logical writer archived once;
+    instance recorded per numbered build attempt, write-once, adopted by a retry only if it passes, and
+    checked by the archive; fixed claims on both sides; each input number of a logical writer archived once;
     the upgrade final once founded, its way-out refused fence-style; the code map's boundary from the
     `Upgrade`.
 12. **Migration of construction**, **fast and full resync**, the per-shard archive.
