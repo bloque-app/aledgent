@@ -135,7 +135,7 @@ fn blob(inv: &Invocation<'_>, key: &BlobKey, what: &str) -> Result<Vec<u8>, Agen
 
 fn read_hot(rows: &dyn Rows) -> Result<Option<Hot>, AgentRefusal> {
     rows.get(HOT)
-        .map(|b| decode::<Hot>(&b).map_err(AgentRefusal::Malformed))
+        .map(|b| hot::decode_hot(&b).map_err(AgentRefusal::Malformed))
         .transpose()
 }
 
@@ -280,6 +280,13 @@ fn genesis(
         limits: g.limits,
         config_len: config.len() as u64,
         observed_slot: inv.slot.unwrap_or(0),
+        code: g.code.code,
+        generation: 0,
+        construction: ledger_core::anchor::construction(),
+        upgrade: None,
+        authority: g.code.authority,
+        authority_next: None,
+        continued_at: None,
     };
     let bytes = hot.bytes();
     if bytes > hot.limits.budget {
@@ -342,6 +349,13 @@ fn state_genesis(
         limits: g.limits,
         config_len: config.len() as u64,
         observed_slot: inv.slot.unwrap_or(0),
+        code: g.code.code,
+        generation: 0,
+        construction: ledger_core::anchor::construction(),
+        upgrade: None,
+        authority: g.code.authority,
+        authority_next: None,
+        continued_at: None,
     };
     let bytes = hot.bytes();
     if bytes > hot.limits.budget {
@@ -574,6 +588,7 @@ fn input(
     hot.audit_shipped = audit.shipped;
     let entry = RingEntry {
         seq: i.seq,
+        code: hot.code,
         calls: i.calls,
         deliveries: delivered,
         roots: hot.roots(),

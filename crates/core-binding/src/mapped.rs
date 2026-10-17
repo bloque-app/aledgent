@@ -82,6 +82,8 @@ pub struct MappedGenesis {
     pub limits: Limits,
     /// The private inputs (the key-ring root).
     pub private: BlobKey,
+    /// The code it is founded under (`T-037-02`).
+    pub code: crate::envelope::FoundingCode,
 }
 
 /// One input to a layout-3 Agent: as [`crate::envelope::InputEnvelope`], with the service keys
@@ -191,7 +193,7 @@ fn load_service(rows: &dyn Rows, keys: &ServiceKeys) -> Result<Vec<LeafEntry>, A
 
 fn read_hot(rows: &dyn Rows) -> Result<Option<Hot>, AgentRefusal> {
     rows.get(HOT)
-        .map(|b| decode::<Hot>(&b).map_err(AgentRefusal::Malformed))
+        .map(|b| crate::hot::decode_hot(&b).map_err(AgentRefusal::Malformed))
         .transpose()
 }
 
@@ -291,6 +293,13 @@ fn genesis(
         limits: g.limits,
         config_len: config.len() as u64,
         observed_slot: inv.slot.unwrap_or(0),
+        code: g.code.code,
+        generation: 0,
+        construction: ledger_core::anchor::construction(),
+        upgrade: None,
+        authority: g.code.authority,
+        authority_next: None,
+        continued_at: None,
     };
     let bytes = hot.bytes();
     if bytes > hot.limits.budget {
@@ -485,6 +494,7 @@ fn input(
     merge(&mut w, overlay);
     let entry = RingEntry {
         seq: i.seq,
+        code: hot.code,
         calls: i.calls,
         deliveries: delivered,
         roots: hot.roots(),
