@@ -945,7 +945,7 @@ new genesis.
   `.rodata` where the platform's program linker keeps only `.rodata`, found by the symbol), exported as
   `ALEDGENT_CODE_GENERATION`; the symbol is that record, defined once by a `ledger-core` macro, and the fence
   reads that very static, so there is no second constant to compare. One reader, `ledger_core::code::generation_of`, reads it in `check-code`
-  (`T-038-25`), which fails the build when it differs, in staging, and in the host's checks at start and
+  ([`T-038-25`](features/F-038-ingress-fleet/tasks.md)), which fails the build when it differs, in staging, and in the host's checks at start and
   before a switch. The digest check binds the constant to *H*.
   The replayer is **not** in the manifest: each range's replayer is a separate code-archive entry,
   `replayer/<hex H>`, so a host rebuild is not a code upgrade. **Nothing of the platform is hashed** outside
