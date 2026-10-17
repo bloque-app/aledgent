@@ -38,12 +38,14 @@ on today, so that a later move to another runtime is one more upgrade, with no n
 ## Design
 
 `DEC-26` holds the design: (a) to (h) from amendment 0023, amended by amendment 0033, and (i), (j) from 0033.
-Amendment 0033's §"The architect's decisions" (D1 to D7) records why the fence uses a code generation, why it
-has a way out, and why a continuation is founded once per input number. In build order:
+Amendment 0033's §"The architect's decisions" (D1 to D14) records why the fence uses a code generation and is
+always on, why it has a way out decided the same by either generation, why the execution node checks the
+runtime, and why a continuation is founded once per input number with its record written last. In build order:
 
 1. **The manifest** (`aledgent/code/v1`): platform, `generation`, artefacts with digest, length, identities
    and build profile, the optional runtime. *H* is its digest. Each package is built with a `GENERATION`
-   constant equal to the manifest's, checked at build time. The replayer is not in it.
+   constant equal to the manifest's, in the ELF section `.aledgent.generation`, read by one function at
+   build time, at staging and in the host's checks. The replayer is not in it.
 2. **The writer's state**: `code`, `generation`, `construction`, `upgrade`, `authority`, `authority_next` in
    the hot row; `code` in each ring entry, under the log hash. `driver` and `observed_slot` are the only
    host-local fields (`SPEC.md` §2 **Writer state**) and enter no hash.
@@ -51,11 +53,14 @@ has a way out, and why a continuation is founded once per input number. In build
 4. **`switch(H, n)`**: one host operation, installing only bytes staged and checked before the upgrade
    committed. It is the registry's compare-and-swap on `saga`, signed with the core's package key through
    the signer. It is an install into the same instance on `vos-core`, and the founding of a continuation
-   across platforms. While an upgrade is scheduled, the host ends its batches at *n* − 1.
+   across platforms. While an upgrade is scheduled, the host ends its batches at *n* − 1. At start and at
+   every switch, the host checks every artefact it runs, the runtime included, against the range's code
+   version by digest.
 5. **The inputs**: `Upgrade`, with the staging check (digests, the next generation, the compiled constant).
-6. **The fence and the way out**: code whose `GENERATION` is not the scheduled one refuses input *n* and
-   later, with nothing written, except `RescheduleUpgrade` and `CancelUpgrade`. The time spent fenced is a
-   metric with an alert.
+6. **The fence, always on, and the way out**: code whose `GENERATION` is neither the state's nor, from a
+   scheduled `from`, the next one refuses the input, with nothing written. `RescheduleUpgrade` and
+   `CancelUpgrade` are decided the same by either generation. The time spent fenced is a metric with an
+   alert.
 7. **The modes** and their inputs.
 8. **Retrieval**: `CodeSource`, plugins, Kreivo preimages.
 9. **Checkpoints as rows and leaf chunks**: the archive's checkpoint, and a snapshot sent to another node,
@@ -63,8 +68,8 @@ has a way out, and why a continuation is founded once per input number. In build
 10. **Per-range replay**: native first for the book, under each range's generation; the Agent side under
     each range's replayer, `replayer/<hex H>` in the code archive.
 11. **The continuation**: `Continuation` beside `StateGenesis`; the writer state carried and compared field
-    by field; the founding record written once per (genesis, writer, *n*); the code map's boundary from the
-    `Upgrade`.
+    by field; the founding record written last and once per (genesis, writer, *n*); each input number
+    archived once; the code map's boundary from the `Upgrade`.
 12. **Migration of construction**, **fast and full resync**, the per-shard archive.
 13. **The `code-history` gate** and **the legal hold**.
 

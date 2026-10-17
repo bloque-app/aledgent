@@ -65,11 +65,15 @@ no new genesis (amendment 0033).
   more after every upgrade. Every package is built with its generation compiled in, and the manifest's digest
   binds that constant to the code version.
 - **The switch of code is one host operation**, taken between two inputs, installing only bytes fetched and
-  checked before the upgrade was accepted. The old code also fences it: while an upgrade to a version from
-  input *n* is scheduled, code of any other generation refuses input *n* and later, with nothing written. A
-  missed switch halts the writer; it never runs an input under the wrong code.
+  checked before the upgrade was accepted. The code also fences itself, at every input: code whose
+  generation is not the writer's (or, from a scheduled upgrade's input *n*, the next one) refuses the input,
+  with nothing written. A missed switch, or a stale package after one, halts the writer; it never runs an
+  input under the wrong generation. Within a generation, the bytes are checked by digest before they are
+  installed, and the node checks every artefact it runs, the runtime included, when it starts and at every
+  switch.
 - **The fence has a way out.** While it holds, the old code still takes an input that moves the upgrade to a
-  later input or cancels it, under the upgrade-authority mode. An alert fires when a writer stays fenced longer
+  later input or cancels it, under the upgrade-authority mode. Either generation decides that input the same
+  way, so the outcome never depends on whether the switch was already made. An alert fires when a writer stays fenced longer
   than the deployment's bound (five minutes by default).
 - **Only the book's upgrade-authority mode authorises an upgrade.** A runtime's own authority to install
   programs is a host key, never an authority over the book's code.
@@ -79,7 +83,8 @@ no new genesis (amendment 0033).
   runtime. Each range's host image (its replayer) is kept in the code archive beside the code version, not in
   it, so the runtime's execution can be checked too, and rebuilding the host is not an upgrade.
 - **A writer can be continued by another at input *n***, carrying its whole state and log head after input
-  *n* − 1. The founding is written once per input number, so two continuations of one writer cannot exist. A
+  *n* − 1. The founding is written once per input number, only after every check has passed, and the
+  archive takes each input number once, so two continuations of one writer cannot both hold an input. A
   move of runtime is an upgrade naming the new runtime, followed by a continuation on it.
 
 ## Code sources

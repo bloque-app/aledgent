@@ -3,7 +3,7 @@
 //! `F-037` — code history and upgrades (amendments 0023 and 0033, `US-K7`, `REQ-RT-15` to
 //! `REQ-RT-21`, `REQ-PR-11`, `NFR-22`). Its registered cases (`F-015` §6, §7).
 //!
-//! All fifteen are pending, registered when each amendment was applied, before `F-037` is built
+//! All nineteen are pending, registered when each amendment was applied, before `F-037` is built
 //! (amendment 0013's practice). They need the code version in each writer's state, the upgrade and
 //! mode inputs, the code archive, per-range replay, the code generation and the fence with its way
 //! out, checkpoints as rows and leaf chunks, the replayer, and the continuation founded once.
@@ -116,5 +116,33 @@ pub const CASES: &[Case] = &[
         Layer::Service,
         Feature::F037,
         &["REQ-RT-19"],
+    ),
+    Case::pending(
+        "AC-K7.16",
+        "ac_k7_16_a_stale_package_or_a_wrong_generation_is_refused__service",
+        Layer::Service,
+        Feature::F037,
+        &["REQ-RT-20"],
+    ),
+    Case::pending(
+        "AC-K7.17",
+        "ac_k7_17_an_unauthorised_reschedule_or_cancel_is_refused__service",
+        Layer::Service,
+        Feature::F037,
+        &["REQ-RT-20", "REQ-RT-18"],
+    ),
+    Case::pending(
+        "AC-K7.18",
+        "ac_k7_18_input_n_is_decided_the_same_by_either_generation__service",
+        Layer::Service,
+        Feature::F037,
+        &["REQ-RT-20", "REQ-RT-17"],
+    ),
+    Case::pending(
+        "AC-K7.19",
+        "ac_k7_19_the_archive_takes_each_input_number_once__service",
+        Layer::Service,
+        Feature::F037,
+        &["REQ-RT-21"],
     ),
 ];
