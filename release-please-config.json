@@ -5,7 +5,7 @@
   "include-v-in-tag": true,
   "bump-minor-pre-major": true,
   "bump-patch-for-minor-pre-major": false,
-  "signoff": "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>",
+  "signoff": "aledgent-release[bot] <342133188+aledgent-release[bot]@users.noreply.github.com>",
   "packages": {
     ".": {
       "release-type": "simple",
