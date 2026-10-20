@@ -924,6 +924,9 @@ impl<S: LeafStore, V: VaultBackend> Running<S, V> {
     /// Execute one input against the ledger: what [`Core::apply`] does, without the journal or
     /// the input numbering.
     pub fn execute(&mut self, input: &CoreInput) -> Outcome {
+        // The writer decides this input as its `next_seq`th: a change of the upgrade-authority
+        // mode takes force at its input, and a delay counts inputs (`T-037-05`), as in the Agent.
+        self.ledger.set_input(self.next_seq);
         match &input.body {
             InputBody::Command {
                 caller,

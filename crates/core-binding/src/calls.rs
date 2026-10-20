@@ -347,6 +347,13 @@ pub fn apply<S: LeafStore, V: VaultBackend>(
             justification,
         } => s(l.reschedule_upgrade(ctx, *from, justification)),
         C::CancelUpgrade { ctx, justification } => s(l.cancel_upgrade(ctx, justification)),
+        // The upgrade-authority inputs (`T-037-05`): in every build, ungated, since every code
+        // version must decide the mode's inputs (`REQ-RT-18`).
+        C::UpgradeAuthority {
+            ctx,
+            input,
+            justification,
+        } => s(l.upgrade_authority(ctx, input.clone(), justification)),
         // An upgrade (`T-037-04`), likewise in every build: *H₀* carries the handler.
         C::Upgrade {
             ctx,

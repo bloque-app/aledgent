@@ -212,6 +212,10 @@ impl State {
             custody,
             anchoring,
             chainspec: seed,
+            // The writer's upgrade-authority record is writer state, not the book's records
+            // (`T-037-05`): an export does not carry it. The writer state's checkpoints do
+            // (`T-037-16`).
+            upgrade_authority: _,
             applying_spec: _,
             spec_undo: _,
         } = self;

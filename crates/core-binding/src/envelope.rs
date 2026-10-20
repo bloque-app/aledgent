@@ -142,7 +142,8 @@ pub struct FoundingCode {
     /// The genesis code version *H₀*: the chainspec's, which the host checked its binaries against
     /// (`F-036`); zeros for a book whose code is not named (tests, stress books).
     pub code: [u8; 32],
-    /// The digest of the initial upgrade-authority mode; zeros until modes exist (`T-037-05`).
+    /// The digest of the initial upgrade-authority mode: zeros, the genesis mode, the operator's
+    /// organisation identity alone (`T-037-05`). A chainspec that names another is `F-036`'s.
     pub authority: [u8; 32],
 }
 

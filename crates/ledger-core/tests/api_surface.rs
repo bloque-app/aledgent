@@ -232,6 +232,36 @@ const SURFACE: &[(&str, &str)] = &[
         "take_way_out",
         "takes the way out of a scheduled upgrade the last commands took (T-037-15)",
     ),
+    // T-037-05: the upgrade-authority inputs, operator commands of `CTR-OPS` decided under the
+    // writer's mode (`REQ-RT-18`, `DEC-26` (b′)). Each writes only the writer's upgrade-authority
+    // record and its audit record.
+    (
+        "set_authority",
+        "operator command: change the upgrade-authority mode, under the mode in force (REQ-RT-18, T-037-05)",
+    ),
+    (
+        "propose_upgrade",
+        "operator command: propose an upgrade, under the upgrade-authority mode (REQ-RT-16, REQ-RT-18, T-037-05)",
+    ),
+    (
+        "approve_upgrade",
+        "operator command: approve a proposed upgrade, migration or change of mode (REQ-RT-18, T-037-05)",
+    ),
+    (
+        "propose_migration",
+        "operator command: propose a migration of construction, under the upgrade-authority mode (REQ-PR-11, REQ-RT-18, T-037-05)",
+    ),
+    (
+        "upgrade_authority",
+        "operator command: any of the four upgrade-authority inputs, as Call::UpgradeAuthority replays them (T-037-05)",
+    ),
+    // T-037-05: the writer's scheduled change of mode, as `set_code` is: no command reaches it,
+    // it writes nothing to the book, and only `core-binding` calls it, from the Agent's hot row.
+    // `set_input` (above) is where a scheduled change takes force.
+    (
+        "set_authority_next",
+        "sets the scheduled change of mode as the writer's hot row holds it (T-037-05)",
+    ),
     (
         "take_upgrade",
         "takes the upgrade the last commands scheduled, for the writer to schedule (T-037-04)",

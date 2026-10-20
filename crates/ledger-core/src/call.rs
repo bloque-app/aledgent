@@ -411,8 +411,15 @@ pub enum Call {
         ctx: Ctx,
         justification: Vec<u8>,
     },
+    /// An upgrade-authority input (`F-037`, `T-037-05`): a change of mode, a proposal or an
+    /// approval. After `CancelUpgrade`, so no earlier variant's tag moves.
+    UpgradeAuthority {
+        ctx: Ctx,
+        input: crate::code::authority::Input,
+        justification: Vec<u8>,
+    },
     /// An upgrade (`T-037-04`, `REQ-RT-16`): the writer's code becomes code version `code` from
-    /// input `from`. After `CancelUpgrade` and before the conformance ports, so no production
+    /// input `from`. After `UpgradeAuthority` and before the conformance ports, so no production
     /// variant's tag moves.
     Upgrade {
         ctx: Ctx,
@@ -521,6 +528,7 @@ impl Call {
             Call::ApplySpecChunk { .. } => "apply_spec_chunk",
             Call::RescheduleUpgrade { .. } => "reschedule_upgrade",
             Call::CancelUpgrade { .. } => "cancel_upgrade",
+            Call::UpgradeAuthority { input, .. } => input.method(),
             Call::Upgrade { .. } => "upgrade",
         }
     }

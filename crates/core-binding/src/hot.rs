@@ -200,10 +200,13 @@ pub struct Hot {
     /// The scheduled upgrade, if any: the code version *H* and the input number `n` it applies
     /// from (`REQ-RT-16`). Its first input moves it into [`Hot::code`] (`T-037-04`).
     pub upgrade: Option<([u8; 32], u64)>,
-    /// The digest of the upgrade-authority mode in force (`REQ-RT-18`); the mode itself is a
-    /// record in the service tree. Zeros until modes exist (`T-037-05`).
+    /// The digest of the upgrade-authority mode in force (`REQ-RT-18`, `T-037-05`); the mode
+    /// itself is a record in the service tree (`ledger_core::code::authority`). Zeros for the
+    /// genesis mode, the operator's organisation identity alone, which no record names.
     pub authority: [u8; 32],
     /// A scheduled change of mode: the new mode's digest and the input number it applies from.
+    /// The input that number names makes it [`Hot::authority`], as its first effect
+    /// (`ledger_core::Ledger::set_input`).
     pub authority_next: Option<([u8; 32], u64)>,
     /// The input number at which this writer was founded as a continuation (`REQ-RT-21`), if it
     /// was (`T-037-17`).

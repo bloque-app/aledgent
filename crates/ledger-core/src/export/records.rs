@@ -490,6 +490,10 @@ tagged!(Command {
     RegisterAlias => 50,
     RescheduleUpgrade => 51,
     CancelUpgrade => 52,
+    SetAuthority => 53,
+    ProposeUpgrade => 54,
+    ApproveUpgrade => 55,
+    ProposeMigration => 56,
     // 53 to 56 are `T-037-05`'s (`crate::audit::command_code`).
     Upgrade => 57,
 });

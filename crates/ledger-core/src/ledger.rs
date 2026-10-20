@@ -263,6 +263,9 @@ pub struct Ledger<S: LeafStore, V: VaultBackend> {
     /// far (`T-037-15`: a way out must be its input's first call). Kept whether or not calls are
     /// recorded, so the Agent, the replica and a replay count alike. Not service state.
     pub(crate) calls_in_input: (u32, u32),
+    /// The writer's upgrade-authority position (`T-037-05`): any scheduled change of mode, and
+    /// what this input has decided. Not service state either.
+    writer: crate::code::authority::Position,
 }
 
 fn policy_used(p: &Principal) -> AuthorityUsed {
@@ -384,6 +387,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             way_out: None,
             upgrade: None,
             calls_in_input: (0, 0),
+            writer: crate::code::authority::Position::default(),
         };
         if let Some(sp) = spec {
             ledger.build_genesis_state(&founded, &sp)?;
@@ -435,6 +439,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             way_out: None,
             upgrade: None,
             calls_in_input: (0, 0),
+            writer: crate::code::authority::Position::default(),
         }
     }
 
@@ -446,13 +451,18 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
         self.code = (code, authority);
     }
 
-    /// The input number the commands that follow take (`T-037-15`), as the writer that runs the
-    /// ledger numbers its inputs: the core Agent sets it from the input before running its calls,
-    /// the host's replica from the input it will stage next, and a replay from each entry. A way out
-    /// of a scheduled upgrade is decided against it ([`Ledger::reschedule_upgrade`]).
+    /// The input number the commands that follow take (`T-037-15`, `T-037-05`), as the writer that
+    /// runs the ledger numbers its inputs: the core Agent sets it from the input before running its
+    /// calls, the host's replica from the input it will stage next, a replay from each entry, and
+    /// the in-process core from its journal's numbering. A way out of a scheduled upgrade is
+    /// decided against it ([`Ledger::reschedule_upgrade`]), a delay of the upgrade-authority mode
+    /// counts it, and a scheduled change of mode whose input has come is the mode in force from
+    /// it ([`crate::code::authority::Position::begin`], the one place that does so). A writer
+    /// that has the hot row gives the scheduled change first ([`Ledger::set_authority_next`]).
     pub fn set_input(&mut self, input: u64) {
         self.input = input;
         self.calls_in_input.1 = 0;
+        self.writer.begin(&mut self.code.1, input);
     }
 
     /// How many calls of the current input were decided before the one running now
@@ -1338,6 +1348,7 @@ pub mod seeding;
 pub mod settle_adapter;
 pub mod settlement;
 pub mod transfers;
+mod upgrade_authority;
 
 pub use transfers::{Leg, Transfer};
 
