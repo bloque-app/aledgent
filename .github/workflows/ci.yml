@@ -378,7 +378,9 @@ jobs:
         working-directory: ${{ runner.temp }}/vos/services/agent-runtime
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/agent-runtime-target
-        run: cargo actor --locked
+        # Without the workflow's RUSTFLAGS (-D warnings): VOS builds with its own flags, and
+        # core.Dockerfile builds it with none; the environment's would also replace the target's.
+        run: env -u RUSTFLAGS cargo actor --locked
       - name: The host's test over it
         working-directory: agents
         env:
