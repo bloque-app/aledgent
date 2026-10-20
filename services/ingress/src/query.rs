@@ -443,6 +443,12 @@ pub struct SignalsBody {
     /// acknowledged yet. The runtime refuses more past 256. Absent for the in-process core.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vos_unacknowledged: Option<u64>,
+    /// How long the core's writer has been fenced, in milliseconds (`T-037-15`, `REQ-RT-20`,
+    /// `NFR-11`): since the fence first refused an input that has not committed since, because the
+    /// code installed is not the code the writer's state names. Absent while it is not fenced, and
+    /// from a core with no fence (the in-process core).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer_fenced_age: Option<u64>,
     /// The book's size (`T-018-11`): what `T-036-17`'s disk-backed store is required by. Absent
     /// from a core that does not count it.
     #[serde(default, skip_serializing_if = "Option::is_none")]

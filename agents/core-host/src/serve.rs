@@ -670,14 +670,18 @@ fn open_core<L: core_binding::core::HostLog>(
     match audit {
         Some(section) => {
             let sink = section.open(dir)?;
-            AgentCore::open_audited(
+            let core = AgentCore::open_audited(
                 port,
                 founding,
                 log,
                 stores,
                 Box::new(sink),
                 section.max_unshipped(),
-            )
+            )?;
+            // What the core refuses without the book (the fence, `T-037-15`) is audited beside
+            // the book's trail.
+            core.set_node_trail(section.open_node_trail(dir)?);
+            Ok(core)
         }
         None => {
             eprintln!(

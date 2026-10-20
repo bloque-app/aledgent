@@ -1435,6 +1435,7 @@ impl<S: LeafStore, V: VaultBackend> Running<S, V> {
             core_halted: false,
             audit: None,
             vos_unacknowledged: None,
+            writer_fenced_age: None,
             book: Some(q::BookSizeBody {
                 records: s.book.records,
                 leaves: s.book.leaves,

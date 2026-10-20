@@ -32,7 +32,7 @@ mapped = []
 std = ["dep:leaf-store", "ledger-kernel/std", "mapped"]
 # The Agent core: ingress's boundary::Core over the Agent, with the host's durable log
 # (core::AgentCore). What aledgent-core-host serves.
-ingress = ["std", "dep:ingress", "dep:tokio", "dep:serde_json"]
+ingress = ["std", "dep:ingress", "dep:tokio", "dep:serde_json", "dep:audit-store"]
 # v1 roots (CipherClerk's full-depth tree): a supported opt-in beside the default v2 (DEC-25,
 # owner ruling cs-q04). Host and guests must agree: build both with it or neither.
 smt-v1 = ["ledger-kernel/smt-v1", "ledger-core/smt-v1", "leaf-store?/smt-v1"]
@@ -57,6 +57,8 @@ leaf-store = { path = "../leaf-store", optional = true }
 ingress = { path = "../../services/ingress", default-features = false, optional = true }
 tokio = { version = "1", features = ["rt", "sync"], optional = true }
 serde_json = { version = "1", optional = true }
+# The audit store's node trail, where the core audits an input the fence refused (T-037-15).
+audit-store = { path = "../audit-store", optional = true }
 
 [dev-dependencies]
 core-binding = { path = ".", features = ["std"] }

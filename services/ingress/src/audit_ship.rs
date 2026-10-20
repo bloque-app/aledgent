@@ -113,6 +113,23 @@ impl AuditStoreSection {
         )
         .map_err(|e| format!("the audit store {}: {e:?}", self.dir.display()))
     }
+
+    /// Open the store's node trail to append (`audit_store::NodeTrail`, `T-037-15`): where the core
+    /// audits what it refused without the book. Same directory and writer credential as
+    /// [`AuditStoreSection::open`], which must have opened the store first.
+    pub fn open_node_trail(&self, book_dir: &Path) -> Result<audit_store::NodeTrail, String> {
+        let secret = std::env::var(ENV_AUDIT_WRITER)
+            .map_err(|_| format!("{ENV_AUDIT_WRITER} is not set"))?;
+        audit_store::NodeTrail::open(
+            &AuditStoreConfig {
+                dir: self.dir.clone(),
+                book_dir: book_dir.to_path_buf(),
+                segment_records: self.segment_records.unwrap_or(DEFAULT_SEGMENT_RECORDS),
+            },
+            &WriterCredential::new(secret.into_bytes()),
+        )
+        .map_err(|e| format!("the audit store's node trail {}: {e:?}", self.dir.display()))
+    }
 }
 
 /// A record's place in the chain: its sequence number and hash.

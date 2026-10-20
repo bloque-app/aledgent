@@ -67,6 +67,8 @@ fn healthy() -> Snapshot {
                 max_unshipped: 65_536,
             }),
             vos_unacknowledged: Some(0),
+            // Fenced, but well inside `fence_alert_after`.
+            writer_fenced_age: Some(299_000),
             book: Some(BookSizeBody {
                 records: 600_000,
                 leaves: 2_400_000,
@@ -223,6 +225,10 @@ fn nfr_11_each_signal_over_its_line_pages_the_test_route() {
         }),
         ("AledgentTickerStale", "ticker", |s| {
             s.core.as_mut().unwrap().tick_age = Some(30_001)
+        }),
+        // REQ-RT-20, T-037-15: a writer fenced past `fence_alert_after` (five minutes).
+        ("AledgentWriterFenced", "writer-fence", |s| {
+            s.core.as_mut().unwrap().writer_fenced_age = Some(301_000)
         }),
         ("AledgentReviewOverdue", "needs-review", |s| {
             let c = s.core.as_mut().unwrap();

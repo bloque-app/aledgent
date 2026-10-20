@@ -5162,6 +5162,15 @@
               "integer",
               "null"
             ]
+          },
+          "writer_fenced_age": {
+            "description": "How long the core's writer has been fenced, in milliseconds (`T-037-15`, `REQ-RT-20`,\n`NFR-11`): since the fence first refused an input that has not committed since, because the\ncode installed is not the code the writer's state names. Absent while it is not fenced, and\nfrom a core with no fence (the in-process core).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [

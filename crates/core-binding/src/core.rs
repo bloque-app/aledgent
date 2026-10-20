@@ -72,7 +72,7 @@ use ledger_core::id::OperationId;
 use ledger_core::ledger::{Founded, Genesis};
 use ledger_core::lifecycle::keys::NotificationId;
 
-use crate::envelope::{decode, encode};
+use crate::envelope::{AgentRefusal, Fenced, decode, encode};
 use crate::host::{
     AgentPort, BatchLimits, DriveError, Driver, HostStore, HostVault, PortError, ReplicaStores,
 };
@@ -563,6 +563,10 @@ pub struct CoreStats {
     /// The runtime's unacknowledged Authority decisions, after the last decision; `u64::MAX`
     /// while the port does not count them ([`AgentPort::unacknowledged`]).
     pub unacknowledged: AtomicU64,
+    /// While the writer is fenced (`T-037-15`): the time input of the first input the fence
+    /// refused since an input last committed; 0 when it is not fenced. The signals report how long
+    /// ago that was (`aledgent_writer_fenced_seconds`, `NFR-11`).
+    pub fenced_since: AtomicU64,
     read_wait_us: Window,
     hold_us: Window,
     native_us: Window,
@@ -686,6 +690,10 @@ struct Inner<P: AgentPort> {
     /// A `verify-genesis` segment's chainspec and first chunk: what a rebuild applies natively
     /// before the segment's archive ([`Driver::recover_segment`]).
     segment: Option<(ledger_core::chainspec::SpecRef, u32)>,
+    /// The node's own trail in the audit store (`T-037-15`, amendment 0033 D25), where an input
+    /// the fence refused is audited, never in the book. Beside it, always, a line on standard
+    /// error.
+    node_trail: Option<audit_store::NodeTrail>,
 }
 
 /// The core's two locks (`T-031-12`, finding F3 of `F-032`). An input takes `ctl`, then the
@@ -866,6 +874,13 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
         )
     }
 
+    /// Audit what the execution node refuses without the book (an input the fence refused,
+    /// `T-037-15`) in the audit store's node trail too, beside the line on standard error that
+    /// every refusal has.
+    pub fn set_node_trail(&self, trail: audit_store::NodeTrail) {
+        lock(&self.inner.ctl).node_trail = Some(trail);
+    }
+
     /// The audit shipping's shared state, when the core ships.
     pub fn audit(&self) -> Option<AuditShared> {
         self.inner.audit.clone()
@@ -970,6 +985,7 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
             failing: None,
             audit,
             segment: segment.map(|(spec, start)| (spec.clone(), start)),
+            node_trail: None,
         };
         let mut running = inner.executor(replica)?;
         // A book founded here emitted genesis's records: the store may hold them already.
@@ -1258,6 +1274,41 @@ impl<P: AgentPort> Inner<P> {
         }
     }
 
+    /// The fence refused `input` (`T-037-15`, `crate::fence`): start the fenced clock if it is not
+    /// running, and audit the refusal at the execution node, on standard error and in the audit
+    /// store's node trail (amendment 0033 D25), never in the book. The line and the record name the
+    /// input by key, kind and time, never by its body (`REQ-AU-8`).
+    fn fenced(&mut self, input: Option<&CoreInput>, f: &Fenced) {
+        let at = input.and_then(input_time).unwrap_or(0).max(1);
+        let _ =
+            self.stats
+                .fenced_since
+                .compare_exchange(0, at, Ordering::Relaxed, Ordering::Relaxed);
+        let what = input.map_or_else(|| "an input".to_string(), describe);
+        let upgrade = f.upgrade.map_or_else(
+            || "none".to_string(),
+            |(h, n)| {
+                let h: String = h.iter().map(|b| format!("{b:02x}")).collect();
+                format!("{h} from input {n}")
+            },
+        );
+        let detail = format!(
+            "input {} refused by the fence: the code installed is generation {}, the writer's \
+             state names generation {} (scheduled upgrade: {upgrade}); {what}",
+            f.seq, f.code_generation, f.generation
+        );
+        std::eprintln!("aledgent-core: AUDIT: {detail}");
+        if let Some(trail) = self.node_trail.as_mut()
+            && let Err(e) = trail.append(at, "fenced", f.seq, &detail)
+        {
+            std::eprintln!(
+                "aledgent-core: WARNING: the audit store's node trail did not take the fence's \
+                 refusal of input {}: {e:?}",
+                f.seq
+            );
+        }
+    }
+
     /// The Agent failed `input` alone, definitively: count it, and halt at [`FAILED_ATTEMPTS`]
     /// in a row (finding F18 of `F-032`). The replica has been rebuilt to what the Agent
     /// committed, so reads go on answering from there.
@@ -1481,6 +1532,8 @@ impl<P: AgentPort> Inner<P> {
                 }
                 if !runs.is_empty() {
                     self.failing = None;
+                    // An input committed: the writer is not fenced (`T-037-15`).
+                    self.stats.fenced_since.store(0, Ordering::Relaxed);
                 }
                 (runs.len(), down)
             }
@@ -1493,11 +1546,19 @@ impl<P: AgentPort> Inner<P> {
                     "aledgent-core: the decision of {} inputs did not commit at input {at}: {why}",
                     inputs.len(),
                 );
+                // The fence (`T-037-15`): the code installed is not the code the writer's state
+                // names. Nothing committed and the input's number is not taken; it is retried once
+                // the code map's code is installed, or a way out is taken, so it never counts
+                // toward the halt. It is audited here, at the execution node, never in the book.
+                let fence = match &e {
+                    DriveError::Refused(AgentRefusal::Fenced(f)) => Some(f.clone()),
+                    _ => None,
+                };
                 // The Agent ran it and committed nothing, and would again (finding F18).
                 let definitive = matches!(
                     e,
                     DriveError::Refused(_) | DriveError::Port(PortError::Aborted(_))
-                );
+                ) && !matches!(e, DriveError::Refused(AgentRefusal::Fenced(_)));
                 let after = match e {
                     DriveError::Diverged(e) | DriveError::Replica(e) => {
                         self.stop(format!("incident: {e}"));
@@ -1519,6 +1580,9 @@ impl<P: AgentPort> Inner<P> {
                     None => 0,
                 };
                 let first = runs.get(n).map_or(at, |(i, _, _)| *i);
+                if let Some(f) = &fence {
+                    self.fenced(inputs.get(first), f);
+                }
                 // Which input it was (finding F18): the index above is where staging stopped,
                 // and a flush inside staging fails the inputs staged before it.
                 if let Some(input) = inputs.get(first) {
@@ -1575,6 +1639,15 @@ impl<P: AgentPort> Inner<P> {
         }
         self.stats.log_us.push(micros(logged));
         (out, first)
+    }
+}
+
+/// An input's time input, where it has one (`T-037-15`: the fenced clock starts at it).
+fn input_time(input: &CoreInput) -> Option<Time> {
+    match &input.body {
+        InputBody::Command { now, .. } | InputBody::Tick { now } => Some(*now),
+        InputBody::RecordDelivery { at, .. } => Some(*at),
+        InputBody::SpecChunk { .. } => None,
     }
 }
 
@@ -1697,6 +1770,9 @@ impl<P: AgentPort + Send + 'static> Core for AgentCore<P> {
             s.audit = self.inner.audit.as_ref().map(|a| a.stats.body(now));
             let u = stats.unacknowledged.load(Ordering::Relaxed);
             s.vos_unacknowledged = (u != u64::MAX).then_some(u);
+            // How long the writer has been fenced (`T-037-15`, `NFR-11`).
+            let since = stats.fenced_since.load(Ordering::Relaxed);
+            s.writer_fenced_age = (since != 0).then(|| now.saturating_sub(since));
         }
         Ok(reply)
     }

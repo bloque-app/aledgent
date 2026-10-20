@@ -517,6 +517,7 @@ dependencies = [
 name = "core-binding"
 version = "0.1.0"
 dependencies = [
+ "audit-store",
  "cipher-clerk",
  "curve25519-dalek",
  "ingress",
