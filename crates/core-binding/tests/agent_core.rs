@@ -1039,7 +1039,9 @@ mod audit {
         core.with_port(|p| p.generation = 1);
         let tick = ticks(1, 1).remove(0);
         for _ in 0..FAILED_ATTEMPTS + 2 {
-            assert_eq!(core.apply(&tick).await, Err(CoreError::Unavailable));
+            // The fence's refusal is a definite `NotRun` (`T-037-18`, amendment 0036), not the
+            // `Unavailable` of an input the core never reached.
+            assert_eq!(core.apply(&tick).await, Err(CoreError::NotRun));
         }
         assert_eq!(core.stopped(), None, "the fence never halts the core");
         assert_eq!(core.stats().halted.load(Ordering::Relaxed), 0);

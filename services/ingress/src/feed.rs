@@ -861,4 +861,98 @@ mod tests {
             "the real feeder is not fenced"
         );
     }
+
+    /// A core behind a fence that is a switch: while it is on, an input it has not decided is
+    /// `NotRun`, and every one after it in the call; a decided input is answered from its record.
+    struct Fenceable {
+        inner: Arc<Counting>,
+        on: AtomicBool,
+    }
+
+    impl Core for Arc<Fenceable> {
+        async fn apply(&self, input: &CoreInput) -> Result<CoreReply, CoreError> {
+            let decided = self.inner.replies.lock().unwrap().contains_key(&input.key);
+            if self.on.load(Ordering::SeqCst) && !decided {
+                return Err(CoreError::NotRun);
+            }
+            self.inner.apply(input).await
+        }
+        async fn apply_batch(&self, inputs: &[CoreInput]) -> Vec<Result<CoreReply, CoreError>> {
+            let mut out = Vec::new();
+            for input in inputs {
+                let r = self.apply(input).await;
+                let stop = r.as_ref().err().copied();
+                out.push(r);
+                if let Some(e) = stop {
+                    out.resize(inputs.len(), Err(e));
+                    break;
+                }
+            }
+            out
+        }
+        async fn outbox(&self, c: Option<&str>, u: bool, n: Time) -> Result<OutboxPage, CoreError> {
+            self.inner.outbox(c, u, n).await
+        }
+        async fn last_tick(&self) -> Result<Option<Time>, CoreError> {
+            self.inner.last_tick().await
+        }
+        async fn query(&self, c: &CallerBody, q: &Query, n: Time) -> Result<QueryReply, CoreError> {
+            self.inner.query(c, q, n).await
+        }
+        async fn credential(&self, c: &str) -> Result<Option<CredentialBody>, CoreError> {
+            self.inner.credential(c).await
+        }
+        async fn party_of(&self, p: &str) -> Result<Option<String>, CoreError> {
+            self.inner.party_of(p).await
+        }
+    }
+
+    /// `T-037-18`, amendment 0036, N5; `AC-K7.23`: the sequencer passes the fence's `NotRun`
+    /// through for the tail of a feed, runs nothing for it, and does not move the sequence it
+    /// expects: the same sequences are taken again, not read as a gap or as duplicates, once the
+    /// fence is gone. A feed under a raised epoch, which is how a feeder that gave the sequences
+    /// back goes on, is taken, and a copy sent under the old epoch is fenced.
+    #[tokio::test]
+    async fn t_037_18_the_sequencer_passes_not_run_through_and_expects_the_same_sequence() {
+        let ingress = key(1);
+        let keys = FeedKeys::of(&[ingress.public()]).unwrap();
+        let core = Arc::new(Fenceable {
+            inner: Arc::new(Counting::default()),
+            on: AtomicBool::new(false),
+        });
+        let seq = Sequencer::new(Arc::clone(&core), Some(keys));
+        let ran = || core.inner.ran();
+        let results = |r: &FeedReply| match r {
+            FeedReply::Answers { answers } => answers.clone(),
+            other => panic!("not answered: {other:?}"),
+        };
+        // One decided before the fence.
+        assert_eq!(
+            answered(&seq.feed(&feed(1, 1, &[1], Some(&ingress))).await),
+            vec![1]
+        );
+        core.on.store(true, Ordering::SeqCst);
+        // The decided input is answered, though fenced; the tail is `NotRun`.
+        let r = seq.feed(&feed(1, 1, &[1, 2, 3], Some(&ingress))).await;
+        let a = results(&r);
+        assert!(matches!(a[0], BatchAnswer::Applied { .. }));
+        assert_eq!(&a[1..], [BatchAnswer::NotRun, BatchAnswer::NotRun]);
+        assert_eq!(ran(), vec![1], "the fence ran nothing");
+        // The same sequences are expected again: no gap, no duplicate.
+        let r = seq.feed(&feed(1, 2, &[2, 3], Some(&ingress))).await;
+        assert_eq!(results(&r), vec![BatchAnswer::NotRun, BatchAnswer::NotRun]);
+        // The feeder gives them back under a raised epoch and sends other inputs at them.
+        core.on.store(false, Ordering::SeqCst);
+        assert_eq!(
+            answered(&seq.feed(&feed(2, 2, &[9, 2, 3], Some(&ingress))).await),
+            vec![2, 3, 4]
+        );
+        assert_eq!(ran(), vec![1, 9, 2, 3], "each once, the new input first");
+        // The copy sent under the old epoch, still in the host's hands, is stale.
+        assert_eq!(
+            seq.feed(&feed(1, 2, &[2, 3], Some(&ingress))).await,
+            FeedReply::Fenced { epoch: 2 }
+        );
+        assert_eq!(ran(), vec![1, 9, 2, 3]);
+    }
 }

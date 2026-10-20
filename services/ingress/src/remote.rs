@@ -302,6 +302,11 @@ pub enum BatchAnswer {
     Unavailable,
     /// The core may have run it.
     Ambiguous,
+    /// The core refused it because of the fence and holds no decision for it, definitely
+    /// (amendment 0036): [`CoreError::NotRun`]. Given for the first input a call did not commit,
+    /// because of the fence, and for every later one of that call. A peer that reads it as
+    /// anything else reads it as `Unavailable`.
+    NotRun,
 }
 
 impl BatchAnswer {
@@ -311,6 +316,7 @@ impl BatchAnswer {
             Ok(reply) => BatchAnswer::Applied { reply },
             Err(CoreError::Unavailable) => BatchAnswer::Unavailable,
             Err(CoreError::Ambiguous) => BatchAnswer::Ambiguous,
+            Err(CoreError::NotRun) => BatchAnswer::NotRun,
         }
     }
 
@@ -320,13 +326,15 @@ impl BatchAnswer {
             BatchAnswer::Applied { reply } => Ok(reply),
             BatchAnswer::Unavailable => Err(CoreError::Unavailable),
             BatchAnswer::Ambiguous => Err(CoreError::Ambiguous),
+            BatchAnswer::NotRun => Err(CoreError::NotRun),
         }
     }
 }
 
 fn error_response(e: CoreError) -> Response {
     match e {
-        CoreError::Unavailable => Response::Unavailable,
+        // `NotRun` is a batch's answer; for a single call it says what `Unavailable` says.
+        CoreError::Unavailable | CoreError::NotRun => Response::Unavailable,
         CoreError::Ambiguous => Response::Ambiguous,
     }
 }
@@ -751,5 +759,27 @@ impl Core for RemoteCore {
             Ok(r) => Err(Self::read_error(r)),
             Err(_) => Err(CoreError::Unavailable),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `T-037-18`, amendment 0036: the fence's definite "not run" is a batch answer of its own on
+    /// the wire, and comes out as [`CoreError::NotRun`]; for a single call it reads as
+    /// `Unavailable`.
+    #[test]
+    fn t_037_18_not_run_is_a_batch_answer_of_its_own() {
+        let json = serde_json::to_string(&BatchAnswer::NotRun).unwrap();
+        assert_eq!(json, r#"{"answer":"not_run"}"#);
+        let back: BatchAnswer = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.clone().result(), Err(CoreError::NotRun));
+        assert_eq!(BatchAnswer::of(Err(CoreError::NotRun)), back);
+        assert_ne!(BatchAnswer::NotRun, BatchAnswer::Unavailable);
+        assert!(matches!(
+            error_response(CoreError::NotRun),
+            Response::Unavailable
+        ));
     }
 }

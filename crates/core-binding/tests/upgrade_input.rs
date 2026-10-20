@@ -24,8 +24,8 @@ use core_binding::core::{AgentCore, Founding, MemLog};
 use core_binding::host::{AgentPort, NativePort};
 use core_binding::hot::{Hot, Limits, MAX_BUDGET};
 use ingress::boundary::{
-    CallerBody, Core, CoreError, CoreInput, CoreReply, CredentialBody, OutboxPage, Query,
-    QueryReply, Staged,
+    CallerBody, Core, CoreError, CoreInput, CoreReply, CredentialBody, InputBody, InputKey,
+    OutboxPage, Query, QueryReply, Staged,
 };
 use ingress::feed::{Feed, FeedReply, Sequencer};
 use ingress::inprocess::MemJournal;
@@ -420,7 +420,11 @@ async fn t037_04_a_retried_upgrade_is_answered_from_its_first_decision() {
 /// switch taking no effect, so the old package refuses input `n` (the fence). Returns the world,
 /// the code version, `n`, and a holder.
 async fn fenced_at_n() -> (World, [u8; 32], u64, Party) {
-    let w = world().await;
+    fence(world().await).await
+}
+
+/// [`fenced_at_n`] over a world the test has already used.
+async fn fence(w: World) -> (World, [u8; 32], u64, Party) {
     let alice: Party = w.d.party("alice", 0).await;
     let op = operator(&w);
     let h1 = w.code.version(1);
@@ -573,19 +577,14 @@ async fn ac_k7_12_a_way_out_overtakes_the_queue_of_a_fenced_writer_end_to_end() 
     assert!(condition(&v).contains("ERR-NotAuthorised"));
 }
 
-/// **B1 of the review of #47 (red; `#[ignore]`d, with its reason).** The same fence as above, but
-/// the first feed after it is answered ambiguous (the core ran it and refused it as fenced, then
-/// the link failed): the head row is *carried* with its feed sequence. `F-038` §3 resends such a
-/// row first, with the sequence it was given, and never gives a sequence back below the highest
-/// position answered ambiguous, so the forwarder retries it for ever and never reads the store
-/// again: the operator's way out, which overtakes in the store, is never sent, and the fenced
-/// writer stays wedged.
-///
-/// It stays red because the fix the owner asked to try conflicts with the feed rule (the report on
-/// `#47`, and `T-037-18` in `tasks.md`): the way out would need the carried row's sequence, or a
-/// sequence past it that the core holds as a gap. Run it with `--ignored` to see the hole.
+/// **B1 of the review of #47; `T-037-18`; amendment 0036; `AC-K7.21`.** The same fence as above,
+/// but the first feed after it is answered ambiguous (the core ran it and refused it as fenced,
+/// then the link failed): the head row is *carried* with its feed sequence. `F-038` §3 resends
+/// such a row first, with that sequence. The core now answers the fence's refusal `NotRun`, so the
+/// resend gives the carried sequence back (and raises the epoch, because the row was in flight),
+/// the operator's way out, which overtakes in the store, takes the first sequence returned, and
+/// the writer is unfenced. The row it overtook is then decided once, after it.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "B1 of the review of #47: a row carried from an ambiguous send is never overtaken (T-037-18)"]
 async fn ac_k7_12_a_way_out_overtakes_a_row_carried_from_an_ambiguous_send() {
     let (w, _h1, n, _alice) = fenced_at_n().await;
     assert_eq!(hot(&w).inputs + 1, n);
@@ -611,4 +610,85 @@ async fn ac_k7_12_a_way_out_overtakes_a_row_carried_from_an_ambiguous_send() {
         "the way out reaches the fenced writer: {v}"
     );
     assert_eq!(hot(&w).upgrade, None);
+    // It took the fenced input's own number, ahead of the row it overtook.
+    let way_out = row(&w, "operator-cancel").await;
+    assert_eq!(way_out.status, Status::Decided);
+    assert_eq!(way_out.core_input_seq, Some(n));
+    // The row it overtook was given back and is decided once, after it, under the old code.
+    until("the carried row to be decided", || {
+        w.core
+            .with_port(|p| p.hot())
+            .is_some_and(|h| h.ok().flatten().is_some_and(|h| h.inputs > n))
+    })
+    .await;
+    let carried = row(&w, "carried").await;
+    assert_eq!(carried.status, Status::Decided);
+    assert_eq!(carried.core_input_seq, Some(n + 1));
+    assert_eq!(hot(&w).inputs, n + 1, "each was decided once, none twice");
+}
+
+/// An input the fenced writer cannot decide, and the core can: a tick under key `k`.
+fn tick(k: u8) -> CoreInput {
+    CoreInput {
+        key: InputKey([k; 16]),
+        body: InputBody::Tick {
+            now: T0 + u64::from(k),
+        },
+    }
+}
+
+/// `T-037-18`, amendment 0036, N1 to N4; `AC-K7.23`: through the real Agent, the fence's refusal
+/// is `NotRun` for the input it refused and every input after it in the call, whether the call
+/// holds one input or several, and an input the core decided is answered from the record of
+/// replies, never `NotRun`, though the writer is fenced. Nothing is committed by a refusal: the
+/// writer's input number does not move, and the same inputs run once the way out is taken.
+#[tokio::test(flavor = "multi_thread")]
+async fn ac_k7_23_a_fenced_refusal_is_not_run_for_the_tail_and_a_decided_input_is_answered() {
+    let w = world().await;
+    // Decided before the fence: its reply is in the record.
+    let decided = tick(1);
+    let reply = w
+        .core
+        .apply(&decided)
+        .await
+        .expect("decided before the fence");
+    let (w, _h1, n, _alice) = fence(w).await;
+    let inputs_before = hot(&w).inputs;
+    assert_eq!(inputs_before + 1, n);
+    // One call: the decided input first (answered, though fenced), then three the fence refuses.
+    let batch = [decided.clone(), tick(2), tick(3), tick(4)];
+    let answers = w.core.apply_batch(&batch).await;
+    assert_eq!(
+        answers[0],
+        Ok(reply.clone()),
+        "a decided input is answered from the record"
+    );
+    for (k, a) in answers.iter().enumerate().skip(1) {
+        assert_eq!(*a, Err(CoreError::NotRun), "input {k} of the call");
+    }
+    // One input alone: the same.
+    assert_eq!(w.core.apply(&tick(5)).await, Err(CoreError::NotRun));
+    assert_eq!(w.core.apply(&decided).await, Ok(reply));
+    // Nothing was committed, and the number was not taken.
+    assert_eq!(hot(&w).inputs, inputs_before);
+    // The way out unfences the writer, and the same inputs then run once, in order.
+    let (s, v) = call(
+        &w.d.router,
+        "POST",
+        "/v1/ops/upgrade/cancel",
+        Some(&operator(&w)),
+        &[("client-key", "operator-cancel")],
+        Some(json!({ "justification": "T-037-18: the switch cannot be taken" })),
+    )
+    .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    let answers = w.core.apply_batch(&[tick(2), tick(3), tick(4)]).await;
+    let numbers: Vec<u64> = answers
+        .iter()
+        .map(|a| a.as_ref().unwrap().input_seq)
+        .collect();
+    assert_eq!(
+        numbers.windows(2).map(|w| w[1] - w[0]).collect::<Vec<_>>(),
+        [1, 1]
+    );
 }

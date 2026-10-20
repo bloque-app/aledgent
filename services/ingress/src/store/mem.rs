@@ -80,6 +80,40 @@ fn row_mut(inner: &mut Inner, op_ref: InputKey) -> Result<&mut Row, StoreError> 
         .ok_or_else(|| StoreError("no such row".into()))
 }
 
+/// Give back the feed sequences from `from` on, under the lease `holder` holds at `epoch`.
+fn unfeed_locked(
+    inner: &mut Inner,
+    partition: &str,
+    holder: &str,
+    epoch: u64,
+    from: u64,
+) -> Result<(), StoreError> {
+    let now = Instant::now();
+    match inner.feeds.get(partition) {
+        Some(l) if l.holder == holder && l.epoch == epoch && l.until > now => {}
+        _ => return Err(StoreError::fenced()),
+    }
+    let tail = inner
+        .rows
+        .values()
+        .filter(|r| r.feed_seq.is_some_and(|s| s >= from));
+    if tail.clone().any(|r| r.status == Status::Decided) {
+        return Err(StoreError(
+            "a decided row holds a sequence to give back".into(),
+        ));
+    }
+    let keys: Vec<u64> = tail.map(|r| r.seq).collect();
+    for k in keys {
+        if let Some(r) = inner.rows.get_mut(&k) {
+            r.feed_seq = None;
+        }
+    }
+    if let Some(l) = inner.feeds.get_mut(partition) {
+        l.next_seq = l.next_seq.min(from);
+    }
+    Ok(())
+}
+
 impl Store for MemStore {
     async fn sign_count(&self, credential: &str) -> Result<Option<u32>, StoreError> {
         Ok(self.lock().counters.get(credential).copied())
@@ -518,31 +552,25 @@ impl Store for MemStore {
         epoch: u64,
         from: u64,
     ) -> Result<(), StoreError> {
+        unfeed_locked(&mut self.lock(), partition, holder, epoch, from)
+    }
+
+    async fn unfeed_in_flight(
+        &self,
+        partition: &str,
+        holder: &str,
+        epoch: u64,
+        from: u64,
+    ) -> Result<u64, StoreError> {
+        // One lock, so the sequences and the epoch move together.
         let mut inner = self.lock();
-        let now = Instant::now();
-        match inner.feeds.get(partition) {
-            Some(l) if l.holder == holder && l.epoch == epoch && l.until > now => {}
-            _ => return Err(StoreError::fenced()),
-        }
-        let tail = inner
-            .rows
-            .values()
-            .filter(|r| r.feed_seq.is_some_and(|s| s >= from));
-        if tail.clone().any(|r| r.status == Status::Decided) {
-            return Err(StoreError(
-                "a decided row holds a sequence to give back".into(),
-            ));
-        }
-        let keys: Vec<u64> = tail.map(|r| r.seq).collect();
-        for k in keys {
-            if let Some(r) = inner.rows.get_mut(&k) {
-                r.feed_seq = None;
-            }
-        }
-        if let Some(l) = inner.feeds.get_mut(partition) {
-            l.next_seq = l.next_seq.min(from);
-        }
-        Ok(())
+        unfeed_locked(&mut inner, partition, holder, epoch, from)?;
+        let lease = inner
+            .feeds
+            .get_mut(partition)
+            .ok_or_else(StoreError::fenced)?;
+        lease.epoch += 1;
+        Ok(lease.epoch)
     }
 
     async fn copy_verifier(

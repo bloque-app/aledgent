@@ -1760,7 +1760,7 @@ async fn ask<S: Store, C: Core>(
     loop {
         match shared.core.query(&caller, query, shared.clock.now()).await {
             Ok(r) => return r,
-            Err(CoreError::Unavailable | CoreError::Ambiguous) => {
+            Err(CoreError::Unavailable | CoreError::Ambiguous | CoreError::NotRun) => {
                 if tokio::time::Instant::now() + wait > until {
                     return QueryReply::Refused {
                         error: Refusal::DecisionUnavailable,

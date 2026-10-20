@@ -1413,7 +1413,11 @@ impl<P: AgentPort> Inner<P> {
             if ok && all.len() > 1 {
                 out.extend(self.apply_chunk(&all[1..]));
             }
-            out.resize_with(all.len(), || Err(CoreError::Unavailable));
+            let rest = match out.last() {
+                Some(Err(CoreError::NotRun)) => CoreError::NotRun,
+                _ => CoreError::Unavailable,
+            };
+            out.resize_with(all.len(), || Err(rest));
             return out;
         }
         self.apply_chunk(all)
@@ -1451,12 +1455,22 @@ impl<P: AgentPort> Inner<P> {
                 break;
             }
         }
-        out.resize_with(all.len(), || Err(CoreError::Unavailable));
+        // What was not reached answers as the last input reached did (amendment 0036, N4): after
+        // the fence's refusal, `NotRun`; otherwise `Unavailable`.
+        let rest = match out.last() {
+            Some(Err(CoreError::NotRun)) => CoreError::NotRun,
+            _ => CoreError::Unavailable,
+        };
+        out.resize_with(all.len(), || Err(rest));
         out
     }
 
     /// Run `inputs` as one batch. Returns every input's answer and, if some did not commit, the
-    /// index of the first: it and everything after it answer `Unavailable`.
+    /// index of the first: it and everything after it answer `Unavailable`, or `NotRun` when the
+    /// fence refused it (`T-037-18`, amendment 0036): the Agent's refusal as fenced, read after
+    /// the replica was rebuilt to what the Agent committed, and nothing else. The record of
+    /// replies was read for every input before it was staged, so an input the core decided is
+    /// `Ok` here, never `NotRun`.
     fn run(&mut self, inputs: &[CoreInput]) -> (Vec<Result<CoreReply, CoreError>>, Option<usize>) {
         let mut out: Vec<Result<CoreReply, CoreError>> =
             inputs.iter().map(|_| Err(CoreError::Unavailable)).collect();
@@ -1473,6 +1487,8 @@ impl<P: AgentPort> Inner<P> {
         let mut runs: Vec<(usize, Outcome, Option<u64>)> = Vec::new();
         let mut failed: Option<(usize, DriveError)> = None;
         let mut down: Option<usize> = None;
+        // The call ended in the fence's refusal (amendment 0036): what did not commit is `NotRun`.
+        let mut fenced_out = false;
         self.stats
             .inputs
             .fetch_add(inputs.len() as u64, Ordering::Relaxed);
@@ -1601,6 +1617,7 @@ impl<P: AgentPort> Inner<P> {
                     DriveError::Refused(AgentRefusal::Fenced(f)) => Some(f.clone()),
                     _ => None,
                 };
+                fenced_out = fence.is_some();
                 // The Agent ran it and committed nothing, and would again (finding F18).
                 let definitive = matches!(
                     e,
@@ -1684,8 +1701,20 @@ impl<P: AgentPort> Inner<P> {
             }
         }
         if let Some(f) = first {
+            // The first input that did not commit and every one after it: the fence's refusal
+            // says nothing ran from there (the core takes inputs in order, amendment 0036, N4).
+            let rest = if fenced_out {
+                CoreError::NotRun
+            } else {
+                CoreError::Unavailable
+            };
             for o in out.iter_mut().skip(f) {
-                *o = Err(CoreError::Unavailable);
+                // An input the record of replies answered stays answered (N3): the core never
+                // reports a decided input as not run.
+                if fenced_out && o.is_ok() {
+                    continue;
+                }
+                *o = Err(rest);
             }
         }
         self.stats.log_us.push(micros(logged));
