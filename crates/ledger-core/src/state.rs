@@ -48,6 +48,7 @@
 //! and the core Agent holds only the tree's root (`F-005`). A store built by [`State::new`] or an
 //! import is whole; one built by [`State::partial`] holds only the leaves a witness gave it.
 
+use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
@@ -186,6 +187,15 @@ pub enum Command {
     RescheduleUpgrade,
     /// `cancel_upgrade`: the way out of a scheduled upgrade, cancelled (`REQ-RT-20`, `T-037-15`).
     CancelUpgrade,
+    /// `set_authority`: a change of the upgrade-authority mode (`REQ-RT-18`, `T-037-05`).
+    SetAuthority,
+    /// `propose_upgrade`: an upgrade of the writer's code, proposed (`REQ-RT-16`, `T-037-05`).
+    ProposeUpgrade,
+    /// `approve_upgrade`: an approval of a proposed upgrade, migration or change of mode
+    /// (`REQ-RT-18`, `T-037-05`).
+    ApproveUpgrade,
+    /// `propose_migration`: a migration of construction, proposed (`REQ-PR-11`, `T-037-05`).
+    ProposeMigration,
 }
 
 /// The attribution of one accepted command (`REQ-AU-7`, `REQ-PN-1`, `INV-20`). For an operation
@@ -293,6 +303,8 @@ pub enum Write {
     Anchor(crate::anchor::AnchorWrite),
     /// Change the seed's record: genesis's commitment, a chunk's progress, an alias (`F-036`).
     ChainSpec(crate::chainspec::SpecWrite),
+    /// Put the writer's upgrade-authority record (`F-037`, `T-037-05`); `None` leaves it absent.
+    UpgradeAuthority(Box<Option<crate::code::authority::AuthorityRecord>>),
 }
 
 /// Why the store refused a write. The whole batch is refused and nothing changes.
@@ -395,6 +407,7 @@ enum Undo {
     Position(AccountId, OpeningUndo),
     Anchor(crate::anchor::AnchorUndo),
     ChainSpec(crate::chainspec::SpecUndo),
+    UpgradeAuthority(Box<Option<crate::code::authority::AuthorityRecord>>),
 }
 
 /// A batch applied by [`State::commit_undoable`], and how to take it back while nothing else has
@@ -450,6 +463,10 @@ pub struct State {
     anchoring: crate::anchor::AnchorStore,
     /// The seed's record (`F-036`).
     chainspec: crate::chainspec::SpecState,
+    /// The writer's upgrade-authority record (`F-037`, `T-037-05`): absent for a book under its
+    /// genesis mode.
+    upgrade_authority:
+        Slot<Option<crate::code::authority::AuthorityRecord>, { kind::UPGRADE_AUTHORITY }>,
     /// While a seed chunk is being applied: the operator's seeding passes the seal's guard
     /// (`crate::principal`). Never stored: it is set and cleared inside one call.
     applying_spec: bool,
@@ -530,6 +547,7 @@ impl State {
             openings: OpeningsState::new(),
             anchoring: crate::anchor::AnchorStore::new(),
             chainspec: crate::chainspec::SpecState::new(),
+            upgrade_authority: Slot::default(),
             applying_spec: false,
             spec_undo: None,
         }
@@ -739,6 +757,9 @@ impl State {
                 Undo::Opening(u) => self.openings.undo(u),
                 Undo::Anchor(u) => self.anchoring.undo(u),
                 Undo::ChainSpec(u) => self.chainspec.undo(u),
+                Undo::UpgradeAuthority(before) => {
+                    self.upgrade_authority.set(*before);
+                }
                 Undo::Position(id, u) => {
                     self.openings.undo(u);
                     if let Some(a) = self.accounts.remove(&id) {
@@ -1008,6 +1029,9 @@ impl State {
                 .apply(w)
                 .map(Undo::Settlement)
                 .map_err(StoreRefusal::Settlement),
+            Write::UpgradeAuthority(r) => Ok(Undo::UpgradeAuthority(Box::new(
+                self.upgrade_authority.set((**r).clone()),
+            ))),
             Write::Anchor(w) => self
                 .anchoring
                 .apply(w)
@@ -1400,6 +1424,12 @@ impl State {
     /// The book's roles, once set.
     pub fn roles(&self) -> Option<Roles> {
         *self.roles.get()
+    }
+
+    /// The writer's upgrade-authority record (`F-037`, `T-037-05`), `None` for a book under its
+    /// genesis mode.
+    pub fn upgrade_authority(&self) -> Option<&crate::code::authority::AuthorityRecord> {
+        self.upgrade_authority.get().as_ref()
     }
 
     /// The accepted transitions of an operation, in order (`F-004`).

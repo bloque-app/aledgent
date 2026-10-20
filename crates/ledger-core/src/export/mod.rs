@@ -472,6 +472,10 @@ pub enum ExportError {
     /// The store or the vault failed after the import began writing: the target is not empty any
     /// more, and must be discarded.
     Partial,
+    /// The writer is under an upgrade-authority mode other than its genesis one, or has a change
+    /// of it scheduled (`REQ-RT-18`, `T-037-05`). An export does not carry the mode yet, and an
+    /// import would found the book under its genesis mode, so nothing is exported.
+    UpgradeAuthority,
 }
 
 impl From<DecodeError> for ExportError {

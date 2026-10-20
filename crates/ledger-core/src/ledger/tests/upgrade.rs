@@ -57,8 +57,9 @@ fn t037_15_an_authorised_way_out_is_taken_once_and_audited() {
 }
 
 /// `AC-K7.17`, `REQ-RT-18`: a way out not authorised under the mode in force is refused, recorded
-/// on the trail, and takes nothing: by another principal than the operator, or by anyone while the
-/// writer names a mode this code does not enforce. A move to the way out's own input or before is
+/// on the trail, and takes nothing: by another principal than the genesis mode's (the operator), or
+/// by anyone while the writer's hot row and its upgrade-authority record disagree on the mode
+/// (`T-037-05`; a way out under a changed mode is `core-binding`'s `tests/upgrade_authority.rs`). A move to the way out's own input or before is
 /// `ERR-InvalidTransition`; a blank justification is `ERR-JustificationRequired`.
 #[test]
 fn t037_15_an_unauthorised_or_invalid_way_out_takes_nothing() {
@@ -88,13 +89,14 @@ fn t037_15_an_unauthorised_or_invalid_way_out_takes_nothing() {
         );
         assert_eq!(fx.ledger.take_way_out(), None);
     }
-    // A writer that names a mode: this code enforces none, so nobody is authorised.
+    // A writer whose hot row names a mode its record does not hold stops there (`T-037-05`): the
+    // way out is decided under no mode at all.
     fx.ledger.set_code([0; 32], [0xA0; 32]);
     fx.ledger.set_input(7);
     let ctx = fx.ctx(op);
     assert_eq!(
         fx.ledger.cancel_upgrade(&ctx, b"a mode").unwrap_err(),
-        Refusal::NotAuthorised
+        Refusal::Internal
     );
     assert_eq!(fx.ledger.take_way_out(), None);
 }

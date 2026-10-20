@@ -20,13 +20,10 @@
 //! earlier request answers that request's outcome and takes nothing again. So a bad way out at the
 //! head of the queue can never wedge the old code.
 //!
-//! **The authority, until `T-037-05`.** The upgrade-authority mode is the only authority over a
-//! writer's code (`REQ-RT-18`, `REQ-RT-20`). The modes and their inputs are `T-037-05`'s. Until
-//! then, one function decides ([`Ledger::upgrade_authority`]), as a stand-in: the writer's mode is
-//! the genesis mode of `PLAN.md` `DEC-26` (b′), `Single` naming the book's operator, while the
-//! writer names no mode (its mode digest is zeros, as every book is founded today). A writer that
-//! names a mode is refused `ERR-NotAuthorised`, because this code enforces no mode. `T-037-05`
-//! replaces that function, and nothing else here.
+//! **The authority.** The upgrade-authority mode is the only authority over a writer's code
+//! (`REQ-RT-18`, `REQ-RT-20`). A way out is authorised under the mode in force at its input, by
+//! any member of it, with the credential the mode names it with (amendment 0034; `T-037-05`,
+//! `crate::ledger::upgrade_authority`): one function, which code of either generation runs.
 
 use alloc::vec::Vec;
 
@@ -37,8 +34,8 @@ use super::digest;
 use crate::audit::{AuditSubject, Justification};
 use crate::authority::AuthorityUsed;
 use crate::code::WayOut;
-use crate::ledger::{Accepted, Ctx, Ledger, policy_used};
-use crate::principal::{Principal, resolve};
+use crate::ledger::{Accepted, Ctx, Ledger};
+use crate::principal::resolve;
 use crate::refusal::Refusal;
 use crate::state::Command;
 
@@ -113,7 +110,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
         }
         let input = self.input;
         let run = |l: &Self| -> Result<(AuthorityUsed, Justification), Refusal> {
-            let used = l.upgrade_authority(&p)?;
+            let used = l.way_out_authority(&ctx.caller, &p)?;
             let j = Justification::new(justification)?;
             if from.is_some_and(|m| m <= input) {
                 return Err(Refusal::InvalidTransition);
@@ -139,18 +136,5 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
         )?;
         self.way_out = Some(way_out);
         Ok(accepted)
-    }
-
-    /// The authority a way out of a scheduled upgrade is taken under: the writer's
-    /// upgrade-authority mode in force (`REQ-RT-18`). **A stand-in until `T-037-05`** (module
-    /// documentation): while the writer names no mode (its digest, [`Ledger::set_code`]'s second
-    /// half, is zeros), the mode is `Single` naming the book's operator, and `p` must be the
-    /// operator's organisation identity, unscoped; a writer that names a mode is refused, since
-    /// this code enforces none.
-    fn upgrade_authority(&self, p: &Principal) -> Result<AuthorityUsed, Refusal> {
-        if self.code.1 != [0; 32] || !self.is_operator(p) {
-            return Err(Refusal::NotAuthorised);
-        }
-        Ok(policy_used(p))
     }
 }

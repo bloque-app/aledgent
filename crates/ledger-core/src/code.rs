@@ -32,6 +32,7 @@
 //! The encoding is `F-014`'s canonical one, so this module's bytes are the manifest's bytes, the
 //! same on every machine.
 
+pub mod authority;
 pub mod generation;
 
 pub use generation::{

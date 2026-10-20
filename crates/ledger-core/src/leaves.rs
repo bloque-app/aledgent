@@ -215,6 +215,8 @@ pub mod kind {
     pub const DISCLOSURE_ON_DEMAND: u8 = 105;
     pub const ANCHOR_LAST: u8 = 106;
     pub const ANCHOR_COMPARED: u8 = 107;
+    // The writer's upgrade-authority record (`F-037`, `T-037-05`).
+    pub const UPGRADE_AUTHORITY: u8 = 110;
     // The core binding's own: a delivery recorded by the Agent (`REQ-RT-4`).
     pub const DELIVERED: u8 = 200;
 
