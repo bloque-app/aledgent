@@ -540,4 +540,14 @@ impl Core for StreamCore {
             _ => Err(CoreError::Unavailable),
         }
     }
+
+    async fn stage_code(&self, code: &[u8; 32]) -> Result<crate::boundary::Staged, CoreError> {
+        let request = Request::StageCode {
+            code: hex::encode(code),
+        };
+        match self.read(false, request).await? {
+            Response::Staged { staged } => Ok(staged),
+            _ => Err(CoreError::Unavailable),
+        }
+    }
 }

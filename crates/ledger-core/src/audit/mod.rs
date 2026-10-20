@@ -150,7 +150,8 @@ impl AuditClass {
             | Command::SetAuthority
             | Command::ProposeUpgrade
             | Command::ApproveUpgrade
-            | Command::ProposeMigration => AuditClass::OperatorIntervention,
+            | Command::ProposeMigration
+            | Command::Upgrade => AuditClass::OperatorIntervention,
             Command::IssueDisclosure => AuditClass::Disclosure,
         }
     }
@@ -160,8 +161,11 @@ impl AuditClass {
 ///
 /// **The writer's code (`F-037`), assigned once for the genesis code** (owner ruling on #44 and
 /// #45): 51 `RescheduleUpgrade` and 52 `CancelUpgrade` (`T-037-15`); 53 `SetAuthority`,
-/// 54 `ProposeUpgrade`, 55 `ApproveUpgrade` and 56 `ProposeMigration` (`T-037-05`). The export
-/// tags (`crate::export::records`, `Command`) take the same numbers.
+/// 54 `ProposeUpgrade`, 55 `ApproveUpgrade` and 56 `ProposeMigration` (`T-037-05`); 57 `Upgrade`
+/// (`T-037-04`: the next number after those reserved; `[PENDING AMENDMENT]`, proposed in the body
+/// of PR #47 for amendment 0035 point 3, to be numbered by the owner before the genesis code
+/// freezes; pinned by `tests/upgrade_authority.rs`). The export tags
+/// (`crate::export::records`, `Command`) take the same numbers.
 pub const fn command_code(c: Command) -> u8 {
     match c {
         Command::Genesis => 1,
@@ -220,11 +224,12 @@ pub const fn command_code(c: Command) -> u8 {
         Command::ProposeUpgrade => 54,
         Command::ApproveUpgrade => 55,
         Command::ProposeMigration => 56,
+        Command::Upgrade => 57,
     }
 }
 
 /// Every command, for decoding.
-const COMMANDS: [Command; 56] = [
+const COMMANDS: [Command; 57] = [
     Command::Genesis,
     Command::OpenIdentity,
     Command::SetIdentityStatus,
@@ -281,6 +286,7 @@ const COMMANDS: [Command; 56] = [
     Command::ProposeUpgrade,
     Command::ApproveUpgrade,
     Command::ProposeMigration,
+    Command::Upgrade,
 ];
 
 /// What a privileged read read (`REQ-PV-4`). Each is one place that uses the mechanism.

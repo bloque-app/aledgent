@@ -236,10 +236,10 @@ fn ids(c: &[Caller]) -> BTreeSet<IdentityId> {
     c.iter().map(|c| c.principal).collect()
 }
 
-/// An upgrade to `H` whose proposal met the mode's conditions: not scheduled, since nothing in
-/// this code version schedules one, and left pending.
+/// An upgrade to `H` whose proposal met the mode's conditions: scheduled by the input that
+/// authorised it (`T-037-04`), and consumed.
 fn met(d: &Decision) -> bool {
-    matches!(d, Decision::AwaitingScheduler(Action::Upgrade { code, .. }) if *code == H)
+    matches!(d, Decision::Scheduled(Action::Upgrade { code, .. }) if *code == H)
 }
 
 /// `AC-K7.7`'s path, in the library: the genesis mode is the operator alone; the operator changes
@@ -272,16 +272,12 @@ fn t037_05_one_principal_changes_the_mode_to_propose_approve() {
     assert_eq!(w.propose(w.operator, next), Err(Refusal::NotAuthorised));
     let (p, d) = w.propose(a, next).unwrap();
     assert_eq!(d, Decision::Pending);
-    // The approver's approval meets the mode. Nothing schedules the upgrade: it stays pending,
-    // with its approval, for the step that will (`T-037-04`).
+    // The approver's approval meets the mode, and schedules the upgrade in the input that
+    // authorises it (`T-037-04`): the writer reads it, and the proposal is consumed.
     let d = w.approve(b, p).unwrap();
     assert!(met(&d));
-    let pending = w.pending();
-    assert_eq!(pending.len(), 1);
-    assert_eq!(
-        (pending[0].id, pending[0].approvals.clone()),
-        (p, ids(&[b]))
-    );
+    assert_eq!(w.l.take_upgrade(), Some((H, next)));
+    assert!(w.pending().is_empty());
     // The change of mode is in the audit trail, accepted, with its justification.
     let mut trail = AuditTrail::new();
     w.l.ship_audit(&mut trail).unwrap();
@@ -558,9 +554,9 @@ fn t037_05_the_proposer_cannot_approve_and_outsiders_learn_nothing() {
     assert_eq!(pending.len(), 1);
     assert!(pending[0].approvals.is_empty());
     assert!(met(&w.approve(b, p).unwrap()));
-    // It met the mode and stays pending, visible; approving it twice is not counted twice.
-    assert_eq!(w.approve(b, p), Err(Refusal::ApprovalRequired));
-    assert_eq!(w.pending().len(), 1);
+    // It met the mode and was scheduled, and consumed: there is nothing left to approve twice.
+    assert_eq!(w.approve(b, p), Err(Refusal::InvalidTransition));
+    assert!(w.pending().is_empty());
 }
 
 /// Under a threshold, `k` distinct members authorise: a second approval by one member is not
@@ -778,8 +774,11 @@ fn t037_05_an_export_never_resets_the_mode() {
     // Under the genesis mode, the export goes as far as it did before.
     assert_ne!(export(&mut w), Some(ExportError::UpgradeAuthority));
     // Review of #45 at `4cc6ae9`, F2: a proposal pending under the genesis mode, which nothing
-    // schedules, leaves a record but no mode: the export is not refused for it.
-    assert!(met(&w.propose(w.operator, w.input + 1).unwrap().1));
+    // schedules (a migration: `T-037-10`), leaves a record but no mode: the export is not refused
+    // for it.
+    let next = w.input + 1;
+    let (_, d) = w.propose_migration(w.operator, 2, next);
+    assert!(matches!(d, Decision::AwaitingScheduler(_)));
     assert!(w.l.state().upgrade_authority().is_some());
     assert_ne!(export(&mut w), Some(ExportError::UpgradeAuthority));
     w.step();
@@ -1006,6 +1005,8 @@ fn t037_05_the_wire_is_pinned() {
         (Command::ProposeUpgrade, 54),
         (Command::ApproveUpgrade, 55),
         (Command::ProposeMigration, 56),
+        // `T-037-04`: the upgrade itself, the next number after those (review of #47, B2).
+        (Command::Upgrade, 57),
     ] {
         assert_eq!(command_code(c), n, "{c:?}");
         assert_eq!(to_bytes(&c), vec![n], "{c:?} in the export");
@@ -1060,3 +1061,110 @@ const RECORD_BYTES: &str = concat!(
     "62206bde34e7e2b732f4c3913adb87747400000001aee10d93d1696c9642da89",
     "479c1ab07c0000000000000046",
 );
+
+impl World {
+    /// A direct `upgrade` input (`T-037-04`).
+    fn upgrade(&mut self, by: Caller, from: u64) -> Result<(), Refusal> {
+        let ctx = self.ctx(by);
+        self.l.upgrade(&ctx, H, from, WHY).map(|_| ())
+    }
+}
+
+/// `T-037-04`, `REQ-RT-18`, amendment 0023 (b′): a direct `upgrade` is the single form of an
+/// upgrade, "a single `Upgrade` under `Single`". Under the genesis mode the operator takes it alone
+/// and the writer reads what it took; under a mode that needs a second approval nobody does, the
+/// proposer, the approver and the operator included, and those go through `propose_upgrade` and
+/// `approve_upgrade`, which schedule the upgrade in the input that authorises it, by the same
+/// writer step.
+#[test]
+fn t037_04_a_direct_upgrade_is_the_single_form_and_the_other_modes_go_through_proposals() {
+    let mut w = World::new();
+    let (a, b) = (w.person(), w.person());
+    let from = w.input + 3;
+    assert_eq!(w.upgrade(a, from), Err(Refusal::NotAuthorised));
+    assert_eq!(w.l.take_upgrade(), None);
+    w.upgrade(w.operator, from).unwrap();
+    assert_eq!(w.l.take_upgrade(), Some((H, from)));
+    // The same through a proposal under a single member: scheduled at the proposal. (A change of
+    // mode never shares an input with an upgrade, so the next input.)
+    w.step();
+    w.change_mode(&w.single(a));
+    let from = w.input + 4;
+    assert_eq!(w.upgrade(w.operator, from), Err(Refusal::NotAuthorised));
+    w.upgrade(a, from).unwrap();
+    assert_eq!(w.l.take_upgrade(), Some((H, from)));
+    let (_, d) = w.propose(a, w.input + 4).unwrap();
+    assert!(met(&d));
+    assert_eq!(w.l.take_upgrade(), Some((H, w.input + 4)));
+    assert!(w.pending().is_empty());
+    // A mode that needs two: no direct upgrade for anyone.
+    w.until(w.input + 1);
+    let mode = w.propose_approve(&[a], &[b]);
+    let from = w.input + 1;
+    w.set(a, &mode, from).unwrap();
+    w.step();
+    assert_eq!(w.l.authority(), mode.digest());
+    let from = w.input + 4;
+    for who in [a, b, w.operator] {
+        assert_eq!(w.upgrade(who, from), Err(Refusal::NotAuthorised));
+    }
+    assert_eq!(w.l.take_upgrade(), None);
+    let (p, d) = w.propose(a, from).unwrap();
+    assert_eq!(d, Decision::Pending);
+    assert_eq!(w.l.take_upgrade(), None);
+    assert!(met(&w.approve(b, p).unwrap()));
+    assert_eq!(w.l.take_upgrade(), Some((H, from)));
+}
+
+/// `T-037-04`, `REQ-RT-18`: a direct upgrade meets the conditions a proposal meets. It is refused
+/// (`ERR-InvalidTransition`) when `from` is not beyond the mode's delay or not later than its own
+/// input, while a change of mode is scheduled and not yet in force, and in an input that changes
+/// the mode.
+#[test]
+fn t037_04_a_direct_upgrade_waits_out_the_delay_and_a_scheduled_change_of_mode() {
+    let mut w = World::new();
+    let a = w.person();
+    let delayed = Mode {
+        rule: Rule::Single { member: w.m(a) },
+        delay: 5,
+    };
+    w.change_mode(&delayed);
+    let at = w.input;
+    assert_eq!(w.upgrade(a, at), Err(Refusal::InvalidTransition));
+    assert_eq!(w.upgrade(a, at + 5), Err(Refusal::InvalidTransition));
+    w.upgrade(a, at + 6).unwrap();
+    assert_eq!(w.l.take_upgrade(), Some((H, at + 6)));
+    w.step();
+    // A change of mode scheduled: the outgoing mode authorises nothing more.
+    let b = w.person();
+    let from = w.input + 8;
+    w.set(a, &w.single(b), from).unwrap();
+    assert_eq!(w.upgrade(a, w.input + 20), Err(Refusal::InvalidTransition));
+    // And a change of mode never shares an input with an upgrade.
+    w.until(from);
+    let mut w2 = World::new();
+    let c = w2.person();
+    let from = w2.input + 2;
+    w2.upgrade(w2.operator, w2.input + 3).unwrap();
+    assert_eq!(
+        w2.set(w2.operator, &w2.single(c), from),
+        Err(Refusal::InvalidTransition)
+    );
+}
+
+/// Review of #47, B3: the direct `upgrade` input is "a single `Upgrade` under `Single`"
+/// (amendment 0023 (b′)), and only that. A member of `Threshold { k: 1 }` (whom `alone` counts as
+/// satisfying the mode by itself) is refused the direct input and upgrades by proposing, which meets
+/// the mode at the proposal and schedules.
+#[test]
+fn t037_04_a_member_of_a_threshold_of_one_upgrades_by_proposing_not_directly() {
+    let mut w = World::new();
+    let (a, b) = (w.person(), w.person());
+    w.change_mode(&w.threshold(&[a, b], 1));
+    let from = w.input + 3;
+    assert_eq!(w.upgrade(a, from), Err(Refusal::NotAuthorised));
+    assert_eq!(w.l.take_upgrade(), None);
+    let (_, d) = w.propose(a, from).unwrap();
+    assert!(met(&d));
+    assert_eq!(w.l.take_upgrade(), Some((H, from)));
+}

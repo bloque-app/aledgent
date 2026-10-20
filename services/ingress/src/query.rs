@@ -813,6 +813,11 @@ pub fn shape(q: &crate::boundary::Query) -> Result<(), Refusal> {
         | Query::Account { account: a } => {
             account(a)?;
         }
+        Query::CodeAuthority { input } => {
+            if !matches!(input.as_str(), "upgrade" | "way_out") {
+                return Err(Refusal::MalformedCommand);
+            }
+        }
         Query::Assets
         | Query::Undelivered
         | Query::Instructions

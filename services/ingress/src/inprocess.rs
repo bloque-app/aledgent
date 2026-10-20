@@ -1326,6 +1326,15 @@ impl<S: LeafStore, V: VaultBackend> Running<S, V> {
                     ..CommandResult::default()
                 },
             ),
+            // The writer's code (`T-037-04`, `T-037-15`): decided here, scheduled by the writer
+            // that runs the ledger (the core Agent), which reads what was taken.
+            OperatorOp::Upgrade { code, from } => {
+                decided(&reference, l.upgrade(ctx, code, from, why)?, nothing)
+            }
+            OperatorOp::RescheduleUpgrade { from } => {
+                decided(&reference, l.reschedule_upgrade(ctx, from, why)?, nothing)
+            }
+            OperatorOp::CancelUpgrade => decided(&reference, l.cancel_upgrade(ctx, why)?, nothing),
         })
     }
 
@@ -1524,6 +1533,18 @@ impl<S: LeafStore, V: VaultBackend> Running<S, V> {
                 Err(error) => refused(error),
             };
         }
+        // Whether the caller may now put the writer's code in hand (`T-037-04`): the authority
+        // function the matching input is decided with, asked at the door.
+        if let Query::CodeAuthority { input } = query {
+            let input = match input.as_str() {
+                "upgrade" => ledger_core::ledger::operator::CodeInput::Upgrade,
+                "way_out" => ledger_core::ledger::operator::CodeInput::WayOut,
+                _ => return refused(Refusal::MalformedCommand),
+            };
+            return QueryReply::CodeAuthority {
+                authorised: self.ledger.may_change_code(&caller, input),
+            };
+        }
         // The adapter's read of anchoring, and anchoring's other reads (`F-017`).
         let clerk = self.clerk.as_deref().map(|c| c as &dyn ClerkSigner);
         match query {
@@ -1583,6 +1604,7 @@ impl<S: LeafStore, V: VaultBackend> Running<S, V> {
                 | Query::IntegratingParties
                 | Query::Alias { .. }
                 | Query::Grants { .. }
+                | Query::CodeAuthority { .. }
                 | Query::Account { .. } => return Err(Refusal::NotAuthorised),
                 Query::IdentityGrants { .. } => return Err(Refusal::NotAuthorised),
                 Query::RecoveryTerms { identity } => {

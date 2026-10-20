@@ -258,6 +258,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             code: ([0; 32], [0; 32]),
             input: 0,
             way_out: None,
+            upgrade: None,
             calls_in_input: (0, 0),
             writer: crate::code::authority::Position::default(),
         };

@@ -274,8 +274,8 @@ fn set<P: AgentPort>(fx: &mut Fx<P>, mode: &Mode, from: u64) {
 }
 
 /// `a` proposes an upgrade and `b` approves it, each in an input of its own, through the Agent.
-/// The approval meets the mode; nothing schedules the upgrade yet (`T-037-04`), so the proposal
-/// stays pending and visible, and the hot row schedules nothing.
+/// The approval meets the mode and schedules the upgrade (`T-037-04`): the proposal is consumed,
+/// and the hot row holds the upgrade from its input.
 fn upgrade<P: AgentPort>(fx: &mut Fx<P>, a: Caller, b: Caller) {
     let from = fx.driver.seq() + 5;
     let ctx = fx.ctx(a);
@@ -295,11 +295,19 @@ fn upgrade<P: AgentPort>(fx: &mut Fx<P>, a: Caller, b: Caller) {
         .value;
     assert!(matches!(
         d,
-        Decision::AwaitingScheduler(Action::Upgrade { code: H, .. })
+        Decision::Scheduled(Action::Upgrade { code: H, .. })
     ));
     fx.synced();
     let (_, pending) = fx.replica.upgrade_authority_in_force().unwrap();
-    assert!(pending.iter().any(|q| q.id == p));
+    assert!(pending.iter().all(|q| q.id != p));
+    assert_eq!(hot(fx).upgrade, Some((H, from)));
+    // The tests that follow go on past `from` with the package of the code in force, so the upgrade
+    // is cancelled, by a member of the mode: the way out of an approved upgrade.
+    let ctx = fx.ctx(a);
+    fx.replica
+        .cancel_upgrade(&ctx, WHY)
+        .expect("a member cancels it");
+    fx.synced();
     assert_eq!(hot(fx).upgrade, None);
 }
 

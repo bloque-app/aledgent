@@ -337,6 +337,25 @@ pub trait AgentPort {
         let _ = code;
         Ok(())
     }
+    /// Stage a code version already fetched and checked ([`crate::staging::fetch`]), so that a
+    /// later [`AgentPort::switch_to`] can install it (`T-037-04`): the last step of the check the
+    /// execution node makes **before** an `Upgrade` naming it is logged. The port reads the writer's
+    /// generation from the Agent's hot row again, under whatever lock the caller holds, so the
+    /// manifest is held to the generation after it; and it checks the package's compiled generation
+    /// in the way its platform wraps a package ([`crate::staging::Checked::check_package`]). A port
+    /// that manages no code stages nothing: it refuses ([`crate::staging::StageRefusal::NoSource`]).
+    ///
+    /// # Errors
+    ///
+    /// [`crate::staging::StageRefusal`]: the code names the wrong generation, or its package does
+    /// not carry it. Nothing was kept.
+    fn stage_code(
+        &mut self,
+        checked: crate::staging::Checked,
+    ) -> Result<(), crate::staging::StageRefusal> {
+        let _ = checked;
+        Err(crate::staging::StageRefusal::NoSource)
+    }
 }
 
 /// Why the driver stopped.
@@ -1300,8 +1319,8 @@ impl<P: AgentPort> Driver<P> {
 
     /// Read the writer's code and mode again from the Agent's hot row, and run the replica's next
     /// commands under them (`T-037-15`). For a host whose Agent's code state changed by other
-    /// means than an input this driver staged (until `T-037-04` lands, a test that sets the hot
-    /// row's `upgrade` and `generation`). Nothing may be staged.
+    /// means than an input this driver staged (a test that sets the hot row's `upgrade` and
+    /// `generation`, to test the fence on its own). Nothing may be staged.
     pub fn reload_code(&mut self, replica: &mut Replica) -> Result<(), DriveError> {
         if !self.staged.is_empty() {
             return Err(DriveError::Replica(
@@ -1337,9 +1356,10 @@ impl<P: AgentPort> Driver<P> {
         seq: u64,
         way_out: bool,
         taken: Option<ledger_core::code::WayOut>,
+        scheduled: Option<([u8; 32], u64)>,
     ) -> WriterCode {
         let mut w = self.writer;
-        crate::fence::decide(&mut w, seq, way_out, taken);
+        crate::fence::decide(&mut w, seq, way_out, taken, scheduled);
         w
     }
 
@@ -1516,6 +1536,7 @@ impl<P: AgentPort> Driver<P> {
         // does to the writer's code (`T-037-15`). An input that mixes a way out with anything else
         // is sent as it is: the Agent refuses it whole (`crate::fence::way_out_input`).
         let taken = replica.take_way_out();
+        let scheduled = replica.take_upgrade();
         let way_out =
             crate::fence::way_out_input(recorded.iter().map(|r| &r.call), deliveries.len())
                 .unwrap_or(false);
@@ -1545,7 +1566,7 @@ impl<P: AgentPort> Driver<P> {
             }
             let seq = self.seq + 1;
             let exec = self.exec_code_of(seq, way_out);
-            let writer = self.decided(seq, way_out, taken);
+            let writer = self.decided(seq, way_out, taken, scheduled);
             let (leaves, whole) = self.service.leaves(&touched)?;
             let changes = changed(replica, &leaves, &deliveries)?;
             let envelope = Envelope::Mapped(Mapped::Input(MappedInput {
@@ -1598,7 +1619,7 @@ impl<P: AgentPort> Driver<P> {
         let (tip, prev) = self.tip();
         let seq = tip + 1;
         let exec = self.exec_code_of(seq, way_out);
-        let writer = self.decided(seq, way_out, taken);
+        let writer = self.decided(seq, way_out, taken, scheduled);
         let input = InputEnvelope {
             seq,
             calls: calls.clone(),
@@ -2148,6 +2169,7 @@ fn replay_with(
         }
         let _ = replica.take_calls();
         let _ = replica.take_way_out();
+        let _ = replica.take_upgrade();
         let touched = Touches::take(&replica, &e.deliveries);
         let (before, _) = service.leaves(&touched)?;
         let changes = changed(&replica, &before, &e.deliveries)?;
@@ -2303,6 +2325,34 @@ impl AgentPort for NativePort {
             .transpose()
     }
 
+    fn stage_code(
+        &mut self,
+        checked: crate::staging::Checked,
+    ) -> Result<(), crate::staging::StageRefusal> {
+        use crate::staging::StageRefusal;
+        let hot = self
+            .hot()
+            .map_err(|e| StageRefusal::Manifest(alloc::format!("{e:?}")))?
+            .ok_or_else(|| StageRefusal::Manifest("the Agent is not founded".into()))?;
+        if hot.generation.checked_add(1) != Some(checked.manifest.generation) {
+            return Err(StageRefusal::Generation {
+                writer: hot.generation,
+                manifest: checked.manifest.generation,
+            });
+        }
+        checked.check_package(&|b| {
+            ledger_core::code::generation_of(b).map_err(|e| alloc::format!("{e:?}"))
+        })?;
+        // The native port runs a version as the generation its manifest names. Until now a port
+        // with no map switched nothing; holding one version makes it hold the code in force too.
+        if self.code_map.is_empty() {
+            self.code_map.insert(hot.code, hot.generation);
+        }
+        self.code_map
+            .insert(checked.manifest.version(), checked.manifest.generation);
+        Ok(())
+    }
+
     fn switch_to(&mut self, code: [u8; 32]) -> Result<(), String> {
         if self.code_map.is_empty() {
             return Ok(());
@@ -2344,6 +2394,12 @@ impl<T: AgentPort + ?Sized> AgentPort for Box<T> {
     }
     fn switch_to(&mut self, code: [u8; 32]) -> Result<(), String> {
         (**self).switch_to(code)
+    }
+    fn stage_code(
+        &mut self,
+        checked: crate::staging::Checked,
+    ) -> Result<(), crate::staging::StageRefusal> {
+        (**self).stage_code(checked)
     }
 }
 

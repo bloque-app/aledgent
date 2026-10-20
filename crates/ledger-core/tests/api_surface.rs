@@ -144,6 +144,12 @@ const SURFACE: &[(&str, &str)] = &[
         "cancel_upgrade",
         "operator command: the upgrade-authority mode in force (REQ-RT-20, REQ-RT-18)",
     ),
+    // T-037-04: the upgrade itself, under the same mode; it writes only the same records, and the
+    // writer schedules what it took.
+    (
+        "upgrade",
+        "operator command: the upgrade-authority mode in force (REQ-RT-16, REQ-RT-18)",
+    ),
     ("resume", "operator command"),
     ("resolve_operation", "operator command"),
     (
@@ -255,6 +261,10 @@ const SURFACE: &[(&str, &str)] = &[
     (
         "set_authority_next",
         "sets the scheduled change of mode as the writer's hot row holds it (T-037-05)",
+    ),
+    (
+        "take_upgrade",
+        "takes the upgrade the last commands scheduled, for the writer to schedule (T-037-04)",
     ),
     // T-031-19: when the kernel's leaves are committed, not what is written. Every command still
     // decides alone, through the command surface; these only group the kernel's commits.

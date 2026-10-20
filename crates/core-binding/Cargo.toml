@@ -82,6 +82,10 @@ name = "agent_core"
 required-features = ["ingress"]
 
 [[test]]
+name = "upgrade_input"
+required-features = ["ingress"]
+
+[[test]]
 name = "memory"
 required-features = ["ingress"]
 

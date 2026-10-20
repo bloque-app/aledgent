@@ -355,6 +355,44 @@ impl AgentPort for VosPort {
         r.map(|_| ()).map_err(|e| e.to_string())
     }
 
+    /// Stage a fetched and checked code version for `switch_to` (`T-037-04`): the version is held in
+    /// this port's staged versions, after [`crate::switch::StagedVersions::insert`] checks, once
+    /// more, the bytes against the manifest and the package's compiled generation. The writer's
+    /// generation is read from the Agent now, so the manifest names the one after it. A port that
+    /// tracks no code stages nothing.
+    fn stage_code(
+        &mut self,
+        checked: core_binding::staging::Checked,
+    ) -> Result<(), core_binding::staging::StageRefusal> {
+        use core_binding::staging::StageRefusal;
+        if self.code_state().is_none() {
+            return Err(StageRefusal::NoSource);
+        }
+        let hot = self
+            .hot()
+            .map_err(|e| StageRefusal::Manifest(format!("{e:?}")))?
+            .ok_or_else(|| StageRefusal::Manifest("the Agent is not founded".into()))?;
+        if hot.generation.checked_add(1) != Some(checked.manifest.generation) {
+            return Err(StageRefusal::Generation {
+                writer: hot.generation,
+                manifest: checked.manifest.generation,
+            });
+        }
+        let Some(state) = self.code_state_mut() else {
+            return Err(StageRefusal::NoSource);
+        };
+        // `saga` runs a runtime of its own beside the package: a version that names none cannot be
+        // installed here.
+        let runtime = checked
+            .runtime
+            .ok_or_else(|| StageRefusal::Manifest("the manifest names no Runtime".into()))?;
+        state
+            .staged
+            .insert(checked.manifest, checked.package, runtime)
+            .map(|_| ())
+            .map_err(StageRefusal::Package)
+    }
+
     fn invoke(&mut self, envelope: Vec<u8>, blobs: Vec<Vec<u8>>) -> Result<Vec<u8>, PortError> {
         #[cfg(feature = "composite")]
         if let Some(mode) = composite_mode()

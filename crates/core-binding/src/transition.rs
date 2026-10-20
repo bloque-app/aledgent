@@ -562,7 +562,8 @@ fn input(
         summaries.push(s);
     }
     // What the input did to the writer's code (`T-037-15`), decided the same by either generation.
-    crate::fence::decide(&mut code, i.seq, way_out, ledger.take_way_out());
+    let taken = ledger.take_way_out();
+    crate::fence::decide(&mut code, i.seq, way_out, taken, ledger.take_upgrade());
     code.store(&mut hot);
     // Deliveries: recorded once, for notifications the core committed (`REQ-RT-4`). Both the
     // notification and its delivery leaf must be witnessed.

@@ -418,6 +418,15 @@ pub enum Call {
         input: crate::code::authority::Input,
         justification: Vec<u8>,
     },
+    /// An upgrade (`T-037-04`, `REQ-RT-16`): the writer's code becomes code version `code` from
+    /// input `from`. After `UpgradeAuthority` and before the conformance ports, so no production
+    /// variant's tag moves.
+    Upgrade {
+        ctx: Ctx,
+        code: [u8; 32],
+        from: u64,
+        justification: Vec<u8>,
+    },
     // The conformance suite's raw ports come last, so that no production variant's index (its
     // postcard tag in the host's archive and in every envelope) depends on whether a build enables
     // `conformance-ports` (T-005-17: a workspace build unifies the feature into every binary, and an
@@ -520,6 +529,7 @@ impl Call {
             Call::RescheduleUpgrade { .. } => "reschedule_upgrade",
             Call::CancelUpgrade { .. } => "cancel_upgrade",
             Call::UpgradeAuthority { input, .. } => input.method(),
+            Call::Upgrade { .. } => "upgrade",
         }
     }
 }

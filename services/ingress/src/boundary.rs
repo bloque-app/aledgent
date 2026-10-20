@@ -197,6 +197,20 @@ pub struct CoreReply {
     pub outcome: Outcome,
 }
 
+/// What staging a code version came to (`T-037-04`, [`Core::stage_code`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "staged", rename_all = "snake_case")]
+pub enum Staged {
+    /// The code version's manifest and artefacts were fetched and checked, and are held for the
+    /// switch.
+    Staged,
+    /// They were not: nothing was kept. `reason` is for the operator's log, never a client's body.
+    Refused {
+        /// Why.
+        reason: String,
+    },
+}
+
 /// Why a call into the core did not answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CoreError {
@@ -334,6 +348,14 @@ pub enum Query {
         /// The identity.
         identity: String,
     },
+    /// Whether the caller may now put the writer's code in hand (`T-037-04`, `REQ-RT-16`,
+    /// `REQ-RT-18`): the core answers with the authority function the matching input is decided
+    /// with. Ingress asks at the door of the code routes, to stage code and to give a way out
+    /// priority only for an authorised caller; the writer decides the input all the same.
+    CodeAuthority {
+        /// Which input: `upgrade`, or `way_out`.
+        input: String,
+    },
 }
 
 /// A query's answer.
@@ -404,6 +426,11 @@ pub enum QueryReply {
     Account(crate::wire::AccountViewBody),
     /// `grants(identity)` (amendment 0026).
     IdentityGrants(crate::wire::IdentityGrantsBody),
+    /// Whether the caller may put the writer's code in hand (`T-037-04`).
+    CodeAuthority {
+        /// It may.
+        authorised: bool,
+    },
 }
 
 /// One working credential, as ingress needs it to authenticate a caller (`F-028`): the identity it
@@ -511,6 +538,23 @@ pub trait Core: Send + Sync + 'static {
     /// it stays `true`.
     fn genesis_open(&self) -> impl Future<Output = Result<bool, CoreError>> + Send {
         async { Ok(true) }
+    }
+
+    /// Fetch the code version `code` (its manifest and artefacts) from the node's sources, check
+    /// everything, and hold it for the switch (`T-037-04`, `REQ-RT-16`, `REQ-RT-20`): what the
+    /// execution node does **before** an `Upgrade` naming `code` is logged. The default stages
+    /// nothing: a core that is not a node driving a writer's code (the in-process core, a test's)
+    /// refuses, so that no upgrade is logged that no node has staged.
+    fn stage_code(
+        &self,
+        code: &[u8; 32],
+    ) -> impl Future<Output = Result<Staged, CoreError>> + Send {
+        let _ = code;
+        async {
+            Ok(Staged::Refused {
+                reason: "this core stages no code".to_owned(),
+            })
+        }
     }
 
     /// Take a sequenced, signed feed (`F-038`, [`crate::feed`]). The default is a core no link

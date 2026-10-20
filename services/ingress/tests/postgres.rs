@@ -75,10 +75,65 @@ fn command(n: u8, principal: &str, key: &str, reserves: bool) -> NewRow {
         body: b"{}".to_vec(),
         pass_through: None,
         reserves,
+        overtakes: false,
         synchronous: reserves,
         received_at: 1_000 + u64::from(n),
         arrived_at: Some(999 + u64::from(n)),
     }
+}
+
+/// `T-037-04` (`REQ-RT-20`, amendment 0035) against the real column and ordering: a row that
+/// overtakes goes before reservations and the rest, after the rows already in flight (given a feed
+/// sequence), and the flag survives a round trip through the table.
+#[tokio::test(flavor = "multi_thread")]
+async fn t_037_04_a_row_that_overtakes_is_read_first_by_the_forwarder() {
+    let Some((_pg, url)) = server().await else {
+        return;
+    };
+    let s = store(&url).await;
+    for (n, reserves, overtakes) in [
+        (1, false, false),
+        (2, true, false),
+        (3, false, false),
+        (4, false, true),
+        (5, false, true),
+    ] {
+        let mut r = command(n, "alice", &format!("k{n}"), reserves);
+        r.overtakes = overtakes;
+        let Appended::New(stored) = s.append(r).await.unwrap() else {
+            panic!("a new row");
+        };
+        assert_eq!(stored.new.overtakes, overtakes);
+    }
+    let refs = |rows: Vec<ingress::store::Row>| {
+        rows.into_iter()
+            .map(|r| r.new.op_ref.0[0])
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        refs(s.next_undecided_batch(10).await.unwrap()),
+        vec![4, 5, 2, 1, 3]
+    );
+    assert_eq!(
+        s.next_undecided().await.unwrap().unwrap().new.op_ref,
+        InputKey([4; 16])
+    );
+    assert!(
+        s.get(InputKey([4; 16]))
+            .await
+            .unwrap()
+            .unwrap()
+            .new
+            .overtakes
+    );
+    assert!(
+        !s.get(InputKey([2; 16]))
+            .await
+            .unwrap()
+            .unwrap()
+            .new
+            .overtakes
+    );
 }
 
 /// `T-009-02`: dedup on (principal, surface, client key), commit settings, the forwarder's

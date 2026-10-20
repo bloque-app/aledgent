@@ -140,8 +140,14 @@ pub struct NewRow {
     /// The command's pass-through data (`REQ-PO-5`), exactly as sent: part of the request's
     /// digest, never part of `body`, so the core never receives it.
     pub pass_through: Option<PassThrough>,
-    /// Whether it reserves: first in the forwarder's queue.
+    /// Whether it reserves: first in the forwarder's queue, after the rows that overtake it.
     pub reserves: bool,
+    /// Whether it overtakes the queue (`T-037-04`, `REQ-RT-20`, amendment 0035): a way out of a
+    /// scheduled upgrade, from a caller the core said may take it. Before every row not yet given a
+    /// feed sequence, reservations included: a fenced writer refuses every other input, and the
+    /// forwarder would retry the refused one first for ever. Set at the door, only after the caller
+    /// is authorised; a caller that is not is logged as an ordinary row.
+    pub overtakes: bool,
     /// Whether its reply waits for the decision.
     pub synchronous: bool,
     /// When it was logged.
@@ -419,13 +425,15 @@ pub trait Store: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
     /// The next row to forward: an undecided row already given a feed sequence (`F-038`), lowest
-    /// first; else undecided, reservations first, then in arrival order.
+    /// first; else undecided, rows that overtake first (`T-037-04`), then reservations, then in
+    /// arrival order.
     fn next_undecided(&self) -> impl Future<Output = Result<Option<Row>, StoreError>> + Send;
 
     /// Up to `n` rows to forward, in the order successive calls of [`Store::next_undecided`]
     /// would give them: undecided rows in flight (given a feed sequence) by that sequence
-    /// (`F-038`), then undecided reservations in arrival order, then the other undecided rows in
-    /// arrival order (`T-031-04`). The default gives the one `next_undecided` gives.
+    /// (`F-038`), then undecided rows that overtake (`T-037-04`) in arrival order, then undecided
+    /// reservations in arrival order, then the other undecided rows in arrival order (`T-031-04`).
+    /// The default gives the one `next_undecided` gives.
     fn next_undecided_batch(
         &self,
         n: usize,

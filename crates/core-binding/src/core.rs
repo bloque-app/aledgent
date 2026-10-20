@@ -718,6 +718,9 @@ struct Parts<P: AgentPort> {
     ship: OnceLock<ShipHandle>,
     /// A chainspec book's `verify-genesis` gate (`T-036-25`), once the host sets it.
     genesis_gate: OnceLock<crate::verified::GenesisGate>,
+    /// Where this node fetches code from, once the host sets it (`T-037-04`): without one, no
+    /// upgrade can be staged, so none is logged.
+    code_source: OnceLock<Arc<dyn crate::staging::CodeFetch>>,
 }
 
 /// A decision, sent to the decider thread.
@@ -1025,6 +1028,7 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
                 audit: inner_audit,
                 ship: OnceLock::new(),
                 genesis_gate: OnceLock::new(),
+                code_source: OnceLock::new(),
             }),
         })
     }
@@ -1069,6 +1073,22 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
             .set(gate)
             .map_err(|_| "the verify-genesis gate is set already".to_string())?;
         Ok(Some(now))
+    }
+
+    /// Set where this node fetches code from, to stage an `Upgrade`'s code version before the
+    /// upgrade is logged (`T-037-04`, [`Core::stage_code`]). Set once.
+    ///
+    /// # Errors
+    ///
+    /// A source was set already.
+    pub fn set_code_source(
+        &self,
+        source: Arc<dyn crate::staging::CodeFetch>,
+    ) -> Result<(), String> {
+        self.inner
+            .code_source
+            .set(source)
+            .map_err(|_| "the code source is set already".to_string())
     }
 
     /// What genesis created.
@@ -1837,6 +1857,55 @@ impl<P: AgentPort + Send + 'static> Core for AgentCore<P> {
             .genesis_gate
             .get()
             .is_none_or(crate::verified::GenesisGate::is_open))
+    }
+
+    async fn stage_code(&self, code: &[u8; 32]) -> Result<ingress::boundary::Staged, CoreError> {
+        use ingress::boundary::Staged;
+        let Some(source) = self.inner.code_source.get().cloned() else {
+            return Ok(Staged::Refused {
+                reason: crate::staging::StageRefusal::NoSource.to_string(),
+            });
+        };
+        let (core, code) = (self.clone(), *code);
+        // Retrieval is slow: it runs off the async runtime and outside the core's locks. Only
+        // the writer's generation is read before it and the staging done after it, each briefly
+        // under the lock, so decisions are not held up by a fetch.
+        tokio::task::spawn_blocking(move || {
+            let generation = {
+                let mut inner = lock(&core.inner.ctl);
+                if inner.stopped.is_some() {
+                    return Err(CoreError::Unavailable);
+                }
+                inner
+                    .driver
+                    .as_mut()
+                    .and_then(|d| d.port_mut().hot().ok().flatten())
+                    .map(|h| h.generation)
+                    .ok_or(CoreError::Unavailable)?
+            };
+            let checked = match crate::staging::fetch(&*source, &code, generation) {
+                Ok(c) => c,
+                Err(r) => {
+                    return Ok(Staged::Refused {
+                        reason: r.to_string(),
+                    });
+                }
+            };
+            let mut inner = lock(&core.inner.ctl);
+            match inner
+                .driver
+                .as_mut()
+                .map(|d| d.port_mut().stage_code(checked))
+            {
+                Some(Ok(())) => Ok(Staged::Staged),
+                Some(Err(r)) => Ok(Staged::Refused {
+                    reason: r.to_string(),
+                }),
+                None => Err(CoreError::Unavailable),
+            }
+        })
+        .await
+        .unwrap_or(Err(CoreError::Unavailable))
     }
 
     async fn party_of(&self, principal: &str) -> Result<Option<String>, CoreError> {

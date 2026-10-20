@@ -106,6 +106,8 @@ const PRODUCTION: &[&str] = &[
     "CancelUpgrade",
     // `T-037-05`: the upgrade-authority inputs, one variant whose input says which.
     "UpgradeAuthority",
+    // `T-037-04`: the upgrade itself.
+    "Upgrade",
 ];
 
 /// The conformance suite's raw ports: only ever after every production variant.
@@ -136,8 +138,9 @@ fn t037_15_the_production_call_tags_are_pinned() {
         ),
         (63, 64, 65)
     );
-    // The upgrade-authority inputs, after them (`T-037-05`).
-    assert_eq!(tag("UpgradeAuthority"), 66);
+    // The upgrade-authority inputs, after them (`T-037-05`), and the upgrade itself after those
+    // (`T-037-04`).
+    assert_eq!((tag("UpgradeAuthority"), tag("Upgrade")), (66, 67));
 }
 
 /// `T-037-05`: inside `Call::UpgradeAuthority`, the four inputs, the kinds an approval names and

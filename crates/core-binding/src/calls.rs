@@ -354,6 +354,13 @@ pub fn apply<S: LeafStore, V: VaultBackend>(
             input,
             justification,
         } => s(l.upgrade_authority(ctx, input.clone(), justification)),
+        // An upgrade (`T-037-04`), likewise in every build: *H₀* carries the handler.
+        C::Upgrade {
+            ctx,
+            code,
+            from,
+            justification,
+        } => s(l.upgrade(ctx, *code, *from, justification)),
         C::Unsupported { method } => {
             Summary::Failed(alloc::format!("`{method}` cannot run inside the Agent"))
         }

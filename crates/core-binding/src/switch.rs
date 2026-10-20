@@ -21,8 +21,8 @@
 //! - **No arbitrary version.** Nothing here takes a version from a caller: a host that wants a
 //!   different version must first commit an upgrade through the writer (`T-037-04`).
 //! - **Staged, not fetched.** [`StagedCode`] answers from what the upgrade staged before it was
-//!   logged (`T-037-04`, `T-037-06` fetch it); a version it does not hold is
-//!   [`SwitchError::NotStaged`].
+//!   logged (`T-037-04`, [`crate::staging`]; the sources are `T-037-06`'s); a version it does not
+//!   hold is [`SwitchError::NotStaged`].
 //!
 //! The platform's install is a [`CodeInstaller`]: on `saga` the registry's compare-and-swap on the
 //! old program, signed with the core's package key through the signer (`agents/core-host`); the

@@ -9,9 +9,9 @@
 //! - **Staged versions** ([`StagedVersions`]): for each code version *H*, its manifest and the bytes
 //!   of its package and runtime. A version enters only through [`StagedVersions::insert`], which
 //!   checks what staging checks: the manifest names a package and a runtime of the bytes' digests
-//!   and lengths, and the package carries the manifest's code generation compiled in. Fetching the
-//!   bytes (`T-037-06`) and the `Upgrade` input that stages them (`T-037-04`) come later; the
-//!   switch installs only from this store.
+//!   and lengths, and the package carries the manifest's code generation compiled in. The `Upgrade`
+//!   input stages them before it is logged (`T-037-04`, [`core_binding::staging`]); the sources
+//!   that fetch them (`T-037-06`) come later; the switch installs only from this store.
 //! - **The install** (`impl CodeInstaller for VosPort`): the runtime's in-place upgrade of the
 //!   installed actor ([`crate::driver::Runtime::upgrade_actor`]), a compare-and-swap on the
 //!   installed deployment, authorised by a receipt the Agent's authority key signs through the
@@ -116,7 +116,6 @@ impl StagedVersions {
     ///
     /// The manifest names no package or no runtime, a digest or length differs from the bytes', or
     /// the package does not carry the manifest's code generation compiled in.
-    #[cfg_attr(not(test), allow(dead_code))] // staging arrives with `T-037-04` and `T-037-06`
     pub fn insert(
         &mut self,
         manifest: CodeManifest,

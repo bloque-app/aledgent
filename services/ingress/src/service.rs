@@ -312,6 +312,7 @@ impl<S: Store, C: Core> Shared<S, C> {
             body: bytes,
             pass_through: None,
             reserves: false,
+            overtakes: false,
             synchronous: false,
             received_at: self.clock.now(),
             arrived_at: None,

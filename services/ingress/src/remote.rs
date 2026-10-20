@@ -112,6 +112,11 @@ pub enum Request {
         /// The feed.
         feed: Feed,
     },
+    /// [`Core::stage_code`] (`T-037-04`): fetch, check and hold a code version.
+    StageCode {
+        /// The code version, hex.
+        code: String,
+    },
 }
 
 /// The first frame of every connection (`F-035`): the link's token. Never formatted.
@@ -269,6 +274,11 @@ pub enum Response {
         /// The answer.
         reply: FeedReply,
     },
+    /// What staging a code version came to (`T-037-04`).
+    Staged {
+        /// The answer.
+        staged: crate::boundary::Staged,
+    },
     /// The core did not run the request.
     Unavailable,
     /// The core may have run it.
@@ -393,6 +403,22 @@ pub async fn answer<C: Core>(core: &C, request: Request) -> Response {
         Request::Feed { feed } => Response::Fed {
             reply: core.feed(&feed).await,
         },
+        Request::StageCode { code } => {
+            let Some(code) = hex::decode(&code)
+                .ok()
+                .and_then(|b| <[u8; 32]>::try_from(b).ok())
+            else {
+                return Response::Staged {
+                    staged: crate::boundary::Staged::Refused {
+                        reason: "a code version is 32 bytes of hex".into(),
+                    },
+                };
+            };
+            match core.stage_code(&code).await {
+                Ok(staged) => Response::Staged { staged },
+                Err(e) => error_response(e),
+            }
+        }
     }
 }
 
@@ -711,6 +737,17 @@ impl Core for RemoteCore {
     async fn genesis_open(&self) -> Result<bool, CoreError> {
         match self.call(&Request::GenesisOpen).await {
             Ok(Response::GenesisOpen { open }) => Ok(open),
+            Ok(r) => Err(Self::read_error(r)),
+            Err(_) => Err(CoreError::Unavailable),
+        }
+    }
+
+    async fn stage_code(&self, code: &[u8; 32]) -> Result<crate::boundary::Staged, CoreError> {
+        let request = Request::StageCode {
+            code: hex::encode(code),
+        };
+        match self.call(&request).await {
+            Ok(Response::Staged { staged }) => Ok(staged),
             Ok(r) => Err(Self::read_error(r)),
             Err(_) => Err(CoreError::Unavailable),
         }

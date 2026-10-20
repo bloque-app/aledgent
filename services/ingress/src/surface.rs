@@ -47,12 +47,13 @@ use serde::de::DeserializeOwned;
 use crate::anchoring::AnchoringRoute;
 use crate::answering;
 use crate::auth::Authenticated;
-use crate::boundary::{Core, CoreError, CoreReply, InputKey, Outcome, Query, QueryReply};
+use crate::boundary::{Core, CoreError, CoreReply, InputKey, Outcome, Query, QueryReply, Staged};
 use crate::command::{
     Command, Intake, MAX_COMMAND_BYTES, derived_client_key, identity_id, request_digest_with,
 };
 use crate::credentials::{self, Pending};
 use crate::metrics::Metrics;
+use crate::operator::OperatorOp;
 use crate::pass_through::{Echo, key_of};
 use crate::query::{AssetParams, MovementBody, StatementParams};
 use crate::service::{Shared, mint};
@@ -160,6 +161,12 @@ pub enum CommandRoute {
     TiePrincipal,
     /// `POST /v1/ops/accounts/{account}/aliases` (`REQ-RC-7`, amendment 0024).
     RegisterAlias,
+    /// `POST /v1/ops/upgrade` (`REQ-RT-16`, `T-037-04`).
+    Upgrade,
+    /// `POST /v1/ops/upgrade/reschedule` (`REQ-RT-20`, `T-037-15`).
+    RescheduleUpgrade,
+    /// `POST /v1/ops/upgrade/cancel` (`REQ-RT-20`, `T-037-15`).
+    CancelUpgrade,
     /// A settlement route (`F-016`): `submit_outbound`, `configure_settlement`, or the
     /// adapter's.
     Settlement(crate::settlement::SettlementRoute),
@@ -504,6 +511,24 @@ pub const ROUTES: &[Route] = &[
         QueryRoute::IntegratingParties,
         "integrating_parties",
         "Operator: every registered integrating party and the principals tied to it (REQ-ID-7).",
+    ),
+    command(
+        "/v1/ops/upgrade",
+        CommandRoute::Upgrade,
+        "upgrade",
+        "Operator: the writer's code becomes a code version from an input. The execution node fetches and checks the version's manifest and artefacts, and its generation, before the command is logged; ERR-InvalidTransition if it cannot (REQ-RT-16, REQ-RT-17, REQ-RT-20). Decided under the upgrade-authority mode in force (REQ-RT-18).",
+    ),
+    command(
+        "/v1/ops/upgrade/reschedule",
+        CommandRoute::RescheduleUpgrade,
+        "reschedule_upgrade",
+        "Operator: move the scheduled upgrade to a later input. The way out of a switch that cannot be taken: it is given priority over the inputs waiting to be forwarded when the mode in force lets the caller take it, and the writer decides it under either generation of code (REQ-RT-20, amendment 0035).",
+    ),
+    command(
+        "/v1/ops/upgrade/cancel",
+        CommandRoute::CancelUpgrade,
+        "cancel_upgrade",
+        "Operator: cancel the scheduled upgrade. A way out, like reschedule_upgrade (REQ-RT-20, amendment 0035).",
     ),
     command(
         "/v1/ops/accounts/{account}/aliases",
@@ -1096,6 +1121,24 @@ fn operator_command(
                 justification: b.justification,
             }
         }
+        CommandRoute::Upgrade => {
+            let b: crate::wire::UpgradeBody = json(bytes)?;
+            OperatorCommand::Upgrade {
+                code: b.code,
+                from: b.from,
+                justification: b.justification,
+            }
+        }
+        CommandRoute::RescheduleUpgrade => {
+            let b: crate::wire::RescheduleUpgradeBody = json(bytes)?;
+            OperatorCommand::RescheduleUpgrade {
+                from: b.from,
+                justification: b.justification,
+            }
+        }
+        CommandRoute::CancelUpgrade => OperatorCommand::CancelUpgrade {
+            justification: justification()?,
+        },
         _ => return Err(Refusal::NotAuthorised),
     })
 }
@@ -1498,6 +1541,39 @@ async fn command_reply<S: Store, C: Core>(
             }
         }
     };
+    // The writer's code (`T-037-04`): an upgrade's code version is staged before the command is
+    // logged, and a way out overtakes the forwarder's queue; both only for a caller the core says
+    // may take the code in hand (`code_door`).
+    // A repeat of a code command is answered from its first decision, before the door looks at it
+    // again: the code it named may be in force by now (so no longer one the writer's next
+    // generation), and its source may be down (`REQ-OP-10`, `INV-18`).
+    if is_code_input(&command) {
+        match shared
+            .store
+            .find(&domain, command.surface(), &client_key)
+            .await
+        {
+            Ok(Some(row)) if row.new.body_digest != digest.0 => {
+                return refusal(Refusal::ClientKeyReused);
+            }
+            Ok(Some(row)) => {
+                return answer(
+                    shared,
+                    &who.principal,
+                    row,
+                    None,
+                    shared.config.decision_wait,
+                )
+                .await;
+            }
+            Ok(None) => {}
+            Err(_) => return refusal(Refusal::DecisionUnavailable),
+        }
+    }
+    let overtakes = match code_door(shared, &command, who, on_behalf_of.as_deref()).await {
+        Ok(o) => o,
+        Err(r) => return refusal(r),
+    };
     let intake = command.intake();
     // REQ-CS-9 (amendment 0013): a principal's answering setting may have its transfers and
     // reservations answered with their decision. Read only for those two.
@@ -1529,6 +1605,7 @@ async fn command_reply<S: Store, C: Core>(
         body: canonical,
         pass_through,
         reserves: intake == Intake::Reserve,
+        overtakes,
         synchronous,
         received_at: shared.clock.now(),
         arrived_at: Some(arrived_at),
@@ -1591,6 +1668,81 @@ async fn command_reply<S: Store, C: Core>(
         shared.metrics.decided(us);
     }
     reply
+}
+
+/// The door of the writer's code (`T-037-04`; `REQ-RT-16`, `REQ-RT-20`, amendment 0035; review of
+/// #44, F1 and N5): whether `command` puts the writer's code in hand, and if it does, what the
+/// execution node must do before it is logged. Returns whether the row overtakes the forwarder's
+/// queue.
+///
+/// The core is asked first whether the caller may take the code in hand, by the authority function
+/// the writer will decide the input with ([`Query::CodeAuthority`]). Only then:
+///
+/// - an **upgrade** has its code version staged: the node fetches the manifest and artefacts and
+///   checks them, and the writer's generation (`REQ-RT-16`, `REQ-RT-20`). If it cannot, the command
+///   is refused here, `ERR-InvalidTransition`, and nothing is logged;
+/// - a **way out** overtakes the queue, so that a fenced writer, which refuses every other input,
+///   still takes it.
+///
+/// A caller the core says may not is logged as any command is, and the writer refuses it and
+/// records the refusal (amendment 0035, `ERR-NotAuthorised`): it stages nothing and gets no
+/// priority, so it can neither make the node fetch code nor starve the queue. A core that cannot
+/// answer is `ERR-DecisionUnavailable`, and nothing is logged.
+async fn code_door<S: Store, C: Core>(
+    shared: &Shared<S, C>,
+    command: &Command,
+    who: &Authenticated,
+    on_behalf_of: Option<&str>,
+) -> Result<bool, Refusal> {
+    let Some(input) = code_input_of(command) else {
+        return Ok(false);
+    };
+    let Command::Operator(j) = command else {
+        return Ok(false);
+    };
+    let caller = who.caller(on_behalf_of.map(str::to_owned));
+    let asked = Query::CodeAuthority {
+        input: match input {
+            ledger_core::ledger::operator::CodeInput::Upgrade => "upgrade",
+            ledger_core::ledger::operator::CodeInput::WayOut => "way_out",
+        }
+        .to_owned(),
+    };
+    let authorised = match shared.core.query(&caller, &asked, shared.clock.now()).await {
+        Ok(QueryReply::CodeAuthority { authorised }) => authorised,
+        // The core refused the question itself (a credential that does not resolve): the caller is
+        // not one it lets in, and the writer will say so.
+        Ok(QueryReply::Refused { .. }) => false,
+        // An answer to another question, or none: nothing is staged and nothing is logged.
+        Ok(_) | Err(_) => return Err(Refusal::DecisionUnavailable),
+    };
+    if !authorised {
+        return Ok(false);
+    }
+    match &j.op {
+        OperatorOp::Upgrade { code, .. } => match shared.core.stage_code(code).await {
+            Ok(Staged::Staged) => Ok(false),
+            Ok(Staged::Refused { reason }) => {
+                // For the operator's log; the client is told the condition and no more.
+                tracing::warn!(%reason, "an upgrade was refused before it was logged: its code is not staged");
+                Err(Refusal::InvalidTransition)
+            }
+            Err(_) => Err(Refusal::DecisionUnavailable),
+        },
+        _ => Ok(true),
+    }
+}
+
+/// Which input of the writer's code `command` is, if it is one (`T-037-04`).
+fn code_input_of(command: &Command) -> Option<ledger_core::ledger::operator::CodeInput> {
+    match command {
+        Command::Operator(j) => j.op.code_input(),
+        _ => None,
+    }
+}
+
+fn is_code_input(command: &Command) -> bool {
+    code_input_of(command).is_some()
 }
 
 /// Ask the core, retrying while it does not answer, for at most `NFR-16`; then the answer is
@@ -1790,6 +1942,8 @@ fn query_response(reply: QueryReply) -> Response {
         QueryReply::CanSpend(c) => json(serde_json::to_value(c)),
         QueryReply::Undelivered { items } => json(serde_json::to_value(items)),
         QueryReply::Refused { error } => refusal(error),
+        // The door's own question (`T-037-04`): no route answers it to a caller.
+        QueryReply::CodeAuthority { .. } => refusal(Refusal::NotAuthorised),
         QueryReply::RecoveryMechanisms(m) => json(serde_json::to_value(m)),
         QueryReply::Custody(c) => json(serde_json::to_value(c)),
         QueryReply::Instructions { items } => json(serde_json::to_value(items)),

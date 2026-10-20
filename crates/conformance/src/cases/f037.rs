@@ -14,16 +14,18 @@
 //! case founds its own book on the core Agent's transition, natively
 //! (`core_binding::host::NativePort`, the code the VOS actor runs), so it exercises no harness
 //! target (`Harness::exercised`). The port runs as the code generation the case sets: 0 is the
-//! package of *H₀*, 1 the next one's; a switch is the case setting it. Until `T-037-04` lands the
-//! `Upgrade` input, a case schedules an upgrade by setting the hot row's `upgrade` directly.
+//! package of *H₀*, 1 the next one's; a switch is the case setting it. A case of the fence
+//! schedules an upgrade by setting the hot row's `upgrade` directly.
+//!
+//! **Run (`T-037-04`, the `Upgrade` input):** `AC-K7.1`, `AC-K7.2` and `AC-K7.16`, both its
+//! parts. They stage a code version on the port as the execution node does before it logs an
+//! upgrade (`core_binding::staging`), then drive the input itself.
 //!
 //! **Still pending, with the clause that remains** (each one's other clauses are checked by
 //! `core-binding`'s `tests/fence.rs` under the case's name):
 //! - `AC-K7.13`: "an execution node whose runtime is not the one the current range's code version
 //!   names refuses to drive the writer" (`T-037-14`). Checked: every upgrade raises the
 //!   generation, carried in the package's bytes, and a missed switch refuses input `n`.
-//! - `AC-K7.16`: "an upgrade whose code version names a generation other than the writer's plus
-//!   one is refused" (`T-037-04`). Checked: a stale package after the switch is refused.
 //! - `AC-K7.18`: "a replay assigns every input the generation the code map, read from the inputs
 //!   alone, names" (`T-037-09`). Checked: a move or cancel at `n`, authorised or not, commits the
 //!   same state under either generation.
@@ -32,10 +34,15 @@
 #![allow(non_snake_case)]
 
 use core_binding::envelope::{AgentRefusal, Committed, Fenced, encode};
-use core_binding::host::{DriveError, Driver, HostKeys, NativePort, Replica};
+use core_binding::host::{AgentPort as _, DriveError, Driver, HostKeys, NativePort, Replica};
 use core_binding::hot::{HOT, Hot, Limits, RingEntry, decode_hot};
+use core_binding::staging::{CodeFetch, StageRefusal};
 use core_binding::transition::Rows as _;
 use ledger_core::call::Summary;
+use ledger_core::code::{
+    Artefact, BuildProfile, CodeManifest, KernelIdentity, Platform, Role, WriterKind,
+    artefact_digest, generation_record,
+};
 use ledger_core::identity::IdentityKind;
 use ledger_core::ledger::{Ctx, Founded};
 use ledger_core::principal::{Caller, Verifier};
@@ -60,19 +67,15 @@ macro_rules! service_case {
 
 /// `F-037`'s table.
 pub const CASES: &[Case] = &[
-    Case::pending(
+    service_case!(
         "AC-K7.1",
-        "ac_k7_1_an_upgrade_applies_forward_and_the_next_anchor_names_it__service",
-        Layer::Service,
-        Feature::F037,
-        &["REQ-RT-15", "REQ-RT-16"],
+        ac_k7_1_an_upgrade_applies_forward_and_the_next_anchor_names_it__service,
+        &["REQ-RT-15", "REQ-RT-16"]
     ),
-    Case::pending(
+    service_case!(
         "AC-K7.2",
-        "ac_k7_2_an_upgrade_whose_code_cannot_be_fetched_is_refused__service",
-        Layer::Service,
-        Feature::F037,
-        &["REQ-RT-16", "REQ-RT-17"],
+        ac_k7_2_an_upgrade_whose_code_cannot_be_fetched_is_refused__service,
+        &["REQ-RT-16", "REQ-RT-17"]
     ),
     Case::pending(
         "AC-K7.3",
@@ -165,12 +168,10 @@ pub const CASES: &[Case] = &[
         Feature::F037,
         &["REQ-RT-19"],
     ),
-    Case::pending(
+    service_case!(
         "AC-K7.16",
-        "ac_k7_16_a_stale_package_or_a_wrong_generation_is_refused__service",
-        Layer::Service,
-        Feature::F037,
-        &["REQ-RT-20"],
+        ac_k7_16_a_stale_package_or_a_wrong_generation_is_refused__service,
+        &["REQ-RT-20"]
     ),
     service_case!(
         "AC-K7.17",
@@ -275,7 +276,8 @@ impl Book {
         Ok(h)
     }
 
-    /// Schedule an upgrade as `T-037-04`'s `Upgrade` will: the hot row's `upgrade`, set directly.
+    /// Schedule an upgrade directly: the hot row's `upgrade`, set. For the fence's cases, which
+    /// test what a scheduled upgrade does, not how it is scheduled.
     fn schedule(&mut self, upgrade: Option<([u8; 32], u64)>) -> Checked<()> {
         let mut h = self.hot()?;
         h.upgrade = upgrade;
@@ -841,10 +843,10 @@ mod modes {
                 b.approve(b.operator, u, Kind::Upgrade),
                 Refusal::NotAuthorised,
             )?;
-            // Both: the approver's approval meets the mode. Nothing in this code version schedules an
-            // upgrade (`T-037-04`), so it stays pending, and says so.
+            // Both: the approver's approval meets the mode, and schedules the upgrade
+            // (`T-037-04`).
             match b.approve(a, u, Kind::Upgrade) {
-                Ok(Decision::AwaitingScheduler(Action::Upgrade { code: H, .. })) => {}
+                Ok(Decision::Scheduled(Action::Upgrade { code: H, .. })) => {}
                 other => return Err(format!("the approver: {other:?}")),
             }
             // In the next anchor.
@@ -967,4 +969,386 @@ mod modes {
             Ok(())
         })())
     }
+}
+
+// -------------------------------------------------------------- the upgrade input (`T-037-04`)
+
+/// A package of code generation `generation`: a standard PVM program with the generation's record
+/// in its read-only data, which `ledger_core::code::generation_of` reads.
+fn code_package(generation: u64) -> Vec<u8> {
+    let ro = generation_record(generation);
+    let mut p = Vec::new();
+    // E3(|o|) ‖ E3(|w|) ‖ E2(z) ‖ E3(s) ‖ o ‖ w ‖ E4(|c|) ‖ c
+    p.extend_from_slice(&(ro.len() as u32).to_le_bytes()[..3]);
+    p.extend_from_slice(&[0; 8]);
+    p.extend_from_slice(&ro);
+    p.extend_from_slice(&1u32.to_le_bytes());
+    p.push(0);
+    p
+}
+
+/// A manifest that names `generation` over `package` and a constant runtime.
+fn code_manifest(generation: u64, package: &[u8]) -> CodeManifest {
+    let profile = || BuildProfile {
+        target: "riscv64em-vos".into(),
+        toolchain: "nightly".into(),
+        opt_level: "s".into(),
+        features: Vec::new(),
+        source_revision: "0123abcd".into(),
+        cargo_lock: [0; 32],
+    };
+    let art = |role, b: &[u8]| Artefact {
+        role,
+        digest: artefact_digest(b),
+        len: b.len() as u64,
+        identities: Vec::new(),
+        profile: profile(),
+    };
+    CodeManifest {
+        writer: WriterKind::Core,
+        platform: Platform {
+            name: "vos-saga".into(),
+            revision: "c54fc1ff".into(),
+            identities: Vec::new(),
+        },
+        generation,
+        artefacts: vec![art(Role::Package, package), art(Role::Runtime, b"runtime")],
+        kernel: KernelIdentity {
+            revision: "e9a7b08".into(),
+            checksum: None,
+        },
+        constructions: Vec::new(),
+        messages: Vec::new(),
+    }
+}
+
+/// A source of code that holds what it was given, by digest. Untrusted: a case makes it lie.
+#[derive(Default)]
+struct Held(std::sync::Mutex<std::collections::BTreeMap<[u8; 32], Vec<u8>>>);
+
+impl Held {
+    fn put_as(&self, digest: [u8; 32], bytes: &[u8]) {
+        self.0.lock().unwrap().insert(digest, bytes.to_vec());
+    }
+
+    fn put(&self, bytes: &[u8]) -> [u8; 32] {
+        let d = artefact_digest(bytes);
+        self.put_as(d, bytes);
+        d
+    }
+
+    /// A whole code version of `generation`; its version.
+    fn version(&self, generation: u64) -> [u8; 32] {
+        let p = code_package(generation);
+        let m = code_manifest(generation, &p);
+        self.put(&p);
+        self.put(b"runtime");
+        self.put(&m.to_bytes());
+        m.version()
+    }
+}
+
+impl CodeFetch for Held {
+    fn name(&self) -> &str {
+        "held"
+    }
+    fn fetch(&self, digest: &[u8; 32], _: Option<u64>) -> Option<Vec<u8>> {
+        self.0.lock().unwrap().get(digest).cloned()
+    }
+}
+
+impl Book {
+    /// Something in the posting log, so that a checkpoint has an entry to cover: a person's
+    /// account, funded with 500 USD by the operator's issuance grant.
+    fn fund(&mut self) -> Checked<()> {
+        use ledger_core::account::{AccountKind, Custody};
+        use ledger_core::asset::{AssetId, Minor, NonZeroMinor};
+        use ledger_core::authority::{GrantKind, OperationKind, Subject, Window};
+        use ledger_core::ledger::{GrantRequest, OpenAccount};
+        use ledger_core::set::NonEmptySet;
+        let usd = AssetId::parse("USD").map_err(|e| format!("{e:?}"))?;
+        let op = self.operator();
+        let ctx = self.ctx(op);
+        self.replica
+            .grant_authority(
+                &ctx,
+                GrantRequest {
+                    kind: GrantKind::Issuance,
+                    principal: op.principal,
+                    subject: Subject::Asset(usd),
+                    ops: NonEmptySet::new([OperationKind::Issue, OperationKind::Redeem].into())
+                        .ok_or("no ops")?,
+                    per_operation: None,
+                    per_window: Some(Window {
+                        length: std::num::NonZeroU64::new(1_000_000).ok_or("window")?,
+                        limit: NonZeroMinor::new(Minor::new(u64::MAX / 2))
+                            .map_err(|e| format!("{e:?}"))?,
+                    }),
+                    assets: Some(NonEmptySet::one(usd)),
+                    counterparties: None,
+                    parent: None,
+                    expires: None,
+                },
+            )
+            .map_err(|r| format!("{r:?}"))?;
+        self.sync().map_err(|e| format!("{e:?}"))?;
+        let p = self.person()?;
+        let ctx = self.ctx(p);
+        let a = self
+            .replica
+            .open_account(
+                &ctx,
+                OpenAccount {
+                    owner: p.principal,
+                    kind: AccountKind::Customer,
+                    custody: Custody::Delegated,
+                    treasury_limits: std::collections::BTreeMap::new(),
+                    acknowledged: None,
+                },
+            )
+            .map_err(|r| format!("{r:?}"))?
+            .value;
+        self.sync().map_err(|e| format!("{e:?}"))?;
+        let ctx = self.ctx(op);
+        self.replica
+            .issue(&ctx, usd, a, Minor::new(500))
+            .map_err(|r| format!("{r:?}"))?;
+        self.sync().map_err(|e| format!("{e:?}"))?;
+        Ok(())
+    }
+
+    /// Stage `code` on the port as the execution node does before it logs an upgrade naming it.
+    fn stage(&mut self, source: &Held, code: &[u8; 32]) -> Result<(), StageRefusal> {
+        let g = self.hot().map_err(StageRefusal::Manifest)?.generation;
+        let checked = core_binding::staging::fetch(source, code, g)?;
+        self.driver.port_mut().stage_code(checked)
+    }
+
+    /// The operator upgrades to `code` from input `from`.
+    fn upgrade(&mut self, code: [u8; 32], from: u64) -> Result<Option<Committed>, DriveError> {
+        let ctx = self.ctx(self.operator());
+        let _ = self
+            .replica
+            .upgrade(&ctx, code, from, b"AC-K7: the next code");
+        self.sync()
+    }
+}
+
+fn ac_k7_1_an_upgrade_applies_forward_and_the_next_anchor_names_it__service(
+    _: &mut dyn Harness,
+) -> Outcome {
+    use ledger_core::operator::OperatorOpKind;
+    use ledger_core::set::NonEmptySet;
+    use ledger_core::settlement::{SettlementConfig, SourceId};
+    outcome((|| {
+        let mut b = Book::new()?;
+        b.fund()?;
+        // A book that can checkpoint: a settlement configuration and the grant to anchor.
+        let ctx = b.ctx(b.operator());
+        let o = b
+            .replica
+            .open_identity(
+                &ctx,
+                IdentityKind::Organisation,
+                None,
+                Verifier::new(vec![9]),
+            )
+            .map_err(|r| format!("{r:?}"))?
+            .value;
+        b.sync().map_err(|e| format!("{e:?}"))?;
+        let ctx = b.ctx(b.operator());
+        b.replica
+            .configure_settlement(
+                &ctx,
+                SettlementConfig {
+                    authoritative: SourceId::of_identity(&o.identity),
+                    instance: 1,
+                    suspense: None,
+                    inbound_deadline: 1_000_000,
+                    expiry_window: 1_000,
+                    block_time: 1,
+                    finality_margin: 1,
+                },
+            )
+            .map_err(|r| format!("{r:?}"))?;
+        b.sync().map_err(|e| format!("{e:?}"))?;
+        let op = b.operator();
+        let ctx = b.ctx(op);
+        b.replica
+            .grant_operator(
+                &ctx,
+                op.principal,
+                NonEmptySet::one(OperatorOpKind::AnchorCheckpoint),
+                None,
+                b"AC-K7.1: the operator anchors",
+            )
+            .map_err(|r| format!("{r:?}"))?;
+        b.sync().map_err(|e| format!("{e:?}"))?;
+        let g = b.hot()?.code;
+        // Staged first, decided under the old code, scheduled from `n`.
+        let source = Held::default();
+        let h1 = source.version(1);
+        b.stage(&source, &h1).map_err(|e| format!("{e}"))?;
+        let at = b.hot()?.inputs + 1;
+        let n = at + 2;
+        let c = committed(b.upgrade(h1, n))?;
+        check(
+            c.seq == at && c.summaries == vec![Summary::Accepted],
+            || format!("{c:?}"),
+        )?;
+        let h = b.hot()?;
+        check(
+            (h.code, h.generation, h.upgrade) == (g, 0, Some((h1, n))),
+            || format!("{h:?}"),
+        )?;
+        // Every input before `n` runs under the old code and keeps its outcome.
+        committed(b.open(1))?;
+        check(b.driver.port().switched.is_empty(), || {
+            "switched before n".into()
+        })?;
+        // Input `n` runs under H, after the host's switch.
+        let c = committed(b.open(2))?;
+        check(c.seq == n && b.driver.port().switched == [h1], || {
+            format!("{c:?} / {:?}", b.driver.port().switched)
+        })?;
+        let h = b.hot()?;
+        check((h.code, h.generation, h.upgrade) == (h1, 1, None), || {
+            format!("{h:?}")
+        })?;
+        for e in &b.archive {
+            check(e.code == if e.seq < n { g } else { h1 }, || {
+                format!("input {} names {:?}", e.seq, e.code)
+            })?;
+        }
+        // The next checkpoint, and its anchor, name H.
+        let ctx = b.ctx(b.operator());
+        let cp = b
+            .replica
+            .anchor_checkpoint(&ctx, b"AC-K7.1: after the upgrade")
+            .map_err(|r| format!("{r:?}"))?
+            .value
+            .ok_or("no checkpoint")?;
+        b.sync().map_err(|e| format!("{e:?}"))?;
+        let binding = cp.binding.ok_or("a v1 or v2 checkpoint")?;
+        check(binding.code == h1 && cp.consistent(), || {
+            format!("{:?}", cp.binding)
+        })?;
+        let named = ledger_core::anchor::commitment_v3(
+            cp.construction,
+            &binding,
+            cp.instance,
+            cp.number,
+            cp.entry_sequence,
+            &cp.kernel_root,
+        );
+        check(cp.commitment == named, || {
+            "the anchor does not bind H".into()
+        })
+    })())
+}
+
+fn ac_k7_2_an_upgrade_whose_code_cannot_be_fetched_is_refused__service(
+    _: &mut dyn Harness,
+) -> Outcome {
+    outcome((|| {
+        let mut b = Book::new()?;
+        b.person()?;
+        let before = b.hot()?;
+        // No source returns the manifest.
+        let none = Held::default();
+        check(
+            matches!(
+                b.stage(&none, &[0xB1; 32]),
+                Err(StageRefusal::NotRetrievable(_))
+            ),
+            || "a manifest nobody holds was staged".into(),
+        )?;
+        // An artefact nobody holds, then one under another digest.
+        let source = Held::default();
+        let h1 = source.version(1);
+        let m = CodeManifest::from_bytes(&source.fetch(&h1, None).ok_or("no manifest")?)
+            .map_err(|e| format!("{e:?}"))?;
+        let package = m.artefact(Role::Package).ok_or("no package")?.digest;
+        let bytes = source.fetch(&package, None).ok_or("no package bytes")?;
+        source.0.lock().unwrap().remove(&package);
+        check(
+            matches!(b.stage(&source, &h1), Err(StageRefusal::NotRetrievable(_))),
+            || "an artefact nobody holds was staged".into(),
+        )?;
+        let mut wrong = bytes.clone();
+        wrong[0] ^= 1;
+        source.put_as(package, &wrong);
+        check(
+            matches!(b.stage(&source, &h1), Err(StageRefusal::Mismatch(_))),
+            || "an artefact of another digest was staged".into(),
+        )?;
+        // Refused: nothing was staged, and the code does not change.
+        check(b.driver.port().code_map.is_empty(), || {
+            "something was staged".into()
+        })?;
+        check(b.hot()? == before, || "the writer changed".into())?;
+        // With the right bytes it stages, and the upgrade is then decided.
+        source.put_as(package, &bytes);
+        b.stage(&source, &h1).map_err(|e| format!("{e}"))?;
+        let n = b.hot()?.inputs + 3;
+        committed(b.upgrade(h1, n))?;
+        check(b.hot()?.upgrade == Some((h1, n)), || {
+            "the staged version was not scheduled".into()
+        })
+    })())
+}
+
+fn ac_k7_16_a_stale_package_or_a_wrong_generation_is_refused__service(
+    _: &mut dyn Harness,
+) -> Outcome {
+    outcome((|| {
+        // First part: the writer is at generation g + 1 after an upgrade; code of generation g,
+        // installed again, refuses the input and changes nothing.
+        let (mut b, _, n) = scheduled(1)?;
+        committed(b.open(1))?;
+        let after = b.hot()?;
+        check(after.generation == 1 && after.inputs == n, || {
+            format!("{after:?}")
+        })?;
+        b.generation(0);
+        let before = b.hot()?;
+        let f = fenced(b.open(2))?;
+        check(f.code_generation == 0 && f.generation == 1, || {
+            format!("{f:?}")
+        })?;
+        check(b.hot()? == before, || "the stale package changed it".into())?;
+        // Second part: an upgrade whose code version names another generation than the writer's
+        // plus one, or whose package carries another constant, is refused and nothing changes.
+        let mut b = Book::new()?;
+        b.person()?;
+        let before = b.hot()?;
+        let source = Held::default();
+        for g in [0, 2, 9] {
+            let h = source.version(g);
+            check(
+                b.stage(&source, &h)
+                    == Err(StageRefusal::Generation {
+                        writer: 0,
+                        manifest: g,
+                    }),
+                || format!("generation {g} over a writer at 0 was staged"),
+            )?;
+        }
+        let p = code_package(2);
+        let m = code_manifest(1, &p);
+        source.put(&p);
+        source.put(b"runtime");
+        source.put(&m.to_bytes());
+        check(
+            matches!(
+                b.stage(&source, &m.version()),
+                Err(StageRefusal::Package(_))
+            ),
+            || "a package of another constant was staged".into(),
+        )?;
+        check(b.driver.port().code_map.is_empty(), || {
+            "something was staged".into()
+        })?;
+        check(b.hot()? == before, || "the writer changed".into())
+    })())
 }

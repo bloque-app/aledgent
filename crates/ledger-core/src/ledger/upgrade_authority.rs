@@ -14,9 +14,17 @@
 //! - for a **change of mode**, schedules it at once: the writer's `authority_next` names it and
 //!   the input it applies from, and every proposal not yet scheduled is cancelled (`REQ-RT-18`).
 //!   From that input, [`Ledger::set_input`] makes it the mode in force;
-//! - for an **upgrade** or a **migration**, answers [`Decision::AwaitingScheduler`] and leaves the
-//!   proposal pending and visible: nothing in this code version schedules one (`T-037-04`,
-//!   `T-037-10`).
+//! - for an **upgrade**, schedules it (`T-037-04`): the writer's `upgrade` becomes the proposal's
+//!   code version and input ([`Ledger::take_upgrade`]), by the same writer step as a direct
+//!   `upgrade` input, and the answer is [`Decision::Scheduled`]. That the code version's artefacts
+//!   are retrievable and match its generation is the execution node's check before the input is
+//!   logged, and the writer, which never sees a manifest, does not look. No `CTR-OPS` route carries
+//!   `propose_upgrade` or `approve_upgrade` yet, so nothing can log either: the route that adds
+//!   them must stage the code at the input that authorises the upgrade (a proposal under a mode of
+//!   one member; an approval, whose code is the pending proposal's), as the door of `upgrade`
+//!   does;
+//! - for a **migration**, answers [`Decision::AwaitingScheduler`] and leaves the proposal pending
+//!   and visible: nothing in this code version schedules one (`T-037-10`).
 //!
 //! While a change of mode is scheduled and not yet in force, the outgoing mode authorises nothing
 //! more: no upgrade, no migration, no other change of mode (`ERR-InvalidTransition`). A change of
@@ -56,6 +64,8 @@ struct Decided {
     next: Option<([u8; 32], u64)>,
     /// An upgrade or a migration met the mode's conditions.
     upgraded: bool,
+    /// The upgrade this input scheduled: its code version and input.
+    upgrade: Option<([u8; 32], u64)>,
 }
 
 impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
@@ -157,6 +167,9 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             if decided.upgraded {
                 self.writer.upgraded = true;
             }
+            if decided.upgrade.is_some() {
+                self.upgrade = decided.upgrade;
+            }
             Ok(accepted)
         })();
         self.leave(top, || crate::call::Summary::of(&r));
@@ -256,6 +269,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             decision: decision.clone(),
             next: None,
             upgraded: false,
+            upgrade: None,
         };
         match decision {
             Decision::Authorised(Action::SetAuthority { mode, from }) => {
@@ -272,13 +286,20 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                 decided.next = Some((mode.digest(), from));
                 decided.record.next = Some((mode, from));
             }
-            Decision::AwaitingScheduler(_) => {
+            Decision::AwaitingScheduler(action) => {
                 if self.writer.next.is_some() || self.writer.changed_mode {
                     return Err(Refusal::InvalidTransition);
                 }
-                // Nothing schedules it yet: it stays pending, and visible.
                 decided.upgraded = true;
-                decided.record.pending.push(proposal);
+                match action {
+                    // Scheduled by the input that authorises it, and consumed (`T-037-04`).
+                    Action::Upgrade { code, from } => {
+                        decided.upgrade = Some((code, from));
+                        decided.decision = Decision::Scheduled(Action::Upgrade { code, from });
+                    }
+                    // Nothing schedules a migration yet: it stays pending, and visible.
+                    _ => decided.record.pending.push(proposal),
+                }
             }
             _ => decided.record.pending.push(proposal),
         }
@@ -297,6 +318,44 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
         caller: &crate::principal::Caller,
         p: &Principal,
     ) -> Result<crate::authority::AuthorityUsed, Refusal> {
+        self.member_in_force(caller, p)?;
+        Ok(policy_used(p))
+    }
+
+    /// The authority an `upgrade` input is taken under (`T-037-04`, `REQ-RT-16`, `REQ-RT-18`): the
+    /// mode in force at its input, in its single form (amendment 0023 (b′): "a single `Upgrade`
+    /// under `Single`"). Its member alone authorises it, so under a mode that needs a second
+    /// approval it is `ERR-NotAuthorised`: those go through `propose_upgrade` and `approve_upgrade`.
+    /// With `from`, the conditions a proposal meets as well: none while a change of mode is
+    /// scheduled or decided in this input (`ERR-InvalidTransition`), and `from` beyond the mode's
+    /// delay and within the lead ([`check_from`]); without it, only the membership, which is what
+    /// the execution node's door asks before it stages the code.
+    pub(super) fn upgrade_input_authority(
+        &self,
+        caller: &crate::principal::Caller,
+        p: &Principal,
+        from: Option<u64>,
+    ) -> Result<crate::authority::AuthorityUsed, Refusal> {
+        let (in_force, me) = self.member_in_force(caller, p)?;
+        if !matches!(in_force.mode.rule, Rule::Single { .. }) || !in_force.mode.may_propose(&me) {
+            return Err(Refusal::NotAuthorised);
+        }
+        if let Some(from) = from {
+            if self.writer.next.is_some() || self.writer.changed_mode {
+                return Err(Refusal::InvalidTransition);
+            }
+            check_from(&in_force.mode, self.input, from)?;
+        }
+        Ok(policy_used(p))
+    }
+
+    /// The mode in force at this input, and the caller as a member of it (`ERR-NotAuthorised` if it
+    /// is not one, or is scoped, or acts for another).
+    fn member_in_force(
+        &self,
+        caller: &crate::principal::Caller,
+        p: &Principal,
+    ) -> Result<(InForce, Member), Refusal> {
         if !p.unscoped() || p.on_behalf_of.is_some() {
             return Err(Refusal::NotAuthorised);
         }
@@ -316,7 +375,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
         if !in_force.mode.members().contains(&me) {
             return Err(Refusal::NotAuthorised);
         }
-        Ok(policy_used(p))
+        Ok((in_force, me))
     }
 
     /// Whether `m` can hold the upgrade authority (amendment 0034): an identity of the registry,

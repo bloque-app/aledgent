@@ -36,11 +36,12 @@
 //!   credentials the registry holds and the input number, so every replica, and every code version
 //!   that decides the same input, decides it the same (`REQ-RT-3`).
 //!
-//! **The seam an upgrade plugs into** (`T-037-04`, `T-037-10`). Nothing in this code version
-//! schedules an upgrade or a migration. A proposal of one that meets the mode's conditions is
-//! [`Decision::AwaitingScheduler`]: it stays pending and visible in the record, never consumed,
-//! until the step those tasks add schedules it. An `Upgrade { code, from }` under a mode that one
-//! member satisfies alone is [`alone`] and [`check_from`]. Nothing here installs anything.
+//! **The seam an upgrade plugs into** (`T-037-04`, `T-037-10`). A proposal of an upgrade that
+//! meets the mode's conditions is [`Decision::AwaitingScheduler`] from [`authorise`], and the
+//! ledger schedules it in the input that authorises it (`T-037-04`): the writer's `upgrade` is
+//! taken from it, as from a direct `Upgrade`, and the answer is [`Decision::Scheduled`]. The
+//! proposal is consumed. A migration is still [`Decision::AwaitingScheduler`] and stays pending
+//! and visible in the record until `T-037-10` schedules it. Nothing here installs anything.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
@@ -262,8 +263,10 @@ impl Mode {
     }
 }
 
-/// `m` satisfies `mode` alone: the mode a single `Upgrade { code, from }` is authorised under
-/// (`DEC-26` (b′), `T-037-04`).
+/// `m` satisfies `mode` alone: a proposal of `m`'s meets the mode at once, with no second approval.
+/// That is **not** the form of the direct `Upgrade { code, from }` input: amendment 0023 (b′) names
+/// it "a single `Upgrade` under `Single`", and `Ledger::upgrade` is authorised under `Single`
+/// only (`T-037-04`). A member of `Threshold { k: 1 }` upgrades by proposing.
 pub fn alone(mode: &Mode, m: &Member) -> bool {
     match &mode.rule {
         Rule::Single { member } => member == m,
@@ -478,6 +481,10 @@ pub enum Decision {
     /// `T-037-10`). The proposal stays pending and visible in the record, and a change of mode
     /// cancels it like any other pending proposal.
     AwaitingScheduler(Action),
+    /// An upgrade whose proposal meets the mode's conditions at this input, **scheduled** by it
+    /// (`T-037-04`): the writer's `upgrade` is the action's, and the proposal is consumed. A
+    /// decision is an answer, not a stored or encoded value, so the variant's place moves no tag.
+    Scheduled(Action),
     /// The same command was accepted before under this operation reference (`REQ-OP-10`): its
     /// outcome is in its record and its audit trail.
     Repeated,
