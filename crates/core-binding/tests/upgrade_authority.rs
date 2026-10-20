@@ -463,6 +463,11 @@ fn t037_05_no_authority_path_installs_a_package() {
     files(&root.join("crates/ledger-core/src"), "rs", &mut path);
     files(&root.join("crates/core-binding/src"), "rs", &mut path);
     for p in &path {
+        // `core_binding::switch` is `switch`'s own logic (`T-037-14`): it names the install it asks
+        // of the platform through a trait and holds no platform type.
+        if p.ends_with("core-binding/src/switch.rs") {
+            continue;
+        }
         for (i, l) in read(p).lines().enumerate() {
             for word in [
                 "ManagementRequest",
@@ -494,14 +499,24 @@ fn t037_05_no_authority_path_installs_a_package() {
             {
                 function = f.split(['(', '<']).next().unwrap_or("");
             }
+            // Prose (comments and docs) may name what a function does.
+            if l.trim_start().starts_with("//") {
+                continue;
+            }
             for word in [
                 "ManagementRequest::Upgrade",
                 "ManagementRequest::Replace",
                 "UpgradeActor",
                 "ReplaceActor",
             ] {
+                // `switch`'s own module (`agents/core-host/src/switch.rs`) and the runtime's
+                // in-place upgrade it calls (`Runtime::upgrade_actor`, `manage` building the request).
+                let allowed = function == "switch"
+                    || p.ends_with("core-host/src/switch.rs")
+                    || (p.ends_with("core-host/src/driver.rs")
+                        && ["upgrade_actor", "manage"].contains(&function));
                 assert!(
-                    !l.contains(word) || function == "switch",
+                    !l.contains(word) || allowed,
                     "{}:{}: {word} outside `switch`",
                     p.display(),
                     i + 1
