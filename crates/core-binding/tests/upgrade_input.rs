@@ -325,6 +325,79 @@ async fn ac_k7_1_an_upgrade_through_ops_is_staged_scheduled_switched_and_in_forc
     assert_eq!(w.core.with_port(|p| p.generation), Some(1));
 }
 
+/// `REQ-OP-10`, `INV-18` on the new routes: a retry of an upgrade is answered from its first
+/// decision, not staged again. After the upgrade is in force its code names the generation the
+/// writer is at, and its source may be gone; the retry still gets the original answer, and logs
+/// nothing. With an explicit client key and with a derived one.
+#[tokio::test(flavor = "multi_thread")]
+async fn t037_04_a_retried_upgrade_is_answered_from_its_first_decision() {
+    for key in [Some("upgrade-once"), None] {
+        let w = world().await;
+        let op = operator(&w);
+        let h1 = w.code.version(1);
+        let n = hot(&w).inputs + 3;
+        let headers: Vec<(&str, &str)> = key.map(|k| ("client-key", k)).into_iter().collect();
+        let (s, first) =
+            w.d.call(
+                "POST",
+                "/v1/ops/upgrade",
+                Some(&op),
+                &headers,
+                Some(upgrade_body(&h1, n)),
+            )
+            .await;
+        assert_eq!(s.as_u16(), 200, "{first}");
+        // Up to and through `n`: the upgrade is in force.
+        let mut k = 0;
+        while hot(&w).inputs < n {
+            k += 1;
+            let (s, _) =
+                w.d.call(
+                    "POST",
+                    "/v1/identities",
+                    Some(&op),
+                    &[("client-key", &format!("person-{k}"))],
+                    Some(json!({ "kind": "person", "verifier": "0a" })),
+                )
+                .await;
+            assert_eq!(s.as_u16(), 200);
+        }
+        assert_eq!(hot(&w).generation, 1);
+        // The source forgets the version.
+        w.code.forget(&h1);
+        let before = logged(&w).await;
+        let (s, again) =
+            w.d.call(
+                "POST",
+                "/v1/ops/upgrade",
+                Some(&op),
+                &headers,
+                Some(upgrade_body(&h1, n)),
+            )
+            .await;
+        assert_eq!(s.as_u16(), 200, "{key:?}: {again}");
+        assert_eq!(
+            again["operation_reference"], first["operation_reference"],
+            "{key:?}: the same operation"
+        );
+        assert_eq!(logged(&w).await, before, "{key:?}: nothing was logged");
+        // A changed request under the same key is refused as ever.
+        if key.is_some() {
+            let (s, v) =
+                w.d.call(
+                    "POST",
+                    "/v1/ops/upgrade",
+                    Some(&op),
+                    &headers,
+                    Some(upgrade_body(&h1, n + 1)),
+                )
+                .await;
+            assert_eq!(s.as_u16(), 409, "{v}");
+            assert!(condition(&v).contains("ERR-ClientKeyReused"), "{v}");
+        }
+    }
+}
+
 /// A writer fenced at `n`: the upgrade staged, scheduled from the next input, and the host's
 /// switch taking no effect, so the old package refuses input `n` (the fence). Returns the world,
 /// the code version, `n`, and a holder.

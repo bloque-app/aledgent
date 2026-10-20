@@ -381,9 +381,14 @@ impl AgentPort for VosPort {
         let Some(state) = self.code_state_mut() else {
             return Err(StageRefusal::NoSource);
         };
+        // `saga` runs a runtime of its own beside the package: a version that names none cannot be
+        // installed here.
+        let runtime = checked
+            .runtime
+            .ok_or_else(|| StageRefusal::Manifest("the manifest names no Runtime".into()))?;
         state
             .staged
-            .insert(checked.manifest, checked.package, checked.runtime)
+            .insert(checked.manifest, checked.package, runtime)
             .map(|_| ())
             .map_err(StageRefusal::Package)
     }

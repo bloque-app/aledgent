@@ -9,8 +9,8 @@
 //!
 //! 1. the manifest's bytes hash to *H* (`blake2b-256`), and decode;
 //! 2. the manifest's `generation` is the writer's plus one (`REQ-RT-20`);
-//! 3. the package and the runtime it names are fetched, each of the length and `blake2b-256`
-//!    the manifest gives;
+//! 3. the package, and the runtime if it names one, are fetched, each of the length and
+//!    `blake2b-256` the manifest gives;
 //! 4. the package's compiled `GENERATION` is the manifest's (`ledger_core::code::generation_of`, the
 //!    one reader), which the platform's port reads out of its package ([`Checked::check_package`]).
 //!
@@ -89,8 +89,9 @@ pub struct Checked {
     pub manifest: CodeManifest,
     /// The package's bytes (`core.vos`).
     pub package: Vec<u8>,
-    /// The runtime's bytes.
-    pub runtime: Vec<u8>,
+    /// The runtime's bytes, if the manifest names one: a platform that runs its own has none
+    /// (`REQ-RT-19`), and the port that needs one refuses its absence.
+    pub runtime: Option<Vec<u8>>,
 }
 
 impl Checked {
@@ -169,10 +170,7 @@ pub fn fetch(
             manifest: manifest.generation,
         });
     }
-    let get = |role: Role| -> Result<Vec<u8>, StageRefusal> {
-        let a = manifest
-            .artefact(role)
-            .ok_or_else(|| StageRefusal::Manifest(format!("it names no {role:?}")))?;
+    let get = |role: Role, a: &ledger_core::code::Artefact| -> Result<Vec<u8>, StageRefusal> {
         let name = || format!("the {role:?} of {}", crate::switch::short(code));
         let bytes = source
             .fetch(&a.digest, Some(a.len))
@@ -182,8 +180,14 @@ pub fn fetch(
         }
         Ok(bytes)
     };
-    let package = get(Role::Package)?;
-    let runtime = get(Role::Runtime)?;
+    let package = manifest
+        .artefact(Role::Package)
+        .ok_or_else(|| StageRefusal::Manifest("it names no Package".into()))
+        .and_then(|a| get(Role::Package, a))?;
+    let runtime = manifest
+        .artefact(Role::Runtime)
+        .map(|a| get(Role::Runtime, a))
+        .transpose()?;
     Ok(Checked {
         manifest,
         package,
@@ -391,6 +395,21 @@ mod tests {
             fetch_checked(&s, &m.version(), 0, &compiled),
             Err(StageRefusal::Package(_))
         ));
+    }
+
+    /// `REQ-RT-19`: a platform that runs its own runtime names none, and the version stages with the
+    /// package alone; whether that platform can run it is the port's to say.
+    #[test]
+    fn t037_04_a_manifest_with_no_runtime_stages_the_package_alone() {
+        let p = package(1);
+        let mut m = manifest(1, &p, b"runtime");
+        m.artefacts.retain(|a| a.role != Role::Runtime);
+        let s = Held::new();
+        s.put(&m.to_bytes());
+        s.put(&p);
+        let c = fetch_checked(&s, &m.version(), 0, &compiled).expect("staged");
+        assert!(c.runtime.is_none());
+        assert_eq!(c.package, p);
     }
 
     /// The writer's generation is a number that can end: plus one never wraps to a match.

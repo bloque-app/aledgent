@@ -412,7 +412,7 @@ fn t037_04_staging_is_what_makes_the_switch_possible() {
             .stage_code(core_binding::staging::Checked {
                 manifest: code_manifest(7, b"x", b"y"),
                 package: b"x".to_vec(),
-                runtime: b"y".to_vec(),
+                runtime: Some(b"y".to_vec()),
             }),
         Err(StageRefusal::Generation { .. })
     ));
