@@ -320,6 +320,18 @@ impl AgentPort for VosPort {
         Some(self.runtime.unacknowledged())
     }
 
+    /// `switch(H, n)` on `saga` (`T-037-14`): make the Agent run `code`, from the versions staged
+    /// for this port. A port that tracks no code runs what it runs.
+    fn switch_to(&mut self, code: [u8; 32]) -> Result<(), String> {
+        let Some(state) = self.code_state() else {
+            return Ok(());
+        };
+        let digests = state.staged.digests();
+        core_binding::switch::ensure(code, None, 0, &digests, self)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
     fn invoke(&mut self, envelope: Vec<u8>, blobs: Vec<Vec<u8>>) -> Result<Vec<u8>, PortError> {
         #[cfg(feature = "composite")]
         if let Some(mode) = composite_mode()

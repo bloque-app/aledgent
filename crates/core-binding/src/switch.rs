@@ -112,9 +112,9 @@ impl core::fmt::Display for SwitchError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::NotStaged(_) => f.write_str("the code version of the next input was not staged"),
-            Self::Stale { .. } => {
-                f.write_str("the platform's install changed under the switch (stale compare-and-swap)")
-            }
+            Self::Stale { .. } => f.write_str(
+                "the platform's install changed under the switch (stale compare-and-swap)",
+            ),
             Self::Cannot(why) => write!(f, "the platform cannot install the target: {why}"),
             Self::Platform(why) => write!(f, "the platform's install failed: {why}"),
             Self::NotInstalled { .. } => {
@@ -282,10 +282,16 @@ mod tests {
         let mut p = Platform::running(1);
         let upgrade = Some((h(2), 5));
         // Before n the target is the hot row's code: nothing to do.
-        assert_eq!(ensure(h(1), upgrade, 4, &staged, &mut p), Ok(Outcome::Unchanged));
+        assert_eq!(
+            ensure(h(1), upgrade, 4, &staged, &mut p),
+            Ok(Outcome::Unchanged)
+        );
         assert!(p.installs.is_empty());
         // At n the program switches, before the input is sent.
-        assert_eq!(ensure(h(1), upgrade, 5, &staged, &mut p), Ok(Outcome::Installed));
+        assert_eq!(
+            ensure(h(1), upgrade, 5, &staged, &mut p),
+            Ok(Outcome::Installed)
+        );
         assert_eq!(p.runs, art(2, 9));
         assert_eq!(p.installs, [h(2)]);
     }
@@ -322,7 +328,10 @@ mod tests {
         ensure(h(1), Some((h(2), 5)), 5, &staged, &mut p).unwrap();
         // ... input 5 was a way-out: it committed with `code` still g and `upgrade` cleared, so the
         // host reinstalls g before 6, by the same call.
-        assert_eq!(ensure(h(1), None, 6, &staged, &mut p), Ok(Outcome::Installed));
+        assert_eq!(
+            ensure(h(1), None, 6, &staged, &mut p),
+            Ok(Outcome::Installed)
+        );
         assert_eq!(p.runs, art(1, 9));
         assert_eq!(p.installs, [h(2), h(1)]);
         // Every install went through the signed mutation, none without it.
@@ -335,7 +344,10 @@ mod tests {
         // The platform still runs H (the previous process crashed between the way-out's commit
         // and the reinstall): the restarted host's start check installs g.
         let mut p = Platform::running(2);
-        assert_eq!(ensure(h(1), None, 6, &staged, &mut p), Ok(Outcome::Installed));
+        assert_eq!(
+            ensure(h(1), None, 6, &staged, &mut p),
+            Ok(Outcome::Installed)
+        );
         assert_eq!(p.runs, art(1, 9));
         assert_eq!(p.installs, [h(1)]);
     }
@@ -381,7 +393,10 @@ mod tests {
         ensure(h(1), upgrade, 5, &staged, &mut p).unwrap();
         // The process crashed after the switch and before input 5 committed: the restarted host
         // reads the same hot row (upgrade still scheduled) and does not switch twice.
-        assert_eq!(ensure(h(1), upgrade, 5, &staged, &mut p), Ok(Outcome::Unchanged));
+        assert_eq!(
+            ensure(h(1), upgrade, 5, &staged, &mut p),
+            Ok(Outcome::Unchanged)
+        );
         assert_eq!(p.installs, [h(2)]);
     }
 

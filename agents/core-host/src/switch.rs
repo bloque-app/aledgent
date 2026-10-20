@@ -28,11 +28,10 @@ use std::collections::HashMap;
 use core_binding::switch::{Artefacts, CodeInstaller, InstallError, StagedCode};
 use ledger_core::code::{CodeManifest, Role, artefact_digest, generation_of};
 
-/// One staged code version: its manifest and the bytes of its package and runtime.
+/// One staged code version: the bytes of its package and runtime, which [`StagedVersions::insert`]
+/// checked against its manifest.
 #[derive(Clone, Debug)]
 pub struct StagedVersion {
-    /// The code version's manifest (`aledgent/code/v1`).
-    pub manifest: CodeManifest,
     /// The actor package (`core.vos`), the signed VOS3 bytes.
     pub package: Vec<u8>,
     /// The runtime program (`agent_runtime.pvm`).
@@ -50,15 +49,54 @@ impl StagedVersion {
     }
 }
 
-/// The code versions staged for this host, by version.
+/// The code versions staged for this host, by version, and the version it runs now.
 #[derive(Clone, Debug, Default)]
-pub struct StagedVersions(HashMap<[u8; 32], StagedVersion>);
+pub struct StagedVersions {
+    versions: HashMap<[u8; 32], StagedVersion>,
+    /// Versions whose artefacts the host's start check already verified against their manifest
+    /// (`crate::code::check`): the one it runs, by digests only.
+    running: HashMap<[u8; 32], Artefacts>,
+}
+
+/// The digests of every version a store holds: what [`core_binding::switch::ensure`] reads while
+/// the port itself is the installer.
+#[derive(Clone, Debug, Default)]
+pub struct StagedDigests(HashMap<[u8; 32], Artefacts>);
+
+impl StagedCode for StagedDigests {
+    fn artefacts(&self, code: &[u8; 32]) -> Option<Artefacts> {
+        self.0.get(code).copied()
+    }
+}
 
 impl StagedVersions {
     /// An empty store.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The version this host runs, whose `package` and `runtime` bytes the start check verified
+    /// against the version's manifest ([`crate::code::check`]); no bytes are kept, so it is never
+    /// installed from here, only recognised as already running.
+    pub fn running(&mut self, version: [u8; 32], package: &[u8], runtime: &[u8]) {
+        self.running.insert(
+            version,
+            Artefacts {
+                package: artefact_digest(package),
+                runtime: artefact_digest(runtime),
+            },
+        );
+    }
+
+    /// The digests of every version held.
+    #[must_use]
+    pub fn digests(&self) -> StagedDigests {
+        let mut m = self.running.clone();
+        for (k, v) in &self.versions {
+            m.insert(*k, v.artefacts());
+        }
+        StagedDigests(m)
     }
 
     /// Stage a code version: its `manifest`, and the `package` and `runtime` bytes it names.
@@ -68,6 +106,7 @@ impl StagedVersions {
     ///
     /// The manifest names no package or no runtime, a digest or length differs from the bytes', or
     /// the package does not carry the manifest's code generation compiled in.
+    #[cfg_attr(not(test), allow(dead_code))] // staging arrives with `T-037-04` and `T-037-06`
     pub fn insert(
         &mut self,
         manifest: CodeManifest,
@@ -94,27 +133,23 @@ impl StagedVersions {
             ));
         }
         let version = manifest.version();
-        self.0.insert(
-            version,
-            StagedVersion {
-                manifest,
-                package,
-                runtime,
-            },
-        );
+        self.versions
+            .insert(version, StagedVersion { package, runtime });
         Ok(version)
     }
 
     /// The staged version `code`, if any.
     #[must_use]
     pub fn get(&self, code: &[u8; 32]) -> Option<&StagedVersion> {
-        self.0.get(code)
+        self.versions.get(code)
     }
 }
 
 impl StagedCode for StagedVersions {
     fn artefacts(&self, code: &[u8; 32]) -> Option<Artefacts> {
-        self.get(code).map(StagedVersion::artefacts)
+        self.get(code)
+            .map(StagedVersion::artefacts)
+            .or_else(|| self.running.get(code).copied())
     }
 }
 
@@ -254,7 +289,6 @@ mod tests {
     #[test]
     fn t037_14_the_digests_of_a_staged_version_are_its_bytes() {
         let v = StagedVersion {
-            manifest: manifest(b"p", b"r"),
             package: b"p".to_vec(),
             runtime: b"r".to_vec(),
         };

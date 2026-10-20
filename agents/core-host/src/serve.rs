@@ -290,6 +290,18 @@ impl AgentPort for Persisting {
         self.port.unacknowledged()
     }
 
+    /// The switch changes the runtime's state (the installed actor): persist it at once, so a
+    /// restart attaches the package the state names.
+    fn switch_to(&mut self, code: [u8; 32]) -> Result<(), String> {
+        self.check().map_err(|e| format!("{e:?}"))?;
+        let before = self.port.code_state().map(|c| c.running);
+        self.port.switch_to(code)?;
+        if self.port.code_state().map(|c| c.running) != before {
+            self.save().map_err(|e| format!("{e:?}"))?;
+        }
+        Ok(())
+    }
+
     fn invoke(&mut self, envelope: Vec<u8>, blobs: Vec<Vec<u8>>) -> Result<Vec<u8>, PortError> {
         self.check()?;
         let r = self.port.invoke(envelope, blobs);
@@ -330,6 +342,7 @@ pub fn open_port(
     actor_package: &[u8],
     keys: &AgentKeys,
     dir: &Path,
+    genesis_code: Option<[u8; 32]>,
 ) -> Result<Persisting, String> {
     let pkg = package::admit_actor(actor_package).map_err(|e| format!("actor package: {e:?}"))?;
     let mut rt = Runtime::create(runtime_pvm, keys).map_err(|e| format!("runtime: {e:?}"))?;
@@ -345,6 +358,19 @@ pub fn open_port(
     };
     let mut vos = VosPort::new(rt, actor, DRIVER);
     vos.keep_samples(false);
+    // `switch(H, n)` (`T-037-14`): the port tracks the code it runs, so the driver's check before
+    // every send recognises the genesis code as already running. Versions staged for an upgrade
+    // arrive with `T-037-04` and `T-037-06`; a book whose genesis names no code tracks none.
+    if let Some(h0) = genesis_code {
+        let mut staged = crate::switch::StagedVersions::new();
+        staged.running(h0, actor_package, runtime_pvm);
+        vos.track_code(crate::switch::CodeState::new(
+            ACTOR_NAME,
+            actor_package,
+            runtime_pvm,
+            staged,
+        ));
+    }
     let mut port = Persisting::new(vos, dir.to_path_buf());
     port.save().map_err(|e| format!("{e:?}"))?;
     Ok(port)
@@ -367,6 +393,9 @@ pub struct Setup {
     pub runtime: Vec<u8>,
     /// The actor package.
     pub actor: Vec<u8>,
+    /// The genesis code version the start check verified the package and the runtime against
+    /// (`F-036`), if the chainspec names one: the code the port tracks as running (`T-037-14`).
+    pub genesis_code: Option<[u8; 32]>,
 }
 
 /// Read the arguments both commands share (`--config`, `--runtime`, `--actor`, `--state`,
@@ -412,6 +441,7 @@ pub fn setup(args: &[String]) -> Result<Setup, String> {
     let actor = fs::read(need(args, "--actor")?).map_err(|e| format!("actor: {e}"))?;
     // F-036, amendment 0023: the chainspec's genesis code. A founding (no replica yet) checks this
     // executable too, since it builds the genesis natively; a restart checks the Agent's code.
+    let mut genesis_code = None;
     if let Some(spec) = founding.genesis.spec.as_deref() {
         let which = if dir.join("replica").exists() {
             crate::code::Check::Agent
@@ -419,6 +449,7 @@ pub fn setup(args: &[String]) -> Result<Setup, String> {
             crate::code::Check::Founding
         };
         if let Some(h0) = crate::code::check(args, spec, Some(&actor), Some(&runtime), which)? {
+            genesis_code = Some(h0);
             let what = match which {
                 crate::code::Check::Founding => "this executable, the package and the runtime are",
                 crate::code::Check::Agent => "the package and the runtime are",
@@ -437,6 +468,7 @@ pub fn setup(args: &[String]) -> Result<Setup, String> {
         dir,
         runtime,
         actor,
+        genesis_code,
     })
 }
 
@@ -477,6 +509,7 @@ pub fn serve(args: &[String]) -> Result<(), String> {
         dir,
         runtime,
         actor,
+        genesis_code,
     } = setup(args)?;
     let path = need(args, "--config")?;
     // F-038: the socket (`core_endpoint`), the stream (`stream.dial`), or both at once during the
@@ -543,7 +576,7 @@ pub fn serve(args: &[String]) -> Result<(), String> {
         .map(|spec| core_archive::open(&spec, Access::Write))
         .transpose()?;
     let pacing = archiver_config(args)?;
-    let port = open_port(&runtime, &actor, &keys, &dir)?;
+    let port = open_port(&runtime, &actor, &keys, &dir, genesis_code)?;
     // T-031-14, T-032-15: the replica's stores under the state directory, each with a bounded
     // cache, rebuilt from the log on every start. The default since the 2 h soak of 2026-10-04 on
     // the fleet (run 37192755903): every bound held, and the core host grew 0.46 → 0.65 GB, against
@@ -771,6 +804,7 @@ pub fn restore(args: &[String]) -> Result<(), String> {
         dir,
         runtime,
         actor,
+        genesis_code,
         ..
     } = setup(args)?;
     let plan_path = dir.join(core_archive::RESTORE_FILE);
@@ -786,7 +820,7 @@ pub fn restore(args: &[String]) -> Result<(), String> {
         ));
     }
     let started = std::time::Instant::now();
-    let port = open_port(&runtime, &actor, &keys, &dir)?;
+    let port = open_port(&runtime, &actor, &keys, &dir, genesis_code)?;
     let entries = FileLog::open(&dir)?.entries()?;
     let stores = ReplicaStores::Disk {
         dir: dir.join("replica"),
