@@ -1,8 +1,9 @@
 // Copyright (c) 2026 Pagos Cube LLC
 // SPDX-License-Identifier: Apache-2.0 OR MIT
-//! The way out of a scheduled upgrade (`T-037-15`, `REQ-RT-20`, `REQ-RT-18`; amendment 0033 D2,
-//! D10; `DEC-26` (b)): `reschedule_upgrade` moves it to a strictly later input, `cancel_upgrade`
-//! cancels it. Each is an operator intervention (`REQ-RT-16`, `REQ-AT-3`): attributed, justified,
+//! The upgrade and the way out of a scheduled one (`T-037-04`, `T-037-15`; `REQ-RT-16`,
+//! `REQ-RT-20`, `REQ-RT-18`; amendment 0033 D2, D10; `DEC-26` (b)): `upgrade` names the code version
+//! the writer's code becomes from an input, `reschedule_upgrade` moves it to a strictly later input,
+//! `cancel_upgrade` cancels it. Each is an operator intervention (`REQ-RT-16`, `REQ-AT-3`): attributed, justified,
 //! idempotent by its client key, and on the audit trail, accepted or refused, like every command
 //! of this surface.
 //!
@@ -19,6 +20,17 @@
 //! `ERR-MalformedCommand`), it is a recorded refusal that takes its input number; a repeat of an
 //! earlier request answers that request's outcome and takes nothing again. So a bad way out at the
 //! head of the queue can never wedge the old code.
+//!
+//! **The upgrade** (`T-037-04`; amendment 0023 (b) step 3) is decided here and scheduled by the
+//! writer: the ledger decides whether it is taken (authorised under the mode in force, a justified
+//! operator intervention, `from` later than its own input number: `ERR-InvalidTransition`
+//! otherwise), and the writer reads what was taken ([`Ledger::take_upgrade`]) and schedules it with
+//! the same function whichever generation of code decides it (`core_binding::fence::decide`). That
+//! the new code version's artefacts are retrievable and match, and that its manifest names the
+//! generation after the writer's, is checked **before** the input is logged, at the execution node
+//! that stages it (`REQ-RT-16`, `REQ-RT-20`); the writer, which never sees the manifest, does not
+//! look. A later upgrade before `from` replaces the pending one (amendment 0023 (b) step 3), and no
+//! upgrade is pending once it has taken effect.
 //!
 //! **The authority, until `T-037-05`.** The upgrade-authority mode is the only authority over a
 //! writer's code (`REQ-RT-18`, `REQ-RT-20`). The modes and their inputs are `T-037-05`'s. Until
@@ -41,6 +53,15 @@ use crate::ledger::{Accepted, Ctx, Ledger, policy_used};
 use crate::principal::{Principal, resolve};
 use crate::refusal::Refusal;
 use crate::state::Command;
+
+/// The kinds of input that put the writer's code in hand ([`Ledger::may_change_code`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodeInput {
+    /// `upgrade`.
+    Upgrade,
+    /// `reschedule_upgrade` or `cancel_upgrade`.
+    WayOut,
+}
 
 impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
     /// `reschedule_upgrade` (`REQ-RT-20`, `T-037-15`): move the writer's scheduled upgrade to input
@@ -82,6 +103,92 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             (|| self.way_out(ctx, WayOut::Cancel, justification))();
         self.leave(top, || crate::call::Summary::of(&r));
         r
+    }
+
+    /// `upgrade` (`REQ-RT-16`, `T-037-04`): the writer's code becomes code version `code` from input
+    /// `from`, which must be later than this command's own input number (`ERR-InvalidTransition`
+    /// otherwise). Authorised under the mode in force (`ERR-NotAuthorised`), with a justification
+    /// (`ERR-JustificationRequired`). It replaces an upgrade still pending (amendment 0023 (b) step
+    /// 3). Whether `code`'s artefacts can be had is the execution node's check before the command is
+    /// logged, never this function's: it is a function of the book's inputs alone.
+    pub fn upgrade(
+        &mut self,
+        ctx: &Ctx,
+        code: [u8; 32],
+        from: u64,
+        justification: &[u8],
+    ) -> Result<Accepted<()>, Refusal> {
+        let top = self.enter(|| crate::call::Call::Upgrade {
+            ctx: *ctx,
+            code,
+            from,
+            justification: justification.to_vec(),
+        });
+        #[allow(clippy::redundant_closure_call)]
+        let r: Result<Accepted<()>, Refusal> =
+            (|| self.schedule_upgrade(ctx, code, from, justification))();
+        self.leave(top, || crate::call::Summary::of(&r));
+        r
+    }
+
+    fn schedule_upgrade(
+        &mut self,
+        ctx: &Ctx,
+        code: [u8; 32],
+        from: u64,
+        justification: &[u8],
+    ) -> Result<Accepted<()>, Refusal> {
+        let p = resolve(&self.state, &ctx.caller)?;
+        let command = Command::Upgrade;
+        let d = digest("upgrade", &p, justification, |c| {
+            c.bytes(&code);
+            c.u64(from);
+        });
+        // A repeat of the same request answers its original outcome, and takes nothing again.
+        if let Some(a) = self.replay(ctx, &p, &d, |_| ())? {
+            return Ok(a);
+        }
+        let input = self.input;
+        let run = |l: &Self| -> Result<(AuthorityUsed, Justification), Refusal> {
+            let used = l.upgrade_input_authority(&p)?;
+            let j = Justification::new(justification)?;
+            if from <= input {
+                return Err(Refusal::InvalidTransition);
+            }
+            Ok((used, j))
+        };
+        let (used, j) = match run(self) {
+            Ok(x) => x,
+            Err(r) => return Err(self.refused(ctx, &p, command, Vec::new(), r)),
+        };
+        let accepted = self.commit_operator(
+            ctx,
+            &p,
+            d,
+            command,
+            used,
+            j,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            (),
+        )?;
+        self.upgrade = Some((code, from));
+        Ok(accepted)
+    }
+
+    /// Whether `caller` may take the writer's code in hand now, by the authority function the
+    /// matching input is decided with: the upgrade's ([`CodeInput::Upgrade`]) or a way out's
+    /// ([`CodeInput::WayOut`]). A read, for the execution node's door: it asks before it fetches
+    /// code or gives an input priority (`T-037-04`), and the writer decides the input all the same.
+    pub fn may_change_code(&self, caller: &crate::principal::Caller, input: CodeInput) -> bool {
+        let Ok(p) = resolve(&self.state, caller) else {
+            return false;
+        };
+        match input {
+            CodeInput::Upgrade => self.upgrade_input_authority(&p).is_ok(),
+            CodeInput::WayOut => self.upgrade_authority(&p).is_ok(),
+        }
     }
 
     fn way_out(
@@ -139,6 +246,12 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
         )?;
         self.way_out = Some(way_out);
         Ok(accepted)
+    }
+
+    /// The authority an `upgrade` input is taken under: **the one function** (`T-037-04`). Until
+    /// `T-037-05` lands the mode checks, it is the way out's stand-in ([`Ledger::upgrade_authority`]).
+    fn upgrade_input_authority(&self, p: &Principal) -> Result<AuthorityUsed, Refusal> {
+        self.upgrade_authority(p)
     }
 
     /// The authority a way out of a scheduled upgrade is taken under: the writer's

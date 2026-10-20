@@ -186,6 +186,9 @@ pub enum Command {
     RescheduleUpgrade,
     /// `cancel_upgrade`: the way out of a scheduled upgrade, cancelled (`REQ-RT-20`, `T-037-15`).
     CancelUpgrade,
+    /// `upgrade`: the writer's code is to change to a code version from an input
+    /// (`REQ-RT-16`, `T-037-04`).
+    Upgrade,
 }
 
 /// The attribution of one accepted command (`REQ-AU-7`, `REQ-PN-1`, `INV-20`). For an operation

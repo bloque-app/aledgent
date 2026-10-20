@@ -123,3 +123,103 @@ fn t037_15_a_way_out_after_another_call_of_its_input_is_malformed() {
     fx.ledger.cancel_upgrade(&ctx, b"first call").unwrap();
     assert_eq!(fx.ledger.take_way_out(), Some(WayOut::Cancel));
 }
+
+/// `REQ-RT-16`, `REQ-RT-18`, `AC-K7.1` (the library's half): an `upgrade` is an operator
+/// intervention under the mode in force. Accepted, it is recorded and audited, and the writer reads
+/// what it took once; a repeat of the same request answers its original outcome and takes nothing
+/// again; a later upgrade before `from` is taken too (the writer replaces the pending one).
+#[test]
+fn t037_04_an_authorised_upgrade_is_taken_once_and_audited() {
+    let mut fx = Fx::new();
+    fx.ledger.set_input(7);
+    let op = fx.operator();
+    let ctx = fx.ctx(op);
+    fx.ledger
+        .upgrade(&ctx, [0xB1; 32], 8, b"T-037-04: the next code")
+        .unwrap();
+    assert_eq!(fx.ledger.take_upgrade(), Some(([0xB1; 32], 8)));
+    assert_eq!(fx.ledger.take_upgrade(), None);
+    let r = last_audit(&fx);
+    assert_eq!(r.action, AuditAction::Command(Command::Upgrade));
+    assert_eq!(r.outcome, AuditOutcome::Accepted);
+    // The same request again, as its own input: its original outcome, nothing taken.
+    fx.ledger.set_input(8);
+    fx.ledger
+        .upgrade(&ctx, [0xB1; 32], 8, b"T-037-04: the next code")
+        .unwrap();
+    assert_eq!(fx.ledger.take_upgrade(), None);
+    // Another code version or another input is another request, and is taken.
+    fx.ledger.set_input(9);
+    let ctx = fx.ctx(op);
+    fx.ledger
+        .upgrade(&ctx, [0xB2; 32], 10, b"T-037-04: another")
+        .unwrap();
+    assert_eq!(fx.ledger.take_upgrade(), Some(([0xB2; 32], 10)));
+}
+
+/// `AC-K7.17`'s sibling for the upgrade, `REQ-RT-18`, `REQ-RT-16`: an upgrade not authorised under
+/// the mode in force is refused, recorded, and takes nothing: another principal than the operator,
+/// a writer naming a mode this code does not enforce. An `from` that is not later than its own
+/// input is `ERR-InvalidTransition` (amendment 0023 (b) step 3), a blank justification
+/// `ERR-JustificationRequired`.
+#[test]
+fn t037_04_an_unauthorised_or_invalid_upgrade_takes_nothing() {
+    let mut fx = Fx::new();
+    let p = fx.person();
+    fx.ledger.set_input(7);
+    let ctx = fx.ctx(p);
+    assert_eq!(
+        fx.ledger
+            .upgrade(&ctx, [0xB1; 32], 9, b"not mine")
+            .unwrap_err(),
+        Refusal::NotAuthorised
+    );
+    let r = last_audit(&fx);
+    assert_eq!(r.action, AuditAction::Command(Command::Upgrade));
+    assert_eq!(r.outcome, AuditOutcome::Refused(Refusal::NotAuthorised));
+    assert_eq!(fx.ledger.take_upgrade(), None);
+    let op = fx.operator();
+    for (from, why, refusal) in [
+        (7, &b"to its own input"[..], Refusal::InvalidTransition),
+        (3, &b"to an earlier input"[..], Refusal::InvalidTransition),
+        (9, &b" \t"[..], Refusal::JustificationRequired),
+    ] {
+        fx.ledger.set_input(7);
+        let ctx = fx.ctx(op);
+        assert_eq!(
+            fx.ledger.upgrade(&ctx, [0xB1; 32], from, why).unwrap_err(),
+            refusal
+        );
+        assert_eq!(fx.ledger.take_upgrade(), None);
+    }
+    fx.ledger.set_code([0; 32], [0xA0; 32]);
+    fx.ledger.set_input(7);
+    let ctx = fx.ctx(op);
+    assert_eq!(
+        fx.ledger
+            .upgrade(&ctx, [0xB1; 32], 9, b"a mode")
+            .unwrap_err(),
+        Refusal::NotAuthorised
+    );
+    assert_eq!(fx.ledger.take_upgrade(), None);
+}
+
+/// `T-037-04`: the door asks the same authority function the input is decided with
+/// ([`Ledger::may_change_code`]): the operator may, another principal may not, and a writer naming
+/// a mode this code does not enforce lets nobody.
+#[test]
+fn t037_04_the_door_asks_the_function_the_input_is_decided_with() {
+    use crate::ledger::operator::CodeInput;
+    let mut fx = Fx::new();
+    let p = fx.person();
+    let op = fx.operator();
+    let (by_op, by_person) = (fx.ctx(op).caller, fx.ctx(p).caller);
+    for input in [CodeInput::Upgrade, CodeInput::WayOut] {
+        assert!(fx.ledger.may_change_code(&by_op, input));
+        assert!(!fx.ledger.may_change_code(&by_person, input));
+    }
+    fx.ledger.set_code([0; 32], [0xA0; 32]);
+    for input in [CodeInput::Upgrade, CodeInput::WayOut] {
+        assert!(!fx.ledger.may_change_code(&by_op, input));
+    }
+}

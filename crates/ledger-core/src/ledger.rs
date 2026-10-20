@@ -255,6 +255,9 @@ pub struct Ledger<S: LeafStore, V: VaultBackend> {
     /// The way out of a scheduled upgrade an input took, until the writer reads it
     /// ([`Ledger::take_way_out`], `T-037-15`). Not service state.
     way_out: Option<crate::code::WayOut>,
+    /// The upgrade an input scheduled (the code version and the input number it applies from),
+    /// until the writer reads it ([`Ledger::take_upgrade`], `T-037-04`). Not service state.
+    upgrade: Option<([u8; 32], u64)>,
     /// How deep the public methods that change the book are nested now, and how many outermost
     /// ones have returned since [`Ledger::set_input`]: the calls of the current input decided so
     /// far (`T-037-15`: a way out must be its input's first call). Kept whether or not calls are
@@ -379,6 +382,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             code: ([0; 32], [0; 32]),
             input: 0,
             way_out: None,
+            upgrade: None,
             calls_in_input: (0, 0),
         };
         if let Some(sp) = spec {
@@ -429,6 +433,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             code: ([0; 32], [0; 32]),
             input: 0,
             way_out: None,
+            upgrade: None,
             calls_in_input: (0, 0),
         }
     }
@@ -462,6 +467,13 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
     /// ledger.
     pub fn take_way_out(&mut self) -> Option<crate::code::WayOut> {
         self.way_out.take()
+    }
+
+    /// The upgrade the last commands scheduled, if one did (`T-037-04`): an [`Ledger::upgrade`]
+    /// accepted, not the replay of an earlier one. The writer schedules it, as the one writer step
+    /// (`core_binding::fence::decide`); the ledger holds no writer state.
+    pub fn take_upgrade(&mut self) -> Option<([u8; 32], u64)> {
+        self.upgrade.take()
     }
 
     /// What a checkpoint created now binds beside a `v2` one (`T-037-03`, `REQ-RT-15`): the book's

@@ -625,3 +625,4 @@ pub use export::{ImportFailure, ImportTarget, Imported, openings_of};
 pub use opening::LoadReport;
 pub use registry::{RegisterAsset, ReviewRef};
 pub use resolution::{ResolutionEvidence, Resolve, SubmitEvidence};
+pub use upgrade::CodeInput;
