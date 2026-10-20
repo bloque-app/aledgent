@@ -1342,6 +1342,18 @@ impl<P: AgentPort> Driver<P> {
         w
     }
 
+    /// The code version that executes input `seq` ([`crate::switch::target_code`]). A way-out
+    /// input is decided the same by either generation ([`crate::fence::admit`]), so it runs under
+    /// the code the writer has: a way out never needs the version it is the way out of, which is
+    /// the point of it when that version cannot be run.
+    fn exec_code_of(&self, seq: u64, way_out: bool) -> [u8; 32] {
+        if way_out {
+            self.writer.code
+        } else {
+            crate::switch::target_code(self.writer.code, self.writer.upgrade, seq)
+        }
+    }
+
     /// Make the platform run the code version `code` (`T-037-14`); an `Err` means send nothing.
     fn switch_for(&mut self, code: [u8; 32]) -> Result<(), DriveError> {
         self.port.switch_to(code).map_err(|why| {
@@ -1531,7 +1543,7 @@ impl<P: AgentPort> Driver<P> {
                 self.flush_staged()?;
             }
             let seq = self.seq + 1;
-            let exec = crate::switch::target_code(self.writer.code, self.writer.upgrade, seq);
+            let exec = self.exec_code_of(seq, way_out);
             let writer = self.decided(seq, way_out, taken);
             let (leaves, whole) = self.service.leaves(&touched)?;
             let changes = changed(replica, &leaves, &deliveries)?;
@@ -1584,7 +1596,7 @@ impl<P: AgentPort> Driver<P> {
         let (roots, next_posting) = replica_roots(replica, &self.service)?;
         let (tip, prev) = self.tip();
         let seq = tip + 1;
-        let exec = crate::switch::target_code(self.writer.code, self.writer.upgrade, seq);
+        let exec = self.exec_code_of(seq, way_out);
         let writer = self.decided(seq, way_out, taken);
         let input = InputEnvelope {
             seq,

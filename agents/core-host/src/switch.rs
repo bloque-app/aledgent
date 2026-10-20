@@ -34,18 +34,33 @@ use ledger_core::code::{CodeManifest, Role, artefact_digest, generation_of};
 pub struct StagedVersion {
     /// The actor package (`core.vos`), the signed VOS3 bytes.
     pub package: Vec<u8>,
-    /// The runtime program (`agent_runtime.pvm`).
+    /// The runtime program (`agent_runtime.pvm`). On `saga` the install changes the package only;
+    /// a runtime change is a restart, which reads these bytes (`T-037-06`).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub runtime: Vec<u8>,
+    /// Their digests, hashed once when the version is held (megabytes, on every switch otherwise).
+    artefacts: Artefacts,
 }
 
 impl StagedVersion {
+    /// A version held with the bytes of its package and runtime.
+    #[must_use]
+    pub fn new(package: Vec<u8>, runtime: Vec<u8>) -> Self {
+        let artefacts = Artefacts {
+            package: artefact_digest(&package),
+            runtime: artefact_digest(&runtime),
+        };
+        Self {
+            package,
+            runtime,
+            artefacts,
+        }
+    }
+
     /// The digests of the package and the runtime.
     #[must_use]
     pub fn artefacts(&self) -> Artefacts {
-        Artefacts {
-            package: artefact_digest(&self.package),
-            runtime: artefact_digest(&self.runtime),
-        }
+        self.artefacts
     }
 }
 
@@ -79,10 +94,7 @@ impl StagedVersions {
     pub fn running(&mut self, version: [u8; 32], package: &[u8], runtime: &[u8]) {
         self.versions.insert(
             version,
-            StagedVersion {
-                package: package.to_vec(),
-                runtime: runtime.to_vec(),
-            },
+            StagedVersion::new(package.to_vec(), runtime.to_vec()),
         );
     }
 
@@ -132,7 +144,7 @@ impl StagedVersions {
         }
         let version = manifest.version();
         self.versions
-            .insert(version, StagedVersion { package, runtime });
+            .insert(version, StagedVersion::new(package, runtime));
         Ok(version)
     }
 
@@ -178,23 +190,28 @@ pub const PARK_MAX_WAIT_MS: u64 = 900_000;
 #[derive(Clone, Debug, Default)]
 pub struct Park {
     target: Option<[u8; 32]>,
+    /// Failed attempts at the target, of any kind: they set the wait.
     failures: u32,
+    /// Those a retry cannot settle (the platform refused the install, the version is not staged,
+    /// the hash is stale): after [`PARK_MAX_FAILURES`] of them the host stops trying. A failure of
+    /// the platform or the signer is transient and never stops it.
+    refusals: u32,
     next_ms: u64,
     why: String,
 }
 
 impl Park {
-    /// Why an attempt at `target` must not be made at `now_ms` (milliseconds since the Unix
-    /// epoch), if it must not.
+    /// Why an attempt at `target` must not be made at `now_ms` (milliseconds on a monotonic clock),
+    /// if it must not.
     #[must_use]
     pub fn blocked(&self, target: &[u8; 32], now_ms: u64) -> Option<String> {
         if self.target.as_ref() != Some(target) {
             return None;
         }
-        if self.failures >= PARK_MAX_FAILURES {
+        if self.refusals >= PARK_MAX_FAILURES {
             return Some(format!(
-                "parked after {} failed attempts, until the host restarts: {}",
-                self.failures, self.why
+                "parked after {} refused attempts, until the host restarts: {}",
+                self.refusals, self.why
             ));
         }
         (now_ms < self.next_ms).then(|| {
@@ -207,13 +224,17 @@ impl Park {
         })
     }
 
-    /// An attempt at `target` failed at `now_ms`.
-    pub fn failed(&mut self, target: [u8; 32], why: String, now_ms: u64) {
+    /// An attempt at `target` failed at `now_ms`; `transient`: a retry may settle it.
+    pub fn failed(&mut self, target: [u8; 32], why: String, transient: bool, now_ms: u64) {
         if self.target != Some(target) {
             self.failures = 0;
+            self.refusals = 0;
         }
         self.target = Some(target);
         self.failures = self.failures.saturating_add(1);
+        if !transient {
+            self.refusals = self.refusals.saturating_add(1);
+        }
         let wait = PARK_FIRST_WAIT_MS
             .saturating_mul(1u64 << (self.failures - 1).min(20))
             .min(PARK_MAX_WAIT_MS);
@@ -355,7 +376,7 @@ mod tests {
         let t = [7u8; 32];
         let mut p = Park::default();
         assert!(p.blocked(&t, 0).is_none(), "nothing failed yet");
-        p.failed(t, "UnsupportedLane".into(), 1_000);
+        p.failed(t, "UnsupportedLane".into(), false, 1_000);
         // Parked for 30 s: no attempt is made, the reason is the failure's.
         let why = p.blocked(&t, 1_001).expect("parked");
         assert!(
@@ -370,7 +391,7 @@ mod tests {
         assert!(p.blocked(&[8; 32], 1_001).is_none());
         // The wait doubles and stops at the cap.
         for i in 2..=PARK_MAX_FAILURES {
-            p.failed(t, "UnsupportedLane".into(), 0);
+            p.failed(t, "UnsupportedLane".into(), false, 0);
             let wait = PARK_FIRST_WAIT_MS
                 .saturating_mul(1u64 << (i - 1))
                 .min(PARK_MAX_WAIT_MS);
@@ -385,6 +406,13 @@ mod tests {
                 .unwrap()
                 .contains("until the host restarts")
         );
+        // A failure of the platform or the signer never stops the host: only the wait grows.
+        let mut q = Park::default();
+        for _ in 0..(PARK_MAX_FAILURES * 3) {
+            q.failed(t, "signer down".into(), true, 0);
+        }
+        assert!(q.blocked(&t, u64::MAX).is_none());
+        assert!(q.blocked(&t, PARK_MAX_WAIT_MS - 1).is_some());
         // A success clears it.
         p.succeeded();
         assert!(p.blocked(&t, 0).is_none());
@@ -404,10 +432,7 @@ mod tests {
 
     #[test]
     fn t037_14_the_digests_of_a_staged_version_are_its_bytes() {
-        let v = StagedVersion {
-            package: b"p".to_vec(),
-            runtime: b"r".to_vec(),
-        };
+        let v = StagedVersion::new(b"p".to_vec(), b"r".to_vec());
         assert_eq!(
             v.artefacts(),
             Artefacts {

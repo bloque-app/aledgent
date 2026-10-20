@@ -93,26 +93,49 @@ fn t037_14_with_an_upgrade_scheduled_the_batch_ends_before_n() {
     assert_eq!(hot(&mut fx).inputs, n);
 }
 
-/// `T-037-14`, D17: the switch is symmetric. After a way-out input at `n` (a cancel: the upgrade
-/// does not take effect, `code` stays *g*), the host runs *g*'s package again before `n + 1`, by
-/// the same call.
+/// `T-037-14`, D17: the switch is symmetric. The platform already runs *H* (the start check
+/// switched it when *n* was next); a way-out input at `n` (a cancel: the upgrade does not take
+/// effect, `code` stays *g*) is decided by *g*, so the host runs *g*'s package again before it.
 #[test]
-fn t037_14_a_way_out_at_n_is_followed_by_the_reinstall_of_g() {
+fn t037_14_a_way_out_at_n_is_run_by_g_and_reinstalls_it() {
     let (mut fx, g, n) = scheduled(1);
+    fx.driver.ensure_code().expect("the start check runs H");
+    assert_eq!(fx.driver.port().switched, [H1]);
     let ctx = fx.ctx(fx.operator());
     let _ = fx.replica.cancel_upgrade(&ctx, b"T-037-14: the way out");
     let c = fx.sync().expect("the way out commits").expect("sent");
     assert_eq!(c.seq, n);
-    // Input n ran under H (the switch preceded it); its upgrade did not take effect.
-    assert_eq!(fx.driver.port().switched, [H1]);
+    assert_eq!(fx.driver.port().switched, [H1, g]);
     let h = hot(&mut fx);
     assert_eq!((h.code, h.generation, h.upgrade), (g, 0, None));
-    // The next input runs under g: the host reinstalls it before sending.
+    // The next input runs under g too: nothing more to install.
     open(&mut fx, 7);
     let c = fx.sync().expect("n + 1 under g").expect("sent");
     assert_eq!(c.seq, n + 1);
     assert_eq!(fx.driver.port().switched, [H1, g]);
     assert_eq!(fx.driver.port().generation, 0);
+}
+
+/// `T-037-14`, review of #46 (finding 1): the way out of an upgrade whose version cannot be run is
+/// still taken. A way-out input never needs *H*, so a platform that cannot install it does not
+/// stop the way out, and the book goes on under *g*.
+#[test]
+fn t037_14_the_way_out_is_taken_when_h_cannot_be_run() {
+    let (mut fx, g, n) = scheduled(1);
+    fx.driver.port_mut().code_map.remove(&H1);
+    // The way out is an input of its own: nothing is installed, and it commits as n.
+    let ctx = fx.ctx(fx.operator());
+    let _ = fx
+        .replica
+        .cancel_upgrade(&ctx, b"T-037-14: H cannot be run");
+    let c = fx.sync().expect("the way out commits").expect("sent");
+    assert_eq!(c.seq, n);
+    assert!(fx.driver.port().switched.is_empty());
+    let h = hot(&mut fx);
+    assert_eq!((h.code, h.generation, h.upgrade), (g, 0, None));
+    open(&mut fx, 2);
+    let c = fx.sync().expect("n + 1 under g").expect("sent");
+    assert_eq!(c.seq, n + 1);
 }
 
 /// `T-037-14`: a host that crashes between a way-out's commit and the reinstall of *g* installs it

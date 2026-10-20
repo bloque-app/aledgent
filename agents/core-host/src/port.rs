@@ -323,9 +323,15 @@ impl AgentPort for VosPort {
     /// `switch(H, n)` on `saga` (`T-037-14`): make the Agent run `code`, from the versions staged
     /// for this port. A port that tracks no code runs what it runs.
     fn switch_to(&mut self, code: [u8; 32]) -> Result<(), String> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        // A monotonic clock: a wall-clock step must not park a healthy host.
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let now = u64::try_from(
+            START
+                .get_or_init(std::time::Instant::now)
+                .elapsed()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
         let Some(state) = self.code_state() else {
             return Ok(());
         };
@@ -338,7 +344,12 @@ impl AgentPort for VosPort {
         if let Some(c) = self.code_state_mut() {
             match &r {
                 Ok(_) => c.park.succeeded(),
-                Err(e) => c.park.failed(code, e.to_string(), now),
+                Err(e) => c.park.failed(
+                    code,
+                    e.to_string(),
+                    matches!(e, core_binding::switch::SwitchError::Platform(_)),
+                    now,
+                ),
             }
         }
         r.map(|_| ()).map_err(|e| e.to_string())
