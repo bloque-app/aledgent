@@ -166,8 +166,8 @@ owner to confirm there.
 - **Who.** Any member of the upgrade-authority mode in force, with the credential the mode names it with,
   may take a way out alone, under every mode: no second approval and no delay. This is how the plan built
   it (`T-037-15`); the ruling keeps it.
-- **A cancellation** is taken as it stands. It leaves the book on the code in force, and it can delay an
-  upgrade, never authorise one, as the section above says of every restriction a member can impose.
+- **A cancellation** is taken as it stands, by any one member. It leaves the book on the code in force: a way
+  out can stop a change of the code, never make one.
 - **A move** must take the upgrade to an input *strictly later* than the input it is scheduled from. Until
   now it was checked only against the way out's own input, which let one member pull an upgrade that the
   approvers, and the delay, had agreed to earlier than the input they agreed to. The rule is now stricter in
