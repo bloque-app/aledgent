@@ -99,6 +99,8 @@ const PRODUCTION: &[&str] = &[
     // `T-037-15`: the way out of a scheduled upgrade.
     "RescheduleUpgrade",
     "CancelUpgrade",
+    // `T-037-04`: the upgrade itself.
+    "Upgrade",
 ];
 
 /// The conformance suite's raw ports: only ever after every production variant.
@@ -119,14 +121,15 @@ fn t037_15_the_production_call_tags_are_pinned() {
             "{name} follows the production variants: append it to PRODUCTION"
         );
     }
-    // The two way outs, by number, as the archive holds them.
+    // The two way outs and the upgrade, by number, as the archive holds them.
     let tag = |name: &str| all.iter().position(|n| *n == name).unwrap();
     assert_eq!(
         (
             tag("ApplySpecChunk"),
             tag("RescheduleUpgrade"),
-            tag("CancelUpgrade")
+            tag("CancelUpgrade"),
+            tag("Upgrade")
         ),
-        (63, 64, 65)
+        (63, 64, 65, 66)
     );
 }

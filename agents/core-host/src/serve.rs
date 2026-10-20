@@ -302,6 +302,14 @@ impl AgentPort for Persisting {
         Ok(())
     }
 
+    /// Staging changes only what the host holds in memory for the switch (`T-037-04`).
+    fn stage_code(
+        &mut self,
+        checked: core_binding::staging::Checked,
+    ) -> Result<(), core_binding::staging::StageRefusal> {
+        self.port.stage_code(checked)
+    }
+
     fn invoke(&mut self, envelope: Vec<u8>, blobs: Vec<Vec<u8>>) -> Result<Vec<u8>, PortError> {
         self.check()?;
         let r = self.port.invoke(envelope, blobs);

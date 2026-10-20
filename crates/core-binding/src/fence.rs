@@ -37,7 +37,8 @@
 //! **The upgrade taking effect.** Code of *g* + 1 that takes an input the upgrade applies to,
 //! other than a way out it takes, makes *H* and *g* + 1 the ones in force as the input's first
 //! effect: the input's checkpoints bind *H* ([`WriterCode::code_for`]) and its ring entry names
-//! *H*. `T-037-04` schedules the upgrade (`Upgrade`); this module is where it takes effect.
+//! *H*. `T-037-04` schedules the upgrade (`Upgrade`, through [`decide`]); this module is where it
+//! takes effect.
 //!
 //! Every function here is pure, `no_std`, and used by both the Agent's transition and the host's
 //! driver, which predicts each entry it compares (`crate::host`).
@@ -161,7 +162,18 @@ pub fn admit(running: u64, w: &WriterCode, seq: u64, way_out: bool) -> Result<()
 /// An upgrade that applies to an input that is not a way out takes effect first; then a way out
 /// taken moves or clears whatever upgrade is still scheduled. A way-out input never makes the
 /// upgrade take effect, taken or not, and keeps the generation.
-pub fn decide(w: &mut WriterCode, seq: u64, way_out: bool, taken: Option<WayOut>) {
+///
+/// `scheduled`: the upgrade the input's calls took (`ledger_core::Ledger::take_upgrade`,
+/// `T-037-04`), if one (the code version and the input number it applies from). It is scheduled
+/// last, replacing an upgrade still pending (amendment 0023 (b) step 3). An input holds a way out
+/// or an upgrade, never both (`way_out_input` refuses the mix whole), so the two do not meet.
+pub fn decide(
+    w: &mut WriterCode,
+    seq: u64,
+    way_out: bool,
+    taken: Option<WayOut>,
+    scheduled: Option<([u8; 32], u64)>,
+) {
     if !way_out
         && let Some((code, n)) = w.upgrade
         && seq >= n
@@ -172,6 +184,9 @@ pub fn decide(w: &mut WriterCode, seq: u64, way_out: bool, taken: Option<WayOut>
     }
     if let Some(t) = taken {
         w.upgrade = t.apply(w.upgrade);
+    }
+    if scheduled.is_some() {
+        w.upgrade = scheduled;
     }
 }
 
@@ -249,7 +264,7 @@ mod tests {
             None,
         ] {
             let mut x = scheduled(10);
-            decide(&mut x, 10, true, taken);
+            decide(&mut x, 10, true, taken, None);
             assert_eq!((x.code, x.generation), (H0, 4));
             assert_eq!(
                 x.upgrade,
@@ -258,13 +273,25 @@ mod tests {
         }
         // Not a way out: the upgrade takes effect, and a way out among its calls finds nothing.
         let mut x = scheduled(10);
-        decide(&mut x, 11, false, Some(WayOut::Reschedule { from: 30 }));
+        decide(
+            &mut x,
+            11,
+            false,
+            Some(WayOut::Reschedule { from: 30 }),
+            None,
+        );
         assert_eq!((x.code, x.generation, x.upgrade), (H1, 5, None));
         // Before `n`, an input changes nothing of the code but what a way out takes.
         let mut x = scheduled(10);
-        decide(&mut x, 9, false, None);
+        decide(&mut x, 9, false, None, None);
         assert_eq!(x, scheduled(10));
-        decide(&mut x, 9, false, Some(WayOut::Reschedule { from: 15 }));
+        decide(
+            &mut x,
+            9,
+            false,
+            Some(WayOut::Reschedule { from: 15 }),
+            None,
+        );
         assert_eq!(x.upgrade, Some((H1, 15)));
         assert_eq!((x.code_for(14), x.code_for(15)), (H0, H1));
     }

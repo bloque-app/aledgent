@@ -64,6 +64,8 @@ pub mod core;
 #[cfg(feature = "std")]
 pub mod host;
 #[cfg(feature = "std")]
+pub mod staging;
+#[cfg(feature = "std")]
 pub mod switch;
 #[cfg(feature = "ingress")]
 pub mod verified;
