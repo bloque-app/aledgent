@@ -8,7 +8,7 @@
 //! mode inputs, the code archive, per-range replay, the code generation and the fence with its way
 //! out, checkpoints as rows and leaf chunks, the replayer, and the continuation founded once.
 //!
-//! **Run (`T-037-05`, the modes):** `AC-K7.7` and `AC-K7.8` ([`modes`]).
+//! **Run (`T-037-05`, the modes):** `AC-K7.7` and `AC-K7.8` (the `modes` module below).
 //!
 //! **Run (`T-037-15`, the fence and the way out):** `AC-K7.9`, `AC-K7.12` and `AC-K7.17`. Each
 //! case founds its own book on the core Agent's transition, natively
