@@ -8,8 +8,8 @@
 //! record `generation_of` reads: one number, D18) with the writer's state:
 //!
 //! - code of the generation in force *g* takes the input, unless a scheduled upgrade applies to it
-//!   (`upgrade = Some((H, n))` and the input is numbered `n` or later): then it takes only a way
-//!   out, and only one it accepts;
+//!   (`upgrade = Some((H, n))` and the input is numbered `n` or later): then it takes only a
+//!   way-out input, and decides every one;
 //! - code of generation *g* + 1 takes the input only when a scheduled upgrade applies to it;
 //! - any other code refuses it.
 //!
@@ -21,12 +21,16 @@
 //!
 //! **The way out.** `reschedule_upgrade` and `cancel_upgrade` (`ledger_core`'s, authorised under
 //! the mode in force) are the only inputs the old code takes once the upgrade applies. A way-out
-//! input is exactly one such call and nothing else ([`way_out_input`]); a way out mixed with other
-//! calls or deliveries is malformed. Code of either generation decides it the same
-//! ([`decide`]): taken, the upgrade does not take effect at its input, a cancel clears it, a
-//! reschedule moves it, and the generation stays *g*. Not taken, the old code refuses it as
-//! fenced, and the new code takes the upgrade and records the refusal, so the committed state at
-//! that input never depends on which package was installed when it arrived.
+//! input is one whose calls are only those, with no delivery ([`way_out_input`]). Code of either
+//! generation decides every way-out input the same (owner ruling on #44, D10; [`decide`]): the
+//! upgrade does not take effect at it, and the generation stays *g*. A way out taken applies: a
+//! cancel clears the upgrade, a reschedule moves it. One not taken (unauthorised, a move not later
+//! than its own input, a repeat of an earlier request, or not its input's first call, which the
+//! library refuses as `ERR-MalformedCommand`) is a recorded refusal that takes its input number,
+//! and the upgrade stays scheduled, to take effect at the next input that is not a way out. So a
+//! bad way out at the head of the queue can never wedge the old code, and the committed state at
+//! that input never depends on which package was installed when it arrived. No input shape is
+//! refused by the Agent: an input that mixes a way out with anything else is an ordinary input.
 //!
 //! **The upgrade taking effect.** Code of *g* + 1 that takes an input the upgrade applies to,
 //! other than a way out it takes, makes *H* and *g* + 1 the ones in force as the input's first
@@ -35,8 +39,6 @@
 //!
 //! Every function here is pure, `no_std`, and used by both the Agent's transition and the host's
 //! driver, which predicts each entry it compares (`crate::host`).
-
-use alloc::string::String;
 
 use ledger_core::call::Call;
 use ledger_core::code::WayOut;
@@ -108,17 +110,18 @@ pub fn way_out_of(call: &Call) -> Option<WayOut> {
     }
 }
 
-/// Whether an input of `calls` with `deliveries` delivery records is a way-out input: exactly one
-/// call, a way out, and no delivery. A way out with anything else is malformed.
-pub fn way_out_input(calls: &[Call], deliveries: usize) -> Result<bool, AgentRefusal> {
-    let ways = calls.iter().filter(|c| way_out_of(c).is_some()).count();
-    match ways {
-        0 => Ok(false),
-        1 if calls.len() == 1 && deliveries == 0 => Ok(true),
-        _ => Err(AgentRefusal::Malformed(String::from(
-            "a way out of an upgrade is an input of its own: one call, no delivery",
-        ))),
+/// Whether an input of `calls` with `deliveries` delivery records is a way-out input: at least one
+/// call, every call a way out, and no delivery. Any other input is an ordinary one, whatever its
+/// calls.
+pub fn way_out_input<'a>(calls: impl IntoIterator<Item = &'a Call>, deliveries: usize) -> bool {
+    let mut any = false;
+    for c in calls {
+        if way_out_of(c).is_none() {
+            return false;
+        }
+        any = true;
     }
+    any && deliveries == 0
 }
 
 /// The fence's admission (module documentation): whether code of generation `running` may decide
@@ -135,39 +138,24 @@ pub fn admit(running: u64, w: &WriterCode, seq: u64, way_out: bool) -> Result<()
     }
 }
 
-/// After the input's calls ran under code of generation `running` (admitted by [`admit`]): the
-/// fence's last word, then [`decide`]. `taken`: the way out the input took
-/// (`ledger_core::Ledger::take_way_out`). The old code takes nothing but a way out it accepts
-/// once the upgrade applies: a way-out input it does not take is refused as fenced, with nothing
-/// written.
-pub fn settle(
-    running: u64,
-    w: &mut WriterCode,
-    seq: u64,
-    taken: Option<WayOut>,
-) -> Result<(), AgentRefusal> {
-    if w.due(seq) && taken.is_none() && running == w.generation {
-        return Err(w.fenced(running, seq));
-    }
-    decide(w, seq, taken);
-    Ok(())
-}
-
 /// What input `seq` does to the writer's code, as the code map reads it and code of either
-/// generation decides it (module documentation): a way out taken moves or clears the upgrade and
-/// keeps the generation; otherwise, an upgrade that applies to the input takes effect.
-pub fn decide(w: &mut WriterCode, seq: u64, taken: Option<WayOut>) {
-    match taken {
-        Some(t) => w.upgrade = t.apply(w.upgrade),
-        None => {
-            if let Some((code, n)) = w.upgrade
-                && seq >= n
-            {
-                w.code = code;
-                w.generation = w.generation.saturating_add(1);
-                w.upgrade = None;
-            }
-        }
+/// generation admitted by [`admit`] decides it (module documentation). `way_out`: the input is a
+/// way-out input; `taken`: the way out its calls took (`ledger_core::Ledger::take_way_out`).
+///
+/// An upgrade that applies to an input that is not a way out takes effect first; then a way out
+/// taken moves or clears whatever upgrade is still scheduled. A way-out input never makes the
+/// upgrade take effect, taken or not, and keeps the generation.
+pub fn decide(w: &mut WriterCode, seq: u64, way_out: bool, taken: Option<WayOut>) {
+    if !way_out
+        && let Some((code, n)) = w.upgrade
+        && seq >= n
+    {
+        w.code = code;
+        w.generation = w.generation.saturating_add(1);
+        w.upgrade = None;
+    }
+    if let Some(t) = taken {
+        w.upgrade = t.apply(w.upgrade);
     }
 }
 
@@ -228,42 +216,40 @@ mod tests {
         );
     }
 
-    /// D10: a way out at or after `n` is decided the same by either generation; an input that is
-    /// not a way out taken makes the upgrade take effect under the new code, and is fenced under
-    /// the old.
+    /// D10 and the owner's ruling on #44: a way-out input at or after `n` is admitted by either
+    /// generation and decided the same, taken or not, and never makes the upgrade take effect;
+    /// any other input there is fenced under the old code and makes the upgrade take effect under
+    /// the new.
     #[test]
     fn t037_15_either_generation_decides_the_way_out_the_same() {
+        let w = scheduled(10);
+        for running in [4, 5] {
+            assert!(admit(running, &w, 10, true).is_ok());
+        }
+        assert!(fenced(admit(4, &w, 10, false)));
         for taken in [
             Some(WayOut::Cancel),
             Some(WayOut::Reschedule { from: 20 }),
             None,
         ] {
-            let (mut old, mut new) = (scheduled(10), scheduled(10));
-            let a = settle(4, &mut old, 10, taken);
-            let b = settle(5, &mut new, 10, taken);
-            match taken {
-                Some(_) => {
-                    assert!(a.is_ok() && b.is_ok());
-                    assert_eq!(old, new);
-                    assert_eq!((old.code, old.generation), (H0, 4));
-                }
-                None => {
-                    assert!(fenced(a));
-                    assert!(b.is_ok());
-                    assert_eq!((new.code, new.generation, new.upgrade), (H1, 5, None));
-                }
-            }
+            let mut x = scheduled(10);
+            decide(&mut x, 10, true, taken);
+            assert_eq!((x.code, x.generation), (H0, 4));
+            assert_eq!(
+                x.upgrade,
+                taken.map_or(Some((H1, 10)), |t| t.apply(Some((H1, 10))))
+            );
         }
-        let mut w = scheduled(10);
-        decide(&mut w, 10, Some(WayOut::Cancel));
-        assert_eq!(w.upgrade, None);
-        let mut w = scheduled(10);
-        decide(&mut w, 10, Some(WayOut::Reschedule { from: 15 }));
-        assert_eq!(w.upgrade, Some((H1, 15)));
-        // Before `n`, an input changes nothing of the code.
-        let mut w = scheduled(10);
-        decide(&mut w, 9, None);
-        assert_eq!(w, scheduled(10));
-        assert_eq!((w.code_for(9), w.code_for(10)), (H0, H1));
+        // Not a way out: the upgrade takes effect, and a way out among its calls finds nothing.
+        let mut x = scheduled(10);
+        decide(&mut x, 11, false, Some(WayOut::Reschedule { from: 30 }));
+        assert_eq!((x.code, x.generation, x.upgrade), (H1, 5, None));
+        // Before `n`, an input changes nothing of the code but what a way out takes.
+        let mut x = scheduled(10);
+        decide(&mut x, 9, false, None);
+        assert_eq!(x, scheduled(10));
+        decide(&mut x, 9, false, Some(WayOut::Reschedule { from: 15 }));
+        assert_eq!(x.upgrade, Some((H1, 15)));
+        assert_eq!((x.code_for(14), x.code_for(15)), (H0, H1));
     }
 }

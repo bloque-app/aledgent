@@ -255,6 +255,11 @@ pub struct Ledger<S: LeafStore, V: VaultBackend> {
     /// The way out of a scheduled upgrade an input took, until the writer reads it
     /// ([`Ledger::take_way_out`], `T-037-15`). Not service state.
     way_out: Option<crate::code::WayOut>,
+    /// How deep the public methods that change the book are nested now, and how many outermost
+    /// ones have returned since [`Ledger::set_input`]: the calls of the current input decided so
+    /// far (`T-037-15`: a way out must be its input's first call). Kept whether or not calls are
+    /// recorded, so the Agent, the replica and a replay count alike. Not service state.
+    pub(crate) calls_in_input: (u32, u32),
 }
 
 fn policy_used(p: &Principal) -> AuthorityUsed {
@@ -374,6 +379,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             code: ([0; 32], [0; 32]),
             input: 0,
             way_out: None,
+            calls_in_input: (0, 0),
         };
         if let Some(sp) = spec {
             ledger.build_genesis_state(&founded, &sp)?;
@@ -423,6 +429,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             code: ([0; 32], [0; 32]),
             input: 0,
             way_out: None,
+            calls_in_input: (0, 0),
         }
     }
 
@@ -440,6 +447,13 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
     /// of a scheduled upgrade is decided against it ([`Ledger::reschedule_upgrade`]).
     pub fn set_input(&mut self, input: u64) {
         self.input = input;
+        self.calls_in_input.1 = 0;
+    }
+
+    /// How many calls of the current input were decided before the one running now
+    /// ([`Ledger::set_input`] starts an input).
+    pub(crate) fn calls_before(&self) -> u32 {
+        self.calls_in_input.1
     }
 
     /// The way out of a scheduled upgrade the last commands took, if one did (`T-037-15`): a

@@ -420,17 +420,11 @@ pub enum AgentRefusal {
     /// The fence (`T-037-15`, `REQ-RT-20`, [`crate::fence`]): the code that received the input is
     /// not the code the writer's state names for it. Nothing is written and the input's number is
     /// not taken: the execution node installs the code the code map names, and sends the same
-    /// input again. Added by call format 2 ([`CALL_FORMAT`]), last, so no earlier refusal's tag
-    /// moves.
+    /// input again. Appended last, so no earlier refusal's tag moves: a host built before it reads
+    /// it as a reply that does not decode, never as another refusal. The continuation's scoped
+    /// refusal shares it (`T-037-17`).
     Fenced(Fenced),
 }
-
-/// The version of the call format: the envelope, the reply and what they carry, as the host and
-/// the Agent exchange them (`PLAN.md` `DEC-26` (d): call formats are versioned, and a change only
-/// adds a version, so every host applies every earlier one exactly). Version 2 adds the fence's
-/// outcome, [`AgentRefusal::Fenced`] (`T-037-15`), which the continuation's scoped refusal shares
-/// (`T-037-17`); everything version 1 encodes, version 2 encodes the same.
-pub const CALL_FORMAT: u32 = 2;
 
 /// Why the fence refused an input (`T-037-15`, [`AgentRefusal::Fenced`]): what the refusing code
 /// is, and what the writer's state names. The execution node audits it (its log and the audit

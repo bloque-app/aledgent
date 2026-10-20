@@ -153,6 +153,11 @@ impl AuditClass {
 }
 
 /// A stable one-byte code for each command. Never reorder; a new command takes the next code.
+///
+/// **The writer's code (`F-037`), assigned once for the genesis code** (owner ruling on #44 and
+/// #45): 51 `RescheduleUpgrade` and 52 `CancelUpgrade` (`T-037-15`); 53 `SetAuthority`,
+/// 54 `ProposeUpgrade`, 55 `ApproveUpgrade` and 56 `ProposeMigration` (`T-037-05`). The export
+/// tags (`crate::export::records`, `Command`) take the same numbers.
 pub const fn command_code(c: Command) -> u8 {
     match c {
         Command::Genesis => 1,

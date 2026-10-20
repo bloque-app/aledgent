@@ -365,7 +365,7 @@ fn input(
         });
     }
     // The fence (`T-037-15`, `crate::fence`): at every input, before anything of it runs.
-    let way_out = crate::fence::way_out_input(&i.calls, i.deliveries.len())?;
+    let way_out = crate::fence::way_out_input(&i.calls, i.deliveries.len());
     let mut code = crate::fence::WriterCode::of(&hot);
     crate::fence::admit(inv.generation, &code, i.seq, way_out)?;
     if hot.inputs - hot.archived >= hot.limits.ring {
@@ -453,8 +453,8 @@ fn input(
         }
         summaries.push(s);
     }
-    // The fence's last word, then what the input did to the writer's code (`T-037-15`).
-    crate::fence::settle(inv.generation, &mut code, i.seq, ledger.take_way_out())?;
+    // What the input did to the writer's code (`T-037-15`), decided the same by either generation.
+    crate::fence::decide(&mut code, i.seq, way_out, ledger.take_way_out());
     code.store(&mut hot);
     let mut delivered = Vec::new();
     for (id, at) in &i.deliveries {

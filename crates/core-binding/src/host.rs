@@ -1312,12 +1312,17 @@ impl<P: AgentPort> Driver<P> {
         replica.set_input(next);
     }
 
-    /// The writer's code after the input numbered `seq`, which took the way out `taken` (the
-    /// replica's), as the code map decides it ([`crate::fence::decide`]): its code is what the
-    /// input's ring entry names.
-    fn decided(&self, seq: u64, taken: Option<ledger_core::code::WayOut>) -> WriterCode {
+    /// The writer's code after the input numbered `seq`, a way-out input or not, which took the
+    /// way out `taken` (the replica's), as the code map decides it ([`crate::fence::decide`]):
+    /// its code is what the input's ring entry names.
+    fn decided(
+        &self,
+        seq: u64,
+        way_out: bool,
+        taken: Option<ledger_core::code::WayOut>,
+    ) -> WriterCode {
         let mut w = self.writer;
-        crate::fence::decide(&mut w, seq, taken);
+        crate::fence::decide(&mut w, seq, way_out, taken);
         w
     }
 
@@ -1456,19 +1461,11 @@ impl<P: AgentPort> Driver<P> {
         {
             return Err(DriveError::Unsupported(r.call.method().to_string()));
         }
-        // A way out of an upgrade is an input of its own (`T-037-15`), and the one it took, the
-        // replica's, decides what the input does to the writer's code.
+        // Whether it is a way-out input, and the way out it took, the replica's: what the input
+        // does to the writer's code (`T-037-15`). No shape of input is refused here.
         let taken = replica.take_way_out();
-        let calls_only: Vec<&Call> = recorded.iter().map(|r| &r.call).collect();
-        if calls_only
-            .iter()
-            .any(|c| crate::fence::way_out_of(c).is_some())
-            && (recorded.len() != 1 || !deliveries.is_empty())
-        {
-            return Err(DriveError::Unsupported(
-                "a way out of an upgrade with other calls or deliveries".into(),
-            ));
-        }
+        let way_out =
+            crate::fence::way_out_input(recorded.iter().map(|r| &r.call), deliveries.len());
         let mut keys = keys;
         keys.journals.insert(replica.book().journal());
         let openings = openings_before(replica, &keys, &before);
@@ -1494,7 +1491,7 @@ impl<P: AgentPort> Driver<P> {
                 self.flush_staged()?;
             }
             let seq = self.seq + 1;
-            let writer = self.decided(seq, taken);
+            let writer = self.decided(seq, way_out, taken);
             let (leaves, whole) = self.service.leaves(&touched)?;
             let changes = changed(replica, &leaves, &deliveries)?;
             let envelope = Envelope::Mapped(Mapped::Input(MappedInput {
@@ -1544,7 +1541,7 @@ impl<P: AgentPort> Driver<P> {
         let (roots, next_posting) = replica_roots(replica, &self.service)?;
         let (tip, prev) = self.tip();
         let seq = tip + 1;
-        let writer = self.decided(seq, taken);
+        let writer = self.decided(seq, way_out, taken);
         let input = InputEnvelope {
             seq,
             calls: calls.clone(),

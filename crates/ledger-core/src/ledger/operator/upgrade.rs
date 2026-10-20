@@ -13,6 +13,13 @@
 //! (`crate::code::WayOut::apply`), with the same function whichever generation of code decides it.
 //! With nothing scheduled, a way out that is taken changes nothing, and is recorded.
 //!
+//! Every way out is **decided**, by code of either generation, even once the upgrade applies
+//! (owner ruling on #44, amendment 0033 D10): taken, it applies; not taken (unauthorised, a move
+//! not later than its own input, a blank justification, or not its input's first call,
+//! `ERR-MalformedCommand`), it is a recorded refusal that takes its input number; a repeat of an
+//! earlier request answers that request's outcome and takes nothing again. So a bad way out at the
+//! head of the queue can never wedge the old code.
+//!
 //! **The authority, until `T-037-05`.** The upgrade-authority mode is the only authority over a
 //! writer's code (`REQ-RT-18`, `REQ-RT-20`). The modes and their inputs are `T-037-05`'s. Until
 //! then, one function decides ([`Ledger::upgrade_authority`]), as a stand-in: the writer's mode is
@@ -95,6 +102,11 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                 c.u64(n);
             });
         });
+        // A way out is an input of its own: its input's first call. One after another call of its
+        // input is refused, and recorded, by code of either generation (`T-037-15`).
+        if self.calls_before() > 0 {
+            return Err(self.refused(ctx, &p, command, Vec::new(), Refusal::MalformedCommand));
+        }
         // A repeat of the same request answers its original outcome, and takes nothing again.
         if let Some(a) = self.replay(ctx, &p, &d, |_| ())? {
             return Ok(a);

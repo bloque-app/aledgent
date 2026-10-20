@@ -312,60 +312,105 @@ fn ac_k7_12_a_fenced_writer_takes_an_authorised_reschedule_or_cancel_as_input_n(
 }
 
 /// `AC-K7.17`, `REQ-RT-18`: a move or cancel not authorised under the mode in force is refused,
-/// nothing of the writer's code changes and the upgrade stays scheduled. Before `n` the refusal is
-/// the command's own, recorded like every operator command's; once the upgrade applies, the old
-/// code takes no input but a way out it accepts, so it refuses it as fenced, with nothing written.
-/// A move to an input that is not later than its own is refused too.
+/// nothing of the writer's code changes and the upgrade stays scheduled, before `n` and from it
+/// alike: every way out is decided, the refusal recorded like every operator command's, taking its
+/// input number (owner ruling on #44). A move to an input not later than its own is refused too.
 #[test]
 fn ac_k7_17_an_unauthorised_reschedule_or_cancel_is_refused() {
     let mut fx = Fx::native();
     let p = fx.person();
     let n = hot(&mut fx).inputs + 3;
     schedule(&mut fx, Some((H1, n)), 0);
-    for to in [None, Some(n + 10)] {
+    // Before `n`, then at `n` and after, under the old code.
+    for (k, to) in [None, Some(n + 10), None, Some(n + 10)]
+        .into_iter()
+        .enumerate()
+    {
         let c = way_out(&mut fx, p, to).unwrap().unwrap();
         assert_eq!(
             c.summaries,
-            vec![Summary::Refused("ERR-NotAuthorised".into())]
+            vec![Summary::Refused("ERR-NotAuthorised".into())],
+            "way out {k}"
         );
         archive(&mut fx);
-        assert_eq!(hot(&mut fx).upgrade, Some((H1, n)));
+        let h = hot(&mut fx);
+        assert_eq!((h.generation, h.upgrade), (0, Some((H1, n))), "way out {k}");
     }
-    // At `n`, under the old code: fenced.
-    let before = hot(&mut fx);
-    let f = fenced(way_out(&mut fx, p, None));
-    assert_eq!(f.seq, n);
-    assert_eq!(hot(&mut fx), before);
+    assert!(hot(&mut fx).inputs > n);
     // An authorised move to its own input or before is refused, and the upgrade stays.
-    let mut fx = rebuild(fx);
-    let mut fresh = Fx::native();
-    let _ = fresh.person();
-    let m = hot(&mut fresh).inputs + 1;
-    schedule(&mut fresh, Some((H1, m + 5)), 0);
-    let op = fresh.operator();
-    let c = way_out(&mut fresh, op, Some(m)).unwrap().unwrap();
+    let op = fx.operator();
+    let own = hot(&mut fx).inputs + 1;
+    let c = way_out(&mut fx, op, Some(own)).unwrap().unwrap();
     assert_eq!(
         c.summaries,
         vec![Summary::Refused("ERR-InvalidTransition".into())]
     );
-    assert_eq!(hot(&mut fresh).upgrade, Some((H1, m + 5)));
-    // The fenced book is still fenced at `n`.
+    archive(&mut fx);
+    assert_eq!(hot(&mut fx).upgrade, Some((H1, n)));
+    // Any other input is still fenced under the old code.
     let _ = fenced(open(&mut fx, 9));
 }
 
-/// `AC-K7.18`, D10: an authorised move or cancel arriving as input `n` commits the same state
-/// whether the old package decides it or the new one, because the switch was already made: the
-/// upgrade does not take effect at `n` and the generation stays. An unauthorised one is refused by
-/// the old package as fenced, and once switched the new package decides it as it decided it
-/// directly. Afterwards the new package is fenced until the old one is installed again.
+/// Owner ruling on #44: a bad way out at the head of the queue does not wedge the old code. With
+/// the switch skipped, an unauthorised cancel arrives as input `n`: the old code decides it, a
+/// recorded refusal identical to the one the new code records (same summaries, same writer state,
+/// same log hash). The valid cancel queued behind it then lands under the old code, as `n` + 1.
+#[test]
+fn t037_15_a_bad_way_out_at_the_head_does_not_wedge_the_old_code() {
+    let (mut old, p, n) = scheduled(0);
+    let (mut new, q, _) = scheduled(1);
+    assert_eq!(p, q);
+    let a = way_out(&mut old, p, None).unwrap().unwrap();
+    let b = way_out(&mut new, q, None).unwrap().unwrap();
+    assert_eq!(a.seq, n);
+    assert_eq!(
+        a.summaries,
+        vec![Summary::Refused("ERR-NotAuthorised".into())]
+    );
+    assert_eq!(a, b);
+    archive(&mut old);
+    archive(&mut new);
+    assert_eq!(writer_state(&mut old), writer_state(&mut new));
+    assert_eq!(
+        old.archive.last().unwrap().log_hash(),
+        new.archive.last().unwrap().log_hash()
+    );
+    let h = hot(&mut old);
+    assert_eq!(
+        (h.code, h.generation, h.upgrade),
+        ([0; 32], 0, Some((H1, n)))
+    );
+    // The valid cancel behind it lands under the old code.
+    let op = old.operator();
+    let c = way_out(&mut old, op, None).unwrap().unwrap();
+    assert_eq!(
+        (c.seq, c.summaries.clone()),
+        (n + 1, vec![Summary::Accepted])
+    );
+    archive(&mut old);
+    let h = hot(&mut old);
+    assert_eq!((h.code, h.generation, h.upgrade), ([0; 32], 0, None));
+    open(&mut old, 3).unwrap().unwrap();
+}
+
+/// `AC-K7.18`, D10, owner ruling on #44: a move or cancel arriving as input `n`, authorised or
+/// not, commits the same state whether the old package decides it or the new one, because the
+/// switch was already made: the upgrade does not take effect at `n` and the generation stays.
+/// Afterwards the new package is fenced at the next input that is not a way out, until the old one
+/// is installed again (taken), or takes the upgrade there (refused).
 #[test]
 fn ac_k7_18_input_n_is_decided_the_same_by_either_generation() {
-    for to in [None, Some(40)] {
-        let (mut old, _, n) = scheduled(0);
+    for (by_operator, to) in [
+        (true, None),
+        (true, Some(40)),
+        (false, None),
+        (false, Some(40)),
+    ] {
+        let (mut old, p, n) = scheduled(0);
         let (mut new, _, _) = scheduled(1);
-        let (x, y) = (old.operator(), new.operator());
-        let a = way_out(&mut old, x, to).unwrap().unwrap();
-        let b = way_out(&mut new, y, to).unwrap().unwrap();
+        let by = if by_operator { old.operator() } else { p };
+        let a = way_out(&mut old, by, to).unwrap().unwrap();
+        let b = way_out(&mut new, by, to).unwrap().unwrap();
         assert_eq!(a, b);
         archive(&mut old);
         archive(&mut new);
@@ -376,40 +421,27 @@ fn ac_k7_18_input_n_is_decided_the_same_by_either_generation() {
         );
         let h = hot(&mut old);
         assert_eq!((h.inputs, h.generation), (n, 0));
-        assert_eq!(h.upgrade, to.map(|m| (H1, m)));
-        // The new package is not the one the state names for the next input: fenced, until the
-        // host installs generation 0 again (the symmetric switch, `T-037-14`).
-        let _ = fenced(open(&mut new, 1));
-        let mut new = rebuild(new);
-        new.driver.port_mut().generation = 0;
-        open(&mut new, 1).unwrap().unwrap();
+        let upgrade = if by_operator {
+            to.map(|m| (H1, m))
+        } else {
+            Some((H1, n))
+        };
+        assert_eq!(h.upgrade, upgrade);
+        if upgrade.is_some_and(|(_, m)| m <= n + 1) {
+            // Refused: the upgrade still applies, so the new package takes the next input and
+            // the upgrade with it.
+            let c = open(&mut new, 1).unwrap().unwrap();
+            archive(&mut new);
+            assert_eq!(c.seq, n + 1);
+            assert_eq!(hot(&mut new).generation, 1);
+        } else {
+            // Taken: the new package is not the one the state names for the next input.
+            let _ = fenced(open(&mut new, 1));
+            let mut new = rebuild(new);
+            new.driver.port_mut().generation = 0;
+            open(&mut new, 1).unwrap().unwrap();
+        }
     }
-    // Unauthorised, at `n`: the old package fences it; the new one takes the upgrade and records
-    // the refusal; the old one, once switched, commits exactly that.
-    let (mut old, p, n) = scheduled(0);
-    let (mut new, q, _) = scheduled(1);
-    assert_eq!(p, q);
-    let _ = fenced(way_out(&mut old, p, None));
-    let b = way_out(&mut new, q, None).unwrap().unwrap();
-    assert_eq!(
-        b.summaries,
-        vec![Summary::Refused("ERR-NotAuthorised".into())]
-    );
-    archive(&mut new);
-    let mut old = rebuild(old);
-    old.driver.port_mut().generation = 1;
-    // The same command again (`Fx::ctx` numbers it as the first attempt was).
-    old.next -= 1;
-    let a = way_out(&mut old, p, None).unwrap().unwrap();
-    archive(&mut old);
-    assert_eq!(a, b);
-    assert_eq!(writer_state(&mut old), writer_state(&mut new));
-    let h = hot(&mut new);
-    assert_eq!(
-        (h.inputs, h.code, h.generation, h.upgrade),
-        (n, H1, 1, None)
-    );
-    assert_eq!(new.archive.last().unwrap().code, H1);
 }
 
 /// `REQ-RT-1`, `T-031-02`: in a batch, the fence ends the batch like any refusal: the inputs before
@@ -438,22 +470,77 @@ fn t037_15_the_fence_ends_a_batch_after_its_prefix() {
     assert_eq!(hot(&mut fx).inputs, n - 1);
 }
 
-/// A way out is an input of its own: the driver does not send one with other calls.
+/// Owner ruling on #44: no input shape is refused by the Agent or stops the host. A way out that
+/// is not its input's first call is refused `ERR-MalformedCommand`, recorded, and changes nothing
+/// of the upgrade; an input that mixes a way out with other calls is an ordinary input.
 #[test]
-fn t037_15_a_way_out_with_other_calls_is_not_sent() {
-    let (mut fx, _, _) = scheduled(0);
+fn t037_15_a_way_out_with_other_calls_is_a_recorded_refusal() {
+    let mut fx = Fx::native();
+    let _ = fx.person();
+    let n = hot(&mut fx).inputs + 5;
+    schedule(&mut fx, Some((H1, n)), 0);
     let op = fx.operator();
-    let ctx = fx.ctx(op);
-    let _ = fx.replica.cancel_upgrade(&ctx, b"T-037-15");
     let ctx = fx.ctx(op);
     let _ = fx
         .replica
         .open_identity(&ctx, IdentityKind::Person, None, Verifier::new(vec![7]));
-    match fx.sync() {
-        Err(DriveError::Unsupported(m)) => assert!(m.contains("way out"), "{m}"),
-        other => panic!("{other:?}"),
-    }
+    let ctx = fx.ctx(op);
+    let _ = fx
+        .replica
+        .cancel_upgrade(&ctx, b"T-037-15: after another call");
+    let c = fx.sync().unwrap().unwrap();
+    assert_eq!(c.summaries.len(), 2);
+    assert_eq!(
+        c.summaries[1],
+        Summary::Refused("ERR-MalformedCommand".into())
+    );
+    archive(&mut fx);
+    assert_eq!(hot(&mut fx).upgrade, Some((H1, n)));
+    // A way out first, then another call: decided in order, an ordinary input.
+    let ctx = fx.ctx(op);
+    let _ = fx
+        .replica
+        .cancel_upgrade(&ctx, b"T-037-15: then another call");
+    let ctx = fx.ctx(op);
+    let _ = fx
+        .replica
+        .open_identity(&ctx, IdentityKind::Person, None, Verifier::new(vec![8]));
+    let c = fx.sync().unwrap().unwrap();
+    assert_eq!(c.summaries[0], Summary::Accepted);
+    archive(&mut fx);
+    assert_eq!(hot(&mut fx).upgrade, None);
     let _: Hot = decode(&encode(&hot(&mut fx))).unwrap();
+}
+
+/// F8 of the review of #44: the way out on the mapped layout, decided at `n` by the old code.
+#[test]
+fn t037_15_the_way_out_holds_for_the_mapped_layout() {
+    let mut fx = Fx::mapped();
+    let p = fx.person();
+    let n = hot(&mut fx).inputs + 1;
+    schedule(&mut fx, Some((H1, n)), 0);
+    let c = way_out(&mut fx, p, None).unwrap().unwrap();
+    assert_eq!(
+        c.summaries,
+        vec![Summary::Refused("ERR-NotAuthorised".into())]
+    );
+    archive(&mut fx);
+    let op = fx.operator();
+    let c = way_out(&mut fx, op, Some(n + 10)).unwrap().unwrap();
+    assert_eq!(
+        (c.seq, c.summaries.clone()),
+        (n + 1, vec![Summary::Accepted])
+    );
+    archive(&mut fx);
+    let h = hot(&mut fx);
+    assert_eq!((h.generation, h.upgrade), (0, Some((H1, n + 10))));
+    // A move to its own input is refused: the input number reaches the mapped transition.
+    let own = h.inputs + 1;
+    let c = way_out(&mut fx, op, Some(own)).unwrap().unwrap();
+    assert_eq!(
+        c.summaries,
+        vec![Summary::Refused("ERR-InvalidTransition".into())]
+    );
 }
 
 /// The fence is the same for an Agent whose book is in its committed maps (layout 3, `F-031`

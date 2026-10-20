@@ -490,6 +490,7 @@ tagged!(Command {
     RegisterAlias => 50,
     RescheduleUpgrade => 51,
     CancelUpgrade => 52,
+    // 53 to 56 are `T-037-05`'s (`crate::audit::command_code`).
 });
 
 impl Canonical for OperationRecord {

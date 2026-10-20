@@ -8,17 +8,23 @@
 //! mode inputs, the code archive, per-range replay, the code generation and the fence with its way
 //! out, checkpoints as rows and leaf chunks, the replayer, and the continuation founded once.
 //!
-//! **Run (`T-037-15`, the fence and the way out):** `AC-K7.9`, `AC-K7.12`, `AC-K7.13`, `AC-K7.17`
-//! and `AC-K7.18`. Each case founds its own book on the core Agent's transition, natively
+//! **Run (`T-037-15`, the fence and the way out):** `AC-K7.9`, `AC-K7.12` and `AC-K7.17`. Each
+//! case founds its own book on the core Agent's transition, natively
 //! (`core_binding::host::NativePort`, the code the VOS actor runs), so it exercises no harness
 //! target (`Harness::exercised`). The port runs as the code generation the case sets: 0 is the
 //! package of *H₀*, 1 the next one's; a switch is the case setting it. Until `T-037-04` lands the
-//! `Upgrade` input, a case schedules an upgrade by setting the hot row's `upgrade` directly. Parts
-//! of three of them complete with other tasks: the execution node's check of the runtime it runs
-//! (`AC-K7.13`, `T-037-14`), and the replay that assigns each input its generation from the code
-//! map (`AC-K7.18`, `T-037-09`). `AC-K7.16` stays pending: its first part (a stale package after
-//! the switch is refused) is `T-037-15`'s and is checked in `core-binding`'s `tests/fence.rs`; its
-//! second (an upgrade naming the wrong generation is refused before it is logged) is `T-037-04`'s.
+//! `Upgrade` input, a case schedules an upgrade by setting the hot row's `upgrade` directly.
+//!
+//! **Still pending, with the clause that remains** (each one's other clauses are checked by
+//! `core-binding`'s `tests/fence.rs` under the case's name):
+//! - `AC-K7.13`: "an execution node whose runtime is not the one the current range's code version
+//!   names refuses to drive the writer" (`T-037-14`). Checked: every upgrade raises the
+//!   generation, carried in the package's bytes, and a missed switch refuses input `n`.
+//! - `AC-K7.16`: "an upgrade whose code version names a generation other than the writer's plus
+//!   one is refused" (`T-037-04`). Checked: a stale package after the switch is refused.
+//! - `AC-K7.18`: "a replay assigns every input the generation the code map, read from the inputs
+//!   alone, names" (`T-037-09`). Checked: a move or cancel at `n`, authorised or not, commits the
+//!   same state under either generation.
 
 // Case names end in `__<layer>`, so a test can be found by id and layer.
 #![allow(non_snake_case)]
@@ -28,10 +34,6 @@ use core_binding::host::{DriveError, Driver, HostKeys, NativePort, Replica};
 use core_binding::hot::{HOT, Hot, Limits, RingEntry, decode_hot};
 use core_binding::transition::Rows as _;
 use ledger_core::call::Summary;
-use ledger_core::code::{
-    Artefact, BuildProfile, CodeManifest, KernelIdentity, Platform, Role, WriterKind,
-    artefact_digest, generation_record,
-};
 use ledger_core::identity::IdentityKind;
 use ledger_core::ledger::{Ctx, Founded};
 use ledger_core::principal::{Caller, Verifier};
@@ -136,10 +138,12 @@ pub const CASES: &[Case] = &[
         ac_k7_12_a_fenced_writer_takes_a_reschedule_or_cancel_and_alerts__service,
         &["REQ-RT-20"]
     ),
-    service_case!(
+    Case::pending(
         "AC-K7.13",
-        ac_k7_13_every_upgrade_raises_the_generation_so_a_missed_switch_is_fenced__service,
-        &["REQ-RT-20"]
+        "ac_k7_13_every_upgrade_raises_the_generation_so_a_missed_switch_is_fenced__service",
+        Layer::Service,
+        Feature::F037,
+        &["REQ-RT-20"],
     ),
     Case::pending(
         "AC-K7.14",
@@ -167,10 +171,12 @@ pub const CASES: &[Case] = &[
         ac_k7_17_an_unauthorised_reschedule_or_cancel_is_refused__service,
         &["REQ-RT-20", "REQ-RT-18"]
     ),
-    service_case!(
+    Case::pending(
         "AC-K7.18",
-        ac_k7_18_input_n_is_decided_the_same_by_either_generation__service,
-        &["REQ-RT-20", "REQ-RT-17"]
+        "ac_k7_18_input_n_is_decided_the_same_by_either_generation__service",
+        Layer::Service,
+        Feature::F037,
+        &["REQ-RT-20", "REQ-RT-17"],
     ),
     Case::pending(
         "AC-K7.19",
@@ -456,74 +462,6 @@ fn ac_k7_12_a_fenced_writer_takes_a_reschedule_or_cancel_and_alerts__service(
     })())
 }
 
-fn ac_k7_13_every_upgrade_raises_the_generation_so_a_missed_switch_is_fenced__service(
-    _: &mut dyn Harness,
-) -> Outcome {
-    outcome((|| {
-        let profile = BuildProfile {
-            target: "riscv64em-vos".into(),
-            toolchain: "nightly-2026-03-20".into(),
-            opt_level: "s".into(),
-            features: Vec::new(),
-            source_revision: "0123abcd".into(),
-            cargo_lock: [0; 32],
-        };
-        // One source: the package differs only by the generation it carries.
-        let package = |g: u64| {
-            let mut bytes = b"the core's package".to_vec();
-            bytes.extend_from_slice(&generation_record(g));
-            bytes
-        };
-        let manifest = |g: u64, runtime: [u8; 32]| CodeManifest {
-            writer: WriterKind::Core,
-            platform: Platform {
-                name: "vos-saga".into(),
-                revision: "c54fc1ff13fcd55b86f2cf4edc77b041b62e245f".into(),
-                identities: Vec::new(),
-            },
-            generation: g,
-            artefacts: vec![
-                Artefact {
-                    role: Role::Package,
-                    digest: artefact_digest(&package(g)),
-                    len: package(g).len() as u64,
-                    identities: Vec::new(),
-                    profile: profile.clone(),
-                },
-                Artefact {
-                    role: Role::Runtime,
-                    digest: runtime,
-                    len: 1,
-                    identities: Vec::new(),
-                    profile: profile.clone(),
-                },
-            ],
-            kernel: KernelIdentity {
-                revision: "e9a7b08".into(),
-                checksum: None,
-            },
-            constructions: vec![ledger_core::anchor::construction()],
-            messages: Vec::new(),
-        };
-        // An upgrade made for the runtime alone: the next generation, so other package bytes.
-        let (old, new) = (manifest(0, [1; 32]), manifest(1, [2; 32]));
-        check(new.generation == old.generation + 1, || {
-            "no new generation".into()
-        })?;
-        check(new.artefacts[0].digest != old.artefacts[0].digest, || {
-            "the package does not carry its generation".into()
-        })?;
-        let h = new.version();
-        // The writer whose switch to it was missed refuses input `n`.
-        let mut b = Book::new()?;
-        let _ = b.person()?;
-        let n = b.hot()?.inputs + 1;
-        b.schedule(Some((h, n)))?;
-        let f = fenced(b.open(1))?;
-        check(f.seq == n && f.upgrade == Some((h, n)), || format!("{f:?}"))
-    })())
-}
-
 fn ac_k7_17_an_unauthorised_reschedule_or_cancel_is_refused__service(
     _: &mut dyn Harness,
 ) -> Outcome {
@@ -542,63 +480,26 @@ fn ac_k7_17_an_unauthorised_reschedule_or_cancel_is_refused__service(
                 "the upgrade moved".into()
             })?;
         }
-        // From `n`, the old code takes no way out it does not accept: fenced, nothing written.
-        let before = b.hot()?;
-        let f = fenced(b.way_out(p, None))?;
-        check(f.seq == n, || format!("{f:?}"))?;
-        check(b.hot()? == before, || {
-            "the refusal changed the writer".into()
-        })
-    })())
-}
-
-fn ac_k7_18_input_n_is_decided_the_same_by_either_generation__service(
-    _: &mut dyn Harness,
-) -> Outcome {
-    outcome((|| {
-        for to in [None, Some(40)] {
-            let (mut old, _, n) = scheduled(0)?;
-            let (mut new, _, _) = scheduled(1)?;
-            let (x, y) = (old.operator(), new.operator());
-            let a = committed(old.way_out(x, to))?;
-            let b = committed(new.way_out(y, to))?;
-            check(a == b, || format!("{a:?} / {b:?}"))?;
-            check(old.writer_state()? == new.writer_state()?, || {
-                "the committed states differ".into()
+        // From `n` too, by the old code and by the new alike: refused, recorded, taking its
+        // number, and the upgrade still scheduled (owner ruling on #44).
+        for _ in 0..2 {
+            let c = committed(b.way_out(p, None))?;
+            check(
+                c.seq >= n && c.summaries == vec![Summary::Refused("ERR-NotAuthorised".into())],
+                || format!("{c:?}"),
+            )?;
+            let h = b.hot()?;
+            check(h.upgrade == Some((H1, n)) && h.generation == 0, || {
+                format!("{h:?}")
             })?;
-            let (ea, eb) = (old.archive.last(), new.archive.last());
-            check(
-                ea.map(RingEntry::log_hash) == eb.map(RingEntry::log_hash),
-                || "the log hashes differ".into(),
-            )?;
-            let h = old.hot()?;
-            check(
-                h.inputs == n && h.generation == 0 && h.upgrade == to.map(|m| (H1, m)),
-                || format!("{h:?}"),
-            )?;
         }
-        // Unauthorised, at `n`: refused by the old code as fenced; the new code takes the
-        // upgrade and records the refusal, and the old code switched commits exactly that.
-        let (mut old, p, n) = scheduled(0)?;
-        let (mut new, q, _) = scheduled(1)?;
-        let _ = fenced(old.way_out(p, None))?;
-        let b = committed(new.way_out(q, None))?;
-        check(
-            b.summaries == vec![Summary::Refused("ERR-NotAuthorised".into())],
-            || format!("{b:?}"),
-        )?;
-        let mut old = old.rebuild()?;
-        old.generation(1);
-        old.next -= 1;
-        let a = committed(old.way_out(p, None))?;
-        check(a == b, || format!("{a:?} / {b:?}"))?;
+        let (mut old, q, m) = scheduled(0)?;
+        let (mut new, _, _) = scheduled(1)?;
+        let a = committed(old.way_out(q, None))?;
+        let z = committed(new.way_out(q, None))?;
+        check(a == z && a.seq == m, || format!("{a:?} / {z:?}"))?;
         check(old.writer_state()? == new.writer_state()?, || {
-            "the committed states differ".into()
-        })?;
-        let h = new.hot()?;
-        check(
-            (h.inputs, h.code, h.generation, h.upgrade) == (n, H1, 1, None),
-            || format!("{h:?}"),
-        )
+            "the generations decide it differently".into()
+        })
     })())
 }

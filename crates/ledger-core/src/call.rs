@@ -600,6 +600,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
     /// writes (`crate::leaves`), until it returns: exactly what the core Agent's replay of the
     /// call will read, so the host can witness it (`F-005`).
     pub(crate) fn enter(&mut self, call: impl FnOnce() -> Call) -> bool {
+        self.calls_in_input.0 += 1;
         let Some(log) = self.calls.as_mut() else {
             return false;
         };
@@ -615,6 +616,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
 
     /// Close the method `enter` opened without recording it: it changed nothing.
     pub(crate) fn cancel(&mut self, top: bool) {
+        self.calls_in_input.0 = self.calls_in_input.0.saturating_sub(1);
         let Some(log) = self.calls.as_mut() else {
             return;
         };
@@ -629,6 +631,11 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
 
     /// Close the method `enter` opened, with its result's summary.
     pub(crate) fn leave(&mut self, top: bool, summary: impl FnOnce() -> Summary) {
+        // An outermost method decided: one more call of the current input (`T-037-15`).
+        self.calls_in_input.0 = self.calls_in_input.0.saturating_sub(1);
+        if self.calls_in_input.0 == 0 {
+            self.calls_in_input.1 = self.calls_in_input.1.saturating_add(1);
+        }
         let Some(log) = self.calls.as_mut() else {
             return;
         };

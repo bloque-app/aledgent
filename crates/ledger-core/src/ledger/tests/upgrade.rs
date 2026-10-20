@@ -30,11 +30,13 @@ fn t037_15_an_authorised_way_out_is_taken_once_and_audited() {
     let r = last_audit(&fx);
     assert_eq!(r.action, AuditAction::Command(Command::RescheduleUpgrade));
     assert_eq!(r.outcome, AuditOutcome::Accepted);
-    // The same request again: its original outcome, and nothing taken.
+    // The same request again, as its own input: its original outcome, and nothing taken.
+    fx.ledger.set_input(8);
     fx.ledger
         .reschedule_upgrade(&ctx, 8, b"T-037-15: the switch failed")
         .unwrap();
     assert_eq!(fx.ledger.take_way_out(), None);
+    fx.ledger.set_input(9);
     let ctx = fx.ctx(op);
     fx.ledger
         .cancel_upgrade(&ctx, b"T-037-15: abandoned")
@@ -61,8 +63,8 @@ fn t037_15_an_authorised_way_out_is_taken_once_and_audited() {
 #[test]
 fn t037_15_an_unauthorised_or_invalid_way_out_takes_nothing() {
     let mut fx = Fx::new();
-    fx.ledger.set_input(7);
     let p = fx.person();
+    fx.ledger.set_input(7);
     let ctx = fx.ctx(p);
     assert_eq!(
         fx.ledger.cancel_upgrade(&ctx, b"not mine").unwrap_err(),
@@ -78,6 +80,7 @@ fn t037_15_an_unauthorised_or_invalid_way_out_takes_nothing() {
         (3, &b"to an earlier input"[..], Refusal::InvalidTransition),
         (9, &b"  "[..], Refusal::JustificationRequired),
     ] {
+        fx.ledger.set_input(7);
         let ctx = fx.ctx(op);
         assert_eq!(
             fx.ledger.reschedule_upgrade(&ctx, from, why).unwrap_err(),
@@ -87,10 +90,36 @@ fn t037_15_an_unauthorised_or_invalid_way_out_takes_nothing() {
     }
     // A writer that names a mode: this code enforces none, so nobody is authorised.
     fx.ledger.set_code([0; 32], [0xA0; 32]);
+    fx.ledger.set_input(7);
     let ctx = fx.ctx(op);
     assert_eq!(
         fx.ledger.cancel_upgrade(&ctx, b"a mode").unwrap_err(),
         Refusal::NotAuthorised
     );
     assert_eq!(fx.ledger.take_way_out(), None);
+}
+
+/// Owner ruling on #44: a way out is its input's first call. One decided after another call of the
+/// same input is refused `ERR-MalformedCommand`, recorded, and takes nothing; the next input starts
+/// again ([`Ledger::set_input`]).
+#[test]
+fn t037_15_a_way_out_after_another_call_of_its_input_is_malformed() {
+    let mut fx = Fx::new();
+    fx.ledger.set_input(7);
+    let _ = fx.person();
+    let op = fx.operator();
+    let ctx = fx.ctx(op);
+    assert_eq!(
+        fx.ledger.cancel_upgrade(&ctx, b"second call").unwrap_err(),
+        Refusal::MalformedCommand
+    );
+    assert_eq!(
+        last_audit(&fx).outcome,
+        AuditOutcome::Refused(Refusal::MalformedCommand)
+    );
+    assert_eq!(fx.ledger.take_way_out(), None);
+    fx.ledger.set_input(8);
+    let ctx = fx.ctx(op);
+    fx.ledger.cancel_upgrade(&ctx, b"first call").unwrap();
+    assert_eq!(fx.ledger.take_way_out(), Some(WayOut::Cancel));
 }
