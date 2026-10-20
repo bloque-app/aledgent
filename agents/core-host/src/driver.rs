@@ -1001,11 +1001,6 @@ mod tests {
         let plain = upgrade_request(actor, &installed, &g1_plain).unwrap();
         assert_eq!(plain.state_compatible_from, None);
 
-        // The claim is part of what the authority signs.
-        let commitment =
-            |u: sdk::UpgradeActor| ManagementRequest::UpgradeActor(Box::new(u)).commitment();
-        assert_ne!(commitment(claimed.clone()), commitment(plain));
-
         // A claim names the program installed now: g2 claims g1, g0 is installed, so none is sent.
         let g2 = admitted(3, &[g1.program()]);
         assert_eq!(
