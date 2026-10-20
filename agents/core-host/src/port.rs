@@ -43,6 +43,8 @@ pub struct VosPort {
     /// for every invocation for ever (`T-032-15`, stress finding F15).
     pub samples: Vec<Sample>,
     keep: bool,
+    /// The code this host runs and the versions it may switch to (`T-037-14`), if it tracks them.
+    code: Option<crate::switch::CodeState>,
 }
 
 impl VosPort {
@@ -54,7 +56,34 @@ impl VosPort {
             driver: PrincipalId(driver),
             samples: Vec::new(),
             keep: true,
+            code: None,
         }
+    }
+
+    /// Track the code this port runs (`T-037-14`): the digests of the `package` and `runtime`
+    /// bytes the host loaded, the actor's `name`, and the versions staged for a switch.
+    pub fn track_code(&mut self, state: crate::switch::CodeState) {
+        self.code = Some(state);
+    }
+
+    /// What the port tracks of its code, if anything.
+    pub fn code_state(&self) -> Option<&crate::switch::CodeState> {
+        self.code.as_ref()
+    }
+
+    pub(crate) fn code_state_mut(&mut self) -> Option<&mut crate::switch::CodeState> {
+        self.code.as_mut()
+    }
+
+    /// Upgrade the installed actor `name` to the admitted `package`, in place, and use the
+    /// upgraded actor from now on (`T-037-14`).
+    pub fn upgrade_actor(
+        &mut self,
+        package: &vos::agent::package_admission::AdmittedActorPackage,
+        name: &str,
+    ) -> Result<(), DriverError> {
+        self.actor = self.runtime.upgrade_actor(package, name)?;
+        Ok(())
     }
 
     /// Whether to keep every invocation's measurements in [`VosPort::samples`].
@@ -289,6 +318,41 @@ impl VosPort {
 impl AgentPort for VosPort {
     fn unacknowledged(&self) -> Option<u64> {
         Some(self.runtime.unacknowledged())
+    }
+
+    /// `switch(H, n)` on `saga` (`T-037-14`): make the Agent run `code`, from the versions staged
+    /// for this port. A port that tracks no code runs what it runs.
+    fn switch_to(&mut self, code: [u8; 32]) -> Result<(), String> {
+        // A monotonic clock: a wall-clock step must not park a healthy host.
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let now = u64::try_from(
+            START
+                .get_or_init(std::time::Instant::now)
+                .elapsed()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        let Some(state) = self.code_state() else {
+            return Ok(());
+        };
+        // A failing install is not retried at once: it would burn the runtime's authority slots.
+        if let Some(why) = state.park.blocked(&code, now) {
+            return Err(why);
+        }
+        let digests = state.staged.digests();
+        let r = core_binding::switch::ensure(code, None, 0, &digests, self);
+        if let Some(c) = self.code_state_mut() {
+            match &r {
+                Ok(_) => c.park.succeeded(&code),
+                Err(e) => c.park.failed(
+                    code,
+                    e.to_string(),
+                    matches!(e, core_binding::switch::SwitchError::Platform(_)),
+                    now,
+                ),
+            }
+        }
+        r.map(|_| ()).map_err(|e| e.to_string())
     }
 
     fn invoke(&mut self, envelope: Vec<u8>, blobs: Vec<Vec<u8>>) -> Result<Vec<u8>, PortError> {

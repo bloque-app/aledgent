@@ -53,7 +53,12 @@ the claim of that number, with its record written last. In build order:
 3. **Checkpoint `v3`**: the commitment amendment 0023 fixed, built from aledgent's fields alone.
 4. **`switch(H, n)`**: one host operation, installing only bytes staged and checked before the upgrade
    committed. It is the registry's compare-and-swap on `saga`, signed with the core's package key through
-   the signer. It is an install into the same instance on `vos-core`, and the founding of a continuation
+   the signer. In the in-process runtime
+   the core host embeds (`agents/core-host`), the equivalent is the runtime's in-place upgrade of the
+   installed actor, a compare-and-swap on the installed deployment: its management receipt is signed by the
+   Agent's authority key, as an install's, and the staged package is signed by the package key (its
+   producer), both through the signer, so no key is in the host (a note of `T-037-14`, not a change of the
+   requirement). It is an install into the same instance on `vos-core`, and the founding of a continuation
    across platforms. While an upgrade is scheduled, the host ends its batches at *n* − 1. At start and at
    every switch, the host checks every artefact it runs, the runtime included, against the code version the
    code map names for the next input, by digest, and installs that version where any differs. The switch is
