@@ -9,50 +9,24 @@
 //! declaration order from serde's own list and pins every production one by name and index. The
 //! conformance suite's raw ports may only follow them.
 
-use serde::de::{self, Visitor};
-
-/// The variant names serde derives for `Call`, in declaration order: what `deserialize_enum` is
-/// handed. Nothing is decoded.
-struct Variants(Option<&'static [&'static str]>);
-
-#[derive(Debug)]
-struct Stop;
-
-impl std::fmt::Display for Stop {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("stop")
-    }
-}
-
-impl std::error::Error for Stop {}
-
-impl de::Error for Stop {
-    fn custom<T: std::fmt::Display>(_: T) -> Self {
-        Stop
-    }
-}
-
-impl<'de> de::Deserializer<'de> for &mut Variants {
-    type Error = Stop;
-
-    fn deserialize_any<V: Visitor<'de>>(self, _: V) -> Result<V::Value, Stop> {
-        Err(Stop)
-    }
-
-    fn deserialize_enum<V: Visitor<'de>>(
-        self,
-        _: &'static str,
-        variants: &'static [&'static str],
-        _: V,
-    ) -> Result<V::Value, Stop> {
-        self.0 = Some(variants);
-        Err(Stop)
-    }
-
-    serde::forward_to_deserialize_any! {
-        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes byte_buf option
-        unit unit_struct newtype_struct seq tuple tuple_struct map struct identifier ignored_any
-    }
+/// The variant names serde derives for `Call`, in declaration order: an unknown variant's error
+/// lists them ("expected one of `A`, `B`, …"). Nothing is decoded.
+fn variants() -> Vec<String> {
+    let e = serde_json::from_str::<ledger_core::call::Call>(r#""__not_a_variant__""#)
+        .expect_err("no such variant")
+        .to_string();
+    let list = e
+        .split("expected one of ")
+        .nth(1)
+        .unwrap_or_else(|| panic!("{e}"));
+    list.split(", ")
+        .map(|v| {
+            v.trim()
+                .trim_end_matches(|c: char| c != '`')
+                .trim_matches('`')
+                .to_string()
+        })
+        .collect()
 }
 
 /// Every production variant of `ledger_core::call::Call`, at its tag (its index). A new variant is
@@ -134,16 +108,14 @@ const PORTS: &[&str] = &["PortReceive", "PortArrive", "PortFire"];
 /// conformance ports follows them.
 #[test]
 fn t037_15_the_production_call_tags_are_pinned() {
-    let mut v = Variants(None);
-    let _ = <ledger_core::call::Call as serde::Deserialize>::deserialize(&mut v);
-    let all = v.0.expect("Call is an enum");
+    let all = variants();
     assert!(all.len() >= PRODUCTION.len(), "{all:?}");
     for (tag, name) in PRODUCTION.iter().enumerate() {
         assert_eq!(all[tag], *name, "tag {tag}");
     }
     for name in &all[PRODUCTION.len()..] {
         assert!(
-            PORTS.contains(name),
+            PORTS.contains(&name.as_str()),
             "{name} follows the production variants: append it to PRODUCTION"
         );
     }
