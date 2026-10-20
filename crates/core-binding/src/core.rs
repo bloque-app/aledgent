@@ -563,8 +563,8 @@ pub struct CoreStats {
     /// The runtime's unacknowledged Authority decisions, after the last decision; `u64::MAX`
     /// while the port does not count them ([`AgentPort::unacknowledged`]).
     pub unacknowledged: AtomicU64,
-    /// While the writer is fenced (`T-037-15`): the time input of the first input the fence
-    /// refused since an input last committed; 0 when it is not fenced. The signals report how long
+    /// While the writer is fenced (`T-037-15`): the newest time input offered to the core when the
+    /// fence first refused an input since an input last committed; 0 when it is not fenced. The signals report how long
     /// ago that was (`aledgent_writer_fenced_seconds`, `NFR-11`).
     pub fenced_since: AtomicU64,
     read_wait_us: Window,
@@ -694,6 +694,9 @@ struct Inner<P: AgentPort> {
     /// the fence refused is audited, never in the book. Beside it, always, a line on standard
     /// error.
     node_trail: Option<audit_store::NodeTrail>,
+    /// The latest time input of any input offered to the core (`T-037-15`): where the fenced clock
+    /// starts, so that an input logged long before it was refused does not age the fence.
+    latest_time: Time,
 }
 
 /// The core's two locks (`T-031-12`, finding F3 of `F-032`). An input takes `ctl`, then the
@@ -986,6 +989,7 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
             audit,
             segment: segment.map(|(spec, start)| (spec.clone(), start)),
             node_trail: None,
+            latest_time: 0,
         };
         let mut running = inner.executor(replica)?;
         // A book founded here emitted genesis's records: the store may hold them already.
@@ -1279,11 +1283,21 @@ impl<P: AgentPort> Inner<P> {
     /// store's node trail (amendment 0033 D25), never in the book. The line and the record name the
     /// input by key, kind and time, never by its body (`REQ-AU-8`).
     fn fenced(&mut self, input: Option<&CoreInput>, f: &Fenced) {
-        let at = input.and_then(input_time).unwrap_or(0).max(1);
-        let _ =
-            self.stats
-                .fenced_since
-                .compare_exchange(0, at, Ordering::Relaxed, Ordering::Relaxed);
+        // The newest time input the core has been offered, not the refused input's own, which may
+        // have waited long before it was first refused. With no time known yet (only seed chunks,
+        // which carry none), the clock does not start: it would read as decades.
+        let at = input
+            .and_then(input_time)
+            .unwrap_or(0)
+            .max(self.latest_time);
+        if at > 0 {
+            let _ = self.stats.fenced_since.compare_exchange(
+                0,
+                at,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
         let what = input.map_or_else(|| "an input".to_string(), describe);
         let upgrade = f.upgrade.map_or_else(
             || "none".to_string(),
@@ -1416,6 +1430,9 @@ impl<P: AgentPort> Inner<P> {
     fn run(&mut self, inputs: &[CoreInput]) -> (Vec<Result<CoreReply, CoreError>>, Option<usize>) {
         let mut out: Vec<Result<CoreReply, CoreError>> =
             inputs.iter().map(|_| Err(CoreError::Unavailable)).collect();
+        if let Some(t) = inputs.iter().filter_map(input_time).max() {
+            self.latest_time = self.latest_time.max(t);
+        }
         // Back-pressure (`T-013-13`): the audit store has not taken records, and the outbox is at
         // its bound. Nothing runs; every input waits `Received`, in order, and is retried.
         if self.audit.as_ref().is_some_and(|a| a.stats.full()) {
@@ -1581,6 +1598,10 @@ impl<P: AgentPort> Inner<P> {
                 };
                 let first = runs.get(n).map_or(at, |(i, _, _)| *i);
                 if let Some(f) = &fence {
+                    // A prefix of the batch committed: the fence starts again at this input.
+                    if n > 0 {
+                        self.stats.fenced_since.store(0, Ordering::Relaxed);
+                    }
                     self.fenced(inputs.get(first), f);
                 }
                 // Which input it was (finding F18): the index above is where staging stopped,

@@ -1050,7 +1050,7 @@ mod audit {
             "the clock runs from the first refused input's time"
         );
         // Audited at the node: one record per refusal, naming the input by key, kind and time.
-        let node = audit_store::NodeTrail::read(&s.config.dir).unwrap();
+        let node = audit_store::NodeTrail::read(&s.config.dir).records;
         assert_eq!(node.len() as u32, FAILED_ATTEMPTS + 2);
         for r in &node {
             assert_eq!(

@@ -306,6 +306,7 @@ groups:
         labels: { severity: page, owner: platform, signal: writer-fence }
         annotations:
           summary: The core's writer has been fenced for longer than fence_alert_after (five minutes); it takes no input until the code its state names is installed, or the upgrade is moved or cancelled.
+          runbook: ops/runbooks/release/writer-fenced.md
 
       # VOS: Authority decisions issued for invocations not yet acknowledged. VOS's Authority
       # issuer refuses past 256 (MAX_AUTHORITY_OPERATION_ISSUER_RECORDS), a Local lane past 32

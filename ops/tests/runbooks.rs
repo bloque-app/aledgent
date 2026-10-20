@@ -8,7 +8,7 @@ use std::path::Path;
 
 use ops::alerts::Rules;
 
-const RUNBOOKS: [&str; 21] = [
+const RUNBOOKS: [&str; 22] = [
     "restore.md",
     "anchoring.md",
     "gap-filling.md",
@@ -29,6 +29,7 @@ const RUNBOOKS: [&str; 21] = [
     "release/settlement-adapter-outage.md",
     "release/total-loss-recovery.md",
     "release/vos-authority-backlog.md",
+    "release/writer-fenced.md",
     "system-accounts.md",
 ];
 
