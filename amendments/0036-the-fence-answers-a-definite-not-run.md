@@ -58,8 +58,8 @@ without committing anything, and its input number was not taken.*
 
 N2. **Where it comes from, and only there.** `NotRun` is given for the Agent's refusal as fenced, after the replica
 has been rebuilt to what the Agent committed, and for nothing else. A port failure, an aborted call, a failed
-rebuild, a halted core, back-pressure and an input past what one invocation carries are still `Unavailable` or
-`Ambiguous`; an input the core refuses before the fence (a way out that is malformed, `ERR-MalformedCommand`) or
+rebuild, a halted core and back-pressure are still `Unavailable` or `Ambiguous`, and so is an input past what one
+invocation carries, unless the fence refused an earlier input of the same call (N4); an input the core refuses before the fence (a way out that is malformed, `ERR-MalformedCommand`) or
 decides as a recorded refusal is answered with its recorded decision, as any decided input is.
 
 N3. **A committed input is never refused.** The record of replies is read before an input is staged, whether or not
@@ -95,8 +95,9 @@ partition's tail, in one store transaction under its lease:
   lease's **epoch rises by one**, in the same transaction. The transaction returns the epoch the lease now has, and
   the feeder carries on under it.
 
-A mixed answer in which a `NotRun` is followed by an `Applied` is not given by the core (N4); a feeder that sees one
-keeps every row in flight and gives nothing back.
+The core gives `NotRun` followed by `Applied` only for a later input of the call that the record of replies already
+answers (N3 keeps it `Applied`); a feeder that sees that mix, or any other, keeps every row in flight and gives
+nothing back, so the rule fails towards the old one.
 
 F3. **The queue after the release.** Nothing is in flight from *p* on. The store is read as before: rows in flight
 first (none), then the way out that overtakes, then reservations, then arrival. The first row marked takes *p*'s
