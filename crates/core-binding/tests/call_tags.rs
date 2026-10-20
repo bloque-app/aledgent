@@ -12,7 +12,12 @@
 /// The variant names serde derives for `Call`, in declaration order: an unknown variant's error
 /// lists them ("expected one of `A`, `B`, …"). Nothing is decoded.
 fn variants() -> Vec<String> {
-    let e = serde_json::from_str::<ledger_core::call::Call>(r#""__not_a_variant__""#)
+    variants_of::<ledger_core::call::Call>()
+}
+
+/// The variant names serde derives for the enum `T`, in declaration order.
+fn variants_of<T: serde::de::DeserializeOwned + core::fmt::Debug>() -> Vec<String> {
+    let e = serde_json::from_str::<T>(r#""__not_a_variant__""#)
         .expect_err("no such variant")
         .to_string();
     let list = e
@@ -99,6 +104,8 @@ const PRODUCTION: &[&str] = &[
     // `T-037-15`: the way out of a scheduled upgrade.
     "RescheduleUpgrade",
     "CancelUpgrade",
+    // `T-037-05`: the upgrade-authority inputs, one variant whose input says which.
+    "UpgradeAuthority",
 ];
 
 /// The conformance suite's raw ports: only ever after every production variant.
@@ -128,5 +135,32 @@ fn t037_15_the_production_call_tags_are_pinned() {
             tag("CancelUpgrade")
         ),
         (63, 64, 65)
+    );
+    // The upgrade-authority inputs, after them (`T-037-05`).
+    assert_eq!(tag("UpgradeAuthority"), 66);
+}
+
+/// `T-037-05`: inside `Call::UpgradeAuthority`, the four inputs, the kinds an approval names and
+/// the modes' rules keep their tags too: postcard writes each as its index, under the log hash.
+/// Appended to, never reordered.
+#[test]
+fn t037_05_the_upgrade_authority_tags_are_pinned() {
+    use ledger_core::code::authority::{Input, Kind, Rule};
+    assert_eq!(
+        variants_of::<Input>(),
+        [
+            "SetAuthority",
+            "ProposeUpgrade",
+            "ApproveUpgrade",
+            "ProposeMigration"
+        ]
+    );
+    assert_eq!(
+        variants_of::<Kind>(),
+        ["Upgrade", "Migration", "SetAuthority"]
+    );
+    assert_eq!(
+        variants_of::<Rule>(),
+        ["Single", "ProposeApprove", "Threshold"]
     );
 }

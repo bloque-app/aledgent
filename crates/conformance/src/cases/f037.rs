@@ -8,6 +8,8 @@
 //! mode inputs, the code archive, per-range replay, the code generation and the fence with its way
 //! out, checkpoints as rows and leaf chunks, the replayer, and the continuation founded once.
 //!
+//! **Run (`T-037-05`, the modes):** `AC-K7.7` and `AC-K7.8` ([`modes`]).
+//!
 //! **Run (`T-037-15`, the fence and the way out):** `AC-K7.9`, `AC-K7.12` and `AC-K7.17`. Each
 //! case founds its own book on the core Agent's transition, natively
 //! (`core_binding::host::NativePort`, the code the VOS actor runs), so it exercises no harness
@@ -100,19 +102,23 @@ pub const CASES: &[Case] = &[
         Feature::F037,
         &["REQ-RT-16"],
     ),
-    Case::pending(
+    Case::run(
         "AC-K7.7",
         "ac_k7_7_a_mode_change_binds_every_later_upgrade__service",
         Layer::Service,
         Feature::F037,
+        Port::Service,
         &["REQ-RT-18"],
+        modes::ac_k7_7_a_mode_change_binds_every_later_upgrade__service,
     ),
-    Case::pending(
+    Case::run(
         "AC-K7.8",
         "ac_k7_8_an_unauthorised_or_unsatisfiable_mode_is_refused__service",
         Layer::Service,
         Feature::F037,
+        Port::Service,
         &["REQ-RT-18"],
+        modes::ac_k7_8_an_unauthorised_or_unsatisfiable_mode_is_refused__service,
     ),
     service_case!(
         "AC-K7.9",
@@ -502,4 +508,463 @@ fn ac_k7_17_an_unauthorised_reschedule_or_cancel_is_refused__service(
             "the generations decide it differently".into()
         })
     })())
+}
+
+/// `AC-K7.7` and `AC-K7.8` (`T-037-05`): each founds its own book in process, through
+/// `ledger-core`'s public surface, and gives it the input numbers the core Agent gives it
+/// (`Ledger::set_input`). Through the Agent itself, natively and in the mapped layout, the same path
+/// is `core-binding`'s `tests/upgrade_authority.rs`.
+mod modes {
+    use ledger_core::Refusal;
+    use ledger_core::account::{AccountKind, Custody};
+    use ledger_core::asset::{AssetId, AssetKind, Minor, NonZeroMinor};
+    use ledger_core::audit::{AuditAction, AuditOutcome, AuditTrail};
+    use ledger_core::authority::{GrantKind, OperationKind, Subject, Window};
+    use ledger_core::code::authority::{
+        Action, Decision, GENESIS, Kind, Member, Mode, Rule, verifier_digest,
+    };
+    use ledger_core::id::{IdentityId, OperationId};
+    use ledger_core::identity::IdentityKind;
+    use ledger_core::ledger::{AssetDecl, Ctx, Genesis, GrantRequest, Ledger, OpenAccount};
+    use ledger_core::lifecycle::LifecycleConfig;
+    use ledger_core::operator::OperatorOpKind;
+    use ledger_core::principal::{Caller, Verifier};
+    use ledger_core::set::NonEmptySet;
+    use ledger_core::settlement::{SettlementConfig, SourceId};
+    use ledger_core::state::Command;
+    use ledger_kernel::book::Book;
+    use ledger_kernel::keys::KeyRing;
+    use ledger_kernel::posting::OperationRef;
+    use ledger_kernel::store::MemStore;
+    use ledger_kernel::vault::MemVault;
+    use std::collections::BTreeMap;
+    use std::num::NonZeroU64;
+
+    use crate::case::Outcome;
+    use crate::harness::Harness;
+
+    type L = Ledger<MemStore, MemVault>;
+
+    const H: [u8; 32] = [0x48; 32];
+    const WHY: &[u8] = b"AC-K7: the upgrade authority";
+
+    /// A book founded in process, its operator, and the input its writer decides.
+    struct Book7 {
+        l: L,
+        operator: Caller,
+        next: u64,
+        input: u64,
+    }
+
+    impl Book7 {
+        fn found() -> Result<Book7, String> {
+            let book = Book::bootstrap(
+                MemStore::new(),
+                MemVault::new(),
+                KeyRing::from_root([0x37; 32]),
+            )
+            .map_err(|e| format!("bootstrap: {e:?}"))?;
+            let genesis = Genesis {
+                assets: vec![AssetDecl {
+                    id: AssetId::parse("USD").map_err(|e| format!("{e:?}"))?,
+                    location: None,
+                    precision: 2,
+                    kind: AssetKind::Fiat,
+                    deprecated: false,
+                }],
+                operator_verifier: Verifier::new(vec![0x0F]),
+                lifecycle: LifecycleConfig::new([0x37; 16], 60, 3_600),
+                chainspec: None,
+                spec: None,
+            };
+            let (l, f) = Ledger::genesis(
+                book,
+                genesis,
+                OperationId::from_ref(OperationRef([0x37; 16])),
+                1,
+            )
+            .map_err(|e| format!("genesis: {e:?}"))?;
+            let mut b = Book7 {
+                l,
+                operator: Caller::new(f.operator, f.operator_credential),
+                next: 0,
+                input: 0,
+            };
+            b.step();
+            Ok(b)
+        }
+
+        fn step(&mut self) {
+            self.input += 1;
+            self.l.set_input(self.input);
+        }
+
+        fn ctx(&mut self, caller: Caller) -> Ctx {
+            self.next += 1;
+            let mut r = [0x70u8; 16];
+            r[8..].copy_from_slice(&self.next.to_be_bytes());
+            Ctx {
+                caller,
+                op: OperationId::from_ref(OperationRef(r)),
+                now: 10 + self.next,
+            }
+        }
+
+        fn identity(&mut self, kind: IdentityKind) -> Result<Caller, String> {
+            let ctx = self.ctx(self.operator);
+            let o = self
+                .l
+                .open_identity(
+                    &ctx,
+                    kind,
+                    None,
+                    Verifier::new(
+                        [0x40, 0x40]
+                            .into_iter()
+                            .chain(self.next.to_be_bytes())
+                            .collect(),
+                    ),
+                )
+                .map_err(|e| format!("open_identity: {}", e.code()))?
+                .value;
+            Ok(Caller::new(o.identity, o.credential))
+        }
+
+        fn set(
+            &mut self,
+            by: Caller,
+            mode: &Mode,
+            from: u64,
+        ) -> Result<(OperationId, Decision), Refusal> {
+            let ctx = self.ctx(by);
+            self.l
+                .set_authority(&ctx, mode.clone(), from, WHY)
+                .map(|a| (ctx.op, a.value))
+        }
+
+        fn propose(&mut self, by: Caller) -> Result<(OperationId, Decision), Refusal> {
+            let ctx = self.ctx(by);
+            let from = self.input + 2;
+            self.l
+                .propose_upgrade(&ctx, H, from, WHY)
+                .map(|a| (ctx.op, a.value))
+        }
+
+        fn approve(&mut self, by: Caller, p: OperationId, kind: Kind) -> Result<Decision, Refusal> {
+            let ctx = self.ctx(by);
+            self.l.approve_upgrade(&ctx, p, kind, WHY).map(|a| a.value)
+        }
+
+        /// The caller as a mode names it: its principal with the credential it calls with
+        /// (amendment 0034).
+        fn m(&self, c: Caller) -> Result<Member, String> {
+            let credential = self
+                .l
+                .state()
+                .credential(&c.credential)
+                .ok_or("no such credential")?;
+            Ok(Member {
+                principal: c.principal,
+                verifier: verifier_digest(credential.verifier()),
+            })
+        }
+
+        /// A settlement configuration, and the operator's grant to anchor on demand.
+        fn anchoring(&mut self) -> Result<(), String> {
+            let adapter = self.identity(IdentityKind::Organisation)?;
+            let ctx = self.ctx(self.operator);
+            self.l
+                .configure_settlement(
+                    &ctx,
+                    SettlementConfig {
+                        authoritative: SourceId::of_identity(&adapter.principal),
+                        instance: 1,
+                        suspense: None,
+                        inbound_deadline: 1_000_000,
+                        expiry_window: 1_000,
+                        block_time: 1,
+                        finality_margin: 1,
+                    },
+                )
+                .map_err(|e| format!("configure_settlement: {}", e.code()))?;
+            let ctx = self.ctx(self.operator);
+            let op = self.operator.principal;
+            self.l
+                .grant_operator(
+                    &ctx,
+                    op,
+                    NonEmptySet::one(OperatorOpKind::AnchorCheckpoint),
+                    None,
+                    WHY,
+                )
+                .map_err(|e| format!("grant_operator: {}", e.code()))?;
+            Ok(())
+        }
+
+        /// A posting, so that an anchor has an entry to bind: USD issued to an account of `owner`.
+        fn posting(&mut self, owner: Caller) -> Result<(), String> {
+            let usd = AssetId::parse("USD").map_err(|e| format!("{e:?}"))?;
+            let ctx = self.ctx(self.operator);
+            self.l
+                .grant_authority(
+                    &ctx,
+                    GrantRequest {
+                        kind: GrantKind::Issuance,
+                        principal: self.operator.principal,
+                        subject: Subject::Asset(usd),
+                        ops: NonEmptySet::one(OperationKind::Issue),
+                        per_operation: None,
+                        per_window: Some(Window {
+                            length: NonZeroU64::MIN,
+                            limit: NonZeroMinor::new(Minor::new(1_000_000))
+                                .map_err(|e| e.code().to_string())?,
+                        }),
+                        assets: Some(NonEmptySet::one(usd)),
+                        counterparties: None,
+                        parent: None,
+                        expires: None,
+                    },
+                )
+                .map_err(|e| format!("grant_authority: {}", e.code()))?;
+            let ctx = self.ctx(owner);
+            let account = self
+                .l
+                .open_account(
+                    &ctx,
+                    OpenAccount {
+                        owner: owner.principal,
+                        kind: AccountKind::Customer,
+                        custody: Custody::Delegated,
+                        treasury_limits: BTreeMap::new(),
+                        acknowledged: None,
+                    },
+                )
+                .map_err(|e| format!("open_account: {}", e.code()))?
+                .value;
+            let ctx = self.ctx(self.operator);
+            self.l
+                .issue(&ctx, usd, account, Minor::new(100))
+                .map_err(|e| format!("issue: {}", e.code()))?;
+            Ok(())
+        }
+
+        /// The mode is the genesis one, unchanged, with nothing scheduled or recorded.
+        fn unchanged(&self) -> Result<(), String> {
+            if (self.l.authority(), self.l.authority_next()) != (GENESIS, None)
+                || self.l.state().upgrade_authority().is_some()
+            {
+                return Err("a refused mode change changed the mode".into());
+            }
+            Ok(())
+        }
+    }
+
+    fn propose_approve(p: &[Member], a: &[Member]) -> Mode {
+        Mode {
+            rule: Rule::ProposeApprove {
+                proposers: p.iter().copied().collect(),
+                approvers: a.iter().copied().collect(),
+            },
+            delay: 0,
+        }
+    }
+
+    fn outcome(r: Result<(), String>) -> Outcome {
+        match r {
+            Ok(()) => Outcome::Pass,
+            Err(e) => Outcome::Fail(e),
+        }
+    }
+
+    fn expect<T: core::fmt::Debug>(
+        what: &str,
+        got: Result<T, Refusal>,
+        want: Refusal,
+    ) -> Result<(), String> {
+        match got {
+            Err(r) if r == want => Ok(()),
+            other => Err(format!("{what}: {other:?}, not {}", want.code())),
+        }
+    }
+
+    /// `AC-K7.7`: Given a book whose genesis fixes the mode "one principal" (the operator's
+    /// organisation identity), When that principal changes the mode to "a proposer and a different
+    /// approver", Then every later upgrade needs both, and the change is in the audit trail and in the
+    /// next anchor (`REQ-RT-18`).
+    pub(super) fn ac_k7_7_a_mode_change_binds_every_later_upgrade__service(
+        _: &mut dyn Harness,
+    ) -> Outcome {
+        outcome((|| {
+            let mut b = Book7::found()?;
+            let (p, a) = (
+                b.identity(IdentityKind::Person)?,
+                b.identity(IdentityKind::Person)?,
+            );
+            b.anchoring()?;
+            b.posting(p)?;
+            let genesis = b.l.upgrade_authority_in_force().ok_or("no roles")?.0;
+            let operator = Member {
+                principal: b.operator.principal,
+                verifier: GENESIS,
+            };
+            if genesis.mode != Mode::single(operator) || genesis.digest != GENESIS {
+                return Err(format!("the genesis mode is {genesis:?}"));
+            }
+            let mode = propose_approve(&[b.m(p)?], &[b.m(a)?]);
+            let from = b.input + 1;
+            match b.set(b.operator, &mode, from) {
+                Ok((_, Decision::Authorised(Action::SetAuthority { .. }))) => {}
+                other => return Err(format!("the operator's change of mode: {other:?}")),
+            }
+            b.step();
+            if b.l.authority() != mode.digest() {
+                return Err("the new mode is not in force from its input".into());
+            }
+            // Every later upgrade needs both: neither the operator, nor the proposer alone, nor the
+            // proposer approving its own proposal.
+            expect(
+                "the operator proposes",
+                b.propose(b.operator),
+                Refusal::NotAuthorised,
+            )?;
+            let (u, d) = b.propose(p).map_err(|e| e.code().to_string())?;
+            if d != Decision::Pending {
+                return Err(format!("the proposer alone: {d:?}"));
+            }
+            expect(
+                "the proposer approves",
+                b.approve(p, u, Kind::Upgrade),
+                Refusal::NotAuthorised,
+            )?;
+            expect(
+                "the operator approves",
+                b.approve(b.operator, u, Kind::Upgrade),
+                Refusal::NotAuthorised,
+            )?;
+            // Both: the approver's approval meets the mode. Nothing in this code version schedules an
+            // upgrade (`T-037-04`), so it stays pending, and says so.
+            match b.approve(a, u, Kind::Upgrade) {
+                Ok(Decision::AwaitingScheduler(Action::Upgrade { code: H, .. })) => {}
+                other => return Err(format!("the approver: {other:?}")),
+            }
+            // In the next anchor.
+            let ctx = b.ctx(b.operator);
+            let c =
+                b.l.anchor_checkpoint(&ctx, WHY)
+                    .map_err(|e| format!("anchor_checkpoint: {}", e.code()))?
+                    .value
+                    .ok_or("no checkpoint")?;
+            let bound = c.binding.ok_or("a checkpoint with no binding")?;
+            if bound.authority != mode.digest() || !c.consistent() {
+                return Err("the next anchor does not bind the mode in force".into());
+            }
+            // In the audit trail.
+            let mut trail = AuditTrail::new();
+            b.l.ship_audit(&mut trail)
+                .map_err(|e| format!("ship_audit: {e:?}"))?;
+            let set = trail
+                .iter()
+                .filter(|r| {
+                    r.action == AuditAction::Command(Command::SetAuthority)
+                        && r.outcome == AuditOutcome::Accepted
+                        && r.principal() == Some(b.operator.principal)
+                        && r.justification.as_ref().map(|j| j.as_bytes()) == Some(WHY)
+                })
+                .count();
+            if set != 1 {
+                return Err(format!("{set} audit records of the change of mode"));
+            }
+            Ok(())
+        })())
+    }
+
+    /// `AC-K7.8`: Given a mode change that is not authorised under the mode in force, or that names a
+    /// principal who does not exist, Then it is refused and the mode does not change (`REQ-RT-18`).
+    pub(super) fn ac_k7_8_an_unauthorised_or_unsatisfiable_mode_is_refused__service(
+        _: &mut dyn Harness,
+    ) -> Outcome {
+        outcome((|| {
+            let mut b = Book7::found()?;
+            let (p, a) = (
+                b.identity(IdentityKind::Person)?,
+                b.identity(IdentityKind::Person)?,
+            );
+            let next = b.input + 1;
+            let (mp, ma) = (b.m(p)?, b.m(a)?);
+            let mode = propose_approve(&[mp], &[ma]);
+            // Not authorised under the genesis mode: only the operator is.
+            expect(
+                "a principal outside the mode",
+                b.set(p, &mode, next),
+                Refusal::NotAuthorised,
+            )?;
+            b.unchanged()?;
+            // A principal who does not exist.
+            let ghost = Member {
+                principal: IdentityId::mint(&OperationId::from_ref(OperationRef([0xEE; 16])), 0),
+                verifier: [0xEE; 32],
+            };
+            let named = propose_approve(&[mp], &[ghost]);
+            expect(
+                "a principal who does not exist",
+                b.set(b.operator, &named, next),
+                Refusal::NotAuthorised,
+            )?;
+            // A principal named with a credential it does not hold (amendment 0034).
+            let unheld = propose_approve(
+                &[mp],
+                &[Member {
+                    verifier: [0xDD; 32],
+                    ..ma
+                }],
+            );
+            expect(
+                "a credential the principal does not hold",
+                b.set(b.operator, &unheld, next),
+                Refusal::NotAuthorised,
+            )?;
+            b.unchanged()?;
+            // A mode no one can satisfy: no approver other than the proposer, a threshold above n.
+            let alone = propose_approve(&[mp], &[mp]);
+            expect(
+                "no different approver",
+                b.set(b.operator, &alone, next),
+                Refusal::MalformedCommand,
+            )?;
+            let over = Mode {
+                rule: Rule::Threshold {
+                    members: [mp, ma].into(),
+                    k: 3,
+                },
+                delay: 0,
+            };
+            expect(
+                "a threshold above n",
+                b.set(b.operator, &over, next),
+                Refusal::MalformedCommand,
+            )?;
+            b.unchanged()?;
+            // Under propose-approve, a change of mode by the proposer alone, or approved by a
+            // principal outside the approvers, does not change it either.
+            b.set(b.operator, &mode, next)
+                .map_err(|e| e.code().to_string())?;
+            b.step();
+            let back = Mode::single(mp);
+            let (s, d) = b
+                .set(p, &back, b.input + 1)
+                .map_err(|e| e.code().to_string())?;
+            if d != Decision::Pending {
+                return Err(format!("the proposer alone changed the mode: {d:?}"));
+            }
+            expect(
+                "an approver outside the set",
+                b.approve(b.operator, s, Kind::SetAuthority),
+                Refusal::NotAuthorised,
+            )?;
+            if (b.l.authority(), b.l.authority_next()) != (mode.digest(), None) {
+                return Err("an unauthorised change of mode changed the mode".into());
+            }
+            Ok(())
+        })())
+    }
 }

@@ -57,6 +57,7 @@ impl LeafHost for State {
         self.openings.leaf_maps(out);
         self.anchoring.leaf_maps(out);
         self.chainspec.leaf_maps(out);
+        out.push(&self.upgrade_authority);
     }
 
     fn leaf_maps_mut<'a>(&'a mut self, out: &mut Vec<&'a mut dyn LeafMap>) {
@@ -85,6 +86,7 @@ impl LeafHost for State {
         self.openings.leaf_maps_mut(out);
         self.anchoring.leaf_maps_mut(out);
         self.chainspec.leaf_maps_mut(out);
+        out.push(&mut self.upgrade_authority);
     }
 }
 

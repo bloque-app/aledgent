@@ -411,6 +411,13 @@ pub enum Call {
         ctx: Ctx,
         justification: Vec<u8>,
     },
+    /// An upgrade-authority input (`F-037`, `T-037-05`): a change of mode, a proposal or an
+    /// approval. After `CancelUpgrade`, so no earlier variant's tag moves.
+    UpgradeAuthority {
+        ctx: Ctx,
+        input: crate::code::authority::Input,
+        justification: Vec<u8>,
+    },
     // The conformance suite's raw ports come last, so that no production variant's index (its
     // postcard tag in the host's archive and in every envelope) depends on whether a build enables
     // `conformance-ports` (T-005-17: a workspace build unifies the feature into every binary, and an
@@ -512,6 +519,7 @@ impl Call {
             Call::ApplySpecChunk { .. } => "apply_spec_chunk",
             Call::RescheduleUpgrade { .. } => "reschedule_upgrade",
             Call::CancelUpgrade { .. } => "cancel_upgrade",
+            Call::UpgradeAuthority { input, .. } => input.method(),
         }
     }
 }

@@ -437,9 +437,11 @@ fn input(
     .map_err(AgentRefusal::Malformed)?;
     let mut ledger = Ledger::from_parts(book, state, config);
     // What a checkpoint this input creates binds (`T-037-03`): the code that executes it, as the
-    // code map names it (`crate::fence`), and the hot row's mode; a way out is decided against the
-    // input's own number (`T-037-15`).
+    // code map names it (`crate::fence`), and the hot row's mode. The input's own number, which a
+    // way out is decided against (`T-037-15`), and at which a scheduled change of mode takes force
+    // (`T-037-05`).
     ledger.set_code(code.code_for(i.seq), hot.authority);
+    ledger.set_authority_next(hot.authority_next);
     ledger.set_input(i.seq);
     let clerk_ref = private.clerk.as_ref().map(|c| c as &dyn ClerkSigner);
     let mut summaries = Vec::with_capacity(i.calls.len());
@@ -474,6 +476,9 @@ fn input(
         return Err(AgentRefusal::UnprovenRead);
     }
     hot.notified += ledger.state().operations().outbox_created() as u64;
+    // The mode in force and any scheduled change of it, as the input leaves them (`T-037-05`).
+    hot.authority = ledger.authority();
+    hot.authority_next = ledger.authority_next();
     // The leaves whose value changed: the only service rows the invocation writes.
     let mut after = ledger.state().witnessed_leaves();
     after.extend(delivered_at.iter().map(|(id, at)| {
