@@ -25,6 +25,9 @@
 //!   builds its witness and private inputs from `F-006`'s store, invokes the Agent through an
 //!   [`host::AgentPort`], and checks the reply against the native run (`T-005-08`).
 //!
+//! - [`switch`] (feature `std`): `switch(H, n)`, the host's one operation for changing a writer's
+//!   code, behind a platform-neutral installer trait (`T-037-14`).
+//!
 //! - [`core`] (feature `ingress`): ingress's `boundary::Core` over the Agent, with the host's
 //!   durable log: what `aledgent-core-host` serves.
 //! - [`verified`] (feature `ingress`): the `verify-genesis` gate of a chainspec book (`T-036-25`).
@@ -60,6 +63,8 @@ pub mod witness;
 pub mod core;
 #[cfg(feature = "std")]
 pub mod host;
+#[cfg(feature = "std")]
+pub mod switch;
 #[cfg(feature = "ingress")]
 pub mod verified;
 
