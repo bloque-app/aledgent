@@ -472,6 +472,13 @@ impl Runtime {
                     Some(i.entry.actor),
                     Some(i.entry.deployment),
                 ),
+                // The switch of a writer's code (`T-037-14`): the same authority as an install,
+                // over the upgrade's target deployment.
+                ManagementRequest::UpgradeActor(u) => (
+                    AuthorityOperationKind::UpgradeActor,
+                    Some(u.actor),
+                    Some(u.to_deployment),
+                ),
                 other => {
                     return Err(DriverError::Runtime(format!(
                         "unsupported management request {other:?}"
@@ -566,6 +573,70 @@ impl Runtime {
             return Err(DriverError::Refused(format!("install: {:?}", t.outcome)));
         }
         self.attach(package, name, installation_data)
+    }
+
+    /// Upgrade the installed actor `name` in place to the admitted `package`: the platform half
+    /// of `switch(H, n)` on `saga` (`T-037-14`, amendment 0033).
+    ///
+    /// The runtime's upgrade is a compare-and-swap on the installed deployment: the request names
+    /// the deployment this host read ([`ActorEntry::deployment`] of the directory's record), and a
+    /// runtime whose actor is another one refuses it and changes nothing. The upgrade is authorised
+    /// like an install: a receipt the Agent's authority key signs (through the signer in a
+    /// deployment, so no key is in this process); the package's own signature, by the package key,
+    /// is checked when it is admitted. The new package must keep the constructor ABI
+    /// ([`sdk::UpgradeActor::constructor_abi`]): an in-place upgrade keeps the actor's immutable
+    /// installation data.
+    pub fn upgrade_actor(
+        &mut self,
+        package: &AdmittedActorPackage,
+        name: &str,
+    ) -> Result<Actor, DriverError> {
+        let actor = ActorId::top_level(self.descriptor.identity.agent, name);
+        let (t, _) = self.manage(
+            ManagementRequest::InspectActors {
+                after: None,
+                limit: 4,
+            },
+            false,
+        )?;
+        let RuntimeOutcome::Management(Ok(ManagementReply::Actors(page))) = t.outcome else {
+            return Err(DriverError::Runtime(format!("inspect: {:?}", t.outcome)));
+        };
+        let record = page
+            .entries
+            .into_iter()
+            .find(|r| r.entry.actor == actor)
+            .ok_or_else(|| DriverError::Runtime("the installed actor is not listed".into()))?;
+        let schema = sdk::schema::decode(package.state_lane_schema_bytes())
+            .map_err(|e| DriverError::Runtime(format!("schema: {e}")))?;
+        let constructor_abi = schema
+            .constructor_abi()
+            .map_err(|e| DriverError::Runtime(format!("constructor ABI: {e:?}")))?;
+        let state_layout = schema
+            .state_layout_hash()
+            .map_err(|e| DriverError::Runtime(format!("state layout: {e:?}")))?;
+        let request = ManagementRequest::UpgradeActor(Box::new(sdk::UpgradeActor {
+            actor,
+            from_deployment: record.entry.deployment,
+            to_deployment: package.deployment(),
+            to_program: package.program(),
+            producer: package.producer(),
+            package: package.package_ref().clone(),
+            agent_schema: package.manifest().state_lane_schema.clone(),
+            method_policy: package.manifest().method_policy.clone(),
+            constructor_abi,
+            state_layout,
+            contract: package.manifest().contract,
+            requirements: package.requirements(),
+        }));
+        let (t, _) = self.manage(request, true)?;
+        if !matches!(
+            t.outcome,
+            RuntimeOutcome::Management(Ok(ManagementReply::Upgraded(_)))
+        ) {
+            return Err(DriverError::Refused(format!("upgrade: {:?}", t.outcome)));
+        }
+        self.attach(package, name, None)
     }
 
     /// The actor `package` installed under `name`, as the Agent's directory lists it: after

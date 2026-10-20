@@ -43,6 +43,8 @@ pub struct VosPort {
     /// for every invocation for ever (`T-032-15`, stress finding F15).
     pub samples: Vec<Sample>,
     keep: bool,
+    /// The code this host runs and the versions it may switch to (`T-037-14`), if it tracks them.
+    code: Option<crate::switch::CodeState>,
 }
 
 impl VosPort {
@@ -54,7 +56,34 @@ impl VosPort {
             driver: PrincipalId(driver),
             samples: Vec::new(),
             keep: true,
+            code: None,
         }
+    }
+
+    /// Track the code this port runs (`T-037-14`): the digests of the `package` and `runtime`
+    /// bytes the host loaded, the actor's `name`, and the versions staged for a switch.
+    pub fn track_code(&mut self, state: crate::switch::CodeState) {
+        self.code = Some(state);
+    }
+
+    /// What the port tracks of its code, if anything.
+    pub fn code_state(&self) -> Option<&crate::switch::CodeState> {
+        self.code.as_ref()
+    }
+
+    pub(crate) fn code_state_mut(&mut self) -> Option<&mut crate::switch::CodeState> {
+        self.code.as_mut()
+    }
+
+    /// Upgrade the installed actor `name` to the admitted `package`, in place, and use the
+    /// upgraded actor from now on (`T-037-14`).
+    pub fn upgrade_actor(
+        &mut self,
+        package: &vos::agent::package_admission::AdmittedActorPackage,
+        name: &str,
+    ) -> Result<(), DriverError> {
+        self.actor = self.runtime.upgrade_actor(package, name)?;
+        Ok(())
     }
 
     /// Whether to keep every invocation's measurements in [`VosPort::samples`].
