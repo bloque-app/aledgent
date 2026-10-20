@@ -1005,6 +1005,8 @@ fn t037_05_the_wire_is_pinned() {
         (Command::ProposeUpgrade, 54),
         (Command::ApproveUpgrade, 55),
         (Command::ProposeMigration, 56),
+        // `T-037-04`: the upgrade itself, the next number after those (review of #47, B2).
+        (Command::Upgrade, 57),
     ] {
         assert_eq!(command_code(c), n, "{c:?}");
         assert_eq!(to_bytes(&c), vec![n], "{c:?} in the export");
@@ -1148,4 +1150,21 @@ fn t037_04_a_direct_upgrade_waits_out_the_delay_and_a_scheduled_change_of_mode()
         w2.set(w2.operator, &w2.single(c), from),
         Err(Refusal::InvalidTransition)
     );
+}
+
+/// Review of #47, B3: the direct `upgrade` input is "a single `Upgrade` under `Single`"
+/// (amendment 0023 (b′)), and only that. A member of `Threshold { k: 1 }` (whom `alone` counts as
+/// satisfying the mode by itself) is refused the direct input and upgrades by proposing, which meets
+/// the mode at the proposal and schedules.
+#[test]
+fn t037_04_a_member_of_a_threshold_of_one_upgrades_by_proposing_not_directly() {
+    let mut w = World::new();
+    let (a, b) = (w.person(), w.person());
+    w.change_mode(&w.threshold(&[a, b], 1));
+    let from = w.input + 3;
+    assert_eq!(w.upgrade(a, from), Err(Refusal::NotAuthorised));
+    assert_eq!(w.l.take_upgrade(), None);
+    let (_, d) = w.propose(a, from).unwrap();
+    assert!(met(&d));
+    assert_eq!(w.l.take_upgrade(), Some((H, from)));
 }

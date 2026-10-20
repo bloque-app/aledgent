@@ -162,7 +162,9 @@ impl AuditClass {
 /// **The writer's code (`F-037`), assigned once for the genesis code** (owner ruling on #44 and
 /// #45): 51 `RescheduleUpgrade` and 52 `CancelUpgrade` (`T-037-15`); 53 `SetAuthority`,
 /// 54 `ProposeUpgrade`, 55 `ApproveUpgrade` and 56 `ProposeMigration` (`T-037-05`); 57 `Upgrade`
-/// (`T-037-04`: the next number after those reserved, `[PENDING AMENDMENT]`). The export tags
+/// (`T-037-04`: the next number after those reserved; `[PENDING AMENDMENT]`, proposed in the body
+/// of PR #47 for amendment 0035 point 3, to be numbered by the owner before the genesis code
+/// freezes; pinned by `tests/upgrade_authority.rs`). The export tags
 /// (`crate::export::records`, `Command`) take the same numbers.
 pub const fn command_code(c: Command) -> u8 {
     match c {

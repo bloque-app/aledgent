@@ -17,6 +17,7 @@
 //!   is its input's only call through the real executor, so it is decided, not malformed.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use core_binding::core::{AgentCore, Founding, MemLog};
@@ -39,7 +40,7 @@ use common::HeldCode;
 /// The host's core: the sequencer in front of the Agent core, as `aledgent-core-host serve` runs
 /// it, so a feed is ordered by its sequences and a refused input gives its sequence back.
 #[derive(Clone)]
-struct Node(Arc<Sequencer<AgentCore<NativePort>>>);
+struct Node(Arc<Sequencer<AgentCore<NativePort>>>, Arc<AtomicBool>);
 
 impl Core for Node {
     async fn apply(&self, input: &CoreInput) -> Result<CoreReply, CoreError> {
@@ -83,13 +84,21 @@ impl Core for Node {
         self.0.stage_code(code).await
     }
     async fn feed(&self, feed: &Feed) -> FeedReply {
-        self.0.feed(feed).await
+        let reply = self.0.feed(feed).await;
+        // The link failing after the core ran the feed: the feeder is told it may have run, and
+        // keeps the rows' sequences (`F-038` §3).
+        if self.1.swap(false, Ordering::SeqCst) {
+            return FeedReply::Ambiguous;
+        }
+        reply
     }
 }
 
 type Dep = Deployment<MemStore, Node>;
 
 struct World {
+    /// Arm it, and the next feed the core answers is reported ambiguous to ingress.
+    ambiguous_next: Arc<AtomicBool>,
     d: Dep,
     core: AgentCore<NativePort>,
     code: HeldCode,
@@ -113,6 +122,7 @@ fn founding() -> Founding {
 /// A deployment over the sequenced Agent core, a source of code, and a ticker that never ticks:
 /// the inputs are the test's own.
 async fn world() -> World {
+    let ambiguous_next = Arc::new(AtomicBool::new(false));
     let core = AgentCore::open(NativePort::new(), founding(), MemLog::default())
         .unwrap_or_else(|e| panic!("the Agent core opens: {e}"));
     let code = HeldCode::default();
@@ -125,12 +135,20 @@ async fn world() -> World {
     let d = Deployment::assemble(
         MemStore::new(Duration::from_millis(50)),
         config,
-        Node(Arc::new(Sequencer::new(core.clone(), None))),
+        Node(
+            Arc::new(Sequencer::new(core.clone(), None)),
+            ambiguous_next.clone(),
+        ),
         core.founded(),
         MemJournal::new(),
     )
     .await;
-    World { d, core, code }
+    World {
+        ambiguous_next,
+        d,
+        core,
+        code,
+    }
 }
 
 fn hot(w: &World) -> Hot {
@@ -553,4 +571,44 @@ async fn ac_k7_12_a_way_out_overtakes_the_queue_of_a_fenced_writer_end_to_end() 
     .await;
     assert_eq!(s.as_u16(), 403, "recorded as a refusal: {v}");
     assert!(condition(&v).contains("ERR-NotAuthorised"));
+}
+
+/// **B1 of the review of #47 (red; `#[ignore]`d, with its reason).** The same fence as above, but
+/// the first feed after it is answered ambiguous (the core ran it and refused it as fenced, then
+/// the link failed): the head row is *carried* with its feed sequence. `F-038` §3 resends such a
+/// row first, with the sequence it was given, and never gives a sequence back below the highest
+/// position answered ambiguous, so the forwarder retries it for ever and never reads the store
+/// again: the operator's way out, which overtakes in the store, is never sent, and the fenced
+/// writer stays wedged.
+///
+/// It stays red because the fix the owner asked to try conflicts with the feed rule (the report on
+/// `#47`, and `T-037-18` in `tasks.md`): the way out would need the carried row's sequence, or a
+/// sequence past it that the core holds as a gap. Run it with `--ignored` to see the hole.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "B1 of the review of #47: a row carried from an ambiguous send is never overtaken (T-037-18)"]
+async fn ac_k7_12_a_way_out_overtakes_a_row_carried_from_an_ambiguous_send() {
+    let (w, _h1, n, _alice) = fenced_at_n().await;
+    assert_eq!(hot(&w).inputs + 1, n);
+    w.ambiguous_next.store(true, Ordering::SeqCst);
+    queue_ordinary(&w, "carried").await;
+    let carried = row(&w, "carried").await;
+    assert!(
+        carried.feed_seq.is_some(),
+        "it was sent, and carries its sequence"
+    );
+    let (s, v) = call(
+        &w.d.router,
+        "POST",
+        "/v1/ops/upgrade/cancel",
+        Some(&operator(&w)),
+        &[("client-key", "operator-cancel")],
+        Some(json!({ "justification": "T-037-04: the switch cannot be taken" })),
+    )
+    .await;
+    assert_eq!(
+        s.as_u16(),
+        200,
+        "the way out reaches the fenced writer: {v}"
+    );
+    assert_eq!(hot(&w).upgrade, None);
 }
