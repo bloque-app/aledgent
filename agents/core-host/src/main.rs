@@ -67,6 +67,7 @@ mod r03gas;
 mod raw;
 mod serve;
 mod sharded;
+mod switch;
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;

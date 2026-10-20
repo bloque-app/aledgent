@@ -971,6 +971,16 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
             .map_err(|e| format!("{e:?}"))?
         };
         check_genesis(&founding, &driver)?;
+        // The artefact check at start (`T-037-14`): the platform runs the code that executes the
+        // next input. A failure does not stop the host from opening: the same call precedes every
+        // send and refuses the input, while reads and a way-out input (which never needs the
+        // version it leaves) stay possible.
+        if let Err(e) = driver.ensure_code() {
+            std::eprintln!(
+                "aledgent-core: the code of the next input cannot be run yet, inputs that need it \
+                 are not sent: {e:?}"
+            );
+        }
         driver.archived();
         let mut inner = Inner {
             running: None,

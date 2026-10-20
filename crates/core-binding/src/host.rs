@@ -324,6 +324,19 @@ pub trait AgentPort {
     fn unacknowledged(&self) -> Option<u64> {
         None
     }
+    /// Make the platform run the code version `code`, the one that executes the input about to
+    /// be sent (`T-037-14`, [`crate::switch`]): "already switched" is success, an install
+    /// compare-and-swapped on what runs otherwise. A port that manages no code (a remote host, a
+    /// test's) runs what it runs: `Ok`. An `Err` means the port cannot run `code`: the driver
+    /// sends nothing.
+    ///
+    /// # Errors
+    ///
+    /// Why the platform cannot run `code`.
+    fn switch_to(&mut self, code: [u8; 32]) -> Result<(), String> {
+        let _ = code;
+        Ok(())
+    }
 }
 
 /// Why the driver stopped.
@@ -449,6 +462,9 @@ struct Staged {
     message_bytes: usize,
     /// The largest its reply can be.
     reply_bytes: usize,
+    /// The code version that executes it ([`crate::switch::target_code`]): a batch holds inputs of
+    /// one version, and the platform runs it before the batch is sent (`T-037-14`).
+    exec_code: [u8; 32],
 }
 
 impl Staged {
@@ -1326,6 +1342,40 @@ impl<P: AgentPort> Driver<P> {
         w
     }
 
+    /// The code version that executes input `seq` ([`crate::switch::target_code`]). A way-out
+    /// input is decided the same by either generation ([`crate::fence::admit`]), so it runs under
+    /// the code the writer has: a way out never needs the version it is the way out of, which is
+    /// the point of it when that version cannot be run.
+    fn exec_code_of(&self, seq: u64, way_out: bool) -> [u8; 32] {
+        if way_out {
+            self.writer.code
+        } else {
+            crate::switch::target_code(self.writer.code, self.writer.upgrade, seq)
+        }
+    }
+
+    /// Make the platform run the code version `code` (`T-037-14`); an `Err` means send nothing.
+    fn switch_for(&mut self, code: [u8; 32]) -> Result<(), DriveError> {
+        self.port.switch_to(code).map_err(|why| {
+            DriveError::Port(PortError::Unavailable(format!(
+                "the code version {} cannot be run: {why}",
+                crate::switch::short(&code)
+            )))
+        })
+    }
+
+    /// The artefact check at start (`T-037-14`): make the platform run the code that executes the
+    /// next input, by the same call that precedes every send. A host calls it once, after it
+    /// opens or recovers the driver; an `Err` means it must not drive the writer.
+    ///
+    /// # Errors
+    ///
+    /// [`DriveError::Port`] with why the platform cannot run it.
+    pub fn ensure_code(&mut self) -> Result<(), DriveError> {
+        let code = crate::switch::target_code(self.writer.code, self.writer.upgrade, self.seq + 1);
+        self.switch_for(code)
+    }
+
     /// The last input number the Agent committed.
     pub fn seq(&self) -> u64 {
         self.seq
@@ -1493,6 +1543,7 @@ impl<P: AgentPort> Driver<P> {
                 self.flush_staged()?;
             }
             let seq = self.seq + 1;
+            let exec = self.exec_code_of(seq, way_out);
             let writer = self.decided(seq, way_out, taken);
             let (leaves, whole) = self.service.leaves(&touched)?;
             let changes = changed(replica, &leaves, &deliveries)?;
@@ -1507,6 +1558,8 @@ impl<P: AgentPort> Driver<P> {
                 },
                 private: self.port.blob_key(&private),
             }));
+            // The platform runs the code that executes this input before it is sent (`T-037-14`).
+            self.switch_for(exec)?;
             let reply = self.send(&envelope, vec![private])?;
             // A refused input leaves the leaves unapplied; the host rebuilds from the Agent.
             if matches!(reply, Reply::Committed(_) | Reply::Duplicate { .. }) {
@@ -1543,6 +1596,7 @@ impl<P: AgentPort> Driver<P> {
         let (roots, next_posting) = replica_roots(replica, &self.service)?;
         let (tip, prev) = self.tip();
         let seq = tip + 1;
+        let exec = self.exec_code_of(seq, way_out);
         let writer = self.decided(seq, way_out, taken);
         let input = InputEnvelope {
             seq,
@@ -1581,12 +1635,19 @@ impl<P: AgentPort> Driver<P> {
             entry,
             log_hash,
             reply_bytes,
+            exec_code: exec,
         };
         self.pin(replica)?;
         // As if committed, as the leaves are: the next input runs under the code this one leaves.
         self.writer = writer;
         self.prepare(replica, seq + 1);
-        if !self.staged.is_empty() && !self.fits(&staged) {
+        // A batch holds inputs of one code version: the batch ends at *n* − 1 when an upgrade takes
+        // effect at *n*, so a restore point and a checkpoint land there (`T-037-14`).
+        let other_code = self
+            .staged
+            .last()
+            .is_some_and(|l| l.exec_code != staged.exec_code);
+        if !self.staged.is_empty() && (other_code || !self.fits(&staged)) {
             self.flush_staged()?;
         }
         self.staged.push(staged);
@@ -1639,6 +1700,10 @@ impl<P: AgentPort> Driver<P> {
     }
 
     fn flush_staged(&mut self) -> Result<(), DriveError> {
+        if let Some(first) = self.staged.first() {
+            let code = first.exec_code;
+            self.switch_for(code)?;
+        }
         let staged = core::mem::take(&mut self.staged);
         let replies = if staged.len() == 1 {
             let s = &staged[0];
@@ -2145,6 +2210,12 @@ pub struct NativePort {
     /// `code_generation()` returns. 0, *H₀*'s; a test sets another to run as a switched or a stale
     /// package.
     pub generation: u64,
+    /// The generation each code version runs as, for tests of the switch (`T-037-14`): when it is
+    /// not empty, [`AgentPort::switch_to`] sets [`NativePort::generation`] to the target's and
+    /// refuses a version it does not hold.
+    pub code_map: BTreeMap<[u8; 32], u64>,
+    /// The versions [`AgentPort::switch_to`] installed, in order, for tests.
+    pub switched: Vec<[u8; 32]>,
 }
 
 /// The principal the native port and the tests invoke as.
@@ -2159,6 +2230,8 @@ impl NativePort {
             slot: 0,
             fail_next: None,
             generation: 0,
+            code_map: BTreeMap::new(),
+            switched: Vec::new(),
         }
     }
 }
@@ -2223,6 +2296,21 @@ impl AgentPort for NativePort {
             .map(|b| decode::<RingEntry>(&b).map_err(PortError::Unavailable))
             .transpose()
     }
+
+    fn switch_to(&mut self, code: [u8; 32]) -> Result<(), String> {
+        if self.code_map.is_empty() {
+            return Ok(());
+        }
+        let generation = *self
+            .code_map
+            .get(&code)
+            .ok_or_else(|| "the version was not staged".to_string())?;
+        if self.generation != generation {
+            self.generation = generation;
+            self.switched.push(code);
+        }
+        Ok(())
+    }
 }
 
 /// Every row of `rows`, for scans of the Agent's state (`T-005-05`).
@@ -2247,6 +2335,9 @@ impl<T: AgentPort + ?Sized> AgentPort for Box<T> {
     }
     fn entry(&mut self, seq: u64) -> Result<Option<RingEntry>, PortError> {
         (**self).entry(seq)
+    }
+    fn switch_to(&mut self, code: [u8; 32]) -> Result<(), String> {
+        (**self).switch_to(code)
     }
 }
 
