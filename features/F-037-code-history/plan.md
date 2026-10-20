@@ -63,7 +63,8 @@ the claim of that number, with its record written last. In build order:
    scheduled `from`, the next one refuses the input, with nothing written. `RescheduleUpgrade` and
    `CancelUpgrade` are decided the same by either generation. The time spent fenced is a metric with an
    alert.
-7. **The modes** and their inputs.
+7. **The modes** and their inputs. A mode names each principal with one of its credentials
+   `[PENDING AMENDMENT 0034]`.
 8. **Retrieval**: `CodeSource`, plugins, Kreivo preimages.
 9. **Checkpoints as rows and leaf chunks**: the archive's checkpoint, and a snapshot sent to another node,
    hold the writer state and the leaves, never `agent.state`.
