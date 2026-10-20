@@ -59,6 +59,48 @@ pub const AGENT_EXECUTION_LIMITS: ExecutionLimits = ExecutionLimits {
     max_lane_state_bytes: 1024 * 1024,
 };
 
+/// The runtime's request to change the installed actor `installed` to the admitted `package`
+/// (`T-037-14`, `T-037-19`).
+///
+/// The compare-and-swap names the deployment installed now, and the new package keeps the
+/// constructor ABI. `state_compatible_from` is the one program of the package's signed claim
+/// (`state_compatible_with`) that is the installed program, or none: a package whose producer does
+/// not claim the program it replaces carries no claim, and the runtime refuses a program change of
+/// a stateful actor without one.
+///
+/// # Errors
+///
+/// The package's schema does not decode.
+pub fn upgrade_request(
+    actor: ActorId,
+    installed: &ActorEntry,
+    package: &AdmittedActorPackage,
+) -> Result<sdk::UpgradeActor, DriverError> {
+    let schema = sdk::schema::decode(package.state_lane_schema_bytes())
+        .map_err(|e| DriverError::Runtime(format!("schema: {e}")))?;
+    let constructor_abi = schema
+        .constructor_abi()
+        .map_err(|e| DriverError::Runtime(format!("constructor ABI: {e:?}")))?;
+    let state_layout = schema
+        .state_layout_hash()
+        .map_err(|e| DriverError::Runtime(format!("state layout: {e:?}")))?;
+    Ok(sdk::UpgradeActor {
+        actor,
+        from_deployment: installed.deployment,
+        to_deployment: package.deployment(),
+        to_program: package.program(),
+        producer: package.producer(),
+        package: package.package_ref().clone(),
+        agent_schema: package.manifest().state_lane_schema.clone(),
+        method_policy: package.manifest().method_policy.clone(),
+        constructor_abi,
+        state_layout,
+        contract: package.manifest().contract,
+        requirements: package.requirements(),
+        state_compatible_from: package.state_compatible_from(installed.program),
+    })
+}
+
 /// The core Agent's bounds, with `F025_ACTOR_GAS` (gas units) overriding the gas for a bench;
 /// with `F025_SKIP_LIMITS=1`, VOS's standard bounds with that gas.
 pub fn agent_limits() -> ExecutionLimits {
@@ -591,6 +633,14 @@ impl Runtime {
     /// is checked when it is admitted. The new package must keep the constructor ABI
     /// ([`sdk::UpgradeActor::constructor_abi`]): an in-place upgrade keeps the actor's immutable
     /// installation data.
+    ///
+    /// **A stateful actor** (one with lanes, the core) changes its program only on the claim of
+    /// the package's producer, which the request carries ([`upgrade_request`], `T-037-19`): the
+    /// patched runtime refuses it otherwise (`UnsupportedLane`), and it checks the claim names the
+    /// program installed now, the same producer, lanes, state layout and constructor ABI, and an
+    /// actor with no invocation result left unacknowledged. Only the patched runtime
+    /// (the VOS fork at the pin) decodes such a request: the released one panics on it, which
+    /// [`Runtime::exec`] reports as a failure of the runtime and not a refusal.
     pub fn upgrade_actor(
         &mut self,
         package: &AdmittedActorPackage,
@@ -612,28 +662,11 @@ impl Runtime {
             .into_iter()
             .find(|r| r.entry.actor == actor)
             .ok_or_else(|| DriverError::Runtime("the installed actor is not listed".into()))?;
-        let schema = sdk::schema::decode(package.state_lane_schema_bytes())
-            .map_err(|e| DriverError::Runtime(format!("schema: {e}")))?;
-        let constructor_abi = schema
-            .constructor_abi()
-            .map_err(|e| DriverError::Runtime(format!("constructor ABI: {e:?}")))?;
-        let state_layout = schema
-            .state_layout_hash()
-            .map_err(|e| DriverError::Runtime(format!("state layout: {e:?}")))?;
-        let request = ManagementRequest::UpgradeActor(Box::new(sdk::UpgradeActor {
+        let request = ManagementRequest::UpgradeActor(Box::new(upgrade_request(
             actor,
-            from_deployment: record.entry.deployment,
-            to_deployment: package.deployment(),
-            to_program: package.program(),
-            producer: package.producer(),
-            package: package.package_ref().clone(),
-            agent_schema: package.manifest().state_lane_schema.clone(),
-            method_policy: package.manifest().method_policy.clone(),
-            constructor_abi,
-            state_layout,
-            contract: package.manifest().contract,
-            requirements: package.requirements(),
-        }));
+            &record.entry,
+            package,
+        )?));
         let (t, _) = self.manage(request, true)?;
         if !matches!(
             t.outcome,
@@ -915,4 +948,158 @@ fn historical_lookup<'p>(
     }
     machine.registers_mut()[7] = value.len() as u64;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::package::admit_actor;
+    use crate::stateful_fixture as fixture;
+
+    fn admitted(tag: u8, claim: &[ProgramId]) -> AdmittedActorPackage {
+        admit_actor(&fixture::package(tag, claim)).expect("admitted")
+    }
+
+    /// The directory entry of `package` installed as `name`, as `Runtime::install` writes it.
+    fn entry_of(agent: AgentId, name: &str, package: &AdmittedActorPackage) -> ActorEntry {
+        let schema = sdk::schema::decode(package.state_lane_schema_bytes()).unwrap();
+        ActorEntry {
+            actor: ActorId::top_level(agent, name),
+            name: name.into(),
+            parent: None,
+            deployment: package.deployment(),
+            program: package.program(),
+            package: package.package_ref().clone(),
+            agent_schema: package.manifest().state_lane_schema.clone(),
+            method_policy: package.manifest().method_policy.clone(),
+            constructor_abi: schema.constructor_abi().unwrap(),
+            installation_data: None,
+            state_layout: schema.state_layout_hash().unwrap(),
+            lanes: package.requirements().lanes,
+            suspended: false,
+        }
+    }
+
+    #[test]
+    fn t037_19_the_upgrade_request_carries_the_producers_claim() {
+        let agent = AgentId([5; 32]);
+        let g0 = admitted(1, &[]);
+        let installed = entry_of(agent, "counter", &g0);
+        let actor = installed.actor;
+
+        // A package whose producer claims g0's program: the request names it.
+        let g1 = admitted(2, &[g0.program()]);
+        let claimed = upgrade_request(actor, &installed, &g1).unwrap();
+        assert_eq!(claimed.state_compatible_from, Some(g0.program()));
+        assert_eq!(claimed.from_deployment, g0.deployment());
+        assert_eq!(claimed.to_deployment, g1.deployment());
+        assert_eq!(claimed.to_program, g1.program());
+        assert_eq!(claimed.producer, g0.producer());
+
+        // One that does not: no claim, which the runtime refuses for a stateful actor.
+        let g1_plain = admitted(2, &[]);
+        let plain = upgrade_request(actor, &installed, &g1_plain).unwrap();
+        assert_eq!(plain.state_compatible_from, None);
+
+        // The claim is part of what the authority signs.
+        let commitment =
+            |u: sdk::UpgradeActor| ManagementRequest::UpgradeActor(Box::new(u)).commitment();
+        assert_ne!(commitment(claimed.clone()), commitment(plain));
+
+        // A claim names the program installed now: g2 claims g1, g0 is installed, so none is sent.
+        let g2 = admitted(3, &[g1.program()]);
+        assert_eq!(
+            upgrade_request(actor, &installed, &g2)
+                .unwrap()
+                .state_compatible_from,
+            None
+        );
+        // Once g1 is installed, it is.
+        let installed = entry_of(agent, "counter", &g1);
+        assert_eq!(
+            upgrade_request(actor, &installed, &g2)
+                .unwrap()
+                .state_compatible_from,
+            Some(g1.program())
+        );
+    }
+
+    /// The runtime itself (`T-037-19`): the patched runtime accepts a stateful actor's program
+    /// change on the producer's claim and refuses it without one, through `Runtime::upgrade_actor`
+    /// as the switch calls it.
+    ///
+    /// The runtime is a build product (VOS `services/agent-runtime` at the pin: its ELF, or the PVM
+    /// `aledgent-core-host runtime-pvm` links from it, as `core.Dockerfile` step 4 does), so the
+    /// test is ignored unless it is given (CI's job `stateful upgrade` builds it and runs this):
+    ///
+    /// ```text
+    /// ALEDGENT_STATEFUL_RUNTIME_PVM=agent_runtime.pvm \
+    ///   cargo test -p core-host -- --ignored t037_19_a_built_runtime
+    /// ```
+    ///
+    /// The released runtime fails it closed: its PVM panics on the claimed request.
+    #[test]
+    #[ignore = "needs ALEDGENT_STATEFUL_RUNTIME_PVM: the runtime built from the pinned VOS fork"]
+    fn t037_19_a_built_runtime_changes_a_stateful_program_only_on_the_claim() {
+        let path = std::env::var("ALEDGENT_STATEFUL_RUNTIME_PVM")
+            .expect("ALEDGENT_STATEFUL_RUNTIME_PVM names the runtime PVM");
+        let bytes = std::fs::read(path).expect("read the runtime");
+        // The runtime ELF (`cargo actor` in VOS `services/agent-runtime`) is linked as
+        // `aledgent-core-host runtime-pvm` links it for the image (Gray Paper calls only).
+        let pvm = if bytes.starts_with(b"\x7fELF") {
+            crate::package::link_runtime(&bytes, true).expect("link the runtime")
+        } else {
+            bytes
+        };
+        eprintln!(
+            "runtime {} B, blake2b-256 {}",
+            pvm.len(),
+            hex::encode(ledger_core::code::artefact_digest(&pvm))
+        );
+        let keys = AgentKeys {
+            package: crate::keys::test_key(fixture::PACKAGE_SEED),
+            authority: crate::keys::test_key(0x72),
+            discriminator: 0x40,
+        };
+        let mut rt = Runtime::create(&pvm, &keys).expect("create the Agent");
+
+        // Generation 1 is installed and runs: it writes its Linear lane and replies.
+        let g1 = admitted(1, &[]);
+        let actor = rt.install(&g1, "counter", None).expect("install g1");
+        let incarnation = actor.record.incarnation;
+        let mode = MethodMode::Linear;
+        let call = |rt: &mut Runtime, actor: &Actor| {
+            let mut message = vec![vos::value::TAG_DYNAMIC];
+            message.extend_from_slice(&vos::value::Msg::new("write").encode());
+            let id = rt.next_invocation(mode);
+            let work = rt.work(actor, id, mode, InvocationOrigin::anonymous(), message, &[]);
+            rt.invoke(&work).map(|i| i.reply)
+        };
+        assert_eq!(call(&mut rt, &actor).unwrap(), [fixture::reply_of(1)]);
+
+        // Generation 2 without the producer's claim: the runtime's own refusal, which the switch
+        // counts (`switch::install_error`). Nothing changed: g1 still runs.
+        let refused = rt.upgrade_actor(&admitted(2, &[]), "counter");
+        let Err(DriverError::Refused(why)) = refused else {
+            panic!("an unclaimed program change of a stateful actor: {refused:?}")
+        };
+        assert!(why.contains("UnsupportedLane"), "{why}");
+        assert_eq!(call(&mut rt, &actor).unwrap(), [fixture::reply_of(1)]);
+
+        // With the claim: accepted, in place (the incarnation and the lane are kept), and g2 runs.
+        let g2 = admitted(2, &[g1.program()]);
+        let actor = rt.upgrade_actor(&g2, "counter").expect("claimed upgrade");
+        assert_eq!(actor.record.entry.program, g2.program());
+        assert_eq!(actor.record.incarnation, incarnation);
+        assert_eq!(call(&mut rt, &actor).unwrap(), [fixture::reply_of(2)]);
+
+        // A claim names the program installed now: g3 claims g1, g2 is installed.
+        let stale = rt.upgrade_actor(&admitted(3, &[g1.program()]), "counter");
+        assert!(matches!(stale, Err(DriverError::Refused(_))), "{stale:?}");
+        // The next generation claims g2 and is accepted: the chain continues.
+        let g3 = admitted(3, &[g2.program()]);
+        let actor = rt.upgrade_actor(&g3, "counter").expect("chained upgrade");
+        assert_eq!(actor.record.entry.program, g3.program());
+        assert_eq!(call(&mut rt, &actor).unwrap(), [fixture::reply_of(3)]);
+    }
 }

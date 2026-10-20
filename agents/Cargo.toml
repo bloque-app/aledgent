@@ -14,11 +14,13 @@
 # | `core` | The Agent actor: `ledger-core` inside one VOS `saga` Local Agent (guest, `riscv64em-vos`). Its own workspace, as VOS's actors are | `nightly-2026-03-20` + `rust-src` |
 # | `core-host` | The host process: the AgentRuntime driver (runtime ABI), the leaf store and witness path, and the server of `ingress::boundary::Core`'s four operations | the same |
 #
-# VOS is pinned to aledgent's fork, branch `perf/agent-stack`, commit `c54fc1ff`: `saga/agents` at
-# e6f2bb45 with aledgent's changes (proposals/vos/0001-0005 and 0006-0010: compact acknowledged
-# results, actor-declared limits, programs loaded in place, the curve precompiles, the program hashed
-# once, the runtime profiles, per-Agent execution limits). TODO(F-025): move the pin to upstream
-# `saga/agents` once the changes are merged there.
+# VOS is pinned to aledgent's fork, branch `stateful-program-upgrade`, commit `10e41fc1`: `perf/agent-stack`
+# `c54fc1ff` (`saga/agents` at e6f2bb45 with aledgent's changes, proposals/vos/0001-0005 and 0006-0010:
+# compact acknowledged results, actor-declared limits, programs loaded in place, the curve
+# precompiles, the program hashed once, the runtime profiles, per-Agent execution limits) plus the
+# stateful program change (T-037-19, owner ruling w5): a stateful actor's program changes in place on
+# a claim its package's producer signs. TODO(F-025): move the pin to upstream `saga/agents` once the
+# changes are merged there.
 [workspace]
 resolver = "2"
 members = ["core-host"]
@@ -33,9 +35,9 @@ repository = "https://github.com/bloque-app/aledgent"
 publish = false
 
 [workspace.dependencies]
-vos = { git = "https://codeberg.org/pandres95/VOS.git", rev = "c54fc1ff13fcd55b86f2cf4edc77b041b62e245f", default-features = false }
-vos-pvm = { git = "https://codeberg.org/pandres95/VOS.git", rev = "c54fc1ff13fcd55b86f2cf4edc77b041b62e245f" }
-vos-pvm-compiler = { git = "https://codeberg.org/pandres95/VOS.git", rev = "c54fc1ff13fcd55b86f2cf4edc77b041b62e245f" }
+vos = { git = "https://codeberg.org/pandres95/VOS.git", rev = "10e41fc12c3f484bed320c2520f8398afd8b017f", default-features = false }
+vos-pvm = { git = "https://codeberg.org/pandres95/VOS.git", rev = "10e41fc12c3f484bed320c2520f8398afd8b017f" }
+vos-pvm-compiler = { git = "https://codeberg.org/pandres95/VOS.git", rev = "10e41fc12c3f484bed320c2520f8398afd8b017f" }
 
 # CipherClerk e9a7b08 with proposals/cipherclerk/0001 (randomness as a parameter), made by
 # tools/cipherclerk-patched.sh. The guest cannot build `signing` without it (getrandom).

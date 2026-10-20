@@ -933,7 +933,7 @@ new genesis.
 *Decision:*
 
 - **(a) `:code` in hot state.** A **code version** *H* is `blake2b-256` of a canonical manifest
-  (`aledgent/code/v1`) that names its **platform** (name and revision, e.g. `vos-saga@c54fc1ff`) and lists,
+  (`aledgent/code/v1`) that names its **platform** (name and revision, e.g. `vos-saga@10e41fc1`) and lists,
   for one writer kind, its **code generation** (`generation: u64`) and each artefact that decides a
   transition (`package`, optionally `runtime`, and `native-decide` wherever a host decides natively) with
   its unkeyed `blake2b-256`, length, **identities** on the platform (VOS `ProgramId` today; on `vos-core`

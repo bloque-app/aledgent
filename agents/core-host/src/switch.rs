@@ -336,7 +336,7 @@ mod tests {
             writer: WriterKind::Core,
             platform: Platform {
                 name: "vos-saga".into(),
-                revision: "c54fc1ff".into(),
+                revision: "10e41fc1".into(),
                 identities: Vec::new(),
             },
             generation: 0,
@@ -455,6 +455,34 @@ mod tests {
             install_error(DriverError::Runtime("signer down".into())),
             InstallError::Platform(_)
         ));
+    }
+
+    /// `T-037-19`: what the patched runtime answers to a program change it refuses is its own
+    /// refusal, as `driver::upgrade_actor` words it, and counts toward the park's stop. The
+    /// released runtime does not refuse a claimed request: its PVM panics, which the driver
+    /// reports as a failure of the runtime (`Platform`: transient, so the park only lengthens its
+    /// wait and never stops the host).
+    #[test]
+    fn t037_19_a_refusal_of_the_runtime_to_change_a_stateful_program_is_a_refusal() {
+        use crate::driver::DriverError;
+        use vos::agent_sdk::{ManagementError, RuntimeOutcome};
+        for refusal in [
+            ManagementError::UnsupportedLane,
+            ManagementError::StaleDeployment,
+        ] {
+            let outcome: RuntimeOutcome = RuntimeOutcome::Management(Err(refusal));
+            let e = install_error(DriverError::Refused(format!("upgrade: {outcome:?}")));
+            assert!(
+                matches!(&e, InstallError::Cannot(why) if why.contains(&format!("{refusal:?}"))),
+                "{e:?}"
+            );
+        }
+        // The released runtime panics on the claim: not a refusal.
+        let panicked = install_error(DriverError::Runtime("the runtime PVM panicked".into()));
+        assert!(
+            matches!(panicked, InstallError::Platform(_)),
+            "{panicked:?}"
+        );
     }
 
     #[test]

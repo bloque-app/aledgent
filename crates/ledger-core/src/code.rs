@@ -9,7 +9,7 @@
 //! - The **manifest** is a canonical encoding that starts with the magic `aledgent/code/v1` and
 //!   names, for one writer kind:
 //!   - its **platform** ([`Platform`]): the runtime and the execution node's software, with a
-//!     revision (`vos-saga@c54fc1ff…` today), and any identity the platform gives what it supplies
+//!     revision (`vos-saga@10e41fc1…` today), and any identity the platform gives what it supplies
 //!     itself (on `vos-core`, the node's default agent program);
 //!   - its **code generation** (`generation`): 0 at genesis, one more after each upgrade. Every
 //!     package carries it compiled in ([`generation`]), and the build fails when the two differ;

@@ -51,7 +51,7 @@ pub const PLATFORM: &str = "vos-saga";
 
 /// The revision of [`PLATFORM`] this host links: the VOS commit `agents/Cargo.toml` pins (a test
 /// keeps the two equal). A manifest naming another revision is another platform's code.
-pub const PLATFORM_REVISION: &str = "c54fc1ff13fcd55b86f2cf4edc77b041b62e245f";
+pub const PLATFORM_REVISION: &str = "10e41fc12c3f484bed320c2520f8398afd8b017f";
 
 /// The identity kind of VOS's `ProgramId` of a program, on [`PLATFORM`].
 pub const VOS_PROGRAM_ID: &str = "vos-program-id";
