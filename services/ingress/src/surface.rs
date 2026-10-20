@@ -1544,6 +1544,32 @@ async fn command_reply<S: Store, C: Core>(
     // The writer's code (`T-037-04`): an upgrade's code version is staged before the command is
     // logged, and a way out overtakes the forwarder's queue; both only for a caller the core says
     // may take the code in hand (`code_door`).
+    // A repeat of a code command is answered from its first decision, before the door looks at it
+    // again: the code it named may be in force by now (so no longer one the writer's next
+    // generation), and its source may be down (`REQ-OP-10`, `INV-18`).
+    if is_code_input(&command) {
+        match shared
+            .store
+            .find(&domain, command.surface(), &client_key)
+            .await
+        {
+            Ok(Some(row)) if row.new.body_digest != digest.0 => {
+                return refusal(Refusal::ClientKeyReused);
+            }
+            Ok(Some(row)) => {
+                return answer(
+                    shared,
+                    &who.principal,
+                    row,
+                    None,
+                    shared.config.decision_wait,
+                )
+                .await;
+            }
+            Ok(None) => {}
+            Err(_) => return refusal(Refusal::DecisionUnavailable),
+        }
+    }
     let overtakes = match code_door(shared, &command, who, on_behalf_of.as_deref()).await {
         Ok(o) => o,
         Err(r) => return refusal(r),
@@ -1668,10 +1694,10 @@ async fn code_door<S: Store, C: Core>(
     who: &Authenticated,
     on_behalf_of: Option<&str>,
 ) -> Result<bool, Refusal> {
-    let Command::Operator(j) = command else {
+    let Some(input) = code_input_of(command) else {
         return Ok(false);
     };
-    let Some(input) = j.op.code_input() else {
+    let Command::Operator(j) = command else {
         return Ok(false);
     };
     let caller = who.caller(on_behalf_of.map(str::to_owned));
@@ -1684,10 +1710,11 @@ async fn code_door<S: Store, C: Core>(
     };
     let authorised = match shared.core.query(&caller, &asked, shared.clock.now()).await {
         Ok(QueryReply::CodeAuthority { authorised }) => authorised,
-        // Any other answer is a refusal of the question itself (a credential that does not
-        // resolve): the caller is not one the core lets in.
-        Ok(_) => false,
-        Err(_) => return Err(Refusal::DecisionUnavailable),
+        // The core refused the question itself (a credential that does not resolve): the caller is
+        // not one it lets in, and the writer will say so.
+        Ok(QueryReply::Refused { .. }) => false,
+        // An answer to another question, or none: nothing is staged and nothing is logged.
+        Ok(_) | Err(_) => return Err(Refusal::DecisionUnavailable),
     };
     if !authorised {
         return Ok(false);
@@ -1704,6 +1731,18 @@ async fn code_door<S: Store, C: Core>(
         },
         _ => Ok(true),
     }
+}
+
+/// Which input of the writer's code `command` is, if it is one (`T-037-04`).
+fn code_input_of(command: &Command) -> Option<ledger_core::ledger::operator::CodeInput> {
+    match command {
+        Command::Operator(j) => j.op.code_input(),
+        _ => None,
+    }
+}
+
+fn is_code_input(command: &Command) -> bool {
+    code_input_of(command).is_some()
 }
 
 /// Ask the core, retrying while it does not answer, for at most `NFR-16`; then the answer is
