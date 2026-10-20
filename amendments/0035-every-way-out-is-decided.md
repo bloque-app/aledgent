@@ -111,3 +111,11 @@ continuation's scoped refusal (`REQ-RT-21`, D16, D22), and every other acceptanc
 (`core_binding::fence`, `ledger_core`'s `reschedule_upgrade` and `cancel_upgrade`). `T-037-04` carries the
 routes and, as a blocker, their priority over the forwarder's queue and the first-call rule shown end to
 end.
+
+## Clarification after the ruling (2026-10-20, owner ruling w6 (B), not part of the approved text)
+
+Added after the owner approved this amendment. It changes neither ruling 1 to 3 nor R1 and R2. R1 says a
+move "to an input not later than its own" is refused. Owner ruling w6 (B) adds that a move is refused too
+when it is not strictly later than the input the upgrade is scheduled from, so that no member alone brings
+an approved upgrade forward. It is recorded in amendment 0034, in its second clarification, which is where
+the question of who may take a way out was left.

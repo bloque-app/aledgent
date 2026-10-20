@@ -60,7 +60,8 @@ pub fn artefact_digest(bytes: &[u8]) -> [u8; 32] {
 /// applies it the same: the upgrade does not take effect at its input, and the generation stays.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WayOut {
-    /// The upgrade is moved to input `from`, later than the way out's own.
+    /// The upgrade is moved to input `from`, later than the way out's own and than the input the
+    /// scheduled upgrade applied from (owner ruling w6: decided by the library, never here).
     Reschedule {
         /// The input number it now applies from.
         from: u64,
