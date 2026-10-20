@@ -387,7 +387,7 @@ jobs:
           ALEDGENT_STATEFUL_RUNTIME_PVM: ${{ runner.temp }}/agent-runtime-target/riscv64em-vos/release/agent_runtime.elf
         run: |
           set -euo pipefail
-          cargo test --locked -p core-host -- --ignored --nocapture t037_19_a_built_runtime | tee "$RUNNER_TEMP/test.log"
+          cargo test --locked -p core-host -- --ignored --nocapture t037_19_a_built_runtime 2>&1 | tee "$RUNNER_TEMP/test.log"
           grep -E '^runtime [0-9]+ B, blake2b-256 [0-9a-f]{64}$' "$RUNNER_TEMP/test.log" | sed 's/^/- /' >> "$GITHUB_STEP_SUMMARY"
 
   # F-027 (T-027-03, T-027-07): the settlement executor's Kreivo PASS transactions, rebuilt with
