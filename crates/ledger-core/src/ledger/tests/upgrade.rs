@@ -101,6 +101,97 @@ fn t037_15_an_unauthorised_or_invalid_way_out_takes_nothing() {
     assert_eq!(fx.ledger.take_way_out(), None);
 }
 
+/// `T-037-05`, owner ruling w6: with an upgrade scheduled from input 10, a move goes strictly
+/// later than 10 (and than its own input): earlier or equal is `ERR-InvalidTransition`, recorded
+/// on the trail, taking nothing; strictly later is taken. A cancel is taken whatever is scheduled.
+/// With nothing scheduled the move is checked against its own input alone, as before. An
+/// unauthorised move stays `ERR-NotAuthorised`, however early.
+#[test]
+fn t037_05_a_move_goes_strictly_later_than_the_scheduled_input() {
+    let mut fx = Fx::new();
+    let op = fx.operator();
+    let p = fx.person();
+    let scheduled = Some(([0xB1; 32], 10));
+    // Earlier than the scheduled input, equal to it: refused, recorded, nothing taken. Input 7
+    // is below both, so the way out's own input does not decide it.
+    for from in [8, 9, 10] {
+        fx.ledger.set_scheduled_upgrade(scheduled);
+        fx.ledger.set_input(7);
+        let ctx = fx.ctx(op);
+        assert_eq!(
+            fx.ledger
+                .reschedule_upgrade(&ctx, from, b"pull it forward")
+                .unwrap_err(),
+            Refusal::InvalidTransition,
+            "to {from}"
+        );
+        assert_eq!(
+            last_audit(&fx).outcome,
+            AuditOutcome::Refused(Refusal::InvalidTransition)
+        );
+        assert_eq!(fx.ledger.take_way_out(), None);
+    }
+    // An unauthorised move keeps its refusal: authority is decided first.
+    fx.ledger.set_scheduled_upgrade(scheduled);
+    fx.ledger.set_input(7);
+    let ctx = fx.ctx(p);
+    assert_eq!(
+        fx.ledger
+            .reschedule_upgrade(&ctx, 8, b"not mine")
+            .unwrap_err(),
+        Refusal::NotAuthorised
+    );
+    // Strictly later: taken.
+    fx.ledger.set_scheduled_upgrade(scheduled);
+    fx.ledger.set_input(7);
+    let ctx = fx.ctx(op);
+    fx.ledger
+        .reschedule_upgrade(&ctx, 11, b"push it back")
+        .unwrap();
+    assert_eq!(
+        fx.ledger.take_way_out(),
+        Some(WayOut::Reschedule { from: 11 })
+    );
+    assert_eq!(last_audit(&fx).outcome, AuditOutcome::Accepted);
+    // A cancel is not a move: taken.
+    fx.ledger.set_scheduled_upgrade(scheduled);
+    fx.ledger.set_input(8);
+    let ctx = fx.ctx(op);
+    fx.ledger.cancel_upgrade(&ctx, b"abandon it").unwrap();
+    assert_eq!(fx.ledger.take_way_out(), Some(WayOut::Cancel));
+    // The scheduled upgrade already applies (the way out's own input is at or after it): the move
+    // is still checked against its own input, which is the later of the two.
+    fx.ledger.set_scheduled_upgrade(scheduled);
+    fx.ledger.set_input(12);
+    let ctx = fx.ctx(op);
+    assert_eq!(
+        fx.ledger
+            .reschedule_upgrade(&ctx, 12, b"to its own input")
+            .unwrap_err(),
+        Refusal::InvalidTransition
+    );
+    fx.ledger.set_input(12);
+    let ctx = fx.ctx(op);
+    fx.ledger
+        .reschedule_upgrade(&ctx, 13, b"after its own input")
+        .unwrap();
+    assert_eq!(
+        fx.ledger.take_way_out(),
+        Some(WayOut::Reschedule { from: 13 })
+    );
+    // Nothing scheduled: only its own input decides, and the move is recorded, changing nothing.
+    fx.ledger.set_scheduled_upgrade(None);
+    fx.ledger.set_input(7);
+    let ctx = fx.ctx(op);
+    fx.ledger
+        .reschedule_upgrade(&ctx, 8, b"nothing to move")
+        .unwrap();
+    assert_eq!(
+        fx.ledger.take_way_out(),
+        Some(WayOut::Reschedule { from: 8 })
+    );
+}
+
 /// Owner ruling on #44: a way out is its input's first call. One decided after another call of the
 /// same input is refused `ERR-MalformedCommand`, recorded, and takes nothing; the next input starts
 /// again ([`Ledger::set_input`]).

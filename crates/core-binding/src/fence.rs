@@ -25,8 +25,9 @@
 //! generation decides every way-out input the same (owner ruling on #44, D10; [`decide`]): the
 //! upgrade does not take effect at it, and the generation stays *g*. A way out taken applies: a
 //! cancel clears the upgrade, a reschedule moves it. One not taken (unauthorised, a move not later
-//! than its own input, a repeat of an earlier request, or not its input's first call, which the
-//! library refuses as `ERR-MalformedCommand`) is a recorded refusal that takes its input number,
+//! than its own input or than the input the scheduled upgrade applies from, a repeat of an earlier
+//! request, or not its input's first call, which the library refuses as `ERR-MalformedCommand`)
+//! is a recorded refusal that takes its input number,
 //! and the upgrade stays scheduled, to take effect at the next input that is not a way out. So a
 //! bad way out at the head of the queue can never wedge the old code, and the committed state at
 //! that input never depends on which package was installed when it arrived. An input that mixes a

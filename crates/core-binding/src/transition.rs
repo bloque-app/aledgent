@@ -548,6 +548,9 @@ fn input(
     // (`T-037-05`).
     ledger.set_code(code.code_for(i.seq), hot.authority);
     ledger.set_authority_next(hot.authority_next);
+    // The scheduled upgrade as this input finds it: a move of it goes strictly later than it
+    // (owner ruling w6, `T-037-05`), the same for code of either generation.
+    ledger.set_scheduled_upgrade(code.upgrade);
     ledger.set_input(i.seq);
     let clerk_ref = private.clerk.as_ref().map(|c| c as &dyn ClerkSigner);
     let mut summaries = Vec::with_capacity(i.calls.len());
