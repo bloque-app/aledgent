@@ -39,7 +39,7 @@ use super::{Accepted, Ctx, Ledger, policy_used};
 use crate::audit::Justification;
 use crate::code::authority::{
     Action, AuthorityRecord, Decision, InForce, Input, Kind, MAX_PENDING, Member, Mode, Proposal,
-    Rule, authorise, check_from, verifier_digest,
+    Rule, authorise, check_from, fits, verifier_digest,
 };
 use crate::export::canon::Enc;
 use crate::id::OperationId;
@@ -216,14 +216,20 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                 if matches!(in_force.mode.rule, Rule::Threshold { .. }) {
                     approvals.insert(p.identity);
                 }
-                Proposal {
+                let proposal = Proposal {
                     id: ctx.op,
                     action,
                     under: in_force.digest,
                     proposer: p.identity,
                     approvals,
                     at: n,
+                };
+                // The record stays one leaf a writer can always store, every approval to come
+                // included (`MAX_RECORD_BYTES`).
+                if !fits(&record, &proposal) {
+                    return Err(Refusal::InvalidTransition);
                 }
+                proposal
             }
             None => {
                 let Input::ApproveUpgrade { proposal, kind } = input else {

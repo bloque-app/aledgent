@@ -21,8 +21,8 @@ use ledger_core::asset::{AssetId, AssetKind};
 use ledger_core::audit::{AuditAction, AuditOutcome, AuditTrail};
 use ledger_core::authority::OperationKind;
 use ledger_core::code::authority::{
-    Action, Decision, GENESIS, Kind, MAX_DELAY, MAX_LEAD, MAX_PENDING, MAX_PRINCIPALS, Member,
-    Mode, Rule, verifier_digest,
+    Action, Decision, GENESIS, Kind, MAX_DELAY, MAX_LEAD, MAX_PENDING, MAX_PRINCIPALS,
+    MAX_RECORD_BYTES, Member, Mode, Rule, verifier_digest,
 };
 use ledger_core::export::ExportError;
 use ledger_core::export::anchor::Anchors;
@@ -949,45 +949,45 @@ fn t037_05_a_full_queue_refuses_until_a_proposal_is_replaced() {
     assert!(w.pending().iter().any(|q| q.id == p));
 }
 
-/// Review of #45 at `4cc6ae9`, F5: the largest record the bounds allow (sixteen changes of mode
-/// pending, each naming thirty-two members, each approved by all of them) is one leaf of about
-/// 37 KB. How the core's guest heap takes it under the platform is not tested here.
+/// Review of #45 at `4cc6ae9`, F5: the record's size bound, through the writer. Under a mode of
+/// thirty-two members, each proposes a change to a mode listing all of them as proposers and as
+/// approvers; the record fills up before the queue does, the next such proposal is refused, and
+/// the record, every approval to come counted, stays within `MAX_RECORD_BYTES`.
 #[test]
-fn t037_05_the_largest_record_is_bounded() {
-    use ledger_core::code::authority::{AuthorityRecord, Proposal};
-    let op = |n: u8| OperationId::from_ref(OperationRef([n; 16]));
-    let members: BTreeSet<Member> = (0..MAX_PRINCIPALS as u8)
-        .map(|n| Member {
-            principal: IdentityId::mint(&op(n), 0),
-            verifier: [n; 32],
-        })
-        .collect();
-    let mode = Mode {
-        rule: Rule::Threshold {
-            members: members.clone(),
-            k: MAX_PRINCIPALS as u32,
-        },
-        delay: MAX_DELAY,
-    };
-    let record = AuthorityRecord {
-        mode: Some(mode.clone()),
-        next: Some((mode.clone(), u64::MAX)),
-        pending: (0..MAX_PENDING as u8)
-            .map(|n| Proposal {
-                id: op(0x80 + n),
-                action: Action::SetAuthority {
-                    mode: mode.clone(),
-                    from: u64::MAX,
-                },
-                under: mode.digest(),
-                proposer: IdentityId::mint(&op(n), 0),
-                approvals: members.iter().map(|m| m.principal).collect(),
-                at: u64::MAX,
-            })
-            .collect(),
-    };
-    let bytes = ledger_core::export::canon::to_bytes(&record).len();
-    assert!(bytes <= 40_000, "{bytes} bytes");
+fn t037_05_a_proposal_that_would_overgrow_the_record_is_refused() {
+    let mut w = World::new();
+    let all: Vec<Caller> = (0..MAX_PRINCIPALS).map(|_| w.person()).collect();
+    w.change_mode(&w.threshold(&all, MAX_PRINCIPALS as u32));
+    let big = w.propose_approve(&all, &all);
+    let far = w.input + 100;
+    let mut refused = None;
+    for (i, p) in all.iter().enumerate() {
+        match w.set(*p, &big, far) {
+            Ok((_, d)) => assert_eq!(d, Decision::Pending),
+            Err(r) => {
+                refused = Some((i, r));
+                break;
+            }
+        }
+    }
+    let (made, r) = refused.expect("the record fills up");
+    assert_eq!(r, Refusal::InvalidTransition);
+    assert!(made < MAX_PENDING, "{made}");
+    assert_eq!(w.pending().len(), made);
+    let bytes =
+        w.l.state()
+            .leaf_value(ledger_core::leaves::kind::UPGRADE_AUTHORITY, &[])
+            .unwrap()
+            .unwrap()
+            .len();
+    let headroom: usize = w
+        .pending()
+        .iter()
+        .map(|p| (MAX_PRINCIPALS - p.approvals.len()) * 16)
+        .sum();
+    assert!(bytes + headroom <= MAX_RECORD_BYTES, "{bytes} + {headroom}");
+    // A small proposal still fits beside them.
+    assert!(w.propose(all[0], far).is_ok());
 }
 
 /// Review of #45 at `4cc6ae9`, F4: the wire, pinned. The audit command codes of the writer's code,

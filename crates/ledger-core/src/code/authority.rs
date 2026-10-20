@@ -84,10 +84,30 @@ pub const MAX_LEAD: u64 = 2 * MAX_DELAY;
 /// in all, so the record stays one bounded leaf. **The limit, stated plainly:** a proposer holds
 /// at most three slots (one per kind), so six or more proposers between them can fill the queue,
 /// and every other proposal is then refused (`ERR-InvalidTransition`) until one is replaced by its
-/// proposer, or a change of mode clears them all. A full record of sixteen changes of mode, each
-/// naming thirty-two members and approved by all of them, is about 37 KB (tested); how the core's
-/// guest heap takes a witness that size under the platform is not tested here.
+/// proposer, or a change of mode clears them all. The record's size is bounded too
+/// ([`MAX_RECORD_BYTES`]), which can refuse a proposal before the queue is full.
 pub const MAX_PENDING: usize = 16;
+
+/// The most bytes the record may take, in its canonical encoding, with every pending proposal
+/// counted as if every member had approved it: 24 KiB. A record is one leaf; in the Agent's mapped
+/// layout one leaf is one row, written in one execution, whose rows the platform bounds (64 KiB a
+/// row, about 48 KiB of state images an execution; `core_binding::hot`). Half the smaller leaves
+/// room for the rest of the input. A proposal that would take the record past it is refused
+/// (`ERR-InvalidTransition`), and an approval never can, since its bytes were counted when the
+/// proposal was made ([`fits`]). How the platform takes a leaf this size is not tested here.
+pub const MAX_RECORD_BYTES: usize = 24 * 1024;
+
+/// Whether `record`, with `proposal` pending in it, stays within [`MAX_RECORD_BYTES`] once every
+/// pending proposal holds as many approvals as a mode can name.
+pub fn fits(record: &AuthorityRecord, proposal: &Proposal) -> bool {
+    let id_bytes = canon::to_bytes(&proposal.proposer).len();
+    let headroom = |p: &Proposal| MAX_PRINCIPALS.saturating_sub(p.approvals.len()) * id_bytes;
+    let bytes = canon::to_bytes(record).len()
+        + canon::to_bytes(proposal).len()
+        + record.pending.iter().map(headroom).sum::<usize>()
+        + headroom(proposal);
+    bytes <= MAX_RECORD_BYTES
+}
 
 /// The digest a member names its credential by: `blake2b-256(VERIFIER_DOMAIN ‖ scheme ‖
 /// material)`. Public material only (`REQ-AU-8`).
@@ -877,6 +897,60 @@ mod tests {
         );
         // The longest delay can elapse.
         assert_eq!(check_from(&at(MAX_DELAY), 10, 10 + MAX_DELAY + 1), Ok(()));
+    }
+
+    /// Review of #45 at `4cc6ae9`, F5: the largest record the bounds allow. The mode in force names
+    /// thirty-two members, a change to a mode listing them all as proposers and as approvers is
+    /// scheduled, and changes of mode of that size are proposed until one no longer fits. Then every
+    /// pending proposal is approved by every member: the record is still within
+    /// `MAX_RECORD_BYTES`.
+    #[test]
+    fn t037_05_the_largest_record_stays_within_its_bound() {
+        let all = (0..MAX_PRINCIPALS as u8).map(m).collect::<BTreeSet<_>>();
+        let big = Mode {
+            rule: Rule::ProposeApprove {
+                proposers: all.clone(),
+                approvers: all.clone(),
+            },
+            delay: MAX_DELAY,
+        };
+        let in_force = Mode {
+            rule: Rule::Threshold {
+                members: all.clone(),
+                k: MAX_PRINCIPALS as u32,
+            },
+            delay: MAX_DELAY,
+        };
+        let mut record = AuthorityRecord {
+            mode: Some(in_force.clone()),
+            next: Some((big.clone(), u64::MAX)),
+            pending: Vec::new(),
+        };
+        loop {
+            let n = record.pending.len() as u8;
+            let p = Proposal {
+                id: op(0x80 + n),
+                action: Action::SetAuthority {
+                    mode: big.clone(),
+                    from: u64::MAX,
+                },
+                under: in_force.digest(),
+                proposer: id(n),
+                approvals: [id(n)].into(),
+                at: u64::MAX,
+            };
+            if !fits(&record, &p) {
+                break;
+            }
+            record.pending.push(p);
+        }
+        assert!(record.pending.len() >= 4, "{}", record.pending.len());
+        for p in &mut record.pending {
+            p.approvals = all.iter().map(|x| x.principal).collect();
+        }
+        let bytes = canon::to_bytes(&record).len();
+        assert!(bytes <= MAX_RECORD_BYTES, "{bytes}");
+        assert!(bytes > MAX_RECORD_BYTES - 4 * 1024, "{bytes}");
     }
 
     /// Review of #45 at `4cc6ae9`, F1: a change applies at most `MAX_LEAD` inputs ahead, so a

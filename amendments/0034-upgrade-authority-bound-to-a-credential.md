@@ -146,9 +146,12 @@ amendment to `SPEC.md`, and for the owner to confirm there.
 - **What an export refuses.** Until the export carries the mode (`T-037-17`), it refuses only a book that
   left its genesis mode or has a change of it scheduled. A proposal still pending under the genesis mode is
   not carried, and need not be, because nothing of it is scheduled.
-- **The proposal queue.** At most sixteen proposals are pending at once, one per proposer and kind. Six or
-  more proposers between them can fill the queue. A full queue refuses every new proposal until a proposer
-  replaces its own, or a change of mode clears them all.
+- **The proposal queue.** At most sixteen proposals are pending at once, one per proposer and kind. The
+  record that holds them is also capped at 24 KiB. That cap counts every approval each proposal could still
+  receive, so an approval never overflows the record, and the record stays one leaf a writer can always
+  store. Large changes of mode reach the cap before the count. Six or more proposers between them can fill
+  the queue. A full queue refuses every new proposal until a proposer replaces its own, or a change of mode
+  clears them all.
 
 Whether one member alone may take a way out of a scheduled upgrade (move or cancel it) is a separate
 question. It is with the owner, and its ruling belongs in an amendment of its own.
