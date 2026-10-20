@@ -246,3 +246,27 @@ fn t037_14_the_driver_switches_before_n_on_the_mapped_layout() {
     ));
     assert_eq!(hot(&mut fx).inputs, before);
 }
+
+/// `T-037-14`, review of #46: a way-out input on the mapped layout is run by *g* too, so it commits
+/// when *H* cannot be run (the mapped path computes the code of its input on its own).
+#[test]
+fn t037_14_the_way_out_is_taken_on_the_mapped_layout_when_h_cannot_be_run() {
+    let mut fx = Fx::mapped();
+    let _ = fx.person();
+    let g = hot(&mut fx).code;
+    let n = hot(&mut fx).inputs + 1;
+    let mut h = hot(&mut fx);
+    h.upgrade = Some((H1, n));
+    fx.driver.port_mut().rows.0.insert(HOT.to_vec(), encode(&h));
+    fx.driver.reload_code(&mut fx.replica).unwrap();
+    fx.driver.port_mut().code_map = [(g, 0)].into_iter().collect();
+    let ctx = fx.ctx(fx.operator());
+    let _ = fx
+        .replica
+        .cancel_upgrade(&ctx, b"T-037-14: H cannot be run");
+    let c = fx.sync().expect("the way out commits").expect("sent");
+    assert_eq!(c.seq, n);
+    assert!(fx.driver.port().switched.is_empty());
+    let h = hot(&mut fx);
+    assert_eq!((h.code, h.generation, h.upgrade), (g, 0, None));
+}

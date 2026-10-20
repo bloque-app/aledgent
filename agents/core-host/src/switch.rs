@@ -242,9 +242,12 @@ impl Park {
         self.why = why;
     }
 
-    /// The platform runs what was asked: nothing is parked.
-    pub fn succeeded(&mut self) {
-        *self = Self::default();
+    /// The platform runs `target`, as asked: what was parked for it is cleared. A park held for
+    /// another target stays (a way-out's reinstall of *g* must not wipe the park of *H*).
+    pub fn succeeded(&mut self, target: &[u8; 32]) {
+        if self.target.as_ref() == Some(target) {
+            *self = Self::default();
+        }
     }
 }
 
@@ -296,11 +299,22 @@ impl CodeInstaller for crate::port::VosPort {
         let package = crate::package::admit_actor(&version.package)
             .map_err(|e| InstallError::Platform(format!("the package is not admitted: {e:?}")))?;
         self.upgrade_actor(&package, &name)
-            .map_err(|e| InstallError::Platform(format!("{e:?}")))?;
+            .map_err(install_error)?;
         if let Some(c) = self.code_state_mut() {
             c.running.package = want.package;
         }
         Ok(())
+    }
+}
+
+/// How a failed `UpgradeActor` is told to the switch: the runtime's own refusal (it decided, and
+/// would decide again: `UnsupportedLane` on a stateful actor) is a refusal the park counts toward
+/// its stop; the runtime program failing is the platform's, which a retry may settle.
+fn install_error(e: crate::driver::DriverError) -> InstallError {
+    use crate::driver::DriverError;
+    match e {
+        DriverError::Refused(why) => InstallError::Cannot(format!("the runtime refused it: {why}")),
+        other => InstallError::Platform(other.to_string()),
     }
 }
 
@@ -414,8 +428,32 @@ mod tests {
         assert!(q.blocked(&t, u64::MAX).is_none());
         assert!(q.blocked(&t, PARK_MAX_WAIT_MS - 1).is_some());
         // A success clears it.
-        p.succeeded();
+        p.succeeded(&t);
         assert!(p.blocked(&t, 0).is_none());
+    }
+
+    #[test]
+    fn t037_14_a_success_for_another_target_keeps_the_park_of_h() {
+        let (h, g) = ([1u8; 32], [2u8; 32]);
+        let mut p = Park::default();
+        p.failed(h, "refused".into(), false, 0);
+        p.succeeded(&g);
+        assert!(p.blocked(&h, 0).is_some(), "g's reinstall does not wipe H's park");
+        p.succeeded(&h);
+        assert!(p.blocked(&h, 0).is_none());
+    }
+
+    #[test]
+    fn t037_14_the_runtimes_refusal_counts_as_a_refusal_and_its_failure_does_not() {
+        use crate::driver::DriverError;
+        assert!(matches!(
+            install_error(DriverError::Refused("UnsupportedLane".into())),
+            InstallError::Cannot(_)
+        ));
+        assert!(matches!(
+            install_error(DriverError::Runtime("signer down".into())),
+            InstallError::Platform(_)
+        ));
     }
 
     #[test]

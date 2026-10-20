@@ -343,7 +343,7 @@ impl AgentPort for VosPort {
         let r = core_binding::switch::ensure(code, None, 0, &digests, self);
         if let Some(c) = self.code_state_mut() {
             match &r {
-                Ok(_) => c.park.succeeded(),
+                Ok(_) => c.park.succeeded(&code),
                 Err(e) => c.park.failed(
                     code,
                     e.to_string(),
