@@ -29,8 +29,10 @@
 //! library refuses as `ERR-MalformedCommand`) is a recorded refusal that takes its input number,
 //! and the upgrade stays scheduled, to take effect at the next input that is not a way out. So a
 //! bad way out at the head of the queue can never wedge the old code, and the committed state at
-//! that input never depends on which package was installed when it arrived. No input shape is
-//! refused by the Agent: an input that mixes a way out with anything else is an ordinary input.
+//! that input never depends on which package was installed when it arrived. An input that mixes a
+//! way out with anything else is refused whole, `ERR-MalformedCommand`, before the fence and the
+//! same by every generation, with nothing written ([`way_out_input`]); no request makes one, since
+//! one command is one call.
 //!
 //! **The upgrade taking effect.** Code of *g* + 1 that takes an input the upgrade applies to,
 //! other than a way out it takes, makes *H* and *g* + 1 the ones in force as the input's first
@@ -39,6 +41,8 @@
 //!
 //! Every function here is pure, `no_std`, and used by both the Agent's transition and the host's
 //! driver, which predicts each entry it compares (`crate::host`).
+
+use alloc::string::String;
 
 use ledger_core::call::Call;
 use ledger_core::code::WayOut;
@@ -110,18 +114,30 @@ pub fn way_out_of(call: &Call) -> Option<WayOut> {
     }
 }
 
-/// Whether an input of `calls` with `deliveries` delivery records is a way-out input: at least one
-/// call, every call a way out, and no delivery. Any other input is an ordinary one, whatever its
-/// calls.
-pub fn way_out_input<'a>(calls: impl IntoIterator<Item = &'a Call>, deliveries: usize) -> bool {
-    let mut any = false;
+/// Whether an input of `calls` with `deliveries` delivery records is a way-out input: exactly one
+/// call, a way out, and no delivery. An input with no way out is an ordinary one. An input that
+/// holds a way out and anything else (another call, a second way out, a delivery) is refused whole,
+/// `ERR-MalformedCommand`, with nothing of it applied, by code of any generation alike, before the
+/// fence (owner ruling on #44, N1; amendment 0035).
+pub fn way_out_input<'a>(
+    calls: impl IntoIterator<Item = &'a Call>,
+    deliveries: usize,
+) -> Result<bool, AgentRefusal> {
+    let (mut n, mut ways) = (0usize, 0usize);
     for c in calls {
-        if way_out_of(c).is_none() {
-            return false;
+        n += 1;
+        if way_out_of(c).is_some() {
+            ways += 1;
         }
-        any = true;
     }
-    any && deliveries == 0
+    match (ways, n, deliveries) {
+        (0, _, _) => Ok(false),
+        (1, 1, 0) => Ok(true),
+        _ => Err(AgentRefusal::Malformed(String::from(
+            "ERR-MalformedCommand: a way out of an upgrade is an input of its own, one call and \
+             nothing else",
+        ))),
+    }
 }
 
 /// The fence's admission (module documentation): whether code of generation `running` may decide

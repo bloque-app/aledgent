@@ -482,7 +482,7 @@ fn input(
         });
     }
     // The fence (`T-037-15`, `crate::fence`): at every input, before anything of it runs.
-    let way_out = crate::fence::way_out_input(&i.calls, i.deliveries.len());
+    let way_out = crate::fence::way_out_input(&i.calls, i.deliveries.len())?;
     let mut code = crate::fence::WriterCode::of(&hot);
     crate::fence::admit(inv.generation, &code, i.seq, way_out)?;
     // Backpressure (`T-005-07`): nothing more until the driver archives.

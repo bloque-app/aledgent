@@ -13,7 +13,7 @@
 
 mod common;
 use common::*;
-use core_binding::envelope::{AgentRefusal, Committed, Fenced, decode, encode};
+use core_binding::envelope::{AgentRefusal, Committed, Fenced, encode};
 use core_binding::host::{BatchLimits, DriveError, Driver, NativePort};
 use core_binding::hot::{HOT, Hot, RingEntry, decode_hot};
 use ledger_core::call::Summary;
@@ -470,46 +470,60 @@ fn t037_15_the_fence_ends_a_batch_after_its_prefix() {
     assert_eq!(hot(&mut fx).inputs, n - 1);
 }
 
-/// Owner ruling on #44: no input shape is refused by the Agent or stops the host. A way out that
-/// is not its input's first call is refused `ERR-MalformedCommand`, recorded, and changes nothing
-/// of the upgrade; an input that mixes a way out with other calls is an ordinary input.
+/// Owner ruling on #44, N1 (amendment 0035): an input that holds a way out must hold nothing else.
+/// `[Cancel, other]`, `[other, Cancel]` and `[Cancel, Cancel]` (a second way out is not allowed
+/// either) at `n` are each refused whole, `ERR-MalformedCommand`, by the old code and the new alike:
+/// nothing of the input applies, the cancel included, and its number is not taken.
 #[test]
-fn t037_15_a_way_out_with_other_calls_is_a_recorded_refusal() {
-    let mut fx = Fx::native();
-    let _ = fx.person();
-    let n = hot(&mut fx).inputs + 5;
-    schedule(&mut fx, Some((H1, n)), 0);
-    let op = fx.operator();
-    let ctx = fx.ctx(op);
-    let _ = fx
-        .replica
-        .open_identity(&ctx, IdentityKind::Person, None, Verifier::new(vec![7]));
-    let ctx = fx.ctx(op);
-    let _ = fx
-        .replica
-        .cancel_upgrade(&ctx, b"T-037-15: after another call");
-    let c = fx.sync().unwrap().unwrap();
-    assert_eq!(c.summaries.len(), 2);
-    assert_eq!(
-        c.summaries[1],
-        Summary::Refused("ERR-MalformedCommand".into())
-    );
-    archive(&mut fx);
-    assert_eq!(hot(&mut fx).upgrade, Some((H1, n)));
-    // A way out first, then another call: decided in order, an ordinary input.
-    let ctx = fx.ctx(op);
-    let _ = fx
-        .replica
-        .cancel_upgrade(&ctx, b"T-037-15: then another call");
-    let ctx = fx.ctx(op);
-    let _ = fx
-        .replica
-        .open_identity(&ctx, IdentityKind::Person, None, Verifier::new(vec![8]));
-    let c = fx.sync().unwrap().unwrap();
-    assert_eq!(c.summaries[0], Summary::Accepted);
-    archive(&mut fx);
-    assert_eq!(hot(&mut fx).upgrade, None);
-    let _: Hot = decode(&encode(&hot(&mut fx))).unwrap();
+fn t037_15_an_input_with_a_way_out_and_anything_else_is_refused_whole() {
+    #[derive(Clone, Copy, Debug)]
+    enum Part {
+        Cancel,
+        Other,
+    }
+    for shape in [
+        [Part::Cancel, Part::Other],
+        [Part::Other, Part::Cancel],
+        [Part::Cancel, Part::Cancel],
+    ] {
+        for generation in [0, 1] {
+            let (mut fx, _, n) = scheduled(generation);
+            let before = hot(&mut fx);
+            let op = fx.operator();
+            for (k, part) in shape.iter().enumerate() {
+                let ctx = fx.ctx(op);
+                match part {
+                    Part::Cancel => {
+                        let _ = fx.replica.cancel_upgrade(&ctx, b"T-037-15: mixed");
+                    }
+                    Part::Other => {
+                        let _ = fx.replica.open_identity(
+                            &ctx,
+                            IdentityKind::Person,
+                            None,
+                            Verifier::new(vec![k as u8 + 40]),
+                        );
+                    }
+                }
+            }
+            match fx.sync() {
+                Err(DriveError::Refused(AgentRefusal::Malformed(m))) => {
+                    assert!(m.contains("ERR-MalformedCommand"), "{shape:?}: {m}")
+                }
+                other => panic!("{shape:?} under {generation}: {other:?}"),
+            }
+            let h = hot(&mut fx);
+            assert_eq!(h, before, "{shape:?} under {generation}: nothing applied");
+            assert_eq!((h.inputs + 1, h.upgrade), (n, Some((H1, n))));
+        }
+    }
+    // A way out alone is taken, by either generation.
+    for generation in [0, 1] {
+        let (mut fx, _, n) = scheduled(generation);
+        let op = fx.operator();
+        let c = way_out(&mut fx, op, None).unwrap().unwrap();
+        assert_eq!((c.seq, c.summaries), (n, vec![Summary::Accepted]));
+    }
 }
 
 /// F8 of the review of #44: the way out on the mapped layout, decided at `n` by the old code.

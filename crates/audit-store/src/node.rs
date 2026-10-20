@@ -31,6 +31,9 @@
 //!   removed. The trail never holds more than `KEEP_FILES × ROTATE_BYTES` (64 MiB) plus one record;
 //!   a node fenced for days keeps its latest records, not its first.
 //!
+//! - **Forged values** (a sequence number or a head count at `u64::MAX`, a length that does not
+//!   fit) never panic: every sum over what the files hold saturates or is checked.
+//!
 //! What it found is reported ([`NodeDamage`]), for the node to log; the core warns and carries on.
 //! Nothing in a record may carry credential material (`REQ-AU-8`): the core writes an input's key,
 //! kind and time, never its body.
@@ -275,7 +278,11 @@ fn read_all(dir: &Path) -> (NodeRead, Option<(u64, [u8; 32])>, u64) {
             read.records.push(record);
         }
     }
-    let found = read.records.last().zip(last).map(|(r, h)| (r.seq + 1, h));
+    let found = read
+        .records
+        .last()
+        .zip(last)
+        .map(|(r, h)| (r.seq.saturating_add(1), h));
     if let (Some((count, _)), found) = (read_head(dir), found) {
         read.damage.missing = count.saturating_sub(found.map_or(0, |(c, _)| c));
     }
@@ -366,7 +373,7 @@ impl NodeTrail {
             let _ = f.set_len(len).and_then(|()| f.sync_all());
             return Err(e.into());
         }
-        self.next += 1;
+        self.next = self.next.saturating_add(1);
         self.head = hash;
         write_head(&self.dir, self.next, &self.head)?;
         Ok(record)
@@ -560,5 +567,35 @@ mod tests {
         let read = NodeTrail::read(&s.config.dir);
         assert_eq!(read.records.len(), KEEP_FILES);
         assert_eq!(read.records.last().unwrap().seq, KEEP_FILES as u64 + 1);
+    }
+
+    /// Review of #44, N3: forged values never panic. A record whose sequence number is `u64::MAX`,
+    /// a head whose count is `u64::MAX`, and a frame whose length is `u64::MAX` open, read and
+    /// append.
+    #[test]
+    fn t037_15_forged_values_in_the_node_trail_never_panic() {
+        let s = store();
+        let forged = NodeRecord {
+            seq: u64::MAX,
+            at: u64::MAX,
+            input: u64::MAX,
+            kind: "fenced".into(),
+            detail: "forged".into(),
+        };
+        let (mut bytes, hash) = frame(&forged, &[0; 32]);
+        // A frame that claims the largest length, after it.
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&u64::MAX.to_be_bytes());
+        bytes.extend_from_slice(b"short");
+        fs::write(file(&s), &bytes).unwrap();
+        write_head(&s.config.dir, u64::MAX, &hash).unwrap();
+        let read = NodeTrail::read(&s.config.dir);
+        assert_eq!(read.records.len(), 1);
+        let mut t = trail(&s);
+        let r = t.append(1, "fenced", 1, "after forged values").unwrap();
+        assert_eq!(r.seq, u64::MAX);
+        let _ = t.append(2, "fenced", 2, "and again").unwrap();
+        let _ = NodeTrail::read(&s.config.dir);
+        let _ = trail(&s);
     }
 }

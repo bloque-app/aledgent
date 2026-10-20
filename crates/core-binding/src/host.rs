@@ -1462,10 +1462,12 @@ impl<P: AgentPort> Driver<P> {
             return Err(DriveError::Unsupported(r.call.method().to_string()));
         }
         // Whether it is a way-out input, and the way out it took, the replica's: what the input
-        // does to the writer's code (`T-037-15`). No shape of input is refused here.
+        // does to the writer's code (`T-037-15`). An input that mixes a way out with anything else
+        // is sent as it is: the Agent refuses it whole (`crate::fence::way_out_input`).
         let taken = replica.take_way_out();
         let way_out =
-            crate::fence::way_out_input(recorded.iter().map(|r| &r.call), deliveries.len());
+            crate::fence::way_out_input(recorded.iter().map(|r| &r.call), deliveries.len())
+                .unwrap_or(false);
         let mut keys = keys;
         keys.journals.insert(replica.book().journal());
         let openings = openings_before(replica, &keys, &before);
