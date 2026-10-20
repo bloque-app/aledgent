@@ -128,3 +128,28 @@ authorise it.
 Approved by the owner as drafted on 2026-10-19, R1 and R2 both, including that under "one principal" a lost
 credential blocks the book for good, with no recovery path. The alternative, a recovery path that the
 operator's own recovery authority could also use, would reopen the takeover R1 closes.
+
+## Clarification after the ruling (2026-10-20, not part of the approved text)
+
+This section was added after the owner approved R1 and R2. It changes neither of them. It records how
+the plan meets them, after the independent review of #45 at `4cc6ae9`. It is for the pass that applies this
+amendment to `SPEC.md`, and for the owner to confirm there.
+
+- **How far ahead a change may apply.** R1 asks that a mode's delay "can elapse within the book's life".
+  The same must hold for the input a change applies from. Otherwise a change of mode could be scheduled for
+  an input the book never reaches. The outgoing mode would then authorise nothing more, and no input withdraws
+  a scheduled change, so the code could never change again. The plan therefore refuses a change, at its
+  proposal and at its authorisation, that would apply more than 2¹⁷ inputs ahead of the input deciding it
+  (`MAX_LEAD`, twice the longest delay). At the ticker's floor of one input a minute, that is about 91 days.
+- **The settlement adapter cannot be a member.** It is refused every command, so it can never "hold the
+  authority" (R1).
+- **What an export refuses.** Until the export carries the mode (`T-037-17`), it refuses only a book that
+  left its genesis mode or has a change of it scheduled. A proposal still pending under the genesis mode is
+  not carried, and need not be, because nothing of it is scheduled.
+- **The proposal queue.** At most sixteen proposals are pending at once, one per proposer and kind. Six or
+  more proposers between them can fill the queue. A full queue refuses every new proposal until a proposer
+  replaces its own, or a change of mode clears them all.
+
+Whether one member alone may take a way out of a scheduled upgrade (move or cancel it) is a separate
+question. It is with the owner, and its ruling belongs in an amendment of its own.
+

@@ -20,6 +20,7 @@ use core_binding::envelope::encode;
 use core_binding::host::{AgentPort, Driver, NativePort};
 use core_binding::hot::{HOT, Hot, Limits, MAX_BUDGET, RingEntry};
 use ledger_core::anchor::Checkpoint;
+use ledger_core::audit::{AuditAction, AuditOutcome};
 use ledger_core::call::Summary;
 use ledger_core::chainspec::{ChunkLimits, GenesisCode};
 use ledger_core::code::authority::{
@@ -34,6 +35,7 @@ use ledger_core::operator::OperatorOpKind;
 use ledger_core::principal::{Caller, Scheme, Verifier};
 use ledger_core::set::NonEmptySet;
 use ledger_core::settlement::{SettlementConfig, SourceId};
+use ledger_core::state::Command;
 
 fn manifest() -> CodeManifest {
     CodeManifest {
@@ -576,19 +578,30 @@ enum By {
     /// The proposer's identity, with a credential the operator imported into it after the mode
     /// named the proposer's own.
     Swapped,
+    /// The proposer of the mode scheduled to take force at the way out's input (boundary books
+    /// only), named by no earlier mode.
+    Incoming,
 }
 
 /// A book whose mode was changed to propose-approve, with an upgrade to `H` scheduled from its
 /// next input (set in the hot row, as `T-037-04`'s `Upgrade` will), run by the package of
-/// `generation`, and a way out taken as input `n` by `by`: a cancel, or a move to `to`. Answers
-/// the book, the input's reply and `n`.
+/// `generation`, and a way out taken as input `n` by `by`: a cancel, or a move to `to`. With
+/// `boundary`, a further change of mode, to `c` proposing and `b` approving, is scheduled to take
+/// force at `n` itself, the way out's input. Answers the book, the input's reply, `n` and the
+/// principal who took the way out.
 fn way_out_book(
     generation: u64,
     by: By,
     to: Option<u64>,
-) -> (Fx<NativePort>, core_binding::envelope::Committed, u64) {
+    boundary: bool,
+) -> (
+    Fx<NativePort>,
+    core_binding::envelope::Committed,
+    u64,
+    ledger_core::id::IdentityId,
+) {
     let mut fx = Fx::native();
-    let (a, b) = (fx.person(), fx.person());
+    let (a, b, c) = (fx.person(), fx.person(), fx.person());
     let mode = propose_approve(&fx, &a, &b);
     let from = fx.driver.seq() + 2;
     set(&mut fx, &mode, from);
@@ -623,6 +636,25 @@ fn way_out_book(
         .unwrap()
         .value[0];
     fx.synced();
+    if boundary {
+        // `a` proposes the change to `c` and `b`, `b` approves it, and it takes force at the
+        // input after the approval: the way out's.
+        let incoming = propose_approve(&fx, &c, &b);
+        let from = fx.driver.seq() + 3;
+        let ctx = fx.ctx(a);
+        let s = ctx.op;
+        fx.replica
+            .set_authority(&ctx, incoming.clone(), from, WHY)
+            .unwrap();
+        fx.synced();
+        let ctx = fx.ctx(b);
+        fx.replica
+            .approve_upgrade(&ctx, s, Kind::SetAuthority, WHY)
+            .unwrap();
+        fx.synced();
+        assert_eq!(hot(&mut fx).authority_next, Some((incoming.digest(), from)));
+        assert_eq!(hot(&mut fx).inputs + 1, from);
+    }
     // The upgrade, scheduled from the next input; the package of `generation` runs it.
     let n = hot(&mut fx).inputs + 1;
     let mut h = hot(&mut fx);
@@ -635,6 +667,7 @@ fn way_out_book(
         By::Approver => b,
         By::Operator => op,
         By::Swapped => Caller::new(a.principal, imported),
+        By::Incoming => c,
     };
     let ctx = fx.ctx(caller);
     let why = b"T-037-05: a way out under the mode in force";
@@ -645,7 +678,84 @@ fn way_out_book(
     let c = fx.sync().unwrap().unwrap();
     fx.archive.push(fx.driver.last_entry.clone().unwrap());
     fx.driver.archived();
-    (fx, c, n)
+    (fx, c, n, caller.principal)
+}
+
+/// The way out's audit record, as the replica (which reached the Agent's roots) holds it: its
+/// command, its outcome and its principal.
+fn way_out_record(
+    fx: &mut Fx<NativePort>,
+) -> (
+    ledger_core::audit::AuditAction,
+    ledger_core::audit::AuditOutcome,
+    Option<ledger_core::id::IdentityId>,
+) {
+    let mut trail = ledger_core::audit::AuditTrail::new();
+    fx.replica.ship_audit(&mut trail).unwrap();
+    let r = trail.iter().last().unwrap();
+    (r.action, r.outcome, r.principal())
+}
+
+/// Check one way out decided by the packages of both generations: the same reply, writer state
+/// and log hash; the summary, the audit record (accepted or refused, naming its principal) and
+/// the upgrade as `taken` says.
+fn check_way_out(by: By, to: Option<u64>, boundary: bool, taken: bool) {
+    let (mut old, a, n, who) = way_out_book(0, by, to, boundary);
+    let (mut new, b, _, _) = way_out_book(1, by, to, boundary);
+    assert_eq!(a, b, "{by:?}");
+    assert_eq!(a.seq, n, "{by:?}: the way out takes input n");
+    let expected = if taken {
+        Summary::Accepted
+    } else {
+        Summary::Refused("ERR-NotAuthorised".into())
+    };
+    assert_eq!(a.summaries, vec![expected], "{by:?}");
+    assert_eq!(writer_state(&mut old), writer_state(&mut new), "{by:?}");
+    assert_eq!(
+        old.archive.last().unwrap().log_hash(),
+        new.archive.last().unwrap().log_hash()
+    );
+    let h = hot(&mut old);
+    let upgrade = match (taken, to) {
+        (true, None) => None,
+        (true, Some(m)) => Some((H, m)),
+        (false, _) => Some((H, n)),
+    };
+    assert_eq!(
+        (h.inputs, h.generation, h.upgrade),
+        (n, 0, upgrade),
+        "{by:?}"
+    );
+    // On the trail, alike under both generations, with the principal who took it.
+    let command = if to.is_some() {
+        Command::RescheduleUpgrade
+    } else {
+        Command::CancelUpgrade
+    };
+    let outcome = if taken {
+        AuditOutcome::Accepted
+    } else {
+        AuditOutcome::Refused(ledger_core::Refusal::NotAuthorised)
+    };
+    let record = (AuditAction::Command(command), outcome, Some(who));
+    assert_eq!(way_out_record(&mut old), record, "{by:?}");
+    assert_eq!(way_out_record(&mut new), record, "{by:?}");
+}
+
+/// Review of #45 at `4cc6ae9`, F6: a way out at exactly the input where a scheduled change of mode
+/// takes force is decided under the new mode, the same by either generation. The incoming mode's
+/// proposer and the approver both modes name take it; the outgoing mode's proposer, and the
+/// operator, are refused, on the trail.
+#[test]
+fn t037_05_a_way_out_at_the_input_a_new_mode_takes_force_is_decided_under_it() {
+    for (by, taken) in [
+        (By::Incoming, true),
+        (By::Approver, true),
+        (By::Proposer, false),
+        (By::Operator, false),
+    ] {
+        check_way_out(by, None, true, taken);
+    }
 }
 
 /// `T-037-05` with `T-037-15` (amendment 0034; amendment 0033 D10; amendment 0035): after a change
@@ -653,7 +763,8 @@ fn way_out_book(
 /// same by the package of either generation. A member of the mode, with the credential the mode
 /// names, takes it; the operator, which the mode no longer names, and the proposer's identity with
 /// a credential the operator imported into it, are refused, and the refusal is recorded at input
-/// `n` alike under both generations, the upgrade still scheduled.
+/// `n` alike under both generations, on the audit trail with its principal, the upgrade still
+/// scheduled.
 #[test]
 fn t037_05_a_way_out_under_the_mode_in_force_is_decided_alike_by_either_generation() {
     for (by, to, taken) in [
@@ -663,31 +774,6 @@ fn t037_05_a_way_out_under_the_mode_in_force_is_decided_alike_by_either_generati
         (By::Operator, Some(500), false),
         (By::Swapped, None, false),
     ] {
-        let (mut old, a, n) = way_out_book(0, by, to);
-        let (mut new, b, _) = way_out_book(1, by, to);
-        assert_eq!(a, b, "{by:?}");
-        assert_eq!(a.seq, n, "{by:?}: the way out takes input n");
-        let expected = if taken {
-            Summary::Accepted
-        } else {
-            Summary::Refused("ERR-NotAuthorised".into())
-        };
-        assert_eq!(a.summaries, vec![expected], "{by:?}");
-        assert_eq!(writer_state(&mut old), writer_state(&mut new), "{by:?}");
-        assert_eq!(
-            old.archive.last().unwrap().log_hash(),
-            new.archive.last().unwrap().log_hash()
-        );
-        let h = hot(&mut old);
-        let upgrade = match (taken, to) {
-            (true, None) => None,
-            (true, Some(m)) => Some((H, m)),
-            (false, _) => Some((H, n)),
-        };
-        assert_eq!(
-            (h.inputs, h.generation, h.upgrade),
-            (n, 0, upgrade),
-            "{by:?}"
-        );
+        check_way_out(by, to, false, taken);
     }
 }

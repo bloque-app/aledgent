@@ -21,7 +21,8 @@ use ledger_core::asset::{AssetId, AssetKind};
 use ledger_core::audit::{AuditAction, AuditOutcome, AuditTrail};
 use ledger_core::authority::OperationKind;
 use ledger_core::code::authority::{
-    Action, Decision, GENESIS, Kind, MAX_DELAY, Member, Mode, Rule, verifier_digest,
+    Action, Decision, GENESIS, Kind, MAX_DELAY, MAX_LEAD, MAX_PENDING, MAX_PRINCIPALS, Member,
+    Mode, Rule, verifier_digest,
 };
 use ledger_core::export::ExportError;
 use ledger_core::export::anchor::Anchors;
@@ -33,6 +34,7 @@ use ledger_core::lifecycle::LifecycleConfig;
 use ledger_core::operator::OperatorOpKind;
 use ledger_core::principal::{Caller, CredentialMarker, Scheme, Verifier};
 use ledger_core::set::NonEmptySet;
+use ledger_core::settlement::{SettlementConfig, SourceId};
 use ledger_core::state::Command;
 use ledger_kernel::book::Book;
 use ledger_kernel::keys::KeyRing;
@@ -775,6 +777,12 @@ fn t037_05_an_export_never_resets_the_mode() {
     };
     // Under the genesis mode, the export goes as far as it did before.
     assert_ne!(export(&mut w), Some(ExportError::UpgradeAuthority));
+    // Review of #45 at `4cc6ae9`, F2: a proposal pending under the genesis mode, which nothing
+    // schedules, leaves a record but no mode: the export is not refused for it.
+    assert!(met(&w.propose(w.operator, w.input + 1).unwrap().1));
+    assert!(w.l.state().upgrade_authority().is_some());
+    assert_ne!(export(&mut w), Some(ExportError::UpgradeAuthority));
+    w.step();
     // A change scheduled, then in force: refused.
     let (_, _) = w.set(w.operator, &w.single(a), w.input + 2).unwrap();
     assert_eq!(export(&mut w), Some(ExportError::UpgradeAuthority));
@@ -821,3 +829,234 @@ fn t037_05_two_writers_decide_the_same() {
     };
     assert_eq!(run(), run());
 }
+
+/// Review of #45 at `4cc6ae9`, F1: a change applies at most `MAX_LEAD` inputs ahead. Without the
+/// bound, a change of mode scheduled for input `u64::MAX` would never take force while the outgoing
+/// mode authorised nothing more: no later change of the code. At the bound it is accepted, one
+/// input past it refused, at the proposal and at the approval.
+#[test]
+fn t037_05_a_change_scheduled_beyond_the_lead_is_refused() {
+    let mut w = World::new();
+    let (a, b) = (w.person(), w.person());
+    let n = w.input;
+    assert_eq!(
+        w.set(w.operator, &w.single(a), n + MAX_LEAD + 1),
+        Err(Refusal::InvalidTransition)
+    );
+    assert_eq!(
+        w.set(w.operator, &w.single(a), u64::MAX),
+        Err(Refusal::InvalidTransition)
+    );
+    assert_eq!(
+        w.propose(w.operator, n + MAX_LEAD + 1),
+        Err(Refusal::InvalidTransition)
+    );
+    // Under propose-approve: refused at the proposal; a proposal at the bound is authorised by its
+    // approval (the lead only shrinks as inputs pass).
+    w.step();
+    w.change_mode(&w.propose_approve(&[a], &[b]));
+    let n = w.input;
+    assert_eq!(
+        w.set(a, &w.single(a), u64::MAX),
+        Err(Refusal::InvalidTransition)
+    );
+    assert_eq!(
+        w.set(a, &w.single(a), n + MAX_LEAD + 1),
+        Err(Refusal::InvalidTransition)
+    );
+    let (s, _) = w.set(a, &w.single(a), n + MAX_LEAD).unwrap();
+    w.step();
+    assert!(matches!(
+        w.approve_kind(b, s, Kind::SetAuthority).unwrap(),
+        Decision::Authorised(_)
+    ));
+    assert_eq!(
+        w.l.authority_next(),
+        Some((w.single(a).digest(), n + MAX_LEAD))
+    );
+}
+
+/// Review of #45 at `4cc6ae9`, F3: the settlement adapter cannot be named in a mode. It is refused
+/// every command, so a mode naming it could never act.
+#[test]
+fn t037_05_the_settlement_adapter_cannot_be_named() {
+    let mut w = World::new();
+    let adapter = w.identity(IdentityKind::Organisation, None);
+    let ctx = w.ctx(w.operator);
+    w.l.configure_settlement(
+        &ctx,
+        SettlementConfig {
+            authoritative: SourceId::of_identity(&adapter.principal),
+            instance: 1,
+            suspense: None,
+            inbound_deadline: 1_000_000,
+            expiry_window: 1_000,
+            block_time: 1,
+            finality_margin: 1,
+        },
+    )
+    .unwrap();
+    let a = w.person();
+    for mode in [w.single(adapter), w.propose_approve(&[a], &[adapter])] {
+        assert_eq!(
+            w.set(w.operator, &mode, w.input + 1),
+            Err(Refusal::NotAuthorised)
+        );
+    }
+    assert!(w.l.state().upgrade_authority().is_none());
+}
+
+/// Review of #45 at `4cc6ae9`, F5: the queue's limit, stated plainly. Six proposers of three kinds
+/// each can fill the sixteen slots, and the next proposal is refused; a proposer still replaces its
+/// own, and a change of mode clears them all.
+#[test]
+fn t037_05_a_full_queue_refuses_until_a_proposal_is_replaced() {
+    let mut w = World::new();
+    let ps: Vec<Caller> = (0..6).map(|_| w.person()).collect();
+    let b = w.person();
+    w.change_mode(&w.propose_approve(&ps, &[b]));
+    let far = w.input + 100;
+    let mut filled = 0;
+    'fill: for p in &ps {
+        for k in 0..3 {
+            if filled == MAX_PENDING {
+                break 'fill;
+            }
+            match k {
+                0 => {
+                    w.propose(*p, far).unwrap();
+                }
+                1 => {
+                    w.propose_migration(*p, 2, far);
+                }
+                _ => {
+                    w.set(*p, &w.single(*p), far).unwrap();
+                }
+            }
+            filled += 1;
+        }
+    }
+    assert_eq!(w.pending().len(), MAX_PENDING);
+    // The sixth proposer's last free kind: refused.
+    let last = ps[5];
+    assert_eq!(
+        w.set(last, &w.single(last), far),
+        Err(Refusal::InvalidTransition)
+    );
+    // The first proposer replaces its own upgrade proposal.
+    let (p, _) = w.propose(ps[0], far + 1).unwrap();
+    assert_eq!(w.pending().len(), MAX_PENDING);
+    assert!(w.pending().iter().any(|q| q.id == p));
+}
+
+/// Review of #45 at `4cc6ae9`, F5: the largest record the bounds allow (sixteen changes of mode
+/// pending, each naming thirty-two members, each approved by all of them) is one leaf of about
+/// 37 KB. How the core's guest heap takes it under the platform is not tested here.
+#[test]
+fn t037_05_the_largest_record_is_bounded() {
+    use ledger_core::code::authority::{AuthorityRecord, Proposal};
+    let op = |n: u8| OperationId::from_ref(OperationRef([n; 16]));
+    let members: BTreeSet<Member> = (0..MAX_PRINCIPALS as u8)
+        .map(|n| Member {
+            principal: IdentityId::mint(&op(n), 0),
+            verifier: [n; 32],
+        })
+        .collect();
+    let mode = Mode {
+        rule: Rule::Threshold {
+            members: members.clone(),
+            k: MAX_PRINCIPALS as u32,
+        },
+        delay: MAX_DELAY,
+    };
+    let record = AuthorityRecord {
+        mode: Some(mode.clone()),
+        next: Some((mode.clone(), u64::MAX)),
+        pending: (0..MAX_PENDING as u8)
+            .map(|n| Proposal {
+                id: op(0x80 + n),
+                action: Action::SetAuthority {
+                    mode: mode.clone(),
+                    from: u64::MAX,
+                },
+                under: mode.digest(),
+                proposer: IdentityId::mint(&op(n), 0),
+                approvals: members.iter().map(|m| m.principal).collect(),
+                at: u64::MAX,
+            })
+            .collect(),
+    };
+    let bytes = ledger_core::export::canon::to_bytes(&record).len();
+    assert!(bytes <= 40_000, "{bytes} bytes");
+}
+
+/// Review of #45 at `4cc6ae9`, F4: the wire, pinned. The audit command codes of the writer's code,
+/// in both tables that write them (the audit record's and the export's), a mode's digest, and a
+/// record's bytes: a reorder of a field or a renumbering fails here, not at the first replay of an
+/// old log.
+#[test]
+fn t037_05_the_wire_is_pinned() {
+    use ledger_core::audit::command_code;
+    use ledger_core::code::authority::{AuthorityRecord, Proposal};
+    use ledger_core::export::canon::to_bytes;
+    for (c, n) in [
+        (Command::RescheduleUpgrade, 51u8),
+        (Command::CancelUpgrade, 52),
+        (Command::SetAuthority, 53),
+        (Command::ProposeUpgrade, 54),
+        (Command::ApproveUpgrade, 55),
+        (Command::ProposeMigration, 56),
+    ] {
+        assert_eq!(command_code(c), n, "{c:?}");
+        assert_eq!(to_bytes(&c), vec![n], "{c:?} in the export");
+    }
+    let op = |n: u8| OperationId::from_ref(OperationRef([n; 16]));
+    let m = |n: u8| Member {
+        principal: IdentityId::mint(&op(n), 0),
+        verifier: [n; 32],
+    };
+    let mode = Mode {
+        rule: Rule::ProposeApprove {
+            proposers: [m(1)].into(),
+            approvers: [m(2), m(3)].into(),
+        },
+        delay: 7,
+    };
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    assert_eq!(hex(&mode.digest()), MODE_DIGEST);
+    let record = AuthorityRecord {
+        mode: Some(Mode::single(m(4))),
+        next: Some((mode.clone(), 90)),
+        pending: vec![Proposal {
+            id: op(5),
+            action: Action::Upgrade {
+                code: [6; 32],
+                from: 80,
+            },
+            under: mode.digest(),
+            proposer: m(1).principal,
+            approvals: [m(2).principal].into(),
+            at: 70,
+        }],
+    };
+    assert_eq!(hex(&to_bytes(&record)), RECORD_BYTES);
+}
+
+/// [`t037_05_the_wire_is_pinned`]'s mode's digest.
+const MODE_DIGEST: &str = "f8c5a8e4715442d8190fc5aeb3e3bfd85b2e258b54c0f4145bc6ac0d81bd6862";
+
+/// [`t037_05_the_wire_is_pinned`]'s record's canonical bytes.
+const RECORD_BYTES: &str = concat!(
+    "010145f2ad8fdda8e8deaf8ea4f43ddbb9510404040404040404040404040404",
+    "0404040404040404040404040404040404040000000000000000010200000001",
+    "206bde34e7e2b732f4c3913adb87747401010101010101010101010101010101",
+    "01010101010101010101010101010101000000029ea679f07da6d9c6f66d6a0b",
+    "64d51c7603030303030303030303030303030303030303030303030303030303",
+    "03030303aee10d93d1696c9642da89479c1ab07c020202020202020202020202",
+    "0202020202020202020202020202020202020202000000000000000700000000",
+    "0000005a00000001050505050505050505050505050505050106060606060606",
+    "0606060606060606060606060606060606060606060606060600000000000000",
+    "50f8c5a8e4715442d8190fc5aeb3e3bfd85b2e258b54c0f4145bc6ac0d81bd68",
+    "62206bde34e7e2b732f4c3913adb87747400000001aee10d93d1696c9642da89",
+    "479c1ab07c0000000000000046",
+);

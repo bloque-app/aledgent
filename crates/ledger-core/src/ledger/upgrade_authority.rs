@@ -314,9 +314,15 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
     }
 
     /// Whether `m` can hold the upgrade authority (amendment 0034): an identity of the registry,
-    /// active, that acts as itself (an agent acts for another identity, `REQ-AG-1`), holding an
-    /// active, unscoped credential whose verifier is the one `m` names.
+    /// active, that acts as itself (an agent acts for another identity, `REQ-AG-1`), is not the
+    /// settlement adapter (refused every command), and holds an active, unscoped credential whose
+    /// verifier is the one `m` names.
     fn holds(&self, m: &Member) -> bool {
+        // The settlement adapter acts for the settlement layer and is refused every command
+        // (`crate::principal::resolve`): it could never act as a member.
+        if crate::principal::is_adapter(&self.state, &m.principal) {
+            return false;
+        }
         let identity = self.state.identity(&m.principal).is_some_and(|i| {
             i.status() == IdentityStatus::Active && i.kind() != IdentityKind::Agent
         });

@@ -72,8 +72,21 @@ pub const MAX_PRINCIPALS: usize = 32;
 /// mode's delay elapses in at most about 45 days; real traffic only shortens that.
 pub const MAX_DELAY: u64 = 1 << 16;
 
+/// The furthest ahead a change may apply, in inputs from the input that authorises it: 2¹⁷,
+/// twice [`MAX_DELAY`], so the longest delay still leaves room. A change of mode scheduled further
+/// ahead would never take force within the book's life, while the outgoing mode authorises
+/// nothing more, and no input withdraws a scheduled change: the book's code could never change
+/// again (amendment 0034, clarification of 2026-10-20). At the ticker's floor of one input a
+/// minute, the furthest change applies within about 91 days.
+pub const MAX_LEAD: u64 = 2 * MAX_DELAY;
+
 /// The most proposals pending at once: one per proposer and kind ([`Kind`]), and at most this many
-/// in all, so the record stays one bounded leaf.
+/// in all, so the record stays one bounded leaf. **The limit, stated plainly:** a proposer holds
+/// at most three slots (one per kind), so six or more proposers between them can fill the queue,
+/// and every other proposal is then refused (`ERR-InvalidTransition`) until one is replaced by its
+/// proposer, or a change of mode clears them all. A full record of sixteen changes of mode, each
+/// naming thirty-two members and approved by all of them, is about 37 KB (tested); how the core's
+/// guest heap takes a witness that size under the platform is not tested here.
 pub const MAX_PENDING: usize = 16;
 
 /// The digest a member names its credential by: `blake2b-256(VERIFIER_DOMAIN ‖ scheme ‖
@@ -241,10 +254,11 @@ pub fn alone(mode: &Mode, m: &Member) -> bool {
 
 /// A change authorised at input `at` may apply from input `from` (`ERR-InvalidTransition`
 /// otherwise): forward only (`from > at`), with at least the mode's delay of inputs strictly
-/// between them (`from − at − 1 ≥ delay`).
+/// between them (`from − at − 1 ≥ delay`), and at most [`MAX_LEAD`] inputs ahead
+/// (`from − at ≤ MAX_LEAD`).
 pub fn check_from(mode: &Mode, at: u64, from: u64) -> Result<(), Refusal> {
     match from.checked_sub(at) {
-        Some(gap) if gap > mode.delay => Ok(()),
+        Some(gap) if gap > mode.delay && gap <= MAX_LEAD => Ok(()),
         _ => Err(Refusal::InvalidTransition),
     }
 }
@@ -863,6 +877,29 @@ mod tests {
         );
         // The longest delay can elapse.
         assert_eq!(check_from(&at(MAX_DELAY), 10, 10 + MAX_DELAY + 1), Ok(()));
+    }
+
+    /// Review of #45 at `4cc6ae9`, F1: a change applies at most `MAX_LEAD` inputs ahead, so a
+    /// change of mode scheduled too far ahead, which would freeze the outgoing mode for good, is
+    /// refused. The bound leaves room for the longest delay.
+    #[test]
+    fn t037_05_the_lead_is_bounded() {
+        let none = Mode::single(m(1));
+        assert_eq!(check_from(&none, 10, 10 + MAX_LEAD), Ok(()));
+        assert_eq!(
+            check_from(&none, 10, 10 + MAX_LEAD + 1),
+            Err(Refusal::InvalidTransition)
+        );
+        assert_eq!(
+            check_from(&none, 10, u64::MAX),
+            Err(Refusal::InvalidTransition)
+        );
+        let longest = Mode {
+            delay: MAX_DELAY,
+            ..none
+        };
+        assert_eq!(check_from(&longest, 10, 10 + MAX_LEAD), Ok(()));
+        const { assert!(MAX_LEAD > MAX_DELAY) };
     }
 
     #[test]
