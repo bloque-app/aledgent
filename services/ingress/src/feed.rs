@@ -536,6 +536,10 @@ impl<C: Core> Core for Sequencer<C> {
     async fn genesis_open(&self) -> Result<bool, CoreError> {
         self.core.genesis_open().await
     }
+
+    async fn stage_code(&self, code: &[u8; 32]) -> Result<crate::boundary::Staged, CoreError> {
+        self.core.stage_code(code).await
+    }
 }
 
 #[cfg(test)]

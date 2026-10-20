@@ -244,6 +244,32 @@ pub struct RegisterAliasBody {
     pub justification: String,
 }
 
+/// `upgrade` (`REQ-RT-16`, `T-037-04`): the writer's code becomes the code version `code` from input
+/// `from`. The execution node fetches the version's manifest and artefacts and checks them
+/// (`REQ-RT-17`, `REQ-RT-20`) before the command is logged; the writer decides it under the
+/// upgrade-authority mode in force (`REQ-RT-18`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpgradeBody {
+    /// The code version: the `blake2b-256` of its manifest, as 64 hex digits.
+    pub code: String,
+    /// The input number it applies from: later than the command's own.
+    pub from: u64,
+    /// Why.
+    pub justification: String,
+}
+
+/// `reschedule_upgrade` (`REQ-RT-20`, `T-037-15`): move the scheduled upgrade to input `from`, later
+/// than the command's own.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RescheduleUpgradeBody {
+    /// The input number the upgrade now applies from.
+    pub from: u64,
+    /// Why.
+    pub justification: String,
+}
+
 /// `alias(source, name)` (`REQ-RC-7`): the account an alias names.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AliasBody {
@@ -1221,6 +1247,27 @@ pub enum OperatorCommand {
         pending: String,
         /// The approval, hex.
         approval: String,
+        /// Why.
+        justification: String,
+    },
+    /// The writer's code becomes a code version from an input (`REQ-RT-16`, `T-037-04`).
+    Upgrade {
+        /// The code version, hex.
+        code: String,
+        /// The input it applies from.
+        from: u64,
+        /// Why.
+        justification: String,
+    },
+    /// Move the scheduled upgrade to a later input (`REQ-RT-20`, `T-037-15`).
+    RescheduleUpgrade {
+        /// The input it now applies from.
+        from: u64,
+        /// Why.
+        justification: String,
+    },
+    /// Cancel the scheduled upgrade (`REQ-RT-20`, `T-037-15`).
+    CancelUpgrade {
         /// Why.
         justification: String,
     },

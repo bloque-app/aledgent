@@ -118,6 +118,7 @@ fn request_schema(route: CommandRoute) -> &'static str {
         | CommandRoute::ProposeReversal
         | CommandRoute::ApproveReversal
         | CommandRoute::RevokeIssuance
+        | CommandRoute::CancelUpgrade
         | CommandRoute::RevokeOperator => "JustifiedBody",
         CommandRoute::Resolve => "ResolveBody",
         CommandRoute::SubmitEvidence => "SubmitEvidenceBody",
@@ -140,6 +141,8 @@ fn request_schema(route: CommandRoute) -> &'static str {
         CommandRoute::RegisterIntegratingParty => "RegisterIntegratingPartyBody",
         CommandRoute::TiePrincipal => "TiePrincipalBody",
         CommandRoute::RegisterAlias => "RegisterAliasBody",
+        CommandRoute::Upgrade => "UpgradeBody",
+        CommandRoute::RescheduleUpgrade => "RescheduleUpgradeBody",
         CommandRoute::Settlement(s) => s.schema(),
         CommandRoute::Anchoring(a) => a.schema(),
     }
@@ -453,6 +456,8 @@ fn schemas() -> Map<String, Value> {
     add::<crate::wire::TiePrincipalBody>(&mut g);
     add::<crate::wire::IntegratingPartiesBody>(&mut g);
     add::<crate::wire::RegisterAliasBody>(&mut g);
+    add::<crate::wire::UpgradeBody>(&mut g);
+    add::<crate::wire::RescheduleUpgradeBody>(&mut g);
     add::<crate::wire::AliasBody>(&mut g);
     add::<crate::wire::GrantsBody>(&mut g);
     add::<crate::wire::AccountViewBody>(&mut g);

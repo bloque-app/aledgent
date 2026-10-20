@@ -232,8 +232,9 @@ impl Store for MemStore {
         let fresh = || undecided().filter(|r| r.feed_seq.is_none());
         Ok(in_flight
             .into_iter()
-            .chain(fresh().filter(|r| r.new.reserves))
-            .chain(fresh().filter(|r| !r.new.reserves))
+            .chain(fresh().filter(|r| r.new.overtakes))
+            .chain(fresh().filter(|r| !r.new.overtakes && r.new.reserves))
+            .chain(fresh().filter(|r| !r.new.overtakes && !r.new.reserves))
             .take(n)
             .cloned()
             .collect())
@@ -640,6 +641,7 @@ mod tests {
             body: Vec::new(),
             pass_through: None,
             reserves,
+            overtakes: false,
             synchronous: false,
             received_at: u64::from(n),
             arrived_at: None,
@@ -670,6 +672,43 @@ mod tests {
             s.next_undecided().await.unwrap().map(|r| r.new.op_ref.0[0]),
             Some(2)
         );
+    }
+
+    /// `T-037-04` (`REQ-RT-20`, amendment 0035): a row that overtakes goes before reservations and
+    /// every other row not yet sent, however late it was logged; a row already given a feed
+    /// sequence (it may have run) still goes before it; decided rows are left out.
+    #[tokio::test]
+    async fn t_037_04_a_row_that_overtakes_goes_before_the_queue_but_not_before_rows_in_flight() {
+        use crate::feed::BOOK;
+        let s = MemStore::new(Duration::from_secs(1));
+        let long = Duration::from_secs(60);
+        assert_eq!(s.try_feed(BOOK, "a", long).await.unwrap(), Some(1));
+        let refs = |rows: Vec<Row>| rows.iter().map(|r| r.new.op_ref.0[0]).collect::<Vec<_>>();
+        let k = |n: u8| InputKey([n; 16]);
+        for (n, reserves) in [(1, false), (2, true), (3, false)] {
+            s.append(row(n, reserves)).await.unwrap();
+        }
+        // 1 was sent already, and is in flight with its sequence.
+        s.mark_fed(BOOK, "a", 1, &[k(1)], 5).await.unwrap();
+        // Two way outs are logged behind everything; a decided one is left out.
+        for n in [4, 5, 6] {
+            let mut r = row(n, false);
+            r.overtakes = true;
+            s.append(r).await.unwrap();
+        }
+        s.mark_decided(k(5), 1, Vec::new(), 9).await.unwrap();
+        assert_eq!(
+            refs(s.next_undecided_batch(10).await.unwrap()),
+            vec![1, 4, 6, 2, 3],
+            "in flight, then the way outs in arrival order, then reservations, then the rest"
+        );
+        assert_eq!(
+            s.next_undecided().await.unwrap().map(|r| r.new.op_ref.0[0]),
+            Some(1)
+        );
+        // Once the row in flight is given back, the way out is first.
+        s.unfeed(BOOK, "a", 1, 1).await.unwrap();
+        assert_eq!(refs(s.next_undecided_batch(2).await.unwrap()), vec![4, 6]);
     }
 
     /// `T-038-03` (`DEC-27` (d)): one holder of a partition's feed lease at a time; its epoch

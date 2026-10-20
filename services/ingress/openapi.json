@@ -4630,6 +4630,27 @@
         ],
         "type": "object"
       },
+      "RescheduleUpgradeBody": {
+        "additionalProperties": false,
+        "description": "`reschedule_upgrade` (`REQ-RT-20`, `T-037-15`): move the scheduled upgrade to input `from`, later\nthan the command's own.",
+        "properties": {
+          "from": {
+            "description": "The input number the upgrade now applies from.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "justification": {
+            "description": "Why.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "from",
+          "justification"
+        ],
+        "type": "object"
+      },
       "ReserveBody": {
         "additionalProperties": false,
         "description": "`reserve` (SPEC §8.1, `REQ-BA-4`): acknowledged at `Received`; the decision follows by query and\nnotification (`REQ-CS-3`).",
@@ -5618,6 +5639,32 @@
         "required": [
           "notification",
           "age"
+        ],
+        "type": "object"
+      },
+      "UpgradeBody": {
+        "additionalProperties": false,
+        "description": "`upgrade` (`REQ-RT-16`, `T-037-04`): the writer's code becomes the code version `code` from input\n`from`. The execution node fetches the version's manifest and artefacts and checks them\n(`REQ-RT-17`, `REQ-RT-20`) before the command is logged; the writer decides it under the\nupgrade-authority mode in force (`REQ-RT-18`).",
+        "properties": {
+          "code": {
+            "description": "The code version: the `blake2b-256` of its manifest, as 64 hex digits.",
+            "type": "string"
+          },
+          "from": {
+            "description": "The input number it applies from: later than the command's own.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "justification": {
+            "description": "Why.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "from",
+          "justification"
         ],
         "type": "object"
       },
@@ -10018,6 +10065,228 @@
           }
         },
         "summary": "The operational signals: counts and ages, never a ledger fact. The operator's, with the read_signals kind."
+      }
+    },
+    "/v1/ops/upgrade": {
+      "post": {
+        "operationId": "upgrade",
+        "parameters": [
+          {
+            "description": "The client key (REQ-OP-10). Without one, a key is derived from the request and returned (REQ-OP-11).",
+            "in": "header",
+            "name": "client-key",
+            "required": false,
+            "schema": {
+              "maxLength": 256,
+              "type": "string"
+            }
+          },
+          {
+            "description": "The identity the caller acts for, where different (REQ-PN-1).",
+            "in": "header",
+            "name": "on-behalf-of",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpgradeBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandReply"
+                }
+              }
+            },
+            "description": "Decided. For a transfer or a reservation, the reply to a repeat once the core has decided (REQ-CS-3)."
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Refusal"
+                }
+              }
+            },
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Refusal"
+                }
+              }
+            },
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
+          }
+        },
+        "summary": "Operator: the writer's code becomes a code version from an input. The execution node fetches and checks the version's manifest and artefacts, and its generation, before the command is logged; ERR-InvalidTransition if it cannot (REQ-RT-16, REQ-RT-17, REQ-RT-20). Decided under the upgrade-authority mode in force (REQ-RT-18)."
+      }
+    },
+    "/v1/ops/upgrade/cancel": {
+      "post": {
+        "operationId": "cancel_upgrade",
+        "parameters": [
+          {
+            "description": "The client key (REQ-OP-10). Without one, a key is derived from the request and returned (REQ-OP-11).",
+            "in": "header",
+            "name": "client-key",
+            "required": false,
+            "schema": {
+              "maxLength": 256,
+              "type": "string"
+            }
+          },
+          {
+            "description": "The identity the caller acts for, where different (REQ-PN-1).",
+            "in": "header",
+            "name": "on-behalf-of",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JustifiedBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandReply"
+                }
+              }
+            },
+            "description": "Decided. For a transfer or a reservation, the reply to a repeat once the core has decided (REQ-CS-3)."
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Refusal"
+                }
+              }
+            },
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Refusal"
+                }
+              }
+            },
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
+          }
+        },
+        "summary": "Operator: cancel the scheduled upgrade. A way out, like reschedule_upgrade (REQ-RT-20, amendment 0035)."
+      }
+    },
+    "/v1/ops/upgrade/reschedule": {
+      "post": {
+        "operationId": "reschedule_upgrade",
+        "parameters": [
+          {
+            "description": "The client key (REQ-OP-10). Without one, a key is derived from the request and returned (REQ-OP-11).",
+            "in": "header",
+            "name": "client-key",
+            "required": false,
+            "schema": {
+              "maxLength": 256,
+              "type": "string"
+            }
+          },
+          {
+            "description": "The identity the caller acts for, where different (REQ-PN-1).",
+            "in": "header",
+            "name": "on-behalf-of",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RescheduleUpgradeBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandReply"
+                }
+              }
+            },
+            "description": "Decided. For a transfer or a reservation, the reply to a repeat once the core has decided (REQ-CS-3)."
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Refusal"
+                }
+              }
+            },
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Refusal"
+                }
+              }
+            },
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
+          }
+        },
+        "summary": "Operator: move the scheduled upgrade to a later input. The way out of a switch that cannot be taken: it is given priority over the inputs waiting to be forwarded when the mode in force lets the caller take it, and the writer decides it under either generation of code (REQ-RT-20, amendment 0035)."
       }
     },
     "/v1/principals/self/answering": {
