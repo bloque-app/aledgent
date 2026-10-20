@@ -985,10 +985,15 @@ new genesis.
   code; on `vos-core`, which has no compare-and-swap and no way for an actor to read its program's hash, the
   fence is the only in-book check. The fence identifies code up to its generation; byte identity within a
   generation is the host's staging check. **The way out:** `RescheduleUpgrade { from: m }` (`m` later than
-  its own number) and `CancelUpgrade`, authorised under the mode in force (an unauthorised one is refused),
-  are the only inputs the fenced code takes; they take their numbers like any input and are decided the
-  same by code of either generation (the upgrade does not take effect, `generation` stays *g*), after which
-  the host reinstalls *g*'s staged package if it had switched. The `code-history` gate decides every way-out
+  its own number) and `CancelUpgrade`, authorised under the mode in force, are the only inputs the fenced
+  code takes; every one is decided, the same by code of either generation, refusals included (an
+  unauthorised one, or a move not later than its own number, is a recorded refusal that takes its number,
+  and the upgrade stays scheduled; amendment 0035); none makes the upgrade take effect (`generation` stays
+  *g*), after which the host installs the code the code map names. An input that holds a way out and
+  anything else is refused whole as `ERR-MalformedCommand`, nothing of it applied, by every generation
+  alike (amendment 0035). Their audit and export command codes are fixed once in *H₀*: `RescheduleUpgrade`
+  51, `CancelUpgrade` 52, `SetAuthority` 53, `ProposeUpgrade` 54, `ApproveUpgrade` 55, `ProposeMigration`
+  56. The `code-history` gate decides every way-out
   fixture input under each staged *H* and under *g* and requires the same committed state. The code map derives from the `Upgrade`,
   `RescheduleUpgrade` and `CancelUpgrade` inputs alone, and native replay takes each input's generation from
   it. `aledgent_writer_fenced_seconds` alerts past `fence_alert_after` (a deployment setting, default five

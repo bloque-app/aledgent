@@ -2,7 +2,7 @@
 # CI regenerates this file and fails on any difference (F-015 §1).
 # 25 invariants (§9), 41 errors (§10), 179 V0 acceptance criteria (§6, §15).
 
-spec_version = "0.4.27"
+spec_version = "0.4.28"
 
 [[invariant]]
 id = "INV-1"
@@ -1204,13 +1204,13 @@ text = "Given a writer whose generation in force is *g* + 1 after an upgrade, Wh
 id = "AC-K7.17"
 story = "US-K7"
 epic = "K"
-text = "Given an upgrade scheduled from input *n*, When an input that moves or cancels it is not authorised under the mode in force, Then it is refused, nothing changes, and the upgrade stays scheduled (`REQ-RT-20`, `REQ-RT-18`)."
+text = "Given an upgrade scheduled from input *n*, When an input that moves or cancels it is not authorised under the mode in force, before *n* or at or after it, Then it is refused, the refusal is recorded and takes its input number, the upgrade stays scheduled, and code of either generation decides it the same; and When an input moves or cancels it together with anything else, Then the whole input is refused as malformed and nothing of it applies (`REQ-RT-20`, `REQ-RT-18`). *Amendment 0035.*"
 
 [[acceptance]]
 id = "AC-K7.18"
 story = "US-K7"
 epic = "K"
-text = "Given an upgrade scheduled from input *n* and an authorised input that moves or cancels it, arriving as input *n*, When it is decided by the old code, and When it is decided by the new code because the switch was already made, Then both commit the same outcome: the upgrade does not take effect at *n* and the generation stays the old one; and a replay assigns every input the generation the code map, read from the inputs alone, names (`REQ-RT-20`, `REQ-RT-17`)."
+text = "Given an upgrade scheduled from input *n* and an input that moves or cancels it, authorised or not, arriving as input *n*, When it is decided by the old code, and When it is decided by the new code because the switch was already made, Then both commit the same outcome: the upgrade does not take effect at *n* and the generation stays the old one; and a replay assigns every input the generation the code map, read from the inputs alone, names (`REQ-RT-20`, `REQ-RT-17`)."
 
 [[acceptance]]
 id = "AC-K7.19"
