@@ -298,8 +298,7 @@ impl CodeInstaller for crate::port::VosPort {
         let name = state.name.clone();
         let package = crate::package::admit_actor(&version.package)
             .map_err(|e| InstallError::Platform(format!("the package is not admitted: {e:?}")))?;
-        self.upgrade_actor(&package, &name)
-            .map_err(install_error)?;
+        self.upgrade_actor(&package, &name).map_err(install_error)?;
         if let Some(c) = self.code_state_mut() {
             c.running.package = want.package;
         }
@@ -438,7 +437,10 @@ mod tests {
         let mut p = Park::default();
         p.failed(h, "refused".into(), false, 0);
         p.succeeded(&g);
-        assert!(p.blocked(&h, 0).is_some(), "g's reinstall does not wipe H's park");
+        assert!(
+            p.blocked(&h, 0).is_some(),
+            "g's reinstall does not wipe H's park"
+        );
         p.succeeded(&h);
         assert!(p.blocked(&h, 0).is_none());
     }
