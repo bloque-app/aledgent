@@ -248,6 +248,18 @@ pub struct Ledger<S: LeafStore, V: VaultBackend> {
     /// holds them (`T-037-02`): what a checkpoint binds beside the book's genesis (`T-037-03`). Not
     /// service state: whoever runs the ledger as a writer sets it ([`Ledger::set_code`]).
     code: ([u8; 32], [u8; 32]),
+    /// The input number the commands that follow take, as the writer that runs the ledger numbers
+    /// its inputs ([`Ledger::set_input`]); 0 when nothing says. What a way out of a scheduled
+    /// upgrade is checked against (`T-037-15`). Not service state.
+    input: u64,
+    /// The way out of a scheduled upgrade an input took, until the writer reads it
+    /// ([`Ledger::take_way_out`], `T-037-15`). Not service state.
+    way_out: Option<crate::code::WayOut>,
+    /// How deep the public methods that change the book are nested now, and how many outermost
+    /// ones have returned since [`Ledger::set_input`]: the calls of the current input decided so
+    /// far (`T-037-15`: a way out must be its input's first call). Kept whether or not calls are
+    /// recorded, so the Agent, the replica and a replay count alike. Not service state.
+    pub(crate) calls_in_input: (u32, u32),
 }
 
 fn policy_used(p: &Principal) -> AuthorityUsed {
@@ -365,6 +377,9 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             fault: None,
             calls: None,
             code: ([0; 32], [0; 32]),
+            input: 0,
+            way_out: None,
+            calls_in_input: (0, 0),
         };
         if let Some(sp) = spec {
             ledger.build_genesis_state(&founded, &sp)?;
@@ -412,6 +427,9 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             fault: None,
             calls: None,
             code: ([0; 32], [0; 32]),
+            input: 0,
+            way_out: None,
+            calls_in_input: (0, 0),
         }
     }
 
@@ -421,6 +439,29 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
     /// replica from the code each entry names. A ledger whose writer names no code binds zeros.
     pub fn set_code(&mut self, code: [u8; 32], authority: [u8; 32]) {
         self.code = (code, authority);
+    }
+
+    /// The input number the commands that follow take (`T-037-15`), as the writer that runs the
+    /// ledger numbers its inputs: the core Agent sets it from the input before running its calls,
+    /// the host's replica from the input it will stage next, and a replay from each entry. A way out
+    /// of a scheduled upgrade is decided against it ([`Ledger::reschedule_upgrade`]).
+    pub fn set_input(&mut self, input: u64) {
+        self.input = input;
+        self.calls_in_input.1 = 0;
+    }
+
+    /// How many calls of the current input were decided before the one running now
+    /// ([`Ledger::set_input`] starts an input).
+    pub(crate) fn calls_before(&self) -> u32 {
+        self.calls_in_input.1
+    }
+
+    /// The way out of a scheduled upgrade the last commands took, if one did (`T-037-15`): a
+    /// [`Ledger::reschedule_upgrade`] or [`Ledger::cancel_upgrade`] accepted, not the replay of an
+    /// earlier one. The writer applies it to its scheduled upgrade, which it holds, not the
+    /// ledger.
+    pub fn take_way_out(&mut self) -> Option<crate::code::WayOut> {
+        self.way_out.take()
     }
 
     /// What a checkpoint created now binds beside a `v2` one (`T-037-03`, `REQ-RT-15`): the book's

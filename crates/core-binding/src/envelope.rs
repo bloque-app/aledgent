@@ -417,6 +417,31 @@ pub enum AgentRefusal {
     Fault(String),
     /// An earlier input of the batch was refused: nothing of this one ran (`T-031-02`).
     Skipped,
+    /// The fence (`T-037-15`, `REQ-RT-20`, [`crate::fence`]): the code that received the input is
+    /// not the code the writer's state names for it. Nothing is written and the input's number is
+    /// not taken: the execution node installs the code the code map names, and sends the same
+    /// input again. Appended last, so no earlier refusal's tag moves: a host built before it reads
+    /// it as a reply that does not decode, never as another refusal. The continuation's scoped
+    /// refusal shares it (`T-037-17`).
+    Fenced(Fenced),
+}
+
+/// Why the fence refused an input (`T-037-15`, [`AgentRefusal::Fenced`]): what the refusing code
+/// is, and what the writer's state names. The execution node audits it (its log and the audit
+/// store), never the book.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Fenced {
+    /// The input refused: its number is not taken.
+    pub seq: u64,
+    /// The code generation compiled into the code that refused it.
+    pub code_generation: u64,
+    /// The code generation in force in the writer's state.
+    pub generation: u64,
+    /// The writer's scheduled upgrade, if any: the code version and the input it applies from.
+    pub upgrade: Option<([u8; 32], u64)>,
+    /// The named refusal of a scoped refusal of this kind, if any: none for the fence; the
+    /// continuation's refusal of a way out (`T-037-17`, `ERR-InvalidTransition`) names its own.
+    pub refusal: Option<String>,
 }
 
 /// Encode a value.

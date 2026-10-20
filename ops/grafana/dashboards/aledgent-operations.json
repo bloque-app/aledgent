@@ -552,8 +552,8 @@
     {
       "id": 16,
       "type": "stat",
-      "title": "Core halt and the runtime's Authority backlog (F18, VOS)",
-      "description": "T-018-10: whether the core has stopped deciding (every input waits Received; core-halt runbook), and the Authority decisions issued for invocations not yet acknowledged, against VOS's limit of 256.",
+      "title": "Core halt, the writer's fence and the runtime's Authority backlog (F18, T-037-15, VOS)",
+      "description": "T-018-10: whether the core has stopped deciding (every input waits Received; core-halt runbook), how long its writer has been fenced (T-037-15: the code installed is not the code its state names; alert past fence_alert_after, five minutes), and the Authority decisions issued for invocations not yet acknowledged, against VOS's limit of 256.",
       "gridPos": {
         "x": 0,
         "y": 43,
@@ -574,6 +574,11 @@
           "refId": "B",
           "expr": "aledgent_vos_unacknowledged_authority_decisions",
           "legendFormat": "unacknowledged Authority decisions (limit 256)"
+        },
+        {
+          "refId": "C",
+          "expr": "aledgent_writer_fenced_seconds",
+          "legendFormat": "writer fenced, seconds (alert past 300)"
         }
       ]
     },

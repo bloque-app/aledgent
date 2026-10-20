@@ -670,14 +670,34 @@ fn open_core<L: core_binding::core::HostLog>(
     match audit {
         Some(section) => {
             let sink = section.open(dir)?;
-            AgentCore::open_audited(
+            let core = AgentCore::open_audited(
                 port,
                 founding,
                 log,
                 stores,
                 Box::new(sink),
                 section.max_unshipped(),
-            )
+            )?;
+            // What the core refuses without the book (the fence, `T-037-15`) is audited beside
+            // the book's trail. An audit side file never keeps the core down (review of #44, F3):
+            // whatever it holds, the core starts, says what it found, and the fence still refuses.
+            match section.open_node_trail(dir) {
+                Ok(trail) => {
+                    let damage = trail.damage();
+                    if damage.any() {
+                        eprintln!(
+                            "aledgent-core-host: WARNING: the audit store's node trail was \
+                             damaged and opened past it: {damage:?}"
+                        );
+                    }
+                    core.set_node_trail(trail);
+                }
+                Err(e) => eprintln!(
+                    "aledgent-core-host: WARNING: the audit store's node trail does not open \
+                     ({e}); a refusal by the fence is audited on standard error only"
+                ),
+            }
+            Ok(core)
         }
         None => {
             eprintln!(

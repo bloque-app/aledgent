@@ -21,6 +21,9 @@
 //!   the `HEAD` file, rewritten after every append. The core also compares this store's head with
 //!   what it emitted, on a cadence ([`ledger_core::Ledger::check_audit_head`]).
 //! - **Reads** by subject, principal, class and time range ([`AuditQuery`]).
+//! - **The node's own trail** ([`NodeTrail`], `T-037-15`): what the execution node refused
+//!   without the book (an input the fence refused) is audited beside the book's trail, in its own
+//!   chained file, never as a record of the book.
 //! - **Retention** is deployment configuration (`NFR-6`). This store never removes a record, so
 //!   any retention period is met; expiring segments past it is an operations task (`F-018`).
 
@@ -30,6 +33,9 @@ use std::path::{Path, PathBuf};
 
 use cipher_clerk::crypto::blake2b_256;
 use ledger_core::audit::{AuditQuery, AuditRecord, AuditSink, AuditTrail, SinkError, TrailError};
+
+mod node;
+pub use node::{NODE_FILE, NodeRecord, NodeTrail};
 
 const CREDENTIAL_FILE: &str = "credential";
 const HEAD_FILE: &str = "HEAD";
@@ -104,6 +110,12 @@ pub enum AuditStoreError {
     },
     /// The records read back do not form the chain (`TrailError`).
     Chain(TrailError),
+    /// The node's trail ([`NodeTrail`], `T-037-15`) has a frame at this position that is not a
+    /// record, or not the next link of its chain.
+    NodeTrail {
+        /// The frame's position.
+        frame: u64,
+    },
 }
 
 impl From<std::io::Error> for AuditStoreError {

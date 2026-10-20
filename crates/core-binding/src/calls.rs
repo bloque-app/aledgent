@@ -340,6 +340,13 @@ pub fn apply<S: LeafStore, V: VaultBackend>(
         // Seeded genesis (`F-036`): its records go through the commands of every group.
         #[cfg(all(feature = "opening", feature = "operator"))]
         C::ApplySpecChunk { ctx, chunk, path } => s(l.apply_spec_chunk(ctx, chunk, path)),
+        // The way out of a scheduled upgrade (`T-037-15`): in every build, as the fence is (*H₀*).
+        C::RescheduleUpgrade {
+            ctx,
+            from,
+            justification,
+        } => s(l.reschedule_upgrade(ctx, *from, justification)),
+        C::CancelUpgrade { ctx, justification } => s(l.cancel_upgrade(ctx, justification)),
         C::Unsupported { method } => {
             Summary::Failed(alloc::format!("`{method}` cannot run inside the Agent"))
         }

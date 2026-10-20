@@ -1021,4 +1021,51 @@ mod audit {
         assert_eq!(unshipped(&core), waiting, "nothing left the outbox");
         assert_eq!(held(&s), held_before, "the store is unchanged");
     }
+
+    /// `T-037-15`, `REQ-RT-20`, amendment 0033 D25, `NFR-11`: an input the fence refuses (here a
+    /// package of the next generation installed while nothing is scheduled) commits nothing and is
+    /// audited at the execution node, in the audit store's node trail and on standard error, never
+    /// in the book: the book's trail does not move, and the Agent's input number is not taken. It
+    /// never counts toward the halt, however often it is retried; the fenced clock runs from the
+    /// first refused input's time and stops when an input commits.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn t037_15_a_fenced_input_is_audited_at_the_node_never_in_the_book() {
+        let s = store();
+        let (core, mut shipper) = audited(NativePort::new(), MemLog::default(), &s, 100_000);
+        assert!(matches!(core.ship(&mut shipper), Some(Ok(_))));
+        core.set_node_trail(audit_store::NodeTrail::open(&s.config, &writer()).unwrap());
+        let before = agent_inputs(&core);
+        let book_before = held(&s).len();
+        core.with_port(|p| p.generation = 1);
+        let tick = ticks(1, 1).remove(0);
+        for _ in 0..FAILED_ATTEMPTS + 2 {
+            assert_eq!(core.apply(&tick).await, Err(CoreError::Unavailable));
+        }
+        assert_eq!(core.stopped(), None, "the fence never halts the core");
+        assert_eq!(core.stats().halted.load(Ordering::Relaxed), 0);
+        assert_eq!(agent_inputs(&core), before, "its number is not taken");
+        assert_eq!(
+            core.stats().fenced_since.load(Ordering::Relaxed),
+            T0 + 1_000,
+            "the clock runs from the first refused input's time"
+        );
+        // Audited at the node: one record per refusal, naming the input by key, kind and time.
+        let node = audit_store::NodeTrail::read(&s.config.dir).records;
+        assert_eq!(node.len() as u32, FAILED_ATTEMPTS + 2);
+        for r in &node {
+            assert_eq!(
+                (r.kind.as_str(), r.input, r.at),
+                ("fenced", before + 1, T0 + 1_000)
+            );
+            assert!(r.detail.contains("generation 1") && r.detail.contains("tick at"));
+        }
+        // Never in the book: its trail holds nothing more.
+        assert!(matches!(core.ship(&mut shipper), Some(Ok(_))));
+        assert_eq!(held(&s).len(), book_before);
+        // The code the state names, installed: the same input commits, and the clock stops.
+        core.with_port(|p| p.generation = 0);
+        assert!(core.apply(&tick).await.is_ok());
+        assert_eq!(agent_inputs(&core), before + 1);
+        assert_eq!(core.stats().fenced_since.load(Ordering::Relaxed), 0);
+    }
 }

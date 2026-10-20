@@ -1,9 +1,9 @@
 ---
 name: aledgent
 summary: A private, provable ledger of record — identities that own accounts, value that moves between them instantly and confidentially, and one settlement layer through which value enters, leaves, and is anchored.
-spec_version: 0.4.27
+spec_version: 0.4.28
 status: draft
-date: 2026-10-17
+date: 2026-10-20
 ---
 
 # aledgent — System Specification
@@ -773,12 +773,16 @@ writer state, the code generation in force. When an upgrade names code version *
   input *n* makes *H* and its generation the ones in force, as its first effect, unless input *n* moves or
   cancels the upgrade.
 - **The way out.** A scheduled upgrade MAY be moved to a strictly later input, or cancelled, by an input of
-  its own, authorised under the upgrade-authority mode in force (`REQ-RT-18`). One that is not so authorised
-  MUST be refused with nothing changed. While the old code is fenced, such an input is the only one it
-  takes, and it takes its input number like any other input. Such an input at or after *n* MUST be decided
-  the same whichever of the two generations decides it: the upgrade does not take effect at that input, and
-  the generation in force stays the old one. The execution node then installs the old generation's code
-  again before the next input.
+  its own, authorised under the upgrade-authority mode in force (`REQ-RT-18`). Every such input MUST be
+  decided, by code of either generation and the same by both, at any input number. One that is not so
+  authorised, or that moves the upgrade to an input not later than its own, MUST be refused as any command
+  is: its refusal is recorded, it takes its input number, and the upgrade stays scheduled. While the old
+  code is fenced, such inputs are the only ones it takes. Whether taken or refused, such an input at or
+  after *n* does not make the upgrade take effect, and the generation in force stays the old one; the
+  upgrade takes effect at the next input that neither moves nor cancels it. The execution node then
+  installs the code the code map names for the next input. An input that moves or cancels the upgrade and
+  also holds anything else MUST be refused whole, as malformed (`ERR-MalformedCommand`), with nothing of it
+  applied and its number not taken, by code of either generation alike. *Amendment 0035.*
 - The code map MUST be derived from the upgrade inputs and the inputs that move or cancel them, alone
   (`REQ-RT-17`), so that replay gives every input the generation that decided it.
 - **What the fence cannot see.** When it starts, and at every switch, the execution node that drives a writer
@@ -2347,10 +2351,12 @@ can still replay all of it, under the code that ran each part.
   an upgrade whose code version names a generation other than the writer's plus one, Then it is refused
   and nothing changes (`REQ-RT-20`).
 - `AC-K7.17` Given an upgrade scheduled from input *n*, When an input that moves or cancels it is not
-  authorised under the mode in force, Then it is refused, nothing changes, and the upgrade stays scheduled
-  (`REQ-RT-20`, `REQ-RT-18`).
-- `AC-K7.18` Given an upgrade scheduled from input *n* and an authorised input that moves or cancels it,
-  arriving as input *n*, When it is decided by the old code, and When it is decided by the new code because
+  authorised under the mode in force, before *n* or at or after it, Then it is refused, the refusal is
+  recorded and takes its input number, the upgrade stays scheduled, and code of either generation decides
+  it the same; and When an input moves or cancels it together with anything else, Then the whole input is
+  refused as malformed and nothing of it applies (`REQ-RT-20`, `REQ-RT-18`). *Amendment 0035.*
+- `AC-K7.18` Given an upgrade scheduled from input *n* and an input that moves or cancels it, authorised
+  or not, arriving as input *n*, When it is decided by the old code, and When it is decided by the new code because
   the switch was already made, Then both commit the same outcome: the upgrade does not take effect at *n*
   and the generation stays the old one; and a replay assigns every input the generation the code map,
   read from the inputs alone, names (`REQ-RT-20`, `REQ-RT-17`).

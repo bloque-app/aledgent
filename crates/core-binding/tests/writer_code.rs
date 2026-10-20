@@ -335,3 +335,31 @@ fn t037_02_driver_and_observed_slot_change_no_root_log_hash_or_commitment() {
     let _: Hot = decode(&encode(&ha)).unwrap();
     let _ = HOT;
 }
+
+/// `T-037-15`: the fence is in *H₀* and always on, and it changes nothing of a book that never
+/// upgrades. The roots and log hash of every input, the checkpoint's anchor commitment, and the
+/// writer state of the hot row (every field but the host-local two) of the book [`drive`] makes
+/// are pinned to what the code before the fence computed (`develop` at `4f0b90c`), under the
+/// default v2 roots (v1 roots give other values, and are not pinned here).
+#[cfg(not(feature = "smt-v1"))]
+#[test]
+fn t037_15_the_fence_changes_nothing_of_a_book_that_never_upgrades() {
+    let (archive, c, mut h) = drive(NativePort::new());
+    let mut acc = Vec::new();
+    for e in &archive {
+        acc.extend_from_slice(&e.seq.to_be_bytes());
+        acc.extend_from_slice(&e.roots.kernel);
+        acc.extend_from_slice(&e.roots.service);
+        acc.extend_from_slice(&e.roots.audit);
+        acc.extend_from_slice(&e.log_hash());
+    }
+    acc.extend_from_slice(&c.commitment);
+    (h.driver, h.observed_slot) = ([0; 32], 0);
+    acc.extend_from_slice(&encode(&h));
+    let pinned = cipher_clerk::crypto::blake2b_256(b"t037-15/pin", &[&acc]);
+    assert_eq!(archive.len(), 8);
+    assert_eq!(
+        hex::encode(pinned),
+        "885d56d7bd55e37b8c94a86ddc2309e2d45fe8b453b349b0f36bb60251a51336"
+    );
+}

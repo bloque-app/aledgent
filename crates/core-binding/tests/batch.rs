@@ -407,6 +407,7 @@ fn t_031_02_a_batch_the_agent_cannot_read_is_refused_whole() {
                 slot: Some(1),
                 message: &message,
                 blob: &none,
+                generation: 0,
             },
         )
     };

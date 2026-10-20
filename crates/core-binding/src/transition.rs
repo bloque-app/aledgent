@@ -73,6 +73,10 @@ pub struct Invocation<'a> {
     pub message: &'a [u8],
     /// The caller blobs, by content (`ctx.invocation_blob`).
     pub blob: &'a dyn Fn(&BlobKey) -> Option<Vec<u8>>,
+    /// The code generation compiled into the code that runs this transition (`T-037-15`): the
+    /// guest's `code_generation()`, the record `ledger_core::code::generation_of` reads. The fence
+    /// compares it with the writer's state at every input ([`crate::fence`]).
+    pub generation: u64,
 }
 
 /// Buffered writes, applied only when the transition succeeds.
@@ -477,6 +481,10 @@ fn input(
             expected: hot.inputs + 1,
         });
     }
+    // The fence (`T-037-15`, `crate::fence`): at every input, before anything of it runs.
+    let way_out = crate::fence::way_out_input(&i.calls, i.deliveries.len())?;
+    let mut code = crate::fence::WriterCode::of(&hot);
+    crate::fence::admit(inv.generation, &code, i.seq, way_out)?;
     // Backpressure (`T-005-07`): nothing more until the driver archives.
     if hot.inputs - hot.archived >= hot.limits.ring {
         return Err(AgentRefusal::RingFull);
@@ -534,8 +542,11 @@ fn input(
         return Err(AgentRefusal::OutboxFull);
     }
     let mut ledger = Ledger::from_parts(book, state, config);
-    // What a checkpoint this input creates binds (`T-037-03`): the hot row's code and mode.
-    ledger.set_code(hot.code, hot.authority);
+    // What a checkpoint this input creates binds (`T-037-03`): the code that executes it, as the
+    // code map names it (`crate::fence`), and the hot row's mode. A way out is decided against the
+    // input's own number (`T-037-15`).
+    ledger.set_code(code.code_for(i.seq), hot.authority);
+    ledger.set_input(i.seq);
     let clerk_ref = private.clerk.as_ref().map(|c| c as &dyn ClerkSigner);
     let mut summaries = Vec::with_capacity(i.calls.len());
     for c in &i.calls {
@@ -548,6 +559,9 @@ fn input(
         }
         summaries.push(s);
     }
+    // What the input did to the writer's code (`T-037-15`), decided the same by either generation.
+    crate::fence::decide(&mut code, i.seq, way_out, ledger.take_way_out());
+    code.store(&mut hot);
     // Deliveries: recorded once, for notifications the core committed (`REQ-RT-4`). Both the
     // notification and its delivery leaf must be witnessed.
     let mut delivered = Vec::new();
@@ -680,6 +694,7 @@ fn batch(
             slot: inv.slot,
             message: inv.message,
             blob: &fetch,
+            generation: inv.generation,
         };
         for i in run {
             if stopped {

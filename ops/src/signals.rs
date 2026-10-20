@@ -14,6 +14,7 @@
 //! | `Needs-Review` count and oldest (`REQ-OP-6`, `AC-C4.1`) | `aledgent_review_queue`, `aledgent_needs_review`, `aledgent_review_most_overdue_ms`, with the queue's owner | core |
 //! | Block production (Kreivo's runtime) | `aledgent_finalized_height`, `aledgent_finalized_stall_ms` | adapter |
 //! | Completion (`NFR-15`, amendment 0007): ceiling 30 s, target 19 s, at p99 | `aledgent_completion_p99_ms`, `aledgent_completion_p50_ms` | ingress |
+//! | How long a writer has been fenced (`REQ-RT-20`, `T-037-15`): alert past `fence_alert_after`, five minutes by default | `aledgent_writer_fenced_seconds` | core host |
 //! | The release's signals (`T-018-10`): the core's halt, the audit trail's shipping, the runtime's Authority backlog, the adapter's service and finality; the sharded profile's lags and R-03's checks of the messages between Agents, deferred ([`RELEASE`], [`DEFERRED`]) | `aledgent_core_halted`, `aledgent_audit_*`, `aledgent_vos_unacknowledged_authority_decisions`, `aledgent_finality_lag_blocks` | core host; adapter |
 //!
 //! Beside them: anchoring's incidents and the latest settlement comparison (`F-017`), the
@@ -97,6 +98,8 @@ pub const SIGNALS: &[(&str, &[&str])] = &[
         "completion",
         &["aledgent_completion_p99_ms", "aledgent_completion_p50_ms"],
     ),
+    // `REQ-RT-20` (amendment 0033): how long a writer has been fenced is one of `NFR-11`'s.
+    ("writer-fence", &["aledgent_writer_fenced_seconds"]),
 ];
 
 /// The kinds of the adapter's alerts (`F-016`), each exported even at zero.
@@ -500,6 +503,12 @@ fn anchoring(e: &mut Exposition, c: &SignalsBody) {
 /// The core host's own signals (`T-018-10`): the halt, the audit trail's shipping (`T-013-13`),
 /// and the runtime's Authority backlog.
 fn host(e: &mut Exposition, c: &SignalsBody) {
+    e.gauge(
+        "aledgent_writer_fenced_seconds",
+        "How long the core's writer has been fenced (T-037-15, REQ-RT-20): the code installed is not the code its state names, so it takes no input until the code map's code is installed or the upgrade is moved or cancelled. 0 when it is not fenced.",
+        &[("writer", "core")],
+        c.writer_fenced_age.map_or(0, |ms| ms / 1_000),
+    );
     e.gauge(
         "aledgent_core_halted",
         "Whether the core has stopped deciding: halted on an input the Agent cannot apply (F18), or stopped on an incident. Every input waits Received.",

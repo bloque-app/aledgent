@@ -92,6 +92,7 @@ use crate::envelope::{
     GenesisEnvelope, GenesisState, InputEnvelope, MAX_BATCH_INPUTS, MAX_BATCH_PACKS, Pack, Private,
     Reply, Roots, StateGenesisEnvelope, decode, encode,
 };
+use crate::fence::WriterCode;
 use crate::hot::{Hot, Limits, RingEntry};
 use crate::mapped::{Mapped, MappedGenesis, MappedInput, ServiceKeys};
 use crate::service::{Node, ServiceWitness, proven_keys};
@@ -525,9 +526,10 @@ pub struct Driver<P: AgentPort> {
     /// The roots of the book's genesis, as this host's replica computed them: from the chainspec
     /// for a chainspec book (`F-036`), which the core checks against the deployment's manifest.
     genesis: Roots,
-    /// The code version that executes the Agent's next input, as its hot row holds it
-    /// (`T-037-02`): each ring entry the replica computes names it.
-    code: [u8; 32],
+    /// The writer's code, as the Agent's hot row holds it after the inputs staged so far
+    /// (`T-037-02`, `T-037-15`): each ring entry the replica computes names the code that executes
+    /// it, as the code map names it and [`crate::fence::decide`] moves it.
+    writer: WriterCode,
     /// The digest of the Agent's upgrade-authority mode, as its hot row holds it: with
     /// [`Driver::code`], what the replica's checkpoints bind (`T-037-03`).
     authority: [u8; 32],
@@ -1155,6 +1157,8 @@ impl<P: AgentPort> Driver<P> {
             apply_spec_prefix(&mut replica, &founded, spec, start)?;
         }
         replica.set_code(code.code, code.authority);
+        // The first input (`T-037-15`): what a way out is decided against.
+        replica.set_input(1);
         replica.record_calls(true);
         let service = ServiceStore::of_in(stores, replica.state())?;
         let mut driver = Driver {
@@ -1174,7 +1178,11 @@ impl<P: AgentPort> Driver<P> {
             last_entry: None,
             mapped,
             genesis: Roots::default(),
-            code: code.code,
+            writer: WriterCode {
+                code: code.code,
+                generation: 0,
+                upgrade: None,
+            },
             authority: code.authority,
         };
         // Bootstrap writes the book's one journal without loading it: witness it absent.
@@ -1265,9 +1273,57 @@ impl<P: AgentPort> Driver<P> {
         &mut self.port
     }
 
-    /// The code version that executes the Agent's next input (`T-037-02`).
+    /// The code version in force after the inputs staged so far (`T-037-02`).
     pub fn code(&self) -> [u8; 32] {
-        self.code
+        self.writer.code
+    }
+
+    /// The writer's code after the inputs staged so far: its code version, generation and
+    /// scheduled upgrade (`T-037-15`).
+    pub fn writer(&self) -> WriterCode {
+        self.writer
+    }
+
+    /// Read the writer's code and mode again from the Agent's hot row, and run the replica's next
+    /// commands under them (`T-037-15`). For a host whose Agent's code state changed by other
+    /// means than an input this driver staged (until `T-037-04` lands, a test that sets the hot
+    /// row's `upgrade` and `generation`). Nothing may be staged.
+    pub fn reload_code(&mut self, replica: &mut Replica) -> Result<(), DriveError> {
+        if !self.staged.is_empty() {
+            return Err(DriveError::Replica(
+                "the writer's code is read again with inputs staged".into(),
+            ));
+        }
+        let hot = self
+            .port
+            .hot()
+            .map_err(DriveError::Port)?
+            .ok_or(DriveError::Refused(AgentRefusal::NotFounded))?;
+        self.writer = WriterCode::of(&hot);
+        self.authority = hot.authority;
+        self.prepare(replica, hot.inputs + 1);
+        Ok(())
+    }
+
+    /// Run the replica's next commands as input `next` (`T-037-15`): under the code the code map
+    /// names for it, which its checkpoints bind, and with a way out decided against its number.
+    fn prepare(&self, replica: &mut Replica, next: u64) {
+        replica.set_code(self.writer.code_for(next), self.authority);
+        replica.set_input(next);
+    }
+
+    /// The writer's code after the input numbered `seq`, a way-out input or not, which took the
+    /// way out `taken` (the replica's), as the code map decides it ([`crate::fence::decide`]):
+    /// its code is what the input's ring entry names.
+    fn decided(
+        &self,
+        seq: u64,
+        way_out: bool,
+        taken: Option<ledger_core::code::WayOut>,
+    ) -> WriterCode {
+        let mut w = self.writer;
+        crate::fence::decide(&mut w, seq, way_out, taken);
+        w
     }
 
     /// The last input number the Agent committed.
@@ -1405,6 +1461,13 @@ impl<P: AgentPort> Driver<P> {
         {
             return Err(DriveError::Unsupported(r.call.method().to_string()));
         }
+        // Whether it is a way-out input, and the way out it took, the replica's: what the input
+        // does to the writer's code (`T-037-15`). An input that mixes a way out with anything else
+        // is sent as it is: the Agent refuses it whole (`crate::fence::way_out_input`).
+        let taken = replica.take_way_out();
+        let way_out =
+            crate::fence::way_out_input(recorded.iter().map(|r| &r.call), deliveries.len())
+                .unwrap_or(false);
         let mut keys = keys;
         keys.journals.insert(replica.book().journal());
         let openings = openings_before(replica, &keys, &before);
@@ -1430,6 +1493,7 @@ impl<P: AgentPort> Driver<P> {
                 self.flush_staged()?;
             }
             let seq = self.seq + 1;
+            let writer = self.decided(seq, way_out, taken);
             let (leaves, whole) = self.service.leaves(&touched)?;
             let changes = changed(replica, &leaves, &deliveries)?;
             let envelope = Envelope::Mapped(Mapped::Input(MappedInput {
@@ -1451,7 +1515,7 @@ impl<P: AgentPort> Driver<P> {
             let (roots, next_posting) = replica_roots(replica, &self.service)?;
             let entry = RingEntry {
                 seq,
-                code: self.code,
+                code: writer.code,
                 calls,
                 deliveries,
                 roots,
@@ -1460,6 +1524,8 @@ impl<P: AgentPort> Driver<P> {
             };
             let log_hash = entry.log_hash();
             let committed = check(&entry, log_hash, &summaries, reply)?;
+            self.writer = writer;
+            self.prepare(replica, seq + 1);
             self.seq = seq;
             self.log_head = committed.log_hash;
             self.last_entry = Some(entry.clone());
@@ -1477,6 +1543,7 @@ impl<P: AgentPort> Driver<P> {
         let (roots, next_posting) = replica_roots(replica, &self.service)?;
         let (tip, prev) = self.tip();
         let seq = tip + 1;
+        let writer = self.decided(seq, way_out, taken);
         let input = InputEnvelope {
             seq,
             calls: calls.clone(),
@@ -1488,7 +1555,7 @@ impl<P: AgentPort> Driver<P> {
         };
         let entry = RingEntry {
             seq,
-            code: self.code,
+            code: writer.code,
             calls,
             deliveries,
             roots,
@@ -1516,6 +1583,9 @@ impl<P: AgentPort> Driver<P> {
             reply_bytes,
         };
         self.pin(replica)?;
+        // As if committed, as the leaves are: the next input runs under the code this one leaves.
+        self.writer = writer;
+        self.prepare(replica, seq + 1);
         if !self.staged.is_empty() && !self.fits(&staged) {
             self.flush_staged()?;
         }
@@ -1742,8 +1812,8 @@ impl<P: AgentPort> Driver<P> {
         let (mut replica, service, recorder, genesis) =
             replay_with(stores, &keys, genesis, op, at, archive, audit_floor, prefix)?;
         recorder.clear();
-        // From here the replica runs the Agent's next inputs, under its hot row's code and mode.
-        replica.set_code(hot.code, hot.authority);
+        // From here the replica runs the Agent's next inputs, under its hot row's code and mode
+        // (`Driver::prepare`, below).
         let (roots, next_posting) = replica_roots(&replica, &service)?;
         if roots != hot.roots() || next_posting != hot.next_posting {
             return Err(DriveError::Diverged(format!(
@@ -1771,9 +1841,10 @@ impl<P: AgentPort> Driver<P> {
             last_entry: archive.last().cloned(),
             mapped: hot.layout == crate::mapped::LAYOUT_MAPPED,
             genesis,
-            code: hot.code,
+            writer: WriterCode::of(&hot),
             authority: hot.authority,
         };
+        driver.prepare(&mut replica, hot.inputs + 1);
         driver.pin(&replica)?;
         Ok((driver, replica))
     }
@@ -1810,9 +1881,12 @@ impl<P: AgentPort> Driver<P> {
                     )));
                 }
                 // The code that executed it, as the Agent's ring names it (`T-037-02`), is what
-                // its checkpoints bind (`T-037-03`).
-                self.code = e.code;
-                replica.set_code(self.code, self.authority);
+                // its checkpoints bind (`T-037-03`), unless an upgrade takes effect at it: then the
+                // code map's (`T-037-15`).
+                if !self.writer.due(e.seq) {
+                    self.writer.code = e.code;
+                }
+                self.prepare(replica, e.seq);
                 for c in &e.calls {
                     let clerk = clerk.as_deref().map(|c| c as &dyn ClerkSigner);
                     crate::calls::apply(replica, c, clerk);
@@ -1993,13 +2067,16 @@ fn replay_with(
                 e.seq
             )));
         }
-        // Each input under the code its entry names (`T-037-02`): what its checkpoints bind.
+        // Each input under the code its entry names (`T-037-02`): what its checkpoints bind; a way
+        // out decided against its number (`T-037-15`).
         replica.set_code(e.code, authority);
+        replica.set_input(e.seq);
         for c in &e.calls {
             let clerk = clerk.as_deref().map(|c| c as &dyn ClerkSigner);
             crate::calls::apply(&mut replica, c, clerk);
         }
         let _ = replica.take_calls();
+        let _ = replica.take_way_out();
         let touched = Touches::take(&replica, &e.deliveries);
         let (before, _) = service.leaves(&touched)?;
         let changes = changed(&replica, &before, &e.deliveries)?;
@@ -2064,6 +2141,10 @@ pub struct NativePort {
     /// Fail the next invocation this way, for tests: `Some(true)` after running it (ambiguous),
     /// `Some(false)` before (unavailable).
     pub fail_next: Option<bool>,
+    /// The code generation the native transition runs as (`T-037-15`): what a guest's
+    /// `code_generation()` returns. 0, *H₀*'s; a test sets another to run as a switched or a stale
+    /// package.
+    pub generation: u64,
 }
 
 /// The principal the native port and the tests invoke as.
@@ -2077,6 +2158,7 @@ impl NativePort {
             origin: DRIVER,
             slot: 0,
             fail_next: None,
+            generation: 0,
         }
     }
 }
@@ -2109,6 +2191,7 @@ impl AgentPort for NativePort {
             slot: Some(self.slot),
             message: &message,
             blob: &fetch,
+            generation: self.generation,
         };
         let reply = crate::transition::transition(&mut self.rows, &inv);
         if self.fail_next == Some(true) {
