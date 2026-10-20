@@ -323,13 +323,25 @@ impl AgentPort for VosPort {
     /// `switch(H, n)` on `saga` (`T-037-14`): make the Agent run `code`, from the versions staged
     /// for this port. A port that tracks no code runs what it runs.
     fn switch_to(&mut self, code: [u8; 32]) -> Result<(), String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
         let Some(state) = self.code_state() else {
             return Ok(());
         };
+        // A failing install is not retried at once: it would burn the runtime's authority slots.
+        if let Some(why) = state.park.blocked(&code, now) {
+            return Err(why);
+        }
         let digests = state.staged.digests();
-        core_binding::switch::ensure(code, None, 0, &digests, self)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        let r = core_binding::switch::ensure(code, None, 0, &digests, self);
+        if let Some(c) = self.code_state_mut() {
+            match &r {
+                Ok(_) => c.park.succeeded(),
+                Err(e) => c.park.failed(code, e.to_string(), now),
+            }
+        }
+        r.map(|_| ()).map_err(|e| e.to_string())
     }
 
     fn invoke(&mut self, envelope: Vec<u8>, blobs: Vec<Vec<u8>>) -> Result<Vec<u8>, PortError> {

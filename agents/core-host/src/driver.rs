@@ -310,6 +310,11 @@ impl Runtime {
         self.linear = linear;
         self.control = control;
         self.slot = self.slot.max(slot);
+        // The authority decisions of management requests are strictly increasing in the runtime's
+        // state, and the counter is not persisted: after a restart the first one would sign
+        // decision 1 and be refused (`AuthoritySequenceRegressed`). Every management request also
+        // takes a slot, so the slot is never below the last decision: start from it.
+        self.decision = self.decision.max(self.slot);
     }
 
     /// The last observed slot.

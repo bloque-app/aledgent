@@ -53,9 +53,6 @@ impl StagedVersion {
 #[derive(Clone, Debug, Default)]
 pub struct StagedVersions {
     versions: HashMap<[u8; 32], StagedVersion>,
-    /// Versions whose artefacts the host's start check already verified against their manifest
-    /// (`crate::code::check`): the one it runs, by digests only.
-    running: HashMap<[u8; 32], Artefacts>,
 }
 
 /// The digests of every version a store holds: what [`core_binding::switch::ensure`] reads while
@@ -77,14 +74,14 @@ impl StagedVersions {
     }
 
     /// The version this host runs, whose `package` and `runtime` bytes the start check verified
-    /// against the version's manifest ([`crate::code::check`]); no bytes are kept, so it is never
-    /// installed from here, only recognised as already running.
+    /// against the version's manifest ([`crate::code::check`]). Its bytes are kept: after a way-out
+    /// at *n* the host runs it again, so it must be able to reinstall it (D17).
     pub fn running(&mut self, version: [u8; 32], package: &[u8], runtime: &[u8]) {
-        self.running.insert(
+        self.versions.insert(
             version,
-            Artefacts {
-                package: artefact_digest(package),
-                runtime: artefact_digest(runtime),
+            StagedVersion {
+                package: package.to_vec(),
+                runtime: runtime.to_vec(),
             },
         );
     }
@@ -92,11 +89,12 @@ impl StagedVersions {
     /// The digests of every version held.
     #[must_use]
     pub fn digests(&self) -> StagedDigests {
-        let mut m = self.running.clone();
-        for (k, v) in &self.versions {
-            m.insert(*k, v.artefacts());
-        }
-        StagedDigests(m)
+        StagedDigests(
+            self.versions
+                .iter()
+                .map(|(k, v)| (*k, v.artefacts()))
+                .collect(),
+        )
     }
 
     /// Stage a code version: its `manifest`, and the `package` and `runtime` bytes it names.
@@ -147,9 +145,7 @@ impl StagedVersions {
 
 impl StagedCode for StagedVersions {
     fn artefacts(&self, code: &[u8; 32]) -> Option<Artefacts> {
-        self.get(code)
-            .map(StagedVersion::artefacts)
-            .or_else(|| self.running.get(code).copied())
+        self.get(code).map(StagedVersion::artefacts)
     }
 }
 
@@ -162,6 +158,73 @@ pub struct CodeState {
     pub running: Artefacts,
     /// The versions staged for this host.
     pub staged: StagedVersions,
+    /// The retry bound of a switch that fails ([`Park`]).
+    pub park: Park,
+}
+
+/// The most failed attempts at one target before the host stops trying until it restarts.
+pub const PARK_MAX_FAILURES: u32 = 8;
+/// The wait after the first failure, doubled after each, to [`PARK_MAX_WAIT_MS`].
+pub const PARK_FIRST_WAIT_MS: u64 = 30_000;
+/// The longest wait between two attempts.
+pub const PARK_MAX_WAIT_MS: u64 = 900_000;
+
+/// The park of a failing switch (`T-037-14`, review of #44, F4): the host's driver asks the port to
+/// run a version before every send, and a failing install is retried by the forwarder at once. On
+/// `saga` each attempt at an upgrade the runtime refuses takes an authority slot of the runtime
+/// that never compacts (256 in all), so the attempts are bounded: after a failure the same target
+/// is not tried again for a while (30 s, doubling to 15 min), and after
+/// [`PARK_MAX_FAILURES`] it is not tried until the host restarts (an operator looks at it).
+#[derive(Clone, Debug, Default)]
+pub struct Park {
+    target: Option<[u8; 32]>,
+    failures: u32,
+    next_ms: u64,
+    why: String,
+}
+
+impl Park {
+    /// Why an attempt at `target` must not be made at `now_ms` (milliseconds since the Unix
+    /// epoch), if it must not.
+    #[must_use]
+    pub fn blocked(&self, target: &[u8; 32], now_ms: u64) -> Option<String> {
+        if self.target.as_ref() != Some(target) {
+            return None;
+        }
+        if self.failures >= PARK_MAX_FAILURES {
+            return Some(format!(
+                "parked after {} failed attempts, until the host restarts: {}",
+                self.failures, self.why
+            ));
+        }
+        (now_ms < self.next_ms).then(|| {
+            format!(
+                "parked for another {} s after {} failed attempts: {}",
+                (self.next_ms - now_ms).div_ceil(1000),
+                self.failures,
+                self.why
+            )
+        })
+    }
+
+    /// An attempt at `target` failed at `now_ms`.
+    pub fn failed(&mut self, target: [u8; 32], why: String, now_ms: u64) {
+        if self.target != Some(target) {
+            self.failures = 0;
+        }
+        self.target = Some(target);
+        self.failures = self.failures.saturating_add(1);
+        let wait = PARK_FIRST_WAIT_MS
+            .saturating_mul(1u64 << (self.failures - 1).min(20))
+            .min(PARK_MAX_WAIT_MS);
+        self.next_ms = now_ms.saturating_add(wait);
+        self.why = why;
+    }
+
+    /// The platform runs what was asked: nothing is parked.
+    pub fn succeeded(&mut self) {
+        *self = Self::default();
+    }
 }
 
 impl CodeState {
@@ -175,6 +238,7 @@ impl CodeState {
                 runtime: artefact_digest(runtime),
             },
             staged,
+            park: Park::default(),
         }
     }
 }
@@ -284,6 +348,58 @@ mod tests {
         assert!(err.unwrap_err().contains("names no"));
         // Nothing was staged.
         assert!(s.artefacts(&[0; 32]).is_none());
+    }
+
+    #[test]
+    fn t037_14_a_failing_switch_is_parked_with_a_growing_wait_and_a_limit() {
+        let t = [7u8; 32];
+        let mut p = Park::default();
+        assert!(p.blocked(&t, 0).is_none(), "nothing failed yet");
+        p.failed(t, "UnsupportedLane".into(), 1_000);
+        // Parked for 30 s: no attempt is made, the reason is the failure's.
+        let why = p.blocked(&t, 1_001).expect("parked");
+        assert!(
+            why.contains("UnsupportedLane") && why.contains("30"),
+            "{why}"
+        );
+        assert!(
+            p.blocked(&t, 1_000 + PARK_FIRST_WAIT_MS).is_none(),
+            "the wait is over"
+        );
+        // Another target is not parked.
+        assert!(p.blocked(&[8; 32], 1_001).is_none());
+        // The wait doubles and stops at the cap.
+        for i in 2..=PARK_MAX_FAILURES {
+            p.failed(t, "UnsupportedLane".into(), 0);
+            let wait = PARK_FIRST_WAIT_MS
+                .saturating_mul(1u64 << (i - 1))
+                .min(PARK_MAX_WAIT_MS);
+            if i < PARK_MAX_FAILURES {
+                assert!(p.blocked(&t, wait - 1).is_some(), "attempt {i}");
+                assert!(p.blocked(&t, wait).is_none(), "attempt {i}");
+            }
+        }
+        // After the limit nothing is tried until the host restarts, whatever the time.
+        assert!(
+            p.blocked(&t, u64::MAX)
+                .unwrap()
+                .contains("until the host restarts")
+        );
+        // A success clears it.
+        p.succeeded();
+        assert!(p.blocked(&t, 0).is_none());
+    }
+
+    #[test]
+    fn t037_14_the_running_version_keeps_its_bytes_so_g_can_be_reinstalled() {
+        let mut s = StagedVersions::new();
+        s.running([1; 32], b"package", b"runtime");
+        let v = s.get(&[1; 32]).expect("kept");
+        assert_eq!(
+            (v.package.as_slice(), v.runtime.as_slice()),
+            (&b"package"[..], &b"runtime"[..])
+        );
+        assert_eq!(s.digests().artefacts(&[1; 32]), Some(v.artefacts()));
     }
 
     #[test]

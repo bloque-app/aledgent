@@ -185,3 +185,41 @@ fn t037_14_a_book_that_never_upgrades_never_switches() {
     assert!(matches!(fx.driver.ensure_code(), Ok(()),));
     let _ = AgentRefusal::NotFounded;
 }
+
+/// `T-037-14`, review of #44 (F8): the switch precedes the input on the mapped layout too, which is
+/// driven one input per invocation by another path of the driver.
+#[test]
+fn t037_14_the_driver_switches_before_n_on_the_mapped_layout() {
+    let mut fx = Fx::mapped();
+    let _ = fx.person();
+    let g = hot(&mut fx).code;
+    let n = hot(&mut fx).inputs + 1;
+    let mut h = hot(&mut fx);
+    h.upgrade = Some((H1, n));
+    fx.driver.port_mut().rows.0.insert(HOT.to_vec(), encode(&h));
+    fx.driver.reload_code(&mut fx.replica).unwrap();
+    fx.driver.port_mut().code_map = [(g, 0), (H1, 1)].into_iter().collect();
+    open(&mut fx, 1);
+    let c = fx.sync().expect("the switch precedes n").expect("sent");
+    assert_eq!(c.seq, n);
+    assert_eq!(fx.driver.port().switched, [H1]);
+    let h = hot(&mut fx);
+    assert_eq!((h.code, h.generation, h.upgrade), (H1, 1, None));
+    // A version the platform cannot run sends nothing on this path either.
+    let mut fx = Fx::mapped();
+    let _ = fx.person();
+    let g = hot(&mut fx).code;
+    let n = hot(&mut fx).inputs + 1;
+    let mut h = hot(&mut fx);
+    h.upgrade = Some((H1, n));
+    fx.driver.port_mut().rows.0.insert(HOT.to_vec(), encode(&h));
+    fx.driver.reload_code(&mut fx.replica).unwrap();
+    fx.driver.port_mut().code_map = [(g, 0)].into_iter().collect();
+    let before = hot(&mut fx).inputs;
+    open(&mut fx, 1);
+    assert!(matches!(
+        fx.sync(),
+        Err(DriveError::Port(PortError::Unavailable(_)))
+    ));
+    assert_eq!(hot(&mut fx).inputs, before);
+}

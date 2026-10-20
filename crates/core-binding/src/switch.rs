@@ -92,8 +92,6 @@ pub enum SwitchError {
     Stale {
         /// What the platform runs now.
         running: Artefacts,
-        /// What the target needs.
-        wanted: Artefacts,
     },
     /// The platform cannot install the target.
     Cannot(String),
@@ -103,8 +101,6 @@ pub enum SwitchError {
     NotInstalled {
         /// What the platform runs now.
         running: Artefacts,
-        /// What the target needs.
-        wanted: Artefacts,
     },
 }
 
@@ -134,14 +130,6 @@ pub fn target_code(code: [u8; 32], upgrade: Option<([u8; 32], u64)>, next_input:
     }
 }
 
-/// Whether the batch must end before input `next_input`: an upgrade is scheduled for it, so the
-/// host flushes after input *n* − 1 (a restore point and a checkpoint land there) and takes the
-/// switch before it sends *n*.
-#[must_use]
-pub fn batch_ends_before(upgrade: Option<([u8; 32], u64)>, next_input: u64) -> bool {
-    matches!(upgrade, Some((_, n)) if next_input == n)
-}
-
 /// Make the platform run the code version that executes input `next_input` (module
 /// documentation). Call it at start and before sending every input; on `Err` send nothing.
 ///
@@ -160,7 +148,7 @@ pub fn ensure(
     let wanted = staged
         .artefacts(&target)
         .ok_or(SwitchError::NotStaged(target))?;
-    let have = installer.running().map_err(to_switch(wanted))?;
+    let have = installer.running().map_err(to_switch())?;
     if have == wanted {
         return Ok(Outcome::Unchanged);
     }
@@ -169,22 +157,19 @@ pub fn ensure(
         // Another attempt (a host that crashed after its install, before it logged it) already
         // ran the target: "already switched" is success, not a stale compare-and-swap.
         Err(InstallError::Stale { running }) if running == wanted => return Ok(Outcome::Unchanged),
-        Err(e) => return Err(to_switch(wanted)(e)),
+        Err(e) => return Err(to_switch()(e)),
     }
-    let now = installer.running().map_err(to_switch(wanted))?;
+    let now = installer.running().map_err(to_switch())?;
     if now == wanted {
         Ok(Outcome::Installed)
     } else {
-        Err(SwitchError::NotInstalled {
-            running: now,
-            wanted,
-        })
+        Err(SwitchError::NotInstalled { running: now })
     }
 }
 
-fn to_switch(wanted: Artefacts) -> impl Fn(InstallError) -> SwitchError {
+fn to_switch() -> impl Fn(InstallError) -> SwitchError {
     move |e| match e {
-        InstallError::Stale { running } => SwitchError::Stale { running, wanted },
+        InstallError::Stale { running } => SwitchError::Stale { running },
         InstallError::Cannot(why) => SwitchError::Cannot(why),
         InstallError::Platform(why) => SwitchError::Platform(why),
     }
@@ -359,13 +344,7 @@ mod tests {
         // Another change slipped in between the read and the swap.
         p.slips_to = Some(art(3, 8));
         let err = ensure(h(1), Some((h(2), 5)), 5, &staged, &mut p).unwrap_err();
-        assert_eq!(
-            err,
-            SwitchError::Stale {
-                running: art(3, 8),
-                wanted: art(2, 9)
-            }
-        );
+        assert_eq!(err, SwitchError::Stale { running: art(3, 8) });
         // The platform kept what it had: nothing was installed or signed, and the caller got an
         // error, so it sends nothing.
         assert_eq!(p.runs, art(3, 8));
@@ -418,14 +397,6 @@ mod tests {
             Err(SwitchError::NotStaged(h(7)))
         );
         assert!(p.installs.is_empty());
-    }
-
-    #[test]
-    fn t037_14_with_an_upgrade_scheduled_the_batch_ends_before_n() {
-        assert!(!batch_ends_before(None, 5));
-        assert!(!batch_ends_before(Some((h(2), 5)), 4));
-        assert!(batch_ends_before(Some((h(2), 5)), 5));
-        assert!(!batch_ends_before(Some((h(2), 5)), 6));
     }
 
     #[test]

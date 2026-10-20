@@ -971,6 +971,11 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
             .map_err(|e| format!("{e:?}"))?
         };
         check_genesis(&founding, &driver)?;
+        // The artefact check at start (`T-037-14`): the platform runs the code that executes the
+        // next input, or the writer is not driven.
+        driver
+            .ensure_code()
+            .map_err(|e| format!("the code of the next input cannot be run: {e:?}"))?;
         driver.archived();
         let mut inner = Inner {
             running: None,
