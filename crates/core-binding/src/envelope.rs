@@ -417,6 +417,37 @@ pub enum AgentRefusal {
     Fault(String),
     /// An earlier input of the batch was refused: nothing of this one ran (`T-031-02`).
     Skipped,
+    /// The fence (`T-037-15`, `REQ-RT-20`, [`crate::fence`]): the code that received the input is
+    /// not the code the writer's state names for it. Nothing is written and the input's number is
+    /// not taken: the execution node installs the code the code map names, and sends the same
+    /// input again. Added by call format 2 ([`CALL_FORMAT`]), last, so no earlier refusal's tag
+    /// moves.
+    Fenced(Fenced),
+}
+
+/// The version of the call format: the envelope, the reply and what they carry, as the host and
+/// the Agent exchange them (`PLAN.md` `DEC-26` (d): call formats are versioned, and a change only
+/// adds a version, so every host applies every earlier one exactly). Version 2 adds the fence's
+/// outcome, [`AgentRefusal::Fenced`] (`T-037-15`), which the continuation's scoped refusal shares
+/// (`T-037-17`); everything version 1 encodes, version 2 encodes the same.
+pub const CALL_FORMAT: u32 = 2;
+
+/// Why the fence refused an input (`T-037-15`, [`AgentRefusal::Fenced`]): what the refusing code
+/// is, and what the writer's state names. The execution node audits it (its log and the audit
+/// store), never the book.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Fenced {
+    /// The input refused: its number is not taken.
+    pub seq: u64,
+    /// The code generation compiled into the code that refused it.
+    pub code_generation: u64,
+    /// The code generation in force in the writer's state.
+    pub generation: u64,
+    /// The writer's scheduled upgrade, if any: the code version and the input it applies from.
+    pub upgrade: Option<([u8; 32], u64)>,
+    /// The named refusal of a scoped refusal of this kind, if any: none for the fence; the
+    /// continuation's refusal of a way out (`T-037-17`, `ERR-InvalidTransition`) names its own.
+    pub refusal: Option<String>,
 }
 
 /// Encode a value.

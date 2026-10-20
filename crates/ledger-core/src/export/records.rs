@@ -488,6 +488,8 @@ tagged!(Command {
     BindAsset => 48,
     ApplyChainSpec => 49,
     RegisterAlias => 50,
+    RescheduleUpgrade => 51,
+    CancelUpgrade => 52,
 });
 
 impl Canonical for OperationRecord {

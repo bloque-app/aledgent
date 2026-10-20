@@ -54,6 +54,31 @@ pub fn artefact_digest(bytes: &[u8]) -> [u8; 32] {
     blake2b_256(b"", &[bytes])
 }
 
+/// A way out of a scheduled upgrade, taken by the writer (`REQ-RT-20`, amendment 0033 D2, D10;
+/// `T-037-15`): `reschedule_upgrade` or `cancel_upgrade`, accepted. Code of either generation
+/// applies it the same: the upgrade does not take effect at its input, and the generation stays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WayOut {
+    /// The upgrade is moved to input `from`, later than the way out's own.
+    Reschedule {
+        /// The input number it now applies from.
+        from: u64,
+    },
+    /// The upgrade is cancelled.
+    Cancel,
+}
+
+impl WayOut {
+    /// The scheduled upgrade (code version and input number) after this way out: cancelled, or
+    /// moved. With nothing scheduled, nothing changes.
+    pub fn apply(self, upgrade: Option<([u8; 32], u64)>) -> Option<([u8; 32], u64)> {
+        match self {
+            WayOut::Cancel => None,
+            WayOut::Reschedule { from } => upgrade.map(|(code, _)| (code, from)),
+        }
+    }
+}
+
 /// The writer a manifest's code runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]

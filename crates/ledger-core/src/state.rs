@@ -182,6 +182,10 @@ pub enum Command {
     TiePrincipal,
     /// `register_alias`, on the operator surface (`REQ-RC-7`, amendment 0024).
     RegisterAlias,
+    /// `reschedule_upgrade`: the way out of a scheduled upgrade, moved (`REQ-RT-20`, `T-037-15`).
+    RescheduleUpgrade,
+    /// `cancel_upgrade`: the way out of a scheduled upgrade, cancelled (`REQ-RT-20`, `T-037-15`).
+    CancelUpgrade,
 }
 
 /// The attribution of one accepted command (`REQ-AU-7`, `REQ-PN-1`, `INV-20`). For an operation

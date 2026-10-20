@@ -132,6 +132,18 @@ const SURFACE: &[(&str, &str)] = &[
         "operator command: the operator's policy authority alone (REQ-RC-7, amendment 0024)",
     ),
     ("revoke_operator", "operator command"),
+    // T-037-15: the way out of a scheduled upgrade, under the upgrade-authority mode in force
+    // (a stand-in for the genesis mode, `Single` naming the operator, until T-037-05). It writes
+    // only its record, request entry and audit record; the writer applies what it took to its
+    // scheduled upgrade.
+    (
+        "reschedule_upgrade",
+        "operator command: the upgrade-authority mode in force (REQ-RT-20, REQ-RT-18)",
+    ),
+    (
+        "cancel_upgrade",
+        "operator command: the upgrade-authority mode in force (REQ-RT-20, REQ-RT-18)",
+    ),
     ("resume", "operator command"),
     ("resolve_operation", "operator command"),
     (
@@ -201,6 +213,18 @@ const SURFACE: &[(&str, &str)] = &[
     (
         "set_code",
         "sets the code version and mode the next checkpoint record binds (T-037-03)",
+    ),
+    // T-037-15: the input number the commands that follow take, as the writer numbers its inputs,
+    // and the way out they took. Neither writes the book: a way out is decided against the first,
+    // and the writer reads the second to apply it to its own scheduled upgrade. Only `core-binding`
+    // calls them.
+    (
+        "set_input",
+        "sets the input number a way out of an upgrade is decided against (T-037-15)",
+    ),
+    (
+        "take_way_out",
+        "takes the way out of a scheduled upgrade the last commands took (T-037-15)",
     ),
     // T-031-19: when the kernel's leaves are committed, not what is written. Every command still
     // decides alone, through the command surface; these only group the kernel's commits.

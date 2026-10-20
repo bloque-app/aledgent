@@ -15,6 +15,7 @@
 //!   invocation's writes (`F-031` lever 2).
 //! - [`hot`]: the Agent's state layout and the budget `H` (`T-005-02`).
 //! - [`envelope`]: the invocation's message, its private inputs and the reply (`T-005-03`).
+//! - [`fence`]: the fence, always on, and the way out of a scheduled upgrade (`T-037-15`).
 //! - [`witness`]: the witnessed leaf store the library runs over inside the Agent (`T-005-04`).
 //! - [`service`]: the witnessed service leaves, and the service tree's root, inside the Agent
 //!   (`T-005-13`).
@@ -44,6 +45,7 @@ pub mod calls;
 #[cfg(feature = "mapped")]
 pub mod committed;
 pub mod envelope;
+pub mod fence;
 pub mod hot;
 #[cfg(feature = "mapped")]
 pub mod mapped;

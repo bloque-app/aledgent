@@ -364,6 +364,10 @@ fn input(
             expected: hot.inputs + 1,
         });
     }
+    // The fence (`T-037-15`, `crate::fence`): at every input, before anything of it runs.
+    let way_out = crate::fence::way_out_input(&i.calls, i.deliveries.len())?;
+    let mut code = crate::fence::WriterCode::of(&hot);
+    crate::fence::admit(inv.generation, &code, i.seq, way_out)?;
     if hot.inputs - hot.archived >= hot.limits.ring {
         return Err(AgentRefusal::RingFull);
     }
@@ -432,8 +436,11 @@ fn input(
     )
     .map_err(AgentRefusal::Malformed)?;
     let mut ledger = Ledger::from_parts(book, state, config);
-    // What a checkpoint this input creates binds (`T-037-03`): the hot row's code and mode.
-    ledger.set_code(hot.code, hot.authority);
+    // What a checkpoint this input creates binds (`T-037-03`): the code that executes it, as the
+    // code map names it (`crate::fence`), and the hot row's mode; a way out is decided against the
+    // input's own number (`T-037-15`).
+    ledger.set_code(code.code_for(i.seq), hot.authority);
+    ledger.set_input(i.seq);
     let clerk_ref = private.clerk.as_ref().map(|c| c as &dyn ClerkSigner);
     let mut summaries = Vec::with_capacity(i.calls.len());
     for c in &i.calls {
@@ -446,6 +453,9 @@ fn input(
         }
         summaries.push(s);
     }
+    // The fence's last word, then what the input did to the writer's code (`T-037-15`).
+    crate::fence::settle(inv.generation, &mut code, i.seq, ledger.take_way_out())?;
+    code.store(&mut hot);
     let mut delivered = Vec::new();
     for (id, at) in &i.deliveries {
         let known = ledger

@@ -615,6 +615,7 @@ mod registry;
 mod resolution;
 pub(crate) mod reversal;
 mod signals;
+mod upgrade;
 
 pub use external::{ExternalKind, ExternalMismatch, ExternalSource, MismatchReason};
 pub use signals::{Signals, SpecSignal, anchor_incident_name, incident_name};

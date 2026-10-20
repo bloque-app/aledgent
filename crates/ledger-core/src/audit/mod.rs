@@ -144,7 +144,9 @@ impl AuditClass {
             | Command::RegisterIntegratingParty
             | Command::TiePrincipal
             | Command::ApplyChainSpec
-            | Command::RegisterAlias => AuditClass::OperatorIntervention,
+            | Command::RegisterAlias
+            | Command::RescheduleUpgrade
+            | Command::CancelUpgrade => AuditClass::OperatorIntervention,
             Command::IssueDisclosure => AuditClass::Disclosure,
         }
     }
@@ -203,11 +205,13 @@ pub const fn command_code(c: Command) -> u8 {
         Command::BindAsset => 48,
         Command::ApplyChainSpec => 49,
         Command::RegisterAlias => 50,
+        Command::RescheduleUpgrade => 51,
+        Command::CancelUpgrade => 52,
     }
 }
 
 /// Every command, for decoding.
-const COMMANDS: [Command; 50] = [
+const COMMANDS: [Command; 52] = [
     Command::Genesis,
     Command::OpenIdentity,
     Command::SetIdentityStatus,
@@ -258,6 +262,8 @@ const COMMANDS: [Command; 50] = [
     Command::BindAsset,
     Command::ApplyChainSpec,
     Command::RegisterAlias,
+    Command::RescheduleUpgrade,
+    Command::CancelUpgrade,
 ];
 
 /// What a privileged read read (`REQ-PV-4`). Each is one place that uses the mechanism.
