@@ -149,8 +149,9 @@ On x86 or CI only (`x86-bench.yml`), never on the 16 GB Mac.
   baseline's, so that cell is reported on its own and is not compared with the baseline's largest.
 - **The mix.** The stress suite's mix of commands and its number of concurrent principals (`NFR-18`), with the share
   of commands that need an approval stated and varied (all, half, none), because the cost is paid only by those.
-  **The gating cell** is one: all commands approved, at the production batch size the owner names. The other cells
-  are reported with their intervals and gate nothing, so the verdict is one test and not a family of them.
+  **The deciding case** is one: all commands need an approval, at the batch size production uses (the owner names
+  it). The other combinations are reported with their intervals and decide nothing, so the verdict is one test and not
+  a family of them.
 - **What is recorded per run.** Commands per second; p50 and p99 latency of acknowledgement (`NFR-1`) and of a
   decision (`NFR-16`); the growth of the book per million commands; the size and the build time of a checkpoint
   and of an export; the time to bring a new node up to date at the same book size (`NFR-21`).
@@ -158,7 +159,7 @@ On x86 or CI only (`x86-bench.yml`), never on the 16 GB Mac.
   real digest of the real length, so the costs are the real costs. The assertion itself is not verified in the
   core in any variant.
 
-**The acceptance rule, the owner's number.** For each of (b), (c1) and (c2), in the gating cell: the mean throughput
+**The acceptance rule, the owner's number.** For each of (b), (c1) and (c2), in the deciding case: the mean throughput
 over its runs must not fall more than **1.5 standard deviations of the baseline's run-to-run variation** below the
 baseline's mean. Latency, book growth and checkpoint and export figures are reported and are gated only by the NFR
 table below. The owner confirms the rule, and the number of runs (at least 10), in a commit **before** the first
@@ -175,12 +176,15 @@ from 10 runs is itself known only to within about a quarter, so the line moves w
 **A sounder rule, proposed next to the owner's number (Q-F of the amendment; not adopted).**
 1. The owner states a **margin** in percent, the largest loss of throughput that is acceptable, from a need: capacity
    against `NFR-2` and `NFR-18`, and latency headroom against `NFR-1`, `NFR-15` and `NFR-16`.
-2. The number of runs is **chosen by a power calculation** for that margin and the baseline's measured variation, and
-   fixed before the run.
-3. Runs are interleaved in blocks (baseline, then each variant) and compared as **paired differences**, which cancels
-   most of a noisy neighbour.
-4. The gate is a **one-sided 95% confidence bound** on the loss: the variant passes if the upper bound of its loss is
-   below the margin. The interval is reported, not only pass or fail.
+2. The number of runs is **worked out beforehand** from that margin and the baseline's measured variation (how many
+   runs are needed to tell a loss of that size from noise), and fixed before the run. The number of warm-up runs is
+   fixed beforehand too.
+3. Runs are interleaved in blocks (baseline, then each variant) and compared as **paired ratios** of throughput,
+   which cancels most of a noisy neighbour and does not depend on the machine's absolute speed.
+4. The gate is a **one-sided 95% confidence bound** on the loss, from a t distribution with one less degree of freedom
+   than the number of pairs: the variant passes if the upper bound of its loss is below the margin. The interval is
+   reported, not only pass or fail. Three variants at one deciding case need all three to pass, which is an
+   intersection and needs no correction.
 
 The owner decides which rule governs. Until then both are reported, the owner's number as the gate it was ruled to be.
 
@@ -231,8 +235,8 @@ The options differ in what else they give.
 | **An approval for another command** | Not applicable | Prevented: the digest binds the command | Prevented at ingress, and again in the core, which parses the text it was given, writes it again by the canonical rules, compares it to the command it decides and only then hashes it | Prevented at ingress; in the core by the same parse-compare-hash check in (c1) and (c2) |
 | **A revoked credential, while the core cannot be read** | Not applicable | Prevented: the approval is refused (`ERR-DecisionUnavailable`) rather than checked against a stored copy; the cost is availability | Same at ingress; the core checks membership again when it decides | Same at ingress; the core checks again when it decides |
 | **A compromised client application** (it shows one amount and asks for another) | Not applicable | Not prevented: the device shows no amount | Not prevented | Not prevented |
-| **Issued-secret (API key) abuse** | Moves value; can change a credential set | Not prevented, by ruling: an issued secret signs nothing and is exempt. A leaked one can still add the attacker's device-bound credential (amendment Q-I) | Same | Same |
-| **A configured token or the adapter's inputs** | Accepted | Exempt by scheme (an `api-key`, or the adapter's facts); a token naming a `key` credential needs that key's signature | Same | Same |
+| **Bearer-secret abuse (an issued secret or a configured token)** | Moves value; can change a credential set | Not prevented, by ruling: an issued secret signs nothing and is exempt. A leaked one can still add the attacker's device-bound credential (amendment Q-I) | Same | Same |
+| **A configured token or the adapter's inputs** | Accepted | Exempt (ruling 4): a bearer secret presented as it is, or the adapter's facts | Same | Same |
 | **A future credential scheme** | Core verifies each scheme or not at all | Ingress must learn each scheme's approval | Ingress signs for any scheme; the record format does not change | The design's point: the core never needs to learn a new scheme, only to trust ingress's digest |
 | **Evidence in the book of who approved** | None | Ingress's note only, outside the book | Yes: the record, signed by ingress | (c2) yes, a digest; (c1) no |
 | **Cost on the core** | None | None | SHA-256 and a signature check in the program; a record per command in the book; the client key, the text and the payload digest added to the input | A digest check; a digest per command in the book for (c2) |

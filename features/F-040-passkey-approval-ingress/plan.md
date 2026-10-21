@@ -35,7 +35,7 @@ Existing requirements this feature must keep true, and the proposed ones it adds
   (`REQ-AU-3`), never instead of it.
 - `REQ-CS-2`, `REQ-CS-8`, `NFR-1`: the approval step takes nothing in; the fifty milliseconds run from the approved
   submission and now include an assertion check and two durable writes.
-- `REQ-OP-10`, `REQ-OP-11`: the client key and the operation reference, both in the digest; a retry is answered
+- `REQ-OP-10`, `REQ-OP-11`: the client key is in the digest and the operation reference is not (ingress mints it at logging and cannot reproduce it); a retry is answered
   from the first result before any approval is asked for.
 - `REQ-ER-1`, `REQ-ER-3`, `REQ-CS-4`: the refusal list is closed; a proof that does not verify is
   `ERR-CredentialInvalid`; a refusal's runtime shape is tested against its published description.
@@ -58,9 +58,9 @@ Amendment 0037 holds the rules and the byte formats; this section orders the bui
    spent number is forgotten, on the database's clock. `T-040-03`.
 4. **The policy.** Every command route and core input classified on purpose, by an exhaustive match, with the default
    list of the amendment's table. `T-040-04`.
-5. **The door.** What each way of proving who the caller is stands for, and so whether its scheme needs an approval:
-   a session, an issued secret, a configured token. `T-040-11`.
-6. **The two steps for a device-bound credential**, with the device's own check forced and the live set read.
+5. **The door.** How the caller proved who it is decides whether an approval is needed: a session, yes; an issued
+   secret or a configured token (a bearer secret presented as it is), no. `T-040-11`.
+6. **The two steps for a device-bound credential**, with the device's own check forced and the current credential list read.
    `T-040-05`. **A key's approval**, for callers whose credential is a key. `T-040-12`. **The approving credential's
    scope**, when the owner has ruled where it is checked. `T-040-13`.
 7. **The refusals tested alone.** Each way an approval can be wrong, each broken on its own. `T-040-06`.
@@ -73,9 +73,9 @@ Amendment 0037 holds the rules and the byte formats; this section orders the bui
 ### The rules, in short (the amendment has them whole)
 
 - **Scope.** The commands in the amendment's table. A deployment may add commands, never remove one.
-- **Callers.** Decided by the scheme of the credential the command was submitted with: `key` and device-bound need an
-  approval, `api-key` signs nothing and is exempt. Never by the kind of principal or the route: a passkey session of a
-  service principal needs one.
+- **Callers.** Decided by how the caller proved who it is: a session (or a signature by a key) needs an approval; an
+  issued secret or a configured token, presented as it is, does not (ruling 4). Never by the kind of principal or the
+  route: a session of a service principal needs one. Only credentials of a scheme that signs can approve.
 - **Sessions** stay for sign-in and reads. Every write, and adding a credential, asks for an approval.
 - **A retry** of an approved, taken-in command under the same client key is answered from the first result and asks
   for no approval.
@@ -106,7 +106,7 @@ Amendment 0037 holds the rules and the byte formats; this section orders the bui
 - **A key's approval is not a person.** It proves the key signed.
 - **Ingress is trusted until `F-041`.** The core does not check the approval. A compromised ingress can log what it
   likes.
-- **Work added to a bounded path.** An assertion check, a read of the live set and two durable writes now sit inside
+- **Work added to a bounded path.** An assertion check, a read of the current credential list and two durable writes now sit inside
   `NFR-1`'s fifty milliseconds for a transfer, a reservation and a withdrawal. `T-040-07` shows the bound still holds.
 - **Availability.** While no core can be read, approved writes are refused (`ERR-DecisionUnavailable`), where `F-038`
   would have acknowledged them. Amendment Q-H asks the owner to accept it.
