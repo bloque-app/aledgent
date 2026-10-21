@@ -27,7 +27,11 @@
 //!
 //! A call that fails says whether the input may have run ([`CoreError::Ambiguous`]) or certainly
 //! did not ([`CoreError::Unavailable`]). The forwarder treats both the same way: it retries the
-//! identical input until the core answers (`REQ-CS-7`).
+//! identical input until the core answers (`REQ-CS-7`). A third answer, [`CoreError::NotRun`], is
+//! the core's definite statement that it holds no decision for the input and refused it because of
+//! the fence (amendment 0036): it also says that no earlier copy of the input was committed, which
+//! `Unavailable` does not, and it is what lets the sequenced forwarder give the input's feed
+//! sequence back (`F-038` §3).
 //!
 //! Every type that crosses the boundary is serialisable, so an implementation behind a network
 //! call (a VOS Agent's HTTP ingress) carries the same values an in-process one does. This crate
@@ -219,6 +223,13 @@ pub enum CoreError {
     /// The call failed in a way that does not prove the input did not run (a 503 or a 504 from a
     /// VOS ingress, a dropped connection). Retry the identical input.
     Ambiguous,
+    /// The core refused the input because of the fence (`REQ-RT-20`) and holds no decision for it:
+    /// nothing was committed and the input number was not taken, and the record of replies, read
+    /// first, has none for this input. Given for nothing else, and never for an input the core
+    /// decided (amendment 0036, N1 to N3). A core answers every input of a call from the first
+    /// one it refused to the end this way, since it takes inputs in order. To a caller that does
+    /// not give sequences back, it is `Unavailable`.
+    NotRun,
 }
 
 /// One notification in the core's outbox.
@@ -467,8 +478,8 @@ pub trait Core: Send + Sync + 'static {
 
     /// Apply several inputs in order, as [`Core::apply`] applies each (`T-031-04`, `REQ-CS-7`):
     /// one answer per input, in order. An input never runs before the ones ahead of it: once one
-    /// fails, every later one answers [`CoreError::Unavailable`] without running, and the caller
-    /// retries from the first failure. A core that batches its own work (the core Agent, `F-031`)
+    /// fails, every later one answers [`CoreError::Unavailable`] (or [`CoreError::NotRun`], after
+    /// one that did) without running, and the caller retries from the first failure. A core that batches its own work (the core Agent, `F-031`)
     /// overrides this; the default applies them one by one.
     fn apply_batch(
         &self,
@@ -484,7 +495,11 @@ pub trait Core: Send + Sync + 'static {
                     break;
                 }
             }
-            out.resize(inputs.len(), Err(CoreError::Unavailable));
+            let rest = match out.last() {
+                Some(Err(CoreError::NotRun)) => CoreError::NotRun,
+                _ => CoreError::Unavailable,
+            };
+            out.resize(inputs.len(), Err(rest));
             out
         }
     }

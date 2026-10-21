@@ -577,7 +577,8 @@ pub trait Store: Clone + Send + Sync + 'static {
 
     /// Take or renew the feed lease of `partition` as `holder`, for `lease` on the store's clock
     /// (`F-038` §3): its epoch, or `None` while another holder's lease runs. The epoch rises every
-    /// time the lease changes holder or lapses, never on a renewal.
+    /// time the lease changes holder or lapses, and when its holder gives back rows that were in
+    /// flight ([`Store::unfeed_in_flight`]); never on a renewal.
     fn try_feed(
         &self,
         partition: &str,
@@ -621,6 +622,20 @@ pub trait Store: Clone + Send + Sync + 'static {
         epoch: u64,
         from: u64,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// [`Store::unfeed`] for rows an earlier copy of which may still reach the core (`F-038` §3,
+    /// amendment 0036): the rows from `from` on were sent before, or carried a sequence into this
+    /// call, and the core has now answered them `NotRun`. The same transaction raises the lease's
+    /// epoch by one, so the core refuses every copy sent under the old one once the next feed has
+    /// reached it, and returns the epoch the lease now has. Only under the lease `holder` holds at
+    /// `epoch` (else [`StoreError::fenced`], and nothing changes).
+    fn unfeed_in_flight(
+        &self,
+        partition: &str,
+        holder: &str,
+        epoch: u64,
+        from: u64,
+    ) -> impl Future<Output = Result<u64, StoreError>> + Send;
 
     /// Keep what the book answered for `credential` (`F-038` §7, `DEC-27` (e″)): its public
     /// material, or, for `None` (no working credential), forget it.

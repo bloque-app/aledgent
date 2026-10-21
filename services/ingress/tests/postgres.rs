@@ -504,6 +504,92 @@ async fn t_038_03_the_feed_lease_on_postgres() {
     assert_eq!(roster.len(), 1, "a lapsed entry leaves the roster");
 }
 
+/// `T-037-18` (amendment 0036, `F-038` §3) on PostgreSQL: giving back the sequences of rows that
+/// were in flight raises the epoch by one in the same transaction and returns it; a stale holder
+/// or epoch is refused and nothing changes; the rows before the position keep their sequences; the
+/// way out, read first, takes the first sequence returned and the rows released follow it; the old
+/// epoch can no longer mark; the plain give back and a renewal leave the epoch alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn t_037_18_a_release_of_rows_in_flight_raises_the_epoch_on_postgres() {
+    use ingress::feed::BOOK;
+    let Some((_pg, url)) = server().await else {
+        return;
+    };
+    let a = store(&url).await;
+    let b = store(&url).await;
+    let long = Duration::from_secs(60);
+    assert_eq!(a.try_feed(BOOK, "a", long).await.unwrap(), Some(1));
+    let mut keys = Vec::new();
+    for n in 1..=4u8 {
+        let row = command(n, "did:aledgent:id:feed", &format!("f-{n}"), false);
+        keys.push(row.op_ref);
+        a.append(row).await.unwrap();
+    }
+    let seqs = |rows: &[ingress::store::Row]| rows.iter().map(|r| r.feed_seq).collect::<Vec<_>>();
+    let fed = a.mark_fed(BOOK, "a", 1, &keys, 7).await.unwrap();
+    assert_eq!(seqs(&fed), vec![Some(1), Some(2), Some(3), Some(4)]);
+    // Not the holder, or not at that epoch: refused, nothing changes.
+    assert!(
+        b.unfeed_in_flight(BOOK, "b", 1, 2)
+            .await
+            .unwrap_err()
+            .is_fenced()
+    );
+    assert!(
+        a.unfeed_in_flight(BOOK, "a", 2, 2)
+            .await
+            .unwrap_err()
+            .is_fenced()
+    );
+    assert_eq!(a.get(keys[1]).await.unwrap().unwrap().feed_seq, Some(2));
+    // Rows 3 and 4 were answered not run: given back, the epoch rises to 2 with them.
+    assert_eq!(a.unfeed_in_flight(BOOK, "a", 1, 3).await.unwrap(), 2);
+    assert_eq!(a.get(keys[0]).await.unwrap().unwrap().feed_seq, Some(1));
+    assert_eq!(a.get(keys[1]).await.unwrap().unwrap().feed_seq, Some(2));
+    assert_eq!(a.get(keys[2]).await.unwrap().unwrap().feed_seq, None);
+    assert_eq!(a.get(keys[3]).await.unwrap().unwrap().feed_seq, None);
+    // The old epoch can no longer mark; the renewal keeps the new one.
+    assert!(
+        a.mark_fed(BOOK, "a", 1, &keys[2..], 8)
+            .await
+            .unwrap_err()
+            .is_fenced()
+    );
+    assert_eq!(a.try_feed(BOOK, "a", long).await.unwrap(), Some(2));
+    // A way out logged now overtakes the rows given back and takes the first sequence returned.
+    let mut way_out = command(9, "did:aledgent:id:operator", "way-out", false);
+    way_out.overtakes = true;
+    let way_out_key = way_out.op_ref;
+    a.append(way_out).await.unwrap();
+    let queue = a.next_undecided_batch(10).await.unwrap();
+    let order: Vec<InputKey> = queue.iter().map(|r| r.new.op_ref).collect();
+    assert_eq!(
+        order,
+        vec![keys[0], keys[1], way_out_key, keys[2], keys[3]],
+        "in flight first, then the way out, then the rest"
+    );
+    // Rows 1 and 2 are decided by the core meanwhile; then the way out takes sequence 3.
+    for (i, k) in keys[..2].iter().enumerate() {
+        a.mark_decided(*k, 1 + i as u64, b"{}".to_vec(), 9)
+            .await
+            .unwrap();
+    }
+    let next: Vec<InputKey> = a
+        .next_undecided_batch(10)
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.new.op_ref)
+        .collect();
+    assert_eq!(next, vec![way_out_key, keys[2], keys[3]]);
+    let fed = a.mark_fed(BOOK, "a", 2, &next, 10).await.unwrap();
+    assert_eq!(seqs(&fed), vec![Some(3), Some(4), Some(5)]);
+    assert_eq!(fed[0].new.op_ref, way_out_key);
+    // The plain give back leaves the epoch alone.
+    a.unfeed(BOOK, "a", 2, 5).await.unwrap();
+    assert_eq!(a.try_feed(BOOK, "a", long).await.unwrap(), Some(2));
+}
+
 /// `T-009-03`, `REQ-AR-7` end to end on PostgreSQL: two replicas share the log; transfers are
 /// acknowledged while the core is down; the leading replica is dropped; the other decides every
 /// row, with gapless input numbers.
