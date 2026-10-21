@@ -33,10 +33,13 @@ the book, so the book itself, and not only ingress, shows a person approved each
   is ingress's under a key in the trusted set, and that the credential is an active member of the acting
   identity's set. It then writes the record into the book. A command with no matching record is refused, and the
   refusal is recorded like any refusal.
-- **What the core must be given.** The digest of F1 names the client key; the core receives only the operation
-  reference derived from it. B adds the client key to what the core receives (amendment 0037, G7). The proposal
-  for the canonical text: ingress sends it, and the core hashes exactly the bytes it was given and then parses
-  them. The core never re-serialises a command to hash it.
+- **What the core must be given.** The digest of F1 holds the deployment, the client key, the initiator, the
+  acted-for identity, a payload digest and the command's canonical text, and not the operation reference. The core
+  already knows the deployment and the caller; it does not receive the client key (amendment 0037, G4). B adds to
+  what the core receives: the client key, the canonical text and the payload digest. The core hashes exactly the bytes
+  it was given, then **parses them, writes them again by the canonical rules and refuses any difference** from
+  the command it decides, so a buggy or compromised ingress cannot send text that says one thing while the core
+  decides another.
 - **The hash.** F1's digest is SHA-256 (ruled). The core links only BLAKE2b today, so this feature adds SHA-256 to
   the core program, a small dependency whose size and time `T-041-00` includes.
 - **The signature.** The proposal: CipherClerk's Schnorr signature over Ristretto255, which the core already verifies
@@ -90,9 +93,8 @@ These come from reading the code and are not from a run. `T-041-00` replaces eve
 than 1.5 standard deviations of the baseline's run-to-run variation below the baseline mean. Latency (p50, p99), the
 book's growth and the checkpoint figures are reported and are not gated.
 
-**To be confirmed by the owner before the run.** 1.5 standard deviations is close to "no measurable slowdown": a
-baseline's own runs fall that far below its mean now and then, so a harmless change can fail it and a small real
-slowdown can pass it. And a standard deviation means little from a few runs, so the baseline needs **at least 10
+**To be confirmed by the owner before the run.** 1.5 standard deviations is close to "no measurable slowdown", and
+it is more permissive than it sounds: see "The acceptance rule" in the measurement design. And a standard deviation means little from a few runs, so the baseline needs **at least 10
 runs** on one machine (more if the variation is large), each long enough to be stable, and the run with records the
 same number. The threshold is written in `tasks.md` and committed before the run, so the number cannot be chosen
 after the result (amendment 0037, Q-F).
@@ -139,12 +141,16 @@ On x86 or CI only (`x86-bench.yml`), never on the 16 GB Mac.
 
 - **One machine, one run order.** All variants run on the same machine type in the same job, interleaved
   (baseline, b, c1, c2, baseline, ...), so that a noisy neighbour hits every variant alike.
-- **Repetitions.** At least **10 runs of each variant**, so that a standard deviation means something. If the
-  baseline's variation is large (more than 5% of its mean), more runs, until the standard deviation settles.
-- **Batch sizes.** The sizes of `notes/MEASUREMENTS-F031.md`, with 1, 8 and 32 among them, and the largest batch the
-  invocation limit allows for variant (b) (its records make a batch carry fewer commands).
+- **Repetitions.** At least **10 runs of each variant**, so that a standard deviation means something, and the number
+  is **fixed before the first run**: more runs added after seeing a result would let the data choose its own test.
+  The first runs of each variant are warm-up, named in the note and discarded.
+- **Batch sizes.** The sizes of `notes/MEASUREMENTS-F031.md`, with 1, 8 and 32 among them. Variants are compared at
+  the **same batch size**. The largest batch the invocation limit allows for variant (b) is smaller than the
+  baseline's, so that cell is reported on its own and is not compared with the baseline's largest.
 - **The mix.** The stress suite's mix of commands and its number of concurrent principals (`NFR-18`), with the share
   of commands that need an approval stated and varied (all, half, none), because the cost is paid only by those.
+  **The gating cell** is one: all commands approved, at the production batch size the owner names. The other cells
+  are reported with their intervals and gate nothing, so the verdict is one test and not a family of them.
 - **What is recorded per run.** Commands per second; p50 and p99 latency of acknowledgement (`NFR-1`) and of a
   decision (`NFR-16`); the growth of the book per million commands; the size and the build time of a checkpoint
   and of an export; the time to bring a new node up to date at the same book size (`NFR-21`).
@@ -152,13 +158,31 @@ On x86 or CI only (`x86-bench.yml`), never on the 16 GB Mac.
   real digest of the real length, so the costs are the real costs. The assertion itself is not verified in the
   core in any variant.
 
-**The acceptance rule (the owner's threshold, to be confirmed before the run).** For each of (b), (c1) and (c2): the
-mean throughput over its runs must not fall more than **1.5 standard deviations of the baseline's run-to-run
-variation** below the baseline's mean. Latency, book growth and checkpoint and export figures are reported and are
-not gated by this rule (they are gated by the NFR table below). **Flag:** 1.5 standard deviations is close to "no
-measurable slowdown". A baseline's own runs fall that far below its mean from time to time, so a harmless change can
-fail the rule, and a small real slowdown can pass it. The owner confirms the rule, and the number of baseline runs
-(at least 10), in a commit **before** the first run; the rule is not changed after seeing a result.
+**The acceptance rule, the owner's number.** For each of (b), (c1) and (c2), in the gating cell: the mean throughput
+over its runs must not fall more than **1.5 standard deviations of the baseline's run-to-run variation** below the
+baseline's mean. Latency, book growth and checkpoint and export figures are reported and are gated only by the NFR
+table below. The owner confirms the rule, and the number of runs (at least 10), in a commit **before** the first
+run; the rule is not changed after seeing a result.
+
+**Why that number is more permissive than it sounds (a correction).** With 10 runs of each variant, the measured
+difference between two means has a standard error of about 0.45 of the baseline's standard deviation. So a harmless
+change almost never fails the rule (less than one time in a thousand). The fault is the other way: a real slowdown of
+**one** standard deviation passes the rule about **87 times in 100**, and one of 1.5 standard deviations passes about
+half the time. And the rule gets looser as the machine gets noisier: if the baseline's standard deviation is 5% of its
+mean, a real loss of about 7% is tolerated; if a noisy runner makes it 10%, a loss of 15% is. The standard deviation
+from 10 runs is itself known only to within about a quarter, so the line moves with luck.
+
+**A sounder rule, proposed next to the owner's number (Q-F of the amendment; not adopted).**
+1. The owner states a **margin** in percent, the largest loss of throughput that is acceptable, from a need: capacity
+   against `NFR-2` and `NFR-18`, and latency headroom against `NFR-1`, `NFR-15` and `NFR-16`.
+2. The number of runs is **chosen by a power calculation** for that margin and the baseline's measured variation, and
+   fixed before the run.
+3. Runs are interleaved in blocks (baseline, then each variant) and compared as **paired differences**, which cancels
+   most of a noisy neighbour.
+4. The gate is a **one-sided 95% confidence bound** on the loss: the variant passes if the upper bound of its loss is
+   below the margin. The interval is reported, not only pass or fail.
+
+The owner decides which rule governs. Until then both are reported, the owner's number as the gate it was ruled to be.
 
 ### 2. The non-functional requirements either option touches
 
@@ -168,9 +192,9 @@ plan must not relax them silently).
 
 | NFR | Touched by | How it is checked | Pass when |
 |---|---|---|---|
-| `NFR-1` acknowledge within 50 ms p99 | (a), (b), (c): ingress does an assertion check and two durable writes before it logs; (b) and (c) add a signature or a digest on the same path | The stress suite's acknowledgement latency for transfer, reservation and withdrawal, approvals on, per variant (`T-040-07` for (a)) | p99 at or under 50 ms for all three commands, at the suite's concurrency |
-| `NFR-2` 2.5 million operations a month, and the entries they imply | (b), (c2): the book grows by a record per command | Book growth per million commands measured; projected at 2.5 million operations a month for a year | The growth fits the deployment's storage plan with the margin the owner sets; no redesign of the book is needed to sustain the volume |
-| `NFR-3` balance read 5 ms p99 at 150 million entries | (b), (c2) only if records are in the same store as entries and slow the reads | The read benchmark at 150 million entries with records present | p99 at or under 5 ms, unchanged within the run-to-run variation |
+| `NFR-1` acknowledge within 50 ms p99 | (a), (b), (c): ingress does an assertion check and two durable writes before it logs; (b) and (c) add a signature or a digest on the same path | The stress suite's acknowledgement latency for transfer, reservation and withdrawal, approvals on, per variant (`T-040-07` for (a)) | p99 at or under 50 ms for all three commands, at the suite's concurrency. **This measurement does not cover `NFR-1` for (b).** The stand-ins sign with a fixed test key and no signer and verify no assertion, so they measure the core's cost only. In production the path adds a round trip to the signer (`F-035`) for (b), plus the assertion check, the live-set read and two writes at ingress; `T-040-07` and a rerun of it with the signer in the path (`T-041-05`) carry that |
+| `NFR-2` 2.5 million operations a month, and the entries they imply | (b), (c2): the book grows by a record per command | Book growth per million commands measured; projected at 2.5 million operations a month for a year | The growth fits the deployment's storage plan with a margin the owner states as a number (Q-F), which is not set yet; no redesign of the book is needed to sustain the volume |
+| `NFR-3` balance read 5 ms p99 at 150 million entries | (b), (c2) only if records are in the same store as entries and slow the reads | The read benchmark at 150 million entries with records present | p99 at or under 5 ms, and not more than the owner's regression margin above the baseline's p99 (Q-F) |
 | `NFR-4` nothing acknowledged is lost; restorable | (b), (c2): records are part of what is restored | The restore drill with records in the book | A restore reproduces the book and its records; every balance re-derived from entries alone (`INV-6`) |
 | `NFR-5`, `NFR-17` deployable and upgradable without an outage | (b), (c): a new core with new code, a new trusted set of ingress keys, a changed input | The upgrade runs on test under load with the fence and its way out (`F-037`), and a rotation of the ingress key is made online | No request refused for the upgrade or the rotation; every command decided as usual or refused under a named condition; the old and the new ingress both work during the roll |
 | `NFR-6` audit trail retained and queryable | (b), (c2): the record is audit evidence; (c1) and (a) leave ingress's note as the only trace | The audit trail query for an approved command | The query names the approving credential and the digests (a note at ingress for (a) and (c1); the book for (b) and (c2)) |
@@ -180,10 +204,10 @@ plan must not relax them silently).
 | `NFR-10` restore drill | (b), (c2) | As `NFR-4` | As `NFR-4` |
 | `NFR-11` observable signals | (a), (b), (c): new refusals and the rollout switch need signals | The signals list gains: approvals asked, accepted, refused by reason class, and report-only would-refuse counts | The six existing signals are unchanged and the new ones are visible, with no credential, assertion or digest of a credential in a label |
 | `NFR-14` conformance suite exercises every invariant and every error | (a), (b), (c): a new refusal | The two-way check between §10 and the refusal list (`T-040-10`) | Every new error and invariant has a case; the named exception is gone once the core carries the refusal |
-| `NFR-15` complete within 30 s p99 | (b), (c) | The stress suite's completion latency | p99 at or under 30 s, unchanged within the run-to-run variation |
+| `NFR-15` complete within 30 s p99 | (b), (c) | The stress suite's completion latency | p99 at or under 30 s, and not more than the owner's regression margin above the baseline's p99 (Q-F) |
 | `NFR-16` answer with the decision within 1 s p99 | (a), (b), (c) | The stress suite's decided-answer latency, approvals on | p99 at or under 1 s for every command answered with its decision, including the approved account and security commands |
 | `NFR-18` throughput measured, scale by partitions | (b), (c) | This measurement, under the stress suite's mix; and a sharded run | Reported with the mix and the principals; the design still scales by adding partitions (records do not tie two partitions together) |
-| `NFR-19` credit lag 2 s p99 | (b), (c): none expected | The stress suite's credit lag | Unchanged within the variation |
+| `NFR-19` credit lag 2 s p99 | (b), (c): none expected | The stress suite's credit lag | p99 at or under 2 s, and not more than the owner's regression margin above the baseline's p99 (Q-F) |
 | `NFR-20` revocation lag 1 s p99 | (b), (c): the core's check that the approving credential is still in the set | A revocation of a credential, then an approval from it | The approval is refused within 1 s of the revocation's commit; for (c) the same, because ingress reads the set through the stream (`F-038`) |
 | `NFR-21` scale out, replace and lose a node; bring a new node up to date in 15 minutes by design | (b), (c2): the book is larger, checkpoints and exports include the records | Time to admit and catch up a new node at the book's size, with records; the decision rate while a node is admitted | The time stays within the design value (15 minutes), or any miss is reported as `NFR-21` says, with `NFR-1`, `NFR-15` and `NFR-16` holding throughout |
 | `NFR-22` retention of what replay needs | (b), (c2): the records are inputs' content; the trusted key set is part of what replay needs | A replay from genesis on a book with records, under every code generation that wrote them | Replay re-derives the same roots; the trusted key set at each input is recoverable from the inputs |
@@ -199,15 +223,19 @@ The options differ in what else they give.
 
 | Threat | Baseline | (a) Front door only | (b) Record per command | (c) A principal of its own |
 |---|---|---|---|---|
-| **A stolen session token** | Moves value and adds a passkey for 15 minutes | Prevented: a write needs an approval from a device the thief does not hold | Prevented, and the book holds the record | Prevented |
-| **A compromised ingress** | Can log any command | Not prevented: it can skip the check | Not detected: it can sign records for anything. The book shows a record, which proves nothing about the person | Not detected: it can mark anything approved |
-| **A path that bypasses ingress** (a second door to the core, a rogue feeder) | Not prevented | Not prevented: the core does not ask | Prevented: the core refuses a command with no record signed by a trusted ingress key | Prevented for commands with no mark; but the mark is carried by the authenticated link, so what is prevented is bypass of the link, not of ingress's code |
+| **A stolen session token** | Moves value and adds a device-bound credential for 15 minutes | Prevented: a write needs an approval from a credential the thief does not hold | Prevented, and the book holds the record | Prevented |
+| **A compromised ingress** | Can log any command | Not prevented: it can skip the check | **Not detected:** it can sign records for anything. The book shows a record, which proves nothing about the person | **Not detected:** it can mark anything approved |
+| **Theft of ingress's signing key, without compromising ingress** | No such key | No such key | Forges approvals for any command, from anywhere that can reach the core, until the key is rotated. The key is in the signer (`F-035`), which limits who can use it, not whether a thief with the key can | No new key; the link's authentication (`F-038`) is what a thief would need |
+| **A path that bypasses ingress** (a second door to the core, a rogue feeder) | Not prevented | Not prevented: the core does not ask | Prevented only if the signer signs for no caller but ingress (`F-035`'s grant model) and the core refuses a command with no record signed by a trusted key | Prevented for a command with no mark; but the mark rides the authenticated link, so what is stopped is bypass of the link, not of ingress's code |
 | **Replay of an approval** | Not applicable | Prevented: one-time number, expiry, the sign count | Prevented at ingress, and the core also refuses a record whose command it has already decided (idempotency) | As (a) at ingress; the core's idempotency covers the command |
-| **An approval for another command** | Not applicable | Prevented: the digest binds the command | Prevented at ingress, and again in the core, which recomputes the digest from the command it was given | Prevented at ingress; in the core only if it recomputes the digest, which (c1) and (c2) do |
-| **Partner API key abuse** | Moves value | Not prevented, by ruling: an API key signs nothing and is exempt | Same | Same |
+| **An approval for another command** | Not applicable | Prevented: the digest binds the command | Prevented at ingress, and again in the core, which parses the text it was given, writes it again by the canonical rules, compares it to the command it decides and only then hashes it | Prevented at ingress; in the core by the same parse-compare-hash check in (c1) and (c2) |
+| **A revoked credential, while the core cannot be read** | Not applicable | Prevented: the approval is refused (`ERR-DecisionUnavailable`) rather than checked against a stored copy; the cost is availability | Same at ingress; the core checks membership again when it decides | Same at ingress; the core checks again when it decides |
+| **A compromised client application** (it shows one amount and asks for another) | Not applicable | Not prevented: the device shows no amount | Not prevented | Not prevented |
+| **Issued-secret (API key) abuse** | Moves value; can change a credential set | Not prevented, by ruling: an issued secret signs nothing and is exempt. A leaked one can still add the attacker's device-bound credential (amendment Q-I) | Same | Same |
+| **A configured token or the adapter's inputs** | Accepted | Exempt by scheme (an `api-key`, or the adapter's facts); a token naming a `key` credential needs that key's signature | Same | Same |
 | **A future credential scheme** | Core verifies each scheme or not at all | Ingress must learn each scheme's approval | Ingress signs for any scheme; the record format does not change | The design's point: the core never needs to learn a new scheme, only to trust ingress's digest |
 | **Evidence in the book of who approved** | None | Ingress's note only, outside the book | Yes: the record, signed by ingress | (c2) yes, a digest; (c1) no |
-| **Cost on the core** | None | None | SHA-256 and a signature check in the program; a record per command in the book; the client key added to the input | A digest check; a digest per command in the book for (c2) |
+| **Cost on the core** | None | None | SHA-256 and a signature check in the program; a record per command in the book; the client key, the text and the payload digest added to the input | A digest check; a digest per command in the book for (c2) |
 
 What this does not say: that (b) is "more secure" than (c). Both depend on ingress's honesty for the passkey.
 (b) adds a signature scheme and a trusted key set to the core, which is more code in the place where code is
