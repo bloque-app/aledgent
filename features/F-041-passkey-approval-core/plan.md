@@ -49,7 +49,7 @@ the book, so the book itself, and not only ingress, shows a person approved each
 
 ## An open design fork (the owner's; not decided here)
 
-Amendment 0037 (Q-A) records a fork this stub does not settle, and which `T-041-01` waits for. Either:
+Amendment 0037 (Q-A) records a fork this stub does not settle, and which `T-041-01` waits for. The owner's ruling `w14` is that both alternatives are measured, for security and throughput, before one is chosen (see "Measurement design" at the end). Either:
 
 1. **The core trusts a digest of ingress's approval.** The core keeps accepting direct proofs only from `key`
    credentials. Every other scheme, present or future, is approved by ingress, which is a principal of its own, and
@@ -60,7 +60,7 @@ Amendment 0037 (Q-A) records a fork this stub does not settle, and which `T-041-
 What each gives, plainly. The record of 2 is signed by ingress, so it cannot detect a compromised ingress. It adds
 evidence in the book of who approved what, and protects against a path that bypasses ingress. In both designs ingress
 vouches for the passkey. Only the core verifying the assertion itself would protect against a compromised ingress, and
-`DEC-19` rejected that. Everything below describes design 2.
+`DEC-19` rejected that. Everything between here and "Measurement design" describes design 2; the measurement covers both.
 
 ## What it costs (an estimate; nothing is measured yet)
 
@@ -113,3 +113,123 @@ and F1 to F3 must be settled before it.
   that ingress said a credential approved a digest, and not, to a third party looking only at the book, that a
   passkey signed. Keeping the assertion elsewhere is how anyone shows the rest.
 - Making the device show the person the amount (amendment 0037, G3).
+
+## Measurement design: baseline, option (b) and option (c)
+
+Owner's ruling `w14` (2026-10-21): Feature A, the front door only, goes first. Before the core design is chosen,
+**both** alternatives are measured, for security and for throughput. The owner's rule is that the non-functional
+requirements are preserved: "my call is that NFRs should be preserved". Nothing here picks a design; it says what
+is measured and what would make each pass.
+
+The four variants, named once:
+
+| Name | What it is |
+|---|---|
+| **Baseline** | Today's code. The core is told nothing about approvals |
+| **(a) Front door only** | Feature A (`F-040`). Ingress asks for and checks the approval; the core is unchanged. Not a separate core variant: for the core it is the baseline |
+| **(b) Record per command** | Ingress signs an approval record for each command (amendment 0037, F3); the core checks the signature against its trusted set of ingress keys, checks the record matches the command and the credential is an active member of the identity's set, and writes the record into the book. A command with no matching record is refused |
+| **(c) A principal of its own** | The core keeps accepting direct proofs only from `key` credentials. Every other scheme, present or future, is approved by ingress, which is a principal of its own, and the core trusts a digest of that approval carried with the command, as it trusts the `PasskeyChecked` mark of `reclaim_custody` today. The link that carries it is already authenticated and signed (`F-038`, `DEC-27` (f)). Whether the digest is written into the book is part of what is measured (the two sub-variants below) |
+
+Variant (c) has two sub-variants, because the answer changes the cost and the evidence: **(c1)** the core checks the
+digest against the command and discards it; **(c2)** the core also writes the digest into the book.
+
+### 1. The throughput and latency protocol
+
+On x86 or CI only (`x86-bench.yml`), never on the 16 GB Mac.
+
+- **One machine, one run order.** All variants run on the same machine type in the same job, interleaved
+  (baseline, b, c1, c2, baseline, ...), so that a noisy neighbour hits every variant alike.
+- **Repetitions.** At least **10 runs of each variant**, so that a standard deviation means something. If the
+  baseline's variation is large (more than 5% of its mean), more runs, until the standard deviation settles.
+- **Batch sizes.** The sizes of `notes/MEASUREMENTS-F031.md`, with 1, 8 and 32 among them, and the largest batch the
+  invocation limit allows for variant (b) (its records make a batch carry fewer commands).
+- **The mix.** The stress suite's mix of commands and its number of concurrent principals (`NFR-18`), with the share
+  of commands that need an approval stated and varied (all, half, none), because the cost is paid only by those.
+- **What is recorded per run.** Commands per second; p50 and p99 latency of acknowledgement (`NFR-1`) and of a
+  decision (`NFR-16`); the growth of the book per million commands; the size and the build time of a checkpoint
+  and of an export; the time to bring a new node up to date at the same book size (`NFR-21`).
+- **The stand-in approval is real in format.** It uses the real record bytes (F3), a real signature and, for (c), a
+  real digest of the real length, so the costs are the real costs. The assertion itself is not verified in the
+  core in any variant.
+
+**The acceptance rule (the owner's threshold, to be confirmed before the run).** For each of (b), (c1) and (c2): the
+mean throughput over its runs must not fall more than **1.5 standard deviations of the baseline's run-to-run
+variation** below the baseline's mean. Latency, book growth and checkpoint and export figures are reported and are
+not gated by this rule (they are gated by the NFR table below). **Flag:** 1.5 standard deviations is close to "no
+measurable slowdown". A baseline's own runs fall that far below its mean from time to time, so a harmless change can
+fail the rule, and a small real slowdown can pass it. The owner confirms the rule, and the number of baseline runs
+(at least 10), in a commit **before** the first run; the rule is not changed after seeing a result.
+
+### 2. The non-functional requirements either option touches
+
+Every `NFR-*` of `SPEC.md` §11 was read. Each is listed once, with whether (b) or (c) touches it, how it is checked
+and what passes. "Pass" always means: the requirement holds as written, with no relaxing of its number (§11: a
+plan must not relax them silently).
+
+| NFR | Touched by | How it is checked | Pass when |
+|---|---|---|---|
+| `NFR-1` acknowledge within 50 ms p99 | (a), (b), (c): ingress does an assertion check and two durable writes before it logs; (b) and (c) add a signature or a digest on the same path | The stress suite's acknowledgement latency for transfer, reservation and withdrawal, approvals on, per variant (`T-040-07` for (a)) | p99 at or under 50 ms for all three commands, at the suite's concurrency |
+| `NFR-2` 2.5 million operations a month, and the entries they imply | (b), (c2): the book grows by a record per command | Book growth per million commands measured; projected at 2.5 million operations a month for a year | The growth fits the deployment's storage plan with the margin the owner sets; no redesign of the book is needed to sustain the volume |
+| `NFR-3` balance read 5 ms p99 at 150 million entries | (b), (c2) only if records are in the same store as entries and slow the reads | The read benchmark at 150 million entries with records present | p99 at or under 5 ms, unchanged within the run-to-run variation |
+| `NFR-4` nothing acknowledged is lost; restorable | (b), (c2): records are part of what is restored | The restore drill with records in the book | A restore reproduces the book and its records; every balance re-derived from entries alone (`INV-6`) |
+| `NFR-5`, `NFR-17` deployable and upgradable without an outage | (b), (c): a new core with new code, a new trusted set of ingress keys, a changed input | The upgrade runs on test under load with the fence and its way out (`F-037`), and a rotation of the ingress key is made online | No request refused for the upgrade or the rotation; every command decided as usual or refused under a named condition; the old and the new ingress both work during the roll |
+| `NFR-6` audit trail retained and queryable | (b), (c2): the record is audit evidence; (c1) and (a) leave ingress's note as the only trace | The audit trail query for an approved command | The query names the approving credential and the digests (a note at ingress for (a) and (c1); the book for (b) and (c2)) |
+| `NFR-7` no unauthenticated route; default deny | (a), (b), (c): a new route that returns the challenge | The default-deny test covers the new route; the stream carries the approval over the authenticated link only | A request without a session to the approval route is refused; no route reaches a ledger fact unauthenticated |
+| `NFR-8` no single process can move value without bound; key material in a separate boundary | (b), (c): ingress gets a signing key for approvals | The key sits in the signer (`F-035`), never in the process environment, a log, a URL or an error; the key's reach is bounded | No key bytes in the ingress or core process; the audit of the boundary lists the new key; a compromised ingress can sign approvals only for commands that reach it (see the security table: this is the honest limit) |
+| `NFR-9` daily reconciliation, three axes | (b), (c): none expected | The reconciliation job runs on a book with records | All three axes report zero difference; records move no balance |
+| `NFR-10` restore drill | (b), (c2) | As `NFR-4` | As `NFR-4` |
+| `NFR-11` observable signals | (a), (b), (c): new refusals and the rollout switch need signals | The signals list gains: approvals asked, accepted, refused by reason class, and report-only would-refuse counts | The six existing signals are unchanged and the new ones are visible, with no credential, assertion or digest of a credential in a label |
+| `NFR-14` conformance suite exercises every invariant and every error | (a), (b), (c): a new refusal | The two-way check between §10 and the refusal list (`T-040-10`) | Every new error and invariant has a case; the named exception is gone once the core carries the refusal |
+| `NFR-15` complete within 30 s p99 | (b), (c) | The stress suite's completion latency | p99 at or under 30 s, unchanged within the run-to-run variation |
+| `NFR-16` answer with the decision within 1 s p99 | (a), (b), (c) | The stress suite's decided-answer latency, approvals on | p99 at or under 1 s for every command answered with its decision, including the approved account and security commands |
+| `NFR-18` throughput measured, scale by partitions | (b), (c) | This measurement, under the stress suite's mix; and a sharded run | Reported with the mix and the principals; the design still scales by adding partitions (records do not tie two partitions together) |
+| `NFR-19` credit lag 2 s p99 | (b), (c): none expected | The stress suite's credit lag | Unchanged within the variation |
+| `NFR-20` revocation lag 1 s p99 | (b), (c): the core's check that the approving credential is still in the set | A revocation of a credential, then an approval from it | The approval is refused within 1 s of the revocation's commit; for (c) the same, because ingress reads the set through the stream (`F-038`) |
+| `NFR-21` scale out, replace and lose a node; bring a new node up to date in 15 minutes by design | (b), (c2): the book is larger, checkpoints and exports include the records | Time to admit and catch up a new node at the book's size, with records; the decision rate while a node is admitted | The time stays within the design value (15 minutes), or any miss is reported as `NFR-21` says, with `NFR-1`, `NFR-15` and `NFR-16` holding throughout |
+| `NFR-22` retention of what replay needs | (b), (c2): the records are inputs' content; the trusted key set is part of what replay needs | A replay from genesis on a book with records, under every code generation that wrote them | Replay re-derives the same roots; the trusted key set at each input is recoverable from the inputs |
+
+`NFR-12` and `NFR-13` are not in `SPEC.md`'s list (a gap in the sequence, not an omission of this table).
+
+### 3. The security comparison
+
+Honest reading first. In every variant ingress is what verifies the passkey, because the core carries no P-256
+(`DEC-19`). So **an approval signed or marked by ingress cannot detect a compromised ingress**: someone who controls
+ingress can approve anything. Only the core verifying the assertion itself would stop that, and `DEC-19` rejected it.
+The options differ in what else they give.
+
+| Threat | Baseline | (a) Front door only | (b) Record per command | (c) A principal of its own |
+|---|---|---|---|---|
+| **A stolen session token** | Moves value and adds a passkey for 15 minutes | Prevented: a write needs an approval from a device the thief does not hold | Prevented, and the book holds the record | Prevented |
+| **A compromised ingress** | Can log any command | Not prevented: it can skip the check | Not detected: it can sign records for anything. The book shows a record, which proves nothing about the person | Not detected: it can mark anything approved |
+| **A path that bypasses ingress** (a second door to the core, a rogue feeder) | Not prevented | Not prevented: the core does not ask | Prevented: the core refuses a command with no record signed by a trusted ingress key | Prevented for commands with no mark; but the mark is carried by the authenticated link, so what is prevented is bypass of the link, not of ingress's code |
+| **Replay of an approval** | Not applicable | Prevented: one-time number, expiry, the sign count | Prevented at ingress, and the core also refuses a record whose command it has already decided (idempotency) | As (a) at ingress; the core's idempotency covers the command |
+| **An approval for another command** | Not applicable | Prevented: the digest binds the command | Prevented at ingress, and again in the core, which recomputes the digest from the command it was given | Prevented at ingress; in the core only if it recomputes the digest, which (c1) and (c2) do |
+| **Partner API key abuse** | Moves value | Not prevented, by ruling: an API key signs nothing and is exempt | Same | Same |
+| **A future credential scheme** | Core verifies each scheme or not at all | Ingress must learn each scheme's approval | Ingress signs for any scheme; the record format does not change | The design's point: the core never needs to learn a new scheme, only to trust ingress's digest |
+| **Evidence in the book of who approved** | None | Ingress's note only, outside the book | Yes: the record, signed by ingress | (c2) yes, a digest; (c1) no |
+| **Cost on the core** | None | None | SHA-256 and a signature check in the program; a record per command in the book; the client key added to the input | A digest check; a digest per command in the book for (c2) |
+
+What this does not say: that (b) is "more secure" than (c). Both depend on ingress's honesty for the passkey.
+(b) adds a signature scheme and a trusted key set to the core, which is more code in the place where code is
+hardest to change, and a key whose compromise lets the holder write approvals. (c) adds less, and gives the core
+no way to tell a good mark from a forged one except that the link is authenticated. The measurement answers the
+cost; the owner decides whether the extra evidence is worth it.
+
+### 4. The stand-in implementation plan
+
+No stand-in is merged. Each lives on its own branch off `develop`, with a draft pull request that is closed, not
+merged, when the measurement ends. The commit trailers and signing rules of the repository apply. Only the code
+below is written, and only as much as the measurement needs.
+
+| Branch | Holds | Minimal code |
+|---|---|---|
+| `bench/approval-baseline` | Today's code with the measurement harness's hooks | A run mode in the stress suite that can mark a share of commands "needs approval", so all variants see the same mix. Nothing in the core changes |
+| `bench/approval-b-record` | Variant (b) | The 149-byte record (F3) as a type in `ledger-core`; the SHA-256 digest; the signature check against a trusted key set held as a constant; the client key and canonical text added to the core input; the write of the record to the book; ingress signs the record with a fixed test key (no signer). Checkpoint, export and import carry the record |
+| `bench/approval-c1-mark` | Variant (c1) | A mark on the core input carrying the 32-byte digest, as `PasskeyChecked` is carried; the core recomputes the digest from the command and refuses a mismatch, then discards it; the link is as today |
+| `bench/approval-c2-mark` | Variant (c2), on `c1` | As (c1), and the core writes the 32-byte digest into the book; checkpoint, export and import carry it |
+
+Each variant's branch also carries the same two helpers the measurement uses: a generator of the approval bytes at
+ingress's side (fixed test keys, real lengths) and a counter of the bytes added per command. Neither is shipped.
+The harness is `x86-bench.yml`'s `compare` mode, run once per variant by branch name; the report is a note in
+`notes/`, written by `T-041-08`. The stand-ins verify no passkey assertion: the measurement is of the core's cost,
+and a real assertion is checked at ingress in every variant alike (`T-040-07` measures that cost).

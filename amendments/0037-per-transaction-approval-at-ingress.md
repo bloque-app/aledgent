@@ -561,7 +561,9 @@ These are not rulings. Each is something the brief did not state and the drafter
 
 Plain English. None of them blocks reading the amendment; Q-A and Q-D change what is built.
 
-- **Q-A. How does the core learn that a person approved? (A design fork, not decided here.)** Two ways:
+- **Q-A. How does the core learn that a person approved? (A design fork, not decided here.)** The owner ruled
+  (`w14`) that Feature A goes first and that both ways below are measured, for security and throughput, before one is
+  chosen, with the non-functional requirements preserved; the measurement design is in `F-041`'s plan. Two ways:
   1. *The core trusts a digest of ingress's approval.* The core keeps accepting direct proofs only from `key`
      credentials. Every other scheme, present or future, is approved by ingress, which is a principal of its own,
      and the core trusts a digest of that approval, as it already trusts the passkey check ingress did for
