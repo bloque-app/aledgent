@@ -10,7 +10,7 @@ is a plan only: no task below starts, and no code merges.
 
 | | |
 |---|---|
-| Milestone | Not assigned by `PLAN.md`; the owner's rulings of 2026-10-19 to 2026-10-21 order it before the final regeneration if the approval lands in time (amendment 0037, Question 2) |
+| Milestone | Not assigned by `PLAN.md`. Ships first, before `F-041` (owner's ruling). Its relation to the next re-genesis of the book is amendment 0037, Question 2 |
 | Home | `services/ingress` (`credentials`, `command`, `auth`, `config`, `surface`, `wire`, `store`, `openapi`, a new migration if `T-040-09` is approved), `crates/authn` (`token`: the approval challenge), `site/` (the integrators' page), `e2e/` (the end-to-end flow). **Not** the core: no core code changes in this feature, with one exception that amendment 0037 names (R2): the refusal's line in `ledger-core`'s list, `T-040-10`, decided by Question 2 |
 | Depends on | `F-028` (passkeys, challenges, durable sign counts and single-use challenge numbers: `T-028-04`), `F-038` (ingress as a fleet: any instance must refuse a spent approval), amendment 0037 |
 | Unblocks | `F-041` (the core records the approval), `M-3D`'s page for integrators |

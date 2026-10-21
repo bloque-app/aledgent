@@ -13,7 +13,7 @@ written down before anyone asks for it.
 
 | | |
 |---|---|
-| Milestone | Not assigned. Delivered as the final regeneration's genesis code or as a core upgrade; the owner decides after `T-041-00` (amendment 0037, Question 10) |
+| Milestone | Not assigned. Delivered as the next re-genesis's genesis code or as a core upgrade; the owner decides after `T-041-00` (amendment 0037, Question 10) |
 | Home | `crates/ledger-core` (the record, the check, the refusal), `crates/core-binding` and `crates/core-archive` (checkpoints, export, import), `agents/core` and `agents/core-host` (the trusted set, the host's side), `services/ingress` (attaching the record), `crates/conformance` |
 | Depends on | `F-040` (the formats frozen, ingress asking for approvals), `F-035` (ingress's signing key sits in the key boundary), `F-037` (a core upgrade, if that is the delivery), amendment 0037 |
 | Unblocks | Proof in the book that a person approved each command |
@@ -82,7 +82,7 @@ run's. Without it, the number means nothing (amendment 0037, Question 9).
 3. `T-041-06` after the measurement, with the owner.
 
 Because `F-037` is merged, B can be delivered as an upgrade of the core after production is founded, so B need not
-block the final regeneration. Only amendment 0037 and F1 to F3 must be settled before it.
+block the next re-genesis. Only amendment 0037 and F1 to F3 must be settled before it.
 
 ## Out of scope
 

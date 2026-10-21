@@ -5,7 +5,7 @@ SPDX-License-Identifier: CC-BY-4.0
 
 # Amendment 0037 — A person approves each command that matters, one command at a time
 
-**Status:** **awaiting the owner's approval.** The direction was ruled on 2026-10-19 (David's ruling: a passkey
+**Status:** **awaiting the owner's approval.** The direction was ruled on 2026-10-19 (the ruling that a passkey
 approves one transaction, not a session) and on 2026-10-20 and 2026-10-21 (owner answers on the Decisions form:
 the work is split in two features; this amendment and its design are public in this repository, ruling `w12` (a)).
 The text below is the drafter's reading of those rulings, worked through to rules and byte formats. It is **not
@@ -49,14 +49,14 @@ leaked token can:
 
 - move value out of the holder's accounts;
 - grant authority over them;
-- add the thief's own passkey to the holder's credential set, which outlives the session. The payment-rails
-  design left this as an accepted risk; David's ruling of 2026-10-19 removes the acceptance.
+- add the thief's own passkey to the holder's credential set, which outlives the session. An earlier
+  design left this as an accepted risk; the ruling of 2026-10-19 removes the acceptance.
 
 The passkey proves possession of a device when it signs in. After that, nothing asks the device again.
 
 ## The rulings this serves
 
-1. **A passkey assertion approves one transaction, not a session** (David, 2026-10-19).
+1. **A passkey assertion approves one transaction, not a session** (ruling of 2026-10-19).
 2. **Two features** (owner, 2026-10-20/21). **Feature A** is ingress only: it asks for the approval, checks it and
    refuses a command without one; it touches no core code and ships first. **Feature B** is the core recording the
    approval in the book; it waits for A and for a throughput measurement.
@@ -181,7 +181,7 @@ drafter recommends (b).
 core program; a test checks it against §10 in both directions (`REQ-ER-1`, the conformance suite), so §10 and the enum
 cannot differ. A new line in §10, or a changed description, is therefore a source change in the core's library, and
 the core program's bytes change with it, even though in Feature A the core never uses the line (ingress answers it
-before logging). After the final regeneration's genesis code is frozen, that is a core upgrade (`F-037`). Before it, it
+before logging). After the next re-genesis's genesis code is frozen, that is a core upgrade (`F-037`). Before it, it
 costs nothing. See Question 2.
 
 ## R3 — `US-A10` and its acceptance criteria (new), proposed text for `SPEC.md` Epic A
@@ -302,9 +302,11 @@ rules, so that an implementation in any language writes the same bytes:
   base32;
 - a member that is absent stays absent. `null` never appears.
 
-This is RFC 8785 restricted to the values a command holds. The examples of what it changes against today's
-`Command::canonical()`: the members come sorted, where today they come in the order the Rust types declare them.
-Today's bytes are therefore not the digest's.
+This is close to RFC 8785 (JSON canonicalisation) for the values a command holds, and not the same: RFC 8785 writes
+a non-ASCII character as raw UTF-8, and this writes it as an escape, so that no implementation can disagree about
+byte order or normalisation. Against today's `Command::canonical()` the difference is that the members come
+sorted, where today they come in the order the Rust types declare them. Today's bytes are therefore not the
+digest's.
 
 **Left out on purpose.**
 
@@ -322,7 +324,8 @@ Today's bytes are therefore not the digest's.
 **The hash.** F1 is written as SHA-256 of the framed bytes, which is what ingress, the browser's passkey machinery and the
 challenge below already use. The core's own program hashes with BLAKE2b-256 and does not link SHA-256, so Feature B
 adds a hash to the core, a small dependency, or the digest changes before A freezes it. The vector in F4 shows both
-for the same bytes. This is Question 6, and it is the owner's to decide before A ships, because A freezes it.
+for the same bytes; the second is plain, unkeyed BLAKE2b-256 of them, not the value of the core's own domain-separated
+`blake2b_256` function, which would need its construction fixed here too. This is Question 6, and it is the owner's to decide before A ships, because A freezes it.
 
 ### F2 — The approval challenge, version 1
 
@@ -332,7 +335,7 @@ What the passkey signs: a *challenge* of 121 bytes, in the same family as the re
 | Bytes | Field |
 |---|---|
 | 0 to 15 | A one-time number, 16 random bytes from the operating system |
-| 16 to 23 | The expiry, a Unix time in seconds, big-endian. Issue time plus the deployment's challenge lifetime (120 seconds by default) |
+| 16 to 23 | The expiry, in milliseconds since the Unix epoch, big-endian: ingress's clock (`Time`) at issue plus the deployment's challenge lifetime (120 000 milliseconds by default) |
 | 24 | The purpose: `0x03`, approve. (`0x01` is sign-in, `0x02` registration, as today) |
 | 25 to 56 | The identity digest: SHA-256 of the text of the initiating identity, as `target_digest` already does (amendment 0027) |
 | 57 to 88 | The command digest of F1 |
@@ -417,7 +420,7 @@ pre = frame(b"aledgent/approval/command", b"\x01", client_key, opref, operation.
 command_digest = sha(pre)
 
 # 2. The approval challenge.
-authn_key, nonce, expires_at = bytes(range(32)), bytes([0x55]) * 16, 1_800_000_120
+authn_key, nonce, expires_at = bytes(range(32)), bytes([0x55]) * 16, 1_800_000_120_000   # milliseconds
 identity_digest = sha(principal.encode())
 exp = struct.pack(">Q", expires_at)
 m = hmac.new(authn_key, b"aledgent/approval-challenge/v1", hashlib.sha256)
@@ -440,7 +443,7 @@ record_message = frame(b"aledgent/approval/record", b"\x01", credential, command
 
 for name, value in [("command text", text.decode()), ("preimage length", len(pre)),
                     ("command digest", command_digest.hex()),
-                    ("same preimage, BLAKE2b-256", hashlib.blake2b(pre, digest_size=32).hexdigest()),
+                    ("same preimage, plain BLAKE2b-256, unkeyed", hashlib.blake2b(pre, digest_size=32).hexdigest()),
                     ("identity digest", identity_digest.hex()), ("challenge", challenge.hex()),
                     ("assertion digest", assertion_digest.hex()), ("record message", record_message.hex())]:
     print(f"{name}: {value}")
@@ -452,11 +455,11 @@ Output, run with `python3 -I`:
 command text: {"command":"transfer","legs":[{"amount":"2500","asset":"USD","from":"did:aledgent:acct:1K6CSK6CSK6CSK6CSK6CSK6CSK","to":"did:aledgent:acct:248H248H248H248H248H248H24"}]}
 preimage length: 347
 command digest: 09f6b859498227fcfdb151604aa51ad6ecd98b771685030df1eda83014a2bc91
-same preimage, BLAKE2b-256: ce5bded6b59211800a5aa6b61ef1ca14cf6be4143fd0641e0a6a7f383bffb862
+same preimage, plain BLAKE2b-256, unkeyed: ce5bded6b59211800a5aa6b61ef1ca14cf6be4143fd0641e0a6a7f383bffb862
 identity digest: 073c7ff1e2f11c45844b0a9df8966d57d7b4f4bcf5acdddb8655f35911445a57
-challenge: 55555555555555555555555555555555000000006b49d27803073c7ff1e2f11c45844b0a9df8966d57d7b4f4bcf5acdddb8655f35911445a5709f6b859498227fcfdb151604aa51ad6ecd98b771685030df1eda83014a2bc91cd62b55cd6574e9495693c4da9300f1880a5cd6f85c03b188b613aa7921d2917
-assertion digest: 1e297388f4d723153167733626be2cfecab4fdcf9a6a128d9ceda9183957a6dd
-record message: 00000018616c656467656e742f617070726f76616c2f7265636f7264000000010100000010666666666666666666666666666666660000002009f6b859498227fcfdb151604aa51ad6ecd98b771685030df1eda83014a2bc91000000201e297388f4d723153167733626be2cfecab4fdcf9a6a128d9ceda9183957a6dd0000000400000001
+challenge: 55555555555555555555555555555555000001a3185e24c003073c7ff1e2f11c45844b0a9df8966d57d7b4f4bcf5acdddb8655f35911445a5709f6b859498227fcfdb151604aa51ad6ecd98b771685030df1eda83014a2bc915b50b69349e9be01e7d34ecc4e530b9385e46b10911aaea57d59121a6cebd137
+assertion digest: f48a07b4e2a97acba012ab26b18ac151b0da0c67ccafe1c9e41e121ea7aef7c2
+record message: 00000018616c656467656e742f617070726f76616c2f7265636f7264000000010100000010666666666666666666666666666666660000002009f6b859498227fcfdb151604aa51ad6ecd98b771685030df1eda83014a2bc9100000020f48a07b4e2a97acba012ab26b18ac151b0da0c67ccafe1c9e41e121ea7aef7c20000000400000001
 ```
 
 The 347 bytes of the preimage are the eight framed fields: 25 + 1 + 19 + 16 + 42 + 42 + 1 + 169 = 315 bytes of
@@ -556,9 +559,9 @@ wait for Feature B.
    reversal". Reuse it for both, or give the new one its own name? Proposal: its own name,
    `ERR-CommandNotApproved`.
 2. **When does the core's list of refusals learn about it?** Any new line in §10 also has to be added to the core's
-   own list, and that changes the core program, though in Feature A the core never uses it. If the final
-   regeneration's code is not frozen yet, adding the line there is free; afterwards it is a core upgrade. Which
-   do you want? Proposal: put it in the final regeneration if the amendment is approved in time; if not, the
+   own list, and that changes the core program, though in Feature A the core never uses it. If the next
+   re-genesis's code is not frozen yet, adding the line there is free; afterwards it is a core upgrade. Which
+   do you want? Proposal: put it in the next re-genesis if the amendment is approved in time; if not, the
    plan chooses between a core upgrade and keeping the refusal outside the core's list with the conformance check
    told about it.
 3. **Which of the holder's passkeys may approve a command?** Only the one they signed in with, or any active
@@ -579,7 +582,7 @@ wait for Feature B.
    who approved a command. It adds one migration. Task `T-040-09` waits for this answer.
 9. **For B: what slowdown is acceptable?** Set the threshold (a percentage of commands per second, or a latency
    figure) *before* the measurement, or the number means nothing (`T-041-00`).
-10. **For B: when does it ship?** In the final regeneration's code, or as a core upgrade after production is founded?
+10. **For B: when does it ship?** In the next re-genesis's code, or as a core upgrade after production is founded?
     Proposal: decide after the measurement. Either way, only this amendment and F1 to F3 must be settled first.
 
 ## What does not change
