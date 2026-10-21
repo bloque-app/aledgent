@@ -778,6 +778,14 @@ async fn forward_legacy<S: Store, C: Core>(
 /// before batches. The rows after the last one in flight certainly did not run; they give back
 /// their sequences and go back to the queue, which is read again, so a reservation logged
 /// meanwhile goes before them. `wait` is the backoff, kept across calls.
+///
+/// The one exception to "in flight until answered" is the core's definite `NotRun` (amendment 0036,
+/// `T-037-18`): the Agent's fence refused the row and every row after it, and the core holds no
+/// decision for them. Those rows give their sequences back whether or not they were in flight,
+/// and, if any was, the lease's epoch rises in the same transaction ([`release`]), so that an
+/// earlier copy of them still in the core's hands is refused as stale. The way out, read from the
+/// store before the rows given back, takes the first sequence returned. A round that decided
+/// nothing waits first, as it does for `Unavailable`.
 async fn forward<S: Store, C: Core>(
     shared: &Shared<S, C>,
     epoch: u64,
@@ -873,6 +881,19 @@ async fn forward<S: Store, C: Core>(
             .rposition(|a| *a == Err(CoreError::Ambiguous))
             .map_or(0, |i| from + i + 1)
             .max(ambiguous_to);
+        // The core's definite "not run" (`F-038` §3, amendment 0036): `Applied` up to a position,
+        // then `NotRun` to the end of the feed. Nothing from there on was committed, whatever an
+        // earlier send of those rows answered, so they stop being in flight. Any other mix keeps
+        // the rule above exactly.
+        let lead = answers.iter().take_while(|a| a.is_ok()).count();
+        let released = (lead < answers.len()
+            && answers[lead..].iter().all(|a| *a == Err(CoreError::NotRun)))
+        .then_some(from + lead);
+        // Whether a row given back was in flight: a copy of it may still be on its way.
+        let (in_flight, stale) = match released {
+            Some(at) => (in_flight.min(at), in_flight > at),
+            None => (in_flight, false),
+        };
         ambiguous_to = in_flight;
         let mut replies = Vec::new();
         for answer in answers {
@@ -888,6 +909,21 @@ async fn forward<S: Store, C: Core>(
         )
         .await?;
         from += decided;
+        // The core said the rest did not run: give their sequences back, and, when any was in
+        // flight, raise the epoch with it, so no earlier copy can run after the next feed. A round
+        // that decided nothing waits first (a fenced writer with no way out costs one send and one
+        // release per backoff period). The way out the store reads before them takes the first
+        // sequence returned.
+        if let Some(at) = released.filter(|at| *at == from) {
+            if decided > 0 {
+                *wait = shared.config.retry_base;
+            } else {
+                Metrics::inc(&shared.metrics.forward_retries);
+                tokio::time::sleep(*wait).await;
+                *wait = (*wait * 2).min(shared.config.retry_max);
+            }
+            return release(shared, epoch, seqs[at], stale).await;
+        }
         // Done, or progress with nothing in flight: the rows after the decided prefix certainly
         // did not run (a core answers past what one invocation carries as `Unavailable`), and go
         // back to the queue at once, without a backoff (`T-031-18`), giving back their feed
@@ -913,6 +949,49 @@ async fn forward<S: Store, C: Core>(
         inputs.truncate(in_flight);
         marked.truncate(in_flight);
         seqs.truncate(in_flight);
+    }
+}
+
+/// The core answered the rows from `seq` on `NotRun` (amendment 0036): give back their feed
+/// sequences, and, when `stale` (a row among them was in flight, so a copy of it may still be on
+/// its way to the core), raise the lease's epoch in the same transaction and carry on under it. A
+/// failure leaves the rows their sequences, which is safe: they are resent first, answered `NotRun`
+/// again and released again. A lease that moved stops the feeder.
+async fn release<S: Store, C: Core>(
+    shared: &Shared<S, C>,
+    epoch: u64,
+    seq: u64,
+    stale: bool,
+) -> Result<(), String> {
+    if !stale {
+        give_back(shared, epoch, seq).await;
+        return Ok(());
+    }
+    match shared
+        .store
+        .unfeed_in_flight(BOOK, &shared.config.replica, epoch, seq)
+        .await
+    {
+        Ok(raised) => {
+            let _ = shared.feed_epoch.compare_exchange(
+                epoch,
+                raised,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+            Ok(())
+        }
+        Err(e) if e.is_fenced() => {
+            let _ =
+                shared
+                    .feed_epoch
+                    .compare_exchange(epoch, 0, Ordering::SeqCst, Ordering::SeqCst);
+            Err("the feed lease moved".into())
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "feed sequences not given back; their rows keep them");
+            Ok(())
+        }
     }
 }
 

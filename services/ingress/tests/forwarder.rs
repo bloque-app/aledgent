@@ -652,8 +652,22 @@ async fn t_038_03_a_row_once_ambiguous_keeps_its_feed_sequence() {
         d.quiesce(Duration::from_secs(30)).await,
         "every row decided"
     );
+    // The rows of the ambiguous round may have run, and keep their sequence. Only those: a row
+    // that never went out before certainly did not run, and may give its sequence back when a
+    // reservation goes before it (`F-038` §3); whether one shared that round is timing.
+    let ambiguous: Vec<InputKey> = core.fed.lock().unwrap()[core.armed.load(Ordering::SeqCst)]
+        .iter()
+        .map(|(_, k)| *k)
+        .collect();
     let mut seq_of: std::collections::HashMap<InputKey, u64> = Default::default();
-    for (seq, key) in core.fed.lock().unwrap().iter().flatten() {
+    for (seq, key) in core
+        .fed
+        .lock()
+        .unwrap()
+        .iter()
+        .flatten()
+        .filter(|(_, k)| ambiguous.contains(k))
+    {
         assert_eq!(
             *seq_of.entry(*key).or_insert(*seq),
             *seq,
@@ -661,10 +675,6 @@ async fn t_038_03_a_row_once_ambiguous_keeps_its_feed_sequence() {
         );
     }
     // The rows of the ambiguous round are decided before the reservation.
-    let ambiguous: Vec<InputKey> = core.fed.lock().unwrap()[core.armed.load(Ordering::SeqCst)]
-        .iter()
-        .map(|(_, k)| *k)
-        .collect();
     let rows = d.store.rows().await.unwrap();
     let reserved = rows
         .iter()
@@ -852,8 +862,17 @@ async fn t_038_03_a_row_an_earlier_feeder_sent_keeps_its_feed_sequence() {
         "every row decided"
     );
     let fed = core.fed.lock().unwrap().clone();
+    // The rows the earlier feeder sent: the ones that may have run, and so keep their sequence.
+    let sent: Vec<InputKey> = fed[core.armed.load(Ordering::SeqCst)]
+        .iter()
+        .map(|(_, k)| *k)
+        .collect();
+    // Only those: a row that never went out before (a tick or a delivery record logged while the
+    // new feeder's first round was held) certainly did not run, and gives its sequence back when
+    // a reservation logged meanwhile goes before it (`F-038` §3). Whether one is in that round is
+    // a matter of timing, so asserting over every input made the test flaky.
     let mut seq_of: std::collections::HashMap<InputKey, u64> = Default::default();
-    for (seq, key) in fed.iter().flatten() {
+    for (seq, key) in fed.iter().flatten().filter(|(_, k)| sent.contains(k)) {
         assert_eq!(
             *seq_of.entry(*key).or_insert(*seq),
             *seq,
@@ -862,10 +881,6 @@ async fn t_038_03_a_row_an_earlier_feeder_sent_keeps_its_feed_sequence() {
         );
     }
     // The rows the earlier feeder sent are decided before the reservation.
-    let sent: Vec<InputKey> = fed[core.armed.load(Ordering::SeqCst)]
-        .iter()
-        .map(|(_, k)| *k)
-        .collect();
     let rows = d.store.rows().await.unwrap();
     let reserved = rows
         .iter()
