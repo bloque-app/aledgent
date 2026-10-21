@@ -59,13 +59,24 @@ without committing anything, and its input number was not taken.*
 N2. **Where it comes from, and only there.** `NotRun` is given for the Agent's refusal as fenced, after the replica
 has been rebuilt to what the Agent committed, and for nothing else. A port failure, an aborted call, a failed
 rebuild, a halted core and back-pressure are still `Unavailable` or `Ambiguous`, and so is an input past what one
-invocation carries, unless the fence refused an earlier input of the same call (N4); an input the core refuses before the fence (a way out that is malformed, `ERR-MalformedCommand`) or
-decides as a recorded refusal is answered with its recorded decision, as any decided input is.
+invocation carries, unless the fence refused an earlier input of the same call (N4). The rebuild comes first: a call
+whose rebuild fails is not certified `NotRun`, whatever refused it. An input the core refuses before the fence (a way
+out that is malformed, `ERR-MalformedCommand`) or decides as a recorded refusal is answered with its recorded
+decision, as any decided input is.
 
 N3. **A committed input is never refused.** The record of replies is read before an input is staged, whether or not
-the writer is fenced, so an input the core decided is always answered `Applied`, from the record, never `NotRun`.
-This is the property that makes `NotRun` definite; it is as strong as the record of replies is durable (`INV-18`),
-no stronger.
+the writer is fenced, so an input the core decided is answered `Applied`, from the record, never `NotRun`. This is the
+property that makes `NotRun` definite; it is as strong as the record of replies is durable (`INV-18`), no stronger.
+
+*Precondition, stated plainly.* The core reads the record input by input, and stops reading at the first input it
+fails to stage or whose reply it cannot read; every input after that one is answered `NotRun` without its record
+having been read (N4). That is safe only while **the order of a feed is the order of decision**: no later input of a
+call can have been decided while an earlier one has not. It holds today, because the forwarder reads its queue in
+flight first by sequence, then the way out, then reservations, then arrival, and the core runs a feed in order. Any
+change to the queue's order, or to how the core runs a feed, has to keep it. One double fault gets past it: a fence
+together with a reply that cannot be read from the log, in the tail of a call. This amendment does not close that case
+(F2 says what the feeder then does). Reading the record for every input of the tail before answering would close it,
+at the price of one more read per refused call; it is offered as a hardening, not required here.
 
 N4. **It covers the tail.** `NotRun` is given for the first input of a call that did not commit and for every later
 input of that call, whether the core staged it or not. The core takes sequences in order and gapless within an
@@ -73,9 +84,11 @@ epoch, so no later input of the feed can have committed while this one did not.
 
 N5. **The sequencer passes it through.** `NotRun` runs nothing and takes no sequence: the expected sequence moves
 only past the items answered `Applied`, as it does now. The sequencer's rules for an epoch below the highest seen
-(`Fenced`), an early arrival (`Gap`) and a duplicate are unchanged. A duplicate is an item *below* the expected
-sequence, which means a sequence the core took; a sequence given back (rule F2) was never taken, so it is never
-read as a duplicate.
+(`Fenced`) and for an early arrival (`Gap`) are unchanged. The sequencer does not recognise a duplicate by its
+sequence: it hands every item of a feed under a current epoch to the core, and the core recognises a repeat by the
+input's key, in the record of replies (`INV-18`). A feed's sequence is therefore only a device for ordering and for
+detecting a gap. It follows that a copy of a feed under the *current* epoch runs in full, whatever its sequences have
+come to mean since they were given back; only a higher epoch stops it (fact 2).
 
 ### The feeder: giving back, and the epoch
 
@@ -88,16 +101,20 @@ to the end, the feeder decides the `Applied` rows as always, and gives back the 
 partition's tail, in one store transaction under its lease:
 
 - the sequences of the undecided rows from there on are cleared, so the rows return to the queue unfed, including
-  rows of the tail that were not in this send (they cannot have committed, by N4);
+  rows of the tail that were not in this send. That is safe because the forwarder reads its queue in flight first: no
+  row that holds a sequence lies beyond a batch that has a fresh row in it, so every row that holds a sequence from
+  *p* on is in the send or before the first fresh row, and N4 says none of them committed;
 - the lease's next sequence is lowered to *p*'s sequence, so the sequences assigned stay gapless: the next row
   marked takes it;
 - **if any row at or after *p* was in flight** (it arrived with a sequence, or any round answered it ambiguous), the
   lease's **epoch rises by one**, in the same transaction. The transaction returns the epoch the lease now has, and
   the feeder carries on under it.
 
-The core gives `NotRun` followed by `Applied` only for a later input of the call that the record of replies already
-answers (N3 keeps it `Applied`); a feeder that sees that mix, or any other, keeps every row in flight and gives
-nothing back, so the rule fails towards the old one.
+The core gives `NotRun` followed by `Applied` only for a later input of the call whose record of replies it had
+already read (N3 keeps it `Applied`), which the order of decision (N3's precondition) makes impossible except in the
+double fault N3 names. A feeder that sees that mix, or any other, keeps every row in flight and gives nothing back, so
+the rule fails towards the old one. Plainly: in the double fault that is the wedge this amendment exists to remove,
+and the way out is not read; the amendment does not cure it.
 
 F3. **The queue after the release.** Nothing is in flight from *p* on. The store is read as before: rows in flight
 first (none), then the way out that overtakes, then reservations, then arrival. The first row marked takes *p*'s
@@ -114,22 +131,26 @@ whichever sequence is the one that reaches the writer first.
 
 ### Why giving a sequence back is then safe — the invariant
 
-> **A row's feed sequence is given back, and the row fed at another, only when the core has answered that row
-> `NotRun` in the send that gave it back; and when an earlier copy of the row may still be on its way to the core, the
-> same transaction raises the epoch above the one that copy was sent under.**
+> **A row's feed sequence is given back, and the row fed at another, only when the core has answered `NotRun` the
+> head of the tail that is given back, in the send that gave it back (N4 covers the rest of the tail); and when an
+> earlier copy of any of those rows may still be on its way to the core, the same transaction raises the epoch above
+> the one that copy was sent under.**
 
 Three facts follow, and the reason for each is the whole case for the rule:
 
-1. **The row is undecided at the moment of the answer** (N3): the record of replies was read first. So giving the
-   sequence back loses no decision.
+1. **The row is undecided at the moment of the answer** (N3, under its precondition): the record of replies was read
+   first. So giving the sequence back loses no decision.
 2. **No earlier copy can run after the next feed has reached the core.** The copy of the row that the earlier,
    ambiguous send left in the core's hands (a host finishes a feed it has been handed even if its stream is gone) is
-   under an older epoch, and the sequencer refuses an epoch below the highest it has seen (`Fenced`), running
-   nothing. A copy that reaches the core *before* the next feed has the old epoch still current, runs in sequence
-   order, and so runs the oldest undecided rows first, which is their log order; the row is then answered from the
-   record when it is fed again. Without the epoch rising, a late copy of a released row could run after rows that
-   were logged behind it and were decided meanwhile, and be decided out of the received log's order. That is the
-   only reason the epoch rises.
+   under an older epoch, and the sequencer refuses an epoch below the highest it has seen (`Fenced`), under the
+   partition's lock and before anything reaches the core, running nothing. The epoch is inside the signed message, so
+   a copy cannot be replayed under a higher one. A copy that reaches the core *before* the next feed still has its
+   epoch current, and the core runs all of it, in the order the feeder composed it, which is queue order, so the rows
+   it decides are the oldest undecided ones; each is then answered from the record when it is fed again. What a
+   sequence number cannot do is stop that copy: the sequencer does not drop an item for its sequence (N5), so after
+   a sequence is given back and reused, a copy under the same epoch would still run in full, in whatever state the
+   rows now are, including after rows logged behind it have been decided. That is why the epoch rises, and why the
+   rise is required rather than a refinement.
 3. **Each row is decided at most once, by key,** whichever copy reaches the writer first (`INV-18`), and at least
    once, because it stays in the received log and the forwarder reads it until it is decided (`REQ-CS-7`).
 
@@ -149,10 +170,16 @@ that no other answer carries, and the code that builds it must show N3 by test. 
   row does, `T-009-04`): the "in flight keeps its place ahead of a reservation" promise of `F-038` §3 holds until the
   core says the row did not run.
 - Each backoff period while fenced costs a send, a mark and a release in ingress's database, and, once, the epoch rise.
-- An old ingress cannot read a `not_run` answer (an unknown tag is a frame it drops, so the feed reads as ambiguous,
-  which is the behaviour today). The core only gives it while fenced, and a fence needs a code source, which
-  `T-037-06` enables and this task gates. Ingress is released before the core host, as `F-038` §12 already orders it.
-  The stream's version is not raised (see Decisions).
+- **An ingress that does not know `not_run` fails harder than "ambiguous".** On the stream link it cannot decode the
+  frame, its read loop ends and the **whole session** is dropped: the feeds in flight fail as ambiguous, the reads as
+  unavailable, the core host dials again, and the next fenced feed does the same. On the legacy socket link an
+  undecodable response reads as the **whole batch ambiguous**, and the forwarder keeps ambiguous rows in flight for
+  ever, so a fenced writer wedges where it did not before. The core only gives `NotRun` while fenced, and a fence needs
+  a code source, which `T-037-06` enables and this task gates. The safe order is therefore: **ingress is released
+  first, then the core hosts** (`F-038` §12 already orders it so), and **ingress is not rolled back below this release
+  while a core host speaks it**. The alternative, raising the stream's version, is Decision 3.
+- A single call and the legacy link read `NotRun` as `Unavailable`, as they read every unrun input today; only the
+  sequenced feed gives sequences back.
 
 ### The cases
 
@@ -173,25 +200,24 @@ that no other answer carries, and the code that builds it must show N3 by test. 
 
 Add, at the end of the way-out point as amendment 0035 left it:
 
-> A way out MUST reach a fenced writer even when commands logged before it were being delivered to it when the
-> delivery was interrupted, so that it is not known whether the writer decided them. The writer's refusal of an
-> input because of the fence MUST be reported to its sender as a definite "not decided", with nothing committed;
-> an input the writer did decide MUST be answered with its decision, whether or not the writer is fenced. *Amendment
-> 0036.*
+> A way out MUST reach a fenced writer even when commands logged before it were being handed to it when the
+> handing over was interrupted, so that it is not known whether the writer decided them. *[Subject to the question
+> above:]* The writer's refusal of an input because of the fence MUST be reported to the component that submitted it
+> as a definite "not decided", with nothing committed; an input the writer did decide MUST be answered with its
+> decision, whether or not the writer is fenced. *Amendment 0036.*
 
 ## R2 — `US-K7`, three acceptance criteria
 
 Add after `AC-K7.20`:
 
-> - `AC-K7.21` Given a writer fenced at input *n*, and a command logged before a way out whose delivery to the
+> - `AC-K7.21` Given a writer fenced at input *n*, and a command logged before a way out whose handing to the
 >   writer was interrupted so that it is not known whether the writer decided it, When the way out is logged, Then
 >   it is decided as input *n*, whether or not the command was interrupted, and the upgrade is moved or cancelled as
 >   it asks (`REQ-RT-20`, `REQ-CS-7`).
 > - `AC-K7.22` Given the commands that a fenced writer refused when the way out overtook them, When the way out is
 >   decided and the fence is gone, Then each of them is decided exactly once, none is lost and none is decided twice,
->   in the order in which they were received, after the way out, with any reservation logged meanwhile first
->   (`REQ-CS-7`, `INV-18`).
-> - `AC-K7.23` Given a command the writer decided, When it reaches the writer again, whether or not the writer is
+>   in the order in which they were received, after the way out (`REQ-CS-7`, `INV-18`).
+> - *[Subject to the question above:]* `AC-K7.23` Given a command the writer decided, When it reaches the writer again, whether or not the writer is
 >   fenced, Then it is answered with that decision and never with "not decided"; and Given a command a fenced
 >   writer refused, Then it is answered "not decided" and nothing of it is recorded (`REQ-RT-20`, `INV-18`).
 
@@ -214,17 +240,32 @@ and the forwarder (`ingress::service`). Its acceptance test is
 
 ## Decisions for the owner
 
-1. **The epoch rises on a release of in-flight rows (F2).** The alternative is key idempotency alone: no epoch change,
-   and a late copy of a released row could decide it out of the received log's order in a narrow window (a copy still
-   in the core's hands, after the fence has lifted and rows logged behind it have run). It is the smaller change; this
-   draft takes the epoch because "out of order" is a guarantee `F-038` makes (`DEC-27` (d)).
+1. **The epoch rises on a release of in-flight rows (F2).** The alternative is key idempotency alone: no epoch change.
+   Then nothing stops a late copy of a released row, which runs in full under the old epoch whatever rows now hold its
+   sequences, so only the key would keep order, and a row could be decided out of the received log's order in a narrow
+   window (after the fence has lifted and rows logged behind it have run). It is the smaller change; this draft takes
+   the epoch because "out of order" is a guarantee `F-038` makes (`DEC-27` (d)).
 2. **`NotRun` covers the tail (N4)** instead of the one refused input, so a feeder never gives back a sequence while
    a later sequence stays carried.
-3. **The stream's version is not raised** for the new answer; the argument is the release order and the gate on
-   `T-037-06` above. A raise would make a core host speak the old answer to an old ingress, which buys nothing while no
-   fence can happen.
-4. **R1 and R2 change `SPEC.md`**: one sentence and three acceptance criteria. If the owner prefers the spec to stay
-   as it is, the rules above still bind in the plan and the criteria become `T-037-18`'s own.
+3. **Raise the stream's version for the new answer, or not?** This draft does not: the argument is the release order
+   and the gate on `T-037-06`, plus the runbook rule "never roll ingress back below this release while a core host
+   speaks it". Raising it would make an old ingress get a clean refusal at the first message instead of a dropped
+   session, and would cost a version negotiation for an answer that cannot occur until a code source is enabled.
+4. **`NotRun` on a single call and on the legacy link reads as `Unavailable`** (behaviour, so it is stated here):
+   only the sequenced feed gives sequences back. The store gains a method of its own for the release
+   (`unfeed_in_flight`) rather than changing `unfeed`; that is an implementation choice, recorded here so it is not a
+   silent one.
+
+### Question for the owner: how much of this goes into `SPEC.md`?
+
+`SPEC.md` describes what a holder can see and says nothing about how ingress and the core talk to each other. Two
+parts of this amendment are of the second kind: the second sentence of R1 and `AC-K7.23` say what the writer answers
+the component that feeds it. No holder can observe that. The rest (the first sentence of R1, `AC-K7.21` and
+`AC-K7.22`) is behaviour a holder does see: a way out gets through, and the commands it overtook are decided once.
+
+**Question: should R1's second sentence and `AC-K7.23` go into `SPEC.md`, or stay in the plan and become `T-037-18`'s
+own criterion?** The drafter has not chosen. If they stay in the plan, nothing else in this amendment changes. R1 and
+R2 below are written with both in, and marked, so that approving "plan only" means deleting two marked passages.
 
 ## Not chosen
 
