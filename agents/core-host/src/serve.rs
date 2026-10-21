@@ -357,6 +357,40 @@ fn need(args: &[String], name: &str) -> Result<String, String> {
     arg(args, name).ok_or_else(|| format!("missing {name}"))
 }
 
+/// Attach the actor a saved runtime state has installed (`T-037-21`): the genesis package `pkg`
+/// (the bytes `actor_package`) if that is what is installed, else the package of the code cache
+/// whose bytes the directory names. Returns the actor and the bytes of the package attached.
+fn attach_saved(
+    rt: &mut Runtime,
+    saved: Saved,
+    pkg: &vos::agent::package_admission::AdmittedActorPackage,
+    actor_package: &[u8],
+    held: Option<&crate::code_source::Fetcher>,
+) -> Result<(crate::driver::Actor, Vec<u8>), String> {
+    rt.restore(saved.state, saved.linear, saved.control, saved.slot);
+    let installed = rt
+        .installed_package(ACTOR_NAME)
+        .map_err(|e| format!("attach: {e:?}"))?;
+    let bytes = crate::restart::package_installed(
+        &installed,
+        actor_package,
+        held.map(|f| f as &dyn crate::restart::Held),
+    )?;
+    let actor = if bytes == actor_package {
+        rt.attach(pkg, ACTOR_NAME, None)
+    } else {
+        let found = package::admit_actor(&bytes)
+            .map_err(|e| format!("the installed package, from the code cache: {e:?}"))?;
+        eprintln!(
+            "aledgent-core-host: the Agent runs a package other than --actor ({} bytes, found in \
+             the code cache): the host switched to it before it stopped",
+            bytes.len()
+        );
+        rt.attach(&found, ACTOR_NAME, None)
+    };
+    Ok((actor.map_err(|e| format!("attach: {e:?}"))?, bytes))
+}
+
 /// Open the Agent in `dir`: restore it if it was saved, create and install it if not.
 ///
 /// A restart attaches the package the runtime's saved state has installed, which after a switch
@@ -374,35 +408,13 @@ pub fn open_port(
 ) -> Result<Persisting, String> {
     let pkg = package::admit_actor(actor_package).map_err(|e| format!("actor package: {e:?}"))?;
     let mut rt = Runtime::create(runtime_pvm, keys).map_err(|e| format!("runtime: {e:?}"))?;
-    // The bytes of the package attached: the genesis package, unless the Agent's state names another.
-    let mut attached = actor_package.to_vec();
-    let actor = match Saved::load(dir)? {
-        Some(s) => {
-            rt.restore(s.state, s.linear, s.control, s.slot);
-            let installed = rt
-                .installed_package(ACTOR_NAME)
-                .map_err(|e| format!("attach: {e:?}"))?;
-            attached = crate::restart::package_installed(
-                &installed,
-                actor_package,
-                held.map(|f| f as &dyn crate::restart::Held),
-            )?;
-            if attached == actor_package {
-                rt.attach(&pkg, ACTOR_NAME, None)
-            } else {
-                let found = package::admit_actor(&attached)
-                    .map_err(|e| format!("the installed package, from the code cache: {e:?}"))?;
-                eprintln!(
-                    "aledgent-core-host: the Agent runs a package other than --actor ({} bytes,                      found in the code cache): the host switched to it before it stopped",
-                    attached.len()
-                );
-                rt.attach(&found, ACTOR_NAME, None)
-            }
-            .map_err(|e| format!("attach: {e:?}"))?
-        }
-        None => rt
-            .install(&pkg, ACTOR_NAME, None)
-            .map_err(|e| format!("install: {e:?}"))?,
+    let (actor, attached) = match Saved::load(dir)? {
+        Some(saved) => attach_saved(&mut rt, saved, &pkg, actor_package, held)?,
+        None => (
+            rt.install(&pkg, ACTOR_NAME, None)
+                .map_err(|e| format!("install: {e:?}"))?,
+            actor_package.to_vec(),
+        ),
     };
     let mut vos = VosPort::new(rt, actor, DRIVER);
     vos.keep_samples(false);
