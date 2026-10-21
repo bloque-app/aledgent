@@ -13,8 +13,9 @@
 mod common;
 use common::*;
 use core_binding::envelope::{AgentRefusal, encode};
-use core_binding::host::{BatchLimits, DriveError, NativePort, PortError};
+use core_binding::host::{AgentPort as _, BatchLimits, DriveError, NativePort, PortError};
 use core_binding::hot::{HOT, Hot, decode_hot};
+use core_binding::staging::{Restaged, StageRefusal, restage};
 use ledger_core::identity::IdentityKind;
 use ledger_core::principal::Verifier;
 
@@ -269,4 +270,219 @@ fn t037_14_the_way_out_is_taken_on_the_mapped_layout_when_h_cannot_be_run() {
     assert!(fx.driver.port().switched.is_empty());
     let h = hot(&mut fx);
     assert_eq!((h.code, h.generation, h.upgrade), (g, 0, None));
+}
+
+// ---------------------------------------------------------------------------------------------
+// `T-037-21`: the core restarts on the versions the book names. A restarted process holds the
+// genesis code and nothing it fetched before: the previous process's staged versions are gone, and
+// the platform runs whatever the previous process left it. The cases below drive the host's start
+// the way `aledgent-core-host serve` does: stage again what the hot row names ([`restage`], from
+// the node's cache, here a `HeldCode`), then the start check ([`Driver::ensure_code`]), then the
+// inputs. The saga-level glue (`open_port`) is not run here: see the pull request.
+
+/// An upgrade to a real code version (`HeldCode::version`: manifest, package, runtime) scheduled
+/// for the `n_after`-th input from now. Returns the book's fixture, the source that holds the
+/// versions, *g*, *H* and *n*.
+fn scheduled_for_real(n_after: u64) -> (Fx<NativePort>, HeldCode, [u8; 32], [u8; 32], u64) {
+    let mut fx = Fx::native();
+    let _ = fx.person();
+    let g = hot(&mut fx).code;
+    let held = HeldCode::default();
+    let h = held.version(1);
+    let n = hot(&mut fx).inputs + n_after;
+    let mut row = hot(&mut fx);
+    row.upgrade = Some((h, n));
+    fx.driver
+        .port_mut()
+        .rows
+        .0
+        .insert(HOT.to_vec(), encode(&row));
+    fx.driver.reload_code(&mut fx.replica).unwrap();
+    // The process that took the `Upgrade` staged H: the platform knows both versions.
+    fx.driver.port_mut().code_map = [(g, 0), (h, 1)].into_iter().collect();
+    (fx, held, g, h, n)
+}
+
+/// A process that starts over what the last one left: it holds *g* alone, and the platform runs
+/// code generation `running`.
+fn restarted(fx: &mut Fx<NativePort>, g: [u8; 32], running: u64) {
+    fx.driver.reload_code(&mut fx.replica).unwrap();
+    let port = fx.driver.port_mut();
+    port.code_map = [(g, 0)].into_iter().collect();
+    port.switched.clear();
+    port.generation = running;
+}
+
+/// `T-037-21`, the first gap: a restart after an `Upgrade` was scheduled and before it takes
+/// effect forgets the version it staged, so at *n* the switch finds it missing and the writer is
+/// fenced until a cancel. Stated here as the case that holds without the new step.
+#[test]
+fn t037_21_without_staging_again_a_restart_loses_the_scheduled_version() {
+    let (mut fx, _, g, _, n) = scheduled_for_real(2);
+    restarted(&mut fx, g, 0);
+    open(&mut fx, 1);
+    fx.sync().expect("n − 1 runs under g").expect("sent");
+    open(&mut fx, 2);
+    assert!(matches!(
+        fx.sync(),
+        Err(DriveError::Port(PortError::Unavailable(why))) if why.contains("cannot be run")
+    ));
+    assert_eq!(fx.driver.seq(), n - 1, "n was never sent");
+}
+
+/// `T-037-21`, `AC-K7.9`: a restart before *n* stages the scheduled version again, from the cache,
+/// so the switch happens at *n*, once.
+#[test]
+fn t037_21_a_restart_before_n_stages_h_again_and_the_switch_happens_at_n() {
+    let (mut fx, held, g, h, n) = scheduled_for_real(2);
+    restarted(&mut fx, g, 0);
+    let report = restage(fx.driver.port_mut(), &held).expect("the hot row reads");
+    assert_eq!(report, [Restaged::Held(g), Restaged::Staged(h)]);
+    // The start check: the next input is n − 1, which runs under g. Nothing to install.
+    fx.driver.ensure_code().expect("the start check");
+    assert!(fx.driver.port().switched.is_empty());
+    open(&mut fx, 1);
+    let c = fx.sync().expect("n − 1 runs under g").expect("sent");
+    assert_eq!(c.seq, n - 1);
+    open(&mut fx, 2);
+    let c = fx.sync().expect("the switch precedes n").expect("sent");
+    assert_eq!(c.seq, n);
+    assert_eq!(fx.driver.port().switched, [h], "one install");
+    let row = hot(&mut fx);
+    assert_eq!((row.code, row.generation, row.upgrade), (h, 1, None));
+}
+
+/// `T-037-21`, the second gap: a restart after the switch starts on the version the book names. The
+/// hot row says the code in force is *H*, the platform runs it, and the new process holds only *g*:
+/// without staging *H* again it could not name what it runs.
+#[test]
+fn t037_21_a_restart_after_the_switch_starts_on_the_version_the_book_names() {
+    let (mut fx, held, g, h, n) = scheduled_for_real(1);
+    open(&mut fx, 1);
+    let c = fx.sync().expect("the switch precedes n").expect("sent");
+    assert_eq!(c.seq, n);
+    assert_eq!(fx.driver.port().switched, [h]);
+    // The process dies; the next one holds g and the platform still runs H.
+    restarted(&mut fx, g, 1);
+    assert!(
+        fx.driver.ensure_code().is_err(),
+        "without H staged the start check cannot name the code in force"
+    );
+    let report = restage(fx.driver.port_mut(), &held).expect("the hot row reads");
+    assert_eq!(report, [Restaged::Staged(h)]);
+    fx.driver.ensure_code().expect("the start check runs H");
+    assert!(fx.driver.port().switched.is_empty(), "nothing is installed");
+    // And it goes on: the next input runs under H.
+    open(&mut fx, 2);
+    let c = fx.sync().expect("n + 1 under H").expect("sent");
+    assert_eq!(c.seq, n + 1);
+    assert_eq!(fx.driver.port().generation, 1);
+    assert!(fx.driver.port().switched.is_empty());
+}
+
+/// `T-037-21`, `AC-K7.9`: a restart in the middle of a switch (the platform runs *H*, installed and
+/// saved, and *n* is not committed) resumes without switching twice: *H* is staged again, the start
+/// check finds the platform already running it, and *n* commits with no second install.
+#[test]
+fn t037_21_a_restart_in_the_middle_of_a_switch_resumes_without_switching_twice() {
+    let (mut fx, held, g, h, n) = scheduled_for_real(1);
+    // The previous process installed H (generation 1) and died before it sent n.
+    restarted(&mut fx, g, 1);
+    let report = restage(fx.driver.port_mut(), &held).expect("the hot row reads");
+    assert_eq!(report, [Restaged::Held(g), Restaged::Staged(h)]);
+    fx.driver.ensure_code().expect("the start check");
+    assert!(
+        fx.driver.port().switched.is_empty(),
+        "H runs already: no second install"
+    );
+    open(&mut fx, 1);
+    let c = fx.sync().expect("n commits under H").expect("sent");
+    assert_eq!(c.seq, n);
+    assert!(fx.driver.port().switched.is_empty());
+    let row = hot(&mut fx);
+    assert_eq!((row.code, row.generation, row.upgrade), (h, 1, None));
+}
+
+/// `T-037-21`: a version that cannot be staged again is reported, and nothing before *n* is fenced
+/// by it. At *n* the way out is taken as it always was for a version the host does not hold: the
+/// cancel commits as *n*, and the book goes on under *g*.
+#[test]
+fn t037_21_a_version_that_cannot_be_staged_again_is_reported_and_fences_nothing_before_n() {
+    let (mut fx, held, g, h, n) = scheduled_for_real(2);
+    held.forget(&h);
+    restarted(&mut fx, g, 0);
+    let report = restage(fx.driver.port_mut(), &held).expect("the hot row reads");
+    assert!(
+        matches!(&report[..], [Restaged::Held(c), Restaged::Refused(v, StageRefusal::NotRetrievable(_))] if *c == g && *v == h),
+        "{report:?}"
+    );
+    fx.driver.ensure_code().expect("the start check");
+    open(&mut fx, 1);
+    let c = fx.sync().expect("n − 1 is not fenced").expect("sent");
+    assert_eq!(c.seq, n - 1);
+    // At n the version is missing, as it was before this task; the way out needs no version.
+    let ctx = fx.ctx(fx.operator());
+    let _ = fx
+        .replica
+        .cancel_upgrade(&ctx, b"T-037-21: H cannot be staged again");
+    let c = fx.sync().expect("the way out commits").expect("sent");
+    assert_eq!(c.seq, n);
+    let row = hot(&mut fx);
+    assert_eq!((row.code, row.generation, row.upgrade), (g, 0, None));
+}
+
+/// `T-037-21`: what the source returns is checked as staging checks it. A package under the right
+/// name with other bytes is refused, and so is a manifest of another generation than the book gives
+/// the version; nothing is staged for either.
+#[test]
+fn t037_21_a_version_staged_again_is_checked_like_any_other() {
+    use ledger_core::code::artefact_digest;
+    // Other bytes under the package's digest.
+    let (mut fx, held, g, h, _) = scheduled_for_real(2);
+    held.lie(artefact_digest(&code_package(1)), b"another package");
+    restarted(&mut fx, g, 0);
+    let report = restage(fx.driver.port_mut(), &held).unwrap();
+    assert!(
+        matches!(&report[..], [_, Restaged::Refused(v, StageRefusal::Mismatch(_))] if *v == h),
+        "{report:?}"
+    );
+    assert!(!fx.driver.port().holds_code(&h));
+    // A version of generation 2 where the book gives the scheduled one generation 1.
+    let (mut fx, held, g, _, n) = scheduled_for_real(2);
+    let h2 = held.version(2);
+    let mut row = hot(&mut fx);
+    row.upgrade = Some((h2, n));
+    fx.driver
+        .port_mut()
+        .rows
+        .0
+        .insert(HOT.to_vec(), encode(&row));
+    restarted(&mut fx, g, 0);
+    let report = restage(fx.driver.port_mut(), &held).unwrap();
+    assert!(
+        matches!(&report[..], [_, Restaged::Refused(v, StageRefusal::Generation { manifest: 2, .. })] if *v == h2),
+        "{report:?}"
+    );
+    assert!(!fx.driver.port().holds_code(&h2));
+}
+
+/// `T-037-21`: a port that manages no code, or a book that never upgraded, has nothing to stage
+/// again.
+#[test]
+fn t037_21_a_book_that_never_upgraded_stages_nothing_again() {
+    let mut fx = Fx::native();
+    let _ = fx.person();
+    let g = hot(&mut fx).code;
+    let held = HeldCode::default();
+    // The port manages no code: it holds every version.
+    assert_eq!(
+        restage(fx.driver.port_mut(), &held).unwrap(),
+        [Restaged::Held(g)]
+    );
+    // It manages code and holds g, the one version the hot row names.
+    fx.driver.port_mut().code_map = [(g, 0)].into_iter().collect();
+    assert_eq!(
+        restage(fx.driver.port_mut(), &held).unwrap(),
+        [Restaged::Held(g)]
+    );
 }

@@ -130,6 +130,24 @@ pub fn target_code(code: [u8; 32], upgrade: Option<([u8; 32], u64)>, next_input:
     }
 }
 
+/// The code versions a writer's hot row names, each with the generation the book gives it: the
+/// code in force (`code`, at `generation`) and, if an upgrade is scheduled, its version (at the
+/// generation after). What a restarted host must hold to run the next input and to return to the
+/// code in force if the upgrade is cancelled (`T-037-21`); [`target_code`] picks, among them, the
+/// one the next input runs.
+#[must_use]
+pub fn named(
+    code: [u8; 32],
+    generation: u64,
+    upgrade: Option<([u8; 32], u64)>,
+) -> alloc::vec::Vec<([u8; 32], u64)> {
+    let mut v = alloc::vec![(code, generation)];
+    if let (Some((h, _)), Some(next)) = (upgrade, generation.checked_add(1)) {
+        v.push((h, next));
+    }
+    v
+}
+
 /// Make the platform run the code version that executes input `next_input` (module
 /// documentation). Call it at start and before sending every input; on `Err` send nothing.
 ///
@@ -259,6 +277,17 @@ mod tests {
             self.runs = to;
             Ok(())
         }
+    }
+
+    #[test]
+    fn t037_21_the_hot_row_names_the_code_in_force_and_a_scheduled_version() {
+        // Nothing scheduled: the code in force, at the writer's generation.
+        assert_eq!(named(h(1), 3, None), [(h(1), 3)]);
+        // Scheduled: also the upgrade's version, one generation on, whatever the input it applies
+        // from (the version is needed from the start, to be staged before that input).
+        assert_eq!(named(h(1), 3, Some((h(2), 40))), [(h(1), 3), (h(2), 4)]);
+        // A generation that cannot be followed names no next version.
+        assert_eq!(named(h(1), u64::MAX, Some((h(2), 40))), [(h(1), u64::MAX)]);
     }
 
     #[test]

@@ -155,6 +155,29 @@ pub fn fetch(
     code: &[u8; 32],
     writer_generation: u64,
 ) -> Result<Checked, StageRefusal> {
+    fetch_generation(source, code, writer_generation.checked_add(1)).map_err(|r| match r {
+        StageRefusal::Generation { manifest, .. } => StageRefusal::Generation {
+            writer: writer_generation,
+            manifest,
+        },
+        other => other,
+    })
+}
+
+/// [`fetch`] for a code version whose generation the caller already knows: the manifest must name
+/// `generation` (`None`: no generation can be named, so none matches). Staging an `Upgrade` expects
+/// the writer's next; staging a version again at start ([`restage`]) expects the one the book
+/// gives it, which for the code in force is the writer's own.
+///
+/// # Errors
+///
+/// As [`fetch`]; [`StageRefusal::Generation`] carries the generation expected, less one, as
+/// `writer`.
+pub fn fetch_generation(
+    source: &dyn CodeFetch,
+    code: &[u8; 32],
+    generation: Option<u64>,
+) -> Result<Checked, StageRefusal> {
     let bytes = source.fetch(code, None).ok_or_else(|| {
         StageRefusal::NotRetrievable(format!("the manifest of {}", crate::switch::short(code)))
     })?;
@@ -170,9 +193,9 @@ pub fn fetch(
     if &manifest.version() != code {
         return Err(StageRefusal::Manifest("not in its canonical form".into()));
     }
-    if writer_generation.checked_add(1) != Some(manifest.generation) {
+    if generation != Some(manifest.generation) {
         return Err(StageRefusal::Generation {
-            writer: writer_generation,
+            writer: generation.map_or(u64::MAX, |g| g.saturating_sub(1)),
             manifest: manifest.generation,
         });
     }
@@ -199,6 +222,56 @@ pub fn fetch(
         package,
         runtime,
     })
+}
+
+/// What staging one named version again did ([`restage`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Restaged {
+    /// The port held it already.
+    Held([u8; 32]),
+    /// It was fetched, checked and staged again.
+    Staged([u8; 32]),
+    /// It could not be, and nothing was kept: the host says so, and the switch that needs it will
+    /// refuse (`SwitchError::NotStaged`) with a way out still open.
+    Refused([u8; 32], StageRefusal),
+}
+
+/// At start, stage again the code versions the writer's hot row names that the port does not hold
+/// ([`crate::switch::named`]): the code in force and the version of a scheduled upgrade
+/// (`T-037-21`). A restarted host holds the code it started with and nothing it fetched before;
+/// without this, an upgrade scheduled before the restart is lost to it (the switch at *n* finds
+/// the version not staged), and a host restarted after the switch cannot name the version it runs.
+///
+/// Each version is fetched and checked as staging checks it, held to the generation the book gives
+/// it ([`fetch_generation`]); the port checks it again ([`AgentPort::restage_code`]). The sources
+/// are untrusted as ever: the node's cache answers first. Call it before the start check
+/// ([`crate::host::Driver::ensure_code`]).
+///
+/// # Errors
+///
+/// The port could not read the writer's hot row. A version that cannot be staged is an entry of
+/// the result, not an error.
+pub fn restage(
+    port: &mut dyn crate::host::AgentPort,
+    source: &dyn CodeFetch,
+) -> Result<Vec<Restaged>, crate::host::PortError> {
+    let Some(hot) = port.hot()? else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for (code, generation) in crate::switch::named(hot.code, hot.generation, hot.upgrade) {
+        if port.holds_code(&code) {
+            out.push(Restaged::Held(code));
+            continue;
+        }
+        let staged = fetch_generation(source, &code, Some(generation))
+            .and_then(|checked| port.restage_code(checked, generation));
+        out.push(match staged {
+            Ok(()) => Restaged::Staged(code),
+            Err(refusal) => Restaged::Refused(code, refusal),
+        });
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
