@@ -17,6 +17,7 @@
 //! | How long a writer has been fenced (`REQ-RT-20`, `T-037-15`): alert past `fence_alert_after`, five minutes by default | `aledgent_writer_fenced_seconds` | core host |
 //! | What the code fetcher discarded as not its digest's bytes (`REQ-RT-17`, `T-037-06`), by place; none while the node has no source of code | `aledgent_code_source_mismatch_total` | core host |
 //! | The release's signals (`T-018-10`): the core's halt, the audit trail's shipping, the runtime's Authority backlog, the adapter's service and finality; the sharded profile's lags and R-03's checks of the messages between Agents, deferred ([`RELEASE`], [`DEFERRED`]) | `aledgent_core_halted`, `aledgent_audit_*`, `aledgent_vos_unacknowledged_authority_decisions`, `aledgent_finality_lag_blocks` | core host; adapter |
+//! | Which program the core's writer runs (`REQ-RT-16`, `REQ-RT-20`, `T-037-23`): its code generation, labelled with the code version in force, and the input a scheduled upgrade applies from | `aledgent_writer_generation`, `aledgent_writer_upgrade_scheduled_input` | core host |
 //!
 //! Beside them: anchoring's incidents and the latest settlement comparison (`F-017`), the
 //! book's size (`aledgent_book_records`, `aledgent_book_leaves`, `aledgent_book_genesis_records`;
@@ -312,6 +313,12 @@ fn escape(v: &str) -> String {
         .replace('\n', "\\n")
 }
 
+/// A code version's first eight bytes in hex (16 characters), the label of a series
+/// (`T-037-23`). The signals carry the whole digest; a label must stay short.
+fn short_code(code: &str) -> &str {
+    code.get(..16).unwrap_or(code)
+}
+
 fn flag(b: bool) -> u8 {
     u8::from(b)
 }
@@ -510,6 +517,26 @@ fn host(e: &mut Exposition, c: &SignalsBody) {
         &[("writer", "core")],
         c.writer_fenced_age.map_or(0, |ms| ms / 1_000),
     );
+    // Which program the writer runs (`T-037-23`, `REQ-RT-16`, `REQ-RT-20`): its generation, labelled
+    // with the first eight bytes of the code version in force, and the input the upgrade scheduled
+    // applies from, while there is one. A label is one code version, so a series exists for the
+    // version in force and, while one is scheduled, the one it installs: never a digest per input.
+    if let Some(w) = &c.writer_code {
+        e.gauge(
+            "aledgent_writer_generation",
+            "The code generation the core's writer is in (T-037-23): 0 at genesis, one more after each upgrade. The label is the first eight bytes of the code version in force, in hex.",
+            &[("writer", "core"), ("code", short_code(&w.code))],
+            w.generation,
+        );
+        if let Some(u) = &w.upgrade {
+            e.gauge(
+                "aledgent_writer_upgrade_scheduled_input",
+                "The input number the scheduled upgrade applies from (T-037-23); present only while an upgrade is scheduled. The label is the first eight bytes of the version it installs, in hex.",
+                &[("writer", "core"), ("code", short_code(&u.code))],
+                u.from,
+            );
+        }
+    }
     e.gauge(
         "aledgent_core_halted",
         "Whether the core has stopped deciding: halted on an input the Agent cannot apply (F18), or stopped on an incident. Every input waits Received.",

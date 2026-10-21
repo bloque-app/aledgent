@@ -1720,11 +1720,13 @@ async fn code_door<S: Store, C: Core>(
         return Ok(false);
     }
     match &j.op {
-        OperatorOp::Upgrade { code, .. } => match shared.core.stage_code(code).await {
+        OperatorOp::Upgrade { code, from, .. } => match shared.core.stage_code(code).await {
             Ok(Staged::Staged) => Ok(false),
             Ok(Staged::Refused { reason }) => {
-                // For the operator's log; the client is told the condition and no more.
-                tracing::warn!(%reason, "an upgrade was refused before it was logged: its code is not staged");
+                // For the operator's log; the client is told the condition and no more. It names
+                // the input the upgrade asked to apply from (`T-037-23`).
+                let (code, from) = (hex::encode(code), *from);
+                tracing::warn!(%reason, %code, from_input = from, "an upgrade was refused before it was logged: its code is not staged");
                 Err(Refusal::InvalidTransition)
             }
             Err(_) => Err(Refusal::DecisionUnavailable),

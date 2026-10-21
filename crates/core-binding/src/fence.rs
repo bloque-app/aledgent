@@ -191,6 +191,90 @@ pub fn decide(
     }
 }
 
+/// Something that happened to the writer's code at an input, or to the platform running it
+/// (`T-037-23`): what the execution node says in its log, one plain line each, naming the input.
+/// The driver records them as inputs commit and the core drains them ([`code_events`]); they are
+/// never written to the book.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodeEvent {
+    /// The platform was made to run `code` for input `input`, which it did not run before: the
+    /// switch to *H* before input *n*, or the reinstall of *g* after a way out. `from` is the
+    /// code the host asked the platform to run before, `None` at the host's first call after it
+    /// starts.
+    Installed {
+        /// The input the platform was made ready for.
+        input: u64,
+        /// The code version now run.
+        code: [u8; 32],
+        /// The one run before.
+        from: Option<[u8; 32]>,
+    },
+    /// Input `input` is the first the new code decided: the scheduled upgrade took effect.
+    Switched {
+        /// The first input under the new code.
+        input: u64,
+        /// The code version before.
+        from: [u8; 32],
+        /// The code version now in force.
+        to: [u8; 32],
+        /// The generation now in force.
+        generation: u64,
+    },
+    /// Input `input` took a way out. `upgrade` is the upgrade scheduled before it, if any.
+    WayOut {
+        /// The way-out input.
+        input: u64,
+        /// What it did.
+        taken: WayOut,
+        /// The upgrade scheduled before it: the code version and the input it applied from.
+        upgrade: Option<([u8; 32], u64)>,
+    },
+    /// Input `input` scheduled an upgrade to `code`, to apply from input `from`.
+    Scheduled {
+        /// The input that scheduled it.
+        input: u64,
+        /// The code version it installs.
+        code: [u8; 32],
+        /// The input it applies from.
+        from: u64,
+    },
+}
+
+/// What input `seq` did to the writer's code, `before` it and `after` it ([`decide`]'s inputs and
+/// result): the events to log when it commits (`T-037-23`).
+pub fn code_events(
+    seq: u64,
+    before: &WriterCode,
+    after: &WriterCode,
+    taken: Option<WayOut>,
+    scheduled: Option<([u8; 32], u64)>,
+) -> alloc::vec::Vec<CodeEvent> {
+    let mut out = alloc::vec::Vec::new();
+    if after.code != before.code {
+        out.push(CodeEvent::Switched {
+            input: seq,
+            from: before.code,
+            to: after.code,
+            generation: after.generation,
+        });
+    }
+    if let Some(taken) = taken {
+        out.push(CodeEvent::WayOut {
+            input: seq,
+            taken,
+            upgrade: before.upgrade,
+        });
+    }
+    if let Some((code, from)) = scheduled {
+        out.push(CodeEvent::Scheduled {
+            input: seq,
+            code,
+            from,
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,6 +288,61 @@ mod tests {
             generation: 4,
             upgrade: Some((H1, n)),
         }
+    }
+
+    /// `T-037-23`: what an input did to the writer's code, for the log: a switch, a way out, a
+    /// scheduled upgrade, each once and naming the input; an ordinary input nothing.
+    #[test]
+    fn t037_23_code_events_say_what_an_input_did() {
+        let before = scheduled(10);
+        let mut after = before;
+        decide(&mut after, 10, false, None, None);
+        assert_eq!(
+            code_events(10, &before, &after, None, None),
+            [CodeEvent::Switched {
+                input: 10,
+                from: H0,
+                to: H1,
+                generation: 5
+            }]
+        );
+        let mut after = before;
+        decide(
+            &mut after,
+            10,
+            true,
+            Some(WayOut::Reschedule { from: 12 }),
+            None,
+        );
+        assert_eq!(
+            code_events(
+                10,
+                &before,
+                &after,
+                Some(WayOut::Reschedule { from: 12 }),
+                None
+            ),
+            [CodeEvent::WayOut {
+                input: 10,
+                taken: WayOut::Reschedule { from: 12 },
+                upgrade: Some((H1, 10))
+            }]
+        );
+        let none = WriterCode {
+            upgrade: None,
+            ..before
+        };
+        let mut after = none;
+        decide(&mut after, 3, false, None, Some((H1, 9)));
+        assert_eq!(
+            code_events(3, &none, &after, None, Some((H1, 9))),
+            [CodeEvent::Scheduled {
+                input: 3,
+                code: H1,
+                from: 9
+            }]
+        );
+        assert!(code_events(3, &none, &none, None, None).is_empty());
     }
 
     fn fenced(r: Result<(), AgentRefusal>) -> bool {
