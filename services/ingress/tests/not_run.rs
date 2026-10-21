@@ -562,3 +562,69 @@ async fn t_037_18_a_release_of_rows_in_flight_raises_the_epoch_in_memory() {
     s.unfeed(BOOK, "a", 2, 4).await.unwrap();
     assert_eq!(s.try_feed(BOOK, "a", long).await.unwrap(), Some(2));
 }
+
+/// A feed of the ticks `ks` at sequences from `first`, under `epoch`.
+fn feed_of(epoch: u64, first: u64, ks: &[u8]) -> Feed {
+    let inputs: Vec<CoreInput> = ks
+        .iter()
+        .map(|k| CoreInput {
+            key: key(*k),
+            body: InputBody::Tick {
+                now: T0 + u64::from(*k),
+            },
+        })
+        .collect();
+    let items: Vec<(u64, &CoreInput)> = (first..).zip(inputs.iter()).collect();
+    Feed::build("book", epoch, &items, None).unwrap()
+}
+
+/// `T-037-18`, amendment 0036, fact 2 (review of #51, C6): the case the epoch rise exists for. A
+/// copy of a send is still in the core's hands when the fence lifts, before any feed under the
+/// raised epoch has reached the core. It is under the epoch the sequencer still holds, so it runs
+/// in full, in queue order; the feeder's next feed, under the raised epoch, rebases and finds the
+/// same rows answered from the record. Each row runs once, in log order, and a second copy after
+/// that feed is `Fenced`.
+#[tokio::test(flavor = "multi_thread")]
+async fn t_037_18_a_late_copy_after_the_fence_lifts_runs_in_log_order_and_nothing_twice() {
+    let journal = MemJournal::new();
+    let inner = InProcessCore::in_memory(genesis(T0), journal).with_clerk(test_clerk());
+    inner.start().unwrap();
+    let gate = Gate::new(inner);
+    gate.fenced.store(true, Ordering::SeqCst);
+    let seq = Sequencer::new(gate.clone(), None);
+    let answers = |r: FeedReply| match r {
+        FeedReply::Answers { answers } => answers,
+        other => panic!("not answered: {other:?}"),
+    };
+    // The first send: refused by the fence, `NotRun` for both, answer lost to the feeder.
+    let first = feed_of(1, 1, &[1, 2]);
+    assert!(
+        answers(seq.feed(&first).await)
+            .iter()
+            .all(|a| *a == ingress::remote::BatchAnswer::NotRun)
+    );
+    // The feeder gave the sequences back and raised its epoch; the fence lifts before its next
+    // feed reaches the core, and the late copy of the first send arrives.
+    gate.fenced.store(false, Ordering::SeqCst);
+    let late = answers(seq.feed(&first).await);
+    assert!(
+        late.iter()
+            .all(|a| matches!(a, ingress::remote::BatchAnswer::Applied { .. }))
+    );
+    assert_eq!(gate.ran(), vec![key(1), key(2)], "in log order");
+    // The next feed, under the raised epoch, resends the same rows with a row logged behind
+    // them: the first two come from the record, the third runs.
+    let next = answers(seq.feed(&feed_of(2, 1, &[1, 2, 3])).await);
+    assert!(
+        next.iter()
+            .all(|a| matches!(a, ingress::remote::BatchAnswer::Applied { .. }))
+    );
+    assert_eq!(
+        gate.ran(),
+        vec![key(1), key(2), key(3)],
+        "each row ran once"
+    );
+    // Another copy of the first send is stale now.
+    assert_eq!(seq.feed(&first).await, FeedReply::Fenced { epoch: 2 });
+    assert_eq!(gate.ran().len(), 3);
+}

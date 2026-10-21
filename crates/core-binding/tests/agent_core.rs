@@ -4,7 +4,8 @@
 //! whose `boundary::Core` is [`AgentCore`] over the native Agent. The same `AgentCore` over VOS
 //! is what `aledgent-core-host serve` runs.
 
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use core_binding::core::{AgentCore, FAILED_ATTEMPTS, Founding, HostLog as _, MemLog};
@@ -1070,4 +1071,154 @@ mod audit {
         assert_eq!(agent_inputs(&core), before + 1);
         assert_eq!(core.stats().fenced_since.load(Ordering::Relaxed), 0);
     }
+}
+
+/// A fence that is a switch on the port's package generation: while it is on, the Agent refuses
+/// every input as fenced and commits nothing (`T-037-15`).
+fn fence_on(core: &AgentCore<Faulty>, on: bool) {
+    core.with_port(|p| p.inner.generation = u64::from(on));
+}
+
+/// Apply `inputs` as the forwarder does: send what is not yet decided, until everything is.
+async fn drive(core: &AgentCore<Faulty>, inputs: &[CoreInput]) {
+    let mut from = 0;
+    for _ in 0..inputs.len() + 1 {
+        let r = core.apply_batch(&inputs[from..]).await;
+        from += r.iter().take_while(|a| a.is_ok()).count();
+        if from == inputs.len() {
+            return;
+        }
+    }
+    panic!("not everything ran");
+}
+
+/// An opened core over a small ring, so that one invocation carries at most two inputs
+/// (`Driver::batch_cap`), and the port that fences on request.
+fn small_core() -> AgentCore<Faulty> {
+    let mut f = founding();
+    f.limits.ring = 2;
+    AgentCore::open(Faulty::new(), f, MemLog::default()).unwrap()
+}
+
+/// `T-037-18`, amendment 0036, N3: an input the core decided is answered `Applied` from the record
+/// even when it comes after the first input the fence refused in the same call. Without the
+/// guard that keeps a decided input's answer, the overlay of the refused tail would turn it into
+/// `NotRun`, a lie about an input the book holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn t037_18_a_decided_input_after_the_first_refusal_is_still_answered() {
+    let core = small_core();
+    let inputs = ticks(1, 3);
+    let decided = core
+        .apply(&inputs[1])
+        .await
+        .expect("decided before the fence");
+    fence_on(&core, true);
+    let before = agent_inputs(&core);
+    // [new, decided, new]: the first and the last are refused, the middle one is the book's.
+    let r = core.apply_batch(&inputs).await;
+    assert_eq!(r[0], Err(CoreError::NotRun));
+    assert_eq!(
+        r[1],
+        Ok(decided),
+        "a decided input is never reported as not run"
+    );
+    assert_eq!(r[2], Err(CoreError::NotRun));
+    assert_eq!(agent_inputs(&core), before, "the refusal committed nothing");
+}
+
+/// `T-037-18`, amendment 0036, N4: the fence's refusal makes the whole rest of the call `NotRun`
+/// even where the rest is past what one invocation carries (here two inputs). If the overflow
+/// answered `Unavailable`, the feeder would see a mix, keep every row in flight and the wedge
+/// would be back on every window longer than one invocation.
+#[tokio::test(flavor = "multi_thread")]
+async fn t037_18_the_not_run_tail_covers_inputs_past_one_invocation() {
+    let core = small_core();
+    fence_on(&core, true);
+    let before = agent_inputs(&core);
+    let r = core.apply_batch(&ticks(1, 5)).await;
+    assert_eq!(r, vec![Err(CoreError::NotRun); 5], "{r:?}");
+    assert_eq!(agent_inputs(&core), before);
+    // Lifted, the same inputs run once and in order.
+    fence_on(&core, false);
+    drive(&core, &ticks(1, 5)).await;
+    assert_eq!(agent_inputs(&core), before + 5, "each ran once");
+}
+
+/// `T-037-18`, amendment 0036, N4: the same for the input the Agent has already failed alone,
+/// which goes first and alone (finding F18): fenced, it is `NotRun` and so is every input behind
+/// it, not `Unavailable`.
+#[tokio::test(flavor = "multi_thread")]
+async fn t037_18_the_not_run_tail_follows_a_head_the_agent_failed_alone() {
+    let core = small_core();
+    let inputs = ticks(1, 4);
+    let s = agent_inputs(&core);
+    // The head fails alone once, for a reason that is not the fence.
+    core.with_port(|p| p.refuse = Some(s + 1));
+    assert_eq!(core.apply(&inputs[0]).await, Err(CoreError::Unavailable));
+    core.with_port(|p| p.refuse = None);
+    assert_eq!(
+        core.stopped(),
+        None,
+        "one failed attempt does not halt the core"
+    );
+    fence_on(&core, true);
+    let r = core.apply_batch(&inputs).await;
+    assert_eq!(r, vec![Err(CoreError::NotRun); 4], "{r:?}");
+    fence_on(&core, false);
+    drive(&core, &inputs).await;
+    assert_eq!(agent_inputs(&core), s + 4, "each ran once");
+}
+
+/// A log whose archive stops reading when told to: a rebuild after a refusal then fails.
+struct FailingArchive {
+    inner: MemLog,
+    broken: Arc<AtomicBool>,
+}
+
+impl core_binding::core::HostLog for FailingArchive {
+    fn entries(&self) -> Result<Vec<RingEntry>, String> {
+        if self.broken.load(Ordering::SeqCst) {
+            return Err("the archive does not read".into());
+        }
+        self.inner.entries()
+    }
+    fn push_entry(&mut self, e: &RingEntry) -> Result<(), String> {
+        self.inner.push_entry(e)
+    }
+    fn replies(&self) -> Result<Vec<(InputKey, ingress::boundary::CoreReply)>, String> {
+        self.inner.replies()
+    }
+    fn push_reply(
+        &mut self,
+        key: &InputKey,
+        reply: &ingress::boundary::CoreReply,
+    ) -> Result<(), String> {
+        self.inner.push_reply(key, reply)
+    }
+}
+
+/// `T-037-18`, amendment 0036, N2: the fence's refusal is a definite "not run" only once the
+/// replica has been rebuilt to what the Agent committed. When the rebuild fails the core stops
+/// and the outcome is not read, so the answer stays `Unavailable`. (The flag was set before the
+/// rebuild, so this answered `NotRun`.)
+#[tokio::test(flavor = "multi_thread")]
+async fn t037_18_a_refusal_whose_rebuild_fails_is_not_certified_not_run() {
+    let broken = Arc::new(AtomicBool::new(false));
+    let log = FailingArchive {
+        inner: MemLog::default(),
+        broken: broken.clone(),
+    };
+    let core = AgentCore::open(NativePort::new(), founding(), log).unwrap();
+    core.with_port(|p| p.generation = 1);
+    broken.store(true, Ordering::SeqCst);
+    let r = core.apply(&ticks(1, 1)[0]).await;
+    assert_eq!(
+        r,
+        Err(CoreError::Unavailable),
+        "the rebuild failed: nothing is certified"
+    );
+    assert!(
+        core.stopped().is_some(),
+        "the core stopped on the unreadable archive"
+    );
 }

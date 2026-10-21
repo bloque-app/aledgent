@@ -1413,10 +1413,7 @@ impl<P: AgentPort> Inner<P> {
             if ok && all.len() > 1 {
                 out.extend(self.apply_chunk(&all[1..]));
             }
-            let rest = match out.last() {
-                Some(Err(CoreError::NotRun)) => CoreError::NotRun,
-                _ => CoreError::Unavailable,
-            };
+            let rest = not_reached(&out);
             out.resize_with(all.len(), || Err(rest));
             return out;
         }
@@ -1457,10 +1454,7 @@ impl<P: AgentPort> Inner<P> {
         }
         // What was not reached answers as the last input reached did (amendment 0036, N4): after
         // the fence's refusal, `NotRun`; otherwise `Unavailable`.
-        let rest = match out.last() {
-            Some(Err(CoreError::NotRun)) => CoreError::NotRun,
-            _ => CoreError::Unavailable,
-        };
+        let rest = not_reached(&out);
         out.resize_with(all.len(), || Err(rest));
         out
     }
@@ -1617,7 +1611,6 @@ impl<P: AgentPort> Inner<P> {
                     DriveError::Refused(AgentRefusal::Fenced(f)) => Some(f.clone()),
                     _ => None,
                 };
-                fenced_out = fence.is_some();
                 // The Agent ran it and committed nothing, and would again (finding F18).
                 let definitive = matches!(
                     e,
@@ -1636,6 +1629,9 @@ impl<P: AgentPort> Inner<P> {
                     // what the Agent committed beyond the log.
                     DriveError::Refused(_) | DriveError::Port(_) => self.rebuild().ok(),
                 };
+                // Only a refusal read after the replica was rebuilt is a definite "not run": a
+                // rebuild that failed leaves the outcome unknown (amendment 0036, N2).
+                fenced_out = fence.is_some() && after.is_some();
                 let n = match after {
                     Some(after) => runs
                         .iter()
@@ -1719,6 +1715,16 @@ impl<P: AgentPort> Inner<P> {
         }
         self.stats.log_us.push(micros(logged));
         (out, first)
+    }
+}
+
+/// What the inputs a call did not reach answer (amendment 0036, N4): `NotRun` once the fence has
+/// refused one input of the call, `Unavailable` otherwise.
+fn not_reached(answered: &[Result<CoreReply, CoreError>]) -> CoreError {
+    if answered.contains(&Err(CoreError::NotRun)) {
+        CoreError::NotRun
+    } else {
+        CoreError::Unavailable
     }
 }
 
