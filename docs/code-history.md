@@ -131,7 +131,17 @@ node has no source of code and refuses every `Upgrade`:
 Paths are absolute. The cache must not be a source, inside one, or inside the state directory. One regular
 file per digest, named by its 64 lowercase hex digits; a symbolic link, a directory or a special file is never
 read. `aledgent_code_source_mismatch_total` has one label, `source`: `cache`, or the kind and position in the
-list (`fs:0`, `fs:1`).
+list (`fs:0`, `fs:1`). It counts wrong answers: bytes that are not the hash's, and a link, a directory or a
+special file where bytes belong. It does not count a source that failed to answer (an I/O error), nor "not
+held here". A manifest longer than 64 KiB cannot be read whole, so it counts as a wrong answer too. Because the
+fetcher never returns bad bytes, a source that lied reads at the door as "not retrievable"; the counter and the
+log carry the difference.
+
+The cache directory belongs to the node's operator: it is created readable by its owner alone (`0700`, files
+`0600`), and a directory found at a digest's place is moved aside, not deleted. A read that fails for a reason
+that does not prove the entry bad (permissions, descriptors, a disk error) leaves the entry in place and asks
+the sources; only a wrong length or hash, or a link or special file, is cleared. A read of a source has no time
+limit yet, and the cache no size bound: both are `T-037-20`'s.
 
 ### Built-in sources
 

@@ -44,8 +44,11 @@ pub const CACHE_NAME: &str = "cache";
 /// Why a source could not answer. Not a mismatch: no bytes came back.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SourceError {
-    /// The source failed (an I/O error, a path that is not a regular file).
+    /// The source failed (an I/O error). Nothing is known about the bytes it holds.
     Failed(String),
+    /// What stands where bytes belong is a link, a directory or a special file. That is not an I/O
+    /// error: it is counted as a wrong answer, and in the cache it is cleared away.
+    NotRegular(String),
     /// The artefact is longer than [`ARTEFACT_CAP`]: it is not read.
     TooLarge(u64),
 }
@@ -53,7 +56,7 @@ pub enum SourceError {
 impl std::fmt::Display for SourceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Failed(why) => f.write_str(why),
+            Self::Failed(why) | Self::NotRegular(why) => f.write_str(why),
             Self::TooLarge(len) => write!(f, "{len} bytes is over the {ARTEFACT_CAP} byte cap"),
         }
     }
@@ -102,13 +105,17 @@ fn read_regular(path: &Path, limit: u64) -> Result<Option<Vec<u8>>, SourceError>
     {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        // `O_NOFOLLOW` on a symbolic link fails the open with `ELOOP`: a link, not an I/O error.
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(SourceError::NotRegular("it is a symbolic link".into()));
+        }
         Err(e) => return Err(SourceError::Failed(format!("not readable: {e}"))),
     };
     let meta = file
         .metadata()
         .map_err(|e| SourceError::Failed(format!("not readable: {e}")))?;
     if !meta.is_file() {
-        return Err(SourceError::Failed(
+        return Err(SourceError::NotRegular(
             "it is not a regular file (a link, a directory or a special file is never read)".into(),
         ));
     }
@@ -189,6 +196,16 @@ pub struct Fetcher {
     temporary: AtomicU64,
 }
 
+/// Make the cache directory (and any parent it lacks) readable by its owner alone. A directory
+/// that exists is left as the operator made it: it belongs to the operator.
+fn make_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+}
+
 /// Print a line about the fetcher to standard error, as the host's other lines.
 fn note(what: &str) {
     eprintln!("aledgent-core-host: code source: {what}");
@@ -212,7 +229,7 @@ impl Fetcher {
     ///
     /// The cache directory cannot be made or listed.
     pub fn new(cache: PathBuf, sources: Vec<Box<dyn CodeSource>>) -> Result<Self, String> {
-        fs::create_dir_all(&cache).map_err(|e| format!("{}: {e}", cache.display()))?;
+        make_dir(&cache).map_err(|e| format!("{}: {e}", cache.display()))?;
         for entry in fs::read_dir(&cache).map_err(|e| format!("{}: {e}", cache.display()))? {
             let entry = entry.map_err(|e| format!("{}: {e}", cache.display()))?;
             if entry.file_name().to_string_lossy().starts_with(TEMPORARY) {
@@ -250,8 +267,7 @@ impl Fetcher {
             }
         };
         absolute("cache", &config.cache)?;
-        fs::create_dir_all(&config.cache)
-            .map_err(|e| format!("cache {}: {e}", config.cache.display()))?;
+        make_dir(&config.cache).map_err(|e| format!("cache {}: {e}", config.cache.display()))?;
         let cache = fs::canonicalize(&config.cache)
             .map_err(|e| format!("cache {}: {e}", config.cache.display()))?;
         let state = fs::canonicalize(state).map_err(|e| format!("{}: {e}", state.display()))?;
@@ -299,7 +315,11 @@ impl Fetcher {
             self.temporary.fetch_add(1, Ordering::Relaxed)
         ));
         let write = || -> std::io::Result<()> {
-            let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+            let mut f = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)?;
             f.write_all(bytes)?;
             f.sync_all()?;
             fs::rename(&tmp, file_of(&self.cache, digest))?;
@@ -309,6 +329,28 @@ impl Fetcher {
             let _ = fs::remove_file(&tmp);
             note(&format!(
                 "WARNING: the cache did not keep {}: {e}",
+                short(digest)
+            ));
+        }
+    }
+
+    /// Clear what is not an entry from `path`: a file or a link is removed; a directory is moved
+    /// aside (never deleted), so that it cannot keep this digest out of the cache for good.
+    fn clear(&self, path: &Path, digest: &[u8; 32]) {
+        let is_dir = fs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
+        let done = if is_dir {
+            let aside = self.cache.join(format!(
+                "{ASIDE}{}-{}",
+                hex::encode(&digest[..6]),
+                self.temporary.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::rename(path, aside)
+        } else {
+            fs::remove_file(path)
+        };
+        if let Err(e) = done {
+            note(&format!(
+                "WARNING: the cache could not clear what stands at {}: {e}",
                 short(digest)
             ));
         }
@@ -331,14 +373,24 @@ impl Fetcher {
                 let _ = fs::remove_file(&path);
                 None
             }
-            Err(e) => {
+            Err(SourceError::NotRegular(why)) => {
+                // Proven not to be an entry: a link, a directory or a special file stands where
+                // bytes belong. Count it, and clear it so that a good entry can take its place.
+                self.count(CACHE_NAME);
                 note(&format!(
-                    "the cache entry for {} is refused: {e}",
+                    "the cache entry for {} is refused: {why}",
                     short(digest)
                 ));
-                // A link or a special file is no entry: remove it so that a good one can take
-                // its place (a directory stays; the cache then keeps nothing for this digest).
-                let _ = fs::remove_file(&path);
+                self.clear(&path, digest);
+                None
+            }
+            Err(e) => {
+                // Not proven bad: the file may be fine and the failure the host's (descriptors,
+                // permissions, a disk error). Leave it, and ask the sources.
+                note(&format!(
+                    "the cache entry for {} could not be read, and is left as it is: {e}",
+                    short(digest)
+                ));
                 None
             }
         }
@@ -347,6 +399,8 @@ impl Fetcher {
 
 /// The start of a temporary file's name in the cache: never a digest, so never an entry.
 const TEMPORARY: &str = ".tmp-";
+/// The start of the name a directory found at a digest's place is moved to: never a digest.
+const ASIDE: &str = ".moved-";
 
 impl CodeFetch for Fetcher {
     fn name(&self) -> &str {
@@ -367,6 +421,10 @@ impl CodeFetch for Fetcher {
                 Ok(Some(bytes)) => bytes,
                 Ok(None) => continue,
                 Err(e) => {
+                    // A link or a special file where bytes belong is a wrong answer: counted.
+                    if matches!(e, SourceError::NotRegular(_)) {
+                        self.count(source.name());
+                    }
                     note(&format!(
                         "{} failed for {}: {e}",
                         source.name(),
@@ -404,12 +462,19 @@ impl CodeFetch for Fetcher {
 ///
 /// The file does not read or parse, or [`Fetcher::open`] refuses what it says.
 pub fn from_args(args: &[String], state: &Path) -> Result<Option<std::sync::Arc<Fetcher>>, String> {
-    let Some(path) = args
-        .windows(2)
-        .find(|w| w[0] == "--code-config")
-        .map(|w| w[1].clone())
-    else {
-        return Ok(None);
+    // The flag is given once and with a value. A flag with none (an empty variable in a unit file)
+    // must not read as "no code source": the node would start, look healthy, and refuse every
+    // `Upgrade` without saying why.
+    let at: Vec<usize> = (0..args.len())
+        .filter(|i| args[*i] == "--code-config")
+        .collect();
+    let path = match at[..] {
+        [] => return Ok(None),
+        [i] => match args.get(i + 1) {
+            Some(v) if !v.is_empty() && !v.starts_with("--") => v.clone(),
+            _ => return Err("--code-config: a file is required after it".into()),
+        },
+        _ => return Err("--code-config: given more than once".into()),
     };
     let text = fs::read_to_string(&path).map_err(|e| format!("--code-config {path}: {e}"))?;
     let config: CodeConfig =
@@ -607,6 +672,162 @@ mod tests {
     }
 
     #[test]
+    fn t037_06_a_code_config_flag_without_a_file_stops_the_start() {
+        let state = Dir::new("state");
+        let flag = || "--code-config".to_owned();
+        // The flag is last: an empty variable in a unit file. It must not read as "no source".
+        let r = from_args(&["serve".to_owned(), flag()], state.path());
+        assert!(r.err().unwrap().contains("a file is required"));
+        // Empty value, or another flag where the value belongs.
+        assert!(from_args(&[flag(), String::new()], state.path()).is_err());
+        assert!(
+            from_args(
+                &[flag(), "--state".to_owned(), "x".to_owned()],
+                state.path()
+            )
+            .is_err()
+        );
+        // Twice.
+        let twice = [flag(), "a.json".to_owned(), flag(), "b.json".to_owned()];
+        assert!(
+            from_args(&twice, state.path())
+                .err()
+                .unwrap()
+                .contains("more than once")
+        );
+        // Not given at all: no source, as before.
+        assert!(
+            from_args(&["serve".to_owned()], state.path())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn t037_06_an_unreadable_cache_entry_is_left_where_it_is() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (cache, src) = (Dir::new("cache"), Dir::new("src"));
+        let d = src.put_bytes(b"the package");
+        let f = fetcher(&cache, &[]);
+        let entry = cache.path().join(hex::encode(d));
+        fs::write(&entry, b"the package").unwrap();
+        fs::set_permissions(&entry, fs::Permissions::from_mode(0o000)).unwrap();
+        if File::open(&entry).is_ok() {
+            return; // running as a user the mode does not bind: nothing to show
+        }
+        // No source holds it: the read fails, nothing is returned, and the entry is not deleted.
+        assert_eq!(f.fetch(&d, Some(11)), None);
+        assert!(fs::symlink_metadata(&entry).is_ok(), "the entry stays");
+        assert_eq!(
+            count(&f, "cache"),
+            0,
+            "an I/O failure is not a wrong answer"
+        );
+        // Readable again, it is the same good entry.
+        fs::set_permissions(&entry, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(f.fetch(&d, Some(11)), Some(b"the package".to_vec()));
+    }
+
+    #[test]
+    fn t037_06_a_link_or_a_directory_in_the_cache_is_cleared_and_counted() {
+        use std::os::unix::fs::symlink;
+        let (cache, src, elsewhere) = (Dir::new("cache"), Dir::new("src"), Dir::new("elsewhere"));
+        let (a, b) = (
+            src.put_bytes(b"linked entry"),
+            src.put_bytes(b"planted entry"),
+        );
+        let target = elsewhere.put_bytes(b"linked entry");
+        symlink(
+            elsewhere.path().join(hex::encode(target)),
+            cache.path().join(hex::encode(a)),
+        )
+        .unwrap();
+        fs::create_dir(cache.path().join(hex::encode(b))).unwrap();
+        let f = fetcher(&cache, &[&src]);
+        // Both are replaced by the checked bytes from the source, and each was counted.
+        assert_eq!(f.fetch(&a, Some(12)), Some(b"linked entry".to_vec()));
+        assert_eq!(f.fetch(&b, Some(13)), Some(b"planted entry".to_vec()));
+        assert_eq!(count(&f, "cache"), 2);
+        for (d, bytes) in [(a, &b"linked entry"[..]), (b, b"planted entry")] {
+            let meta = fs::symlink_metadata(cache.path().join(hex::encode(d))).unwrap();
+            assert!(meta.is_file(), "a regular file now");
+            assert_eq!(fs::read(cache.path().join(hex::encode(d))).unwrap(), bytes);
+        }
+        // The planted directory was moved aside, not deleted.
+        assert!(
+            cache.files().iter().any(|n| n.starts_with(ASIDE)),
+            "{:?}",
+            cache.files()
+        );
+    }
+
+    #[test]
+    fn t037_06_a_link_or_a_special_file_in_a_source_is_counted() {
+        use std::os::unix::fs::symlink;
+        let (cache, src, elsewhere) = (Dir::new("cache"), Dir::new("src"), Dir::new("elsewhere"));
+        let d = artefact_digest(b"linked");
+        let target = elsewhere.put_bytes(b"linked");
+        symlink(
+            elsewhere.path().join(hex::encode(target)),
+            src.path().join(hex::encode(d)),
+        )
+        .unwrap();
+        let f = fetcher(&cache, &[&src]);
+        assert_eq!(f.fetch(&d, Some(6)), None);
+        assert_eq!(
+            count(&f, "fs:0"),
+            1,
+            "a link where bytes belong is a wrong answer"
+        );
+        // An I/O failure is not.
+        let failing = Scripted {
+            name: "failing".into(),
+            answer: Err(SourceError::Failed("down".into())),
+            asked: AtomicUsize::new(0),
+        };
+        let g = Fetcher::new(cache.path().to_path_buf(), vec![Box::new(failing)]).unwrap();
+        assert_eq!(g.fetch(&d, Some(6)), None);
+        assert_eq!(count(&g, "failing"), 0);
+    }
+
+    #[test]
+    fn t037_06_the_cache_is_private_to_its_owner() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (state, src, root) = (Dir::new("state"), Dir::new("src"), Dir::new("root"));
+        let d = src.put_bytes(b"the package");
+        let config = CodeConfig {
+            cache: root.path().join("a/b/cache"),
+            sources: vec![SourceConfig::Fs {
+                path: src.path().to_path_buf(),
+            }],
+        };
+        let f = Fetcher::open(&config, state.path()).unwrap();
+        f.fetch(&d, Some(11)).unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let cache = fs::canonicalize(root.path().join("a/b/cache")).unwrap();
+        assert_eq!(mode(&cache), 0o700);
+        assert_eq!(mode(cache.parent().unwrap()), 0o700);
+        assert_eq!(mode(&cache.join(hex::encode(d))), 0o600);
+    }
+
+    #[test]
+    fn t037_06_a_cache_that_cannot_be_written_still_returns_the_checked_bytes() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (cache, src) = (Dir::new("cache"), Dir::new("src"));
+        let d = src.put_bytes(b"the package");
+        let f = fetcher(&cache, &[&src]);
+        fs::set_permissions(cache.path(), fs::Permissions::from_mode(0o500)).unwrap();
+        let wrote = File::create(cache.path().join("probe")).is_ok();
+        let got = f.fetch(&d, Some(11));
+        fs::set_permissions(cache.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        if wrote {
+            return; // running as a user the mode does not bind
+        }
+        assert_eq!(got, Some(b"the package".to_vec()));
+        assert!(cache.files().is_empty());
+    }
+
+    #[test]
     fn t037_06_a_corrupt_cache_entry_is_discarded_and_fetched_again() {
         let (cache, src) = (Dir::new("cache"), Dir::new("src"));
         let d = src.put_bytes(b"the package");
@@ -627,7 +848,6 @@ mod tests {
         assert_eq!(p, Path::new("/srv/code").join("ab".repeat(32)));
         // A source directory holding files named like paths gives nothing for them.
         let (cache, src) = (Dir::new("cache"), Dir::new("src"));
-        fs::create_dir_all(src.path().join("..").join("..")).unwrap();
         src.put("core.vos", b"package");
         src.put("agent_runtime.pvm", b"runtime");
         let f = fetcher(&cache, &[&src]);
@@ -830,6 +1050,12 @@ mod tests {
         write(format!(
             r#"{{ "cache": "{}", "sources": [], "extra": 1 }}"#,
             cache.path().display()
+        ));
+        assert!(from_args(&args, state.path()).is_err());
+        write(format!(
+            r#"{{ "cache": "{}", "sources": [ {{ "kind": "fs", "path": "{}", "extra": 1 }} ] }}"#,
+            cache.path().display(),
+            src.path().display()
         ));
         assert!(from_args(&args, state.path()).is_err());
         // Without the flag there is no source: every `Upgrade` is refused, as before.
