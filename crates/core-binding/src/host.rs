@@ -380,6 +380,22 @@ pub trait AgentPort {
         let _ = (checked, generation);
         Err(crate::staging::StageRefusal::NoSource)
     }
+
+    /// Whether [`AgentPort::switch_to`] could install `checked` as this port runs now
+    /// (`T-037-22`, owner ruling w16, proposal 4). Asked by the core **before** the version is
+    /// staged, and so before the `Upgrade` that names it is logged: a version the switch would
+    /// refuse at input *n* (it names another runtime than the one running, or is signed by another
+    /// package key, or does not claim the program running) is refused at the door, instead of
+    /// being recorded and fencing the writer until a way out. Reads, and changes nothing. A port
+    /// that installs whatever it is given (the native port) answers yes.
+    ///
+    /// # Errors
+    ///
+    /// Why the switch could not install `checked`, in a line fit for the operator's log.
+    fn can_install(&self, checked: &crate::staging::Checked) -> Result<(), String> {
+        let _ = checked;
+        Ok(())
+    }
 }
 
 /// Why the driver stopped.
@@ -2468,6 +2484,10 @@ impl<T: AgentPort + ?Sized> AgentPort for Box<T> {
         generation: u64,
     ) -> Result<(), crate::staging::StageRefusal> {
         (**self).restage_code(checked, generation)
+    }
+
+    fn can_install(&self, checked: &crate::staging::Checked) -> Result<(), String> {
+        (**self).can_install(checked)
     }
 }
 

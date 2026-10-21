@@ -411,6 +411,14 @@ impl AgentPort for VosPort {
         }
     }
 
+    /// Whether the switch could install `checked` (`T-037-22`): the checks of
+    /// [`crate::switch::installable`], over the code this port runs. A port that tracks no code
+    /// answers yes; [`AgentPort::stage_code`] refuses it anyway.
+    fn can_install(&self, checked: &core_binding::staging::Checked) -> Result<(), String> {
+        self.code_state()
+            .map_or(Ok(()), |state| state.check_install(checked))
+    }
+
     fn invoke(&mut self, envelope: Vec<u8>, blobs: Vec<Vec<u8>>) -> Result<Vec<u8>, PortError> {
         #[cfg(feature = "composite")]
         if let Some(mode) = composite_mode()

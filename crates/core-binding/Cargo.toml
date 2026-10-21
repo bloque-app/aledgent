@@ -86,6 +86,10 @@ name = "upgrade_input"
 required-features = ["ingress"]
 
 [[test]]
+name = "install_check"
+required-features = ["ingress"]
+
+[[test]]
 name = "memory"
 required-features = ["ingress"]
 

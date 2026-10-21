@@ -343,6 +343,92 @@ impl CodeInstaller for crate::port::VosPort {
     }
 }
 
+/// What the door needs to know of a code version to say whether the switch could install it
+/// (`T-037-22`): the digest of the runtime it names and the key its package is signed with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Candidate {
+    /// The digest of the runtime the version carries; `None` if it carries none.
+    pub runtime: Option<[u8; 32]>,
+    /// The producer of its package (the package key's identity).
+    pub producer: vos::agent_sdk::ProducerId,
+}
+
+/// Whether `install` (above) would accept `candidate` while the host runs `running` from a package
+/// signed by `running_producer` (`T-037-22`, owner ruling w16, proposal 4). The same conditions the
+/// switch checks at its input, asked at the door, from what the host already knows, so a version
+/// the switch would refuse never gets recorded:
+///
+/// 1. the runtime is the one this process runs (`saga` installs the package only: a runtime
+///    change is a restart);
+/// 2. the package is signed by the producer of the package running (the runtime refuses an upgrade
+///    that changes the producer).
+///
+/// **Hook for `T-037-19` (PR #49):** the claim. A package that changes the program of a stateful
+/// actor must carry the producer's signed claim over the program running, which the patched VOS
+/// (`state_compatible_with`) defines and the pin of this tree does not have. The line that asks
+/// for it goes here, below the two checks; until then a program change is refused by the runtime
+/// itself when the switch tries it.
+///
+/// # Errors
+///
+/// Why the switch could not install `candidate`, for the operator's log.
+pub fn installable(
+    running: Artefacts,
+    running_producer: vos::agent_sdk::ProducerId,
+    candidate: Candidate,
+) -> Result<(), String> {
+    match candidate.runtime {
+        None => return Err("the manifest names no runtime".into()),
+        Some(r) if r != running.runtime => {
+            return Err(
+                "it names another runtime than the one this host runs (a runtime change is a \
+                 restart of the host, not a switch)"
+                    .into(),
+            );
+        }
+        Some(_) => {}
+    }
+    if candidate.producer != running_producer {
+        return Err(
+            "its package is signed by another key than the package running (the runtime refuses \
+             an upgrade that changes the producer)"
+                .into(),
+        );
+    }
+    // The claim over the running program: `T-037-19`.
+    Ok(())
+}
+
+impl CodeState {
+    /// Whether the switch could install `checked` as this host runs now ([`installable`]): reads
+    /// the producer of the package running from the bytes the host holds for it (`T-037-22`).
+    ///
+    /// # Errors
+    ///
+    /// Why not, for the operator's log.
+    pub fn check_install(&self, checked: &core_binding::staging::Checked) -> Result<(), String> {
+        let running = self
+            .staged
+            .versions
+            .values()
+            .find(|v| v.artefacts().package == self.running.package)
+            .ok_or("the package this host runs is not held, so its key cannot be compared")?;
+        let producer = |bytes: &[u8]| {
+            crate::package::admit_actor(bytes)
+                .map(|p| p.producer())
+                .map_err(|e| format!("the package is not admitted: {e}"))
+        };
+        installable(
+            self.running,
+            producer(&running.package)?,
+            Candidate {
+                runtime: checked.runtime.as_deref().map(artefact_digest),
+                producer: producer(&checked.package)?,
+            },
+        )
+    }
+}
+
 /// How a failed `UpgradeActor` is told to the switch: the runtime's own refusal (it decided, and
 /// would decide again: `UnsupportedLane` on a stateful actor) is a refusal the park counts toward
 /// its stop; the runtime program failing is the platform's, which a retry may settle.
@@ -419,6 +505,54 @@ mod tests {
         assert!(err.unwrap_err().contains("names no"));
         // Nothing was staged.
         assert!(s.artefacts(&[0; 32]).is_none());
+    }
+
+    /// `T-037-22`: the door asks what the switch would ask. The same runtime and the same package
+    /// key pass; another runtime, no runtime, or another key do not, each with its own reason.
+    #[test]
+    fn t037_22_the_door_refuses_what_the_switch_could_not_install() {
+        use vos::agent_sdk::ProducerId;
+        let running = Artefacts {
+            package: [1; 32],
+            runtime: [9; 32],
+        };
+        let key = ProducerId::of_public_key(&[0x71; 32]);
+        let other_key = ProducerId::of_public_key(&[0x72; 32]);
+        let same = Candidate {
+            runtime: Some([9; 32]),
+            producer: key,
+        };
+        assert_eq!(installable(running, key, same), Ok(()));
+        let why = installable(
+            running,
+            key,
+            Candidate {
+                runtime: Some([8; 32]),
+                ..same
+            },
+        )
+        .unwrap_err();
+        assert!(why.contains("another runtime"), "{why}");
+        let why = installable(
+            running,
+            key,
+            Candidate {
+                runtime: None,
+                ..same
+            },
+        )
+        .unwrap_err();
+        assert!(why.contains("no runtime"), "{why}");
+        let why = installable(
+            running,
+            key,
+            Candidate {
+                producer: other_key,
+                ..same
+            },
+        )
+        .unwrap_err();
+        assert!(why.contains("another key"), "{why}");
     }
 
     #[test]
