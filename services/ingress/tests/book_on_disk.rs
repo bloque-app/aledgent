@@ -59,9 +59,22 @@ async fn req_rt_3_an_on_disk_core_rebuilds_from_its_journal() {
     let inputs = core.inputs();
 
     core.stop();
+    // The replica's ticker keeps logging inputs (every 50 ms in `fast_config`), so the count read
+    // before the stop is only a lower bound. What was journaled when the core stopped is what the
+    // restart must replay; a tick logged after the restart may add to it.
+    let journaled = d.journal.len() as u64;
+    assert!(
+        Some(journaled) >= inputs,
+        "{journaled} journaled, {inputs:?} applied"
+    );
     core.start()
         .unwrap_or_else(|e| panic!("the core restarts: {e}"));
-    assert_eq!(core.inputs(), inputs, "the journal replayed");
+    let replayed = core.inputs().unwrap_or_default();
+    let now_journaled = d.journal.len() as u64;
+    assert!(
+        (journaled..=now_journaled).contains(&replayed),
+        "the journal replayed: {replayed} applied, {journaled} journaled at the stop, {now_journaled} now"
+    );
     let (_, after) = d
         .call("GET", &balances(&bob_account), Some(&bob.token), &[], None)
         .await;
