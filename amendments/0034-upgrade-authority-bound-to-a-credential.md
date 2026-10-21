@@ -193,4 +193,22 @@ to the library before each input, as it gives the scheduled change of mode, and 
 move in the one function both generations run. A replay of the archive follows the writer's code input by
 input, so it decides every move as the writer did.
 
+## Clarification after the ruling, third (2026-10-21, ruling w9 (a), not part of the approved text)
 
+This section was added after the owner approved R1 and R2, and after the two clarifications above. It changes
+neither of them. It records the owner's ruling on how far ahead a way out may move a scheduled upgrade
+(`REQ-RT-20`, amendment 0035). It is for the pass that applies this amendment to `SPEC.md`, and for the owner
+to confirm there.
+
+- **The same upper limit as a change of mode.** A move of a scheduled upgrade takes it to an input at most
+  `MAX_LEAD` (2¹⁷) inputs after the way out's own input, counted exactly as a change of mode is: the target
+  minus the deciding input is at most `MAX_LEAD`. A move exactly `MAX_LEAD` ahead is valid; one input further
+  is refused as `ERR-InvalidTransition`, recorded like every refused way out (amendment 0035, ruling 1).
+- **Why.** The first clarification above says why a change must apply within the book's life: an input the
+  book never reaches would leave the writer's code unable to change again. A move to a far input does the same
+  to an upgrade, and a lone member can take a way out alone (ruling w6), so the move has the limit a proposal
+  has.
+- **Cancel is unaffected.** A cancellation has no target and is taken as before. With nothing scheduled, a move
+  is still checked against its own input and this limit, and changes nothing.
+- **Together with ruling w6**, a move must be strictly later than the scheduled input and at most `MAX_LEAD`
+  after its own input.

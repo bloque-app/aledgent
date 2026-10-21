@@ -192,6 +192,70 @@ fn t037_05_a_move_goes_strictly_later_than_the_scheduled_input() {
     );
 }
 
+/// `T-037-05`, owner ruling w9: a move goes at most `MAX_LEAD` inputs after its own input, the
+/// bound a change of mode is held to (`check_from`). Exactly `MAX_LEAD` ahead is taken; one past it
+/// is `ERR-InvalidTransition`, recorded, taking nothing, with or without an upgrade scheduled. A
+/// cancel has no target and is unaffected. An unauthorised move stays `ERR-NotAuthorised`.
+#[test]
+fn t037_05_a_move_goes_at_most_the_lead_ahead() {
+    use crate::code::authority::MAX_LEAD;
+    let mut fx = Fx::new();
+    let op = fx.operator();
+    let p = fx.person();
+    let own = 7;
+    for scheduled in [None, Some(([0xB1; 32], 10))] {
+        for (from, taken) in [
+            (own + MAX_LEAD, true),
+            (own + MAX_LEAD + 1, false),
+            (u64::MAX, false),
+        ] {
+            fx.ledger.set_scheduled_upgrade(scheduled);
+            fx.ledger.set_input(own);
+            let ctx = fx.ctx(op);
+            let r = fx.ledger.reschedule_upgrade(&ctx, from, b"far ahead");
+            if taken {
+                r.unwrap();
+                assert_eq!(
+                    fx.ledger.take_way_out(),
+                    Some(WayOut::Reschedule { from }),
+                    "{scheduled:?} {from}"
+                );
+                assert_eq!(last_audit(&fx).outcome, AuditOutcome::Accepted);
+            } else {
+                assert_eq!(r.unwrap_err(), Refusal::InvalidTransition, "{from}");
+                assert_eq!(
+                    last_audit(&fx).outcome,
+                    AuditOutcome::Refused(Refusal::InvalidTransition)
+                );
+                assert_eq!(fx.ledger.take_way_out(), None);
+            }
+        }
+    }
+    // The lead counts from the way out's own input, not from the scheduled one.
+    fx.ledger.set_scheduled_upgrade(Some(([0xB1; 32], 10)));
+    fx.ledger.set_input(own + 1);
+    let ctx = fx.ctx(op);
+    assert_eq!(
+        fx.ledger
+            .reschedule_upgrade(&ctx, own + 1 + MAX_LEAD + 1, b"one past")
+            .unwrap_err(),
+        Refusal::InvalidTransition
+    );
+    // A cancel is unaffected; an unauthorised move is refused for authority first.
+    fx.ledger.set_input(own + 2);
+    let ctx = fx.ctx(op);
+    fx.ledger.cancel_upgrade(&ctx, b"abandon").unwrap();
+    assert_eq!(fx.ledger.take_way_out(), Some(WayOut::Cancel));
+    fx.ledger.set_input(own + 3);
+    let ctx = fx.ctx(p);
+    assert_eq!(
+        fx.ledger
+            .reschedule_upgrade(&ctx, u64::MAX, b"not mine")
+            .unwrap_err(),
+        Refusal::NotAuthorised
+    );
+}
+
 /// Owner ruling on #44: a way out is its input's first call. One decided after another call of the
 /// same input is refused `ERR-MalformedCommand`, recorded, and takes nothing; the next input starts
 /// again ([`Ledger::set_input`]).

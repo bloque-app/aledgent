@@ -832,6 +832,11 @@ fn t037_05_a_move_to_the_scheduled_input_or_before_is_refused_alike_by_either_ge
         }
         check_way_out_refused(by, Some(1), false, None);
         check_way_out_refused(by, None, false, None);
+        // Owner ruling w9: at most `MAX_LEAD` inputs after the way out's own, the same by both
+        // generations; one past it is refused and recorded.
+        let lead = ledger_core::code::authority::MAX_LEAD as i64;
+        check_way_out_refused(by, Some(lead), false, None);
+        check_way_out_refused(by, Some(lead + 1), false, Some(Refusal::InvalidTransition));
     }
 }
 
@@ -847,6 +852,7 @@ fn t037_05_a_move_to_the_scheduled_input_or_before_is_refused_alike_by_either_ge
 #[test]
 fn t037_05_a_lone_member_may_not_pull_a_scheduled_upgrade_earlier() {
     use ledger_core::Refusal;
+    use ledger_core::code::authority::MAX_LEAD;
     const AHEAD: u64 = 5;
     for by in [By::Proposer, By::Approver] {
         for (to, refusal) in [
@@ -855,6 +861,8 @@ fn t037_05_a_lone_member_may_not_pull_a_scheduled_upgrade_earlier() {
             (Some(AHEAD as i64), Some(Refusal::InvalidTransition)),
             (Some(AHEAD as i64 + 1), None),
             (Some(500), None),
+            (Some(MAX_LEAD as i64), None),
+            (Some(MAX_LEAD as i64 + 1), Some(Refusal::InvalidTransition)),
             (None, None),
         ] {
             let (mut fx, c, n, who) = way_out_book(0, by, to, AHEAD, false);
