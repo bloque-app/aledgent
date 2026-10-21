@@ -307,7 +307,8 @@ impl CodeInstaller for crate::port::VosPort {
 
 /// How a failed `UpgradeActor` is told to the switch: the runtime's own refusal (it decided, and
 /// would decide again: `UnsupportedLane` on a stateful actor) is a refusal the park counts toward
-/// its stop; the runtime program failing is the platform's, which a retry may settle.
+/// its stop (so does the revert of a claimed switch after state was written under the new program:
+/// the switch took effect and stays, `T-037-19`); the runtime program failing is the platform's, which a retry may settle.
 fn install_error(e: crate::driver::DriverError) -> InstallError {
     use crate::driver::DriverError;
     match e {
@@ -336,7 +337,7 @@ mod tests {
             writer: WriterKind::Core,
             platform: Platform {
                 name: "vos-saga".into(),
-                revision: "10e41fc1".into(),
+                revision: "e2d59d17".into(),
                 identities: Vec::new(),
             },
             generation: 0,

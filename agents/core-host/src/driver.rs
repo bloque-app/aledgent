@@ -59,14 +59,47 @@ pub const AGENT_EXECUTION_LIMITS: ExecutionLimits = ExecutionLimits {
     max_lane_state_bytes: 1024 * 1024,
 };
 
+/// Which way an in-place program change goes (`T-037-19`): what the request carries besides the
+/// package, chosen from the packages alone, so that a restarted host chooses as the one that
+/// switched did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    /// The same program repackaged: no claim, no revert.
+    Repackage,
+    /// Forward: the package's producer signed that it reads the state of the installed program
+    /// (`state_compatible_with`), and the request carries that program as `state_compatible_from`.
+    Claim(ProgramId),
+    /// Back: the package is another program that does not claim the installed one, which is what
+    /// the package of the generation a claimed switch replaced looks like (it was signed before
+    /// the installed program existed). The request carries the installed program as
+    /// `revert_from`, and the runtime accepts it only if that is the program it replaced with
+    /// this very deployment and nothing has written the actor's lanes since. After a write it
+    /// answers `UnsupportedLane`: the switch took effect, and it stays.
+    Revert(ProgramId),
+}
+
+impl Direction {
+    /// The direction of installing `package` over the program installed now.
+    #[must_use]
+    pub fn of(installed: ProgramId, package: &AdmittedActorPackage) -> Self {
+        if let Some(from) = package.state_compatible_from(installed) {
+            Self::Claim(from)
+        } else if package.program() != installed {
+            Self::Revert(installed)
+        } else {
+            Self::Repackage
+        }
+    }
+}
+
 /// The runtime's request to change the installed actor `installed` to the admitted `package`
 /// (`T-037-14`, `T-037-19`).
 ///
 /// The compare-and-swap names the deployment installed now, and the new package keeps the
-/// constructor ABI. `state_compatible_from` is the one program of the package's signed claim
-/// (`state_compatible_with`) that is the installed program, or none: a package whose producer does
-/// not claim the program it replaces carries no claim, and the runtime refuses a program change of
-/// a stateful actor without one.
+/// constructor ABI. The package is sent exactly as it is: for a revert it must be the original
+/// package of the generation being put back (its own deployment id), never a re-signed copy. The
+/// [`Direction`] says whether the request carries the producer's claim or the revert marker, never
+/// both; the runtime refuses a program change of a stateful actor with neither.
 ///
 /// # Errors
 ///
@@ -84,6 +117,7 @@ pub fn upgrade_request(
     let state_layout = schema
         .state_layout_hash()
         .map_err(|e| DriverError::Runtime(format!("state layout: {e:?}")))?;
+    let direction = Direction::of(installed.program, package);
     Ok(sdk::UpgradeActor {
         actor,
         from_deployment: installed.deployment,
@@ -97,7 +131,14 @@ pub fn upgrade_request(
         state_layout,
         contract: package.manifest().contract,
         requirements: package.requirements(),
-        state_compatible_from: package.state_compatible_from(installed.program),
+        state_compatible_from: match direction {
+            Direction::Claim(from) => Some(from),
+            _ => None,
+        },
+        revert_from: match direction {
+            Direction::Revert(from) => Some(from),
+            _ => None,
+        },
     })
 }
 
@@ -635,10 +676,12 @@ impl Runtime {
     /// installation data.
     ///
     /// **A stateful actor** (one with lanes, the core) changes its program only on the claim of
-    /// the package's producer, which the request carries ([`upgrade_request`], `T-037-19`): the
-    /// patched runtime refuses it otherwise (`UnsupportedLane`), and it checks the claim names the
-    /// program installed now, the same producer, lanes, state layout and constructor ABI, and an
-    /// actor with no invocation result left unacknowledged. Only the patched runtime
+    /// the package's producer, or as the revert of such a change, which the request carries
+    /// ([`Direction`], [`upgrade_request`], `T-037-19`): the patched runtime refuses it otherwise
+    /// (`UnsupportedLane`). It checks the claim names the program installed now, or, for a revert,
+    /// that the target is exactly what the last claimed change replaced and no lane was written
+    /// since; the same producer, lanes, state layout and constructor ABI; and an actor with no
+    /// invocation result left unacknowledged. Only the patched runtime
     /// (the VOS fork at the pin) decodes such a request: the released one panics on it, which
     /// [`Runtime::exec`] reports as a failure of the runtime and not a refusal.
     pub fn upgrade_actor(
@@ -1001,6 +1044,36 @@ mod tests {
         let plain = upgrade_request(actor, &installed, &g1_plain).unwrap();
         assert_eq!(plain.state_compatible_from, None);
 
+        // The directions: a claim forward, a revert back, nothing for the same program.
+        assert_eq!(
+            Direction::of(g0.program(), &g1),
+            Direction::Claim(g0.program())
+        );
+        assert_eq!(
+            Direction::of(g1.program(), &g0),
+            Direction::Revert(g1.program())
+        );
+        assert_eq!(Direction::of(g0.program(), &g0), Direction::Repackage);
+        // A package that does not claim the installed program is a revert candidate, whatever
+        // it is: the runtime decides (it knows the program it replaced, and whether state moved).
+        assert_eq!(
+            Direction::of(g0.program(), &admitted(2, &[])),
+            Direction::Revert(g0.program())
+        );
+
+        // The way back: g0's own package over g1, with the revert marker and no claim; the
+        // package is sent as it is (its own deployment id), the compare-and-swap names g1's.
+        let at_h = entry_of(agent, "counter", &g1);
+        let back = upgrade_request(actor, &at_h, &g0).unwrap();
+        assert_eq!(back.revert_from, Some(g1.program()));
+        assert_eq!(back.state_compatible_from, None);
+        assert_eq!(back.from_deployment, g1.deployment());
+        assert_eq!(back.to_deployment, g0.deployment());
+        assert_eq!(back.to_program, g0.program());
+        // Forward carries no revert marker, and the two are different requests.
+        assert_eq!(claimed.revert_from, None);
+        assert_ne!(back, claimed);
+
         // A claim names the program installed now: g2 claims g1, g0 is installed, so none is sent.
         let g2 = admitted(3, &[g1.program()]);
         assert_eq!(
@@ -1081,11 +1154,34 @@ mod tests {
         assert!(why.contains("UnsupportedLane"), "{why}");
         assert_eq!(call(&mut rt, &actor).unwrap(), [fixture::reply_of(1)]);
 
-        // With the claim: accepted, in place (the incarnation and the lane are kept), and g2 runs.
+        // With the claim: accepted, in place (the incarnation and the lane are kept).
         let g2 = admitted(2, &[g1.program()]);
         let actor = rt.upgrade_actor(&g2, "counter").expect("claimed upgrade");
         assert_eq!(actor.record.entry.program, g2.program());
         assert_eq!(actor.record.incarnation, incarnation);
+
+        // The way back, before g2 wrote anything: g1's original package, no claim, accepted. g1
+        // is back exactly (its deployment, the incarnation) and runs.
+        assert_eq!(
+            Direction::of(g2.program(), &g1),
+            Direction::Revert(g2.program())
+        );
+        let actor = rt
+            .upgrade_actor(&g1, "counter")
+            .expect("revert before a write");
+        assert_eq!(actor.record.entry.deployment, g1.deployment());
+        assert_eq!(actor.record.incarnation, incarnation);
+        assert_eq!(call(&mut rt, &actor).unwrap(), [fixture::reply_of(1)]);
+
+        // Forward again; g2 runs, and its write ends the way back.
+        let actor = rt.upgrade_actor(&g2, "counter").expect("claimed again");
+        assert_eq!(call(&mut rt, &actor).unwrap(), [fixture::reply_of(2)]);
+        let late = rt.upgrade_actor(&g1, "counter");
+        let Err(DriverError::Refused(why)) = late else {
+            panic!("a revert after a write: {late:?}")
+        };
+        assert!(why.contains("UnsupportedLane"), "{why}");
+        // Nothing changed: g2 still runs.
         assert_eq!(call(&mut rt, &actor).unwrap(), [fixture::reply_of(2)]);
 
         // A claim names the program installed now: g3 claims g1, g2 is installed.

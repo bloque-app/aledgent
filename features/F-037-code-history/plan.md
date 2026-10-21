@@ -61,8 +61,9 @@ the claim of that number, with its record written last. In build order:
    requirement). On `saga` the runtime accepts a program change of a stateful actor only on a claim the
    target package's producer signs (`state_compatible_with`) and the host copies into the request, in our
    VOS fork (owner ruling w5; `T-037-19`): the `package` build takes the previous package's program,
-   the first generation claims nothing. The patched runtime is a new runtime artefact that enters with a
-   (re)founding, since the core host's driver has no `UpgradeRuntime`. The switch is an install into the
+   the first generation claims nothing. The way back after a way-out is the same call with `revert_from`
+   (no claim) and *g*'s original package, accepted by the runtime until a lane write. The patched runtime
+   is a new runtime artefact that enters with a (re)founding, since the core host's driver has no `UpgradeRuntime`. The switch is an install into the
    same instance on `vos-core`, and the founding of a continuation across platforms. While an upgrade is scheduled, the host ends its batches at *n* − 1. At start and at
    every switch, the host checks every artefact it runs, the runtime included, against the code version the
    code map names for the next input, by digest, and installs that version where any differs. The switch is

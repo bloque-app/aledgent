@@ -138,9 +138,9 @@ on:
         type: string
         default: "900"
       vos_ref:
-        description: "VOS commit for the core Agent (the pin: stateful-program-upgrade 10e41fc1, on perf/agent-stack c54fc1ff)"
+        description: "VOS commit for the core Agent (the pin: stateful-program-upgrade e2d59d17, on perf/agent-stack c54fc1ff)"
         type: string
-        default: 10e41fc12c3f484bed320c2520f8398afd8b017f
+        default: e2d59d17a7234a3f0bc0ab3a29720caa722991b3
       vos_picks:
         description: "commits cherry-picked onto vos_ref (none: no pick, for a VOS that has them)"
         type: string
@@ -192,7 +192,7 @@ jobs:
             faults: (if (.faults == true or .faults == "true") then "1" else "0" end),
             drill: (if (.drill == true or .drill == "true") then "1" else "0" end),
             drain_secs: ((.drain_secs // "900") | tostring),
-            vos_ref: (.vos_ref // "10e41fc12c3f484bed320c2520f8398afd8b017f"),
+            vos_ref: (.vos_ref // "e2d59d17a7234a3f0bc0ab3a29720caa722991b3"),
             vos_picks: (if .vos_picks == "none" then "" else (.vos_picks // "") end),
             agent_profile: (.agent_profile // ""),
             core_opt_level: ((.core_opt_level // "") | tostring),

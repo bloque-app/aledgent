@@ -535,7 +535,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vos"
 version = "0.1.0"
-source = "git+https://codeberg.org/pandres95/VOS.git?rev=10e41fc12c3f484bed320c2520f8398afd8b017f#10e41fc12c3f484bed320c2520f8398afd8b017f"
+source = "git+https://codeberg.org/pandres95/VOS.git?rev=e2d59d17a7234a3f0bc0ab3a29720caa722991b3#e2d59d17a7234a3f0bc0ab3a29720caa722991b3"
 dependencies = [
  "blake2b_simd",
  "log",
@@ -549,7 +549,7 @@ dependencies = [
 [[package]]
 name = "vos-agent-sdk"
 version = "0.1.0"
-source = "git+https://codeberg.org/pandres95/VOS.git?rev=10e41fc12c3f484bed320c2520f8398afd8b017f#10e41fc12c3f484bed320c2520f8398afd8b017f"
+source = "git+https://codeberg.org/pandres95/VOS.git?rev=e2d59d17a7234a3f0bc0ab3a29720caa722991b3#e2d59d17a7234a3f0bc0ab3a29720caa722991b3"
 dependencies = [
  "vos-protocol",
 ]
@@ -557,7 +557,7 @@ dependencies = [
 [[package]]
 name = "vos-macros"
 version = "0.1.0"
-source = "git+https://codeberg.org/pandres95/VOS.git?rev=10e41fc12c3f484bed320c2520f8398afd8b017f#10e41fc12c3f484bed320c2520f8398afd8b017f"
+source = "git+https://codeberg.org/pandres95/VOS.git?rev=e2d59d17a7234a3f0bc0ab3a29720caa722991b3#e2d59d17a7234a3f0bc0ab3a29720caa722991b3"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -567,7 +567,7 @@ dependencies = [
 [[package]]
 name = "vos-protocol"
 version = "0.1.0"
-source = "git+https://codeberg.org/pandres95/VOS.git?rev=10e41fc12c3f484bed320c2520f8398afd8b017f#10e41fc12c3f484bed320c2520f8398afd8b017f"
+source = "git+https://codeberg.org/pandres95/VOS.git?rev=e2d59d17a7234a3f0bc0ab3a29720caa722991b3#e2d59d17a7234a3f0bc0ab3a29720caa722991b3"
 dependencies = [
  "blake2b_simd",
  "rkyv",
@@ -576,7 +576,7 @@ dependencies = [
 [[package]]
 name = "vos-pvm-precompiles"
 version = "0.1.0"
-source = "git+https://codeberg.org/pandres95/VOS.git?rev=10e41fc12c3f484bed320c2520f8398afd8b017f#10e41fc12c3f484bed320c2520f8398afd8b017f"
+source = "git+https://codeberg.org/pandres95/VOS.git?rev=e2d59d17a7234a3f0bc0ab3a29720caa722991b3#e2d59d17a7234a3f0bc0ab3a29720caa722991b3"
 dependencies = [
  "curve25519-dalek",
 ]
@@ -584,7 +584,7 @@ dependencies = [
 [[package]]
 name = "vos-pvm-program"
 version = "0.1.0"
-source = "git+https://codeberg.org/pandres95/VOS.git?rev=10e41fc12c3f484bed320c2520f8398afd8b017f#10e41fc12c3f484bed320c2520f8398afd8b017f"
+source = "git+https://codeberg.org/pandres95/VOS.git?rev=e2d59d17a7234a3f0bc0ab3a29720caa722991b3#e2d59d17a7234a3f0bc0ab3a29720caa722991b3"
 
 [[package]]
 name = "zerocopy"

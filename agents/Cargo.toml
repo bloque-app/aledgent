@@ -14,7 +14,7 @@
 # | `core` | The Agent actor: `ledger-core` inside one VOS `saga` Local Agent (guest, `riscv64em-vos`). Its own workspace, as VOS's actors are | `nightly-2026-03-20` + `rust-src` |
 # | `core-host` | The host process: the AgentRuntime driver (runtime ABI), the leaf store and witness path, and the server of `ingress::boundary::Core`'s four operations | the same |
 #
-# VOS is pinned to aledgent's fork, branch `stateful-program-upgrade`, commit `10e41fc1`: `perf/agent-stack`
+# VOS is pinned to aledgent's fork, branch `stateful-program-upgrade`, commit `e2d59d17`: `perf/agent-stack`
 # `c54fc1ff` (`saga/agents` at e6f2bb45 with aledgent's changes, proposals/vos/0001-0005 and 0006-0010:
 # compact acknowledged results, actor-declared limits, programs loaded in place, the curve
 # precompiles, the program hashed once, the runtime profiles, per-Agent execution limits) plus the
@@ -35,9 +35,9 @@ repository = "https://github.com/bloque-app/aledgent"
 publish = false
 
 [workspace.dependencies]
-vos = { git = "https://codeberg.org/pandres95/VOS.git", rev = "10e41fc12c3f484bed320c2520f8398afd8b017f", default-features = false }
-vos-pvm = { git = "https://codeberg.org/pandres95/VOS.git", rev = "10e41fc12c3f484bed320c2520f8398afd8b017f" }
-vos-pvm-compiler = { git = "https://codeberg.org/pandres95/VOS.git", rev = "10e41fc12c3f484bed320c2520f8398afd8b017f" }
+vos = { git = "https://codeberg.org/pandres95/VOS.git", rev = "e2d59d17a7234a3f0bc0ab3a29720caa722991b3", default-features = false }
+vos-pvm = { git = "https://codeberg.org/pandres95/VOS.git", rev = "e2d59d17a7234a3f0bc0ab3a29720caa722991b3" }
+vos-pvm-compiler = { git = "https://codeberg.org/pandres95/VOS.git", rev = "e2d59d17a7234a3f0bc0ab3a29720caa722991b3" }
 
 # CipherClerk e9a7b08 with proposals/cipherclerk/0001 (randomness as a parameter), made by
 # tools/cipherclerk-patched.sh. The guest cannot build `signing` without it (getrandom).
