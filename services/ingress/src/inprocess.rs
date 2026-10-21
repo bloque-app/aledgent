@@ -1448,6 +1448,7 @@ impl<S: LeafStore, V: VaultBackend> Running<S, V> {
             audit: None,
             vos_unacknowledged: None,
             writer_fenced_age: None,
+            code_source_mismatches: Vec::new(),
             book: Some(q::BookSizeBody {
                 records: s.book.records,
                 leaves: s.book.leaves,

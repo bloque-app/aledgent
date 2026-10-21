@@ -5,6 +5,7 @@
 //! ```text
 //! aledgent-core-host serve --config <file> --runtime <runtime.pvm> --actor <actor.vos> --state <dir> [--chainspec <file> [--genesis-manifest <file>] [--unnamed-code] [--unverified-genesis]] [--budget <bytes>] [--batch N]
 //!                     [--archive <spec> [--archive-interval-ms MS] [--checkpoint-every N] [--checkpoint-every-secs S]]
+//!                     [--code-config <file>]
 //!                                    the core Agent behind ingress's boundary::Core, streaming every
 //!                                    decision to the off-node archive (serve.rs)
 //! aledgent-core-host restore --config <file> --runtime <runtime.pvm> --actor <actor.vos> --state <dir> [--budget <bytes>]
@@ -56,6 +57,7 @@ mod diag;
 static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 mod chainspec;
 mod code;
+mod code_source;
 mod driver;
 mod fleet;
 mod keys;
@@ -87,7 +89,7 @@ use ledger_kernel::posting::OperationRef;
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  aledgent-core-host serve --config <file> --runtime <runtime.pvm> --actor <actor.vos> --state <dir> [--chainspec <file> [--genesis-manifest <file>] [--unnamed-code] [--unverified-genesis]] [--budget <bytes>] [--batch N] [--archive <spec> [--archive-interval-ms MS] [--checkpoint-every N] [--checkpoint-every-secs S]]\n  \
+        "usage:\n  aledgent-core-host serve --config <file> --runtime <runtime.pvm> --actor <actor.vos> --state <dir> [--chainspec <file> [--genesis-manifest <file>] [--unnamed-code] [--unverified-genesis]] [--budget <bytes>] [--batch N] [--archive <spec> [--archive-interval-ms MS] [--checkpoint-every N] [--checkpoint-every-secs S]] [--code-config <file>]\n  \
          aledgent-core-host restore --config <file> --runtime <runtime.pvm> --actor <actor.vos> --state <dir> [--budget <bytes>]\n  \
          aledgent-core-host code-manifest --actor <vos> --runtime <pvm> --profile <json> --out <file>\n  \
          aledgent-core-host check-code --actor <vos> --runtime <pvm> (--chainspec <file> | --manifest <file>) [--code <hex>] [--write-manifest <file>] [--out <file>]\n  \

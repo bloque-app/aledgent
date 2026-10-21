@@ -35,6 +35,8 @@ core-binding = { path = "../../crates/core-binding", features = ["std", "ingress
 # The off-node archive: continuous backup and the restore's layout (T-005-15, T-005-16; no VOS).
 core-archive = { path = "../../crates/core-archive" }
 hex = "0.4"
+# `O_NOFOLLOW` and `O_NONBLOCK`, to read a code source's file without following a link (T-037-06).
+libc = "0.2"
 # The deployment's configuration file and the boundary::Core server (no VOS in ingress).
 ingress = { path = "../../services/ingress", default-features = false }
 serde = { version = "1", features = ["derive"] }

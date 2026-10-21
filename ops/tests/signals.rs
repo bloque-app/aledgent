@@ -258,3 +258,40 @@ async fn t_018_11_an_operation_adds_one_record_to_the_scraped_book() {
     assert_eq!(after, records + 1);
     assert!(grown > leaves);
 }
+
+/// `T-037-06`: the code fetcher's discarded answers are exported as a counter with one label, the
+/// place's name, each place listed even at zero; a node with no source of code exports none.
+#[test]
+fn t037_06_the_code_source_mismatches_are_exported_by_source() {
+    use ingress::query::{CodeSourceMismatchBody, SignalsBody};
+    use ops::signals::{Snapshot, render};
+    let with = |code_source_mismatches| Snapshot {
+        core: Some(SignalsBody {
+            code_source_mismatches,
+            ..SignalsBody::default()
+        }),
+        ..Snapshot::default()
+    };
+    let body = |source: &str, count| CodeSourceMismatchBody {
+        source: source.into(),
+        count,
+    };
+    let text = render(&with(vec![
+        body("cache", 0),
+        body("fs:0", 2),
+        body("fs:1", 0),
+    ]));
+    for line in [
+        "# TYPE aledgent_code_source_mismatch_total counter",
+        r#"aledgent_code_source_mismatch_total{source="cache"} 0"#,
+        r#"aledgent_code_source_mismatch_total{source="fs:0"} 2"#,
+        r#"aledgent_code_source_mismatch_total{source="fs:1"} 0"#,
+    ] {
+        assert!(text.lines().any(|l| l == line), "{line}:\n{text}");
+    }
+    let none = render(&with(Vec::new()));
+    assert!(
+        !none.contains("aledgent_code_source_mismatch_total"),
+        "{none}"
+    );
+}

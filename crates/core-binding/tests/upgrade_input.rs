@@ -692,3 +692,52 @@ async fn t037_18_a_fenced_refusal_is_not_run_for_the_tail_and_a_decided_input_is
         [1, 1]
     );
 }
+
+/// `T-037-06`, `REQ-RT-17`: the core reports in its signals what the code fetcher discarded, one
+/// entry for the cache and for each source, each listed even at zero; the exporter turns them into
+/// `aledgent_code_source_mismatch_total`.
+#[tokio::test(flavor = "multi_thread")]
+async fn t037_06_the_signals_carry_what_the_fetcher_discarded() {
+    let w = world().await;
+    let op = Some(w.d.operator.token.as_str());
+    let (st, v) =
+        w.d.call_decided(
+            "POST",
+            "/v1/identities",
+            op,
+            &[("client-key", "ops-identity")],
+            Some(json!({ "kind": "organisation", "verifier": "0c" })),
+        )
+        .await;
+    assert_eq!(st.as_u16(), 200, "{v}");
+    let reader = CallerBody {
+        principal: v["result"]["identity"].as_str().unwrap().to_owned(),
+        credential: v["result"]["credential"].as_str().unwrap().to_owned(),
+        on_behalf_of: None,
+    };
+    let (st, v) =
+        w.d.call_decided(
+            "POST",
+            "/v1/ops/operator-grants",
+            op,
+            &[("client-key", "ops-grant")],
+            Some(json!({
+                "principal": reader.principal,
+                "kinds": ["read_signals"],
+                "justification": "T-037-06: the signals",
+            })),
+        )
+        .await;
+    assert_eq!(st.as_u16(), 200, "{v}");
+    assert!(w.d.quiesce(Duration::from_secs(20)).await);
+    let Ok(QueryReply::Signals(s)) = w.core.query(&reader, &Query::Signals, T0 + 1_000_000).await
+    else {
+        panic!("signals")
+    };
+    let got: Vec<(String, u64)> = s
+        .code_source_mismatches
+        .iter()
+        .map(|m| (m.source.clone(), m.count))
+        .collect();
+    assert_eq!(got, [("cache".to_owned(), 0), ("fs:0".to_owned(), 2)]);
+}

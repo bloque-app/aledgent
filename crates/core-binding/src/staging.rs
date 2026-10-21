@@ -39,6 +39,12 @@ pub trait CodeFetch: Send + Sync {
     /// the manifest names it; the manifest itself: `None`); `None` if this source does not hold
     /// them.
     fn fetch(&self, digest: &[u8; 32], len: Option<u64>) -> Option<Vec<u8>>;
+    /// How many answers each place of this source discarded because the bytes were not what their
+    /// digest or length names (`aledgent_code_source_mismatch_total`, `T-037-06`): the place's
+    /// name, and the count. Empty for a source that does not count.
+    fn mismatches(&self) -> Vec<(String, u64)> {
+        Vec::new()
+    }
 }
 
 /// Why a code version was not staged. Nothing was kept.

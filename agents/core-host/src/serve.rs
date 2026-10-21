@@ -503,7 +503,8 @@ fn archiver_config(args: &[String]) -> Result<ArchiverConfig, String> {
 
 /// `serve --config <file> --runtime <runtime.pvm> --actor <actor.vos> --state <dir>
 /// [--chainspec <file> [--genesis-manifest <file>] [--unnamed-code]] [--budget <bytes>] [--batch <inputs>] [--replica-in-memory] [--archive <spec>
-/// [--archive-interval-ms <ms>] [--checkpoint-every <inputs>] [--checkpoint-every-secs <s>]]`.
+/// [--archive-interval-ms <ms>] [--checkpoint-every <inputs>] [--checkpoint-every-secs <s>]]
+/// [--code-config <file>]`.
 /// `--batch` is the most inputs one invocation carries (`T-031-03`); it overrides the
 /// configuration's `core_batch`, and 1 is one input per invocation. The replica's stores are under
 /// `<dir>/replica/` (`T-031-14`) unless `--replica-in-memory`; `--replica-on-disk`, the default, is
@@ -584,6 +585,10 @@ pub fn serve(args: &[String]) -> Result<(), String> {
         .map(|spec| core_archive::open(&spec, Access::Write))
         .transpose()?;
     let pacing = archiver_config(args)?;
+    // T-037-06: where an `Upgrade`'s code is fetched from. Read before anything starts, so a
+    // misconfiguration fails the start; without `--code-config` the node has no source of code and
+    // every `Upgrade` is refused, as before.
+    let code_source = crate::code_source::from_args(args, &dir)?;
     let port = open_port(&runtime, &actor, &keys, &dir, genesis_code)?;
     // T-031-14, T-032-15: the replica's stores under the state directory, each with a bounded
     // cache, rebuilt from the log on every start. The default since the 2 h soak of 2026-10-04 on
@@ -661,6 +666,13 @@ pub fn serve(args: &[String]) -> Result<(), String> {
                 None => {}
             }
         }
+    }
+    if let Some(source) = code_source {
+        core.set_code_source(source)?;
+        eprintln!(
+            "aledgent-core-host: code source: an Upgrade's code is fetched from the cache and the \
+             sources of --code-config, each answer checked by length and hash (T-037-06)"
+        );
     }
     crate::diag::start(core.stats(), dir.clone());
     // The actor gas this host's VOS gives one invocation bounds the batch too.

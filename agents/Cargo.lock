@@ -544,6 +544,7 @@ dependencies = [
  "ingress",
  "ledger-core",
  "ledger-kernel",
+ "libc",
  "serde",
  "serde_json",
  "shards",

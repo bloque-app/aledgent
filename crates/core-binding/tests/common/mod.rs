@@ -416,4 +416,8 @@ impl CodeFetch for HeldCode {
     fn fetch(&self, digest: &[u8; 32], _: Option<u64>) -> Option<Vec<u8>> {
         self.0.lock().unwrap().get(digest).cloned()
     }
+    /// What a fetcher with a cache and one source that once lied would report (`T-037-06`).
+    fn mismatches(&self) -> Vec<(String, u64)> {
+        vec![("cache".into(), 0), ("fs:0".into(), 2)]
+    }
 }

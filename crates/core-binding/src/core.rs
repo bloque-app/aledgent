@@ -1859,6 +1859,14 @@ impl<P: AgentPort + Send + 'static> Core for AgentCore<P> {
             // How long the writer has been fenced (`T-037-15`, `NFR-11`).
             let since = stats.fenced_since.load(Ordering::Relaxed);
             s.writer_fenced_age = (since != 0).then(|| now.saturating_sub(since));
+            // What the code fetcher discarded as not its digest's bytes (`T-037-06`).
+            if let Some(source) = self.inner.code_source.get() {
+                s.code_source_mismatches = source
+                    .mismatches()
+                    .into_iter()
+                    .map(|(source, count)| ingress::query::CodeSourceMismatchBody { source, count })
+                    .collect();
+            }
         }
         Ok(reply)
     }

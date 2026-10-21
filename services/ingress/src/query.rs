@@ -449,10 +449,26 @@ pub struct SignalsBody {
     /// from a core with no fence (the in-process core).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub writer_fenced_age: Option<u64>,
+    /// Answers the core host's code fetcher discarded because the bytes were not what their digest
+    /// and length name (`T-037-06`, `aledgent_code_source_mismatch_total`), per place it asked: the
+    /// cache and each configured source, each listed even at zero. Empty when the node has no
+    /// source of code, and from a core with none (the in-process core).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub code_source_mismatches: Vec<CodeSourceMismatchBody>,
     /// The book's size (`T-018-11`): what `T-036-17`'s disk-backed store is required by. Absent
     /// from a core that does not count it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub book: Option<BookSizeBody>,
+}
+
+/// The answers one place of the code fetcher discarded (`T-037-06`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CodeSourceMismatchBody {
+    /// The place: `cache`, or a source's kind and position in the configured list, as `fs:0`.
+    /// Never a path, a URL or a credential.
+    pub source: String,
+    /// Answers discarded, ever, since the host started.
+    pub count: u64,
 }
 
 /// The book's size, as the signals carry it: counts only, each kept by the collection that holds
