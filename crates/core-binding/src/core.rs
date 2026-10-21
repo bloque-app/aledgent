@@ -1935,16 +1935,28 @@ impl<P: AgentPort + Send + 'static> Core for AgentCore<P> {
                 }
             };
             let mut inner = lock(&core.inner.ctl);
-            match inner
-                .driver
-                .as_mut()
-                .map(|d| d.port_mut().stage_code(checked))
-            {
-                Some(Ok(())) => Ok(Staged::Staged),
-                Some(Err(r)) => Ok(Staged::Refused {
+            let Some(driver) = inner.driver.as_mut() else {
+                return Err(CoreError::Unavailable);
+            };
+            // Could the switch install it? Asked before the version is staged, under the same lock
+            // as the staging, so a version it would refuse at its input is refused at the door
+            // (`T-037-22`, owner ruling w16): nothing is staged and, the door refusing it, nothing
+            // is logged.
+            if let Err(why) = driver.port_mut().can_install(&checked) {
+                let refusal = crate::staging::StageRefusal::CannotInstall(why).to_string();
+                std::eprintln!(
+                    "aledgent-core: refused an upgrade to code {} before it was logged (the last \
+                     committed input is {}): {refusal}",
+                    crate::switch::short(&code),
+                    driver.seq()
+                );
+                return Ok(Staged::Refused { reason: refusal });
+            }
+            match driver.port_mut().stage_code(checked) {
+                Ok(()) => Ok(Staged::Staged),
+                Err(r) => Ok(Staged::Refused {
                     reason: r.to_string(),
                 }),
-                None => Err(CoreError::Unavailable),
             }
         })
         .await

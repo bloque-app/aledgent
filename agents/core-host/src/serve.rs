@@ -310,6 +310,11 @@ impl AgentPort for Persisting {
         self.port.stage_code(checked)
     }
 
+    /// Whether the switch could install `checked` (`T-037-22`): the wrapped port answers.
+    fn can_install(&self, checked: &core_binding::staging::Checked) -> Result<(), String> {
+        self.port.can_install(checked)
+    }
+
     fn invoke(&mut self, envelope: Vec<u8>, blobs: Vec<Vec<u8>>) -> Result<Vec<u8>, PortError> {
         self.check()?;
         let r = self.port.invoke(envelope, blobs);
