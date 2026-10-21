@@ -615,15 +615,18 @@ enum By {
 }
 
 /// A book whose mode was changed to propose-approve, with an upgrade to `H` scheduled from its
-/// next input (set in the hot row, as `T-037-04`'s `Upgrade` will), run by the package of
-/// `generation`, and a way out taken as input `n` by `by`: a cancel, or a move to `to`. With
+/// next input plus `ahead` (set in the hot row, as `T-037-04`'s `Upgrade` will), run by the package
+/// of `generation`, and a way out taken as input `n` by `by`: a cancel, or a move to `n` plus the
+/// signed offset `to` (owner ruling w6: the scheduled input is `n + ahead`; the package of
+/// generation 1 is only admitted at `ahead = 0`, the input the upgrade applies from). With
 /// `boundary`, a further change of mode, to `c` proposing and `b` approving, is scheduled to take
 /// force at `n` itself, the way out's input. Answers the book, the input's reply, `n` and the
 /// principal who took the way out.
 fn way_out_book(
     generation: u64,
     by: By,
-    to: Option<u64>,
+    to: Option<i64>,
+    ahead: u64,
     boundary: bool,
 ) -> (
     Fx<NativePort>,
@@ -689,7 +692,7 @@ fn way_out_book(
     // The upgrade, scheduled from the next input; the package of `generation` runs it.
     let n = hot(&mut fx).inputs + 1;
     let mut h = hot(&mut fx);
-    h.upgrade = Some((H, n));
+    h.upgrade = Some((H, n + ahead));
     fx.driver.port_mut().rows.0.insert(HOT.to_vec(), encode(&h));
     fx.driver.reload_code(&mut fx.replica).unwrap();
     fx.driver.port_mut().generation = generation;
@@ -703,7 +706,9 @@ fn way_out_book(
     let ctx = fx.ctx(caller);
     let why = b"T-037-05: a way out under the mode in force";
     let _ = match to {
-        Some(m) => fx.replica.reschedule_upgrade(&ctx, m, why),
+        Some(off) => fx
+            .replica
+            .reschedule_upgrade(&ctx, n.checked_add_signed(off).unwrap(), why),
         None => fx.replica.cancel_upgrade(&ctx, why),
     };
     let c = fx.sync().unwrap().unwrap();
@@ -730,15 +735,28 @@ fn way_out_record(
 /// Check one way out decided by the packages of both generations: the same reply, writer state
 /// and log hash; the summary, the audit record (accepted or refused, naming its principal) and
 /// the upgrade as `taken` says.
-fn check_way_out(by: By, to: Option<u64>, boundary: bool, taken: bool) {
-    let (mut old, a, n, who) = way_out_book(0, by, to, boundary);
-    let (mut new, b, _, _) = way_out_book(1, by, to, boundary);
+fn check_way_out(by: By, to: Option<i64>, boundary: bool, taken: bool) {
+    let refusal = (!taken).then_some(ledger_core::Refusal::NotAuthorised);
+    check_way_out_refused(by, to, boundary, refusal);
+}
+
+/// [`check_way_out`], with the refusal a way out that is not taken is recorded with
+/// (`None`: taken). Both packages run it with the upgrade scheduled from the way out's own input,
+/// the only input the package of generation 1 is admitted at.
+fn check_way_out_refused(
+    by: By,
+    to: Option<i64>,
+    boundary: bool,
+    refusal: Option<ledger_core::Refusal>,
+) {
+    let taken = refusal.is_none();
+    let (mut old, a, n, who) = way_out_book(0, by, to, 0, boundary);
+    let (mut new, b, _, _) = way_out_book(1, by, to, 0, boundary);
     assert_eq!(a, b, "{by:?}");
     assert_eq!(a.seq, n, "{by:?}: the way out takes input n");
-    let expected = if taken {
-        Summary::Accepted
-    } else {
-        Summary::Refused("ERR-NotAuthorised".into())
+    let expected = match refusal {
+        None => Summary::Accepted,
+        Some(r) => Summary::Refused(format!("ERR-{r:?}")),
     };
     assert_eq!(a.summaries, vec![expected], "{by:?}");
     assert_eq!(writer_state(&mut old), writer_state(&mut new), "{by:?}");
@@ -749,7 +767,7 @@ fn check_way_out(by: By, to: Option<u64>, boundary: bool, taken: bool) {
     let h = hot(&mut old);
     let upgrade = match (taken, to) {
         (true, None) => None,
-        (true, Some(m)) => Some((H, m)),
+        (true, Some(off)) => Some((H, n.checked_add_signed(off).unwrap())),
         (false, _) => Some((H, n)),
     };
     assert_eq!(
@@ -763,10 +781,9 @@ fn check_way_out(by: By, to: Option<u64>, boundary: bool, taken: bool) {
     } else {
         Command::CancelUpgrade
     };
-    let outcome = if taken {
-        AuditOutcome::Accepted
-    } else {
-        AuditOutcome::Refused(ledger_core::Refusal::NotAuthorised)
+    let outcome = match refusal {
+        None => AuditOutcome::Accepted,
+        Some(r) => AuditOutcome::Refused(r),
     };
     let record = (AuditAction::Command(command), outcome, Some(who));
     assert_eq!(way_out_record(&mut old), record, "{by:?}");
@@ -807,4 +824,169 @@ fn t037_05_a_way_out_under_the_mode_in_force_is_decided_alike_by_either_generati
     ] {
         check_way_out(by, to, false, taken);
     }
+}
+
+/// Owner ruling w6 (`T-037-05`, amendments 0034 and 0035): a lone member of the mode in force may
+/// cancel a scheduled upgrade, and may move it only strictly later than the input it is scheduled
+/// from. At the input the upgrade applies from, both generations decide a move to that input or
+/// before it the same: refused `ERR-InvalidTransition`, recorded on the trail with its principal,
+/// the upgrade still scheduled; a move strictly later, and a cancel, are taken the same.
+#[test]
+fn t037_05_a_move_to_the_scheduled_input_or_before_is_refused_alike_by_either_generation() {
+    use ledger_core::Refusal;
+    for by in [By::Proposer, By::Approver] {
+        for off in [-3, -1, 0] {
+            check_way_out_refused(by, Some(off), false, Some(Refusal::InvalidTransition));
+        }
+        check_way_out_refused(by, Some(1), false, None);
+        check_way_out_refused(by, None, false, None);
+        // Owner ruling w9: at most `MAX_LEAD` inputs after the way out's own, the same by both
+        // generations; one past it is refused and recorded.
+        let lead = ledger_core::code::authority::MAX_LEAD as i64;
+        check_way_out_refused(by, Some(lead), false, None);
+        check_way_out_refused(by, Some(lead + 1), false, Some(Refusal::InvalidTransition));
+    }
+}
+
+/// Owner ruling w6, the case the two generations cannot both reach (the new package is admitted
+/// only from the scheduled input, and by then the way out's own input already is that or later): an
+/// upgrade scheduled `AHEAD` inputs after a lone member's way out. The member may cancel it, may
+/// move it strictly later than the scheduled input, and may not bring it forward to an input
+/// before or at the scheduled one, though still later than the way out's own: refused
+/// `ERR-InvalidTransition`, on the trail with its principal, the upgrade still scheduled where it
+/// was. The Agent, which holds the scheduled upgrade in its hot row, and the replica, which the
+/// driver tells, decide it alike (`fx.sync` checks the replica reaches the Agent's roots), and a
+/// replay of the archive reaches them too.
+#[test]
+fn t037_05_a_lone_member_may_not_pull_a_scheduled_upgrade_earlier() {
+    use ledger_core::Refusal;
+    use ledger_core::code::authority::MAX_LEAD;
+    const AHEAD: u64 = 5;
+    for by in [By::Proposer, By::Approver] {
+        for (to, refusal) in [
+            (Some(1), Some(Refusal::InvalidTransition)),
+            (Some(AHEAD as i64 - 1), Some(Refusal::InvalidTransition)),
+            (Some(AHEAD as i64), Some(Refusal::InvalidTransition)),
+            (Some(AHEAD as i64 + 1), None),
+            (Some(500), None),
+            (Some(MAX_LEAD as i64), None),
+            (Some(MAX_LEAD as i64 + 1), Some(Refusal::InvalidTransition)),
+            (None, None),
+        ] {
+            let (mut fx, c, n, who) = way_out_book(0, by, to, AHEAD, false);
+            let expected = match refusal {
+                None => Summary::Accepted,
+                Some(r) => Summary::Refused(format!("ERR-{r:?}")),
+            };
+            assert_eq!(c.summaries, vec![expected], "{by:?} {to:?}");
+            let upgrade = match (refusal, to) {
+                (Some(_), _) => Some((H, n + AHEAD)),
+                (None, Some(off)) => Some((H, n.checked_add_signed(off).unwrap())),
+                (None, None) => None,
+            };
+            let h = hot(&mut fx);
+            assert_eq!(
+                (h.inputs, h.generation, h.upgrade),
+                (n, 0, upgrade),
+                "{by:?} {to:?}"
+            );
+            let command = if to.is_some() {
+                Command::RescheduleUpgrade
+            } else {
+                Command::CancelUpgrade
+            };
+            let outcome = match refusal {
+                None => AuditOutcome::Accepted,
+                Some(r) => AuditOutcome::Refused(r),
+            };
+            assert_eq!(
+                way_out_record(&mut fx),
+                (AuditAction::Command(command), outcome, Some(who)),
+                "{by:?} {to:?}"
+            );
+        }
+    }
+}
+
+/// Owner ruling w6, end to end through a scheduled upgrade the members really approved (not one
+/// written into the hot row): the proposer and the approver of a propose-approve mode schedule an
+/// upgrade from `from`. A lone member's move to an input after its own but before `from` is
+/// refused `ERR-InvalidTransition` and recorded; the scheduled upgrade stays where it was. A move
+/// strictly later is taken. The host's replay of the archive, which learns the scheduled upgrade
+/// only from the inputs that scheduled and moved it, decides each way out as the Agent did and
+/// reaches every root, the audit trail's included.
+#[test]
+fn t037_05_a_replay_decides_a_move_against_the_scheduled_input_as_the_agent_did() {
+    scheduled_move(named_on(NativePort::new()), Some(named_genesis()));
+}
+
+/// The same through the mapped layout (`F-031` lever 2), without the replay.
+#[test]
+fn t037_05_a_move_against_the_scheduled_input_through_the_mapped_agent() {
+    scheduled_move(Fx::mapped(), None);
+}
+
+/// [`t037_05_a_replay_decides_a_move_against_the_scheduled_input_as_the_agent_did`] on `fx`,
+/// replaying its archive from `replay_genesis` when given.
+fn scheduled_move(mut fx: Fx<NativePort>, replay_genesis: Option<ledger_core::ledger::Genesis>) {
+    let (a, b) = (fx.person(), fx.person());
+    let mode = propose_approve(&fx, &a, &b);
+    let at = fx.driver.seq() + 2;
+    set(&mut fx, &mode, at);
+    let _ = fx.person();
+    let from = fx.driver.seq() + 8;
+    let ctx = fx.ctx(a);
+    let p = ctx.op;
+    fx.replica.propose_upgrade(&ctx, H, from, WHY).unwrap();
+    fx.synced();
+    let ctx = fx.ctx(b);
+    fx.replica
+        .approve_upgrade(&ctx, p, Kind::Upgrade, WHY)
+        .unwrap();
+    fx.synced();
+    assert_eq!(hot(&mut fx).upgrade, Some((H, from)));
+    // The approver, alone, tries to bring it forward: after its own input, before `from`.
+    let early = fx.driver.seq() + 3;
+    assert!(early < from);
+    let ctx = fx.ctx(b);
+    let r = fx.replica.reschedule_upgrade(&ctx, early, WHY);
+    assert_eq!(r.unwrap_err(), ledger_core::Refusal::InvalidTransition);
+    fx.synced();
+    assert_eq!(hot(&mut fx).upgrade, Some((H, from)));
+    // Moving it to `from` itself is refused too; strictly later is taken.
+    let ctx = fx.ctx(a);
+    let r = fx.replica.reschedule_upgrade(&ctx, from, WHY);
+    assert_eq!(r.unwrap_err(), ledger_core::Refusal::InvalidTransition);
+    fx.synced();
+    let ctx = fx.ctx(a);
+    fx.replica.reschedule_upgrade(&ctx, from + 1, WHY).unwrap();
+    fx.synced();
+    assert_eq!(hot(&mut fx).upgrade, Some((H, from + 1)));
+    // On the trail, in order: the two refusals and the move taken.
+    let mut trail = ledger_core::audit::AuditTrail::new();
+    fx.replica.ship_audit(&mut trail).unwrap();
+    let moves: Vec<AuditOutcome> = trail
+        .iter()
+        .filter(|r| r.action == AuditAction::Command(Command::RescheduleUpgrade))
+        .map(|r| r.outcome)
+        .collect();
+    let refused = AuditOutcome::Refused(ledger_core::Refusal::InvalidTransition);
+    assert_eq!(moves, vec![refused, refused, AuditOutcome::Accepted]);
+    // The replay reaches every root, as the Agent does.
+    if let Some(genesis) = replay_genesis {
+        let (replica, service) =
+            core_binding::host::replay(&keys(), genesis, op(0), 1, &fx.archive).unwrap();
+        let h = hot(&mut fx);
+        assert_eq!(fx.archive.last().unwrap().roots, h.roots());
+        assert_eq!(service.root(), h.service_root);
+        assert_eq!(
+            replica.book().store().inner().roots().kernel,
+            fx.replica.book().store().inner().roots().kernel
+        );
+    }
+    // A cancel is taken whatever is scheduled.
+    let ctx = fx.ctx(b);
+    fx.replica.cancel_upgrade(&ctx, WHY).unwrap();
+    fx.synced();
+    assert_eq!(hot(&mut fx).upgrade, None);
 }

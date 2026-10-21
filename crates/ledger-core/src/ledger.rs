@@ -258,6 +258,10 @@ pub struct Ledger<S: LeafStore, V: VaultBackend> {
     /// The upgrade an input scheduled (the code version and the input number it applies from),
     /// until the writer reads it ([`Ledger::take_upgrade`], `T-037-04`). Not service state.
     upgrade: Option<([u8; 32], u64)>,
+    /// The upgrade the writer has scheduled, as its hot row holds it (the code version and the
+    /// input number it applies from): what a move of it is checked against
+    /// ([`Ledger::set_scheduled_upgrade`], `T-037-05`, owner ruling w6). Not service state.
+    scheduled: Option<([u8; 32], u64)>,
     /// How deep the public methods that change the book are nested now, and how many outermost
     /// ones have returned since [`Ledger::set_input`]: the calls of the current input decided so
     /// far (`T-037-15`: a way out must be its input's first call). Kept whether or not calls are
@@ -386,6 +390,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             input: 0,
             way_out: None,
             upgrade: None,
+            scheduled: None,
             calls_in_input: (0, 0),
             writer: crate::code::authority::Position::default(),
         };
@@ -438,6 +443,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             input: 0,
             way_out: None,
             upgrade: None,
+            scheduled: None,
             calls_in_input: (0, 0),
             writer: crate::code::authority::Position::default(),
         }
@@ -463,6 +469,19 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
         self.input = input;
         self.calls_in_input.1 = 0;
         self.writer.begin(&mut self.code.1, input);
+    }
+
+    /// The upgrade the writer has scheduled, as its hot row holds it, before the input that
+    /// follows (`T-037-05`, owner ruling w6): the code version and the input number it applies
+    /// from. A move of it ([`Ledger::reschedule_upgrade`]) must go strictly later than that input
+    /// number, so that one member alone cannot pull an approved upgrade earlier than the input the
+    /// approvers and the delay agreed to. Whoever runs the ledger as a writer sets it before
+    /// [`Ledger::set_input`], from the code it holds (the core Agent from its hot row, the host's
+    /// replica and a replay from the code the inputs before have left); a ledger never told has
+    /// nothing scheduled, and the move is checked against its own input alone. It writes nothing
+    /// to the book.
+    pub fn set_scheduled_upgrade(&mut self, scheduled: Option<([u8; 32], u64)>) {
+        self.scheduled = scheduled;
     }
 
     /// How many calls of the current input were decided before the one running now

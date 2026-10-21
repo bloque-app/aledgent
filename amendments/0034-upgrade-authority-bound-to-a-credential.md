@@ -153,6 +153,62 @@ amendment to `SPEC.md`, and for the owner to confirm there.
   the queue. A full queue refuses every new proposal until a proposer replaces its own, or a change of mode
   clears them all.
 
-Whether one member alone may take a way out of a scheduled upgrade (move or cancel it) is a separate
-question. It is with the owner, and its ruling belongs in an amendment of its own.
+Whether one member alone may take a way out of a scheduled upgrade (move or cancel it) was a separate
+question. The owner has ruled on it: see the next section.
 
+## Clarification after the ruling, second (2026-10-20, ruling w6 (B), not part of the approved text)
+
+This section was added after the owner approved R1 and R2, and after the clarification above. It changes
+neither of them. It records the owner's ruling on who may take a way out of a scheduled upgrade
+(`REQ-RT-20`, amendment 0035). It is for the pass that applies this amendment to `SPEC.md`, and for the
+owner to confirm there.
+
+- **Who.** Any member of the upgrade-authority mode in force, with the credential the mode names it with,
+  may take a way out alone, under every mode: no second approval and no delay. This is how the plan built
+  it (`T-037-15`); the ruling keeps it.
+- **A cancellation** is taken as it stands, by any one member. It leaves the book on the code in force: a way
+  out can stop a change of the code, never make one.
+- **A move** must take the upgrade to an input *strictly later* than the input it is scheduled from. Until
+  now it was checked only against the way out's own input, which let one member pull an upgrade that the
+  approvers, and the delay, had agreed to earlier than the input they agreed to. The rule is now stricter in
+  one way: a move to the scheduled input itself or before it is refused as `ERR-InvalidTransition`, like a
+  move not later than the way out's own input, and recorded the same way (amendment 0035, ruling 1: its
+  refusal is recorded, it takes its input number, and the upgrade stays scheduled). A move to a later input
+  stays valid. Where the scheduled input is already behind the way out's own, the way out's own input is the
+  later bound, as before.
+- **With nothing scheduled**, nothing changes: a way out is checked against its own input alone, recorded,
+  and changes nothing.
+- **Trade-off, stated plainly.** One member alone can still cancel an approved upgrade, or move it later
+  again and again, and so hold it back for good. That stays, as the ruling asks. What a member can no longer
+  do alone is make an approved upgrade happen sooner than the approvers and the delay agreed.
+
+*Reading of amendment 0035.* Its R1 says a move to "an input not later than its own" is refused. That
+reading is narrowed, not replaced: a move is also refused when it is not later than the input the upgrade
+is scheduled from.
+
+### What the plan does with it (informative, `T-037-05`)
+
+The scheduled upgrade is writer state, so the library cannot read it from the book. The writer gives it
+to the library before each input, as it gives the scheduled change of mode, and the library decides the
+move in the one function both generations run. A replay of the archive follows the writer's code input by
+input, so it decides every move as the writer did.
+
+## Clarification after the ruling, third (2026-10-21, ruling w9 (a), not part of the approved text)
+
+This section was added after the owner approved R1 and R2, and after the two clarifications above. It changes
+neither of them. It records the owner's ruling on how far ahead a way out may move a scheduled upgrade
+(`REQ-RT-20`, amendment 0035). It is for the pass that applies this amendment to `SPEC.md`, and for the owner
+to confirm there.
+
+- **The same upper limit as a change of mode.** A move of a scheduled upgrade takes it to an input at most
+  `MAX_LEAD` (2¹⁷) inputs after the way out's own input, counted exactly as a change of mode is: the target
+  minus the deciding input is at most `MAX_LEAD`. A move exactly `MAX_LEAD` ahead is valid; one input further
+  is refused as `ERR-InvalidTransition`, recorded like every refused way out (amendment 0035, ruling 1).
+- **Why.** The first clarification above says why a change must apply within the book's life: an input the
+  book never reaches would leave the writer's code unable to change again. A move to a far input does the same
+  to an upgrade, and a lone member can take a way out alone (ruling w6), so the move has the limit a proposal
+  has.
+- **Cancel is unaffected.** A cancellation has no target and is taken as before. With nothing scheduled, a move
+  is still checked against its own input and this limit, and changes nothing.
+- **Together with ruling w6**, a move must be strictly later than the scheduled input and at most `MAX_LEAD`
+  after its own input.

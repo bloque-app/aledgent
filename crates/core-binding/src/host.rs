@@ -1345,6 +1345,9 @@ impl<P: AgentPort> Driver<P> {
         // The mode is the replica's: the inputs it decided set it (`T-037-05`).
         let authority = replica.authority();
         replica.set_code(self.writer.code_for(next), authority);
+        // The upgrade the writer has scheduled, which a move of it must go strictly later than
+        // (owner ruling w6, `T-037-05`).
+        replica.set_scheduled_upgrade(self.writer.upgrade);
         replica.set_input(next);
     }
 
@@ -2148,6 +2151,10 @@ fn replay_with(
     drop_shipped(&mut replica);
     replica.record_calls(true);
     replica.set_code([0; 32], authority);
+    // The writer's code as the inputs leave it, which the way out of a scheduled upgrade is
+    // checked against (owner ruling w6, `T-037-05`): the same step the Agent takes
+    // ([`crate::fence::decide`]), so a replay decides every way out as the Agent did.
+    let mut writer = WriterCode::default();
     let clerk = recorder.clerk();
     let mut prev = [0u8; 32];
     for (i, e) in entries.iter().enumerate() {
@@ -2162,14 +2169,17 @@ fn replay_with(
         // in force (`T-037-05`).
         let authority = replica.authority();
         replica.set_code(e.code, authority);
+        replica.set_scheduled_upgrade(writer.upgrade);
         replica.set_input(e.seq);
         for c in &e.calls {
             let clerk = clerk.as_deref().map(|c| c as &dyn ClerkSigner);
             crate::calls::apply(&mut replica, c, clerk);
         }
         let _ = replica.take_calls();
-        let _ = replica.take_way_out();
-        let _ = replica.take_upgrade();
+        // An archived input was taken whole: a way-out input is one call and no delivery.
+        let way_out = crate::fence::way_out_input(&e.calls, e.deliveries.len()).unwrap_or(false);
+        let (taken, scheduled) = (replica.take_way_out(), replica.take_upgrade());
+        crate::fence::decide(&mut writer, e.seq, way_out, taken, scheduled);
         let touched = Touches::take(&replica, &e.deliveries);
         let (before, _) = service.leaves(&touched)?;
         let changes = changed(&replica, &before, &e.deliveries)?;

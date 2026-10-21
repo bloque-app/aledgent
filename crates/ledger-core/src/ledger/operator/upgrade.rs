@@ -9,15 +9,18 @@
 //!
 //! The scheduled upgrade is writer state, which the writer holds (the core Agent's hot row), not
 //! the book's service state. So the ledger decides only whether the way out is taken: authorised
-//! under the mode in force, and, for a move, to an input later than its own ([`Ledger::set_input`]).
+//! under the mode in force, and, for a move, to an input later than its own ([`Ledger::set_input`])
+//! and than the input the scheduled upgrade applies from ([`Ledger::set_scheduled_upgrade`]; owner
+//! ruling w6: any member may cancel alone, none may bring the upgrade forward), and at most
+//! `MAX_LEAD` inputs after its own, as a change of mode is (owner ruling w9).
 //! The writer reads what was taken ([`Ledger::take_way_out`]) and applies it to its upgrade
 //! (`crate::code::WayOut::apply`), with the same function whichever generation of code decides it.
 //! With nothing scheduled, a way out that is taken changes nothing, and is recorded.
 //!
 //! Every way out is **decided**, by code of either generation, even once the upgrade applies
 //! (owner ruling on #44, amendment 0033 D10): taken, it applies; not taken (unauthorised, a move
-//! not later than its own input, a blank justification, or not its input's first call,
-//! `ERR-MalformedCommand`), it is a recorded refusal that takes its input number; a repeat of an
+//! not later than its own input or than the scheduled one, or further than `MAX_LEAD` ahead, a
+//! blank justification, or not its input's first call, `ERR-MalformedCommand`), it is a recorded refusal that takes its input number; a repeat of an
 //! earlier request answers that request's outcome and takes nothing again. So a bad way out at the
 //! head of the queue can never wedge the old code.
 //!
@@ -49,6 +52,7 @@ use super::digest;
 use crate::audit::{AuditSubject, Justification};
 use crate::authority::AuthorityUsed;
 use crate::code::WayOut;
+use crate::code::authority::MAX_LEAD;
 use crate::ledger::{Accepted, Ctx, Ledger};
 use crate::principal::Caller;
 use crate::principal::resolve;
@@ -151,8 +155,10 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
     }
 
     /// `reschedule_upgrade` (`REQ-RT-20`, `T-037-15`): move the writer's scheduled upgrade to input
-    /// `from`, which must be later than this command's own input number
-    /// (`ERR-InvalidTransition` otherwise). Authorised under the mode in force
+    /// `from`, which must be later than this command's own input number and, when the writer has an
+    /// upgrade scheduled ([`Ledger::set_scheduled_upgrade`]), strictly later than the input that
+    /// upgrade applies from, so that a move never brings it forward, and at most `MAX_LEAD` inputs
+    /// after it (`ERR-InvalidTransition` otherwise; owner rulings w6 and w9, `T-037-05`). Authorised under the mode in force
     /// (`ERR-NotAuthorised`), with a justification (`ERR-JustificationRequired`).
     pub fn reschedule_upgrade(
         &mut self,
@@ -222,7 +228,18 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
         let run = |l: &Self| -> Result<(AuthorityUsed, Justification), Refusal> {
             let used = l.way_out_authority(&ctx.caller, &p)?;
             let j = Justification::new(justification)?;
-            if from.is_some_and(|m| m <= input) {
+            // A move goes strictly later than its own input and, with an upgrade scheduled,
+            // strictly later than the input that upgrade applies from (owner ruling w6): one
+            // member alone may cancel it, but never pull it earlier than the input the approvers
+            // and the delay agreed to. With nothing scheduled there is nothing to compare.
+            let scheduled = l.scheduled.map(|(_, n)| n);
+            if from.is_some_and(|m| m <= input || scheduled.is_some_and(|n| m <= n)) {
+                return Err(Refusal::InvalidTransition);
+            }
+            // And no further ahead than a change of mode may apply (owner ruling w9): at most
+            // `MAX_LEAD` inputs after its own, the bound `check_from` holds a proposal to, so an
+            // upgrade is never pushed to an input the book may never reach.
+            if from.is_some_and(|m| m.saturating_sub(input) > MAX_LEAD) {
                 return Err(Refusal::InvalidTransition);
             }
             Ok((used, j))

@@ -94,13 +94,28 @@ the next **feed sequence**.
   longer the lease's is refused that transaction (fenced) and stops.
 - The queue is read in-flight first: undecided rows that already have a feed sequence, in that order, then
   the rest as before (reservations first, then arrival). A row the core may have run is therefore always
-  resent with the sequence it was first given, after every row with a lower one.
+  resent with the sequence it was first given, after every row with a lower one, **until the core answers it
+  `NotRun`** (below, `[PENDING AMENDMENT 0036]`).
 - Rows the core certainly did not run (answered unavailable, or never sent) give their sequences back, the
   partition's tail, under the lease (`Store::unfeed`), and return to the queue: a reservation logged
   meanwhile still goes before them (`T-009-04`, `T-031-18`), and the next row sent takes the first of those
   sequences again. The core host expects exactly that sequence, since nothing at or past it ran. A row
   answered ambiguous in any round of a send stays in flight even if a later round answers it
   unavailable: sequences are never given back below the highest position ever answered ambiguous.
+- **`[PENDING AMENDMENT 0036]` A definite "not run" gives a carried row back.** When the Agent's fence refuses an
+  input (nothing committed, its input number not taken), the core answers it, and every later input of
+  that call, `NotRun`: a `BatchAnswer` of its own, given for nothing but the fence and never for an input the
+  core decided (a committed input is always answered from the reply log, fenced or not). The feeder then
+  gives back the sequences from the first `NotRun` position on, in one transaction under the lease, in
+  flight or not; and if any of those rows was in flight (carried into the call, or answered ambiguous in
+  any round) the same transaction **raises the lease's epoch by one**, so that every earlier copy of those
+  rows still in the core's hands is refused as stale (§4). The way out, which the store reads before the
+  released rows, takes the first sequence returned; the rows released are fed again, once each, after it.
+  A round that decided nothing still backs off before it gives back. The invariant that makes this safe:
+  **a row's feed sequence is given back, and the row fed at another, only when the core has answered that
+  row `NotRun` in the send that gave it back; and when an earlier copy of the row may still be on its way
+  to the core, the same transaction raises the epoch above the one that copy was sent under.** Every other
+  answer keeps the rule above exactly (`Unavailable`, `Ambiguous`, `Gap`, `Fenced`, `Refused`).
 - Today the book has one writer, the core Agent, so there is one partition, `book`. The sharded profile
   routes each row to its payer's partition; that routing is `T-038-22`'s, and the lease and the sequencer
   are per partition already.
@@ -110,6 +125,13 @@ the next **feed sequence**.
 *Trade-off, stated plainly:* a row the core may have run (an ambiguous answer) keeps its place ahead of
 any reservation logged after it, where before the forwarder retried it first anyway; and every lease
 renewal is a write to ingress's database, every third of the lease.
+
+*Trade-off, stated plainly* `[PENDING AMENDMENT 0036]`: a row the core answers `NotRun` loses its place to the
+way out and to any reservation logged meanwhile, and is fed at more than one sequence, so "an input is never
+fed at two sequences" holds for every row the core has not certified and is replaced for a certified one by
+"decided exactly once, by key" (`INV-18`); the epoch now also rises when in-flight rows are given back; the rule
+is as strong as the core's `NotRun`, which must never be given for an input the core decided; and while the
+writer stays fenced with no valid way out each backoff period costs a send, a mark and a release.
 
 ### 4. The core host keeps the order (the sequencer)
 
@@ -125,6 +147,11 @@ the core input's JSON exactly as signed. The host's sequencer, in front of the A
    reply log without running again (`INV-18`); an early arrival is held for up to `hold_ms` (500) for the
    gap to fill, then refused (`Gap { expected }`), nothing run;
 4. hands the rest to the core as one batch (`apply_batch`, `T-031-04`), and answers each item.
+   `[PENDING AMENDMENT 0036]` An item the Agent's fence refused, and every later item of the call, is
+   answered `NotRun`: nothing ran, the expected sequence does not move past it, and it is never read as a
+   duplicate (a duplicate is below the expected sequence, a sequence the core took). An epoch below the
+   highest seen is refused whole, so an earlier copy of a row whose sequence was given back runs nothing
+   once the feeder's next feed, under the raised epoch, has reached the core.
 
 One mutex per partition serialises feeds from every stream and the socket. A host with `ingress_keys`
 refuses every unsequenced `apply` or `apply_batch` (an ingress of an earlier release, or anything unsigned)

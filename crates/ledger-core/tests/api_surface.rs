@@ -262,6 +262,13 @@ const SURFACE: &[(&str, &str)] = &[
         "set_authority_next",
         "sets the scheduled change of mode as the writer's hot row holds it (T-037-05)",
     ),
+    // T-037-05, owner ruling w6: the writer's scheduled upgrade, as `set_authority_next` is: the
+    // hot row's, given by `core-binding` before each input, and only what a move of it is checked
+    // against. It writes nothing to the book.
+    (
+        "set_scheduled_upgrade",
+        "sets the upgrade the writer has scheduled, which a move of it must go strictly later than (T-037-05)",
+    ),
     (
         "take_upgrade",
         "takes the upgrade the last commands scheduled, for the writer to schedule (T-037-04)",
