@@ -858,6 +858,9 @@ mod tests {
         }
         assert_eq!(got, Some(b"the package".to_vec()));
         assert!(cache.files().is_empty());
+    }
+
+    #[test]
     fn t037_21_the_cache_lists_the_digests_it_holds_and_reads_them_checked() {
         let (cache, src) = (Dir::new("cache"), Dir::new("src"));
         let (a, b) = (src.put_bytes(b"the package"), src.put_bytes(b"the runtime"));
