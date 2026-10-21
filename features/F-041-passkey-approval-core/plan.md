@@ -36,7 +36,8 @@ the book, so the book itself, and not only ingress, shows a person approved each
 - **What the core must be given.** The digest of F1 holds the deployment, the client key, the initiator, the
   acted-for identity, a payload digest and the command's canonical text, and not the operation reference. The core
   already knows the deployment and the caller; it does not receive the client key (amendment 0037, G4). B adds to
-  what the core receives: the client key, the canonical text and the payload digest. The core hashes exactly the bytes
+  what the core receives: the client key, the environment name (the core never sees it; it is part of the digest),
+  the canonical text and the payload digest. The core hashes exactly the bytes
   it was given, then **parses them, writes them again by the canonical rules and refuses any difference** from
   the command it decides, so a buggy or compromised ingress cannot send text that says one thing while the core
   decides another.

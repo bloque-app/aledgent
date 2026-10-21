@@ -51,7 +51,8 @@ Some terms, once, so the rest reads without a glossary.
   itself, and it is the thing a thief steals.
 - **Bearer secret.** A secret that proves who a caller is simply by being presented, as an issued secret (an API key)
   does, or a **configured token**: a secret an operator set up in ingress's configuration for a service, a partner or
-  an agent. Whoever holds it is the caller.
+  an agent. Whoever holds it is the caller. A session is not one: it stands for a sign-in made with a device, and it
+  is the thing a bearer secret is contrasted with below.
 - **Payload digest.** The fingerprint of extra material a command brings, such as the registration of a new device,
   so that the approval covers that material and not only the command's words.
 - **The current credential list.** The list of credentials an identity holds, as the book keeps it now.
@@ -60,7 +61,7 @@ Some terms, once, so the rest reads without a glossary.
 ## The problem
 
 A sign-in at ingress with a device-bound credential returns a session token that lasts fifteen minutes and serves
-any number of commands (`DEC-19`). The token is a bearer secret: whoever holds it acts as the holder. So, within
+any number of commands (`DEC-19`). The token is held by whoever presents it: whoever holds it acts as the holder. So, within
 those minutes, a stolen or leaked token can:
 
 - move value out of the holder's accounts;
@@ -127,8 +128,8 @@ Plainly, so nobody reads a choice into silence. Each is also in "Questions for t
 >   account, or change a credential. The default list is the table of amendment 0037, "Which commands". A
 >   deployment MAY add commands and MUST NOT remove one. It publishes the list with its limits (§8.2).
 > - **Which callers.** Decided by how the caller proved who it is, and by nothing else: not the kind of principal, and
->   not the route. A caller that proves who it is by a proof of possession made at the time needs an approval: a
->   session, which stands for a sign-in with a device-bound credential, or a signature by a key. A caller that
+>   not the route. A caller whose proof of who it is rests on a credential that signs needs an approval: a
+>   session, which stands for a sign-in made with a device-bound credential, or a signature by a key. A caller that
 >   presents a bearer secret as it is (an issued secret, or a token an operator configured for a principal) needs
 >   none, and nor does an input the book gives itself (a deadline, a settlement observation). Approvals themselves
 >   can be made only by a credential of a scheme that signs.
@@ -301,7 +302,7 @@ decision":
 >
 > **§2, glossary, two entries.** *Approval:* a proof of possession by a credential, over one command, that the command
 > may be taken in (`REQ-AU-23`). *Session:* a short-lived proof that a sign-in succeeded; it stands for the caller until
-> it expires and signs nothing. *Bearer secret:* a secret that proves who a caller is by being presented as it is.
+> it expires and signs nothing. *Bearer secret:* a secret that proves who a caller is by being presented as it is; a session is not one, because it stands for a sign-in made with a credential that signs.
 >
 > **`REQ-AU-20`, one sentence at the end of the first paragraph:** Adding or removing a credential is a command that
 > needs an approval (`REQ-AU-23`); adding a device-bound credential needs it from a credential already in the set, in
@@ -437,7 +438,7 @@ It is the SHA-256 of these fields, in this order, framed as above:
 | 1 | Tag | The ASCII text `aledgent/approval/command` (25 bytes). Separates this digest from every other the repository hashes |
 | 2 | Version | `0x01` |
 | 3 | Deployment | The book's identity, 16 bytes: the `deployment` of the genesis configuration. It separates two books with different genesis files. **It does not separate a restore or a clone of the same book**, which carry the same value |
-| 4 | Environment | The text of a new ingress setting, `environment`: a name the operator gives each running environment (for example `prod-eu`, `test`, a restore drill). It is configuration, not book state, so a restore does not bring it. Nothing in ingress's configuration does this today, so this amendment proposes adding it; ingress refuses to start with approvals on and no `environment` |
+| 4 | Environment | The text of a new ingress setting, `environment`: a name the operator gives each running environment (for example `prod-eu`, `test`, a restore drill). It is configuration, not book state, so a restore does not bring it. Nothing in ingress's configuration does this today, so this amendment proposes adding it; ingress refuses to start with approvals on and no `environment`. **A copied or duplicated name is not detected:** two environments given the same name are not separated. All ingress instances of one environment must hold identical values, and the roster check of `F-038` is where to compare them. The core never sees `environment`, so Feature B must carry it (G4) |
 | 5 | Client key | The key as ingress holds it: the bytes of the string the caller sent, or, when the caller sent none, the 64 hexadecimal characters ingress derives and returns (`REQ-OP-11`). The derivation reads the request only, so step 1 and step 5 derive the same key. Two deliberately identical payments sent with no key are therefore one request, as today, and the second is answered with the first's result |
 | 6 | Initiator | The text of the initiating principal, `did:aledgent:id:…` |
 | 7 | Acted-for flag | `0x00` if the command acts for nobody else; `0x01` if it acts for another identity |
@@ -789,9 +790,10 @@ it. A task of `F-040` shows the bound holds with approvals on (`T-040-07`).
 - **G3 — A credential added by the identities principal.** The identities principal is a service and presents a
   bearer secret, so it is exempt, and `REQ-AU-20` lets it add a credential to a managed identity's set. A person
   who wants the approval to cover that path needs the integrating party to stop using it, or Q-I.
-- **G4 — The core input lacks the client key.** F1's fourth field is the client key; the core receives only the
-  operation reference derived from it. Feature A needs nothing from the core. For B to recompute the digest, its
-  input must carry the client key, the acted-for flag, the canonical text and the payload digest. That is a change to
+- **G4 — The core input lacks the client key and the environment.** F1's fifth field is the client key; the core
+  receives only the operation reference derived from it, and it never sees `environment` (the fourth field). Feature A
+  needs nothing from the core. For B to recompute the digest, its input must carry the client key, the environment,
+  the acted-for flag, the canonical text and the payload digest. That is a change to
   what the core receives, and part of `F-041`.
 - **G5 — Today the record of approvals is ingress's, if anyone's.** Between A and B, an approval is written durably
   only in ingress's note (`T-040-09`, ruled).
@@ -834,7 +836,7 @@ These are not rulings. Each is something the brief did not state and the drafter
 
 Plain English, one decision each. Terms first: the **digest** is the short fingerprint of a command that the approval
 signs. **Ingress** is the front door that receives commands. **The core** is the part that keeps the book and decides.
-**The next core** is the next release of that part. Q-E of the earlier drafts was withdrawn: it asked about a setting
+**The next core** is the next release of that part. The **credential list** is the devices and keys an account's holder has registered. The **upgrade mode** is the rule that says who may schedule a new version of the book's program (amendment 0034). An **idempotency key** (the `client key` in the spec) is the label a caller chooses so that repeating a request is safe. Q-E of the earlier drafts was withdrawn: it asked about a setting
 that no longer exists. Nothing here blocks reading the amendment; Q-A is not needed to approve it.
 
 **Q-A. How should the book itself learn that a person approved? (You asked for both ways to be measured first.)**
@@ -865,7 +867,7 @@ that no longer exists. Nothing here blocks reading the amendment; Q-A is not nee
   (`ERR-CommandApprovalRequired`) will be in the spec before the next core, which carries it in its list, exists.
 - *Choices.* (a) Allow one named exception in the test until the next core. It weakens the guarantee that the two
   lists always match, for a while. (b) Switch the new rule on nowhere until the next core is out. No exception, but
-  the protection comes later. Also, which web status number should the new error carry? Proposal: the same as "not
+  the protection comes later. Also, which web response code (the number a web server answers with, such as 403 for "forbidden") should the new error carry? Proposal: the same as "not
   authorised".
 - *If you say nothing.* (a).
 - *Proposal.* (a).
@@ -878,16 +880,17 @@ that no longer exists. Nothing here blocks reading the amendment; Q-A is not nee
   100, and the noisier the machine, the more slowdown it lets through.
 - *The alternative.* You state the largest slowdown you accept as a plain percentage (say 3%), from what capacity you
   need. We then work out how many runs are needed to see a slowdown of that size, compare speeds as a ratio, and pass
-  only if we are 95% sure the loss is below your percentage (a one-sided t-based bound, with the number of warm-up
-  runs also fixed in advance).
+  only if we are 95% sure the loss is below your percentage (a standard statistical test for a small number of runs, "one-sided" because only a loss matters, with the number of
+  warm-up runs also fixed in advance).
 - *If you say nothing.* Both are reported; your 1.5 rule decides.
 - *Proposal.* The percentage rule decides. Which percentage?
 
 **Q-G. Which of these commands should need an approval?** One line each on what the command does and the proposal.
 - `register_integrating_party` records a partner company in the book; `tie_principal` links one of that partner's
-  service accounts to it, which decides whose client keys they share and who sees their attached notes. *Proposal: yes.*
+  service accounts to it, which decides whose idempotency keys (the labels callers choose to make repeats safe) they share and who sees their
+  attached notes. *Proposal: yes.*
 - `resume` restarts a stalled payment so it can go on to the outside world. *Proposal: yes.*
-- `upgrade` schedules a new version of the book's program. *Proposal: yes, by the credential the upgrade mode names.*
+- `upgrade` schedules a new version of the book's program. *Proposal: yes, by the credential the upgrade mode names for the caller.*
 - `reschedule_upgrade` postpones and `cancel_upgrade` calls off a scheduled upgrade. *Proposal: no*, because
   amendment 0034 lets any one member do it alone and quickly in an emergency. The cost: a stolen session of a member
   could keep postponing a security update with no device.
