@@ -1295,6 +1295,26 @@
         ],
         "type": "object"
       },
+      "CodeSourceMismatchBody": {
+        "description": "The answers one place of the code fetcher discarded (`T-037-06`).",
+        "properties": {
+          "count": {
+            "description": "Answers discarded, ever, since the host started.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "source": {
+            "description": "The place: `cache`, or a source's kind and position in the configured list, as `fs:0`.\nNever a path, a URL or a credential.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "count"
+        ],
+        "type": "object"
+      },
       "CommandReply": {
         "additionalProperties": false,
         "description": "The reply to a command (`REQ-CS-2`): an acknowledgement, not an outcome. Its state may be\n`Received`; a caller learns completion by notification or by `operation(reference)`\n(`REQ-CS-6`). There is no blocking \"wait until terminal\" reply.",
@@ -5038,6 +5058,13 @@
               }
             ],
             "description": "The book's size (`T-018-11`): what `T-036-17`'s disk-backed store is required by. Absent\nfrom a core that does not count it."
+          },
+          "code_source_mismatches": {
+            "description": "Answers the core host's code fetcher discarded because the bytes were not what their digest\nand length name (`T-037-06`, `aledgent_code_source_mismatch_total`), per place it asked: the\ncache and each configured source, each listed even at zero. Empty when the node has no\nsource of code, and from a core with none (the in-process core).",
+            "items": {
+              "$ref": "#/components/schemas/CodeSourceMismatchBody"
+            },
+            "type": "array"
           },
           "completion_p50": {
             "description": "Completion of commands at p50 and p99, in milliseconds, over ingress's latest samples\n(`NFR-15`, amendment 0007); absent before the first. Ingress's own, added by the surface.",

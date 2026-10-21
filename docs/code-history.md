@@ -118,6 +118,21 @@ sources = [
 ]
 ```
 
+In the core host the table is a file of its own, in JSON, named by `aledgent-core-host serve --code-config
+<file>` (the deployment file is shared with the front door, which refuses keys it does not know). It has the
+same keys. Today only `fs` is built in; any other `kind` stops the node at start, and without the flag the
+node has no source of code and refuses every `Upgrade`:
+
+```json
+{ "cache": "/srv/aledgent/code-cache",
+  "sources": [ { "kind": "fs", "path": "/srv/aledgent/code-src" } ] }
+```
+
+Paths are absolute. The cache must not be a source, inside one, or inside the state directory. One regular
+file per digest, named by its 64 lowercase hex digits; a symbolic link, a directory or a special file is never
+read. `aledgent_code_source_mismatch_total` has one label, `source`: `cache`, or the kind and position in the
+list (`fs:0`, `fs:1`).
+
 ### Built-in sources
 
 | Kind | What | Notes |

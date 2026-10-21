@@ -69,6 +69,7 @@ fn healthy() -> Snapshot {
             vos_unacknowledged: Some(0),
             // Fenced, but well inside `fence_alert_after`.
             writer_fenced_age: Some(299_000),
+            code_source_mismatches: Vec::new(),
             book: Some(BookSizeBody {
                 records: 600_000,
                 leaves: 2_400_000,

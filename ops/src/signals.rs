@@ -15,6 +15,7 @@
 //! | Block production (Kreivo's runtime) | `aledgent_finalized_height`, `aledgent_finalized_stall_ms` | adapter |
 //! | Completion (`NFR-15`, amendment 0007): ceiling 30 s, target 19 s, at p99 | `aledgent_completion_p99_ms`, `aledgent_completion_p50_ms` | ingress |
 //! | How long a writer has been fenced (`REQ-RT-20`, `T-037-15`): alert past `fence_alert_after`, five minutes by default | `aledgent_writer_fenced_seconds` | core host |
+//! | What the code fetcher discarded as not its digest's bytes (`REQ-RT-17`, `T-037-06`), by place; none while the node has no source of code | `aledgent_code_source_mismatch_total` | core host |
 //! | The release's signals (`T-018-10`): the core's halt, the audit trail's shipping, the runtime's Authority backlog, the adapter's service and finality; the sharded profile's lags and R-03's checks of the messages between Agents, deferred ([`RELEASE`], [`DEFERRED`]) | `aledgent_core_halted`, `aledgent_audit_*`, `aledgent_vos_unacknowledged_authority_decisions`, `aledgent_finality_lag_blocks` | core host; adapter |
 //!
 //! Beside them: anchoring's incidents and the latest settlement comparison (`F-017`), the
@@ -564,6 +565,23 @@ fn host(e: &mut Exposition, c: &SignalsBody) {
             &[],
             a.max_unshipped,
         );
+    }
+    // The code fetcher's discarded answers (`T-037-06`), one series per place it asks, each listed
+    // even at zero; none when the node has no source of code. The label is the place's name
+    // (`cache`, `fs:0`): never a path, a URL or a credential (`REQ-AU-8`).
+    if !c.code_source_mismatches.is_empty() {
+        e.declare(
+            "aledgent_code_source_mismatch_total",
+            "counter",
+            "Answers the code fetcher discarded because the bytes were not what their digest and length name (REQ-RT-17), by place: the cache or a configured source.",
+        );
+        for m in &c.code_source_mismatches {
+            e.sample(
+                "aledgent_code_source_mismatch_total",
+                &[("source", &m.source)],
+                m.count,
+            );
+        }
     }
     if let Some(u) = c.vos_unacknowledged {
         e.gauge(
