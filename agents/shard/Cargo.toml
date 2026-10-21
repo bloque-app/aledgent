@@ -35,10 +35,10 @@ crate-type = ["rlib", "cdylib"]
 # BLAKE2b (`vos-blake2b`), and the empty-subtree chain is a static table (0004, applied by
 # tools/cipherclerk-patched.sh). Curve arithmetic is in software unless `native-curve` (outside JAM).
 cipher-clerk = { git = "https://codeberg.org/Virto/CipherClerk.git", rev = "e9a7b0851f183c14dbd1635dbf0437c86682ad6f", default-features = false, features = ["vos-blake2b"] }
-vos = { git = "https://codeberg.org/pandres95/VOS.git", rev = "e2d59d17a7234a3f0bc0ab3a29720caa722991b3", default-features = false, features = ["macros", "pvm"] }
+vos = { git = "https://codeberg.org/pandres95/VOS.git", rev = "bd8d1bb70551391a4c80a96c2249313ab7e0a0fc", default-features = false, features = ["macros", "pvm"] }
 
 [target.'cfg(not(target_arch = "riscv64"))'.dependencies]
-vos = { git = "https://codeberg.org/pandres95/VOS.git", rev = "e2d59d17a7234a3f0bc0ab3a29720caa722991b3", default-features = false, features = ["macros", "extension"] }
+vos = { git = "https://codeberg.org/pandres95/VOS.git", rev = "bd8d1bb70551391a4c80a96c2249313ab7e0a0fc", default-features = false, features = ["macros", "extension"] }
 
 [dependencies]
 # Everything the shard Agents decide (Apache-2.0 OR MIT, no VOS).

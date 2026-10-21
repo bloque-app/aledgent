@@ -118,7 +118,7 @@ pub fn upgrade_request(
         .state_layout_hash()
         .map_err(|e| DriverError::Runtime(format!("state layout: {e:?}")))?;
     let direction = Direction::of(installed.program, package);
-    Ok(sdk::UpgradeActor {
+    let request = sdk::UpgradeActor {
         actor,
         from_deployment: installed.deployment,
         to_deployment: package.deployment(),
@@ -139,7 +139,34 @@ pub fn upgrade_request(
             Direction::Revert(from) => Some(from),
             _ => None,
         },
-    })
+    };
+    ensure_claim_signed(&request, package)?;
+    Ok(request)
+}
+
+/// The host-side check that a claim in `request` is one `package`'s producer signed
+/// (`T-037-19`): the runtime never sees manifests, and this host does not go through VOS's
+/// `validate_sdk_actor_upgrade`, so it asks the admitted package
+/// ([`AdmittedActorPackage::signs_state_claim_of`]) before the request is built into a receipt.
+/// A request without a claim needs nothing from the manifest.
+///
+/// # Errors
+///
+/// [`DriverError::Refused`], a refusal the switch counts: the package does not sign the claim, so
+/// asking again changes nothing.
+pub fn ensure_claim_signed(
+    request: &sdk::UpgradeActor,
+    package: &AdmittedActorPackage,
+) -> Result<(), DriverError> {
+    if package.signs_state_claim_of(request) {
+        Ok(())
+    } else {
+        Err(DriverError::Refused(format!(
+            "the package's producer does not sign the state claim {:?}: its manifest names {:?}",
+            request.state_compatible_from,
+            package.manifest().state_compatible_with
+        )))
+    }
 }
 
 /// The core Agent's bounds, with `F025_ACTOR_GAS` (gas units) overriding the gas for a bench;
@@ -683,9 +710,9 @@ impl Runtime {
     /// installation data.
     ///
     /// **A stateful actor** (one with lanes, the core) changes its program only on the claim of
-    /// the package's producer (an assertion this host copies from the manifest and the authority
-    /// signs, which the runtime does not check against the manifest, and which the producer key
-    /// does not make trustworthy: `package` signs with a fixed key), or as the revert of such a change, which the request carries
+    /// the package's producer (an assertion this host checks against the manifest before it sends
+    /// it, [`ensure_claim_signed`], because the runtime never sees manifests, and which the
+    /// producer key does not make trustworthy: `package` signs with a fixed key), or as the revert of such a change, which the request carries
     /// ([`Direction`], [`upgrade_request`], `T-037-19`): the patched runtime refuses it otherwise
     /// (`UnsupportedLane`). It checks the claim names the program installed now, or, for a revert,
     /// that the target is exactly what the last claimed change replaced and no lane was written
@@ -1043,6 +1070,44 @@ mod tests {
             lanes: package.requirements().lanes,
             suspended: false,
         }
+    }
+
+    /// `T-037-19`: the host asks the package before it sends a claim; the runtime cannot.
+    #[test]
+    fn t037_19_a_claim_the_producer_did_not_sign_is_refused_here() {
+        let agent = AgentId([6; 32]);
+        let g0 = admitted(1, &[]);
+        let installed = entry_of(agent, "counter", &g0);
+        let actor = installed.actor;
+        let other = admitted(3, &[]).program();
+
+        // A request built from a package that signs its claim passes.
+        let g1 = admitted(2, &[g0.program()]);
+        let ok = upgrade_request(actor, &installed, &g1).unwrap();
+        assert_eq!(ok.state_compatible_from, Some(g0.program()));
+        ensure_claim_signed(&ok, &g1).unwrap();
+
+        // The same request over a package whose manifest names nothing, or another program, or
+        // its own program: refused, as a refusal the switch counts.
+        let silent = admitted(2, &[]);
+        let named_other = admitted(2, &[other]);
+        for package in [&silent, &named_other, &g1] {
+            let mut forged = ok.clone();
+            forged.state_compatible_from = Some(if package.program() == g1.program() {
+                package.program()
+            } else {
+                g0.program()
+            });
+            let e = ensure_claim_signed(&forged, package).unwrap_err();
+            assert!(
+                matches!(&e, DriverError::Refused(w) if w.contains("does not sign")),
+                "{e:?}"
+            );
+        }
+        // A request with no claim needs nothing from the manifest (a revert, a repackage).
+        let back = upgrade_request(actor, &entry_of(agent, "counter", &g1), &g0).unwrap();
+        assert_eq!(back.state_compatible_from, None);
+        ensure_claim_signed(&back, &silent).unwrap();
     }
 
     #[test]

@@ -359,7 +359,7 @@ mod tests {
             writer: WriterKind::Core,
             platform: Platform {
                 name: "vos-saga".into(),
-                revision: "e2d59d17".into(),
+                revision: "bd8d1bb7".into(),
                 identities: Vec::new(),
             },
             generation: 0,

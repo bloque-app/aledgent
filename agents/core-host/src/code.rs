@@ -51,7 +51,7 @@ pub const PLATFORM: &str = "vos-saga";
 
 /// The revision of [`PLATFORM`] this host links: the VOS commit `agents/Cargo.toml` pins (a test
 /// keeps the two equal). A manifest naming another revision is another platform's code.
-pub const PLATFORM_REVISION: &str = "e2d59d17a7234a3f0bc0ab3a29720caa722991b3";
+pub const PLATFORM_REVISION: &str = "bd8d1bb70551391a4c80a96c2249313ab7e0a0fc";
 
 /// The `blake2b-256` of the standard AgentRuntime built from the VOS at [`PLATFORM_REVISION`] and
 /// linked as the image links it (`runtime-pvm`, Gray Paper calls only), in hex (`T-037-19`). The

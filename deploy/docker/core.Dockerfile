@@ -77,7 +77,7 @@ ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7d
 # Steps 1 to 3: the host.
 FROM ${BUILD_IMAGE} AS host
 ARG VOS_URL=https://codeberg.org/pandres95/VOS.git
-ARG VOS_REV=e2d59d17a7234a3f0bc0ab3a29720caa722991b3
+ARG VOS_REV=bd8d1bb70551391a4c80a96c2249313ab7e0a0fc
 # The one toolchain of agents/ and of VOS's standard runtime at VOS_REV.
 ARG GUEST_TOOLCHAIN=nightly-2026-03-20
 # The runtime's cargo features: its profile (proposals/vos/0008). Empty: JAM-compatible
@@ -211,7 +211,7 @@ FROM ${RUNTIME_IMAGE} AS core-on-genesis
 ARG ROOTS
 ARG GENESIS_IMAGE
 ARG VOS_URL=https://codeberg.org/pandres95/VOS.git
-ARG VOS_REV=e2d59d17a7234a3f0bc0ab3a29720caa722991b3
+ARG VOS_REV=bd8d1bb70551391a4c80a96c2249313ab7e0a0fc
 LABEL org.opencontainers.image.title="aledgent-core" \
       org.opencontainers.image.description="aledgent core as a VOS Agent: the current aledgent-core-host serve, with the genesis image's agent_runtime.pvm and core.vos (F-038 §12 step 0)" \
       org.opencontainers.image.source="https://github.com/bloque-app/aledgent" \
@@ -236,7 +236,7 @@ CMD ["serve", "--config", "/etc/aledgent/ingress.json", \
 FROM ${RUNTIME_IMAGE} AS core
 ARG ROOTS
 ARG VOS_URL=https://codeberg.org/pandres95/VOS.git
-ARG VOS_REV=e2d59d17a7234a3f0bc0ab3a29720caa722991b3
+ARG VOS_REV=bd8d1bb70551391a4c80a96c2249313ab7e0a0fc
 LABEL org.opencontainers.image.title="aledgent-core" \
       org.opencontainers.image.description="aledgent core as a VOS Agent (F-005): aledgent-core-host serve, with agent_runtime.pvm and core.vos" \
       org.opencontainers.image.source="https://github.com/bloque-app/aledgent" \
