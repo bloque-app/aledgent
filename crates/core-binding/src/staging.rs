@@ -243,7 +243,7 @@ pub enum Restaged {
 /// the version not staged), and a host restarted after the switch cannot name the version it runs.
 ///
 /// Each version is fetched and checked as staging checks it, held to the generation the book gives
-/// it ([`fetch_generation`]); the port checks it again ([`AgentPort::restage_code`]). The sources
+/// it ([`fetch_generation`]); the port checks it again ([`crate::host::AgentPort::restage_code`]). The sources
 /// are untrusted as ever: the node's cache answers first. Call it before the start check
 /// ([`crate::host::Driver::ensure_code`]).
 ///
