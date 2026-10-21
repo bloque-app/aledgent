@@ -195,7 +195,7 @@ pub fn decide(
 /// (`T-037-23`): what the execution node says in its log, one plain line each, naming the input.
 /// The driver records them as inputs commit and the core drains them ([`code_events`]); they are
 /// never written to the book.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CodeEvent {
     /// The platform was made to run `code` for input `input`, which it did not run before: the
     /// switch to *H* before input *n*, or the reinstall of *g* after a way out. `from` is the
@@ -238,6 +238,40 @@ pub enum CodeEvent {
         /// The input it applies from.
         from: u64,
     },
+    /// The writer refused an `Upgrade` to `code` from input `from` and recorded the refusal,
+    /// which took input `input` (the door's own refusals take none: the host logs those).
+    UpgradeRefused {
+        /// The input the refusal took.
+        input: u64,
+        /// The code version asked for.
+        code: [u8; 32],
+        /// The input it asked to apply from.
+        from: u64,
+        /// The condition the writer gave (`ERR-…`).
+        condition: alloc::string::String,
+    },
+}
+
+/// The `Upgrade` calls among an input's recorded calls that the writer refused (`T-037-23`): one
+/// event each, naming the input the refusal took.
+pub fn refused_upgrades<'a>(
+    seq: u64,
+    calls: impl Iterator<Item = (&'a Call, &'a ledger_core::call::Summary)>,
+) -> alloc::vec::Vec<CodeEvent> {
+    use ledger_core::call::Summary;
+    calls
+        .filter_map(|(call, summary)| match (call, summary) {
+            (Call::Upgrade { code, from, .. }, Summary::Refused(condition)) => {
+                Some(CodeEvent::UpgradeRefused {
+                    input: seq,
+                    code: *code,
+                    from: *from,
+                    condition: condition.clone(),
+                })
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// What input `seq` did to the writer's code, `before` it and `after` it ([`decide`]'s inputs and
