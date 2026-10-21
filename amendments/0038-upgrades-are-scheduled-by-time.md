@@ -208,18 +208,23 @@ and within the heartbeat if `next_due` cannot be read.
   clock is authoritative, is still open). A leader whose clock runs ahead raises the book clock for good, and
   fixes every pending upgrade early in real time, as it already fires every deadline early. Today the operator
   can bring a numbered upgrade forward in real time by generating inputs. Neither form defends against the
-  operator's own infrastructure; the mode's authorisation does, and is unchanged.
+  operator's own infrastructure; the mode's authorisation does, and is unchanged. This amendment does not close
+  `OQ-36`: its answer would change only where the book clock's time comes from, not how an upgrade uses it.
 - **The delay stays in inputs** in this draft, so it still shrinks in real time when traffic grows. Q1 asks
   whether to move it to time as well.
 - **Changes of mode stay in inputs** (`SetAuthority { from }`, `MAX_LEAD` 2¹⁷ inputs), with the same unknown
   rate. Q1 asks about them too. The "about 91 days" in amendment 0034's first clarification should read "about 91
   days at the ticker's floor of one input a minute, and less at any real traffic".
 - **Up to 91 days of waiting means the core host will restart in between.** A restart today loses the staged
-  version (gap G2 in the rehearsal runbook); PR #55 (`T-037-21`) re-stages it at start. Scheduling by time makes
-  that a hard prerequisite: the time form must not be offered by the door before it is merged.
+  version (gap G2 in the rehearsal runbook). PR #55 (`T-037-21`) re-stages at start the versions **the hot row**
+  names; while an upgrade is pending by time the hot row names none, and *H* is only in the `upgrade-at` record.
+  So the re-stage at start must also read that record (`T-037-22`). Without it, a restart during the wait leaves
+  *H* unstaged, the switch at *n* finds it missing, and the writer stays fenced until a way out: closed, but the
+  feature defeated. The door must not offer the time form before both are merged.
 - **Two forms are carried for good.** The library keeps the number form for replay, whatever the door offers.
   That is code that already exists and is already tested.
-- **The upgrade lands within about a second of *T*, not at *T*.** Within the heartbeat if `next_due` fails.
+- **The upgrade lands within one tick interval of *T*, not at *T*.** That is one second as deployed
+  (`tick_interval_ms` = 1000 in `deploy/templates/ingress.json`), and the 60 s heartbeat if `next_due` fails.
 
 ---
 
@@ -322,7 +327,9 @@ What follows names plan facts (the hot row, the call format, the ticker), so it 
 | `crates/ledger-core/src/code.rs` | `WayOut::RescheduleAt { from_time }`: `apply` clears a fixed upgrade (the library writes the record) |
 | `crates/ledger-core/src/ledger/anchoring.rs` | `next_due` includes a pending *T* |
 | `crates/core-binding/src/fence.rs` | `way_out_of` recognises `RescheduleUpgradeAt`. `admit`, `decide`, `WriterCode` unchanged |
-| `services/ingress/src/operator.rs`, `surface.rs`, `openapi.json`, `wire.rs` | The time form on the `CTR-OPS` routes, behind the writer's code knowing it |
+| `services/ingress/src/operator.rs`, `surface.rs`, `openapi.json`, `wire.rs` | The time form on the `CTR-OPS` routes, behind the writer's code knowing it. `OperatorOp::code_input` covers both new forms: `UpgradeAt` is `CodeInput::Upgrade`, staged before it is logged as `Upgrade` is (`REQ-RT-16`, `T-037-04`); `RescheduleUpgradeAt` is `CodeInput::WayOut`, so it overtakes the forwarder's queue (`T-037-04`, amendment 0036) and cannot wait behind the head row of a fenced writer |
+| `core_binding::staging::restage` and the core host's start (PR #55, `T-037-21`) | Also stage again the version a pending `upgrade-at` record names |
+| `export_book` (`T-037-17`'s interim refusal) | Also refuses a book that holds a pending `upgrade-at` record, until the export carries it as it will carry the mode |
 | `ops/runbooks/release/` | Scheduling by date; reading the pending record |
 
 Not changed: `hot.rs` (the `Hot` struct, `LAYOUT`, `LOG_DOMAIN`), `envelope.rs` (`Fenced`, `InputEnvelope`),
@@ -357,8 +364,21 @@ fixing tick.
 
 | ID | Task | Traces | Done when |
 |---|---|---|---|
-| T-037-22 | Upgrades scheduled by time (amendment 0038): the `upgrade-at` record; `UpgradeAt`, `RescheduleUpgradeAt`, `ProposeUpgradeAt` (codes 58 to 60) beside the number forms, which keep their decisions; the fixing in the tick (*n* = the later of the fixing input + 1 and `not_before`); the longest lead of 91 days and the shortest (later than the book clock); a book with no clock refuses; the way-out and upgrade tables; `next_due` includes *T*; the door's time form, offered only for a writer whose code knows it and only once `T-037-21` is merged | `REQ-RT-16`, `REQ-RT-20`, `REQ-RT-17`, `REQ-RT-18`, `REQ-RT-7` | `AC-K7.24` to `AC-K7.28` pass, and the plan criteria above; the `code-history` fixtures (`T-037-12`, D18) include a move by time decided by both generations |
+| T-037-22 | Upgrades scheduled by time (amendment 0038): the `upgrade-at` record; `UpgradeAt`, `RescheduleUpgradeAt`, `ProposeUpgradeAt` (codes 58 to 60) beside the number forms, which keep their decisions; the fixing in the tick (*n* = the later of the fixing input + 1 and `not_before`); the longest lead of 91 days and the shortest (later than the book clock); a book with no clock refuses; the way-out and upgrade tables; `next_due` includes *T*; the door's time form, offered only for a writer whose code knows it and only once `T-037-21` is merged; the re-stage at start reads the pending record; the export's interim refusal covers it | `REQ-RT-16`, `REQ-RT-20`, `REQ-RT-17`, `REQ-RT-18`, `REQ-RT-7` | `AC-K7.24` to `AC-K7.28` pass, and the plan criteria above; the `code-history` fixtures (`T-037-12`, D18) include a move by time decided by both generations; an `UpgradeAt` whose code cannot be staged is refused before it is logged; a `RescheduleUpgradeAt` logged behind a carried row reaches a fenced writer first (as `ac_k7_12_a_way_out_overtakes_a_row_carried_from_an_ambiguous_send` shows for the number form); a core host restarted while an upgrade is pending by time has *H* staged again at start, and the switch at *n* finds it; an export of a book with a pending record is refused |
 | T-037-23 | *Only if the owner answers Q1 "yes":* the mode's delay and changes of mode by time: `Mode` gains a delay in milliseconds under a new mode domain (`aledgent/upgrade-authority/v2`), `SetAuthority` gains a time form, `MAX_DELAY` and `MAX_LEAD` for modes become 45 and 91 days | `REQ-RT-18` | `AC-K7.7` and `AC-K7.8` pass under the time form; a mode with a delay gives the same refusals at any input rate |
+
+### Existing rows that change (proposed, not applied)
+
+- `T-037-04`: staging before logging, and overtaking the forwarder's queue, cover `UpgradeAt` and
+  `RescheduleUpgradeAt` as they cover `Upgrade` and `RescheduleUpgrade`.
+- `T-037-05` and `T-037-15`: owner rulings w6 and w9 hold in time as well: a move by time goes strictly later than
+  the scheduled time (or, once *n* is fixed, never fixes a new *n* at or before it), and at most 91 days after the
+  book clock at its own input.
+- `T-037-09`: the code map is derived from the upgrade inputs of both forms, the way outs of both forms, **and the
+  ticks** (the book clock), not from the first three alone.
+- `T-037-17`: a founding is made only once *n* is fixed; the interim export refusal also covers a pending
+  `upgrade-at` record.
+- `T-037-21` (PR #55): the re-stage at start also reads the pending record.
 
 **Size, honestly.** `T-037-22`: about 5 days of a developer's work (4 to 6): 2 in the library (calls, record, tick,
 tables, authority), 1 in the binding and its tests across the replica, the Agent and the mapped layout, half a day
