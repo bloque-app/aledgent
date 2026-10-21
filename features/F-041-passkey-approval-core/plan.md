@@ -13,7 +13,7 @@ written down before anyone asks for it.
 
 | | |
 |---|---|
-| Milestone | Not assigned. Delivered as the next re-genesis's genesis code or as a core upgrade; the owner decides after `T-041-00` (amendment 0037, Question 10) |
+| Milestone | Not assigned. Ships in the next core, as a core upgrade (`F-037`), after `T-041-00` (owner's ruling of 2026-10-21), not in the next re-genesis |
 | Home | `crates/ledger-core` (the record, the check, the refusal), `crates/core-binding` and `crates/core-archive` (checkpoints, export, import), `agents/core` and `agents/core-host` (the trusted set, the host's side), `services/ingress` (attaching the record), `crates/conformance` |
 | Depends on | `F-040` (the formats frozen, ingress asking for approvals), `F-035` (ingress's signing key sits in the key boundary), `F-037` (a core upgrade, if that is the delivery), amendment 0037 |
 | Unblocks | Proof in the book that a person approved each command |
@@ -37,16 +37,30 @@ the book, so the book itself, and not only ingress, shows a person approved each
   reference derived from it. B adds the client key to what the core receives (amendment 0037, G7). The proposal
   for the canonical text: ingress sends it, and the core hashes exactly the bytes it was given and then parses
   them. The core never re-serialises a command to hash it.
-- **The hash.** F1's digest is SHA-256 unless the owner picks the BLAKE2b the core already uses (Question 6). The
-  core does not link SHA-256 today. If SHA-256 stays, this feature adds it to the core program, a small
-  dependency whose size and time `T-041-00` includes.
+- **The hash.** F1's digest is SHA-256 (ruled). The core links only BLAKE2b today, so this feature adds SHA-256 to
+  the core program, a small dependency whose size and time `T-041-00` includes.
 - **The signature.** The proposal: CipherClerk's Schnorr signature over Ristretto255, which the core already verifies
   for `key` credentials, so the program gains no new cryptography. A proposal to confirm in `T-041-02`; it fixes
   the record's last 64 bytes.
 - **The key.** Ingress's signing key sits in the key boundary like the feed key (`F-035`). Rotating it needs a
   trusted set with ids; the record's key id names one.
-- **The refusal.** Under either option of amendment 0037, R2, the refusal is a line in the core's list. If
-  `T-040-10` kept it outside, this feature brings it in.
+- **The refusal.** `ERR-CommandApprovalRequired` joins the core's own list with the next core (amendment 0037, R2,
+  ruled), which removes the named exception `T-040-10` added to the conformance check.
+
+## An open design fork (the owner's; not decided here)
+
+Amendment 0037 (Q-A) records a fork this stub does not settle, and which `T-041-01` waits for. Either:
+
+1. **The core trusts a digest of ingress's approval.** The core keeps accepting direct proofs only from `key`
+   credentials. Every other scheme, present or future, is approved by ingress, which is a principal of its own, and
+   the core trusts a digest of that approval, as it already trusts the passkey check ingress did for
+   `reclaim_custody`; or
+2. **The core records an ingress-signed approval record for each command**, which is this feature as drafted.
+
+What each gives, plainly. The record of 2 is signed by ingress, so it cannot detect a compromised ingress. It adds
+evidence in the book of who approved what, and protects against a path that bypasses ingress. In both designs ingress
+vouches for the passkey. Only the core verifying the assertion itself would protect against a compromised ingress, and
+`DEC-19` rejected that. Everything below describes design 2.
 
 ## What it costs (an estimate; nothing is measured yet)
 
@@ -72,8 +86,16 @@ These come from reading the code and are not from a run. `T-041-00` replaces eve
    book per million commands, and the change in a checkpoint's and an export's size and time. A recommendation, set
    against the owner's threshold.
 
-The owner sets the threshold of "acceptable" **before the run**, in the task file and in a commit that precedes the
-run's. Without it, the number means nothing (amendment 0037, Question 9).
+**The threshold (owner's ruling of 2026-10-21).** The measured throughput with approval records must not fall more
+than 1.5 standard deviations of the baseline's run-to-run variation below the baseline mean. Latency (p50, p99), the
+book's growth and the checkpoint figures are reported and are not gated.
+
+**To be confirmed by the owner before the run.** 1.5 standard deviations is close to "no measurable slowdown": a
+baseline's own runs fall that far below its mean now and then, so a harmless change can fail it and a small real
+slowdown can pass it. And a standard deviation means little from a few runs, so the baseline needs **at least 10
+runs** on one machine (more if the variation is large), each long enough to be stable, and the run with records the
+same number. The threshold is written in `tasks.md` and committed before the run, so the number cannot be chosen
+after the result (amendment 0037, Q-F).
 
 ## Order
 
@@ -81,8 +103,8 @@ run's. Without it, the number means nothing (amendment 0037, Question 9).
 2. If the cost is acceptable, `T-041-01` (the amendment), `T-041-02`, `T-041-03`, `T-041-04`, `T-041-05`.
 3. `T-041-06` after the measurement, with the owner.
 
-Because `F-037` is merged, B can be delivered as an upgrade of the core after production is founded, so B need not
-block the next re-genesis. Only amendment 0037 and F1 to F3 must be settled before it.
+B ships as a core upgrade in the next core (`F-037`), so it does not block the next re-genesis. Only amendment 0037
+and F1 to F3 must be settled before it.
 
 ## Out of scope
 

@@ -8,16 +8,16 @@ SPDX-License-Identifier: CC-BY-4.0
 **Status:** **awaiting the owner's approval.** The direction was ruled on 2026-10-19 (the ruling that a passkey
 approves one transaction, not a session) and on 2026-10-20 and 2026-10-21 (owner answers on the Decisions form:
 the work is split in two features; this amendment and its design are public in this repository, ruling `w12` (a)).
-The text below is the drafter's reading of those rulings, worked through to rules and byte formats. It is **not
-approved**. Nothing in `SPEC.md` or `PLAN.md` changes with this file: the proposed spec text is marked as such, and
+The owner answered the first draft's ten questions on 2026-10-21; this version applies those answers (see "Rulings
+applied", near the end). The text below is the drafter's reading of the rulings, worked through to rules and byte
+formats. It is **still not approved**. Nothing in `SPEC.md` or `PLAN.md` changes with this file: the proposed spec text is marked as such, and
 the plan sites will cite `[PENDING AMENDMENT 0037]` once the owner approves. The features that build it
 (`F-040`, `F-041`) merge no code before that.
 **Target:** `SPEC.md` v0.4.28 as on `develop`. Amendment 0036 (PR #50, also awaiting approval) touches `REQ-RT-20`
 and `US-K7` and no clause named here. `PLAN.md` `DEC-19`, plus a new decision (see "Plan").
 **Date:** 2026-10-21
 **Number:** 0036 is taken by an open pull request (#50); this is the next free one.
-**Adds:** `REQ-AU-23`, `US-A10` with `AC-A10.1` to `AC-A10.10`, one refusal in §10 (its name is the first question
-below), and one sentence in `REQ-CS-8`. Nothing is withdrawn. Nothing existing is renumbered.
+**Adds:** `REQ-AU-23`, `US-A10` with `AC-A10.1` to `AC-A10.11`, one refusal in §10 (`ERR-CommandApprovalRequired`), and one sentence in `REQ-CS-8`. Nothing is withdrawn. Nothing existing is renumbered.
 **Serves:** `REQ-AU-1`, `REQ-AU-7`, `REQ-AU-20`, `REQ-AU-21`, `REQ-CS-4`, `REQ-OP-10`, `NFR-1`, `NFR-7`.
 **Rationale in one line:** today a passkey sign-in buys a session that serves every action for fifteen minutes, so
 whoever holds a stolen session token can move the holder's value and even add their own passkey; one approval per
@@ -68,17 +68,20 @@ The passkey proves possession of a device when it signs in. After that, nothing 
 6. **A retry** of an approved command under the same client key is answered from the first result and needs no new
    approval.
 7. **Place.** The amendment and the design are public (`w12` (a)).
+8. **Schemes.** The per-transaction rule applies only to credentials of a scheme that *signs*: `key` and passkey
+   (`webauthn-es256`). It does not apply to `api-key`, which signs nothing (2026-10-21).
+9. **Any of the identity's passkeys may approve**, not only the one that signed in (2026-10-21).
 
 ## What this amendment does not decide
 
-Plainly, so nobody reads a choice into silence. Each is also in "Questions for the owner" or "Gaps".
+Plainly, so nobody reads a choice into silence. Each is also in "Questions for the owner (still open)" or "Gaps".
 
-- The refusal's name (taken; see R2).
-- Whether the new refusal's line may enter the core's library list, which changes the core program (R2).
-- Which of the holder's passkeys may approve a command (G2).
-- The borderline commands of the table in R1.
-- Whether the digest is a SHA-256 or the BLAKE2b the core already uses (F1).
-- Anything about Feature B beyond its record's bytes (F3): its delivery, its throughput threshold, its signature scheme.
+- Which design Feature B takes: the core trusting a digest of ingress's approval, or the core recording an
+  ingress-signed record per command (the fork in "Questions for the owner (still open)", Q-A).
+- The bytes of the approval a `key` credential gives (G9).
+- Whether the approving passkey's own scope must cover the accounts a command touches (G2).
+- How the closed list of refusals is kept true between Feature A and the next core (R2, Q-D).
+- Anything about Feature B beyond its record's bytes (F3): its signature scheme and its threshold's confirmation.
 
 ---
 
@@ -87,27 +90,29 @@ Plainly, so nobody reads a choice into silence. Each is also in "Questions for t
 > **Proposed text. Applied nowhere.**
 >
 > **`REQ-AU-23`** **A person approves each command that matters, one command at a time.** An **approval** is a
-> proof of possession, made at a person's device with a device-bound credential of the initiating identity, over
-> one command: who initiates it, which operation it acts under, its client key, and everything it carries that
-> decides what it does. An approval approves that command and no other, once. A session, a token or an issued
+> proof of possession, made with a credential of the initiating identity whose scheme signs (a key, or a
+> device-bound credential), over one command: who initiates it, which operation it acts under, its client key, and
+> everything it carries that decides what it does. An approval approves that command and no other, once. A session, a token or an issued
 > secret never stands in for it.
 >
 > - **Which commands.** Every command that moves or reserves value, changes who may act on an account, or changes
 >   a credential. A deployment MAY add commands to that list and MUST NOT remove one. It publishes the list with
 >   its limits (§8.2).
-> - **Which callers.** A command submitted by a caller that authenticated with a device-bound credential needs an
->   approval. A command submitted with an issued secret or a configured service token does not, and nor does an
->   input the book gives itself (a deadline, a settlement observation): no person is behind them. A deployment MAY
->   also require an approval for every command of an identity of kind person, whatever credential it presents, so
->   long as that identity's credential set holds a device-bound credential able to give one.
+> - **Which callers.** A command submitted by a caller that authenticated with a credential of a scheme that signs
+>   (a key, or a device-bound credential) needs an approval. A credential of a scheme that signs nothing, such as
+>   an issued secret, is exempt, and so is a configured service token and any input the book gives itself (a
+>   deadline, a settlement observation): no person is behind them.
+> - **Who approves.** Any active credential of the initiating identity's set that is of a scheme that signs, not
+>   only the one the caller signed in with. A device-bound approval MUST carry the device's user verification (its
+>   PIN, fingerprint or face), whatever the deployment asks of sign-in.
 > - **Sessions.** A session proves who is calling, for sign-in and for reads. It does not approve a write. Adding a
->   device-bound credential to a set needs an approval from a device-bound credential already in that set, in
->   addition to the ceremony of `REQ-AU-20`.
+>   device-bound credential to a set needs an approval from a credential already in that set, in addition to the
+>   ceremony of `REQ-AU-20`.
 > - **No approval.** A command that needs an approval and carries none MUST be refused with the refusal of R2, and
 >   nothing is taken in: no operation reference, no row, no state.
 > - **A bad approval.** An approval that does not verify, that was already used, that has expired, that was
 >   issued for another command or for another identity, or that a credential outside the initiating identity's set
->   made, MUST be refused with `ERR-CredentialInvalid`, whichever of those it is, with nothing taken in
+>   made, or that lacks user verification, MUST be refused with `ERR-CredentialInvalid`, whichever of those it is, with nothing taken in
 >   (`REQ-ER-3`).
 > - **Once, everywhere.** An approval is valid for a stated, short time and is accepted once, by any instance of the
 >   component that receives commands and also after a restart.
@@ -135,7 +140,8 @@ Plainly, so nobody reads a choice into silence. Each is also in "Questions for t
   a program that submits commands on its own. It does not stop malicious code in the holder's own browser.
   Showing the person what they approve is the client's duty; this amendment gives it the digest and the command
   to show, and no more.
-- **Exempt callers are exempt.** An issued secret and a service token still move value with no approval. The
+- **Exempt callers are exempt.** An API key (it signs nothing, so it cannot approve) and a service token still move
+  value with no approval. The
   identities principal can still add a credential to the set of an identity it manages (`REQ-AU-20`, clause R2 of
   amendment 0025), with no approval, because it is a service. Trust in those callers is the integrating party's
   and the operator's, as it is today.
@@ -147,42 +153,26 @@ Plainly, so nobody reads a choice into silence. Each is also in "Questions for t
   sync between devices (as at sign-in today). For those, the one-time number and the short expiry are the only
   protection against a replayed approval.
 
-## R2 — §10: the refusal, and a clash with an existing name
+## R2 — §10: the refusal
 
-The owner's rulings call the new refusal `ERR-ApprovalRequired`. **That identifier is already in §10**, with another
-meaning:
+The owner named the new refusal `ERR-ApprovalRequired` and then ruled (2026-10-21) that it is called
+**`ERR-CommandApprovalRequired`**, because `ERR-ApprovalRequired` is already in §10 with another meaning, a second
+principal approving a reversal. That one is not touched.
 
-> `ERR-ApprovalRequired` — A reversal, or a release without proof (`REQ-RC-5` step 3), was submitted without a
-> second, distinct principal approving it (`REQ-OS-3`).
-
-It is also a variant of `Refusal` in `ledger-core` and in `services/ingress/openapi.json`. Identifiers are stable
-(`SPEC.md` §0), so this amendment does not decide how to resolve it. Both are written out, as marked text. The
-**working name used everywhere else in this file is `ERR-CommandNotApproved`**, option (b); option (a) swaps the
-existing name in with no other change.
-
-> **Proposed text. Applied nowhere. Option (b), a new identifier, recommended.**
+> **Proposed text. Applied nowhere.**
 >
 > Add to the table of §10, after `ERR-ApprovalRequired`:
 >
-> | `ERR-CommandNotApproved` | A command that needs a person's approval of that one command (`REQ-AU-23`) was submitted without one. A presented approval that does not verify is `ERR-CredentialInvalid` |
+> | `ERR-CommandApprovalRequired` | A command that needs a person's approval of that one command (`REQ-AU-23`) was submitted without one. A presented approval that does not verify is `ERR-CredentialInvalid` |
 
-> **Proposed text. Applied nowhere. Option (a), widen the existing identifier.**
->
-> Replace the description of `ERR-ApprovalRequired` with: "A reversal, or a release without proof (`REQ-RC-5`
-> step 3), was submitted without a second, distinct principal approving it (`REQ-OS-3`); or a command that needs
-> a person's approval of that one command (`REQ-AU-23`) was submitted without one."
-
-The case for (b): two unrelated conditions behind one name make a caller's error handling guess, and the closed list
-(`REQ-ER-1`) is meant to say one thing per entry. The case for (a): the owner's words name it, and both are "an
-approval is missing". The first is about a *second principal*, the second about *the person's own device*, so the
-drafter recommends (b).
-
-**A change to the core's library follows from either option.** `Refusal` is an enum in `ledger-core`, compiled into the
-core program; a test checks it against §10 in both directions (`REQ-ER-1`, the conformance suite), so §10 and the enum
-cannot differ. A new line in §10, or a changed description, is therefore a source change in the core's library, and
-the core program's bytes change with it, even though in Feature A the core never uses the line (ingress answers it
-before logging). After the next re-genesis's genesis code is frozen, that is a core upgrade (`F-037`). Before it, it
-costs nothing. See Question 2.
+**When the core learns it (ruled 2026-10-21).** `Refusal` is an enum in `ledger-core`, compiled into the core program,
+and a test checks it against §10 in both directions (`REQ-ER-1`), so §10 and the enum cannot differ. The owner ruled
+that the core's side of the new line ships with **the next core**, after the throughput measurement of `F-041`, and not
+with the next re-genesis. Feature A ships first, so for a time ingress answers a refusal the core's list does not yet
+have. The drafter's reading, for the owner to confirm (Q-D): the line enters §10 when this amendment is applied;
+until the next core carries it, ingress holds the refusal in its own type and the two-way test is told about this one
+named exception, which is removed in the same change that adds the line to the core. Nothing else about the core
+changes in Feature A, and Feature A never sends the core this refusal.
 
 ## R3 — `US-A10` and its acceptance criteria (new), proposed text for `SPEC.md` Epic A
 
@@ -191,7 +181,7 @@ costs nothing. See Question 2.
 > **`US-A10`** — As an **identity holder**, nobody holds my value, my authority or my credentials with only a stolen
 > session: I approve each command that matters myself, on my own device, one command at a time.
 > - `AC-A10.1` Given a command that needs an approval and none attached, Then it is refused with
->   `ERR-CommandNotApproved`, nothing is taken in, and no operation reference exists for it (`REQ-AU-23`).
+>   `ERR-CommandApprovalRequired`, nothing is taken in, and no operation reference exists for it (`REQ-AU-23`).
 > - `AC-A10.2` Given a valid approval of that command, Then it is taken in and decided as any command is
 >   (`REQ-AU-23`, `REQ-CS-8`).
 > - `AC-A10.3` Given an approval of one command, When it accompanies a command that differs in amount, destination,
@@ -203,12 +193,15 @@ costs nothing. See Question 2.
 > - `AC-A10.5` Given a command approved and taken in, When it is repeated under the same client key, Then the first
 >   result is returned and no approval is asked for; and When the same key carries a different command, Then it is
 >   `ERR-ClientKeyReused` (`REQ-AU-23`, `REQ-OP-10`).
-> - `AC-A10.6` Given a command that needs an approval, When it comes with an issued secret or a service token, Then
->   it is taken in without one, unless the deployment requires approval of an identity of kind person's every
->   command and the command is that identity's (`REQ-AU-23`).
+> - `AC-A10.6` Given a command that needs an approval, When it comes with an issued secret (a scheme that signs
+>   nothing) or a service token, Then it is taken in without one (`REQ-AU-23`).
+> - `AC-A10.11` Given an identity with two passkeys and a session made with the first, When the second approves a
+>   command, Then it is accepted, and the record names the second as the approver and the first as the caller
+>   (`REQ-AU-23`, `REQ-AU-7`); and When an approval lacks user verification, Then it is refused with
+>   `ERR-CredentialInvalid`.
 > - `AC-A10.7` Given a session, When it signs in or reads, Then no approval is asked for (`REQ-AU-23`).
 > - `AC-A10.8` Given a session and no approval, When a device-bound credential is registered, Then the command is
->   refused with `ERR-CommandNotApproved`; and Given the approval of an existing device-bound credential in the
+>   refused with `ERR-CommandApprovalRequired`; and Given the approval of an existing credential in the
 >   set, and the registration ceremony of `REQ-AU-20`, Then the credential joins the set (`REQ-AU-23`).
 > - `AC-A10.9` Given two independent implementations of the command digest, When both are given one command,
 >   Then they produce the same digest, byte for byte (`REQ-AU-23`; the vector of F4).
@@ -230,13 +223,13 @@ decision":
 ## Which commands: the table behind R1
 
 The default list is a floor (R1: a deployment may add, not remove). Classified by the three tests of the ruling,
-from the commands as ingress has them today (`CommandBody`, `OperatorCommand`). "Person's session" means the caller
-authenticated with a device-bound credential; for any other caller the callers rule of R1 applies and the
-command is exempt.
+from the commands as ingress has them today (`CommandBody`, `OperatorCommand`). "A person's session" means the caller
+authenticated with a credential of a scheme that signs (`key`, passkey); for any other caller the callers rule of R1
+applies and the command is exempt.
 
 | Needs an approval when a person's session submits it | Why |
 |---|---|
-| `transfer`, `reserve`, `withdraw`, `capture`, `issue`, `redeem` | Move or reserve value |
+| `transfer`, `reserve`, `withdraw`, `capture`, `release`, `issue`, `redeem` | Move or reserve value |
 | `grant_authority`, `revoke_authority`, `delegate_custody`, `name_successor`, `claim_succession`, `cancel_recovery` | Change who may act on an account |
 | `register_credential`, `remove_credential` | Change a credential |
 | The operator surface, where a person's session submits it: reversals, `resolve`, issuance and operator grants, `import_credentials`, `initiate_recovery` | Same three tests. The operator surface is exempt as a class when a service principal holds it, which is the usual case |
@@ -249,8 +242,9 @@ command is exempt.
 | `complete_enrolment` | No credential of the set exists yet to approve it (`REQ-AU-22`) |
 | `register_credential` by the identities principal acting for an identity it manages (`REQ-AU-20`, amendment 0025 R2) | A service is the caller. See Gap G5 |
 
-**Unclear rows, not decided here** (Question 4): `release`, `open_account`, `close_account`, `set_answering`,
-`open_identity`, `reclaim_custody`. The drafter's proposal for each is in the question.
+**Ruled 2026-10-21:** of `release`, `open_account`, `close_account`, `set_answering`, `open_identity` and
+`reclaim_custody`, only `release` needs an approval (it changes a reservation the person made). The other five do
+not.
 
 A new kind of command must be put on one side of this table on purpose, the way `intake()` already forces every
 command into one of two answers. A command nobody classified must not default to exempt (task `T-040-04`).
@@ -321,11 +315,10 @@ digest's.
   decision. The digest covers the command as sent.
 - *The surface.* It follows from the command's name.
 
-**The hash.** F1 is written as SHA-256 of the framed bytes, which is what ingress, the browser's passkey machinery and the
-challenge below already use. The core's own program hashes with BLAKE2b-256 and does not link SHA-256, so Feature B
-adds a hash to the core, a small dependency, or the digest changes before A freezes it. The vector in F4 shows both
-for the same bytes; the second is plain, unkeyed BLAKE2b-256 of them, not the value of the core's own domain-separated
-`blake2b_256` function, which would need its construction fixed here too. This is Question 6, and it is the owner's to decide before A ships, because A freezes it.
+**The hash (ruled 2026-10-21): SHA-256.** WebAuthn itself hashes the client data with SHA-256, and browsers and
+hardware support it natively, so the same function serves the digest, the challenge and the device. The cost is on
+Feature B: the core's own program links only BLAKE2b-256, so B adds SHA-256 to the core (a small dependency).
+Feature A freezes this choice when it ships.
 
 ### F2 — The approval challenge, version 1
 
@@ -356,7 +349,7 @@ One record per approved command, 149 bytes, written by the core into the book ne
 | Bytes | Field |
 |---|---|
 | 0 | Version: `0x01` |
-| 1 to 16 | The credential that made the approval: its 16-byte identifier body |
+| 1 to 16 | The credential that actually signed the approval: its 16-byte identifier body. It may differ from the credential the caller signed in with |
 | 17 to 48 | The command digest of F1 |
 | 49 to 80 | The assertion digest: SHA-256 of these framed fields, in order, the tag `aledgent/approval/assertion`, `0x01`, the credential's raw id, the authenticator data, the client data JSON and the signature, each as the device returned them |
 | 81 to 84 | The key id: an unsigned number, big-endian, naming the ingress signing key in the trusted set the core holds |
@@ -443,7 +436,6 @@ record_message = frame(b"aledgent/approval/record", b"\x01", credential, command
 
 for name, value in [("command text", text.decode()), ("preimage length", len(pre)),
                     ("command digest", command_digest.hex()),
-                    ("same preimage, plain BLAKE2b-256, unkeyed", hashlib.blake2b(pre, digest_size=32).hexdigest()),
                     ("identity digest", identity_digest.hex()), ("challenge", challenge.hex()),
                     ("assertion digest", assertion_digest.hex()), ("record message", record_message.hex())]:
     print(f"{name}: {value}")
@@ -455,7 +447,6 @@ Output, run with `python3 -I`:
 command text: {"command":"transfer","legs":[{"amount":"2500","asset":"USD","from":"did:aledgent:acct:1K6CSK6CSK6CSK6CSK6CSK6CSK","to":"did:aledgent:acct:248H248H248H248H248H248H24"}]}
 preimage length: 347
 command digest: 09f6b859498227fcfdb151604aa51ad6ecd98b771685030df1eda83014a2bc91
-same preimage, plain BLAKE2b-256, unkeyed: ce5bded6b59211800a5aa6b61ef1ca14cf6be4143fd0641e0a6a7f383bffb862
 identity digest: 073c7ff1e2f11c45844b0a9df8966d57d7b4f4bcf5acdddb8655f35911445a57
 challenge: 55555555555555555555555555555555000001a3185e24c003073c7ff1e2f11c45844b0a9df8966d57d7b4f4bcf5acdddb8655f35911445a5709f6b859498227fcfdb151604aa51ad6ecd98b771685030df1eda83014a2bc915b50b69349e9be01e7d34ecc4e530b9385e46b10911aaea57d59121a6cebd137
 assertion digest: f48a07b4e2a97acba012ab26b18ac151b0da0c67ccafe1c9e41e121ea7aef7c2
@@ -479,13 +470,13 @@ it into a test and two implementations agree.
 2. If the command needs no approval, it says so and the client submits normally.
 3. Otherwise ingress issues the approval challenge of F2 and returns it with the digest, so the client can show
    the person what is being approved.
-4. The client has the device sign the challenge. The browser offers only the passkeys the rule of G2 names.
+4. The client has the device sign the challenge. The browser's list of allowed credentials is the initiating identity's active passkeys, any of them (a phone's passkey may approve while the person browses with another), and user verification is required.
 5. The client submits the command with the assertion attached. Ingress recomputes the digest from the command in
    *this* request (it never trusts one the client sends), then checks, in this order and with one refusal for
    every failure: the shape; whether a first result already exists for the client key (a retry: answered, done);
    whether the command needs an approval; the challenge's seal, purpose, length and expiry; that its command
    digest is this command's and its identity digest is the initiator's; that the credential is an active passkey
-   of the initiator's set and the one G2 names; that the assertion verifies, as sign-in checks it; that the
+   of the initiator's set (any of them); that the assertion verifies, as sign-in checks it, with user verification; that the
    challenge's number was never used; and the sign count rises.
 6. Only then does ingress log the command and pass it on. Nothing before this point leaves a row.
 
@@ -503,15 +494,11 @@ number's spending and the sign count's raising). That is a risk to the bound, no
 
 ## Gaps this amendment names and does not decide
 
-- **G1 — The refusal's name.** R2, Question 1.
-- **G2 — Which credential approves.** The challenge names the initiating identity, not a credential. A session
-  was made by passkey *X*; an approval could come from another passkey *Y* of the same identity. That matters for a
-  credential limited to some of an identity's accounts (`REQ-AU-20`), which could approve what it may not act
-  on, and for attribution: the command says *X* acted (`REQ-AU-7`) and the approval says *Y* approved. The
-  format of F2 supports either rule; the *rule* is the open point. **Proposal: *Y* must be *X*.** It is the simplest, the
-  device that signed in is the device that approves, the scope check the core already makes for *X* covers it, and
-  attribution stays one credential. The cost: a person who signed in on one device and holds another passkey
-  on a second device cannot approve from the second. Question 3.
+- **G2 — The approving passkey's own scope.** Any passkey of the identity may approve (ruling 9), so the passkey that
+  approves can differ from the one the command is attributed to (`REQ-AU-7`). A credential may be limited to some of
+  the identity's accounts (`REQ-AU-20`). The core's scope check covers the caller's credential. Whether the approving
+  credential's scope must also cover the accounts the command touches is not ruled. Proposal: yes, a credential
+  limited away from an account cannot approve what touches it. Q-C.
 - **G3 — The device shows no amount.** See the trade-off of R1. Nothing in this amendment makes the device display
   what it approves.
 - **G4 — Declaring "not enforced".** `REQ-AR-5` makes a deployment declare which *invariants* it enforces. An approval is not an
@@ -522,16 +509,21 @@ number's spending and the sign count's raising). That is a risk to the bound, no
 - **G5 — A credential added by the identities principal.** The identities principal is a service and exempt, and
   `REQ-AU-20` lets it add a credential to a managed identity's set. A person who wants the approval to cover that
   path needs the integrating party to stop using it. The spec does not say it should.
-- **G6 — Credentials that cannot approve.** A person-kind identity whose only credentials are a `key` or an issued
-  secret cannot make a device-bound approval. Under the stricter setting of R1, writes by such an identity would be
-  refused for good. R1's wording ("so long as that identity's set holds a device-bound credential able to give
-  one") exempts them, which leaves their `key` or secret as a way round the approval. The spec does not
-  say whether an identity should be made to hold a passkey first.
+- **G6 — An identity with no signing credential.** An identity of kind person whose only credential is an API key
+  is exempt by ruling 8, and so can still move value with no approval. The first draft's stricter deployment setting
+  ("require approval for every human credential") has no meaning left for it, since an API key cannot approve, so
+  this version drops it. Q-E.
 - **G7 — The core input lacks the client key.** F1's third field is the client key; the core receives only the
   operation reference derived from it. Feature A needs nothing from the core. For B to recompute the digest, its
   input must carry the client key. That is a change to what the core receives, and part of `F-041`.
+- **G9 — What a `key` credential's approval is.** A `key` credential signs, so ruling 8 puts it under the rule, and
+  the core already verifies `key` proofs itself. F2 and F3 are written for a passkey (a challenge the device signs).
+  A `key` approval would be a signature by that key over a message that holds the command digest of F1; its bytes
+  are not fixed here. Proposal: the framed fields of the tag `aledgent/approval/key`, `0x01` and the command digest,
+  signed with the credential's scheme, and, if the fork in Q-A chooses the second design, no ingress record is
+  needed for it. Q-B.
 - **G8 — Today the record of approvals is ingress's, if anyone's.** Between A and B, no approval is
-  written anywhere durable unless ingress keeps a note. Question 8.
+  written anywhere durable unless ingress keeps a note. Ruled: it does (`T-040-09`).
 
 ## Choices the drafter made, for review to check
 
@@ -550,40 +542,47 @@ These are not rulings. Each is something the brief did not state and the drafter
 5. **A bad approval is `ERR-CredentialInvalid`, with no detail**, like every failure of a sign-in, so the route is
    not an oracle (`REQ-AU-8`).
 
-## Questions for the owner
+## Rulings applied (the owner's answers of 2026-10-21 to the first draft's ten questions)
 
-Plain English, each with the drafter's proposal. Questions 1 to 8 are needed to approve this amendment; 9 and 10 can
-wait for Feature B.
+| # | Question | Answer, as applied |
+|---|---|---|
+| 1 | The refusal's name | `ERR-CommandApprovalRequired` (R2) |
+| 2 | When the core learns the refusal | With the next core, after the throughput measurement, not the next re-genesis (R2) |
+| 3 | Which passkey approves | Any passkey of the identity, not only the one that signed in. The challenge binds the identity; the record names the credential that signed (F2, F3) |
+| 4 | The six borderline commands | Only `release` needs approval (the table behind R1) |
+| 5 | People without a passkey | API keys stay exempt. The rule applies only to schemes that sign: `key` and passkey (R1, G6, G9) |
+| 6 | The hash | SHA-256. Reasons: WebAuthn hashes with it and browsers and hardware support it natively. Cost: the core links only BLAKE2b, so Feature B adds SHA-256 (F1) |
+| 7 | User verification | Required on every approval (R1) |
+| 8 | A note of who approved | Yes: ingress keeps the credential and the two digests beside the command, never the assertion (`T-040-09`) |
+| 9 | Acceptable slowdown for Feature B | Throughput with approval records must not fall more than 1.5 standard deviations of the baseline's run-to-run variation below the baseline mean (`T-041-00`; see Q-F) |
+| 10 | When Feature B ships | In the next core, as a core upgrade, not in the next re-genesis |
 
-1. **What do we call the new refusal?** `ERR-ApprovalRequired` already means "a second person must approve a
-   reversal". Reuse it for both, or give the new one its own name? Proposal: its own name,
-   `ERR-CommandNotApproved`.
-2. **When does the core's list of refusals learn about it?** Any new line in §10 also has to be added to the core's
-   own list, and that changes the core program, though in Feature A the core never uses it. If the next
-   re-genesis's code is not frozen yet, adding the line there is free; afterwards it is a core upgrade. Which
-   do you want? Proposal: put it in the next re-genesis if the amendment is approved in time; if not, the
-   plan chooses between a core upgrade and keeping the refusal outside the core's list with the conformance check
-   told about it.
-3. **Which of the holder's passkeys may approve a command?** Only the one they signed in with, or any active
-   passkey of theirs? Proposal: the same one (G2).
-4. **Which of these commands need an approval: `release`, `open_account`, `close_account`, `set_answering`,
-   `open_identity`, `reclaim_custody`?** Proposal: `release` yes (it changes a reservation the person made); the others
-   no; and `reclaim_custody` already carries a passkey proof of its own, which counts as its approval.
-5. **A person who has no passkey, under the stricter setting.** Let their API key or `key` credential work around
-   the approval (G6), or refuse their writes until they register a passkey? Proposal: let it work for now, and say
-   so in the deployment's declaration.
-6. **Which hash for the command digest?** SHA-256, which ingress and the browser side already use, or BLAKE2b, which
-   the core already links and SHA-256 would add? Both digests are in F4. A freezes the choice when it ships.
-   Proposal: SHA-256 for A, and `F-041` adds it to the core; the owner may prefer to avoid the dependency.
-7. **Must every approval carry user verification** (the device's PIN or fingerprint), even in a deployment whose sign-in
-   does not require it? Proposal: yes. A bare touch on a stolen unlocked device is a weak approval of a transfer.
-8. **Until B, should ingress keep a note of who approved each command** (the credential and the two digests, never
-   the assertion), in its own database beside the command? Proposal: yes. Without it, Feature A leaves no trace of
-   who approved a command. It adds one migration. Task `T-040-09` waits for this answer.
-9. **For B: what slowdown is acceptable?** Set the threshold (a percentage of commands per second, or a latency
-   figure) *before* the measurement, or the number means nothing (`T-041-00`).
-10. **For B: when does it ship?** In the next re-genesis's code, or as a core upgrade after production is founded?
-    Proposal: decide after the measurement. Either way, only this amendment and F1 to F3 must be settled first.
+## Questions for the owner (still open)
+
+Plain English. None of them blocks reading the amendment; Q-A and Q-D change what is built.
+
+- **Q-A. How does the core learn that a person approved? (A design fork, not decided here.)** Two ways:
+  1. *The core trusts a digest of ingress's approval.* The core keeps accepting direct proofs only from `key`
+     credentials. Every other scheme, present or future, is approved by ingress, which is a principal of its own,
+     and the core trusts a digest of that approval, as it already trusts the passkey check ingress did for
+     `reclaim_custody`.
+  2. *The core records an ingress-signed approval record for each command* (Feature B as drafted, F3).
+
+  What each gives, plainly. In both, ingress vouches for the passkey, because the core does not verify the passkey
+  (`DEC-19` rejects that). So neither detects a compromised ingress: a record signed by ingress is only as honest as
+  ingress. The record of 2 adds evidence in the book of who approved what, and protects against a path that bypasses
+  ingress (a command that reaches the core with no record is refused). Only the core verifying the assertion itself
+  would protect against a compromised ingress, and that is the choice `DEC-19` rejected.
+- **Q-B. What is a `key` credential's approval?** G9 proposes a signature over the command digest. Confirm, or say
+  `key` credentials stay as they are today.
+- **Q-C. Must the approving passkey's own scope cover the accounts the command touches?** G2 proposes yes.
+- **Q-D. Is this the right way to keep the closed list true until the next core?** R2: the line enters §10 when the
+  amendment is applied, ingress holds the refusal itself, and the two-way test gets one named exception that goes
+  away with the next core.
+- **Q-E. Is dropping the "require approval for every human credential" setting right?** G6: with API keys exempt it
+  would change nothing, so the draft drops it.
+- **Q-F. Confirm the threshold before the run.** 1.5 standard deviations is close to "no measurable slowdown". See
+  `T-041-00` and the plan of `F-041`.
 
 ## What does not change
 

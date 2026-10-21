@@ -10,8 +10,8 @@ is a plan only: no task below starts, and no code merges.
 
 | | |
 |---|---|
-| Milestone | Not assigned by `PLAN.md`. Ships first, before `F-041` (owner's ruling). Its relation to the next re-genesis of the book is amendment 0037, Question 2 |
-| Home | `services/ingress` (`credentials`, `command`, `auth`, `config`, `surface`, `wire`, `store`, `openapi`, a new migration if `T-040-09` is approved), `crates/authn` (`token`: the approval challenge), `site/` (the integrators' page), `e2e/` (the end-to-end flow). **Not** the core: no core code changes in this feature, with one exception that amendment 0037 names (R2): the refusal's line in `ledger-core`'s list, `T-040-10`, decided by Question 2 |
+| Milestone | Not assigned by `PLAN.md`. Ships first, before `F-041` (owner's ruling). The core's side of its refusal ships with the next core, not with this feature (amendment 0037, R2) |
+| Home | `services/ingress` (`credentials`, `command`, `auth`, `config`, `surface`, `wire`, `store`, `openapi`, a new migration for `T-040-09`), `crates/authn` (`token`: the approval challenge), `site/` (the integrators' page), `e2e/` (the end-to-end flow). **Not** the core: no core code changes in this feature, with one exception that amendment 0037 names (R2): the refusal's line in `ledger-core`'s list, which ships with the next core (`T-040-10`) |
 | Depends on | `F-028` (passkeys, challenges, durable sign counts and single-use challenge numbers: `T-028-04`), `F-038` (ingress as a fleet: any instance must refuse a spent approval), amendment 0037 |
 | Unblocks | `F-041` (the core records the approval), `M-3D`'s page for integrators |
 | Realises | `REQ-AU-23` and `US-A10` `[PENDING AMENDMENT 0037]`; `REQ-AU-1`, `REQ-AU-20`, `REQ-AU-21`, `REQ-CS-2`, `REQ-CS-8`, `REQ-OP-10`, `NFR-1`, `NFR-7` |
@@ -47,7 +47,7 @@ Existing requirements this feature must keep true, and the proposed ones it adds
 Amendment 0037 holds the rules and the three byte formats; this section orders the build. In build order:
 
 1. **The rules, applied.** The amendment's text goes into `SPEC.md` and `PLAN.md` (`DEC-28`, `DEC-19`'s sentence,
-   two feature rows) in one change, with the owner's choices to Questions 1 to 8 written in. `T-040-01`.
+   two feature rows) in one change, with the owner's rulings of 2026-10-21 written in. `T-040-01`.
 2. **The formats, frozen.** The command digest (F1), the approval challenge (F2) and the signed message of the
    approval record (F3) written as code and pinned by a test whose values the amendment's script computed and a
    second, independent implementation reproduces. After this task ships, B cannot change them. `T-040-02`.
@@ -65,27 +65,31 @@ Amendment 0037 holds the rules and the three byte formats; this section orders t
 7. **The rollout, and the latency.** A switch with three positions and the check that the fifty milliseconds
    still hold with approvals on. `T-040-07`.
 8. **The page for integrators.** `T-040-08`.
-9. **Two tasks that wait for the owner.** The ingress's note of who approved (`T-040-09`, Question 8) and the
-   refusal's line in the core's list (`T-040-10`, Question 2).
+9. **Two more tasks.** The ingress's note of who approved (`T-040-09`) and the refusal's line, held at ingress until
+   the next core carries it (`T-040-10`).
 
 ### The rules, in short (the amendment has them whole)
 
 - **Scope.** Every command that moves or reserves value, changes who may act, or changes a credential. A
   deployment may add commands, never remove one.
-- **Callers.** A caller that signed in with a passkey needs an approval. An API key, a service token and the book's
-  own inputs do not. A deployment may also require approval for every command of an identity of kind person.
+- **Callers.** The rule applies to credentials of a scheme that signs: `key` and passkey. An API key signs nothing,
+  so it and a service token and the book's own inputs are exempt.
 - **Sessions** stay for sign-in and reads. Every write, and adding a passkey, asks for an approval.
 - **A retry** of an approved, taken-in command under the same client key is answered from the first result and
   asks for no approval.
-- **Which passkey.** `[PENDING AMENDMENT 0037, Question 3]` Proposal: the one the session was made with.
+- **Which passkey.** Any active passkey of the initiating identity, not only the one that signed in: a phone's passkey
+  can approve while the person browses with another. The challenge binds the identity; the record names the passkey
+  that signed. User verification is required on every approval.
+- **The refusal** is `ERR-CommandApprovalRequired`. A bad approval is `ERR-CredentialInvalid`.
+- **The hash** is SHA-256, which WebAuthn itself uses and browsers and hardware support natively.
 
 ### What ingress keeps, and does not
 
 - The received log keeps the command as before. It never keeps an assertion, an attestation or a secret
   (`REQ-AU-8`).
 - Spent challenge numbers are kept until their expiry in the table `F-028` made.
-- If the owner says yes to Question 8, one more column or table keeps the approving credential and the two
-  digests beside the command (`T-040-09`), so that before `F-041` there is a trace of who approved.
+- One more column or table keeps the approving credential and the two digests beside the command (`T-040-09`,
+  ruled yes), so that before `F-041` there is a trace of who approved.
 
 ## Trade-offs, stated plainly
 
@@ -112,6 +116,8 @@ Amendment 0037 holds the rules and the three byte formats; this section orders t
   pending.
 - **Showing the person what they approve.** The digest and the command are returned so a client can show them;
   nothing here makes a device display them.
-- **Making a person without a passkey hold one.** Question 5 and the amendment's G6.
-- **Approval by a `key` credential or an issued secret.** Only a device-bound credential approves.
+- **Making a person without a signing credential hold one.** An API key is exempt by ruling (the amendment's G6).
+- **Approval by a `key` credential.** It is under the rule, but its bytes are not fixed (the amendment's G9 and
+  Q-B); this feature builds the passkey approval and takes the `key` one in when Q-B is answered.
+- **Approval by an issued secret.** It signs nothing and cannot approve.
 - **Changes to the registration ceremony** of amendment 0027, which still runs in addition to the approval.
