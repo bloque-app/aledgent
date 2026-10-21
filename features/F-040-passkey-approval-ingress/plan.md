@@ -66,6 +66,8 @@ Amendment 0037 holds the rules and the byte formats; this section orders the bui
 7. **The refusals tested alone.** Each way an approval can be wrong, each broken on its own. `T-040-06`.
 8. **The rollout, and the latency.** A switch with three positions and the check that the fifty milliseconds still
    hold with approvals on. `T-040-07`.
+   The migration with `payment-rails` (mediums) is a step of the deployment runbook, ruled by the owner on 2026-10-21
+   (Q-G): `payment-rails` moves its session calls to the two steps before enforce is turned on. `T-040-14`.
 9. **The page for integrators.** `T-040-08`.
 10. **Two more tasks.** Ingress's note of who approved (`T-040-09`) and the refusal, held at ingress until the next core
     carries it (`T-040-10`).
