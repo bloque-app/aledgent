@@ -232,6 +232,11 @@ that the core's side of the new line ships with **the next core**, after the thr
 with the next re-genesis. Feature A ships first, so for a time ingress would answer a refusal the core's list does not
 yet have. The drafter's reading is that the line enters §10 when this amendment is applied; until the next core
 carries it, ingress holds the refusal in its own type and the two-way test is told about this one named exception.
+The exception must **cite this amendment and the release that ends it**, and the test **fails once that release
+ships**, so the allowance cannot outlive its reason (advice of the Narthex session, 2026-10-21: a spec running ahead
+of the program is legitimate only with a deadline; the program running ahead of the spec, code with no spec item,
+stays a hard failure). The durable form is data on the spec item (`planned` with its release and amendment,
+`implemented`, `withdrawn`), from which the check derives the allowance, so nobody edits a test (`T-040-15`).
 Plainly, that exception **weakens `REQ-ER-1`** for a window of unknown length: the test is the thing that keeps the
 closed list closed. The alternative (Q-D) is to keep the refusal unreachable: the rollout switch is never put to
 "enforce" anywhere until the next core carries the line, and the exception only covers report-only and off. Nothing
