@@ -75,6 +75,11 @@ fn healthy() -> Snapshot {
                 leaves: 2_400_000,
                 genesis_records: Some(581_404),
             }),
+            writer_code: Some(ingress::query::WriterCodeBody {
+                code: "a0".repeat(32),
+                generation: 1,
+                upgrade: None,
+            }),
         }),
         adapter: Some(AdapterSignals {
             at: NOW - 1_000,
