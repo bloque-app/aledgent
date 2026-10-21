@@ -1280,6 +1280,8 @@ impl<P: AgentPort> Inner<P> {
         for event in driver.take_code_events() {
             std::eprintln!("aledgent-core: {}", describe_code_event(&event));
         }
+        // The platform keeps running what it ran: the next check is no install (`T-037-23`).
+        let running_code = driver.running_code();
         let port = driver.into_port();
         let mut archive = match self.log.entries() {
             Ok(a) => a,
@@ -1325,6 +1327,7 @@ impl<P: AgentPort> Inner<P> {
                 }
                 driver.archived();
                 driver.set_batch_limits(self.batch);
+                driver.set_running_code(running_code);
                 let seq = driver.seq();
                 self.driver = Some(driver);
                 self.report_code();
@@ -2028,7 +2031,7 @@ fn writer_code_body(w: &crate::fence::WriterCode) -> ingress::query::WriterCodeB
 fn describe_code_event(event: &crate::fence::CodeEvent) -> String {
     use crate::fence::CodeEvent;
     use crate::switch::short;
-    match *event {
+    match event.clone() {
         CodeEvent::Installed {
             input,
             code,
@@ -2078,6 +2081,16 @@ fn describe_code_event(event: &crate::fence::CodeEvent) -> String {
         }
         CodeEvent::Scheduled { input, code, from } => format!(
             "input {input} scheduled an upgrade to code {}, to apply from input {from}",
+            short(&code)
+        ),
+        CodeEvent::UpgradeRefused {
+            input,
+            code,
+            from,
+            condition,
+        } => format!(
+            "input {input} was an upgrade to code {} from input {from} that the writer refused \
+             and recorded: {condition}",
             short(&code)
         ),
     }

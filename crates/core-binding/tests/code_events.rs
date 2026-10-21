@@ -149,3 +149,69 @@ fn t037_23_a_book_that_never_upgrades_says_nothing_more() {
     }
     assert!(fx.driver.take_code_events().is_empty());
 }
+
+/// An `Upgrade` the writer refuses and records takes an input number, and the log says so, naming
+/// that input, the version and the condition (here, a caller who holds no authority over the code).
+#[test]
+fn t037_23_an_upgrade_the_writer_refuses_names_its_input() {
+    let mut fx = Fx::native();
+    let _ = fx.person();
+    let person = fx.person();
+    let _ = fx.driver.take_code_events();
+    let from = hot(&mut fx).inputs + 20;
+    let ctx = fx.ctx(person);
+    assert!(fx.replica.upgrade(&ctx, H1, from, b"T-037-23").is_err());
+    let c = fx.sync().expect("the refusal is recorded").expect("sent");
+    let events = fx.driver.take_code_events();
+    let [
+        CodeEvent::UpgradeRefused {
+            input,
+            code,
+            from: asked,
+            condition,
+        },
+    ] = events.as_slice()
+    else {
+        panic!("{events:?}");
+    };
+    assert_eq!((*input, *code, *asked), (c.seq, H1, from));
+    assert!(condition.starts_with("ERR-"), "{condition}");
+}
+
+/// A driver that replaces one the host dropped (the core's rebuild, through `Driver::recover`) is
+/// told what the platform runs, so its first check is no install; one that is not told records the
+/// check as an install from none, which is what the host would then repeat after every rebuild.
+#[test]
+fn t037_23_a_rebuilt_driver_that_is_told_what_runs_records_no_install() {
+    let mut fx = Fx::native();
+    open(&mut fx, 1);
+    fx.synced();
+    let g = hot(&mut fx).code;
+    fx.driver.port_mut().code_map = [(g, 0)].into_iter().collect();
+    fx.driver.ensure_code().expect("the check");
+    let ran = fx.driver.running_code();
+    assert_eq!(ran, Some(g));
+    let Fx {
+        driver,
+        mut archive,
+        ..
+    } = fx;
+    let (mut again, _replica) = core_binding::host::Driver::recover(
+        driver.into_port(),
+        keys(),
+        genesis(),
+        op(0),
+        1,
+        &mut archive,
+    )
+    .expect("the driver is rebuilt");
+    assert_eq!(again.running_code(), None, "a new driver knows nothing");
+    again.ensure_code().expect("the check");
+    assert!(matches!(
+        again.take_code_events().as_slice(),
+        [CodeEvent::Installed { from: None, .. }]
+    ));
+    again.set_running_code(ran);
+    again.ensure_code().expect("the check");
+    assert!(again.take_code_events().is_empty(), "told: no install");
+}

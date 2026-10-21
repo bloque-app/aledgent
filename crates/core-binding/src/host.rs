@@ -1450,6 +1450,17 @@ impl<P: AgentPort> Driver<P> {
         Ok(())
     }
 
+    /// The code version the host last made the platform run, if it has (`T-037-23`).
+    pub fn running_code(&self) -> Option<[u8; 32]> {
+        self.running_code
+    }
+
+    /// Say which code version the platform runs, for a driver that replaces one the host dropped
+    /// (the core's rebuild): the platform did not change, so the next check is not an install.
+    pub fn set_running_code(&mut self, code: Option<[u8; 32]>) {
+        self.running_code = code;
+    }
+
     /// What happened to the writer's code and to the platform running it since this was last
     /// called, in order, each naming its input (`T-037-23`). The host logs them.
     pub fn take_code_events(&mut self) -> Vec<CodeEvent> {
@@ -1646,7 +1657,12 @@ impl<P: AgentPort> Driver<P> {
             let seq = self.seq + 1;
             let exec = self.exec_code_of(seq, way_out);
             let writer = self.decided(seq, way_out, taken, scheduled);
-            let events = crate::fence::code_events(seq, &self.writer, &writer, taken, scheduled);
+            let mut events =
+                crate::fence::code_events(seq, &self.writer, &writer, taken, scheduled);
+            events.extend(crate::fence::refused_upgrades(
+                seq,
+                recorded.iter().map(|r| (&r.call, &r.summary)),
+            ));
             let (leaves, whole) = self.service.leaves(&touched)?;
             let changes = changed(replica, &leaves, &deliveries)?;
             let envelope = Envelope::Mapped(Mapped::Input(MappedInput {
@@ -1701,7 +1717,11 @@ impl<P: AgentPort> Driver<P> {
         let seq = tip + 1;
         let exec = self.exec_code_of(seq, way_out);
         let writer = self.decided(seq, way_out, taken, scheduled);
-        let events = crate::fence::code_events(seq, &self.writer, &writer, taken, scheduled);
+        let mut events = crate::fence::code_events(seq, &self.writer, &writer, taken, scheduled);
+        events.extend(crate::fence::refused_upgrades(
+            seq,
+            recorded.iter().map(|r| (&r.call, &r.summary)),
+        ));
         let input = InputEnvelope {
             seq,
             calls: calls.clone(),
