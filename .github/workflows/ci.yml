@@ -388,7 +388,17 @@ jobs:
         run: |
           set -euo pipefail
           cargo test --locked -p core-host -- --ignored --nocapture t037_19_a_built_runtime 2>&1 | tee "$RUNNER_TEMP/test.log"
-          grep -E '^runtime [0-9]+ B, blake2b-256 [0-9a-f]{64}$' "$RUNNER_TEMP/test.log" | sed 's/^/- /' >> "$GITHUB_STEP_SUMMARY"
+          line=$(grep -E '^runtime [0-9]+ B, blake2b-256 [0-9a-f]{64}$' "$RUNNER_TEMP/test.log")
+          echo "- $line" >> "$GITHUB_STEP_SUMMARY"
+          # The runtime this pin builds is the one the founding ships: its digest is recorded once,
+          # in code.rs next to the platform revision, and a pin that changes it fails here.
+          want=$(grep -A1 'pub const PATCHED_RUNTIME_DIGEST' core-host/src/code.rs | grep -oE '[0-9a-f]{64}' | head -n 1)
+          test -n "$want"
+          got=${line##* }
+          if [ "$got" != "$want" ]; then
+            echo "::error::the runtime built from the pinned VOS is $got, code.rs expects $want (PATCHED_RUNTIME_DIGEST): update it with the pin"
+            exit 1
+          fi
 
   # F-027 (T-027-03, T-027-07): the settlement executor's Kreivo PASS transactions, rebuilt with
   # Kreivo's own crates in both formats it signs: spec 133 (Kreivo 4aef055, kreivo-pin) and spec 132

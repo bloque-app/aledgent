@@ -207,6 +207,12 @@ pub enum DriverError {
     Acknowledgement(String),
     /// The runtime program itself failed.
     Runtime(String),
+    /// A program change of a stateful actor the runtime refused with `UnsupportedLane` while the
+    /// request carried no claim (`T-037-19`): the package is not a claim on the program installed
+    /// now, and the runtime does not take it as the revert of the last claimed change, either
+    /// because something wrote the actor's lanes since, or because it is not what that change
+    /// replaced. Nothing a retry changes: the switch parks for good.
+    RevertClosed(String),
 }
 
 impl core::fmt::Display for DriverError {
@@ -215,6 +221,7 @@ impl core::fmt::Display for DriverError {
             DriverError::Refused(s) => write!(f, "refused: {s}"),
             DriverError::Acknowledgement(s) => write!(f, "acknowledgement refused: {s}"),
             DriverError::Runtime(s) => write!(f, "runtime: {s}"),
+            DriverError::RevertClosed(s) => write!(f, "refused for good: {s}"),
         }
     }
 }
@@ -676,7 +683,9 @@ impl Runtime {
     /// installation data.
     ///
     /// **A stateful actor** (one with lanes, the core) changes its program only on the claim of
-    /// the package's producer, or as the revert of such a change, which the request carries
+    /// the package's producer (an assertion this host copies from the manifest and the authority
+    /// signs, which the runtime does not check against the manifest, and which the producer key
+    /// does not make trustworthy: `package` signs with a fixed key), or as the revert of such a change, which the request carries
     /// ([`Direction`], [`upgrade_request`], `T-037-19`): the patched runtime refuses it otherwise
     /// (`UnsupportedLane`). It checks the claim names the program installed now, or, for a revert,
     /// that the target is exactly what the last claimed change replaced and no lane was written
@@ -705,6 +714,7 @@ impl Runtime {
             .into_iter()
             .find(|r| r.entry.actor == actor)
             .ok_or_else(|| DriverError::Runtime("the installed actor is not listed".into()))?;
+        let direction = Direction::of(record.entry.program, package);
         let request = ManagementRequest::UpgradeActor(Box::new(upgrade_request(
             actor,
             &record.entry,
@@ -715,7 +725,19 @@ impl Runtime {
             t.outcome,
             RuntimeOutcome::Management(Ok(ManagementReply::Upgraded(_)))
         ) {
-            return Err(DriverError::Refused(format!("upgrade: {:?}", t.outcome)));
+            let why = format!("upgrade ({direction:?}): {:?}", t.outcome);
+            // `UnsupportedLane` with no claim is final: only a write or a different package
+            // could have made it otherwise, and neither is a retry.
+            return Err(
+                if matches!(direction, Direction::Revert(_))
+                    && t.outcome
+                        == RuntimeOutcome::Management(Err(sdk::ManagementError::UnsupportedLane))
+                {
+                    DriverError::RevertClosed(why)
+                } else {
+                    DriverError::Refused(why)
+                },
+            );
         }
         self.attach(package, name, None)
     }
@@ -1148,7 +1170,7 @@ mod tests {
         // Generation 2 without the producer's claim: the runtime's own refusal, which the switch
         // counts (`switch::install_error`). Nothing changed: g1 still runs.
         let refused = rt.upgrade_actor(&admitted(2, &[]), "counter");
-        let Err(DriverError::Refused(why)) = refused else {
+        let Err(DriverError::RevertClosed(why)) = refused else {
             panic!("an unclaimed program change of a stateful actor: {refused:?}")
         };
         assert!(why.contains("UnsupportedLane"), "{why}");
@@ -1177,7 +1199,7 @@ mod tests {
         let actor = rt.upgrade_actor(&g2, "counter").expect("claimed again");
         assert_eq!(call(&mut rt, &actor).unwrap(), [fixture::reply_of(2)]);
         let late = rt.upgrade_actor(&g1, "counter");
-        let Err(DriverError::Refused(why)) = late else {
+        let Err(DriverError::RevertClosed(why)) = late else {
             panic!("a revert after a write: {late:?}")
         };
         assert!(why.contains("UnsupportedLane"), "{why}");
@@ -1186,7 +1208,10 @@ mod tests {
 
         // A claim names the program installed now: g3 claims g1, g2 is installed.
         let stale = rt.upgrade_actor(&admitted(3, &[g1.program()]), "counter");
-        assert!(matches!(stale, Err(DriverError::Refused(_))), "{stale:?}");
+        assert!(
+            matches!(stale, Err(DriverError::RevertClosed(_))),
+            "{stale:?}"
+        );
         // The next generation claims g2 and is accepted: the chain continues.
         let g3 = admitted(3, &[g2.program()]);
         let actor = rt.upgrade_actor(&g3, "counter").expect("chained upgrade");

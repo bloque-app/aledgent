@@ -142,7 +142,9 @@ impl VosPort {
 
 fn map_err(e: DriverError) -> PortError {
     match e {
-        DriverError::Refused(s) | DriverError::Acknowledgement(s) => PortError::Aborted(s),
+        DriverError::Refused(s)
+        | DriverError::RevertClosed(s)
+        | DriverError::Acknowledgement(s) => PortError::Aborted(s),
         DriverError::Runtime(s) => PortError::Unavailable(s),
     }
 }
