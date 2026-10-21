@@ -70,7 +70,7 @@ the claim of that number, with its record written last. In build order:
    alert.
 7. **The modes** and their inputs. A mode names each principal with one of its credentials
    `[PENDING AMENDMENT 0034]`.
-8. **Retrieval**: `CodeSource`, plugins, Kreivo preimages.
+8. **Retrieval**: `CodeSource`, plugins, Kreivo preimages. The sources are configured in a file of their own, named by `serve --code-config`, with amendment 0023's `[code]` keys, because the deployment file is shared with ingress and refuses unknown fields (`T-037-06`).
 9. **Checkpoints as rows and leaf chunks**: the archive's checkpoint, and a snapshot sent to another node,
    hold the writer state and the leaves, never `agent.state`.
 10. **Per-range replay**: native first for the book, under each range's generation; the Agent side under
