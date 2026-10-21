@@ -5,17 +5,17 @@ SPDX-License-Identifier: CC-BY-4.0
 
 # Amendment 0036 — The fence answers a definite "not run", so a way out can overtake a carried row
 
-**Status:** **awaiting the owner's approval.** The direction was ruled on 2026-10-20 (owner ruling w7 (a), in the
-review of `T-037-04`, PR #47, finding B1): the core answers a refusal by the fence with a definite "not run", and
-the feeder gives back the sequences it had carried. The text below is the drafter's reading of that ruling, worked
-through to the rules, and is **not approved**: the Decisions form carries the approval item. Until it is approved,
-the plan sites cite `[PENDING AMENDMENT 0036]`, and the code that builds it (`T-037-18`) is a draft that merges only
-after the approval.
+**Status:** **ruled by the owner on 2026-10-21: approved** (Decisions form, ruling w8), with the question on
+`SPEC.md`'s scope answered "plan only": the second sentence of the former R1 and the former `AC-K7.23` are **not**
+added to `SPEC.md`; they bind in the plan and are `T-037-18`'s own criterion. The direction was ruled on 2026-10-20
+(owner ruling w7 (a), in the review of `T-037-04`, PR #47, finding B1): the core answers a refusal by the fence with
+a definite "not run", and the feeder gives back the sequences it had carried. Not yet applied to `SPEC.md`: the code
+and the plan cite it as `[PENDING AMENDMENT 0036]` until the pass that applies R1 and R2.
 **Target:** `SPEC.md` v0.4.28 as on `develop`; `PLAN.md` `DEC-27` (d); `F-038` plan §3 and §4.
 **Date:** 2026-10-20
 **Number:** 0034 and 0035 are taken; this is the next free one.
-**Amends:** `REQ-RT-20`, the way-out point (amendment 0035, R1), by one sentence, and `US-K7` by three acceptance
-criteria. Changes the feed rule of `F-038` §3 and §4. Nothing is withdrawn.
+**Amends:** `REQ-RT-20`, the way-out point (amendment 0035, R1), by one sentence, and `US-K7` by two acceptance
+criteria. Changes the feed rule of `F-038` §3 and §4, in the plan. Nothing is withdrawn.
 **Serves:** `REQ-RT-20`, `REQ-CS-7`, `NFR-17`, `INV-18`.
 **Rationale in one line:** the feed rule keeps a row that may have run at the sequence it was first given, for
 ever, so a fenced writer whose head row is such a row can never be sent the way out that would unfence it; the
@@ -201,12 +201,9 @@ that no other answer carries, and the code that builds it must show N3 by test. 
 Add, at the end of the way-out point as amendment 0035 left it:
 
 > A way out MUST reach a fenced writer even when commands logged before it were being handed to it when the
-> handing over was interrupted, so that it is not known whether the writer decided them. *[Subject to the question
-> above:]* The writer's refusal of an input because of the fence MUST be reported to the component that submitted it
-> as a definite "not decided", with nothing committed; an input the writer did decide MUST be answered with its
-> decision, whether or not the writer is fenced. *Amendment 0036.*
+> handing over was interrupted, so that it is not known whether the writer decided them. *Amendment 0036.*
 
-## R2 — `US-K7`, three acceptance criteria
+## R2 — `US-K7`, two acceptance criteria
 
 Add after `AC-K7.20`:
 
@@ -217,9 +214,16 @@ Add after `AC-K7.20`:
 > - `AC-K7.22` Given the commands that a fenced writer refused when the way out overtook them, When the way out is
 >   decided and the fence is gone, Then each of them is decided exactly once, none is lost and none is decided twice,
 >   in the order in which they were received, after the way out (`REQ-CS-7`, `INV-18`).
-> - *[Subject to the question above:]* `AC-K7.23` Given a command the writer decided, When it reaches the writer again, whether or not the writer is
->   fenced, Then it is answered with that decision and never with "not decided"; and Given a command a fenced
->   writer refused, Then it is answered "not decided" and nothing of it is recorded (`REQ-RT-20`, `INV-18`).
+
+## The criterion that stays in the plan (owner ruling w8)
+
+What the writer answers the component that feeds it is a boundary between ingress and the core, which `SPEC.md`
+leaves to the plan (`CLAUDE.md`, guardrail 1). It is therefore not in `SPEC.md`; it is a criterion of `T-037-18`:
+
+> **`T-037-18` criterion (amendment 0036, N1 to N4).** Given a command the writer decided, When it reaches the writer
+> again, whether or not the writer is fenced, Then it is answered with that decision and never with "not run"; and
+> Given a command a fenced writer refused, Then it is answered "not run", nothing of it is recorded and its input
+> number is not taken (`REQ-RT-20`, `INV-18`).
 
 ## What does not change
 
@@ -236,36 +240,26 @@ involves `NotRun`.
 marked `[PENDING AMENDMENT 0036]`. `T-037-18` builds them: the core's answer (`core_binding::core`,
 `ingress::boundary`, `ingress::remote`, `ingress::feed`), the store's release with the epoch (`MemStore`, `PgStore`),
 and the forwarder (`ingress::service`). Its acceptance test is
-`ac_k7_12_a_way_out_overtakes_a_row_carried_from_an_ambiguous_send`, without `#[ignore]`.
+`ac_k7_12_a_way_out_overtakes_a_row_carried_from_an_ambiguous_send` (`AC-K7.21`), without `#[ignore]`; the criterion
+above is shown by `T-037-18`'s own tests, which name `T-037-18` and not an `AC-*` that `SPEC.md` does not hold.
 
-## Decisions for the owner
+## Decisions (approved with the text)
 
 1. **The epoch rises on a release of in-flight rows (F2).** The alternative is key idempotency alone: no epoch change.
    Then nothing stops a late copy of a released row, which runs in full under the old epoch whatever rows now hold its
    sequences, so only the key would keep order, and a row could be decided out of the received log's order in a narrow
-   window (after the fence has lifted and rows logged behind it have run). It is the smaller change; this draft takes
+   window (after the fence has lifted and rows logged behind it have run). It is the smaller change; the amendment takes
    the epoch because "out of order" is a guarantee `F-038` makes (`DEC-27` (d)).
 2. **`NotRun` covers the tail (N4)** instead of the one refused input, so a feeder never gives back a sequence while
    a later sequence stays carried.
-3. **Raise the stream's version for the new answer, or not?** This draft does not: the argument is the release order
+3. **The stream's version is not raised for the new answer.** The argument is the release order
    and the gate on `T-037-06`, plus the runbook rule "never roll ingress back below this release while a core host
-   speaks it". Raising it would make an old ingress get a clean refusal at the first message instead of a dropped
-   session, and would cost a version negotiation for an answer that cannot occur until a code source is enabled.
+   speaks it". Raising it would have given an old ingress a clean refusal at the first message instead of a dropped
+   session, at the cost of a version negotiation for an answer that cannot occur until a code source is enabled.
 4. **`NotRun` on a single call and on the legacy link reads as `Unavailable`** (behaviour, so it is stated here):
    only the sequenced feed gives sequences back. The store gains a method of its own for the release
    (`unfeed_in_flight`) rather than changing `unfeed`; that is an implementation choice, recorded here so it is not a
    silent one.
-
-### Question for the owner: how much of this goes into `SPEC.md`?
-
-`SPEC.md` describes what a holder can see and says nothing about how ingress and the core talk to each other. Two
-parts of this amendment are of the second kind: the second sentence of R1 and `AC-K7.23` say what the writer answers
-the component that feeds it. No holder can observe that. The rest (the first sentence of R1, `AC-K7.21` and
-`AC-K7.22`) is behaviour a holder does see: a way out gets through, and the commands it overtook are decided once.
-
-**Question: should R1's second sentence and `AC-K7.23` go into `SPEC.md`, or stay in the plan and become `T-037-18`'s
-own criterion?** The drafter has not chosen. If they stay in the plan, nothing else in this amendment changes. R1 and
-R2 below are written with both in, and marked, so that approving "plan only" means deleting two marked passages.
 
 ## Not chosen
 
