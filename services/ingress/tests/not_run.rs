@@ -1,7 +1,8 @@
 // Copyright (c) 2026 Pagos Cube LLC
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 //! The fence's definite "not run" and the feed sequences it gives back (`T-037-18`; amendment
-//! 0036; `F-038` §3, §4; `REQ-RT-20`, `REQ-CS-7`, `INV-18`; `AC-K7.21`, `AC-K7.22`, `AC-K7.23`).
+//! 0036; `F-038` §3, §4; `REQ-RT-20`, `REQ-CS-7`, `INV-18`; `AC-K7.21`, `AC-K7.22`; the answer to a
+//! decided or refused input is `T-037-18`'s own criterion, ruling w8).
 //!
 //! A real forwarder and a real [`Sequencer`] over a core whose fence is a switch: while it is on
 //! the core runs only the inputs the test lets through (the way out, or a chosen prefix) and

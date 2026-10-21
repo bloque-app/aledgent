@@ -637,13 +637,13 @@ fn tick(k: u8) -> CoreInput {
     }
 }
 
-/// `T-037-18`, amendment 0036, N1 to N4; `AC-K7.23`: through the real Agent, the fence's refusal
+/// `T-037-18`, amendment 0036, N1 to N4; the plan criterion kept out of `SPEC.md` (ruling w8): through the real Agent, the fence's refusal
 /// is `NotRun` for the input it refused and every input after it in the call, whether the call
 /// holds one input or several, and an input the core decided is answered from the record of
 /// replies, never `NotRun`, though the writer is fenced. Nothing is committed by a refusal: the
 /// writer's input number does not move, and the same inputs run once the way out is taken.
 #[tokio::test(flavor = "multi_thread")]
-async fn ac_k7_23_a_fenced_refusal_is_not_run_for_the_tail_and_a_decided_input_is_answered() {
+async fn t037_18_a_fenced_refusal_is_not_run_for_the_tail_and_a_decided_input_is_answered() {
     let w = world().await;
     // Decided before the fence: its reply is in the record.
     let decided = tick(1);

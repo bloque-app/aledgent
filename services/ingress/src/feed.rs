@@ -907,7 +907,7 @@ mod tests {
         }
     }
 
-    /// `T-037-18`, amendment 0036, N5; `AC-K7.23`: the sequencer passes the fence's `NotRun`
+    /// `T-037-18`, amendment 0036, N5, the criterion kept in the plan (ruling w8): the sequencer passes the fence's `NotRun`
     /// through for the tail of a feed, runs nothing for it, and does not move the sequence it
     /// expects: the same sequences are taken again, not read as a gap or as duplicates, once the
     /// fence is gone. A feed under a raised epoch, which is how a feeder that gave the sequences
