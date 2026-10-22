@@ -13,6 +13,7 @@ const G: &str = "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbeb
 const H: &str = "c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf";
 
 fn with(writer_code: Option<WriterCodeBody>) -> String {
+    let writer_code = writer_code.map(Box::new);
     render(&Snapshot {
         core: Some(SignalsBody {
             writer_code,
@@ -74,11 +75,11 @@ fn t037_23_the_signals_field_is_optional_in_both_directions() {
     let s: SignalsBody = serde_json::from_value(older).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(s.writer_code, None);
     let body = SignalsBody {
-        writer_code: Some(WriterCodeBody {
+        writer_code: Some(Box::new(WriterCodeBody {
             code: G.into(),
             generation: 2,
             upgrade: None,
-        }),
+        })),
         ..SignalsBody::default()
     };
     let mut json = serde_json::to_value(&body).unwrap();
