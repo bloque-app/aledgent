@@ -118,9 +118,9 @@ pub fn refusals() -> Vec<(&'static str, &'static str)> {
 ///
 /// The only way the spec may hold an error the program's closed list does not: the line is in
 /// `SPEC.md` §10 and in no `Refusal`, and the check below is told so by name. The allowance names
-/// the amendment that put the line in the spec and the release that ends it, and the check
-/// **fails once that release ships** (the `Refusal` then holds the code), so the allowance cannot
-/// outlive its reason. The other direction, a `Refusal` with no line in §10, stays a hard failure.
+/// the amendment that put the line in the spec and the release that ends it, as the core's code
+/// generation (`ends_at_generation`), and the check **fails once that release ships**, whether or
+/// not the core got the line, so the allowance cannot outlive its reason. The other direction, a `Refusal` with no line in §10, stays a hard failure.
 /// `T-040-15` makes this data on the spec item; this list is the stopgap until it is decided.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpecAhead {
@@ -128,8 +128,28 @@ pub struct SpecAhead {
     pub id: &'static str,
     /// The amendment that put it in the spec.
     pub amendment: &'static str,
-    /// The release that ends the allowance.
+    /// The release that ends the allowance, in words.
     pub ends_with: &'static str,
+    /// The release, as a number that changes by itself: the code generation of the core that
+    /// ends the allowance (`REQ-RT-20`; every upgrade of the core raises it). While the core's
+    /// compiled generation is below it, the allowance holds; at it, the allowance fails whether
+    /// or not the core got the line.
+    pub ends_at_generation: u64,
+}
+
+/// The code generation the core Agent is compiled with: the `GENERATION` of `agents/core`, read
+/// from its source so that the check follows the code and not a copy.
+pub fn core_generation() -> Result<u64, String> {
+    const CORE: &str = include_str!("../../../agents/core/src/lib.rs");
+    let line = CORE
+        .lines()
+        .find(|l| l.starts_with("const GENERATION: u64 = "))
+        .ok_or("agents/core/src/lib.rs has no `const GENERATION: u64 = N;`")?;
+    line["const GENERATION: u64 = ".len()..]
+        .trim_end_matches(';')
+        .trim()
+        .parse()
+        .map_err(|e| format!("the core's GENERATION does not parse: {e}"))
 }
 
 /// The one allowance. It **weakens `REQ-ER-1`** (the closed list is closed in both directions)
@@ -139,7 +159,9 @@ pub struct SpecAhead {
 pub const SPEC_AHEAD_OF_PROGRAM: &[SpecAhead] = &[SpecAhead {
     id: "ERR-CommandApprovalRequired",
     amendment: "0037",
-    ends_with: "the release that carries the core's line for the refusal (T-041-06, the next core)",
+    ends_with: "the next core, the first of code generation 1, which carries the core's line for \
+                the refusal (T-041-06)",
+    ends_at_generation: 1,
 }];
 
 /// The closed refusal list equals the catalogue's errors, both ways, and
@@ -149,6 +171,7 @@ pub fn refusal_matches_catalogue(
     cat: &Catalogue,
     refusals: &[(&str, &str)],
     ahead: &[SpecAhead],
+    core_generation: u64,
 ) -> Result<(), Findings> {
     let mut findings = Vec::new();
     for (code, description) in refusals {
@@ -181,6 +204,13 @@ pub fn refusal_matches_catalogue(
             findings.push(format!(
                 "{}: an allowance for an error SPEC §10 does not name",
                 a.id
+            ));
+        }
+        if core_generation >= a.ends_at_generation {
+            findings.push(format!(
+                "{}: the allowance of amendment {} ended with {} (the core is at code generation \
+                 {core_generation}): put the line in Refusal and remove the allowance",
+                a.id, a.amendment, a.ends_with
             ));
         }
         if refusals.iter().any(|(code, _)| *code == a.id) {
@@ -219,7 +249,10 @@ pub fn run_all(cat: &Catalogue, cases: &[Case]) -> Vec<(&'static str, Result<(),
         ),
         (
             "refusal_matches_catalogue",
-            refusal_matches_catalogue(cat, &refusals(), SPEC_AHEAD_OF_PROGRAM),
+            match core_generation() {
+                Ok(g) => refusal_matches_catalogue(cat, &refusals(), SPEC_AHEAD_OF_PROGRAM, g),
+                Err(e) => Err(vec![e]),
+            },
         ),
     ]
 }
@@ -308,7 +341,7 @@ mod tests {
     fn a_refusal_added_without_a_catalogue_entry_fails() {
         let mut list = refusals();
         list.push(("ERR-Fault", "An unexpected fault"));
-        let err = refusal_matches_catalogue(&cat(), &list, SPEC_AHEAD_OF_PROGRAM).unwrap_err();
+        let err = refusal_matches_catalogue(&cat(), &list, SPEC_AHEAD_OF_PROGRAM, 0).unwrap_err();
         assert_eq!(
             err,
             vec!["Refusal has ERR-Fault, which SPEC §10 does not name".to_string()]
@@ -321,7 +354,7 @@ mod tests {
             .into_iter()
             .filter(|(c, _)| *c != "ERR-QueryUnbounded")
             .collect();
-        let err = refusal_matches_catalogue(&cat(), &list, SPEC_AHEAD_OF_PROGRAM).unwrap_err();
+        let err = refusal_matches_catalogue(&cat(), &list, SPEC_AHEAD_OF_PROGRAM, 0).unwrap_err();
         assert_eq!(
             err,
             vec!["SPEC §10 names ERR-QueryUnbounded, which Refusal lacks".to_string()]
@@ -332,7 +365,7 @@ mod tests {
     fn a_description_that_differs_from_the_published_one_fails() {
         let mut list = refusals();
         list[0].1 = "Not allowed";
-        let err = refusal_matches_catalogue(&cat(), &list, SPEC_AHEAD_OF_PROGRAM).unwrap_err();
+        let err = refusal_matches_catalogue(&cat(), &list, SPEC_AHEAD_OF_PROGRAM, 0).unwrap_err();
         assert_eq!(err.len(), 1);
         assert!(err[0].starts_with("ERR-NotAuthorised: the runtime description"));
     }
@@ -344,11 +377,30 @@ mod tests {
         assert_eq!(a.id, "ERR-CommandApprovalRequired");
         assert_eq!(a.amendment, "0037");
         assert!(a.ends_with.contains("T-041-06"));
+        assert_eq!(a.ends_at_generation, 1);
+    }
+
+    #[test]
+    fn the_allowance_holds_today_and_fails_at_the_next_core_even_without_the_line() {
+        // The core as compiled today is generation 0: the allowance holds.
+        assert_eq!(core_generation(), Ok(0));
+        assert!(
+            refusal_matches_catalogue(&cat(), &refusals(), SPEC_AHEAD_OF_PROGRAM, 0).is_ok(),
+            "the allowance holds while the core is at generation 0"
+        );
+        // The next core is generation 1. Whether or not it carries the line, the allowance is over.
+        let err =
+            refusal_matches_catalogue(&cat(), &refusals(), SPEC_AHEAD_OF_PROGRAM, 1).unwrap_err();
+        assert_eq!(err.len(), 1, "{err:?}");
+        assert!(
+            err[0].contains("the allowance of amendment 0037 ended"),
+            "{err:?}"
+        );
     }
 
     #[test]
     fn without_the_allowance_the_spec_line_ahead_of_the_program_fails() {
-        let err = refusal_matches_catalogue(&cat(), &refusals(), &[]).unwrap_err();
+        let err = refusal_matches_catalogue(&cat(), &refusals(), &[], 0).unwrap_err();
         assert_eq!(
             err,
             vec!["SPEC §10 names ERR-CommandApprovalRequired, which Refusal lacks".to_string()]
@@ -364,7 +416,7 @@ mod tests {
             .condition
             .clone();
         list.push(("ERR-CommandApprovalRequired", description.leak()));
-        let err = refusal_matches_catalogue(&cat(), &list, SPEC_AHEAD_OF_PROGRAM).unwrap_err();
+        let err = refusal_matches_catalogue(&cat(), &list, SPEC_AHEAD_OF_PROGRAM, 0).unwrap_err();
         assert_eq!(err.len(), 1, "{err:?}");
         assert!(err[0].ends_with("remove the allowance"), "{err:?}");
     }
@@ -375,8 +427,9 @@ mod tests {
             id: "ERR-CommandApprovalRequired",
             amendment: "",
             ends_with: "",
+            ends_at_generation: 1,
         }];
-        let err = refusal_matches_catalogue(&cat(), &refusals(), &bare).unwrap_err();
+        let err = refusal_matches_catalogue(&cat(), &refusals(), &bare, 0).unwrap_err();
         assert_eq!(err.len(), 1, "{err:?}");
     }
 
@@ -386,7 +439,7 @@ mod tests {
             .into_iter()
             .filter(|(c, _)| *c != "ERR-QueryUnbounded")
             .collect();
-        let err = refusal_matches_catalogue(&cat(), &list, SPEC_AHEAD_OF_PROGRAM).unwrap_err();
+        let err = refusal_matches_catalogue(&cat(), &list, SPEC_AHEAD_OF_PROGRAM, 0).unwrap_err();
         assert_eq!(
             err,
             vec!["SPEC §10 names ERR-QueryUnbounded, which Refusal lacks".to_string()]
