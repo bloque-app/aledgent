@@ -90,6 +90,10 @@ on:
         description: "With genesis_image, required: the genesis code version H0 (64 hex, either case) the manifest must have"
         type: string
         default: ""
+      rehearsal:
+        description: "THROWAWAY BRANCH ONLY: build the rehearsal code versions (core.Dockerfile, target rehearsal-out) and upload them as a run artefact. Builds nothing else, pushes nothing"
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       version:
@@ -160,7 +164,7 @@ jobs:
     name: ingress, settle, ops, signer
     # Pull requests, releases and dispatches; never a plain push to main (only the sidecar's), and
     # never a dispatch for a core on a genesis.
-    if: (inputs.version != '' || github.event_name != 'push') && inputs.genesis_image == ''
+    if: (inputs.version != '' || github.event_name != 'push') && inputs.genesis_image == '' && inputs.rehearsal != true
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -394,7 +398,7 @@ jobs:
 
   core:
     name: core (VOS Agent)
-    if: (inputs.version != '' || github.event_name != 'push') && inputs.genesis_image == ''
+    if: (inputs.version != '' || github.event_name != 'push') && inputs.genesis_image == '' && inputs.rehearsal != true
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
@@ -516,6 +520,86 @@ jobs:
             echo "- \`$repo:sha-$COMMIT$ROOTS_TAG@$digest\`" >> "$GITHUB_STEP_SUMMARY"
             echo "$t=$repo@$digest" >> "$GITHUB_OUTPUT"
           done
+
+  # THROWAWAY (branch rehearsal/integration; never merged): the code versions of the first real core
+  # upgrade's rehearsal (core.Dockerfile, the `rehearsal` stages). Nothing is pushed to any registry:
+  # the files, the host and the core image (OCI archive) are a run artefact, kept 14 days.
+  rehearsal:
+    name: rehearsal code versions
+    if: inputs.rehearsal == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ env.COMMIT }}
+          persist-credentials: false
+      - name: Free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          docker system prune -af > /dev/null
+          df -h /
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - name: Build the versions
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: deploy/docker/core.Dockerfile
+          target: rehearsal-out
+          platforms: linux/amd64
+          build-args: |
+            ROOTS=${{ env.ROOTS }}
+            REHEARSAL_SOURCE_REV=${{ env.COMMIT }}
+          cache-from: type=gha,scope=rehearsal
+          cache-to: type=gha,scope=rehearsal,mode=max
+          outputs: type=local,dest=out
+      # The core image from the same layers: its host must be the one that wrote the manifests.
+      - name: Build the core image (g)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: deploy/docker/core.Dockerfile
+          target: core
+          platforms: linux/amd64
+          build-args: ROOTS=${{ env.ROOTS }}
+          cache-from: type=gha,scope=rehearsal
+          tags: aledgent-core:rehearsal
+          outputs: type=docker,dest=core-image.tar
+      - name: The image carries the host and the programs the manifests name
+        run: |
+          set -euo pipefail
+          docker load -i core-image.tar
+          id=$(docker create aledgent-core:rehearsal)
+          mkdir image
+          docker cp "$id:/usr/local/bin/aledgent-core-host" image/aledgent-core-host
+          docker cp "$id:/usr/share/aledgent/core.vos" image/core.vos
+          docker cp "$id:/usr/share/aledgent/agent_runtime.pvm" image/agent_runtime.pvm
+          docker rm "$id" > /dev/null
+          cmp image/aledgent-core-host out/aledgent-core-host
+          cmp image/core.vos out/g/core.vos
+          cmp image/agent_runtime.pvm out/g/agent_runtime.pvm
+          cat out/g-rebuild.txt
+          mv core-image.tar out/core-image-g.tar
+          (cd out && sha256sum core-image-g.tar >> SHA256SUMS)
+          {
+            echo "### Rehearsal code versions"
+            echo
+            echo '```'
+            cat out/SHA256SUMS
+            echo '```'
+            for v in g H H-gen2 H-noclaim H-otherrt H-otherkey; do
+              echo "- $v: $(jq -c '{version, generation}' "out/$v/manifest.json" 2>/dev/null || echo 'manifest refused')"
+            done
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rehearsal-versions
+          path: out
+          retention-days: 14
+          if-no-files-found: error
 
   # F-038 §12 step 0, DEC-27 (i): the current host on a deployment's genesis package and runtime
   # (this file's header). Published on a dispatch with `genesis_image`; tested on every pull request.
@@ -851,7 +935,7 @@ jobs:
 
   sidecar:
     name: sidecar (GHCR)
-    if: inputs.genesis_image == ''
+    if: inputs.genesis_image == '' && inputs.rehearsal != true
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:

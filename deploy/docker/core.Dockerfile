@@ -257,3 +257,130 @@ CMD ["serve", "--config", "/etc/aledgent/ingress.json", \
      "--runtime", "/usr/share/aledgent/agent_runtime.pvm", \
      "--actor", "/usr/share/aledgent/core.vos", \
      "--state", "/var/lib/aledgent/core"]
+
+# ---------------------------------------------------------------------------------------------------
+# THROWAWAY (branch rehearsal/integration only; never merged): the code versions of the first real
+# core upgrade's rehearsal (handovers/2026-10-21-f037-rehearsal-runbook.md, phase B). One build
+# session, so every version shares the host binary, the VOS tree, the toolchain and the Cargo.lock
+# that g's build resolved (runbook B2):
+#
+#   g            the founding version: what the `core` target ships (generation 0)
+#   H            generation 1, packaged with g as its predecessor: installable
+#   H-gen2       generation 2 with g's claim: the door refuses it (wrong generation)
+#   H-noclaim    generation 1 packaged without --previous: no claim over g
+#   H-otherrt    H's package with another runtime (blake2b-precompile) in the manifest
+#   H-otherkey   H, packaged under another package key (a host that signs with 0x73)
+#
+# Every version has code.bin (its manifest, written by the host this image ships), manifest.json (what
+# the host printed), core.vos and agent_runtime.pvm. `--target rehearsal-out` exports the directory.
+FROM build AS rehearsal-h
+# H, H-gen2 and H-noclaim: the same guest with the generation constant changed, nothing else.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/w/target,sharing=locked <<'EOF2'
+set -eu
+host=/out/bin/aledgent-core-host
+R=/out/rehearsal
+mkdir -p "$R/g" "$R/H" "$R/H-gen2" "$R/H-noclaim" /w/elfs
+cp /out/share/core.vos /out/share/agent_runtime.pvm "$R/g/"
+cd /w/aledgent/agents/core
+cp Cargo.lock "$R/Cargo.lock"
+elf_of() {
+  elf=$(find /w/target/core/riscv64em-vos/release -maxdepth 1 -name 'aledgent_core*.elf' | head -n 1)
+  if [ -z "$elf" ]; then elf=/w/target/core/riscv64em-vos/release/aledgent_core; fi
+  echo "$elf"
+}
+build_generation() {
+  sed -i "s/^const GENERATION: u64 = [0-9]*;/const GENERATION: u64 = $1;/" src/lib.rs
+  grep -q "^const GENERATION: u64 = $1;" src/lib.rs
+  CARGO_TARGET_DIR=/w/target/core cargo actor --locked --config /w/vos-patch.toml $(cat /w/roots-features)
+  cp "$(elf_of)" "/w/elfs/gen$1.elf"
+}
+build_generation 1
+build_generation 2
+build_generation 0
+"$host" package "/w/elfs/gen1.elf" "$R/H/core.vos" --previous "$R/g/core.vos" > "$R/H/package.txt"
+cat "$R/H/package.txt"
+"$host" package "/w/elfs/gen2.elf" "$R/H-gen2/core.vos" --previous "$R/g/core.vos" > "$R/H-gen2/package.txt"
+cat "$R/H-gen2/package.txt"
+"$host" package "/w/elfs/gen1.elf" "$R/H-noclaim/core.vos" > "$R/H-noclaim/package.txt"
+cat "$R/H-noclaim/package.txt"
+# The rebuilt generation 0 must be g's package, byte for byte: the proof that a rebuild in this session
+# reproduces the version the `core` image ships.
+"$host" package "/w/elfs/gen0.elf" "$R/g-rebuilt.vos" > "$R/g-rebuilt.txt"
+cat "$R/g-rebuilt.txt"
+if cmp "$R/g-rebuilt.vos" "$R/g/core.vos"; then echo reproduces > "$R/g-rebuild.txt"; else echo DIFFERS > "$R/g-rebuild.txt"; fi
+cat "$R/g-rebuild.txt"
+rm -f "$R/g-rebuilt.vos"
+EOF2
+
+# H-otherrt: a runtime other than g's, to name in H's manifest (VOS's blake2b-precompile profile).
+FROM rehearsal-h AS rehearsal-rt
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/w/target,sharing=locked <<'EOF2'
+set -eu
+R=/out/rehearsal
+mkdir -p "$R/H-otherrt"
+cd /w/vos/services/agent-runtime
+CARGO_TARGET_DIR=/w/target/agent-runtime-alt cargo actor --locked --features blake2b-precompile
+ALEDGENT_RUNTIME_GP_ONLY=0 /out/bin/aledgent-core-host runtime-pvm \
+  /w/target/agent-runtime-alt/riscv64em-vos/release/agent_runtime.elf "$R/H-otherrt/agent_runtime.pvm"
+cp "$R/H/core.vos" "$R/H-otherrt/core.vos"
+EOF2
+
+# H-otherkey: the host built a second time with another package key, used to package H and for
+# nothing else. The shipped host is not this one.
+FROM rehearsal-rt AS rehearsal-key
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/w/target,sharing=locked <<'EOF2'
+set -eu
+R=/out/rehearsal
+mkdir -p "$R/H-otherkey"
+cd /w/aledgent/agents
+cp core-host/src/main.rs /w/main.rs.orig
+grep -q '\[0x71; 32\]' core-host/src/main.rs
+sed -i 's/\[0x71; 32\]/[0x73; 32]/' core-host/src/main.rs
+# In place: only core-host recompiles. The shipped host is the copy in /out/bin, made earlier.
+CARGO_TARGET_DIR=/w/target/host cargo build --release -p core-host --config /w/vos-patch.toml $(cat /w/roots-features)
+cp /w/target/host/release/aledgent-core-host /w/host-otherkey
+cp /w/main.rs.orig core-host/src/main.rs
+/w/host-otherkey package /w/elfs/gen1.elf "$R/H-otherkey/core.vos" --previous "$R/g/core.vos" > "$R/H-otherkey/package.txt"
+cat "$R/H-otherkey/package.txt"
+cmp "$R/H/core.vos" "$R/H-otherkey/core.vos" && { echo "the other key changed nothing"; exit 1; } || true
+EOF2
+
+# The manifests, written by the host this image ships (the manifest names the host's own bytes).
+FROM rehearsal-key AS rehearsal
+ARG REHEARSAL_SOURCE_REV=unknown
+RUN <<'EOF2'
+set -eu
+R=/out/rehearsal
+host=/out/bin/aledgent-core-host
+cat > "$R/profile.json" <<EOP
+{"kernel": {"revision": "e9a7b08"},
+ "package": {"target": "riscv64em-vos", "toolchain": "nightly-2026-03-20", "opt_level": "s", "features": [], "source_revision": "$REHEARSAL_SOURCE_REV", "cargo_lock": "Cargo.lock"},
+ "runtime": {"target": "riscv64em-vos", "toolchain": "nightly-2026-03-20", "opt_level": "3", "features": [], "source_revision": "$REHEARSAL_SOURCE_REV", "cargo_lock": "Cargo.lock"},
+ "native_decide": {"target": "x86_64-unknown-linux-gnu", "toolchain": "nightly-2026-03-20", "opt_level": "3", "features": [], "source_revision": "$REHEARSAL_SOURCE_REV", "cargo_lock": "Cargo.lock"}}
+EOP
+for v in g H H-gen2 H-noclaim H-otherrt H-otherkey; do
+  d="$R/$v"
+  if [ -f "$d/agent_runtime.pvm" ]; then rt="$d/agent_runtime.pvm"; else rt="$R/g/agent_runtime.pvm"; cp "$rt" "$d/agent_runtime.pvm"; fi
+  # The designed-bad versions may be refused by the host itself: that is recorded, not fatal.
+  if "$host" code-manifest --actor "$d/core.vos" --runtime "$rt" --profile "$R/profile.json" --out "$d/code.bin" > "$d/manifest.json"; then
+    cat "$d/manifest.json"
+  else
+    case "$v" in
+      g|H) exit 1 ;;
+      *) echo "code-manifest refused $v" | tee "$d/manifest-refused.txt" ;;
+    esac
+  fi
+done
+cp "$host" "$R/aledgent-core-host"
+(cd "$R" && find . -type f ! -name SHA256SUMS | sort | xargs sha256sum > SHA256SUMS)
+cat "$R/SHA256SUMS"
+EOF2
+
+FROM scratch AS rehearsal-out
+COPY --from=rehearsal /out/rehearsal /
