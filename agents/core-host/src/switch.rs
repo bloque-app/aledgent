@@ -333,6 +333,29 @@ pub struct Candidate {
     pub runtime: Option<[u8; 32]>,
     /// The producer of its package (the package key's identity).
     pub producer: vos::agent_sdk::ProducerId,
+    /// Whether its package may replace the program running: it is that very program, or it carries
+    /// the producer's signed claim over it ([`claims_running`]).
+    pub claims_running_program: bool,
+}
+
+/// Whether `candidate`'s package may replace the program `running`'s package holds: the same
+/// program (nothing changes), or a claim, signed with the package, to read the state of the program
+/// running (`T-037-19`: `state_compatible_with`). The runtime refuses a program change without it.
+///
+/// # Errors
+///
+/// A package that is not admitted.
+pub fn claims_running(running: &[u8], candidate: &[u8]) -> Result<bool, String> {
+    let admit = |bytes: &[u8]| {
+        crate::package::admit_actor(bytes).map_err(|e| format!("the package is not admitted: {e}"))
+    };
+    let running = admit(running)?.program();
+    let candidate = admit(candidate)?;
+    Ok(candidate.program() == running
+        || candidate
+            .manifest()
+            .state_compatible_with
+            .contains(&running))
 }
 
 /// Whether `install` (above) would accept `candidate` while the host runs `running` from a package
@@ -345,11 +368,10 @@ pub struct Candidate {
 /// 2. the package is signed by the producer of the package running (the runtime refuses an upgrade
 ///    that changes the producer).
 ///
-/// **Hook for `T-037-19` (PR #49):** the claim. A package that changes the program of a stateful
-/// actor must carry the producer's signed claim over the program running, which the patched VOS
-/// (`state_compatible_with`) defines and the pin of this tree does not have. The line that asks
-/// for it goes here, below the two checks; until then a program change is refused by the runtime
-/// itself when the switch tries it.
+/// 3. the package changes the program only with the producer's signed claim over the program
+///    running (`T-037-19`, the patched VOS's `state_compatible_with`): a version built without
+///    `--previous` would be refused by the runtime at the switch. (The line `T-037-22` left as a
+///    hook for PR #49, filled on the rehearsal integration branch.)
 ///
 /// # Errors
 ///
@@ -377,7 +399,14 @@ pub fn installable(
                 .into(),
         );
     }
-    // The claim over the running program: `T-037-19`.
+    if !candidate.claims_running_program {
+        return Err(
+            "its package carries no claim over the program running (build it with \
+             `package --previous <the package running>`): the runtime refuses to change the \
+             program of a stateful actor without it"
+                .into(),
+        );
+    }
     Ok(())
 }
 
@@ -406,6 +435,7 @@ impl CodeState {
             Candidate {
                 runtime: checked.runtime.as_deref().map(artefact_digest),
                 producer: producer(&checked.package)?,
+                claims_running_program: claims_running(&running.package, &checked.package)?,
             },
         )
     }
@@ -506,6 +536,7 @@ mod tests {
         let same = Candidate {
             runtime: Some([9; 32]),
             producer: key,
+            claims_running_program: true,
         };
         assert_eq!(installable(running, key, same), Ok(()));
         let why = installable(
@@ -538,6 +569,31 @@ mod tests {
         )
         .unwrap_err();
         assert!(why.contains("another key"), "{why}");
+        let why = installable(
+            running,
+            key,
+            Candidate {
+                claims_running_program: false,
+                ..same
+            },
+        )
+        .unwrap_err();
+        assert!(why.contains("no claim"), "{why}");
+    }
+
+    /// `T-037-22` over `T-037-19`: the claim is read from the packages themselves. A package built
+    /// with its predecessor claims it; one built without does not; the same program needs none.
+    #[test]
+    fn t037_22_the_claim_over_the_running_program_is_read_from_the_packages() {
+        use crate::stateful_fixture as fixture;
+        let g0 = fixture::package(1, &[]);
+        let claim = crate::package::state_claim(Some(&g0)).unwrap();
+        let claimed = fixture::package(2, &claim);
+        let unclaimed = fixture::package(2, &[]);
+        assert_eq!(claims_running(&g0, &claimed), Ok(true));
+        assert_eq!(claims_running(&g0, &unclaimed), Ok(false));
+        assert_eq!(claims_running(&g0, &g0), Ok(true));
+        assert!(claims_running(&g0, b"not a package").is_err());
     }
 
     #[test]
