@@ -1,9 +1,9 @@
 ---
 name: aledgent
 summary: A private, provable ledger of record — identities that own accounts, value that moves between them instantly and confidentially, and one settlement layer through which value enters, leaves, and is anchored.
-spec_version: 0.4.28
+spec_version: 0.4.29
 status: draft
-date: 2026-10-20
+date: 2026-10-22
 ---
 
 # aledgent — System Specification
@@ -268,6 +268,9 @@ One canonical name per concept. This document uses each term only in the sense g
 | **Settlement** | The completion of value exchange with a counterparty. Reached only after finality. |
 | **Authority** | The right to cause a named class of operation on a named ledger account, within bounds. |
 | **Credential** | Whatever proves that its holder has an authority: a key, a device-bound credential, an issued secret. Never a name. |
+| **Approval** | a proof of possession by a credential, over one command, that the command may be taken in (`REQ-AU-23`). |
+| **Session** | a short-lived proof that a sign-in succeeded; it stands for the caller until it expires and signs nothing. |
+| **Bearer secret** | a secret that proves who a caller is by being presented as it is; a session is not one, because it stands for a sign-in made with a credential that signs. |
 | **Owner authority** | The authority an identity holds over its own accounts, exercised with its own credential. |
 | **Delegated authority** | A scoped, bounded, revocable authority that an identity grants to another principal: an agent, a member. |
 | **Operator authority** | The custodial authority the operator holds over accounts in the delegated custody mode. |
@@ -419,7 +422,7 @@ an invariant at a weaker layer than the one named. In particular, an invariant n
 store MUST NOT be downgraded to an application check. Any weakening is a specification amendment.
 
 **`REQ-AR-5`** A deployment MUST declare, in machine-readable form, which invariants of §9 it enforces and
-which it only attests. aledgent MUST show this as an **assurance level** on any disclosure it issues.
+which it only attests. aledgent MUST show this as an **assurance level** on any disclosure it issues. A deployment MUST also declare whether it enforces approvals (`REQ-AU-23`): enforced, reporting only, or off. *Amendment 0037.*
 
 **`REQ-AR-6`** The first release's assurance level MUST declare every invariant at the layer §9's **V0**
 column names, or at a stronger one. Where the V0 column names a weaker layer than the target column, the
@@ -1676,7 +1679,7 @@ none serves any set. *Amendment 0027.* An identity's set is empty only from an o
 until its first credential joins. Removing the identity's last credential MUST be refused with `ERR-NotAuthorised`: outside a
 recovery, a holder cannot lock themselves out. A recovery reissues credentials into the set. A holder-held recovery credential (`REQ-AU-18`) is
 a member of the set, marked as such. Where a credential is stored, such as a device, a key file or a hardware
-token, is not a ledger fact.
+token, is not a ledger fact. Adding or removing a credential is a command that needs an approval (`REQ-AU-23`); adding a device-bound credential needs it from a credential already in the set, in addition to the ceremony above. *Amendment 0037.*
 
 **`REQ-AU-21`** A credential held by an identity holder or by an agent MAY reach aledgent directly, as a
 service principal's may. Every call, whoever holds its credential, enters through the one component that
@@ -1724,6 +1727,53 @@ not accept, an expired, used or cancelled enrolment) or `ERR-JustificationRequir
 imported one carries the import's (`REQ-MG-8`). aledgent proves that whoever completed the enrolment holds
 the credential. It cannot prove that this person is the holder the integrating party meant: the
 integrating party is the authority for that, and the enrolment's record names who opened it.
+
+**`REQ-AU-23`** **A credential approves each command that matters, one command at a time.** An **approval** is a
+proof of possession by a credential of the initiating principal's identity whose scheme signs (a key, or a
+device-bound credential), over one command: the deployment, the client key, the initiating principal, the
+principal it acts for where different, and everything the command carries that decides what it does. For a
+command that adds a verifier to a credential set, that includes the verifier. An approval approves that command
+and no other, once.
+
+- **Which commands.** The commands that move or reserve value, name where value goes, change who may act on an
+  account, or change a credential. The default list is the table of amendment 0037, "Which commands". A
+  deployment MAY add commands and MUST NOT remove one. It publishes the list with its limits (§8.2).
+- **Which callers.** Decided by how the caller proved who it is, and by nothing else: not the kind of principal, and
+  not the route. A caller whose proof of who it is rests on a credential that signs needs an approval: a
+  session, which stands for a sign-in made with a device-bound credential, or a signature by a key. A caller that
+  presents a bearer secret as it is (an issued secret, or a token an operator configured for a principal) needs
+  none, and nor does an input the book gives itself (a deadline, a settlement observation). Approvals themselves
+  can be made only by a credential of a scheme that signs.
+- **Who approves.** Any active credential of the initiating principal's set whose scheme signs, not only the one
+  the caller presented. The principal acted for never approves. Exception: the command that schedules a new version
+  of the code (`upgrade`) MUST be approved by the credential the upgrade-authority mode (`REQ-RT-18`) names for the
+  caller. The commands that move or cancel a scheduled upgrade take no approval (amendment 0034, ruling `w6` (B)).
+- **What the approval carries.** A device-bound credential's approval MUST carry the device's own check that the
+  person using it is its owner (a PIN, a fingerprint or a face), whatever the deployment asks of sign-in. A key's
+  approval is a signature by that key, valid for a stated, short time.
+- **A session never approves.** A session proves who is calling, for sign-in and for reads. It does not approve a
+  write.
+- **No approval.** A command that needs an approval and carries none MUST be refused with `ERR-CommandApprovalRequired`, and
+  nothing is taken in: no operation reference, no row, no state.
+- **A bad approval.** An approval that does not verify, that was already used, that has expired, that was made for
+  another command, another identity or another deployment, that lacks the device's check, or that a credential
+  outside the initiating principal's set made, MUST be refused with `ERR-CredentialInvalid`, whichever of those it
+  is, with nothing taken in (`REQ-ER-3`).
+- **The current credential list.** Whether the approving credential is still a member of the set MUST be decided
+  against the list as the book holds it now, at most as old as the bound of `NFR-20`. If it cannot be read, the command is refused with `ERR-DecisionUnavailable`. A stored copy
+  of a credential never stands in for an approval.
+- **Once, everywhere.** A device-bound approval is valid for a stated, short time and is accepted once, by any
+  instance of the component that receives commands, and also after a restart.
+- **A retry.** A repeat of a command that was approved and taken in, under the same client key, returns the first
+  result and needs no new approval (`REQ-OP-10`). The same client key with a different command is
+  `ERR-ClientKeyReused`, as always.
+- **Order of checks.** A shape fault is found first (`REQ-ER-3`), then whether a first result exists for the key
+  (a retry), then whether an approval is needed and valid. A command with a shape fault never reaches the
+  question of approval.
+- **Two steps, one command.** Obtaining what a credential must sign takes nothing in. The command is taken in, and
+  `REQ-CS-2`, `REQ-CS-8` and `NFR-1` apply to it, from the request that carries its approval.
+- **Where it is enforced.** By the component that receives commands. This requirement does not say whether the
+  book also records the approval.
 
 **`REQ-AU-10`** Issuance authority (`REQ-AS-6`) is authority over an asset, not over an account. It MUST be
 bounded like any other authority, per window and per asset. It MUST be revocable. Every use of it MUST be
@@ -1934,6 +1984,51 @@ my own device, through the integrating party's client.
   it, Then it is refused with `ERR-NotAuthorised` (`REQ-AU-22`, `REQ-AU-20`).
 - `AC-A9.6` Given an enrolled credential, When it reclaims custody, Then the reclaim needs its proof that
   it works, as for any other credential (`REQ-AU-13`, `REQ-AU-22`).
+
+**`US-A10`** — As an **identity holder**, nobody moves my value, my authority or my credentials with only a stolen
+session: each command that matters is approved with one of my own credentials, one command at a time.
+- `AC-A10.1` Given a command that needs an approval and none attached, Then it is refused with
+  `ERR-CommandApprovalRequired`, nothing is taken in, and no operation reference exists for it (`REQ-AU-23`).
+- `AC-A10.2` Given a valid approval of that command, Then it is taken in and decided as any command is
+  (`REQ-AU-23`, `REQ-CS-8`).
+- `AC-A10.3` Given an approval of one command, When it accompanies a command that differs in amount, destination,
+  client key, initiator or acted-for principal, Then it is refused with `ERR-CredentialInvalid` and nothing is taken
+  in (`REQ-AU-23`).
+- `AC-A10.4` Given an approval already used, or expired, or made by a credential of another identity, or made over
+  a challenge issued for another identity or another deployment, Then it is refused with `ERR-CredentialInvalid`,
+  on any instance and after a restart (`REQ-AU-23`, `REQ-ER-3`).
+- `AC-A10.5` Given a command approved and taken in, When it is repeated under the same client key, Then the first
+  result is returned and no approval is asked for; and When the same key carries a different command, Then it is
+  `ERR-ClientKeyReused` (`REQ-AU-23`, `REQ-OP-10`).
+- `AC-A10.6` Given a command that needs an approval, When it comes with a bearer secret presented as it is (an
+  issued secret, or a token an operator configured for a principal), Then it is taken in without one
+  (`REQ-AU-23`).
+- `AC-A10.7` Given a session, When it signs in or reads, Then no approval is asked for (`REQ-AU-23`).
+- `AC-A10.8` Given a session and no approval, When a device-bound credential is registered, Then the command is
+  refused with `ERR-CommandApprovalRequired`; and Given the approval of an existing credential in the set, and the
+  registration ceremony of `REQ-AU-20`, Then the credential joins the set (`REQ-AU-23`).
+- `AC-A10.9` Given two independent implementations of the command digest, When both are given one command, Then
+  they produce the same digest, byte for byte (`REQ-AU-23`; the worked vector of amendment 0037).
+- `AC-A10.10` Given a command that needs an approval and has a shape fault, Then it is `ERR-MalformedCommand`, not
+  a refusal for the missing approval (`REQ-AU-23`, `REQ-ER-3`).
+- `AC-A10.11` Given an identity with two device-bound credentials and a session made with the first, When the
+  second approves a command, Then it is accepted, and the audit names the second as the approver and the first as
+  the caller (`REQ-AU-23`, `REQ-AU-7`); and When an approval lacks the device's own check, Then it is refused with
+  `ERR-CredentialInvalid`, also in a deployment that does not ask for that check at sign-in.
+- `AC-A10.12` Given the approval of a registration of one device-bound credential, When the command arrives
+  carrying the registration of another, Then it is refused with `ERR-CredentialInvalid` and the set is unchanged
+  (`REQ-AU-23`).
+- `AC-A10.13` Given a credential that was removed from its set, When it approves a command, Then it is refused with
+  `ERR-CredentialInvalid`; and When the current list cannot be read, Then the command is refused with
+  `ERR-DecisionUnavailable` and a stored copy of the credential is not used (`REQ-AU-23`, `NFR-20`).
+- `AC-A10.14` Given a command that needs an approval, When it comes under a session, by a principal of any kind, Then
+  it needs an approval; and Given a key credential in the initiating principal's set, When its key signs the digest
+  within its validity, Then that is an approval and the command is taken in (`REQ-AU-23`).
+- `AC-A10.15` Given an approval made for one deployment, When it is presented to another that shares the
+  authentication key, Then it is refused with `ERR-CredentialInvalid` (`REQ-AU-23`).
+- `AC-A10.16` Given the command that schedules an upgrade, When a credential other than the one the mode names
+  approves it, Then it is refused with `ERR-CredentialInvalid`; and Given a command that moves or cancels a
+  scheduled upgrade, Then it takes no approval (`REQ-AU-23`, `REQ-RT-18`, amendment 0034).
 
 ### Epic B — Internal transfers
 
@@ -2505,7 +2600,7 @@ The account and security commands MUST always be answered with their decision. T
 open identities; open or close ledger accounts; register or remove credentials; grant or revoke authority,
 issuance authority and operator authority included; initiate, cancel or complete a recovery; name a
 successor or claim a succession; change custody; and every command of the operator surface (`CTR-OPS`).
-Only an amendment may move a command from one way to the other.
+Only an amendment may move a command from one way to the other. A command that needs a credential's approval (`REQ-AU-23`) is answered, or acknowledged, only once its approval has been verified; before that it is refused and nothing is taken in. *Amendment 0037.*
 
 The answering setting of `REQ-CS-9` does not move a command from one way to the other. It chooses, per
 principal, which of the two ways that principal's `transfer` and `reserve` are answered.
@@ -3057,7 +3152,7 @@ disclosures, anchor checkpoints, or resolve an existing operation. They submit n
 | `statement(subject, period)` | Opening, movements, closing. It balances exactly (`INV-6`) |
 | `operation(reference)` | State, deadline, evidence, outcome, and the named error condition where refused |
 | `assets()` | The registry: identity, precision, kind, status (`REQ-AS-1`) |
-| `limits()` | What this deployment accepts in one command: the most legs of a multi-leg submission, and the largest pass-through data (`REQ-CS-10`, `REQ-PO-5`) |
+| `limits()` | What this deployment accepts in one command: the most legs of a multi-leg submission, and the largest pass-through data (`REQ-CS-10`, `REQ-PO-5`); and which commands need a credential's approval, whether the deployment enforces that, and how long an approval is valid (`REQ-AU-23`). *Amendment 0037.* |
 | `open_reservations(subject, [asset], [before], cursor)` | Open reservations of an account, an identity, or the calling principal: aggregated per (account, asset) and itemised, from one consistent view that names its position. Only what the caller may see (`REQ-QR-7`, `REQ-QR-4`) |
 | `trial_balance([asset])` | Sum of all entries per asset. It is exactly zero (`INV-5`) |
 | `verify(disclosure)` | Whether a disclosure is consistent with a checkpoint (`REQ-DS-3`) |
@@ -3156,6 +3251,7 @@ and the book can never disagree about whether value moved:
 | `ERR-EvidenceInsufficient` | The evidence supplied does not establish the outcome claimed (`INV-11`) |
 | `ERR-JustificationRequired` | An operator action was submitted without a justification |
 | `ERR-ApprovalRequired` | A reversal, or a release without proof (`REQ-RC-5` step 3), was submitted without a second, distinct principal approving it (`REQ-OS-3`) |
+| `ERR-CommandApprovalRequired` | A command that needs a credential's approval of that one command (`REQ-AU-23`) was submitted without one. A presented approval that does not verify is `ERR-CredentialInvalid` |
 | `ERR-DisclosureUnsupported` | aledgent cannot make the assertion requested |
 | `ERR-DisclosureFalse` | aledgent can determine locally that the assertion is false (`REQ-DS-4`) |
 | `ERR-NotDisclosable` | The subject has not authorised this disclosure, and no legal obligation applies |
@@ -3352,7 +3448,7 @@ invalid. This specification MUST NOT contain a requirement that serves no story.
 
 | Epic | Stories | Principal requirements | Key invariants |
 |---|---|---|---|
-| A — Identity and accounts | `US-A1`, `US-A2`, `US-A4`–`US-A9` | `REQ-ID-*`, `REQ-LA-*`, `REQ-AU-5`, `REQ-AU-6`, `REQ-AU-8`, `REQ-AU-9`, `REQ-AU-11`–`REQ-AU-20`, `REQ-AU-22`, `REQ-SN-1` | `INV-9`, `INV-16`, `INV-17`, `INV-20` |
+| A — Identity and accounts | `US-A1`, `US-A2`, `US-A4`–`US-A10` | `REQ-ID-*`, `REQ-LA-*`, `REQ-AU-5`, `REQ-AU-6`, `REQ-AU-8`, `REQ-AU-9`, `REQ-AU-11`–`REQ-AU-20`, `REQ-AU-22`, `REQ-AU-23`, `REQ-SN-1` | `INV-9`, `INV-16`, `INV-17`, `INV-20` |
 | B — Internal transfers | `US-B1`–`US-B3` | `REQ-KER-1`, `REQ-KER-10`, `REQ-BA-4`, `REQ-SL-5`, `REQ-CS-10` | `INV-1`, `INV-3`, `INV-25` |
 | C — Reservations | `US-C1`–`US-C6` | `REQ-BA-1`–`REQ-BA-4`, `REQ-OP-2`, `REQ-OP-5`, `REQ-OP-9`, `REQ-QR-7`, `REQ-EV-8` | `INV-14`, `INV-15`, `INV-21` |
 | D — Inbound | `US-D1`–`US-D3` | `REQ-IN-1`–`REQ-IN-7`, `REQ-SA-7`, `REQ-SI-*` | `INV-10`, `INV-11`, `INV-12` |
@@ -3379,7 +3475,7 @@ property in this document.
 
 | Epic | V0 | Beyond V0 |
 |---|---|---|
-| A — Identity and accounts | `US-A1`, `US-A2`, `US-A4`–`US-A9` | — |
+| A — Identity and accounts | `US-A1`, `US-A2`, `US-A4`–`US-A10` | — |
 | B — Internal transfers | `US-B1`–`US-B3` | — |
 | C — Reservations | `US-C1`–`US-C4`, `US-C6` | `US-C5` (encumbrance — `DEF-11`) |
 | D — Inbound | `US-D1`–`US-D3` | — |
