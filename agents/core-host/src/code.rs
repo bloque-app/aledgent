@@ -51,7 +51,16 @@ pub const PLATFORM: &str = "vos-saga";
 
 /// The revision of [`PLATFORM`] this host links: the VOS commit `agents/Cargo.toml` pins (a test
 /// keeps the two equal). A manifest naming another revision is another platform's code.
-pub const PLATFORM_REVISION: &str = "c54fc1ff13fcd55b86f2cf4edc77b041b62e245f";
+pub const PLATFORM_REVISION: &str = "bd8d1bb70551391a4c80a96c2249313ab7e0a0fc";
+
+/// The `blake2b-256` of the standard AgentRuntime built from the VOS at [`PLATFORM_REVISION`] and
+/// linked as the image links it (`runtime-pvm`, Gray Paper calls only), in hex (`T-037-19`). The
+/// host does not read it: the CI job `stateful upgrade through the built runtime` builds that
+/// runtime and fails unless it has this digest, so a pin bump that changes the runtime is found
+/// there and not at the founding. Update it with the pin, in one change.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const PATCHED_RUNTIME_DIGEST: &str =
+    "24d9f4512335347ef2e70d84794693fbebf06f0a679274ff7b7bd2af16ba90f9";
 
 /// The identity kind of VOS's `ProgramId` of a program, on [`PLATFORM`].
 pub const VOS_PROGRAM_ID: &str = "vos-program-id";
@@ -754,6 +763,17 @@ mod tests {
         check_format(SPEC_VERSION).unwrap();
         let e = check_format(ledger_core::chainspec::SPEC_VERSION_V4).unwrap_err();
         assert!(e.contains("format 4") && e.contains("format 5"), "{e}");
+    }
+
+    /// The expected runtime digest is a `blake2b-256` in hex, as CI compares it.
+    #[test]
+    fn the_patched_runtime_digest_is_a_blake2b_256_in_hex() {
+        assert_eq!(PATCHED_RUNTIME_DIGEST.len(), 64);
+        assert!(
+            PATCHED_RUNTIME_DIGEST
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        );
     }
 
     /// The platform this host names is the VOS it links.

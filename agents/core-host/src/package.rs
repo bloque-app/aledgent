@@ -22,7 +22,7 @@ use vos::agent_sdk::package::{
     AgentRuntimePackageManifest, PackageArtifact, PackageEnvelope, PackageManifest, PackageSigning,
 };
 use vos::agent_sdk::wire::CanonicalWire as _;
-use vos::agent_sdk::{BlobRef, ProducerId, RuntimeCapabilities};
+use vos::agent_sdk::{BlobRef, ProducerId, ProgramId, RuntimeCapabilities};
 
 /// Why a package could not be built.
 #[derive(Debug)]
@@ -117,11 +117,32 @@ pub fn generation(elf: &[u8], program: &[u8]) -> Result<u64, PackageError> {
     Ok(of_elf)
 }
 
-/// The signed VOS3 package of an actor ELF (see the module documentation).
+/// The programs a new generation's package claims to read the state of (`T-037-19`, owner ruling
+/// w5): none for the first generation, which has no predecessor, and the program of the previous
+/// generation's package otherwise.
+///
+/// The program is the Agent `ProgramId` of the admitted package ([`AdmittedActorPackage::program`]),
+/// the one the runtime lists as the installed actor's program and the claim is compared with. It is
+/// not `vos::service::ProgramId`, the legacy service identity: the runtime would refuse every
+/// switch with `UnsupportedLane`.
+pub fn state_claim(previous: Option<&[u8]>) -> Result<Vec<ProgramId>, PackageError> {
+    previous.map_or_else(
+        || Ok(Vec::new()),
+        |bytes| {
+            admit_actor(bytes)
+                .map(|p| vec![p.program()])
+                .map_err(|e| err(format!("the previous package: {e}")))
+        },
+    )
+}
+
+/// The signed VOS3 package of an actor ELF (see the module documentation), its producer claiming
+/// that its program reads the state of the `state_compatible_with` programs ([`state_claim`]).
 pub fn actor_package(
     elf: &[u8],
     name: Option<&str>,
     key: &dyn AgentSigner,
+    state_compatible_with: &[ProgramId],
 ) -> Result<Vec<u8>, PackageError> {
     let pvm = link(elf)?;
     let metadata_bytes = vos::metadata::raw_section_from_elf(elf)
@@ -275,6 +296,7 @@ pub fn actor_package(
             resources: (pvm.len() > sdk::STANDARD_ACTOR_PROGRAM_BYTES)
                 .then(|| vos::agent::package_admission::actor_program_resources(&pvm))
                 .flatten(),
+            state_compatible_with: Vec::new(),
             signing: PackageSigning {
                 producer: ProducerId::of_public_key(&public_key),
                 public_key,
@@ -283,7 +305,32 @@ pub fn actor_package(
         }),
         artifacts,
     };
-    sign(key, package)?.encode().map_err(err)
+    seal(package, state_compatible_with, key)
+}
+
+/// Set the producer's state-compatibility claim on an actor `package`, sign it and encode it.
+///
+/// The claim is what VOS lets a stateful actor's program change in place on (`T-037-19`): the
+/// list is signed with the package and enters its deployment id, so it is set before signing. It
+/// is sorted and without repeats, as the manifest requires. A package that is admitted is the
+/// proof that the claim is well formed, so one with a claim is admitted here: VOS refuses a
+/// package that claims its own program (a rebuild of the same generation, say), and that must
+/// fail the build, not an install.
+pub(crate) fn seal(
+    mut package: PackageEnvelope,
+    state_compatible_with: &[ProgramId],
+    key: &dyn AgentSigner,
+) -> Result<Vec<u8>, PackageError> {
+    let PackageManifest::Actor(manifest) = &mut package.manifest else {
+        return Err(err("not an actor package"));
+    };
+    let mut claim = state_compatible_with.to_vec();
+    claim.sort_unstable();
+    claim.dedup();
+    manifest.state_compatible_with = claim;
+    let bytes = sign(key, package)?.encode().map_err(err)?;
+    admit_actor(&bytes)?;
+    Ok(bytes)
 }
 
 /// Admit an actor package, as the Local host does before installing it.
@@ -315,4 +362,98 @@ pub fn runtime_package(
     };
     let package = sign(key, package)?;
     admit_runtime_package(&package.encode().map_err(err)?).map_err(|e| err(format!("{e:?}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stateful_fixture as fixture;
+
+    fn program_of(package: &[u8]) -> ProgramId {
+        admit_actor(package).expect("admitted").program()
+    }
+
+    fn claim_of(package: &[u8]) -> Vec<ProgramId> {
+        admit_actor(package)
+            .expect("admitted")
+            .manifest()
+            .state_compatible_with
+            .clone()
+    }
+
+    #[test]
+    fn t037_19_the_first_generation_claims_nothing() {
+        assert!(state_claim(None).unwrap().is_empty());
+        let genesis = fixture::package(1, &[]);
+        assert!(claim_of(&genesis).is_empty());
+        let admitted = admit_actor(&genesis).unwrap();
+        // With no claim, no request to the runtime carries one, whatever is installed.
+        assert_eq!(admitted.state_compatible_from(program_of(&genesis)), None);
+        assert_eq!(
+            admitted.state_compatible_from(program_of(&fixture::package(3, &[]))),
+            None
+        );
+    }
+
+    #[test]
+    fn t037_19_a_package_built_with_a_predecessor_claims_its_program() {
+        let g0 = fixture::package(1, &[]);
+        let claim = state_claim(Some(&g0)).unwrap();
+        assert_eq!(claim, vec![program_of(&g0)]);
+
+        let g1 = fixture::package(2, &claim);
+        assert_eq!(claim_of(&g1), vec![program_of(&g0)]);
+        let admitted = admit_actor(&g1).unwrap();
+        // The host copies the claim for the program installed now, and for no other.
+        assert_eq!(
+            admitted.state_compatible_from(program_of(&g0)),
+            Some(program_of(&g0))
+        );
+        assert_eq!(
+            admitted.state_compatible_from(program_of(&fixture::package(3, &[]))),
+            None
+        );
+        assert_eq!(admitted.state_compatible_from(program_of(&g1)), None);
+
+        // The claim is signed with the package and part of its deployment, so a package that
+        // claims and one that does not are two deployments of one program.
+        let unclaimed = admit_actor(&fixture::package(2, &[])).unwrap();
+        assert_eq!(unclaimed.program(), admitted.program());
+        assert_ne!(unclaimed.deployment(), admitted.deployment());
+    }
+
+    #[test]
+    fn t037_19_the_claim_names_the_agent_program_id_and_not_the_service_one() {
+        let g0 = fixture::package(1, &[]);
+        let admitted = admit_actor(&g0).unwrap();
+        // The legacy `vos::service::ProgramId` of the same bytes is another id: a claim made of it
+        // would never match the installed program, and every switch would be refused.
+        let service = vos::service::ProgramId::of_pvm(admitted.program_bytes());
+        assert_ne!(service.0, admitted.program().0);
+        assert_eq!(state_claim(Some(&g0)).unwrap()[0], admitted.program());
+    }
+
+    #[test]
+    fn t037_19_a_previous_package_that_is_not_one_fails_the_build() {
+        assert!(state_claim(Some(b"not a package")).is_err());
+    }
+
+    #[test]
+    fn t037_19_a_package_cannot_claim_its_own_program() {
+        let g1 = fixture::package(2, &[]);
+        let own = program_of(&g1);
+        let envelope = PackageEnvelope::decode(&g1).unwrap();
+        // The same generation rebuilt over itself: VOS refuses it at admission, the build says so.
+        let key = ed25519_dalek::SigningKey::from_bytes(&[fixture::PACKAGE_SEED; 32]);
+        assert!(seal(envelope, &[own], &key).is_err());
+    }
+
+    #[test]
+    fn t037_19_the_claim_is_ascending_and_without_repeats() {
+        let a = program_of(&fixture::package(1, &[]));
+        let b = program_of(&fixture::package(3, &[]));
+        let (low, high) = if a < b { (a, b) } else { (b, a) };
+        let package = fixture::package(2, &[high, low, high]);
+        assert_eq!(claim_of(&package), vec![low, high]);
+    }
 }

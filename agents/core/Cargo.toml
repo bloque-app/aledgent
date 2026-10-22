@@ -52,10 +52,10 @@ crate-type = ["rlib", "cdylib"]
 # the gas of the `blake2` crate's per hash, the same digests, guest code only) and does its curve
 # arithmetic in software, unless the `native-curve` feature (outside JAM) asks for VOS's precompiles.
 cipher-clerk = { git = "https://codeberg.org/Virto/CipherClerk.git", rev = "e9a7b0851f183c14dbd1635dbf0437c86682ad6f", default-features = false, features = ["vos-blake2b"] }
-vos = { git = "https://codeberg.org/pandres95/VOS.git", rev = "c54fc1ff13fcd55b86f2cf4edc77b041b62e245f", default-features = false, features = ["macros", "pvm"] }
+vos = { git = "https://codeberg.org/pandres95/VOS.git", rev = "bd8d1bb70551391a4c80a96c2249313ab7e0a0fc", default-features = false, features = ["macros", "pvm"] }
 
 [target.'cfg(not(target_arch = "riscv64"))'.dependencies]
-vos = { git = "https://codeberg.org/pandres95/VOS.git", rev = "c54fc1ff13fcd55b86f2cf4edc77b041b62e245f", default-features = false, features = ["macros", "extension"] }
+vos = { git = "https://codeberg.org/pandres95/VOS.git", rev = "bd8d1bb70551391a4c80a96c2249313ab7e0a0fc", default-features = false, features = ["macros", "extension"] }
 
 [dependencies]
 # Everything the Agent decides (Apache-2.0 OR MIT, no VOS).

@@ -339,6 +339,67 @@ jobs:
       # cs-q04: a v1 deployment builds its core host with v1 roots (deploy/docker/core.Dockerfile).
       - run: cargo check --locked -p core-host --features smt-v1
 
+  # F-037 (T-037-19): the core host changes a stateful actor's program in place on the producer's
+  # claim, through the runtime built from the VOS the host pins (the fork's stateful program
+  # change). The runtime is a build product, so the test is ignored in the job above and runs here:
+  # VOS at the pin, its standard AgentRuntime built as core.Dockerfile step 4 builds it, then the
+  # host's test over it (Runtime::upgrade_actor accepted with the claim, refused without it). The
+  # runtime's digest goes to the summary: the genesis that ships the patched runtime has the same.
+  stateful-upgrade:
+    name: stateful upgrade through the built runtime (T-037-19)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-03-20
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: agents
+      - run: tools/cipherclerk-patched.sh
+      # VOS at the commit agents/Cargo.toml pins, fetched by commit as the image does.
+      - name: VOS at the pin
+        run: |
+          set -euo pipefail
+          rev=$(grep -oE 'rev = "[0-9a-f]{40}"' agents/Cargo.toml | head -n 1 | grep -oE '[0-9a-f]{40}')
+          test -n "$rev"
+          git init -q "$RUNNER_TEMP/vos"
+          git -C "$RUNNER_TEMP/vos" remote add origin https://codeberg.org/pandres95/VOS.git
+          for i in 1 2 3 4 5; do git -C "$RUNNER_TEMP/vos" fetch -q --depth 1 origin "$rev" && break; sleep $((i * 10)); done
+          git -C "$RUNNER_TEMP/vos" checkout -q FETCH_HEAD
+          test "$(git -C "$RUNNER_TEMP/vos" rev-parse HEAD)" = "$rev"
+          echo "VOS $rev" >> "$GITHUB_STEP_SUMMARY"
+      - name: The standard AgentRuntime from that tree
+        working-directory: ${{ runner.temp }}/vos/services/agent-runtime
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/agent-runtime-target
+        # Without the workflow's RUSTFLAGS (-D warnings): VOS builds with its own flags, and
+        # core.Dockerfile builds it with none; the environment's would also replace the target's.
+        run: env -u RUSTFLAGS cargo actor --locked
+      - name: The host's test over it
+        working-directory: agents
+        env:
+          ALEDGENT_STATEFUL_RUNTIME_PVM: ${{ runner.temp }}/agent-runtime-target/riscv64em-vos/release/agent_runtime.elf
+        run: |
+          set -euo pipefail
+          cargo test --locked -p core-host -- --ignored --nocapture t037_19_a_built_runtime 2>&1 | tee "$RUNNER_TEMP/test.log"
+          line=$(grep -E '^runtime [0-9]+ B, blake2b-256 [0-9a-f]{64}$' "$RUNNER_TEMP/test.log")
+          echo "- $line" >> "$GITHUB_STEP_SUMMARY"
+          # The runtime this pin builds is the one the founding ships: its digest is recorded once,
+          # in code.rs next to the platform revision, and a pin that changes it fails here.
+          want=$(grep -A1 'pub const PATCHED_RUNTIME_DIGEST' core-host/src/code.rs | grep -oE '[0-9a-f]{64}' | head -n 1)
+          test -n "$want"
+          got=${line##* }
+          if [ "$got" != "$want" ]; then
+            echo "::error::the runtime built from the pinned VOS is $got, code.rs expects $want (PATCHED_RUNTIME_DIGEST): update it with the pin"
+            exit 1
+          fi
+
   # F-027 (T-027-03, T-027-07): the settlement executor's Kreivo PASS transactions, rebuilt with
   # Kreivo's own crates in both formats it signs: spec 133 (Kreivo 4aef055, kreivo-pin) and spec 132
   # (release 0.16.9, live on mainnet, kreivo-pin-132). Each is a workspace of its own, built from

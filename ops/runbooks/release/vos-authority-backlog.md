@@ -18,7 +18,7 @@ SPDX-License-Identifier: CC-BY-4.0
 An invocation whose acknowledgement fails keeps its result retained. VOS bounds what it retains:
 
 - its Authority issuer journal refuses a new decision once it holds **256** without evidence of their
-  consumption (`MAX_AUTHORITY_OPERATION_ISSUER_RECORDS`, `JournalFull`, pinned VOS `c54fc1ff`);
+  consumption (`MAX_AUTHORITY_OPERATION_ISSUER_RECORDS`, `JournalFull`, pinned VOS `bd8d1bb7`);
 - a Local lane retains at most **32** unacknowledged results (`MAX_INVOCATION_RESULTS_PER_LANE`).
 
 So on the Local host the warning (any decision unacknowledged for ten minutes) comes well before the page.

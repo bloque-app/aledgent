@@ -58,8 +58,13 @@ the claim of that number, with its record written last. In build order:
    installed actor, a compare-and-swap on the installed deployment: its management receipt is signed by the
    Agent's authority key, as an install's, and the staged package is signed by the package key (its
    producer), both through the signer, so no key is in the host (a note of `T-037-14`, not a change of the
-   requirement). It is an install into the same instance on `vos-core`, and the founding of a continuation
-   across platforms. While an upgrade is scheduled, the host ends its batches at *n* − 1. At start and at
+   requirement). On `saga` the runtime accepts a program change of a stateful actor only on a claim the
+   target package's producer signs (`state_compatible_with`) and the host copies into the request, in our
+   VOS fork (owner ruling w5; `T-037-19`): the `package` build takes the previous package's program,
+   the first generation claims nothing. The way back after a way-out is the same call with `revert_from`
+   (no claim) and *g*'s original package, accepted by the runtime until a lane write. The patched runtime
+   is a new runtime artefact that enters with a (re)founding, since the core host's driver has no `UpgradeRuntime`. The switch is an install into the
+   same instance on `vos-core`, and the founding of a continuation across platforms. While an upgrade is scheduled, the host ends its batches at *n* − 1. At start and at
    every switch, the host checks every artefact it runs, the runtime included, against the code version the
    code map names for the next input, by digest, and installs that version where any differs. The switch is
    symmetric: it installs a newer generation after an upgrade and the old one again after a way-out input.
@@ -91,7 +96,8 @@ the claim of that number, with its record written last. In build order:
 
 - The move to `vos-core` itself. This feature makes it an upgrade; doing it is its own work, once
   `vos-core`'s formats settle.
-- Changes to VOS. A compare-and-swap on install, and a way for an actor to read its own program's hash, would
+- Changes to VOS, except the saga fork's stateful program change (`T-037-19`, owner ruling w5); the same
+  change upstream, and on `vos-core`, stays out. A compare-and-swap on install, and a way for an actor to read its own program's hash, would
   each strengthen the switch on `vos-core`; the fence does not depend on them. That an instance's rows
   survive a re-install on `vos-core` is an assumption, to be shown by the spike before `switch`'s `vos-core`
   form is used.
