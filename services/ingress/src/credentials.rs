@@ -251,7 +251,7 @@ pub fn build_reclaim(
     })
 }
 
-fn b64(s: &str) -> Result<Vec<u8>, Refusal> {
+pub(crate) fn b64(s: &str) -> Result<Vec<u8>, Refusal> {
     URL_SAFE_NO_PAD
         .decode(s.trim_end_matches('='))
         .map_err(|_| Refusal::CredentialInvalid)
@@ -346,6 +346,31 @@ async fn check_assertion<S: Store, C: Core>(
     a: &AssertionBody,
     challenge: &[u8],
 ) -> Result<(), Refusal> {
+    let count = verify_assertion_count(
+        shared,
+        pk,
+        credential,
+        key,
+        a,
+        challenge,
+        pk.require_user_verification(),
+    )
+    .await?;
+    raise_count(shared, credential, count).await
+}
+
+/// Verify `a` for `credential` against `challenge`, with the user-verified flag required if
+/// `require_user_verification`, and return the sign count to raise ([`raise_count`]). Writes
+/// nothing.
+pub(crate) async fn verify_assertion_count<S: Store, C: Core>(
+    shared: &Shared<S, C>,
+    pk: &Passkeys,
+    credential: &str,
+    key: &PasskeyKey,
+    a: &AssertionBody,
+    challenge: &[u8],
+    require_user_verification: bool,
+) -> Result<u32, Refusal> {
     let stored = shared
         .store
         .sign_count(credential)
@@ -358,7 +383,7 @@ async fn check_assertion<S: Store, C: Core>(
     let ad = b64(&a.authenticator_data)?;
     let cdj = b64(&a.client_data_json)?;
     let sig = b64(&a.signature)?;
-    let count = webauthn::verify_assertion(
+    webauthn::verify_assertion(
         key,
         &Assertion {
             raw_id: &raw_id,
@@ -369,11 +394,20 @@ async fn check_assertion<S: Store, C: Core>(
         challenge,
         &Policy {
             origins: &party.origins,
-            require_user_verification: pk.require_user_verification(),
+            require_user_verification,
         },
         stored,
     )
-    .map_err(|_| Refusal::CredentialInvalid)?;
+    .map_err(|_| Refusal::CredentialInvalid)
+}
+
+/// Raise `credential`'s durable sign count to `count` (`F-028`): the same count sign-in raises, so
+/// a count one reached refuses an older other. Zero is a synced passkey, which never counts.
+pub(crate) async fn raise_count<S: Store, C: Core>(
+    shared: &Shared<S, C>,
+    credential: &str,
+    count: u32,
+) -> Result<(), Refusal> {
     // Zero and zero: a synced passkey, which never counts. Anything else is written first.
     if count > 0
         && !shared
@@ -528,6 +562,7 @@ pub async fn sign_in<S: Store, C: Core>(
         principal: found.identity.clone(),
         credential: b.credential.clone(),
         kind: shared.auth.kind_of(&found.identity, &found.kind),
+        proof: crate::auth::Proof::Session,
     })?;
     let (session, expires_at) = shared.auth.session(&pk, &who, now)?;
     Ok((

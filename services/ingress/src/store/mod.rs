@@ -319,6 +319,10 @@ impl std::fmt::Display for StoreError {
 
 impl std::error::Error for StoreError {}
 
+/// How long a spent challenge number is kept past its expiry (amendment 0037, F2): the margin for
+/// the clock difference between ingress instances. Sixty seconds.
+pub const SPENT_MARGIN_MS: Time = 60_000;
+
 /// What a [`StoreError`] from [`Store::mark_fed`] says when the caller no longer holds the feed
 /// lease under its epoch (`F-038`).
 pub const FENCED: &str = "fenced: the feed lease is another holder's or another epoch's";
@@ -359,8 +363,11 @@ pub trait Store: Clone + Send + Sync + 'static {
         count: u32,
     ) -> impl Future<Output = Result<bool, StoreError>> + Send;
 
-    /// Use a challenge (`F-028`): `true` the first time its nonce is seen, `false` after. It is
-    /// kept until `expires_at`; expired ones are dropped as of `now`.
+    /// Use a challenge (`F-028`, and an approval's, amendment 0037 `T-040-03`): `true` the first
+    /// time its nonce is seen, `false` after, on every instance that shares the store (one
+    /// statement decides it, so two racing on one nonce get one `true`). It is kept until
+    /// `expires_at` plus [`SPENT_MARGIN_MS`]: an instance whose clock runs ahead of another's by
+    /// less than the margin does not forget a number the other still accepts.
     fn use_challenge(
         &self,
         nonce: [u8; 16],

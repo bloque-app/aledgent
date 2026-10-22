@@ -136,8 +136,16 @@ impl Store for MemStore {
         now: Time,
     ) -> Result<bool, StoreError> {
         let mut inner = self.lock();
-        inner.challenges.retain(|_, exp| *exp > now);
-        Ok(inner.challenges.insert(nonce, expires_at).is_none())
+        let cutoff = now.saturating_sub(super::SPENT_MARGIN_MS);
+        inner.challenges.retain(|_, exp| *exp > cutoff);
+        // As PostgreSQL's `ON CONFLICT DO NOTHING`: a refused second use keeps the first expiry.
+        match inner.challenges.entry(nonce) {
+            std::collections::hash_map::Entry::Occupied(_) => Ok(false),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(expires_at);
+                Ok(true)
+            }
+        }
     }
 
     async fn find(
@@ -646,8 +654,18 @@ mod passkey_tests {
             assert_eq!(s.sign_count("c").await.unwrap(), Some(5));
             assert!(s.use_challenge([1; 16], 100, 10).await.unwrap());
             assert!(!s.use_challenge([1; 16], 100, 20).await.unwrap());
-            // Pruned once expired; an expired challenge never checks anyway.
-            assert!(s.use_challenge([1; 16], 300, 150).await.unwrap());
+            // Kept past its expiry for the margin (amendment 0037, `T-040-03`), pruned after it;
+            // an expired challenge never checks anyway.
+            assert!(
+                !s.use_challenge([1; 16], 300, 99 + crate::store::SPENT_MARGIN_MS)
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                s.use_challenge([1; 16], 300, 100 + crate::store::SPENT_MARGIN_MS)
+                    .await
+                    .unwrap()
+            );
         });
     }
 }

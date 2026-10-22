@@ -1063,8 +1063,10 @@ impl Sidecar {
             require_user_verification: true,
             challenge_ttl_ms: 120_000,
             session_ttl_ms: 900_000,
+            approvals: Default::default(),
+            environment: None,
         }
-        .passkeys(AuthnKey::new(TEST_AUTHN_KEY))
+        .passkeys(AuthnKey::new(TEST_AUTHN_KEY), &hex::encode(DEPLOYMENT))
         .map_err(|e| format!("{ENV_RP_ID}/{ENV_RP_ORIGINS}: {e}"))?;
         auth.set_passkeys(passkeys);
         // The test token, then every extra one: the same operator, the same credential.

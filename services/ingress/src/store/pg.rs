@@ -520,7 +520,7 @@ impl Store for PgStore {
         let c = self.client().await?;
         c.execute(
             "DELETE FROM used_challenges WHERE expires_at <= $1",
-            &[&i64_of(now)?],
+            &[&i64_of(now.saturating_sub(super::SPENT_MARGIN_MS))?],
         )
         .await
         .map_err(err)?;
