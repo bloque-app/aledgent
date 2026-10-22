@@ -22,7 +22,18 @@ and the generation the state names.
 
 - [ ] Read the latest `aledgent-core: AUDIT: input … refused by the fence` line: the generation
   installed, the generation in force, and the scheduled upgrade with the input it applies from.
-- [ ] Read the writer's hot row (`aledgent-core-host` diagnostics): `generation`, `upgrade`, `code`.
+- [ ] Read which program the writer is in (`T-037-23`): `GET /v1/ops/signals` with the operations
+  principal returns `writer_code` with the version in force (`code`), its `generation` and the
+  `upgrade` scheduled (the version and the input it applies from), as of the last input that
+  committed; the exporter shows the same as `aledgent_writer_generation{code}` and, while an upgrade
+  is scheduled, `aledgent_writer_upgrade_scheduled_input{code}` (the label is the first eight bytes
+  of the version in hex).
+- [ ] Read the core's standard error for what happened to the code, one line each, naming the input:
+  `input N is the first to run code …` (a switch took effect), `input N took the way out: …`,
+  `input N scheduled an upgrade to code …`, and `the platform now runs code … for input N` (an
+  install). Before an upgrade was recorded, `aledgent-core: refused an upgrade to code …` and the
+  front door's `an upgrade was refused before it was logged` name the reason (another runtime,
+  another package key, or code that could not be fetched or staged).
 
 ## Steps
 
@@ -32,7 +43,10 @@ and the generation the state names.
    (`T-037-14`), from its staged copy. Restart the core host so it runs that check; never install a
    package by hand outside `switch` (`REQ-RT-20`: the platform's install authority is not an
    authority over the book).
-2. **If the new code cannot run** (its package is broken, or cannot be staged), take the way out: a
+2. **If the new code cannot run** (its package is broken, or cannot be staged; a version that names
+   another runtime than the host runs, or whose package is signed by another key, is refused at the
+   door before it is recorded, `T-037-22`, so what reaches here is a broken package or a platform
+   that failed), take the way out: a
    `RescheduleUpgrade` to a later input or a `CancelUpgrade`, authorised under the upgrade-authority
    mode in force (`CTR-OPS`). The old code decides it even while fenced. Check that it reached the
    writer: a way out queued behind other inputs does not overtake them until `T-037-04`'s route gives

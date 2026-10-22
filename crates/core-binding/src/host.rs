@@ -92,7 +92,7 @@ use crate::envelope::{
     GenesisEnvelope, GenesisState, InputEnvelope, MAX_BATCH_INPUTS, MAX_BATCH_PACKS, Pack, Private,
     Reply, Roots, StateGenesisEnvelope, decode, encode,
 };
-use crate::fence::WriterCode;
+use crate::fence::{CodeEvent, WriterCode};
 use crate::hot::{Hot, Limits, RingEntry};
 use crate::mapped::{Mapped, MappedGenesis, MappedInput, ServiceKeys};
 use crate::service::{Node, ServiceWitness, proven_keys};
@@ -380,6 +380,22 @@ pub trait AgentPort {
         let _ = (checked, generation);
         Err(crate::staging::StageRefusal::NoSource)
     }
+
+    /// Whether [`AgentPort::switch_to`] could install `checked` as this port runs now
+    /// (`T-037-22`, owner ruling w16, proposal 4). Asked by the core **before** the version is
+    /// staged, and so before the `Upgrade` that names it is logged: a version the switch would
+    /// refuse at input *n* (it names another runtime than the one running, or is signed by another
+    /// package key, or does not claim the program running) is refused at the door, instead of
+    /// being recorded and fencing the writer until a way out. Reads, and changes nothing. A port
+    /// that installs whatever it is given (the native port) answers yes.
+    ///
+    /// # Errors
+    ///
+    /// Why the switch could not install `checked`, in a line fit for the operator's log.
+    fn can_install(&self, checked: &crate::staging::Checked) -> Result<(), String> {
+        let _ = checked;
+        Ok(())
+    }
 }
 
 /// Why the driver stopped.
@@ -508,6 +524,8 @@ struct Staged {
     /// The code version that executes it ([`crate::switch::target_code`]): a batch holds inputs of
     /// one version, and the platform runs it before the batch is sent (`T-037-14`).
     exec_code: [u8; 32],
+    /// What it does to the writer's code, for the log when it commits (`T-037-23`).
+    events: Vec<CodeEvent>,
 }
 
 impl Staged {
@@ -590,6 +608,13 @@ pub struct Driver<P: AgentPort> {
     /// it, as the code map names it and [`crate::fence::decide`] moves it. The mode is the
     /// replica's own (`Ledger::authority`, `T-037-05`): the inputs it decides change it.
     writer: WriterCode,
+    /// The code version the host last made the platform run (`T-037-23`): a call for another one
+    /// is an install, which is logged. `None` until the first call after the host starts.
+    running_code: Option<[u8; 32]>,
+    /// What happened to the writer's code and the platform since the host last drained it
+    /// ([`Driver::take_code_events`]): recorded as inputs commit and as the platform is made to
+    /// run another version, never while an archive is replayed.
+    code_events: Vec<CodeEvent>,
 }
 
 /// A clerk shared between threads: what the executor signs disclosures with.
@@ -1241,6 +1266,8 @@ impl<P: AgentPort> Driver<P> {
                 generation: 0,
                 upgrade: None,
             },
+            running_code: None,
+            code_events: Vec::new(),
         };
         // Bootstrap writes the book's one journal without loading it: witness it absent.
         let mut keys = replica.book().store().take_keys();
@@ -1403,13 +1430,48 @@ impl<P: AgentPort> Driver<P> {
     }
 
     /// Make the platform run the code version `code` (`T-037-14`); an `Err` means send nothing.
-    fn switch_for(&mut self, code: [u8; 32]) -> Result<(), DriveError> {
+    fn switch_for(&mut self, code: [u8; 32], input: u64) -> Result<(), DriveError> {
         self.port.switch_to(code).map_err(|why| {
             DriveError::Port(PortError::Unavailable(format!(
                 "the code version {} cannot be run: {why}",
                 crate::switch::short(&code)
             )))
-        })
+        })?;
+        // A call for another version than the last one is an install (`T-037-23`): the switch to
+        // *H* before input *n*, the reinstall of *g* after a way out, or the check at start.
+        if self.running_code != Some(code) {
+            self.code_events.push(CodeEvent::Installed {
+                input,
+                code,
+                from: self.running_code,
+            });
+            self.running_code = Some(code);
+        }
+        Ok(())
+    }
+
+    /// The code version the host last made the platform run, if it has (`T-037-23`).
+    pub fn running_code(&self) -> Option<[u8; 32]> {
+        self.running_code
+    }
+
+    /// Say which code version the platform runs, for a driver that replaces one the host dropped
+    /// (the core's rebuild): the platform did not change, so the next check is not an install.
+    pub fn set_running_code(&mut self, code: Option<[u8; 32]>) {
+        self.running_code = code;
+    }
+
+    /// What happened to the writer's code and to the platform running it since this was last
+    /// called, in order, each naming its input (`T-037-23`). The host logs them.
+    pub fn take_code_events(&mut self) -> Vec<CodeEvent> {
+        core::mem::take(&mut self.code_events)
+    }
+
+    /// The writer's code as of the last input committed, or `None` while inputs are staged and not
+    /// yet committed (then [`Driver::writer`] is ahead of the Agent): what the signals report
+    /// (`T-037-23`).
+    pub fn committed_writer(&self) -> Option<WriterCode> {
+        self.staged.is_empty().then_some(self.writer)
     }
 
     /// The artefact check at start (`T-037-14`): make the platform run the code that executes the
@@ -1420,8 +1482,9 @@ impl<P: AgentPort> Driver<P> {
     ///
     /// [`DriveError::Port`] with why the platform cannot run it.
     pub fn ensure_code(&mut self) -> Result<(), DriveError> {
-        let code = crate::switch::target_code(self.writer.code, self.writer.upgrade, self.seq + 1);
-        self.switch_for(code)
+        let next = self.seq + 1;
+        let code = crate::switch::target_code(self.writer.code, self.writer.upgrade, next);
+        self.switch_for(code, next)
     }
 
     /// The last input number the Agent committed.
@@ -1594,6 +1657,12 @@ impl<P: AgentPort> Driver<P> {
             let seq = self.seq + 1;
             let exec = self.exec_code_of(seq, way_out);
             let writer = self.decided(seq, way_out, taken, scheduled);
+            let mut events =
+                crate::fence::code_events(seq, &self.writer, &writer, taken, scheduled);
+            events.extend(crate::fence::refused_upgrades(
+                seq,
+                recorded.iter().map(|r| (&r.call, &r.summary)),
+            ));
             let (leaves, whole) = self.service.leaves(&touched)?;
             let changes = changed(replica, &leaves, &deliveries)?;
             let envelope = Envelope::Mapped(Mapped::Input(MappedInput {
@@ -1608,7 +1677,7 @@ impl<P: AgentPort> Driver<P> {
                 private: self.port.blob_key(&private),
             }));
             // The platform runs the code that executes this input before it is sent (`T-037-14`).
-            self.switch_for(exec)?;
+            self.switch_for(exec, seq)?;
             let reply = self.send(&envelope, vec![private])?;
             // A refused input leaves the leaves unapplied; the host rebuilds from the Agent.
             if matches!(reply, Reply::Committed(_) | Reply::Duplicate { .. }) {
@@ -1633,6 +1702,7 @@ impl<P: AgentPort> Driver<P> {
             self.last_entry = Some(entry.clone());
             self.entries.push(entry);
             self.done.push(committed);
+            self.code_events.extend(events);
             self.pin(replica)?;
             return Ok(Some(seq));
         }
@@ -1647,6 +1717,11 @@ impl<P: AgentPort> Driver<P> {
         let seq = tip + 1;
         let exec = self.exec_code_of(seq, way_out);
         let writer = self.decided(seq, way_out, taken, scheduled);
+        let mut events = crate::fence::code_events(seq, &self.writer, &writer, taken, scheduled);
+        events.extend(crate::fence::refused_upgrades(
+            seq,
+            recorded.iter().map(|r| (&r.call, &r.summary)),
+        ));
         let input = InputEnvelope {
             seq,
             calls: calls.clone(),
@@ -1685,6 +1760,7 @@ impl<P: AgentPort> Driver<P> {
             log_hash,
             reply_bytes,
             exec_code: exec,
+            events,
         };
         self.pin(replica)?;
         // As if committed, as the leaves are: the next input runs under the code this one leaves.
@@ -1750,8 +1826,8 @@ impl<P: AgentPort> Driver<P> {
 
     fn flush_staged(&mut self) -> Result<(), DriveError> {
         if let Some(first) = self.staged.first() {
-            let code = first.exec_code;
-            self.switch_for(code)?;
+            let (code, input) = (first.exec_code, first.entry.seq);
+            self.switch_for(code, input)?;
         }
         let staged = core::mem::take(&mut self.staged);
         let replies = if staged.len() == 1 {
@@ -1777,6 +1853,7 @@ impl<P: AgentPort> Driver<P> {
             self.last_entry = Some(s.entry.clone());
             self.entries.push(s.entry);
             self.done.push(committed);
+            self.code_events.extend(s.events);
         }
         Ok(())
     }
@@ -1958,6 +2035,8 @@ impl<P: AgentPort> Driver<P> {
             mapped: hot.layout == crate::mapped::LAYOUT_MAPPED,
             genesis,
             writer: WriterCode::of(&hot),
+            running_code: None,
+            code_events: Vec::new(),
         };
         driver.prepare(&mut replica, hot.inputs + 1);
         driver.pin(&replica)?;
@@ -2468,6 +2547,9 @@ impl<T: AgentPort + ?Sized> AgentPort for Box<T> {
         generation: u64,
     ) -> Result<(), crate::staging::StageRefusal> {
         (**self).restage_code(checked, generation)
+    }
+    fn can_install(&self, checked: &crate::staging::Checked) -> Result<(), String> {
+        (**self).can_install(checked)
     }
 }
 

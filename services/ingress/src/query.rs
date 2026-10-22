@@ -459,6 +459,38 @@ pub struct SignalsBody {
     /// from a core that does not count it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub book: Option<BookSizeBody>,
+    /// The code the core's writer runs (`T-037-23`, `REQ-RT-16`, `REQ-RT-20`, `NFR-11`): the
+    /// version in force, its generation, and the upgrade scheduled, as of the last input that
+    /// committed. Absent from a core that does not report it (the in-process core, an older core
+    /// host): a reader that does not know the field ignores it, and a body without it reads as
+    /// "not reported".
+    // Boxed: the signals ride in the reply enum of every query, and an inline body would make each
+    // of them as large as this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer_code: Option<Box<WriterCodeBody>>,
+}
+
+/// The code the core's writer runs, as the signals carry it (`T-037-23`): what to look at to know
+/// which program is deciding, before and after a switch.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WriterCodeBody {
+    /// The code version in force: the digest of its manifest, 64 hex characters in lower case. All
+    /// zeros for a book founded without a named code version (tests).
+    pub code: String,
+    /// The code generation in force: 0 at genesis, one more after each upgrade.
+    pub generation: u64,
+    /// The upgrade scheduled, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgrade: Option<ScheduledUpgradeBody>,
+}
+
+/// An upgrade the writer has scheduled (`T-037-23`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ScheduledUpgradeBody {
+    /// The version it installs, as [`WriterCodeBody::code`].
+    pub code: String,
+    /// The input number it applies from: that input and those after it run under the new code.
+    pub from: u64,
 }
 
 /// The answers one place of the code fetcher discarded (`T-037-06`).
