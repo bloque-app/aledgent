@@ -5,8 +5,8 @@ SPDX-License-Identifier: CC-BY-4.0
 
 # F-040 — Per-transaction approval at ingress (Feature A)
 
-`[PENDING AMENDMENT 0037]`. The amendment is awaiting the owner's approval. Until it is approved, this feature
-is a plan only: no task below starts, and no code merges.
+`[PENDING AMENDMENT 0037]`. The amendment was approved by the owner on 2026-10-22. The marker stays until `T-040-01` applies its
+text to `SPEC.md`; the tasks below may now start.
 
 | | |
 |---|---|

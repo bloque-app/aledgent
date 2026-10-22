@@ -5,7 +5,7 @@ SPDX-License-Identifier: CC-BY-4.0
 
 # F-040 — tasks
 
-Amendment 0037, awaiting the owner's approval. **No task starts before it is approved.** Every id marked `[0037]` is
+Amendment 0037, approved by the owner on 2026-10-22. The tasks may start. Every id marked `[0037]` is
 proposed by that amendment and does not exist in `SPEC.md` yet; it is cited as `[PENDING AMENDMENT 0037]` until the
 amendment is applied (`T-040-01`). The earlier handover called these tasks A-01 to A-08 and named the feature `F-039`;
 that number belongs to the documentation feature, so the tasks are `T-040-*`.

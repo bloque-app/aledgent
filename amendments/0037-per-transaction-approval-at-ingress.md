@@ -5,16 +5,18 @@ SPDX-License-Identifier: CC-BY-4.0
 
 # Amendment 0037 — A credential approves each command that matters, one command at a time
 
-**Status:** **awaiting the owner's approval.** The direction was ruled on 2026-10-19 (the ruling that a passkey
+**Status:** **approved by the owner on 2026-10-22** (his instruction of that evening: per-transaction approval at the
+front door is built that night, deployed to test the next morning and to production the next afternoon; the answers
+to `w17` and `w18` of the Decisions form stand). The direction was ruled on 2026-10-19 (the ruling that a passkey
 approves one transaction, not a session) and on 2026-10-20 and 2026-10-21 (owner answers on the Decisions form:
 the work is split in two features; this amendment and its design are public in this repository, ruling `w12` (a)).
 The owner answered the first draft's ten questions on 2026-10-21 and ruled on the core options on the same day
 (`w14`). An independent review of the second draft found four blocking faults, and a second review of the third draft found
-two more (the exemption of configured tokens, and the plain-English questions); this fourth draft fixes them. The
-text below is the drafter's reading of the rulings, worked through to rules and byte formats. It is **still not
-approved**. Nothing in `SPEC.md` or `PLAN.md` changes with this file: the proposed spec text is marked as such, and
-the plan sites will cite `[PENDING AMENDMENT 0037]` once the owner approves. The features that build it
-(`F-040`, `F-041`) merge no code before that.
+two more (the exemption of configured tokens, and the plain-English questions); the fourth draft fixes them. The
+text below is the drafter's reading of the rulings, worked through to rules and byte formats. Nothing in `SPEC.md`
+changes with this file: the proposed spec text is marked as such until `T-040-01` applies it, and the plan sites cite
+`[PENDING AMENDMENT 0037]` until then. The features that build it (`F-040`, `F-041`) may now start, within their own
+gates (`F-041` stays blocked by `F-040` and by `T-041-00`).
 **Target:** `SPEC.md` v0.4.28 as on `develop`. Amendment 0036 (PR #50, also awaiting approval) touches `REQ-RT-20`
 and `US-K7` and no clause named here. Amendment 0034 (the upgrade authority is held with a credential) is cited
 where the two meet (R1, "Upgrade routes"). `PLAN.md` `DEC-19`, plus a new decision (see "Plan").
