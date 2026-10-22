@@ -386,15 +386,18 @@ pub trait AgentPort {
     /// staged, and so before the `Upgrade` that names it is logged: a version the switch would
     /// refuse at input *n* (it names another runtime than the one running, or is signed by another
     /// package key, or does not claim the program running) is refused at the door, instead of
-    /// being recorded and fencing the writer until a way out. Reads, and changes nothing. A port
-    /// that installs whatever it is given (the native port) answers yes.
+    /// being recorded and fencing the writer until a way out. Reads, and changes nothing.
+    ///
+    /// **Fails safe:** the default says no, as [`AgentPort::stage_code`]'s default stages nothing.
+    /// A port that can install code answers for itself (the native port installs whatever it is
+    /// given and says yes), and a wrapper must forward the question, or no version passes it.
     ///
     /// # Errors
     ///
     /// Why the switch could not install `checked`, in a line fit for the operator's log.
     fn can_install(&self, checked: &crate::staging::Checked) -> Result<(), String> {
         let _ = checked;
-        Ok(())
+        Err("this port does not say whether it could install a code version".into())
     }
 }
 
@@ -1463,6 +1466,12 @@ impl<P: AgentPort> Driver<P> {
 
     /// What happened to the writer's code and to the platform running it since this was last
     /// called, in order, each naming its input (`T-037-23`). The host logs them.
+    ///
+    /// **Best effort, by design:** an event is recorded when the Agent's reply to the batch that
+    /// carried it is read. If that send is ambiguous and the Agent did commit it, the host rebuilds
+    /// this driver by replaying the archive, which records no events, so the line for that input
+    /// is not written. The signals ([`Driver::committed_writer`]) are exact either way, so a
+    /// reader who finds a generation change without its line trusts the signals.
     pub fn take_code_events(&mut self) -> Vec<CodeEvent> {
         core::mem::take(&mut self.code_events)
     }
@@ -2436,6 +2445,12 @@ impl AgentPort for NativePort {
             .get(&crate::hot::ring_key(seq))
             .map(|b| decode::<RingEntry>(&b).map_err(PortError::Unavailable))
             .transpose()
+    }
+
+    fn can_install(&self, checked: &crate::staging::Checked) -> Result<(), String> {
+        // The native port runs whatever generation its manifest names (`stage_code` below).
+        let _ = checked;
+        Ok(())
     }
 
     fn stage_code(

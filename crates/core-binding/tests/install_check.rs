@@ -111,3 +111,52 @@ async fn t037_22_a_version_the_port_can_install_is_staged_as_before() {
     ));
     assert!(staged(&core));
 }
+
+/// A wrapper that forwards staging and forgets the question must not turn the door off: the
+/// default of `can_install` says no, so the version is refused and nothing is staged (`T-037-22`).
+struct Forgetful(NativePort);
+
+impl AgentPort for Forgetful {
+    fn invoke(&mut self, message: Vec<u8>, blobs: Vec<Vec<u8>>) -> Result<Vec<u8>, PortError> {
+        self.0.invoke(message, blobs)
+    }
+    fn blob_key(&self, bytes: &[u8]) -> BlobKey {
+        self.0.blob_key(bytes)
+    }
+    fn hot(&mut self) -> Result<Option<Hot>, PortError> {
+        self.0.hot()
+    }
+    fn entry(&mut self, seq: u64) -> Result<Option<RingEntry>, PortError> {
+        self.0.entry(seq)
+    }
+    fn stage_code(&mut self, checked: Checked) -> Result<(), core_binding::staging::StageRefusal> {
+        self.0.stage_code(checked)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn t037_22_a_wrapper_that_forgets_the_question_refuses_everything() {
+    let founding = Founding {
+        genesis: common::genesis(),
+        op: common::op(0),
+        at: 1,
+        keys: common::keys(),
+        limits: Limits {
+            budget: MAX_BUDGET,
+            ..Limits::DEFAULT
+        },
+        genesis_roots: None,
+    };
+    let core = AgentCore::open(Forgetful(NativePort::new()), founding, MemLog::default()).unwrap();
+    let code = HeldCode::default();
+    core.set_code_source(Arc::new(code.clone())).unwrap();
+    let Staged::Refused { reason } = core.stage_code(&code.version(1)).await.unwrap() else {
+        panic!("a port that does not answer the question staged a version");
+    };
+    assert!(reason.contains("does not say"), "{reason}");
+    assert!(
+        !core
+            .with_port(|p| !p.0.code_map.is_empty())
+            .unwrap_or_default()
+    );
+}

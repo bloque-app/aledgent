@@ -343,39 +343,109 @@ impl CodeInstaller for crate::port::VosPort {
     }
 }
 
+/// What the door reads of an actor package to say whether the switch could install it
+/// (`T-037-22`): the facts the runtime compares when it upgrades an installed actor, all functions
+/// of the package alone (`Runtime::upgrade_actor` computes the same three from the same bytes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PackageFacts {
+    /// The producer of its package (the package key's identity).
+    pub producer: vos::agent_sdk::ProducerId,
+    /// The commitment to its state layout (the schema's fields): the runtime refuses an upgrade
+    /// that changes it (`UnsupportedLane`), and a build from another dependency lock can.
+    pub state_layout: [u8; 32],
+    /// The commitment to its constructor ABI: the runtime refuses an upgrade that changes it
+    /// (`InvalidRequest`), since an in-place upgrade keeps the actor's installation data.
+    pub constructor_abi: [u8; 32],
+    /// The lanes, scheduling and proofs it requires: a change of lanes is refused by the runtime
+    /// (`UnsupportedLane`), and the authority actor refuses a change of the others.
+    pub requirements: vos::agent_sdk::RuntimeRequirements,
+}
+
+impl PackageFacts {
+    /// The facts of the package `bytes`.
+    ///
+    /// # Errors
+    ///
+    /// The package is not admitted, or its schema does not decode.
+    pub fn of(bytes: &[u8]) -> Result<Self, String> {
+        let package = crate::package::admit_actor(bytes)
+            .map_err(|e| format!("the package is not admitted: {e}"))?;
+        let schema = vos::agent_sdk::schema::decode(package.state_lane_schema_bytes())
+            .map_err(|e| format!("the package's schema does not decode: {e}"))?;
+        Ok(Self {
+            producer: package.producer(),
+            state_layout: *schema
+                .state_layout_hash()
+                .map_err(|e| format!("state layout: {e:?}"))?
+                .as_bytes(),
+            constructor_abi: *schema
+                .constructor_abi()
+                .map_err(|e| format!("constructor ABI: {e:?}"))?
+                .as_bytes(),
+            requirements: package.requirements(),
+        })
+    }
+}
+
 /// What the door needs to know of a code version to say whether the switch could install it
-/// (`T-037-22`): the digest of the runtime it names and the key its package is signed with.
+/// (`T-037-22`): the digest of the runtime it names and the facts of its package.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Candidate {
     /// The digest of the runtime the version carries; `None` if it carries none.
     pub runtime: Option<[u8; 32]>,
-    /// The producer of its package (the package key's identity).
-    pub producer: vos::agent_sdk::ProducerId,
+    /// The facts of its package.
+    pub package: PackageFacts,
 }
 
 /// Whether `install` (above) would accept `candidate` while the host runs `running` from a package
-/// signed by `running_producer` (`T-037-22`, owner ruling w16, proposal 4). The same conditions the
-/// switch checks at its input, asked at the door, from what the host already knows, so a version
-/// the switch would refuse never gets recorded:
+/// with the facts `running_package` (`T-037-22`, owner ruling w16, proposal 4). The conditions the
+/// switch, and the runtime under it, refuse on, asked at the door from what the host already holds
+/// (both packages), so that a version that would fence the writer at its input is never recorded:
 ///
 /// 1. the runtime is the one this process runs (`saga` installs the package only: a runtime
 ///    change is a restart);
-/// 2. the package is signed by the producer of the package running (the runtime refuses an upgrade
-///    that changes the producer).
+/// 2. the package key is the running package's. This is the door's own rule: the pinned runtime
+///    overwrites the producer on an upgrade, and the patched one ties its claim to it; a change of
+///    key is never what an upgrade means here;
+/// 3. the state layout, 4. the constructor ABI and 5. the lanes, scheduling and proofs are the
+///    running package's: the runtime refuses an in-place upgrade that changes them. A build of the
+///    same source from a drifted `Cargo.lock` is the usual way to change the first two.
 ///
-/// **Hook for `T-037-19` (PR #49):** the claim. A package that changes the program of a stateful
-/// actor must carry the producer's signed claim over the program running, which the patched VOS
-/// (`state_compatible_with`) defines and the pin of this tree does not have. The line that asks
-/// for it goes here, below the two checks; until then a program change is refused by the runtime
-/// itself when the switch tries it.
+/// # Hook for `T-037-19` (PR #49): the claim over the running program
+///
+/// Not here yet, because the VOS pinned in this tree has no notion of a claim (the patched VOS of
+/// `T-037-19` does: a package manifest's `state_compatible_with`, copied into the request as
+/// `state_compatible_from`, checked on the host side by `AdmittedActorPackage::signs_state_claim_of`).
+/// Whoever lands `T-037-19` fills this in, **below the five checks and in this function**, with
+/// this contract:
+///
+/// - *Inputs.* [`PackageFacts`] and [`Candidate`] each gain the package's program id
+///   (`admit_actor(bytes).program()`, the Agent `ProgramId`, never `vos::service::ProgramId`) and
+///   its claim (`manifest().state_compatible_with`). Both come from the same two admitted packages
+///   [`CodeState::check_install_with`] already reads, so no new source is needed.
+/// - *Refuse* when the candidate's program is not the running program and the candidate's claim,
+///   signed by its producer, does not name the running program; and when the candidate claims its
+///   own program. The generation is compiled into the program, so every real upgrade is a program
+///   change and needs the claim.
+/// - *Accept* a candidate with the running program (a repackage, no claim needed).
+/// - *Same words as the switch:* the same conditions `Direction::of` and `ensure_claim_signed`
+///   (`driver.rs`, `T-037-19`) apply when the request is built, so that the door never admits what
+///   the switch refuses, and never refuses what it accepts. A candidate with no claim and another
+///   program is what `Direction::of` calls a revert, which the runtime accepts only against the
+///   claimed switch it replaced: the door must refuse it, since it is never the way forward.
+/// - *Tests.* One case per refusal above and one for the repackage, in `switch.rs`'s tests on
+///   stub [`PackageFacts`] (no runtime needed).
+///
+/// Until it lands, a program change is refused by the runtime itself when the switch tries it
+/// (on the pinned VOS, every real upgrade is, because a stateful actor cannot change program).
 ///
 /// # Errors
 ///
 /// Why the switch could not install `candidate`, for the operator's log.
 pub fn installable(
     running: Artefacts,
-    running_producer: vos::agent_sdk::ProducerId,
-    candidate: Candidate,
+    running_package: &PackageFacts,
+    candidate: &Candidate,
 ) -> Result<(), String> {
     match candidate.runtime {
         None => return Err("the manifest names no runtime".into()),
@@ -388,42 +458,70 @@ pub fn installable(
         }
         Some(_) => {}
     }
-    if candidate.producer != running_producer {
+    let c = &candidate.package;
+    if c.producer != running_package.producer {
+        return Err("its package is signed by another key than the package running".into());
+    }
+    if c.state_layout != running_package.state_layout {
         return Err(
-            "its package is signed by another key than the package running (the runtime refuses \
-             an upgrade that changes the producer)"
+            "its state layout differs from the package running (built from another dependency \
+             lock, or another state?); the runtime refuses an in-place upgrade that changes it"
                 .into(),
         );
     }
-    // The claim over the running program: `T-037-19`.
+    if c.constructor_abi != running_package.constructor_abi {
+        return Err(
+            "its constructor ABI differs from the package running; the runtime refuses an \
+             in-place upgrade that changes it"
+                .into(),
+        );
+    }
+    if c.requirements != running_package.requirements {
+        return Err(
+            "the lanes, scheduling or proofs it requires differ from the package running; the \
+             runtime refuses an in-place upgrade that changes them"
+                .into(),
+        );
+    }
+    // The claim over the running program: `T-037-19`, contract above.
     Ok(())
 }
 
 impl CodeState {
-    /// Whether the switch could install `checked` as this host runs now ([`installable`]): reads
-    /// the producer of the package running from the bytes the host holds for it (`T-037-22`).
+    /// Whether the switch could install `checked` as this host runs now ([`installable`]), from
+    /// the bytes of the package running (held, because the running version is kept to be
+    /// reinstalled) and the candidate's (`T-037-22`).
     ///
     /// # Errors
     ///
     /// Why not, for the operator's log.
     pub fn check_install(&self, checked: &core_binding::staging::Checked) -> Result<(), String> {
+        self.check_install_with(checked, &PackageFacts::of)
+    }
+
+    /// [`CodeState::check_install`], reading the facts of a package with `facts`: a test supplies
+    /// stand-ins, since a real package needs an actor ELF.
+    ///
+    /// # Errors
+    ///
+    /// Why not, for the operator's log.
+    pub fn check_install_with(
+        &self,
+        checked: &core_binding::staging::Checked,
+        facts: &dyn Fn(&[u8]) -> Result<PackageFacts, String>,
+    ) -> Result<(), String> {
         let running = self
             .staged
             .versions
             .values()
             .find(|v| v.artefacts().package == self.running.package)
-            .ok_or("the package this host runs is not held, so its key cannot be compared")?;
-        let producer = |bytes: &[u8]| {
-            crate::package::admit_actor(bytes)
-                .map(|p| p.producer())
-                .map_err(|e| format!("the package is not admitted: {e}"))
-        };
+            .ok_or("the package this host runs is not held, so it cannot be compared")?;
         installable(
             self.running,
-            producer(&running.package)?,
-            Candidate {
+            &facts(&running.package)?,
+            &Candidate {
                 runtime: checked.runtime.as_deref().map(artefact_digest),
-                producer: producer(&checked.package)?,
+                package: facts(&checked.package)?,
             },
         )
     }
@@ -507,52 +605,106 @@ mod tests {
         assert!(s.artefacts(&[0; 32]).is_none());
     }
 
-    /// `T-037-22`: the door asks what the switch would ask. The same runtime and the same package
-    /// key pass; another runtime, no runtime, or another key do not, each with its own reason.
+    fn facts(key: u8, layout: u8, abi: u8, scheduling: bool) -> PackageFacts {
+        PackageFacts {
+            producer: vos::agent_sdk::ProducerId::of_public_key(&[key; 32]),
+            state_layout: [layout; 32],
+            constructor_abi: [abi; 32],
+            requirements: vos::agent_sdk::RuntimeRequirements {
+                scheduling,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// `T-037-22`: the door asks what the switch, and the runtime under it, would ask. The same
+    /// runtime, key, state layout, constructor ABI and requirements pass; each one that differs,
+    /// and no runtime, is refused with its own reason.
     #[test]
     fn t037_22_the_door_refuses_what_the_switch_could_not_install() {
-        use vos::agent_sdk::ProducerId;
         let running = Artefacts {
             package: [1; 32],
             runtime: [9; 32],
         };
-        let key = ProducerId::of_public_key(&[0x71; 32]);
-        let other_key = ProducerId::of_public_key(&[0x72; 32]);
+        let base = facts(0x71, 5, 6, false);
         let same = Candidate {
             runtime: Some([9; 32]),
-            producer: key,
+            package: base,
         };
-        assert_eq!(installable(running, key, same), Ok(()));
-        let why = installable(
-            running,
-            key,
+        assert_eq!(installable(running, &base, &same), Ok(()));
+        let refused = |c: Candidate, says: &str| {
+            let why = installable(running, &base, &c).unwrap_err();
+            assert!(why.contains(says), "{says}: {why}");
+        };
+        refused(
             Candidate {
                 runtime: Some([8; 32]),
                 ..same
             },
-        )
-        .unwrap_err();
-        assert!(why.contains("another runtime"), "{why}");
-        let why = installable(
-            running,
-            key,
+            "another runtime",
+        );
+        refused(
             Candidate {
                 runtime: None,
                 ..same
             },
-        )
-        .unwrap_err();
-        assert!(why.contains("no runtime"), "{why}");
-        let why = installable(
-            running,
-            key,
-            Candidate {
-                producer: other_key,
-                ..same
-            },
-        )
-        .unwrap_err();
-        assert!(why.contains("another key"), "{why}");
+            "no runtime",
+        );
+        for (c, says) in [
+            (facts(0x72, 5, 6, false), "another key"),
+            (facts(0x71, 7, 6, false), "state layout"),
+            (facts(0x71, 5, 8, false), "constructor ABI"),
+            (facts(0x71, 5, 6, true), "lanes, scheduling or proofs"),
+        ] {
+            refused(Candidate { package: c, ..same }, says);
+        }
+    }
+
+    /// `T-037-22`: the same, through the host's own state (`CodeState::check_install_with`), which
+    /// finds the package running by the digests it tracks, so a version that is not the one
+    /// running is compared against the right package after a switch too.
+    #[test]
+    fn t037_22_the_code_state_compares_the_candidate_with_the_package_running() {
+        use core_binding::staging::Checked;
+        let (g_pkg, g_rt) = (b"g-package".to_vec(), b"the-runtime".to_vec());
+        let mut staged = StagedVersions::new();
+        staged.running([0xA0; 32], &g_pkg, &g_rt);
+        let state = CodeState::new("core", &g_pkg, &g_rt, staged);
+        let m = manifest(b"h-package", &g_rt);
+        let checked = |package: &[u8], runtime: &[u8]| Checked {
+            manifest: m.clone(),
+            package: package.to_vec(),
+            runtime: Some(runtime.to_vec()),
+        };
+        // Stand-in facts: the bytes name them.
+        let read = |bytes: &[u8]| match bytes {
+            b"g-package" => Ok(facts(0x71, 5, 6, false)),
+            b"h-package" => Ok(facts(0x71, 5, 6, false)),
+            b"h-drifted" => Ok(facts(0x71, 9, 6, false)),
+            b"h-other-key" => Ok(facts(0x72, 5, 6, false)),
+            _ => Err("not a package".to_owned()),
+        };
+        assert_eq!(
+            state.check_install_with(&checked(b"h-package", &g_rt), &read),
+            Ok(())
+        );
+        for (package, runtime, says) in [
+            (&b"h-drifted"[..], &g_rt[..], "state layout"),
+            (b"h-other-key", &g_rt[..], "another key"),
+            (b"h-package", b"another-runtime", "another runtime"),
+            (b"garbage", &g_rt[..], "not a package"),
+        ] {
+            let why = state
+                .check_install_with(&checked(package, runtime), &read)
+                .unwrap_err();
+            assert!(why.contains(says), "{says}: {why}");
+        }
+        // A host that no longer holds the package it runs cannot compare, and so refuses.
+        let empty = CodeState::new("core", &g_pkg, &g_rt, StagedVersions::new());
+        let why = empty
+            .check_install_with(&checked(b"h-package", &g_rt), &read)
+            .unwrap_err();
+        assert!(why.contains("not held"), "{why}");
     }
 
     #[test]

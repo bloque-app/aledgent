@@ -571,6 +571,9 @@ pub struct CoreStats {
     /// scheduled upgrade, kept here so the signals read it without the execution lock, and never
     /// ahead of a commit. `None` until the driver is open.
     pub writer_code: Mutex<Option<crate::fence::WriterCode>>,
+    /// How many lines about the writer's code the core has written (`T-037-23`): tests count them,
+    /// since the lines themselves go to standard error.
+    pub code_lines: AtomicU64,
     read_wait_us: Window,
     hold_us: Window,
     native_us: Window,
@@ -1255,9 +1258,7 @@ impl<P: AgentPort> Inner<P> {
         let Some(driver) = self.driver.as_mut() else {
             return;
         };
-        for event in driver.take_code_events() {
-            std::eprintln!("aledgent-core: {}", describe_code_event(&event));
-        }
+        write_code_events(&self.stats, driver.take_code_events());
         if let Some(w) = driver.committed_writer() {
             *lock(&self.stats.writer_code) = Some(w);
         }
@@ -1277,9 +1278,7 @@ impl<P: AgentPort> Inner<P> {
             return Err(CoreError::Unavailable);
         };
         // What the old driver recorded before it is dropped (`T-037-23`).
-        for event in driver.take_code_events() {
-            std::eprintln!("aledgent-core: {}", describe_code_event(&event));
-        }
+        write_code_events(&self.stats, driver.take_code_events());
         // The platform keeps running what it ran: the next check is no install (`T-037-23`).
         let running_code = driver.running_code();
         let port = driver.into_port();
@@ -2003,6 +2002,14 @@ impl<P: AgentPort + Send + 'static> Core for AgentCore<P> {
         // can only answer "none" for a tie it has not seen yet.
         let principal = String::from(principal);
         self.read(move |r| r.party_of(&principal)).await
+    }
+}
+
+/// Write one line for each event of the writer's code, and count them (`T-037-23`).
+fn write_code_events(stats: &CoreStats, events: Vec<crate::fence::CodeEvent>) {
+    for event in events {
+        std::eprintln!("aledgent-core: {}", describe_code_event(&event));
+        stats.code_lines.fetch_add(1, Ordering::Relaxed);
     }
 }
 

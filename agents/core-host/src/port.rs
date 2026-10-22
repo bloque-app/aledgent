@@ -381,6 +381,12 @@ impl AgentPort for VosPort {
         let Some(state) = self.code_state_mut() else {
             return Err(StageRefusal::NoSource);
         };
+        // The port never stages what its switch could not install, whatever sits around it: the
+        // question the core asks first (`AgentPort::can_install`) is asked here again, so a
+        // wrapper that forgets to forward it cannot turn the door off (`T-037-22`).
+        state
+            .check_install(&checked)
+            .map_err(StageRefusal::CannotInstall)?;
         // `saga` runs a runtime of its own beside the package: a version that names none cannot be
         // installed here.
         let runtime = checked
