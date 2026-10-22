@@ -518,11 +518,19 @@ fn t037_05_no_authority_path_installs_a_package() {
                 "ReplaceActor",
             ] {
                 // `switch`'s own module (`agents/core-host/src/switch.rs`) and the runtime's
-                // in-place upgrade it calls (`Runtime::upgrade_actor`, `manage` building the request).
+                // in-place upgrade it calls (`Runtime::upgrade_actor`, `manage` building the
+                // request, and `upgrade_request`, which builds the one `upgrade_actor` sends, and
+                // `ensure_claim_signed`, which checks it: `T-037-19`).
                 let allowed = function == "switch"
                     || p.ends_with("core-host/src/switch.rs")
                     || (p.ends_with("core-host/src/driver.rs")
-                        && ["upgrade_actor", "manage"].contains(&function));
+                        && [
+                            "upgrade_actor",
+                            "manage",
+                            "upgrade_request",
+                            "ensure_claim_signed",
+                        ]
+                        .contains(&function));
                 assert!(
                     !l.contains(word) || allowed,
                     "{}:{}: {word} outside `switch`",

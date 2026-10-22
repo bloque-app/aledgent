@@ -241,6 +241,16 @@ impl Park {
         self.why = why;
     }
 
+    /// An attempt at `target` was refused for good (`T-037-19`: the runtime will not take the
+    /// package as a revert, and it is no claim): the host does not try it again until it restarts.
+    pub fn close(&mut self, target: [u8; 32], why: String) {
+        self.target = Some(target);
+        self.failures = self.failures.max(1);
+        self.refusals = PARK_MAX_FAILURES;
+        self.next_ms = u64::MAX;
+        self.why = why;
+    }
+
     /// The platform runs `target`, as asked: what was parked for it is cleared. A park held for
     /// another target stays (a way-out's reinstall of *g* must not wipe the park of *H*).
     pub fn succeeded(&mut self, target: &[u8; 32]) {
@@ -297,7 +307,17 @@ impl CodeInstaller for crate::port::VosPort {
         let name = state.name.clone();
         let package = crate::package::admit_actor(&version.package)
             .map_err(|e| InstallError::Platform(format!("the package is not admitted: {e:?}")))?;
-        self.upgrade_actor(&package, &name).map_err(install_error)?;
+        if let Err(e) = self.upgrade_actor(&package, &name) {
+            if let (crate::driver::DriverError::RevertClosed(why), Some(c)) =
+                (&e, self.code_state_mut())
+            {
+                // Final, not transient: a retry would take another authority slot of the runtime
+                // (256 in all, never compacted) for the same answer.
+                eprintln!("aledgent-core-host: switch to {}: {why}", hex::encode(code));
+                c.park.close(*code, why.clone());
+            }
+            return Err(install_error(e));
+        }
         if let Some(c) = self.code_state_mut() {
             c.running.package = want.package;
         }
@@ -307,11 +327,14 @@ impl CodeInstaller for crate::port::VosPort {
 
 /// How a failed `UpgradeActor` is told to the switch: the runtime's own refusal (it decided, and
 /// would decide again: `UnsupportedLane` on a stateful actor) is a refusal the park counts toward
-/// its stop; the runtime program failing is the platform's, which a retry may settle.
+/// its stop (so does the revert of a claimed switch after state was written under the new program:
+/// the switch took effect and stays, `T-037-19`); the runtime program failing is the platform's, which a retry may settle.
 fn install_error(e: crate::driver::DriverError) -> InstallError {
     use crate::driver::DriverError;
     match e {
-        DriverError::Refused(why) => InstallError::Cannot(format!("the runtime refused it: {why}")),
+        DriverError::Refused(why) | DriverError::RevertClosed(why) => {
+            InstallError::Cannot(format!("the runtime refused it: {why}"))
+        }
         other => InstallError::Platform(other.to_string()),
     }
 }
@@ -336,7 +359,7 @@ mod tests {
             writer: WriterKind::Core,
             platform: Platform {
                 name: "vos-saga".into(),
-                revision: "c54fc1ff".into(),
+                revision: "bd8d1bb7".into(),
                 identities: Vec::new(),
             },
             generation: 0,
@@ -430,6 +453,34 @@ mod tests {
         assert!(p.blocked(&t, 0).is_none());
     }
 
+    /// `T-037-19`: a revert the runtime refuses (a write since the claimed switch) is final at the
+    /// first answer, not after eight, and the park says why.
+    #[test]
+    fn t037_19_a_refused_revert_parks_for_good_at_once() {
+        use crate::driver::DriverError;
+        let t = [9u8; 32];
+        let mut p = Park::default();
+        p.close(t, "upgrade (Revert): UnsupportedLane".into());
+        let why = p.blocked(&t, 0).expect("parked");
+        assert!(
+            why.contains("until the host restarts") && why.contains("UnsupportedLane"),
+            "{why}"
+        );
+        assert!(p.blocked(&t, u64::MAX).is_some(), "no wait ends it");
+        // The port's own `failed` after the install does not reopen it.
+        p.failed(t, "again".into(), false, 5);
+        assert!(p.blocked(&t, u64::MAX).is_some());
+        // Another target is free; a success for the target clears it (a restart does too).
+        assert!(p.blocked(&[1; 32], 0).is_none());
+        p.succeeded(&t);
+        assert!(p.blocked(&t, 0).is_none());
+        // The switch is told it is a refusal, not a platform failure.
+        assert!(matches!(
+            install_error(DriverError::RevertClosed("UnsupportedLane".into())),
+            InstallError::Cannot(_)
+        ));
+    }
+
     #[test]
     fn t037_14_a_success_for_another_target_keeps_the_park_of_h() {
         let (h, g) = ([1u8; 32], [2u8; 32]);
@@ -455,6 +506,34 @@ mod tests {
             install_error(DriverError::Runtime("signer down".into())),
             InstallError::Platform(_)
         ));
+    }
+
+    /// `T-037-19`: what the patched runtime answers to a program change it refuses is its own
+    /// refusal, as `driver::upgrade_actor` words it, and counts toward the park's stop. The
+    /// released runtime does not refuse a claimed request: its PVM panics, which the driver
+    /// reports as a failure of the runtime (`Platform`: transient, so the park only lengthens its
+    /// wait and never stops the host).
+    #[test]
+    fn t037_19_a_refusal_of_the_runtime_to_change_a_stateful_program_is_a_refusal() {
+        use crate::driver::DriverError;
+        use vos::agent_sdk::{ManagementError, RuntimeOutcome};
+        for refusal in [
+            ManagementError::UnsupportedLane,
+            ManagementError::StaleDeployment,
+        ] {
+            let outcome: RuntimeOutcome = RuntimeOutcome::Management(Err(refusal));
+            let e = install_error(DriverError::Refused(format!("upgrade: {outcome:?}")));
+            assert!(
+                matches!(&e, InstallError::Cannot(why) if why.contains(&format!("{refusal:?}"))),
+                "{e:?}"
+            );
+        }
+        // The released runtime panics on the claim: not a refusal.
+        let panicked = install_error(DriverError::Runtime("the runtime PVM panicked".into()));
+        assert!(
+            matches!(panicked, InstallError::Platform(_)),
+            "{panicked:?}"
+        );
     }
 
     #[test]

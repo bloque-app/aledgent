@@ -607,7 +607,23 @@ jobs:
             # it (the next genesis's H0 is built with them), and the test below checks that instead.
             if ! jq -e 'has("generation")' "$RUNNER_TEMP/manifest.json" > /dev/null; then
               echo "before_0033=true" >> "$GITHUB_OUTPUT"
+              echo "refused=true" >> "$GITHUB_OUTPUT"
+              echo "refusal=not a code manifest of amendment 0033's format" >> "$GITHUB_OUTPUT"
               echo "::notice::release $tag's genesis predates amendment 0033 (no code generation): this host must refuse it" | tee -a "$GITHUB_STEP_SUMMARY"
+            else
+              # T-037-19: this host drives the platform revision it pins (the VOS in agents/Cargo.toml),
+              # and refuses a manifest naming another (`code::check_platform`). A release built before
+              # the pin moved is another platform's code, so it is refused like a genesis from before
+              # amendment 0033, until a release carries the pin (the regenesis that ships the patched
+              # runtime): then this test is the build's pass again.
+              ours=$(grep -oE 'rev = "[0-9a-f]{40}"' agents/Cargo.toml | head -n 1 | grep -oE '[0-9a-f]{40}')
+              theirs=$(jq -r '.platform.revision // empty' "$RUNNER_TEMP/manifest.json")
+              test -n "$ours"
+              if [ "$theirs" != "$ours" ]; then
+                echo "refused=true" >> "$GITHUB_OUTPUT"
+                echo "refusal=this host drives vos-saga@$ours" >> "$GITHUB_OUTPUT"
+                echo "::notice::release $tag's genesis runs on platform revision ${theirs:-none}, this host drives $ours: this host must refuse it" | tee -a "$GITHUB_STEP_SUMMARY"
+              fi
             fi
           else
             if ! [[ "$GENESIS_MANIFEST" =~ ^([0-9a-fA-F]{2})+$ ]]; then
@@ -641,7 +657,7 @@ jobs:
       # in the registry on the runner, so that the build pulls it by digest as it would a real one.
       - name: A tampered copy of the genesis
         id: tampered
-        if: github.event_name == 'pull_request' && steps.genesis.outputs.before_0033 != 'true'
+        if: github.event_name == 'pull_request' && steps.genesis.outputs.refused != 'true'
         env:
           GENESIS: ${{ steps.genesis.outputs.image }}
         run: |
@@ -684,7 +700,7 @@ jobs:
       # step may fail then; its host layers stay in the builder's cache either way.
       - name: Build core on genesis
         id: build
-        continue-on-error: ${{ steps.genesis.outputs.before_0033 == 'true' }}
+        continue-on-error: ${{ steps.genesis.outputs.refused == 'true' }}
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
@@ -705,7 +721,7 @@ jobs:
           tags: aledgent-core-on-genesis:ci
 
       - name: The image carries the genesis bytes and the current host
-        if: steps.genesis.outputs.before_0033 != 'true'
+        if: steps.genesis.outputs.refused != 'true'
         env:
           GENESIS: ${{ steps.genesis.outputs.image }}
           ROOTS_GENESIS: ${{ steps.genesis.outputs.roots }}
@@ -743,7 +759,7 @@ jobs:
       # The pull request's refusals, from the builder's cache (the host is built): the tampered
       # copy fails the manifest check, and a genesis named by tag fails before it.
       - name: A tampered genesis, and one named by tag, fail the build
-        if: github.event_name == 'pull_request' && steps.genesis.outputs.before_0033 != 'true'
+        if: github.event_name == 'pull_request' && steps.genesis.outputs.refused != 'true'
         env:
           TAMPERED: ${{ steps.tampered.outputs.image }}
           ROOTS_GENESIS: ${{ steps.genesis.outputs.roots }}
@@ -773,15 +789,17 @@ jobs:
           echo "- refused: a tampered genesis (\`$TAMPERED\`) and a genesis named by tag" >> "$GITHUB_STEP_SUMMARY"
 
       # T-037-01: a genesis from before amendment 0033 has no code generation compiled in, and its
-      # manifest names no platform: this host refuses to build a core on it.
-      - name: A genesis from before amendment 0033 fails the build
-        if: github.event_name == 'pull_request' && steps.genesis.outputs.before_0033 == 'true'
+      # manifest names no platform: this host refuses to build a core on it. T-037-19: so does a
+      # genesis on another platform revision than the VOS this host pins.
+      - name: A genesis from before amendment 0033, or on another platform, fails the build
+        if: github.event_name == 'pull_request' && steps.genesis.outputs.refused == 'true'
         env:
           GENESIS: ${{ steps.genesis.outputs.image }}
           ROOTS_GENESIS: ${{ steps.genesis.outputs.roots }}
           CONTEXT: ${{ steps.genesis.outputs.context }}
           CODE: ${{ steps.genesis.outputs.code }}
           BUILD: ${{ steps.build.outcome }}
+          REFUSAL: ${{ steps.genesis.outputs.refusal }}
         run: |
           set -euo pipefail
           if [ "$BUILD" != failure ]; then
@@ -796,9 +814,9 @@ jobs:
             cat "$RUNNER_TEMP/before-0033.log"
             echo "::error::a genesis from before amendment 0033 built"; exit 1
           fi
-          grep -F "not a code manifest of amendment 0033's format" "$RUNNER_TEMP/before-0033.log" \
+          grep -F "$REFUSAL" "$RUNNER_TEMP/before-0033.log" \
             || { tail -100 "$RUNNER_TEMP/before-0033.log"; exit 1; }
-          echo "- refused: a genesis from before amendment 0033 (\`$GENESIS\`), which carries no code generation" >> "$GITHUB_STEP_SUMMARY"
+          echo "- refused: a genesis from before amendment 0033, or on another platform revision (\`$GENESIS\`): $REFUSAL" >> "$GITHUB_STEP_SUMMARY"
 
       # A dispatch from main or develop: pushed as `host-<commit>-on-genesis-<short>` only.
       - name: Push core on genesis
