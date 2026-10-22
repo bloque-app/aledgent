@@ -359,8 +359,47 @@ impl Fetcher {
     /// The bytes of the cache's entry for `digest`, if it holds a good one. A bad entry is
     /// counted, logged and deleted, so that the sources are asked.
     fn cached(&self, digest: &[u8; 32], len: Option<u64>) -> Option<Vec<u8>> {
+        self.entry(digest, read_limit(len).ok()?, len)
+    }
+
+    /// The cache's entries, in digest order: each regular file named by 64 lowercase hex digits,
+    /// with its length. Names and lengths only; nothing is read, so nothing here is checked
+    /// (`T-037-21`: a restarted host looks for the package it must attach among them, through
+    /// [`Fetcher::read_held`], and skips the entries whose length cannot be the one it wants).
+    ///
+    /// # Errors
+    ///
+    /// The cache directory cannot be listed: that is not an empty cache, and is said so.
+    pub fn held(&self) -> Result<Vec<([u8; 32], u64)>, String> {
+        let entries = fs::read_dir(&self.cache).map_err(|e| {
+            format!(
+                "the code cache {} cannot be listed: {e}",
+                self.cache.display()
+            )
+        })?;
+        let mut held: Vec<([u8; 32], u64)> = entries
+            .filter_map(Result::ok)
+            .filter_map(|e| {
+                let meta = e.metadata().ok().filter(|m| m.is_file())?;
+                let name = e.file_name().into_string().ok()?;
+                let lower = name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+                let bytes = hex::decode(&name).ok().filter(|_| lower)?;
+                Some((<[u8; 32]>::try_from(bytes).ok()?, meta.len()))
+            })
+            .collect();
+        held.sort_unstable();
+        Ok(held)
+    }
+
+    /// The bytes of the cache's entry for `digest`, `len` long, if they hash to it. A bad entry is
+    /// counted, logged and deleted, as on every read of the cache.
+    #[must_use]
+    pub fn read_held(&self, digest: &[u8; 32], len: u64) -> Option<Vec<u8>> {
+        self.entry(digest, read_limit(Some(len)).ok()?, Some(len))
+    }
+
+    fn entry(&self, digest: &[u8; 32], limit: u64, len: Option<u64>) -> Option<Vec<u8>> {
         let path = file_of(&self.cache, digest);
-        let limit = read_limit(len).ok()?;
         match read_regular(&path, limit) {
             Ok(None) => None,
             Ok(Some(bytes)) if is_what_it_names(&bytes, digest, len) => Some(bytes),
@@ -825,6 +864,36 @@ mod tests {
         }
         assert_eq!(got, Some(b"the package".to_vec()));
         assert!(cache.files().is_empty());
+    }
+
+    #[test]
+    fn t037_21_the_cache_lists_the_digests_it_holds_and_reads_them_checked() {
+        let (cache, src) = (Dir::new("cache"), Dir::new("src"));
+        let (a, b) = (src.put_bytes(b"the package"), src.put_bytes(b"the runtime"));
+        let f = fetcher(&cache, &[&src]);
+        assert!(f.held().unwrap().is_empty());
+        f.fetch(&a, Some(11)).unwrap();
+        f.fetch(&b, Some(11)).unwrap();
+        // Files that are not entries are not listed: a temporary file, a name that is not a digest,
+        // a directory named like one, an upper-case name.
+        cache.put(&format!("{TEMPORARY}9-9"), b"x");
+        cache.put("core.vos", b"x");
+        cache.put(&"AB".repeat(32), b"x");
+        fs::create_dir(cache.path().join("cd".repeat(32))).unwrap();
+        let mut want = vec![(a, 11), (b, 11)];
+        want.sort_unstable();
+        assert_eq!(f.held().unwrap(), want);
+        // Read back, whatever the length, checked.
+        assert_eq!(f.read_held(&a, 11), Some(b"the package".to_vec()));
+        assert_eq!(f.read_held(&[7; 32], 11), None);
+        cache.put(&hex::encode(b), b"rotten runtime");
+        assert_eq!(f.read_held(&b, 14), None);
+        assert_eq!(count(&f, "cache"), 1);
+        assert_eq!(
+            f.held().unwrap(),
+            vec![(a, 11)],
+            "the bad entry was deleted"
+        );
     }
 
     #[test]

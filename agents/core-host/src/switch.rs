@@ -266,6 +266,44 @@ impl CodeState {
     }
 }
 
+impl CodeState {
+    /// Whether the version `code` is staged here.
+    #[must_use]
+    pub fn holds(&self, code: &[u8; 32]) -> bool {
+        self.staged.get(code).is_some()
+    }
+
+    /// Stage again, at start, a version the hot row names (`T-037-21`): the same insert as staging
+    /// an `Upgrade`, which checks the bytes against the manifest and the package's compiled
+    /// generation, but held to `generation`, the one the book gives the version (the writer's for
+    /// the code in force, the next for a scheduled upgrade).
+    ///
+    /// # Errors
+    ///
+    /// [`core_binding::staging::StageRefusal`]: the manifest names another generation, or no
+    /// runtime, or the bytes are not its. Nothing was kept.
+    pub fn restage(
+        &mut self,
+        checked: core_binding::staging::Checked,
+        generation: u64,
+    ) -> Result<(), core_binding::staging::StageRefusal> {
+        use core_binding::staging::StageRefusal;
+        if checked.manifest.generation != generation {
+            return Err(StageRefusal::Generation {
+                writer: generation.saturating_sub(1),
+                manifest: checked.manifest.generation,
+            });
+        }
+        let runtime = checked
+            .runtime
+            .ok_or_else(|| StageRefusal::Manifest("the manifest names no Runtime".into()))?;
+        self.staged
+            .insert(checked.manifest, checked.package, runtime)
+            .map(|_| ())
+            .map_err(StageRefusal::Package)
+    }
+}
+
 impl CodeInstaller for crate::port::VosPort {
     fn running(&mut self) -> Result<Artefacts, InstallError> {
         self.code_state()
@@ -467,6 +505,31 @@ mod tests {
             (&b"package"[..], &b"runtime"[..])
         );
         assert_eq!(s.digests().artefacts(&[1; 32]), Some(v.artefacts()));
+    }
+
+    #[test]
+    fn t037_21_staging_again_holds_a_version_to_the_generation_the_book_gives_it() {
+        use core_binding::staging::{Checked, StageRefusal};
+        let mut state = CodeState::new("core", b"g", b"r", StagedVersions::new());
+        let checked = |runtime: Option<&[u8]>| Checked {
+            manifest: manifest(b"package", b"runtime"),
+            package: b"package".to_vec(),
+            runtime: runtime.map(<[u8]>::to_vec),
+        };
+        // `manifest()` names generation 0: held to 1, it is refused.
+        let err = state.restage(checked(Some(b"runtime")), 1).unwrap_err();
+        assert!(
+            matches!(err, StageRefusal::Generation { manifest: 0, .. }),
+            "{err:?}"
+        );
+        // No runtime: refused (saga runs a runtime of its own beside the package).
+        let err = state.restage(checked(None), 0).unwrap_err();
+        assert!(matches!(err, StageRefusal::Manifest(_)), "{err:?}");
+        // The package is not a VOS package: the insert's own check refuses it.
+        let err = state.restage(checked(Some(b"runtime")), 0).unwrap_err();
+        assert!(matches!(err, StageRefusal::Package(_)), "{err:?}");
+        // Nothing was kept, and the running version is still the only one held.
+        assert!(!state.holds(&manifest(b"package", b"runtime").version()));
     }
 
     #[test]

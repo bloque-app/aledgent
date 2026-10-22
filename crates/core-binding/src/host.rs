@@ -356,6 +356,30 @@ pub trait AgentPort {
         let _ = checked;
         Err(crate::staging::StageRefusal::NoSource)
     }
+    /// Whether the port holds the code version `code` staged, so that [`AgentPort::switch_to`] can
+    /// run it (`T-037-21`). A port that manages no code holds every version.
+    fn holds_code(&self, code: &[u8; 32]) -> bool {
+        let _ = code;
+        true
+    }
+    /// Stage again, at start, a code version the writer's hot row names ([`crate::staging::restage`]),
+    /// already fetched and checked against `generation`, the one the book gives it (the writer's
+    /// for the code in force, the next for a scheduled upgrade). The port checks it as it checks
+    /// any staged version, apart from the generation's relation to the writer's. A port that
+    /// manages no code refuses it ([`crate::staging::StageRefusal::NoSource`]).
+    ///
+    /// # Errors
+    ///
+    /// [`crate::staging::StageRefusal`]: the version is not what its manifest names, or its
+    /// package does not carry `generation`. Nothing was kept.
+    fn restage_code(
+        &mut self,
+        checked: crate::staging::Checked,
+        generation: u64,
+    ) -> Result<(), crate::staging::StageRefusal> {
+        let _ = (checked, generation);
+        Err(crate::staging::StageRefusal::NoSource)
+    }
 }
 
 /// Why the driver stopped.
@@ -2363,6 +2387,30 @@ impl AgentPort for NativePort {
         Ok(())
     }
 
+    fn holds_code(&self, code: &[u8; 32]) -> bool {
+        self.code_map.is_empty() || self.code_map.contains_key(code)
+    }
+
+    fn restage_code(
+        &mut self,
+        checked: crate::staging::Checked,
+        generation: u64,
+    ) -> Result<(), crate::staging::StageRefusal> {
+        use crate::staging::StageRefusal;
+        if checked.manifest.generation != generation {
+            return Err(StageRefusal::Generation {
+                writer: generation.saturating_sub(1),
+                manifest: checked.manifest.generation,
+            });
+        }
+        checked.check_package(&|b| {
+            ledger_core::code::generation_of(b).map_err(|e| alloc::format!("{e:?}"))
+        })?;
+        self.code_map
+            .insert(checked.manifest.version(), checked.manifest.generation);
+        Ok(())
+    }
+
     fn switch_to(&mut self, code: [u8; 32]) -> Result<(), String> {
         if self.code_map.is_empty() {
             return Ok(());
@@ -2410,6 +2458,16 @@ impl<T: AgentPort + ?Sized> AgentPort for Box<T> {
         checked: crate::staging::Checked,
     ) -> Result<(), crate::staging::StageRefusal> {
         (**self).stage_code(checked)
+    }
+    fn holds_code(&self, code: &[u8; 32]) -> bool {
+        (**self).holds_code(code)
+    }
+    fn restage_code(
+        &mut self,
+        checked: crate::staging::Checked,
+        generation: u64,
+    ) -> Result<(), crate::staging::StageRefusal> {
+        (**self).restage_code(checked, generation)
     }
 }
 

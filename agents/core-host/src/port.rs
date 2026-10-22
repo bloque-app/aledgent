@@ -393,6 +393,24 @@ impl AgentPort for VosPort {
             .map_err(StageRefusal::Package)
     }
 
+    /// Whether the version is staged here, or this port tracks no code (it holds whatever it
+    /// runs).
+    fn holds_code(&self, code: &[u8; 32]) -> bool {
+        self.code_state().is_none_or(|c| c.holds(code))
+    }
+
+    /// Stage again, at start, a version the hot row names (`T-037-21`): [`crate::switch::CodeState::restage`].
+    fn restage_code(
+        &mut self,
+        checked: core_binding::staging::Checked,
+        generation: u64,
+    ) -> Result<(), core_binding::staging::StageRefusal> {
+        match self.code_state_mut() {
+            Some(state) => state.restage(checked, generation),
+            None => Err(core_binding::staging::StageRefusal::NoSource),
+        }
+    }
+
     fn invoke(&mut self, envelope: Vec<u8>, blobs: Vec<Vec<u8>>) -> Result<Vec<u8>, PortError> {
         #[cfg(feature = "composite")]
         if let Some(mode) = composite_mode()

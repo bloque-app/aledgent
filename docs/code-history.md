@@ -143,6 +143,26 @@ that does not prove the entry bad (permissions, descriptors, a disk error) leave
 the sources; only a wrong length or hash, or a link or special file, is cleared. A read of a source has no time
 limit yet, and the cache no size bound: both are `T-037-20`'s.
 
+**A restart needs the cache.** The core host keeps the versions it has fetched only in the cache and in
+memory; it writes nothing else for them, and `agent.state` is unchanged. When it starts, it reads the package
+the runtime has installed, which after a switch is a version fetched earlier and not the `--actor` file (that
+stays the genesis package, still checked against the chainspec's genesis code), and attaches the cache's copy
+of it. It then stages again, from the cache, the version the hot row names as the code in force and the
+version of a scheduled upgrade, and runs the start check as before. A node restarted after a switch without
+`--code-config`, or with a cache that lost the version, does not start and says so. A node restarted before
+the input of a scheduled upgrade, with the version gone from the cache, starts, says so, and refuses the
+input that needs it; the way out of the upgrade stays open. It is not the same if the version that is gone is
+the code **in force** (the version after a switch, or a later one than the genesis): then every input is
+refused, a cancel or a reschedule included, because a way out is decided by the code in force. The host says
+so at start; put the version's manifest and files back in the cache or a source and restart.
+
+The cache must be on the same persistent volume as the state. A cache that is lost on its own leaves a node
+that switched unable to start, even after a crash between the install and the input, when a cancel back to the
+genesis version would have been a valid way out. The error names VOS's own reference to the installed package
+(a hash VOS computes, not the digest the cache's files are named by) and how many entries it looked at. Start
+now reads the sources for a version missing from the cache, and a source has no time limit until `T-037-20`: a
+source that hangs holds the start up.
+
 ### Built-in sources
 
 | Kind | What | Notes |
