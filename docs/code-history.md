@@ -143,6 +143,16 @@ that does not prove the entry bad (permissions, descriptors, a disk error) leave
 the sources; only a wrong length or hash, or a link or special file, is cleared. A read of a source has no time
 limit yet, and the cache no size bound: both are `T-037-20`'s.
 
+**A restart needs the cache.** The core host keeps the versions it has fetched only in the cache and in
+memory; it writes nothing else for them, and `agent.state` is unchanged. When it starts, it reads the package
+the runtime has installed, which after a switch is a version fetched earlier and not the `--actor` file (that
+stays the genesis package, still checked against the chainspec's genesis code), and attaches the cache's copy
+of it. It then stages again, from the cache, the version the hot row names as the code in force and the
+version of a scheduled upgrade, and runs the start check as before. A node restarted after a switch without
+`--code-config`, or with a cache that lost the version, does not start and says so. A node restarted before
+the input of a scheduled upgrade, with the version gone from the cache, starts, says so, and refuses the
+input that needs it; the way out of the upgrade stays open.
+
 ### Built-in sources
 
 | Kind | What | Notes |

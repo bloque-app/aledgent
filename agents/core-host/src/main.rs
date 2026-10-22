@@ -67,6 +67,7 @@ mod package;
 mod port;
 mod r03gas;
 mod raw;
+mod restart;
 mod serve;
 mod sharded;
 #[cfg(test)]

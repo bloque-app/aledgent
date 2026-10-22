@@ -395,6 +395,42 @@ impl AgentPort for VosPort {
             .map_err(StageRefusal::Package)
     }
 
+    /// Whether the version is staged here, or this port tracks no code (it holds whatever it
+    /// runs).
+    fn holds_code(&self, code: &[u8; 32]) -> bool {
+        self.code_state()
+            .is_none_or(|c| c.staged.get(code).is_some())
+    }
+
+    /// Stage again, at start, a version the hot row names (`T-037-21`): the same insert as
+    /// [`AgentPort::stage_code`], which checks the bytes against the manifest and the package's
+    /// compiled generation, but held to the generation the book gives the version, not the
+    /// writer's next: a restarted host stages the code in force too.
+    fn restage_code(
+        &mut self,
+        checked: core_binding::staging::Checked,
+        generation: u64,
+    ) -> Result<(), core_binding::staging::StageRefusal> {
+        use core_binding::staging::StageRefusal;
+        let Some(state) = self.code_state_mut() else {
+            return Err(StageRefusal::NoSource);
+        };
+        if checked.manifest.generation != generation {
+            return Err(StageRefusal::Generation {
+                writer: generation.saturating_sub(1),
+                manifest: checked.manifest.generation,
+            });
+        }
+        let runtime = checked
+            .runtime
+            .ok_or_else(|| StageRefusal::Manifest("the manifest names no Runtime".into()))?;
+        state
+            .staged
+            .insert(checked.manifest, checked.package, runtime)
+            .map(|_| ())
+            .map_err(StageRefusal::Package)
+    }
+
     fn invoke(&mut self, envelope: Vec<u8>, blobs: Vec<Vec<u8>>) -> Result<Vec<u8>, PortError> {
         #[cfg(feature = "composite")]
         if let Some(mode) = composite_mode()

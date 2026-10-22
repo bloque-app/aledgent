@@ -769,14 +769,8 @@ impl Runtime {
         self.attach(package, name, None)
     }
 
-    /// The actor `package` installed under `name`, as the Agent's directory lists it: after
-    /// [`Runtime::install`], or after [`Runtime::restore`] on a restart.
-    pub fn attach(
-        &mut self,
-        package: &AdmittedActorPackage,
-        name: &str,
-        installation_data: Option<Vec<u8>>,
-    ) -> Result<Actor, DriverError> {
+    /// The directory's record of the actor installed under `name`.
+    fn record_of(&mut self, name: &str) -> Result<ActorDirectoryRecord, DriverError> {
         let actor = ActorId::top_level(self.descriptor.identity.agent, name);
         let (t, _) = self.manage(
             ManagementRequest::InspectActors {
@@ -788,11 +782,29 @@ impl Runtime {
         let RuntimeOutcome::Management(Ok(ManagementReply::Actors(page))) = t.outcome else {
             return Err(DriverError::Runtime(format!("inspect: {:?}", t.outcome)));
         };
-        let record = page
-            .entries
+        page.entries
             .into_iter()
             .find(|r| r.entry.actor == actor)
-            .ok_or_else(|| DriverError::Runtime("the installed actor is not listed".into()))?;
+            .ok_or_else(|| DriverError::Runtime("the installed actor is not listed".into()))
+    }
+
+    /// The package installed under `name`, as the directory names it: the reference to its exact
+    /// bytes (`BlobRef::of_bytes`, the hash VOS gives a blob, and their length). A restarted host
+    /// reads it, after [`Runtime::restore`], to find the package it must attach (`T-037-21`): the
+    /// installed one may be a version the host switched to, not the one it was started with.
+    pub fn installed_package(&mut self, name: &str) -> Result<BlobRef, DriverError> {
+        Ok(self.record_of(name)?.entry.package)
+    }
+
+    /// The actor `package` installed under `name`, as the Agent's directory lists it: after
+    /// [`Runtime::install`], or after [`Runtime::restore`] on a restart.
+    pub fn attach(
+        &mut self,
+        package: &AdmittedActorPackage,
+        name: &str,
+        installation_data: Option<Vec<u8>>,
+    ) -> Result<Actor, DriverError> {
+        let record = self.record_of(name)?;
         if record.entry.program != package.program() {
             return Err(DriverError::Refused(
                 "the installed actor runs another program than this package".into(),
