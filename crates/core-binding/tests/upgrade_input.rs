@@ -740,6 +740,7 @@ async fn t037_06_the_signals_carry_what_the_fetcher_discarded() {
         .map(|m| (m.source.clone(), m.count))
         .collect();
     assert_eq!(got, [("cache".to_owned(), 0), ("fs:0".to_owned(), 2)]);
+}
 
 /// `T-037-23`, `REQ-RT-16`, `NFR-11`: `GET /v1/ops/signals` shows which program the writer runs:
 /// the code in force and its generation from the start, the upgrade scheduled (the version and the

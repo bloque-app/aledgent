@@ -1890,7 +1890,7 @@ impl<P: AgentPort + Send + 'static> Core for AgentCore<P> {
             let u = stats.unacknowledged.load(Ordering::Relaxed);
             s.vos_unacknowledged = (u != u64::MAX).then_some(u);
             // Which program the writer runs, as of the last input committed (`T-037-23`).
-            s.writer_code = (*lock(&stats.writer_code)).map(|w| writer_code_body(&w));
+            s.writer_code = (*lock(&stats.writer_code)).map(|w| Box::new(writer_code_body(&w)));
             // How long the writer has been fenced (`T-037-15`, `NFR-11`).
             let since = stats.fenced_since.load(Ordering::Relaxed);
             s.writer_fenced_age = (since != 0).then(|| now.saturating_sub(since));

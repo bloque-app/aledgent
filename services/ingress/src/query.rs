@@ -464,8 +464,10 @@ pub struct SignalsBody {
     /// committed. Absent from a core that does not report it (the in-process core, an older core
     /// host): a reader that does not know the field ignores it, and a body without it reads as
     /// "not reported".
+    // Boxed: the signals ride in the reply enum of every query, and an inline body would make each
+    // of them as large as this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub writer_code: Option<WriterCodeBody>,
+    pub writer_code: Option<Box<WriterCodeBody>>,
 }
 
 /// The code the core's writer runs, as the signals carry it (`T-037-23`): what to look at to know
