@@ -1043,7 +1043,12 @@ async fn req_cs_4_every_refusal_matches_its_openapi_description() {
         .as_array()
         .unwrap()
         .clone();
-    assert_eq!(alternatives.len(), Refusal::ALL.len());
+    // The core's closed list, and the refusals only ingress sends until the next core
+    // (amendment 0037, R2; `tests/refusal.rs` checks those).
+    assert_eq!(
+        alternatives.len(),
+        Refusal::ALL.len() + ingress::refusal::IngressRefusal::ALL.len()
+    );
     for r in Refusal::ALL {
         let published = alternatives
             .iter()

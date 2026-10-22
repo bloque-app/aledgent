@@ -5,7 +5,7 @@ SPDX-License-Identifier: CC-BY-4.0
 
 # F-041 — The core records the approval (Feature B, a stub)
 
-`[PENDING AMENDMENT 0037]`. **This is a stub, not a plan to build from.** It is **blocked** by two things: Feature A
+Amendment 0037 is applied to `SPEC.md` v0.4.29. **This is a stub, not a plan to build from.** It is **blocked** by two things: Feature A
 (`F-040`) shipping, and the throughput measurement of `T-041-00`, against a threshold the owner sets before the run.
 Nothing in it starts, and no code merges, until both are done and the owner has approved the amendment that
 `T-041-01` writes. It is here so that A freezes formats B can live with, and so the cost B puts on the book is
@@ -17,7 +17,7 @@ written down before anyone asks for it.
 | Home | `crates/ledger-core` (the record, the check, the refusal), `crates/core-binding` and `crates/core-archive` (checkpoints, export, import), `agents/core` and `agents/core-host` (the trusted set, the host's side), `services/ingress` (attaching the record), `crates/conformance` |
 | Depends on | `F-040` (the formats frozen, ingress asking for approvals), `F-035` (ingress's signing key sits in the key boundary), `F-037` (a core upgrade, if that is the delivery), amendment 0037 |
 | Unblocks | Proof in the book that a person approved each command |
-| Realises | `REQ-AU-23` `[PENDING AMENDMENT 0037]`, `REQ-AU-7`, `REQ-AU-3`, `REQ-AU-20`, `REQ-RC-3`, `REQ-PR-10`, and a requirement amendment B adds in `T-041-01` (not named until then) |
+| Realises | `REQ-AU-23`, `REQ-AU-7`, `REQ-AU-3`, `REQ-AU-20`, `REQ-RC-3`, `REQ-PR-10`, and a requirement amendment B adds in `T-041-01` (not named until then) |
 
 ## Goal
 

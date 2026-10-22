@@ -5,8 +5,8 @@ SPDX-License-Identifier: CC-BY-4.0
 
 # F-040 — Per-transaction approval at ingress (Feature A)
 
-`[PENDING AMENDMENT 0037]`. The amendment was approved by the owner on 2026-10-22. The marker stays until `T-040-01` applies its
-text to `SPEC.md`; the tasks below may now start.
+Amendment 0037 was approved by the owner on 2026-10-22 and is applied to `SPEC.md` v0.4.29 (`T-040-01`);
+the tasks below may start.
 
 | | |
 |---|---|
@@ -14,7 +14,7 @@ text to `SPEC.md`; the tasks below may now start.
 | Home | `services/ingress` (`credentials`, `command`, `auth`, `config`, `surface`, `wire`, `store`, `openapi`, a new migration for `T-040-09`), `crates/authn` (`token`: the approval challenge and the key approval's message), `site/` (the integrators' page), `e2e/` (the end-to-end flow). **Not** the core: no core code changes in this feature, with one exception that amendment 0037 names (R2): the refusal's line in `ledger-core`'s list, which ships with the next core (`T-040-10`) |
 | Depends on | `F-028` (passkeys, challenges, durable sign counts and single-use challenge numbers: `T-028-04`), `F-038` (ingress as a fleet: any instance must refuse a spent approval), amendment 0037 |
 | Unblocks | `F-041` (the core records the approval), `M-3D`'s page for integrators |
-| Realises | `REQ-AU-23` and `US-A10` `[PENDING AMENDMENT 0037]`; `REQ-AU-1`, `REQ-AU-20`, `REQ-AU-21`, `REQ-CS-2`, `REQ-CS-8`, `REQ-OP-10`, `NFR-1`, `NFR-7` |
+| Realises | `REQ-AU-23` and `US-A10`; `REQ-AU-1`, `REQ-AU-20`, `REQ-AU-21`, `REQ-CS-2`, `REQ-CS-8`, `REQ-OP-10`, `NFR-1`, `NFR-7` |
 
 ## Goal
 
@@ -26,10 +26,10 @@ a key), once, and ingress refuses it without that approval before it logs anythi
 
 Existing requirements this feature must keep true, and the proposed ones it adds. Proposed ones are marked.
 
-- `REQ-AU-23` `[PENDING AMENDMENT 0037]`: an approval is a proof by a credential whose scheme signs, over one command,
+- `REQ-AU-23`: an approval is a proof by a credential whose scheme signs, over one command,
   accepted once, everywhere; a command that needs one and has none is refused with nothing taken in; a bad approval is
   `ERR-CredentialInvalid`; a retry needs none.
-- `US-A10`, `AC-A10.1` to `AC-A10.16` `[PENDING AMENDMENT 0037]`: the acceptance criteria the tests name.
+- `US-A10`, `AC-A10.1` to `AC-A10.16`: the acceptance criteria the tests name.
 - `REQ-AU-20`, `REQ-AU-21`: credentials are a set; every call enters through ingress. The approval is in addition
   to the core's own check that the credential is an active member of its identity's set and covers the account
   (`REQ-AU-3`), never instead of it.
