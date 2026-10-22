@@ -7,7 +7,8 @@
 //! - no case cites an id the catalogue does not hold;
 //! - case names are unique and owners are features of PLAN §4;
 //! - `ledger-core`'s closed [`Refusal`] list equals the catalogue's `ERR-*`
-//!   ids and descriptions, both ways (`REQ-ER-1`).
+//!   ids and descriptions, both ways (`REQ-ER-1`), with the one named allowance of
+//!   [`SPEC_AHEAD_OF_PROGRAM`] (amendment 0037), which fails once its release ships.
 //!
 //! Each check is a pure function of the catalogue and a case table, so the
 //! tests below run it on fixture tables that must fail.
@@ -113,11 +114,41 @@ pub fn refusals() -> Vec<(&'static str, &'static str)> {
         .collect()
 }
 
+/// A spec item that runs ahead of the program, for a stated time (`REQ-ER-1`).
+///
+/// The only way the spec may hold an error the program's closed list does not: the line is in
+/// `SPEC.md` §10 and in no `Refusal`, and the check below is told so by name. The allowance names
+/// the amendment that put the line in the spec and the release that ends it, and the check
+/// **fails once that release ships** (the `Refusal` then holds the code), so the allowance cannot
+/// outlive its reason. The other direction, a `Refusal` with no line in §10, stays a hard failure.
+/// `T-040-15` makes this data on the spec item; this list is the stopgap until it is decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpecAhead {
+    /// The `ERR-*` in §10 that the core's list does not have yet.
+    pub id: &'static str,
+    /// The amendment that put it in the spec.
+    pub amendment: &'static str,
+    /// The release that ends the allowance.
+    pub ends_with: &'static str,
+}
+
+/// The one allowance. It **weakens `REQ-ER-1`** (the closed list is closed in both directions)
+/// until the next core: `ERR-CommandApprovalRequired` is answered by ingress from its own type
+/// (`ingress::refusal::IngressRefusal`), and the core's `Refusal` gets the line, with its audit code
+/// appended at the end, in the release of `T-041-06`, which removes this entry in the same change.
+pub const SPEC_AHEAD_OF_PROGRAM: &[SpecAhead] = &[SpecAhead {
+    id: "ERR-CommandApprovalRequired",
+    amendment: "0037",
+    ends_with: "the release that carries the core's line for the refusal (T-041-06, the next core)",
+}];
+
 /// The closed refusal list equals the catalogue's errors, both ways, and
-/// each description is the published one (`REQ-ER-1`).
+/// each description is the published one (`REQ-ER-1`), with the named
+/// allowances of `ahead` and no others.
 pub fn refusal_matches_catalogue(
     cat: &Catalogue,
     refusals: &[(&str, &str)],
+    ahead: &[SpecAhead],
 ) -> Result<(), Findings> {
     let mut findings = Vec::new();
     for (code, description) in refusals {
@@ -131,8 +162,33 @@ pub fn refusal_matches_catalogue(
         }
     }
     for e in &cat.errors {
-        if !refusals.iter().any(|(code, _)| *code == e.id) {
-            findings.push(format!("SPEC §10 names {}, which Refusal lacks", e.id));
+        if refusals.iter().any(|(code, _)| *code == e.id) {
+            continue;
+        }
+        if ahead.iter().any(|a| a.id == e.id) {
+            continue;
+        }
+        findings.push(format!("SPEC §10 names {}, which Refusal lacks", e.id));
+    }
+    for a in ahead {
+        if a.amendment.is_empty() || a.ends_with.is_empty() {
+            findings.push(format!(
+                "{}: an allowance must name its amendment and the release that ends it",
+                a.id
+            ));
+        }
+        if cat.error(a.id).is_none() {
+            findings.push(format!(
+                "{}: an allowance for an error SPEC §10 does not name",
+                a.id
+            ));
+        }
+        if refusals.iter().any(|(code, _)| *code == a.id) {
+            findings.push(format!(
+                "{} is allowed to be missing from Refusal (amendment {}, until {}), and Refusal \
+                 now has it: remove the allowance",
+                a.id, a.amendment, a.ends_with
+            ));
         }
     }
     let unique: BTreeSet<&str> = refusals.iter().map(|(c, _)| *c).collect();
@@ -163,7 +219,7 @@ pub fn run_all(cat: &Catalogue, cases: &[Case]) -> Vec<(&'static str, Result<(),
         ),
         (
             "refusal_matches_catalogue",
-            refusal_matches_catalogue(cat, &refusals()),
+            refusal_matches_catalogue(cat, &refusals(), SPEC_AHEAD_OF_PROGRAM),
         ),
     ]
 }
@@ -252,7 +308,7 @@ mod tests {
     fn a_refusal_added_without_a_catalogue_entry_fails() {
         let mut list = refusals();
         list.push(("ERR-Fault", "An unexpected fault"));
-        let err = refusal_matches_catalogue(&cat(), &list).unwrap_err();
+        let err = refusal_matches_catalogue(&cat(), &list, SPEC_AHEAD_OF_PROGRAM).unwrap_err();
         assert_eq!(
             err,
             vec!["Refusal has ERR-Fault, which SPEC §10 does not name".to_string()]
@@ -265,7 +321,7 @@ mod tests {
             .into_iter()
             .filter(|(c, _)| *c != "ERR-QueryUnbounded")
             .collect();
-        let err = refusal_matches_catalogue(&cat(), &list).unwrap_err();
+        let err = refusal_matches_catalogue(&cat(), &list, SPEC_AHEAD_OF_PROGRAM).unwrap_err();
         assert_eq!(
             err,
             vec!["SPEC §10 names ERR-QueryUnbounded, which Refusal lacks".to_string()]
@@ -276,8 +332,64 @@ mod tests {
     fn a_description_that_differs_from_the_published_one_fails() {
         let mut list = refusals();
         list[0].1 = "Not allowed";
-        let err = refusal_matches_catalogue(&cat(), &list).unwrap_err();
+        let err = refusal_matches_catalogue(&cat(), &list, SPEC_AHEAD_OF_PROGRAM).unwrap_err();
         assert_eq!(err.len(), 1);
         assert!(err[0].starts_with("ERR-NotAuthorised: the runtime description"));
+    }
+
+    #[test]
+    fn the_one_allowance_names_its_amendment_and_release() {
+        assert_eq!(SPEC_AHEAD_OF_PROGRAM.len(), 1);
+        let a = SPEC_AHEAD_OF_PROGRAM[0];
+        assert_eq!(a.id, "ERR-CommandApprovalRequired");
+        assert_eq!(a.amendment, "0037");
+        assert!(a.ends_with.contains("T-041-06"));
+    }
+
+    #[test]
+    fn without_the_allowance_the_spec_line_ahead_of_the_program_fails() {
+        let err = refusal_matches_catalogue(&cat(), &refusals(), &[]).unwrap_err();
+        assert_eq!(
+            err,
+            vec!["SPEC §10 names ERR-CommandApprovalRequired, which Refusal lacks".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_allowance_fails_once_the_core_carries_the_line() {
+        let mut list = refusals();
+        let description = cat()
+            .error("ERR-CommandApprovalRequired")
+            .unwrap()
+            .condition
+            .clone();
+        list.push(("ERR-CommandApprovalRequired", description.leak()));
+        let err = refusal_matches_catalogue(&cat(), &list, SPEC_AHEAD_OF_PROGRAM).unwrap_err();
+        assert_eq!(err.len(), 1, "{err:?}");
+        assert!(err[0].ends_with("remove the allowance"), "{err:?}");
+    }
+
+    #[test]
+    fn an_allowance_without_an_amendment_or_a_release_fails() {
+        let bare = [SpecAhead {
+            id: "ERR-CommandApprovalRequired",
+            amendment: "",
+            ends_with: "",
+        }];
+        let err = refusal_matches_catalogue(&cat(), &refusals(), &bare).unwrap_err();
+        assert_eq!(err.len(), 1, "{err:?}");
+    }
+
+    #[test]
+    fn the_allowance_covers_that_error_only() {
+        let list: Vec<_> = refusals()
+            .into_iter()
+            .filter(|(c, _)| *c != "ERR-QueryUnbounded")
+            .collect();
+        let err = refusal_matches_catalogue(&cat(), &list, SPEC_AHEAD_OF_PROGRAM).unwrap_err();
+        assert_eq!(
+            err,
+            vec!["SPEC §10 names ERR-QueryUnbounded, which Refusal lacks".to_string()]
+        );
     }
 }

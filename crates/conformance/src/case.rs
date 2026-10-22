@@ -126,10 +126,12 @@ impl Feature {
     pub const F036: Feature = Feature(36);
     /// Code history and upgrades (amendment 0023, `REQ-RT-15` to `REQ-RT-18`).
     pub const F037: Feature = Feature(37);
+    /// Per-transaction approval at ingress (amendment 0037, `REQ-AU-23`).
+    pub const F040: Feature = Feature(40);
 
     /// Whether PLAN §4 has this feature.
     pub const fn is_planned(self) -> bool {
-        (self.0 >= 1 && self.0 <= 29) || self.0 == 36 || self.0 == 37
+        (self.0 >= 1 && self.0 <= 29) || self.0 == 36 || self.0 == 37 || self.0 == 40
     }
 
     /// Parse `F-004`.
