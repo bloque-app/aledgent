@@ -338,24 +338,28 @@ pub struct Candidate {
     pub claims_running_program: bool,
 }
 
-/// Whether `candidate`'s package may replace the program `running`'s package holds: the same
-/// program (nothing changes), or a claim, signed with the package, to read the state of the program
-/// running (`T-037-19`: `state_compatible_with`). The runtime refuses a program change without it.
+/// Whether `candidate`'s package may replace the program `running`'s package holds, by the very
+/// rule the switch applies ([`crate::driver::Direction::of`], `T-037-19`): the same program
+/// repackaged, or a package whose producer signed a claim over the program running
+/// (`state_compatible_with`). The third direction, [`crate::driver::Direction::Revert`], is what a
+/// package that claims nothing looks like: the runtime accepts it only as the way back to the
+/// program the last claimed change replaced, never as a new version, so the door refuses it. A way
+/// out that puts the genesis code back does not pass the door at all (that version is already held).
 ///
 /// # Errors
 ///
 /// A package that is not admitted.
 pub fn claims_running(running: &[u8], candidate: &[u8]) -> Result<bool, String> {
+    use crate::driver::Direction;
     let admit = |bytes: &[u8]| {
         crate::package::admit_actor(bytes).map_err(|e| format!("the package is not admitted: {e}"))
     };
     let running = admit(running)?.program();
     let candidate = admit(candidate)?;
-    Ok(candidate.program() == running
-        || candidate
-            .manifest()
-            .state_compatible_with
-            .contains(&running))
+    Ok(!matches!(
+        Direction::of(running, &candidate),
+        Direction::Revert(_)
+    ))
 }
 
 /// Whether `install` (above) would accept `candidate` while the host runs `running` from a package
@@ -593,6 +597,9 @@ mod tests {
         assert_eq!(claims_running(&g0, &claimed), Ok(true));
         assert_eq!(claims_running(&g0, &unclaimed), Ok(false));
         assert_eq!(claims_running(&g0, &g0), Ok(true));
+        // The way back: running g1, a package that claims nothing over it is the revert's shape,
+        // which the runtime accepts only for the program the last claimed change replaced.
+        assert_eq!(claims_running(&claimed, &g0), Ok(false));
         assert!(claims_running(&g0, b"not a package").is_err());
     }
 
