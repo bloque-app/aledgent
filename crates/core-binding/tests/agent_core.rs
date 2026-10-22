@@ -1222,3 +1222,33 @@ async fn t037_18_a_refusal_whose_rebuild_fails_is_not_certified_not_run() {
         "the core stopped on the unreadable archive"
     );
 }
+
+/// `T-037-23`: the core writes a line about the writer's code at start (the platform runs the code
+/// of the next input) and none for an input refused and rebuilt after, nor for the retry: the
+/// driver the core builds in its place is told what the platform runs, so its first check is no
+/// install. Without that, every rebuild after a refused input repeated the line, which an operator
+/// reads as an install, during the fence.
+#[tokio::test(flavor = "multi_thread")]
+async fn t037_23_a_rebuild_after_a_refused_input_writes_no_install_line() {
+    let (d, core, _log) = deployment().await;
+    let alice = d.party("alice", 1_000).await;
+    let a = Some(alice.token.as_str());
+    let lines = |c: &AgentCore<NativePort>| c.stats().code_lines.load(Ordering::Relaxed);
+    let at_start = lines(&core);
+    assert_eq!(at_start, 1, "the check at start, once");
+    for (n, fail) in [(1, false), (2, true)] {
+        core.with_port(|p| p.fail_next = Some(fail));
+        let key = format!("rebuild-{n}");
+        let (s, r) = d
+            .call_decided(
+                "POST",
+                "/v1/reservations",
+                a,
+                &[("client-key", &key)],
+                Some(json!({ "payer": alice.account, "asset": USD, "amount": n.to_string() })),
+            )
+            .await;
+        assert_eq!(s.as_u16(), 200, "{r}");
+    }
+    assert_eq!(lines(&core), at_start, "the rebuilds wrote nothing");
+}

@@ -567,6 +567,13 @@ pub struct CoreStats {
     /// fence first refused an input since an input last committed; 0 when it is not fenced. The signals report how long
     /// ago that was (`aledgent_writer_fenced_seconds`, `NFR-11`).
     pub fenced_since: AtomicU64,
+    /// The writer's code as of the last input committed (`T-037-23`): its version, generation and
+    /// scheduled upgrade, kept here so the signals read it without the execution lock, and never
+    /// ahead of a commit. `None` until the driver is open.
+    pub writer_code: Mutex<Option<crate::fence::WriterCode>>,
+    /// How many lines about the writer's code the core has written (`T-037-23`): tests count them,
+    /// since the lines themselves go to standard error.
+    pub code_lines: AtomicU64,
     read_wait_us: Window,
     hold_us: Window,
     native_us: Window,
@@ -1004,6 +1011,8 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
             node_trail: None,
             latest_time: 0,
         };
+        // The code the writer is in, and the platform's check at start (`T-037-23`).
+        inner.report_code();
         let mut running = inner.executor(replica)?;
         // A book founded here emitted genesis's records: the store may hold them already.
         if let Some(f) = floor {
@@ -1150,6 +1159,9 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
         inner.running = slot.take();
         let out = f(inner);
         *slot = inner.running.take();
+        // What happened to the writer's code and the platform in this decision, in the log, and
+        // the signals' view of the writer's code (`T-037-23`).
+        inner.report_code();
         // The committed credentials, before any read sees the new state (`Credentials`), with
         // the ones this decision created: their holders' first requests would otherwise each wait
         // for an invocation.
@@ -1238,6 +1250,20 @@ impl<P: AgentPort> Inner<P> {
         Ok(running)
     }
 
+    /// Write one plain line for everything the driver recorded about the writer's code since the
+    /// last call, and publish the code the writer is in as of the last commit (`T-037-23`). The
+    /// lines name the input; they are for the operator, never in the book, and none is written
+    /// while an archive is replayed (the driver records nothing then).
+    fn report_code(&mut self) {
+        let Some(driver) = self.driver.as_mut() else {
+            return;
+        };
+        write_code_events(&self.stats, driver.take_code_events());
+        if let Some(w) = driver.committed_writer() {
+            *lock(&self.stats.writer_code) = Some(w);
+        }
+    }
+
     /// Stop on an incident: every later call is `Unavailable` until the core is reopened.
     fn stop(&mut self, why: String) -> CoreError {
         self.stopped = Some(why);
@@ -1248,9 +1274,13 @@ impl<P: AgentPort> Inner<P> {
     /// Rebuild the replica and the executor from the log and the Agent. `Ok(n)`: the Agent's
     /// input number after the rebuild.
     fn rebuild(&mut self) -> Result<u64, CoreError> {
-        let Some(driver) = self.driver.take() else {
+        let Some(mut driver) = self.driver.take() else {
             return Err(CoreError::Unavailable);
         };
+        // What the old driver recorded before it is dropped (`T-037-23`).
+        write_code_events(&self.stats, driver.take_code_events());
+        // The platform keeps running what it ran: the next check is no install (`T-037-23`).
+        let running_code = driver.running_code();
         let port = driver.into_port();
         let mut archive = match self.log.entries() {
             Ok(a) => a,
@@ -1296,8 +1326,10 @@ impl<P: AgentPort> Inner<P> {
                 }
                 driver.archived();
                 driver.set_batch_limits(self.batch);
+                driver.set_running_code(running_code);
                 let seq = driver.seq();
                 self.driver = Some(driver);
+                self.report_code();
                 match self.executor(replica) {
                     Ok(r) => self.running = Some(r),
                     Err(e) => return Err(self.stop(e)),
@@ -1856,6 +1888,8 @@ impl<P: AgentPort + Send + 'static> Core for AgentCore<P> {
             s.audit = self.inner.audit.as_ref().map(|a| a.stats.body(now));
             let u = stats.unacknowledged.load(Ordering::Relaxed);
             s.vos_unacknowledged = (u != u64::MAX).then_some(u);
+            // Which program the writer runs, as of the last input committed (`T-037-23`).
+            s.writer_code = (*lock(&stats.writer_code)).map(|w| Box::new(writer_code_body(&w)));
             // How long the writer has been fenced (`T-037-15`, `NFR-11`).
             let since = stats.fenced_since.load(Ordering::Relaxed);
             s.writer_fenced_age = (since != 0).then(|| now.saturating_sub(since));
@@ -1935,16 +1969,28 @@ impl<P: AgentPort + Send + 'static> Core for AgentCore<P> {
                 }
             };
             let mut inner = lock(&core.inner.ctl);
-            match inner
-                .driver
-                .as_mut()
-                .map(|d| d.port_mut().stage_code(checked))
-            {
-                Some(Ok(())) => Ok(Staged::Staged),
-                Some(Err(r)) => Ok(Staged::Refused {
+            let Some(driver) = inner.driver.as_mut() else {
+                return Err(CoreError::Unavailable);
+            };
+            // Could the switch install it? Asked before the version is staged, under the same lock
+            // as the staging, so a version it would refuse at its input is refused at the door
+            // (`T-037-22`, owner ruling w16): nothing is staged and, the door refusing it, nothing
+            // is logged.
+            if let Err(why) = driver.port_mut().can_install(&checked) {
+                let refusal = crate::staging::StageRefusal::CannotInstall(why).to_string();
+                std::eprintln!(
+                    "aledgent-core: refused an upgrade to code {} before it was logged (the last \
+                     committed input is {}): {refusal}",
+                    crate::switch::short(&code),
+                    driver.seq()
+                );
+                return Ok(Staged::Refused { reason: refusal });
+            }
+            match driver.port_mut().stage_code(checked) {
+                Ok(()) => Ok(Staged::Staged),
+                Err(r) => Ok(Staged::Refused {
                     reason: r.to_string(),
                 }),
-                None => Err(CoreError::Unavailable),
             }
         })
         .await
@@ -1956,6 +2002,104 @@ impl<P: AgentPort + Send + 'static> Core for AgentCore<P> {
         // can only answer "none" for a tie it has not seen yet.
         let principal = String::from(principal);
         self.read(move |r| r.party_of(&principal)).await
+    }
+}
+
+/// Write one line for each event of the writer's code, and count them (`T-037-23`).
+fn write_code_events(stats: &CoreStats, events: Vec<crate::fence::CodeEvent>) {
+    for event in events {
+        std::eprintln!("aledgent-core: {}", describe_code_event(&event));
+        stats.code_lines.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A code version's digest in lower-case hex (`T-037-23`).
+fn hex32(code: &[u8; 32]) -> String {
+    code.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The writer's code as the signals carry it (`T-037-23`).
+fn writer_code_body(w: &crate::fence::WriterCode) -> ingress::query::WriterCodeBody {
+    ingress::query::WriterCodeBody {
+        code: hex32(&w.code),
+        generation: w.generation,
+        upgrade: w
+            .upgrade
+            .map(|(code, from)| ingress::query::ScheduledUpgradeBody {
+                code: hex32(&code),
+                from,
+            }),
+    }
+}
+
+/// The line the operator reads for an event of the writer's code (`T-037-23`): plain, naming the
+/// input, with a version as its first eight bytes in hex, the way the fence's refusal does not
+/// (it names all of it) and the signals' label does.
+fn describe_code_event(event: &crate::fence::CodeEvent) -> String {
+    use crate::fence::CodeEvent;
+    use crate::switch::short;
+    match event.clone() {
+        CodeEvent::Installed {
+            input,
+            code,
+            from: Some(from),
+        } => format!(
+            "the platform now runs code {} (it ran {}) for input {input}",
+            short(&code),
+            short(&from)
+        ),
+        CodeEvent::Installed {
+            input,
+            code,
+            from: None,
+        } => format!("the platform runs code {} for input {input}", short(&code)),
+        CodeEvent::Switched {
+            input,
+            from,
+            to,
+            generation,
+        } => format!(
+            "input {input} is the first to run code {} (generation {generation}), after code {}: \
+             the scheduled upgrade took effect",
+            short(&to),
+            short(&from)
+        ),
+        CodeEvent::WayOut {
+            input,
+            taken,
+            upgrade,
+        } => {
+            let scheduled = upgrade.map_or_else(
+                || "no upgrade was scheduled".to_string(),
+                |(code, from)| {
+                    format!(
+                        "the upgrade to code {} was scheduled from input {from}",
+                        short(&code)
+                    )
+                },
+            );
+            let done = match taken {
+                ledger_core::code::WayOut::Cancel => "it is cancelled".to_string(),
+                ledger_core::code::WayOut::Reschedule { from } => {
+                    format!("it now applies from input {from}")
+                }
+            };
+            format!("input {input} took the way out: {scheduled}, {done}")
+        }
+        CodeEvent::Scheduled { input, code, from } => format!(
+            "input {input} scheduled an upgrade to code {}, to apply from input {from}",
+            short(&code)
+        ),
+        CodeEvent::UpgradeRefused {
+            input,
+            code,
+            from,
+            condition,
+        } => format!(
+            "input {input} was an upgrade to code {} from input {from} that the writer refused \
+             and recorded: {condition}",
+            short(&code)
+        ),
     }
 }
 

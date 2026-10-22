@@ -1454,6 +1454,8 @@ impl<S: LeafStore, V: VaultBackend> Running<S, V> {
                 leaves: s.book.leaves,
                 genesis_records: s.book.genesis_records,
             }),
+            // The in-process core drives no writer's code (`T-037-23`).
+            writer_code: None,
         }
     }
 

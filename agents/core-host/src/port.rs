@@ -381,6 +381,12 @@ impl AgentPort for VosPort {
         let Some(state) = self.code_state_mut() else {
             return Err(StageRefusal::NoSource);
         };
+        // The port never stages what its switch could not install, whatever sits around it: the
+        // question the core asks first (`AgentPort::can_install`) is asked here again, so a
+        // wrapper that forgets to forward it cannot turn the door off (`T-037-22`).
+        state
+            .check_install(&checked)
+            .map_err(StageRefusal::CannotInstall)?;
         // `saga` runs a runtime of its own beside the package: a version that names none cannot be
         // installed here.
         let runtime = checked
@@ -409,6 +415,14 @@ impl AgentPort for VosPort {
             Some(state) => state.restage(checked, generation),
             None => Err(core_binding::staging::StageRefusal::NoSource),
         }
+    }
+
+    /// Whether the switch could install `checked` (`T-037-22`): the checks of
+    /// [`crate::switch::installable`], over the code this port runs. A port that tracks no code
+    /// answers yes; [`AgentPort::stage_code`] refuses it anyway.
+    fn can_install(&self, checked: &core_binding::staging::Checked) -> Result<(), String> {
+        self.code_state()
+            .map_or(Ok(()), |state| state.check_install(checked))
     }
 
     fn invoke(&mut self, envelope: Vec<u8>, blobs: Vec<Vec<u8>>) -> Result<Vec<u8>, PortError> {

@@ -741,3 +741,99 @@ async fn t037_06_the_signals_carry_what_the_fetcher_discarded() {
         .collect();
     assert_eq!(got, [("cache".to_owned(), 0), ("fs:0".to_owned(), 2)]);
 }
+
+/// `T-037-23`, `REQ-RT-16`, `NFR-11`: `GET /v1/ops/signals` shows which program the writer runs:
+/// the code in force and its generation from the start, the upgrade scheduled (the version and the
+/// input it applies from) once it is, and the new code and generation from the input that
+/// switched, never before its commit.
+#[tokio::test(flavor = "multi_thread")]
+async fn t037_23_the_signals_show_the_writers_code_generation_and_scheduled_upgrade() {
+    let w = world().await;
+    let op = operator(&w);
+    // An operations principal that reads the signals (`F-018`).
+    let (s, v) =
+        w.d.call_decided(
+            "POST",
+            "/v1/identities",
+            Some(&op),
+            &[("client-key", "signals-identity")],
+            Some(json!({ "kind": "organisation", "verifier": "0c" })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    let (reader, reader_token) = (
+        v["result"]["identity"].as_str().unwrap().to_owned(),
+        v["result"]["credential"].as_str().unwrap().to_owned(),
+    );
+    let (s, v) =
+        w.d.call_decided(
+            "POST",
+            "/v1/ops/operator-grants",
+            Some(&op),
+            &[("client-key", "signals-grant")],
+            Some(json!({
+                "principal": reader,
+                "kinds": ["read_signals"],
+                "justification": "T-037-23: the signals",
+            })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    let caller = CallerBody {
+        principal: reader,
+        credential: reader_token,
+        on_behalf_of: None,
+    };
+    let signals = || async {
+        match w.core.query(&caller, &Query::Signals, T0 + 1_000_000).await {
+            // The body as the wire carries it (JSON).
+            Ok(QueryReply::Signals(s)) => serde_json::to_value(s).unwrap()["writer_code"].clone(),
+            other => panic!("signals: {other:?}"),
+        }
+    };
+    let g = hot(&w);
+    let hex = |c: &[u8; 32]| hex::encode(c);
+    let before = signals().await;
+    assert_eq!(before["code"], hex(&g.code), "{before}");
+    assert_eq!(before["generation"], 0);
+    assert!(before.get("upgrade").is_none(), "{before}");
+    // Scheduled.
+    let h1 = w.code.version(1);
+    let n = g.inputs + 3;
+    let (s, v) =
+        w.d.call(
+            "POST",
+            "/v1/ops/upgrade",
+            Some(&op),
+            &[],
+            Some(upgrade_body(&h1, n)),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    let scheduled = signals().await;
+    assert_eq!(scheduled["generation"], 0, "{scheduled}");
+    assert_eq!(
+        scheduled["upgrade"],
+        json!({ "code": hex(&h1), "from": n }),
+        "{scheduled}"
+    );
+    // Through n.
+    let mut k = 0;
+    while hot(&w).inputs < n {
+        k += 1;
+        let (s, v) =
+            w.d.call(
+                "POST",
+                "/v1/identities",
+                Some(&op),
+                &[("client-key", &format!("signals-person-{k}"))],
+                Some(json!({ "kind": "person", "verifier": "0a" })),
+            )
+            .await;
+        assert_eq!(s.as_u16(), 200, "{v}");
+    }
+    let after = signals().await;
+    assert_eq!(after["code"], hex(&h1), "{after}");
+    assert_eq!(after["generation"], 1);
+    assert!(after.get("upgrade").is_none(), "{after}");
+}

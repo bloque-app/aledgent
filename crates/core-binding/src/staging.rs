@@ -67,6 +67,9 @@ pub enum StageRefusal {
     },
     /// The package does not carry the manifest's generation in its bytes (`AC-K7.16`).
     Package(String),
+    /// The switch could not install this version as the port runs now (`T-037-22`): it names
+    /// another runtime, or another package key, or does not claim the program running.
+    CannotInstall(String),
 }
 
 impl core::fmt::Display for StageRefusal {
@@ -82,6 +85,9 @@ impl core::fmt::Display for StageRefusal {
                 writer.saturating_add(1)
             ),
             Self::Package(why) => write!(f, "the package is refused: {why}"),
+            Self::CannotInstall(why) => {
+                write!(f, "the switch could not install this version: {why}")
+            }
         }
     }
 }
