@@ -13,9 +13,9 @@ the work is split in two features; this amendment and its design are public in t
 The owner answered the first draft's ten questions on 2026-10-21 and ruled on the core options on the same day
 (`w14`). An independent review of the second draft found four blocking faults, and a second review of the third draft found
 two more (the exemption of configured tokens, and the plain-English questions); the fourth draft fixes them. The
-text below is the drafter's reading of the rulings, worked through to rules and byte formats. Nothing in `SPEC.md`
-changes with this file: the proposed spec text is marked as such until `T-040-01` applies it, and the plan sites cite
-`[PENDING AMENDMENT 0037]` until then. The features that build it (`F-040`, `F-041`) may now start, within their own
+text below is the drafter's reading of the rulings, worked through to rules and byte formats. **Applied** to `SPEC.md`
+**v0.4.29** (`T-040-01`; `PLAN.md` section 4 has the rows for `F-040` and `F-041`; `DEC-28` and the sentence in `DEC-19`
+are not yet written). The features that build it (`F-040`, `F-041`) may start, within their own
 gates (`F-041` stays blocked by `F-040` and by `T-041-00`).
 **Target:** `SPEC.md` v0.4.28 as on `develop`. Amendment 0036 (PR #50, also awaiting approval) touches `REQ-RT-20`
 and `US-K7` and no clause named here. Amendment 0034 (the upgrade authority is held with a credential) is cited
