@@ -15,11 +15,21 @@ use ingress::approval::{
     APPROVAL_HEADER, ApprovalBody, ApprovalMode, Approvals, COMMAND_APPROVAL_REQUIRED,
 };
 use ingress::auth::Passkeys;
+use ingress::boundary::{
+    CallerBody, Core, CoreError, CoreInput, CoreReply, CredentialBody, OutboxPage, Query,
+    QueryReply,
+};
+use ingress::inprocess::{InProcessCore, MemJournal};
 use ingress::store::Store as _;
-use ingress::testkit::{Deployment, Party, fast_config};
+use ingress::store::mem::MemStore;
+use ingress::testkit::{Deployment, Party, T0, TestCore, fast_config, genesis, test_clerk};
 use ingress::wire::AssertionBody;
 use ledger_core::Refusal;
+use ledger_core::account::Time;
 use serde_json::{Value, json};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 const RP: &str = "api.bloque.app";
 const ORIGIN: &str = "https://api.bloque.app";
@@ -49,7 +59,7 @@ fn passkeys(mode: ApprovalMode, require_uv_at_sign_in: bool) -> Passkeys {
     .with_approvals(Approvals::new(mode, Some("test"), DEPLOYMENT).unwrap())
 }
 
-async fn challenge(d: &Deployment, purpose: &str) -> Vec<u8> {
+async fn challenge<C: Core + Clone>(d: &Deployment<MemStore, C>, purpose: &str) -> Vec<u8> {
     let (s, v) = d
         .call(
             "POST",
@@ -82,7 +92,12 @@ fn assertion(soft: &Soft, challenge: &[u8]) -> AssertionBody {
 
 /// Register `soft` into `party`'s set with its configured token (exempt), and sign in: the
 /// credential and the session.
-async fn enrol(d: &Deployment, party: &Party, soft: &Soft, key: &str) -> (String, String) {
+async fn enrol<C: Core + Clone>(
+    d: &Deployment<MemStore, C>,
+    party: &Party,
+    soft: &Soft,
+    key: &str,
+) -> (String, String) {
     let ch = challenge(d, "register").await;
     let (s, v) = d
         .call(
@@ -156,7 +171,13 @@ fn transfer(w: &World, amount: &str) -> Value {
 }
 
 /// Step (a): the reply.
-async fn step_a(d: &Deployment, token: &str, path: &str, key: &str, body: &Value) -> Value {
+async fn step_a<C: Core + Clone>(
+    d: &Deployment<MemStore, C>,
+    token: &str,
+    path: &str,
+    key: &str,
+    body: &Value,
+) -> Value {
     let (s, v) = d
         .call(
             "POST",
@@ -182,8 +203,8 @@ fn approve(reply: &Value, soft: &Soft, credential: &str) -> String {
     .header()
 }
 
-async fn submit(
-    d: &Deployment,
+async fn submit<C: Core + Clone>(
+    d: &Deployment<MemStore, C>,
     token: &str,
     path: &str,
     key: &str,
@@ -568,5 +589,190 @@ async fn t_040_07_off_changes_nothing_and_report_only_refuses_nothing() {
         assert_eq!(st, StatusCode::ACCEPTED, "{mode:?}: {v}");
         let a = step_a(d, s, "/v1/transfers", "t-13", &body).await;
         assert_eq!(a["required"], mode != ApprovalMode::Off, "{mode:?}");
+    }
+}
+
+/// A core whose credential reads can be made to fail: the book that cannot be read.
+#[derive(Clone)]
+struct Flaky {
+    inner: TestCore,
+    down: Arc<AtomicBool>,
+}
+
+impl Core for Flaky {
+    async fn apply(&self, input: &CoreInput) -> Result<CoreReply, CoreError> {
+        self.inner.apply(input).await
+    }
+
+    async fn apply_batch(&self, inputs: &[CoreInput]) -> Vec<Result<CoreReply, CoreError>> {
+        self.inner.apply_batch(inputs).await
+    }
+
+    async fn outbox(
+        &self,
+        cursor: Option<&str>,
+        undelivered: bool,
+        now: Time,
+    ) -> Result<OutboxPage, CoreError> {
+        self.inner.outbox(cursor, undelivered, now).await
+    }
+
+    async fn last_tick(&self) -> Result<Option<Time>, CoreError> {
+        self.inner.last_tick().await
+    }
+
+    async fn next_due(&self) -> Result<Option<Time>, CoreError> {
+        self.inner.next_due().await
+    }
+
+    async fn query(
+        &self,
+        caller: &CallerBody,
+        query: &Query,
+        now: Time,
+    ) -> Result<QueryReply, CoreError> {
+        self.inner.query(caller, query, now).await
+    }
+
+    async fn credential(&self, credential: &str) -> Result<Option<CredentialBody>, CoreError> {
+        if self.down.load(Ordering::SeqCst) {
+            return Err(CoreError::Unavailable);
+        }
+        self.inner.credential(credential).await
+    }
+
+    async fn party_of(&self, principal: &str) -> Result<Option<String>, CoreError> {
+        self.inner.party_of(principal).await
+    }
+
+    async fn genesis_open(&self) -> Result<bool, CoreError> {
+        self.inner.genesis_open().await
+    }
+}
+
+/// `AC-A10.13`: while the current credential list cannot be read, an approval is refused with
+/// `ERR-DecisionUnavailable` and no stored copy is used; and a credential removed from the set
+/// approves nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn ac_a10_13_an_unreadable_list_and_a_removed_credential() {
+    let journal = MemJournal::new();
+    let inner = InProcessCore::in_memory(genesis(T0), journal.clone()).with_clerk(test_clerk());
+    inner.start().unwrap();
+    let founded = inner.founded().unwrap();
+    let core = Flaky {
+        inner,
+        down: Arc::default(),
+    };
+    let d = Deployment::assemble(
+        MemStore::new(Duration::from_millis(50)),
+        fast_config("ingress-0"),
+        core.clone(),
+        founded,
+        journal,
+    )
+    .await;
+    d.auth.set_passkeys(passkeys(ApprovalMode::Enforce, true));
+    let alice = d.party("alice", 1_000).await;
+    let bob = d.party("bob", 1_000).await;
+    let first = Soft::new(41, RP);
+    let second = Soft::new(42, RP);
+    let (_, session) = enrol(&d, &alice, &first, "pk-41").await;
+    let (second_cred, _) = enrol(&d, &alice, &second, "pk-42").await;
+    let body = json!({ "legs": [{
+        "from": alice.account.as_deref().unwrap(),
+        "to": bob.account.as_deref().unwrap(),
+        "asset": "USD", "amount": "10",
+    }]});
+
+    // The book cannot be read: refused with ERR-DecisionUnavailable, even though ingress's
+    // durable copy holds the credential (the sign-ins above wrote it).
+    let a = step_a(&d, &session, "/v1/transfers", "t-20", &body).await;
+    let h = approve(&a, &second, &second_cred);
+    core.down.store(true, Ordering::SeqCst);
+    let (_, v) = submit(&d, &session, "/v1/transfers", "t-20", &body, Some(&h)).await;
+    assert!(is_refusal(&v, Refusal::DecisionUnavailable), "{v}");
+    core.down.store(false, Ordering::SeqCst);
+
+    // The second credential removed (with the configured token, which is exempt): it approves
+    // nothing.
+    let (s, v) = d
+        .call(
+            "POST",
+            &format!("/v1/credentials/{second_cred}/remove"),
+            Some(&alice.token),
+            &[("client-key", "rm-42")],
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let a = step_a(&d, &session, "/v1/transfers", "t-21", &body).await;
+    let h = approve(&a, &second, &second_cred);
+    let (_, v) = submit(&d, &session, "/v1/transfers", "t-21", &body, Some(&h)).await;
+    assert!(is_refusal(&v, Refusal::CredentialInvalid), "{v}");
+}
+
+/// `AC-A10.6`, `T-040-11`: an issued secret (an API key), presented as it is, needs no approval
+/// under enforce.
+#[tokio::test(flavor = "multi_thread")]
+async fn ac_a10_6_an_api_key_is_exempt() {
+    let w = world(ApprovalMode::Enforce).await;
+    let (s, v) =
+        w.d.call(
+            "POST",
+            "/v1/credentials",
+            Some(&w.alice.token),
+            &[("client-key", "ak-1")],
+            Some(json!({ "marker": "ordinary", "scheme": "api-key" })),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let key = v["api_key"].as_str().expect("the API key").to_owned();
+    let body = transfer(&w, "10");
+    let a = step_a(&w.d, &key, "/v1/transfers", "t-22", &body).await;
+    assert_eq!(a["required"], false);
+    let (st, v) = submit(&w.d, &key, "/v1/transfers", "t-22", &body, None).await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+}
+
+/// `T-040-03`, `AC-A10.4`: two instances verifying one approval at the same moment accept it
+/// once; the one-time number is the only thing that stops the second. (Two client keys cannot
+/// share one approval: the key is in the digest, so the second would be refused for its digest
+/// before the number is read. The race is therefore run on the approval check itself, which
+/// passes twice without the single-use store.)
+#[tokio::test(flavor = "multi_thread")]
+async fn t_040_03_two_instances_verifying_one_approval_accept_it_once() {
+    let w = world(ApprovalMode::Enforce).await;
+    let (d, s) = (&w.d, w.alice_session.as_str());
+    let body = transfer(&w, "10");
+    let a = step_a(d, s, "/v1/transfers", "t-23", &body).await;
+    let h = approve(&a, &w.alice_soft, &w.alice_cred);
+    let digest: [u8; 32] = hex::decode(a["command_digest"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let who = ingress::auth::Authenticated {
+        principal: w.alice.identity.clone(),
+        credential: w.alice_cred.clone(),
+        kind: ingress::auth::CredentialKind::Holder,
+        proof: ingress::auth::Proof::Session,
+    };
+    let (other, _router) = d.another_replica(fast_config("ingress-2"));
+    let (one, two) = (d.replica.shared.clone(), other.shared.clone());
+    let pk = d.auth.passkeys().unwrap();
+    let kind = ingress::approval::Kind::Transfer;
+    let (r1, r2) = tokio::join!(
+        ingress::approval::verify(&one, &pk, &who, kind, &digest, &h),
+        ingress::approval::verify(&two, &pk, &who, kind, &digest, &h),
+    );
+    assert_eq!(
+        usize::from(r1.is_ok()) + usize::from(r2.is_ok()),
+        1,
+        "{r1:?} {r2:?}"
+    );
+    for r in [r1, r2] {
+        assert!(
+            r.is_ok() || r == Err(ingress::approval::Rejected::NumberSpent),
+            "{r:?}"
+        );
     }
 }

@@ -100,10 +100,21 @@ fn default_session_ttl() -> Time {
 }
 
 impl PasskeysConfig {
-    /// The authenticator's passkeys under `key`, or why the configuration is refused: an `rpId`
-    /// that is not a lower-case DNS name, a party with no origin, an origin that is not `https`
-    /// (or `http://localhost`), or a zero time to live.
-    pub fn passkeys(&self, key: authn::token::AuthnKey) -> Result<crate::auth::Passkeys, String> {
+    /// The authenticator's passkeys under `key`, with the per-command approval setting for the
+    /// book `deployment` (genesis's, 16 bytes of hex; read only when approvals are on), or why the
+    /// configuration is refused: an `rpId` that is not a lower-case DNS name, a party with no
+    /// origin, an origin that is not `https` (or `http://localhost`), a zero time to live, or
+    /// approvals on with no `environment` (amendment 0037).
+    pub fn passkeys(
+        &self,
+        key: authn::token::AuthnKey,
+        deployment: &str,
+    ) -> Result<crate::auth::Passkeys, String> {
+        let approvals = crate::approval::Approvals::new(
+            self.approvals,
+            self.environment.as_deref(),
+            deployment,
+        )?;
         if self.relying_parties.is_empty() {
             return Err("passkeys: at least one relying party".into());
         }
@@ -147,7 +158,8 @@ impl PasskeysConfig {
             self.require_user_verification,
             self.challenge_ttl_ms,
             self.session_ttl_ms,
-        ))
+        )
+        .with_approvals(approvals))
     }
 }
 
@@ -1574,7 +1586,10 @@ mod tests {
             .map(|r| (r.rp_id.as_str(), r.registrations))
             .collect();
         assert_eq!(parties, [("example.com", true), ("api.example.com", false)]);
-        assert!(p.passkeys(authn::token::AuthnKey::new([0; 32])).is_ok());
+        assert!(
+            p.passkeys(authn::token::AuthnKey::new([0; 32]), &c.genesis.deployment)
+                .is_ok()
+        );
         let settle: serde_json::Value =
             serde_json::from_str(include_str!("../../../deploy/templates/settle.json")).unwrap();
         // Amendment 0011: the template's assets are registered book-only, COPM/2, TSTA/2, TSTB/2
@@ -1650,6 +1665,7 @@ mod tests {
     #[test]
     fn dec_19_a_passkey_configuration_is_refused_unless_well_formed() {
         let key = || authn::token::AuthnKey::new([1; 32]);
+        const DEP: &str = "d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9";
         let good: PasskeysConfig = serde_json::from_value(serde_json::json!({
             "relying_parties": [
                 { "rp_id": "api.bloque.app", "origins": ["https://api.bloque.app"] }
@@ -1658,7 +1674,17 @@ mod tests {
         .unwrap();
         assert!(good.require_user_verification);
         assert_eq!(good.session_ttl_ms, 900_000);
-        assert!(good.passkeys(key()).is_ok());
+        assert!(good.passkeys(key(), DEP).is_ok());
+        // Approvals on need an environment, and the setting is part of the passkeys built.
+        let mut on = good.clone();
+        on.approvals = crate::approval::ApprovalMode::Enforce;
+        assert!(on.passkeys(key(), DEP).is_err());
+        on.environment = Some("test".into());
+        let built = on.passkeys(key(), DEP).unwrap();
+        assert_eq!(
+            built.approvals().mode(),
+            crate::approval::ApprovalMode::Enforce
+        );
         for bad in [
             serde_json::json!({ "relying_parties": [] }),
             serde_json::json!({ "relying_parties": [
@@ -1671,7 +1697,7 @@ mod tests {
                 "session_ttl_ms": 0 }),
         ] {
             let c: PasskeysConfig = serde_json::from_value(bad.clone()).unwrap();
-            assert!(c.passkeys(key()).is_err(), "{bad}");
+            assert!(c.passkeys(key(), DEP).is_err(), "{bad}");
         }
     }
 }

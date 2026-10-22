@@ -558,6 +558,23 @@ pub fn issue(
 
 // ----------------------------------------------------------------------------- step (b)
 
+/// Why [`verify`] did not accept an approval.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rejected {
+    /// Refused with this refusal.
+    Refused(Refusal),
+    /// Everything verified but the one-time number was already spent: by the first attempt of
+    /// this same request, still in flight, or by another. The caller checks for the first before
+    /// it refuses with `ERR-CredentialInvalid`.
+    NumberSpent,
+}
+
+impl From<Refusal> for Rejected {
+    fn from(r: Refusal) -> Rejected {
+        Rejected::Refused(r)
+    }
+}
+
 /// An approval as the [`APPROVAL_HEADER`] header carries it, base64url of this JSON.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -592,7 +609,7 @@ pub async fn verify<S: Store, C: Core>(
     kind: Kind,
     digest: &[u8; 32],
     header: &str,
-) -> Result<String, Refusal> {
+) -> Result<String, Rejected> {
     let now = shared.clock.now();
     let body: ApprovalBody = URL_SAFE_NO_PAD
         .decode(header.trim().trim_end_matches('='))
@@ -606,10 +623,10 @@ pub async fn verify<S: Store, C: Core>(
     let issued = fmt::check_approval_challenge(pk.key(), &ch, now, &a.deployment, &a.environment)
         .ok_or(Refusal::CredentialInvalid)?;
     if !issued.is_for(&initiator, digest) {
-        return Err(Refusal::CredentialInvalid);
+        return Err(Refusal::CredentialInvalid.into());
     }
     if kind == Kind::Upgrade && body.credential != who.credential {
-        return Err(Refusal::CredentialInvalid);
+        return Err(Refusal::CredentialInvalid.into());
     }
     // The current credential list (R1): live, never the durable copy.
     let found = shared
@@ -619,7 +636,7 @@ pub async fn verify<S: Store, C: Core>(
         .map_err(|_| Refusal::DecisionUnavailable)?
         .ok_or(Refusal::CredentialInvalid)?;
     if found.scheme != Scheme::WebAuthnEs256.name() || found.identity != who.principal {
-        return Err(Refusal::CredentialInvalid);
+        return Err(Refusal::CredentialInvalid.into());
     }
     let key = hex::decode(&found.verifier)
         .ok()
@@ -641,7 +658,7 @@ pub async fn verify<S: Store, C: Core>(
         .await
         .map_err(|_| Refusal::DecisionUnavailable)?;
     if !first {
-        return Err(Refusal::CredentialInvalid);
+        return Err(Rejected::NumberSpent);
     }
     credentials::raise_count(shared, &body.credential, count).await?;
     Ok(body.credential)
@@ -649,15 +666,26 @@ pub async fn verify<S: Store, C: Core>(
 
 /// What the report-only position logs for a command it would have refused: the command kind and
 /// how the caller proved who it is, never a credential, an assertion or a digest.
-pub fn report(kind: Kind, proof: Proof, why: &'static str) {
-    tracing::info!(
-        target: "aledgent_ingress::approval",
-        command = kind.name(),
-        proof = proof.name(),
-        scheme = "webauthn-es256",
-        would_refuse = why,
-        "approval report-only: this command would be refused under enforce"
-    );
+/// `presented` says whether an approval came with the command: only then is a scheme named.
+pub fn report(kind: Kind, proof: Proof, presented: bool) {
+    if presented {
+        tracing::info!(
+            target: "aledgent_ingress::approval",
+            command = kind.name(),
+            proof = proof.name(),
+            scheme = "webauthn-es256",
+            would_refuse = "invalid",
+            "approval report-only: this command would be refused under enforce"
+        );
+    } else {
+        tracing::info!(
+            target: "aledgent_ingress::approval",
+            command = kind.name(),
+            proof = proof.name(),
+            would_refuse = "missing",
+            "approval report-only: this command would be refused under enforce"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -336,16 +336,12 @@ async fn run<C: Core + Clone>(
     if let Some(p) = &c.passkeys {
         let key =
             std::env::var(ENV_AUTHN_KEY).map_err(|_| format!("{ENV_AUTHN_KEY} is not set"))?;
-        // Amendment 0037: approvals on need an environment; the book's identity is genesis's.
-        let approvals = ingress::approval::Approvals::new(
-            p.approvals,
-            p.environment.as_deref(),
+        // Amendment 0037: the approval setting is built with the passkeys; the book's identity
+        // is genesis's.
+        auth.set_passkeys(p.passkeys(
+            authn::token::AuthnKey::from_hex(&key)?,
             &c.genesis.deployment,
-        )?;
-        auth.set_passkeys(
-            p.passkeys(authn::token::AuthnKey::from_hex(&key)?)?
-                .with_approvals(approvals),
-        );
+        )?);
     }
     for t in &c.tokens {
         auth.add(t)?;

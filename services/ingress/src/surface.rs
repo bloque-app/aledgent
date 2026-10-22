@@ -844,7 +844,7 @@ pub fn status_of(r: Refusal) -> StatusCode {
 #[derive(Clone)]
 struct Logged {
     principal: String,
-    route: &'static str,
+    route: std::borrow::Cow<'static, str>,
 }
 
 /// The `Retry-After` an `ERR-DecisionUnavailable` carries, in seconds (`DEC-27` (g), the owner's
@@ -869,7 +869,17 @@ pub fn refusal(r: Refusal) -> Response {
     resp
 }
 
-fn logged(mut resp: Response, who: Option<&Authenticated>, route: &'static str) -> Response {
+fn logged(resp: Response, who: Option<&Authenticated>, route: &'static str) -> Response {
+    logged_as(resp, who, std::borrow::Cow::Borrowed(route))
+}
+
+/// [`logged`] under a name that is not a route's: step (a) of an approval is logged as
+/// `approve_<route>`, apart from the command's own route (amendment 0037).
+fn logged_as(
+    mut resp: Response,
+    who: Option<&Authenticated>,
+    route: std::borrow::Cow<'static, str>,
+) -> Response {
     resp.extensions_mut().insert(Logged {
         principal: who.map_or_else(|| "-".to_owned(), |a| a.principal.clone()),
         route,
@@ -886,13 +896,15 @@ async fn access_log(req: Request, next: Next) -> Response {
     let (principal, route) = resp
         .extensions()
         .get::<Logged>()
-        .map_or(("-".to_owned(), "-"), |l| (l.principal.clone(), l.route));
+        .map_or(("-".to_owned(), "-".into()), |l| {
+            (l.principal.clone(), l.route.clone())
+        });
     tracing::info!(
         target: "aledgent_ingress::access",
         request_id = %id,
         principal = %principal,
         method = %method,
-        route = route,
+        route = route.as_ref(),
         status = resp.status().as_u16(),
         "access"
     );
@@ -1763,6 +1775,8 @@ async fn approve<S: Store, C: Core>(
             return Some(answer(shared, &who.principal, row, None, wait).await);
         }
         Ok(None) => {}
+        // Report only refuses nothing: the command goes on as with the switch off.
+        Err(_) if mode != approval::ApprovalMode::Enforce => return None,
         Err(_) => return Some(refusal(Refusal::DecisionUnavailable)),
     }
     let kind = approval::kind_of(command);
@@ -1775,9 +1789,20 @@ async fn approve<S: Store, C: Core>(
         Some(Ok(h)) => {
             match approval::digest_of(pk.approvals(), who, obo, client_key, pending, command) {
                 Err(r) => Err(Some(r)),
-                Ok((_, d)) => approval::verify(shared, &pk, who, kind, &d, &h)
-                    .await
-                    .map_err(Some),
+                Ok((_, d)) => match approval::verify(shared, &pk, who, kind, &d, &h).await {
+                    Ok(c) => Ok(c),
+                    Err(approval::Rejected::Refused(r)) => Err(Some(r)),
+                    // The number is spent: by this same request's first attempt, still in flight,
+                    // or by another. A retry of the first gets its result once it is logged.
+                    Err(approval::Rejected::NumberSpent) => {
+                        if let Some(r) =
+                            in_flight(shared, who, domain, client_key, request, command).await
+                        {
+                            return Some(r);
+                        }
+                        Err(Some(Refusal::CredentialInvalid))
+                    }
+                },
             }
         }
     };
@@ -1786,14 +1811,49 @@ async fn approve<S: Store, C: Core>(
         (approval::ApprovalMode::Enforce, Err(None)) => Some(approval::approval_required()),
         (approval::ApprovalMode::Enforce, Err(Some(r))) => Some(refusal(r)),
         (_, Err(why)) => {
-            approval::report(
-                kind,
-                who.proof,
-                if why.is_none() { "missing" } else { "invalid" },
-            );
+            approval::report(kind, who.proof, why.is_some());
             None
         }
     }
+}
+
+/// How long a request whose approval's number is already spent waits for the first attempt of the
+/// same request (same client key, same command) to be logged, before it is refused.
+const IN_FLIGHT_WAIT: Duration = Duration::from_millis(500);
+
+/// The first attempt of this request, if it is logged within [`IN_FLIGHT_WAIT`]: answered from its
+/// result, as any retry is (`REQ-OP-10`). `None` if it does not appear, or the store does not answer.
+async fn in_flight<S: Store, C: Core>(
+    shared: &Shared<S, C>,
+    who: &Authenticated,
+    domain: &str,
+    client_key: &str,
+    request: &ledger_core::lifecycle::keys::RequestDigest,
+    command: &Command,
+) -> Option<Response> {
+    let until = Instant::now() + IN_FLIGHT_WAIT;
+    loop {
+        match shared
+            .store
+            .find(domain, command.surface(), client_key)
+            .await
+        {
+            Ok(Some(row)) if row.new.body_digest == request.0 => {
+                let wait = answering::wait_for(shared, command, &who.principal).await;
+                return Some(answer(shared, &who.principal, row, None, wait).await);
+            }
+            Ok(Some(_)) => return Some(refusal(Refusal::ClientKeyReused)),
+            Ok(None) if Instant::now() < until => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// The access log's name of step (a) for the route `name`.
+fn step_a(name: &'static str) -> std::borrow::Cow<'static, str> {
+    std::borrow::Cow::Owned(format!("approve_{name}"))
 }
 
 /// Step (a) of an approval (`T-040-05`): the command route's request, read and validated exactly
@@ -1809,14 +1869,14 @@ async fn handle_approval<S: Store, C: Core>(
 ) -> Response {
     let who = match credentials::authenticate(&shared, &headers).await {
         Ok(a) => a,
-        Err(r) => return logged(refusal(r), None, name),
+        Err(r) => return logged_as(refusal(r), None, step_a(name)),
     };
     let Ok(bytes) = axum::body::to_bytes(body, MAX_COMMAND_BYTES).await else {
-        return logged(refusal(too_large(route)), Some(&who), name);
+        return logged_as(refusal(too_large(route)), Some(&who), step_a(name));
     };
     let p = match prepare_request(&shared, route, param, &headers, &bytes, &who) {
         Ok(p) => p,
-        Err(r) => return logged(refusal(r), Some(&who), name),
+        Err(r) => return logged_as(refusal(r), Some(&who), step_a(name)),
     };
     let pk = shared.auth.passkeys();
     let approvals = pk
@@ -1844,11 +1904,11 @@ async fn handle_approval<S: Store, C: Core>(
             &p.command,
         ) {
             Ok(x) => x,
-            Err(r) => return logged(refusal(r), Some(&who), name),
+            Err(r) => return logged_as(refusal(r), Some(&who), step_a(name)),
         };
         let (challenge, expires_at) = match approval::issue(pk, &who, &d, shared.clock.now()) {
             Ok(x) => x,
-            Err(r) => return logged(refusal(r), Some(&who), name),
+            Err(r) => return logged_as(refusal(r), Some(&who), step_a(name)),
         };
         reply.required = true;
         reply.command = Some(String::from_utf8_lossy(&text).into_owned());
@@ -1856,10 +1916,10 @@ async fn handle_approval<S: Store, C: Core>(
         reply.challenge = Some(challenge);
         reply.expires_at = Some(expires_at);
     }
-    logged(
+    logged_as(
         (StatusCode::OK, axum::Json(reply)).into_response(),
         Some(&who),
-        name,
+        step_a(name),
     )
 }
 
