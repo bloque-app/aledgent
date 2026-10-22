@@ -685,6 +685,51 @@ async fn f_028_sign_counts_and_challenges_are_shared_and_durable() {
     assert!(!b.use_challenge([9; 16], 1_000, 20).await.unwrap());
 }
 
+/// `T-040-03` (amendment 0037, `AC-A10.4`): on PostgreSQL, an approval's number is spent once
+/// across instances sharing the database, under a race, and after a restart; it is kept past its
+/// expiry for the margin that covers clock skew between instances, and dropped after it.
+#[tokio::test(flavor = "multi_thread")]
+async fn t_040_03_an_approval_number_is_spent_once_everywhere() {
+    let Some((_pg, url)) = server().await else {
+        return;
+    };
+    let (a, b) = (store(&url).await, store(&url).await);
+    let mut tasks = Vec::new();
+    for i in 0..16u64 {
+        let s = if i % 2 == 0 { a.clone() } else { b.clone() };
+        tasks.push(tokio::spawn(async move {
+            s.use_challenge([3; 16], 1_000, 10 + i).await.unwrap()
+        }));
+    }
+    let mut wins = 0;
+    for t in tasks {
+        wins += usize::from(t.await.unwrap());
+    }
+    assert_eq!(
+        wins, 1,
+        "two instances racing on one number accept exactly one"
+    );
+    // A restart: a new connection still refuses it.
+    let again = store(&url).await;
+    assert!(!again.use_challenge([3; 16], 1_000, 500).await.unwrap());
+    // An instance whose clock runs ahead by less than the margin does not forget it.
+    let margin = ingress::store::SPENT_MARGIN_MS;
+    assert!(
+        !again
+            .use_challenge([3; 16], 1_000, 1_000 + margin - 1)
+            .await
+            .unwrap()
+    );
+    // Past the margin it is dropped (the challenge itself expired long before, so the seal check
+    // refuses it anyway).
+    assert!(
+        again
+            .use_challenge([3; 16], 1_000, 1_000 + margin + 1)
+            .await
+            .unwrap()
+    );
+}
+
 /// `T-009-18` (amendment 0013, `REQ-CS-9`): on PostgreSQL, a principal's answering setting is
 /// absent by default, kept with who set it and when, replaced in place, and shared by every replica
 /// on the store.
