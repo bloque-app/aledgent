@@ -121,11 +121,15 @@ impl Approvals {
 
     /// The setting for `mode`, in `environment`, for the book `deployment` (16 bytes of hex, the
     /// genesis configuration's). Ingress refuses to start with approvals on and no environment.
+    /// Off reads neither, so it can never stop a deployment from starting.
     pub fn new(
         mode: ApprovalMode,
         environment: Option<&str>,
         deployment: &str,
     ) -> Result<Approvals, String> {
+        if mode == ApprovalMode::Off {
+            return Ok(Approvals::off());
+        }
         let environment = environment.unwrap_or_default().to_owned();
         if mode != ApprovalMode::Off && environment.trim().is_empty() {
             return Err(
@@ -746,6 +750,11 @@ mod tests {
         let dep = "d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9";
         assert_eq!(ApprovalMode::default(), ApprovalMode::Off);
         assert!(Approvals::new(ApprovalMode::Off, None, dep).is_ok());
+        // Off reads nothing: a deployment value it cannot parse never stops a start.
+        assert_eq!(
+            Approvals::new(ApprovalMode::Off, None, "<FILL>"),
+            Ok(Approvals::off())
+        );
         for m in [ApprovalMode::ReportOnly, ApprovalMode::Enforce] {
             assert!(Approvals::new(m, None, dep).is_err());
             assert!(Approvals::new(m, Some(" "), dep).is_err());

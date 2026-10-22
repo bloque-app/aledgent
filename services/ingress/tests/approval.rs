@@ -491,6 +491,48 @@ async fn ac_a10_8_12_adding_a_passkey_needs_an_approval_of_that_passkey() {
     assert_eq!(st, StatusCode::OK, "{v}");
 }
 
+/// `NFR-7`: step (a)'s routes are default-deny like every route, with and without a path
+/// parameter; and a command sent with no client key (the key ingress derives) is approved and taken
+/// in, the key being the same at both steps.
+#[tokio::test(flavor = "multi_thread")]
+async fn nfr_7_step_a_refuses_the_unauthenticated_and_a_derived_key_works() {
+    let w = world(ApprovalMode::Enforce).await;
+    let d = &w.d;
+    for path in [
+        "/v1/approvals/transfers",
+        "/v1/approvals/withdrawals/x/submit",
+    ] {
+        let (st, v) = d.call("POST", path, None, &[], Some(json!({}))).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "{path}: {v}");
+        assert!(is_refusal(&v, Refusal::CredentialInvalid), "{path}: {v}");
+    }
+    let s = w.alice_session.as_str();
+    let body = transfer(&w, "7");
+    let (st, a) = d
+        .call(
+            "POST",
+            "/v1/approvals/transfers",
+            Some(s),
+            &[],
+            Some(body.clone()),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{a}");
+    assert_eq!(a["client_key_derived"], true);
+    let h = approve(&a, &w.alice_soft, &w.alice_cred);
+    let (st, v) = d
+        .call(
+            "POST",
+            "/v1/transfers",
+            Some(s),
+            &[(APPROVAL_HEADER, h.as_str())],
+            Some(body),
+        )
+        .await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+    assert_eq!(v["client_key"], a["client_key"]);
+}
+
 /// `AC-A10.6`, `T-040-11`: a configured token (a bearer secret presented as it is) needs no
 /// approval, under enforce.
 #[tokio::test(flavor = "multi_thread")]
