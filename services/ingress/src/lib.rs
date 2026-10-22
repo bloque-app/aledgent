@@ -51,6 +51,7 @@
 
 pub mod anchoring;
 pub mod answering;
+pub mod approval;
 pub mod archived;
 pub mod audit_ship;
 pub mod auth;

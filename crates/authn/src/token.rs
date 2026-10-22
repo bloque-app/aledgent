@@ -54,7 +54,7 @@ impl AuthnKey {
             .ok_or("the authentication key must be 32 bytes of hex")
     }
 
-    fn mac(&self, domain: &str, parts: &[&[u8]]) -> [u8; 32] {
+    pub(crate) fn mac(&self, domain: &str, parts: &[&[u8]]) -> [u8; 32] {
         // HMAC accepts a key of any length.
         let mut m = <HmacSha256 as hmac::Mac>::new_from_slice(&self.0)
             .unwrap_or_else(|_| unreachable!("HMAC takes any key length"));

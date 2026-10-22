@@ -14,5 +14,6 @@
 //! Nothing here formats a secret: the token types implement neither `Debug` nor `Display`
 //! (`REQ-AU-8`).
 
+pub mod approval;
 pub mod token;
 pub mod webauthn;

@@ -136,7 +136,8 @@ impl Store for MemStore {
         now: Time,
     ) -> Result<bool, StoreError> {
         let mut inner = self.lock();
-        inner.challenges.retain(|_, exp| *exp > now);
+        let cutoff = now.saturating_sub(super::SPENT_MARGIN_MS);
+        inner.challenges.retain(|_, exp| *exp > cutoff);
         Ok(inner.challenges.insert(nonce, expires_at).is_none())
     }
 

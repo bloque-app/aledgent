@@ -75,6 +75,16 @@ pub struct PasskeysConfig {
     /// How long a session lives, milliseconds (default 900 000: Kreivo's own session bound).
     #[serde(default = "default_session_ttl")]
     pub session_ttl_ms: Time,
+    /// Per-command approval (amendment 0037, `T-040-07`): `off` (the default), `report_only` or
+    /// `enforce`. An approval lives as long as a challenge (`challenge_ttl_ms`).
+    #[serde(default)]
+    pub approvals: crate::approval::ApprovalMode,
+    /// The name of this running environment (amendment 0037, F1 field 4), such as `prod-eu` or
+    /// `test`: separates its approvals from another environment's, a restore drill's included.
+    /// Required unless `approvals` is `off`. Never share the authentication key between
+    /// environments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
 }
 
 fn yes() -> bool {
