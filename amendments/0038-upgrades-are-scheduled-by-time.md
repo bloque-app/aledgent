@@ -227,7 +227,9 @@ amendment 0035 (R1) and D10 forbid. Three rules close it.
 
 **The number form stays at the door, for every writer**, as a stated emergency route: `upgrade` and
 `reschedule_upgrade` keep their routes, marked in the API as the break-glass form, audited as today, authorised
-under the mode as today, and limited to `MAX_LEAD` inputs. It is the only form for code that does not know the
+under the mode as today, and limited to `MAX_LEAD` inputs. The route that adds the upgrade-authority inputs
+(`ProposeUpgrade`, `ApproveUpgrade`, which has none today) carries both forms, `ProposeUpgrade` by number and
+`ProposeUpgradeAt` by time, so under a mode that needs a second approval the emergency route still works. It is the only form for code that does not know the
 time form, and the way out of a book clock that has jumped (below).
 
 ### The ticker
@@ -253,7 +255,11 @@ once the replica is rebuilt. So the time form adds a second, later step:
   (`Ledger::pending_upgrade_at`, a read), and, if its *H* is not held (`AgentPort::holds_code`), fetches and
   stages it through the same `staging::fetch_generation` and `AgentPort::restage_code` that #55 uses, with the
   generation the writer's plus one. A version that cannot be staged is reported like #55's `Restaged::Refused`
-  and does not stop the start. *H* is not needed until the fixing tick, so this point is early enough.
+  and does not stop the start. *H* is not needed until the fixing tick, so this point is early enough. A slow
+  first fetch delays the core's opening, as #55's own re-stage does, so it is bounded by the same limit as #55's
+  re-stage: the per-read time limit that `T-037-20` gives every source (#55 adds none of its own; its `fs` source
+  reads without one until `T-037-20` lands). A fetch that runs out of time is reported as refused and retried
+  as below.
 - **Retried, and watched.** While the record names a version the port does not hold, the host tries again on the
   parked switch's back-off (30 s doubling to 15 min), and the signals expose
   `aledgent_upgrade_pending_unstaged` (1 while a pending upgrade's version is not staged, else 0), with an alert
@@ -418,7 +424,9 @@ What follows names plan facts (the hot row, the call format, the ticker), so it 
 > (1); the door offers the time form only when the manifest of the code in force, and of any scheduled or fixed
 > *H*, lists `aledgent/ops/upgrade-at/v1`, and so never in the window of an upgrade into the first code that
 > knows it; staging refuses an upgrade or an approval to code without that capability while the code in force
-> has it; the number-form routes stay, marked as the break-glass form; an input that holds a fixing tick and a
+> has it; the `T-037-12` gate fails a release whose manifest lists the capability for a package that does not decide
+> every time-form command as the library does; the number-form routes stay, marked as the break-glass form, and the
+> route for proposals carries both forms; an input that holds a fixing tick and a
 > time-form call leaves one scheduled upgrade, not two; after a restart during the wait, the host stages the
 > pending *H* again after the replica is rebuilt, and `aledgent_upgrade_pending_unstaged` reads 1 (with its alert)
 > while it cannot; a book clock more than an hour ahead of the ingress clock raises
@@ -495,7 +503,11 @@ fixing tick.
 - `T-037-17`: a founding is made only once *n* is fixed; the interim export refusal also covers a pending
   `upgrade-at` record.
 - `T-037-12`: the gate's fixtures gain a fixing tick and the time-form way outs, each decided by both generations
-  (D18), and an upgrade into the first code that knows the time form.
+  (D18), and an upgrade into the first code that knows the time form. And, because the capability is only declared
+  in the manifest: for every code version whose manifest lists `aledgent/ops/upgrade-at/v1`, the gate runs each
+  time-form command (`UpgradeAt`, `RescheduleUpgradeAt`, `ProposeUpgradeAt`, and a fixing tick) under that code's
+  package and fails unless it is decided as the library decides it; a manifest that lists the capability for code
+  that does not handle it fails the release.
 - `T-037-16`: a test that a checkpoint carries the `upgrade-at` leaf and a restore from it fixes *n* at the same
   input.
 - `T-037-18`: the forwarder classes `RescheduleUpgradeAt` as a way out, so it overtakes and takes the first
