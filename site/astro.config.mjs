@@ -115,6 +115,7 @@ export default defineConfig({
 			sidebar: [
 				{ label: 'Start', items: [{ autogenerate: { directory: 'start' } }] },
 				{ label: 'Concepts', items: [{ autogenerate: { directory: 'concepts' } }] },
+				{ label: 'Integrate', items: [{ autogenerate: { directory: 'integrate' } }] },
 				{ label: 'Operate', items: [{ autogenerate: { directory: 'operate' } }] },
 				apiGroup,
 				operatorGroup,

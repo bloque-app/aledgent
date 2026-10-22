@@ -1,0 +1,80 @@
+---
+title: Approving a command
+description: Why a write needs a person's approval, the two calls, and what your client must show.
+sidebar:
+  order: 1
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+<Aside type="caution" title="Draft">
+One page, not polished. The exact fields are in the [API reference](../../api/); where this page and
+that document differ, the document is right.
+</Aside>
+
+## Why a write needs an approval
+
+A sign-in gives your client a session. A session proves who is calling, for sign-in and for reads. It
+does not prove that a person agreed to *this* transfer. So when a command moves or reserves value, names
+where value goes, changes who may act on an account, or changes a credential, and it comes under a
+session, the person's own device must approve that one command. An approval covers one command and
+is used once. A stolen session alone can no longer move value.
+
+Callers that present a bearer secret as it is (an API key, or a token the operator configured) are not
+asked for an approval. There is no person behind them.
+
+## The two calls
+
+<Steps>
+
+1. **Ask.** Send the command to its route under `/v1/approvals/` (for a transfer,
+   `POST /v1/approvals/transfers`), with the same body and headers you would send to `POST /v1/transfers`.
+   Nothing is taken in. The reply says whether an approval is needed and, if so, carries the `command`
+   text, its `command_digest`, a `challenge`, its `expires_at`, and the `client_key` the command is approved
+   under.
+
+2. **Have the device approve, then send.** Ask the person's device (a passkey) to sign the `challenge`. Any of the
+   person's passkeys can do it, not only the one used to sign in, and the device must check that its owner is
+   present (PIN, fingerprint or face). Then send the command to its usual route with the header
+   `aledgent-approval`: base64url of `{"credential": <the passkey's did>, "assertion": <the assertion>}`.
+   Use the same body and the same `client_key` as in step 1.
+
+</Steps>
+
+If the reply to step 1 says no approval is needed, skip step 2's header and send the command as usual.
+Ask again for each command: a challenge is good for one command, one time, for a short while.
+
+## What your client must show the person
+
+The device's prompt does not say what is being approved. Your client must: show the `command` text (the
+amount, the destination, who it is for) *before* asking the device to sign, and ask the device to sign the
+challenge ingress returned, not one you built. Ingress recomputes the digest from the command in the second
+request, so an approval of one command cannot be used for another. An approval proves a person with the
+device was there; it does not prove they read the amount.
+
+A withdrawal is two commands (`withdraw`, then `submit_outbound`), so it takes two approvals.
+
+## Retrying
+
+If a command was approved and taken in, repeat it with the same `client_key` and you get the first result
+back, with no new approval. The same `client_key` with a different command is `ERR-ClientKeyReused`.
+
+## Errors
+
+| You see | It means | What to do |
+|---|---|---|
+| `ERR-CommandApprovalRequired` (403) | The command needs an approval and had none | Do the two calls |
+| `ERR-CredentialInvalid` (401) | The approval did not verify: spent, expired, for another command, identity or deployment, without the device check, or by a credential that is not the person's | Ask again for a new challenge; one refusal covers every cause, on purpose |
+| `ERR-MalformedCommand` (400) | The command itself is malformed, found before any approval is looked at | Fix the command |
+| `ERR-ClientKeyReused` (409) | This `client_key` carries a different command | Use a new key |
+| `ERR-DecisionUnavailable` (503) | The person's credential list could not be read just now | Retry with the same `client_key` after `Retry-After` |
+
+## Rollout positions
+
+An operator runs approvals in one of three positions, and `limits()` says which:
+
+- **off**: nothing is asked for.
+- **report only**: nothing is refused. The operator counts what would have been.
+- **enforce**: a command that needs an approval and has none is refused with `ERR-CommandApprovalRequired`.
+
+Build for enforce. Expect to meet all three.
