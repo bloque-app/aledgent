@@ -362,34 +362,40 @@ impl Fetcher {
         self.entry(digest, read_limit(len).ok()?, len)
     }
 
-    /// The digests the cache holds an entry for, in order: the regular files named by 64 lowercase
-    /// hex digits. Names only; nothing is read, so nothing here is checked (`T-037-21`: a
-    /// restarted host looks for the package it must attach among them, through
-    /// [`Fetcher::read_held`]).
-    #[must_use]
-    pub fn held(&self) -> Vec<[u8; 32]> {
-        let Ok(entries) = fs::read_dir(&self.cache) else {
-            return Vec::new();
-        };
-        let mut held: Vec<[u8; 32]> = entries
+    /// The cache's entries, in digest order: each regular file named by 64 lowercase hex digits,
+    /// with its length. Names and lengths only; nothing is read, so nothing here is checked
+    /// (`T-037-21`: a restarted host looks for the package it must attach among them, through
+    /// [`Fetcher::read_held`], and skips the entries whose length cannot be the one it wants).
+    ///
+    /// # Errors
+    ///
+    /// The cache directory cannot be listed: that is not an empty cache, and is said so.
+    pub fn held(&self) -> Result<Vec<([u8; 32], u64)>, String> {
+        let entries = fs::read_dir(&self.cache).map_err(|e| {
+            format!(
+                "the code cache {} cannot be listed: {e}",
+                self.cache.display()
+            )
+        })?;
+        let mut held: Vec<([u8; 32], u64)> = entries
             .filter_map(Result::ok)
-            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
             .filter_map(|e| {
+                let meta = e.metadata().ok().filter(|m| m.is_file())?;
                 let name = e.file_name().into_string().ok()?;
                 let lower = name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
                 let bytes = hex::decode(&name).ok().filter(|_| lower)?;
-                <[u8; 32]>::try_from(bytes).ok()
+                Some((<[u8; 32]>::try_from(bytes).ok()?, meta.len()))
             })
             .collect();
         held.sort_unstable();
-        held
+        Ok(held)
     }
 
-    /// The bytes of the cache's entry for `digest`, of any length up to [`ARTEFACT_CAP`], if they
-    /// hash to it. A bad entry is counted, logged and deleted, as on every read of the cache.
+    /// The bytes of the cache's entry for `digest`, `len` long, if they hash to it. A bad entry is
+    /// counted, logged and deleted, as on every read of the cache.
     #[must_use]
-    pub fn read_held(&self, digest: &[u8; 32]) -> Option<Vec<u8>> {
-        self.entry(digest, ARTEFACT_CAP + 1, None)
+    pub fn read_held(&self, digest: &[u8; 32], len: u64) -> Option<Vec<u8>> {
+        self.entry(digest, read_limit(Some(len)).ok()?, Some(len))
     }
 
     fn entry(&self, digest: &[u8; 32], limit: u64, len: Option<u64>) -> Option<Vec<u8>> {
@@ -865,7 +871,7 @@ mod tests {
         let (cache, src) = (Dir::new("cache"), Dir::new("src"));
         let (a, b) = (src.put_bytes(b"the package"), src.put_bytes(b"the runtime"));
         let f = fetcher(&cache, &[&src]);
-        assert!(f.held().is_empty());
+        assert!(f.held().unwrap().is_empty());
         f.fetch(&a, Some(11)).unwrap();
         f.fetch(&b, Some(11)).unwrap();
         // Files that are not entries are not listed: a temporary file, a name that is not a digest,
@@ -874,16 +880,20 @@ mod tests {
         cache.put("core.vos", b"x");
         cache.put(&"AB".repeat(32), b"x");
         fs::create_dir(cache.path().join("cd".repeat(32))).unwrap();
-        let mut want = vec![a, b];
+        let mut want = vec![(a, 11), (b, 11)];
         want.sort_unstable();
-        assert_eq!(f.held(), want);
+        assert_eq!(f.held().unwrap(), want);
         // Read back, whatever the length, checked.
-        assert_eq!(f.read_held(&a), Some(b"the package".to_vec()));
-        assert_eq!(f.read_held(&[7; 32]), None);
+        assert_eq!(f.read_held(&a, 11), Some(b"the package".to_vec()));
+        assert_eq!(f.read_held(&[7; 32], 11), None);
         cache.put(&hex::encode(b), b"rotten runtime");
-        assert_eq!(f.read_held(&b), None);
+        assert_eq!(f.read_held(&b, 14), None);
         assert_eq!(count(&f, "cache"), 1);
-        assert_eq!(f.held(), vec![a], "the bad entry was deleted");
+        assert_eq!(
+            f.held().unwrap(),
+            vec![(a, 11)],
+            "the bad entry was deleted"
+        );
     }
 
     #[test]

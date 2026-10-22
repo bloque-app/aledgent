@@ -357,38 +357,31 @@ fn need(args: &[String], name: &str) -> Result<String, String> {
     arg(args, name).ok_or_else(|| format!("missing {name}"))
 }
 
-/// Attach the actor a saved runtime state has installed (`T-037-21`): the genesis package `pkg`
-/// (the bytes `actor_package`) if that is what is installed, else the package of the code cache
-/// whose bytes the directory names. Returns the actor and the bytes of the package attached.
-fn attach_saved(
-    rt: &mut Runtime,
-    saved: Saved,
-    pkg: &vos::agent::package_admission::AdmittedActorPackage,
-    actor_package: &[u8],
-    held: Option<&crate::code_source::Fetcher>,
-) -> Result<(crate::driver::Actor, Vec<u8>), String> {
-    rt.restore(saved.state, saved.linear, saved.control, saved.slot);
-    let installed = rt
-        .installed_package(ACTOR_NAME)
-        .map_err(|e| format!("attach: {e:?}"))?;
-    let bytes = crate::restart::package_installed(
-        &installed,
-        actor_package,
-        held.map(|f| f as &dyn crate::restart::Held),
-    )?;
-    let actor = if bytes == actor_package {
-        rt.attach(pkg, ACTOR_NAME, None)
-    } else {
-        let found = package::admit_actor(&bytes)
+/// The runtime, asked to attach what a saved state has installed.
+struct Attaching<'a>(&'a mut Runtime);
+
+impl crate::restart::Attach for Attaching<'_> {
+    type Actor = crate::driver::Actor;
+
+    fn installed_package(&mut self) -> Result<vos::agent_sdk::BlobRef, String> {
+        self.0
+            .installed_package(ACTOR_NAME)
+            .map_err(|e| format!("attach: {e:?}"))
+    }
+
+    fn attach(&mut self, bytes: &[u8]) -> Result<Self::Actor, String> {
+        let package = package::admit_actor(bytes)
             .map_err(|e| format!("the installed package, from the code cache: {e:?}"))?;
-        eprintln!(
-            "aledgent-core-host: the Agent runs a package other than --actor ({} bytes, found in \
-             the code cache): the host switched to it before it stopped",
-            bytes.len()
-        );
-        rt.attach(&found, ACTOR_NAME, None)
-    };
-    Ok((actor.map_err(|e| format!("attach: {e:?}"))?, bytes))
+        self.0
+            .attach(&package, ACTOR_NAME, None)
+            .map_err(|e| format!("attach: {e:?}"))
+    }
+}
+
+impl crate::restart::Tracks for VosPort {
+    fn track(&mut self, state: crate::switch::CodeState) {
+        self.track_code(state);
+    }
 }
 
 /// Open the Agent in `dir`: restore it if it was saved, create and install it if not.
@@ -409,7 +402,14 @@ pub fn open_port(
     let pkg = package::admit_actor(actor_package).map_err(|e| format!("actor package: {e:?}"))?;
     let mut rt = Runtime::create(runtime_pvm, keys).map_err(|e| format!("runtime: {e:?}"))?;
     let (actor, attached) = match Saved::load(dir)? {
-        Some(saved) => attach_saved(&mut rt, saved, &pkg, actor_package, held)?,
+        Some(saved) => {
+            rt.restore(saved.state, saved.linear, saved.control, saved.slot);
+            crate::restart::attach_installed(
+                &mut Attaching(&mut rt),
+                actor_package,
+                held.map(|f| f as &dyn crate::restart::Held),
+            )?
+        }
         None => (
             rt.install(&pkg, ACTOR_NAME, None)
                 .map_err(|e| format!("install: {e:?}"))?,
@@ -424,61 +424,19 @@ pub fn open_port(
     // and `T-037-06`, and stay in memory: a restart stages again the ones the book names
     // (`T-037-21`). A book whose genesis names no code tracks none.
     if let Some(h0) = genesis_code {
-        let mut staged = crate::switch::StagedVersions::new();
-        staged.running(h0, actor_package, runtime_pvm);
-        vos.track_code(crate::switch::CodeState::new(
+        crate::restart::track_and_restage(
+            &mut vos,
             ACTOR_NAME,
+            h0,
+            actor_package,
             &attached,
             runtime_pvm,
-            staged,
-        ));
-        restage(&mut vos, held)?;
+            held.map(|f| f as &dyn core_binding::staging::CodeFetch),
+        )?;
     }
     let mut port = Persisting::new(vos, dir.to_path_buf());
     port.save().map_err(|e| format!("{e:?}"))?;
     Ok(port)
-}
-
-/// Stage again the versions the Agent's hot row names that this host does not hold (`T-037-21`),
-/// from the code cache, and say what became of each. A version that cannot be staged does not stop
-/// the start: reads and the way out stay possible, and the switch that needs it is refused.
-fn restage(port: &mut VosPort, held: Option<&crate::code_source::Fetcher>) -> Result<(), String> {
-    use core_binding::staging::{CodeFetch, Restaged};
-    /// The source of a host with no code cache: it holds nothing.
-    struct Nothing;
-    impl CodeFetch for Nothing {
-        fn name(&self) -> &str {
-            "none"
-        }
-        fn fetch(&self, _: &[u8; 32], _: Option<u64>) -> Option<Vec<u8>> {
-            None
-        }
-    }
-    let source: &dyn CodeFetch = match held {
-        Some(f) => f,
-        None => &Nothing,
-    };
-    let report = core_binding::staging::restage(port, source)
-        .map_err(|e| format!("the Agent's hot row: {e:?}"))?;
-    for r in report {
-        match r {
-            Restaged::Held(_) => {}
-            Restaged::Staged(code) => eprintln!(
-                "aledgent-core-host: code version {} is staged again from the code cache",
-                core_binding::switch::short(&code)
-            ),
-            Restaged::Refused(code, why) => eprintln!(
-                "aledgent-core-host: WARNING: code version {}, which the book names, cannot be                  staged again ({why}){}: it cannot be run until it is, and an input that needs it                  is refused; the way out of an upgrade stays open (T-037-21)",
-                core_binding::switch::short(&code),
-                if held.is_none() {
-                    " and this host has no --code-config"
-                } else {
-                    ""
-                }
-            ),
-        }
-    }
-    Ok(())
 }
 
 /// What `serve` and `restore` both read: the deployment, the founding, the Agent's keys, the
@@ -693,7 +651,17 @@ pub fn serve(args: &[String]) -> Result<(), String> {
         &dir,
         genesis_code,
         code_source.as_deref(),
-    )?;
+    )
+    .map_err(|e| {
+        if code_source.is_none() && e.starts_with(crate::restart::NOT_FOUND) {
+            format!(
+                "{e}. Start with --code-config naming the cache that holds the versions it \
+                 switched to (T-037-21)"
+            )
+        } else {
+            e
+        }
+    })?;
     // T-031-14, T-032-15: the replica's stores under the state directory, each with a bounded
     // cache, rebuilt from the log on every start. The default since the 2 h soak of 2026-10-04 on
     // the fleet (run 37192755903): every bound held, and the core host grew 0.46 → 0.65 GB, against
@@ -944,7 +912,16 @@ pub fn restore(args: &[String]) -> Result<(), String> {
         ));
     }
     let started = std::time::Instant::now();
-    let port = open_port(&runtime, &actor, &keys, &dir, genesis_code, None)?;
+    let port = open_port(&runtime, &actor, &keys, &dir, genesis_code, None).map_err(|e| {
+        if e.starts_with(crate::restart::NOT_FOUND) {
+            format!(
+                "{e}. A restore across an upgrade is not supported yet (T-037-09): restore from a \
+                 checkpoint taken before the switch"
+            )
+        } else {
+            e
+        }
+    })?;
     let entries = FileLog::open(&dir)?.entries()?;
     let stores = ReplicaStores::Disk {
         dir: dir.join("replica"),
