@@ -707,6 +707,25 @@ mod tests {
         assert!(why.contains("not held"), "{why}");
     }
 
+    /// `T-037-22`: bytes that are not an actor package are an error, never a yes: the real reading
+    /// of the facts (`PackageFacts::of`, through `CodeState::check_install`) is closed on garbage,
+    /// whether it is the candidate or the package the host believes it runs.
+    #[test]
+    fn t037_22_check_install_on_bytes_that_are_no_package_is_an_error() {
+        use core_binding::staging::Checked;
+        let rt = b"the-runtime".to_vec();
+        let mut staged = StagedVersions::new();
+        staged.running([0xA0; 32], b"not a package", &rt);
+        let state = CodeState::new("core", b"not a package", &rt, staged);
+        let checked = Checked {
+            manifest: manifest(b"h-package", &rt),
+            package: b"also not a package".to_vec(),
+            runtime: Some(rt),
+        };
+        let why = state.check_install(&checked).unwrap_err();
+        assert!(why.contains("not admitted"), "{why}");
+    }
+
     #[test]
     fn t037_14_a_failing_switch_is_parked_with_a_growing_wait_and_a_limit() {
         let t = [7u8; 32];
