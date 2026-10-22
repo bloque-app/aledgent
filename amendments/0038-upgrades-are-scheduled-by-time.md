@@ -5,11 +5,13 @@ SPDX-License-Identifier: CC-BY-4.0
 
 # Amendment 0038 — An upgrade is scheduled by time; the writer fixes its input number
 
-**Status:** **awaiting the owner's approval.** Drafted on 2026-10-21 from the owner's ruling w20 (b) in the
-Decisions form: "limit by time instead of by input number". Nothing here is applied to `SPEC.md` or `PLAN.md`,
-and no code is changed. Three questions for the owner are at the end (§"Questions for the owner"); the design
-does not depend on their answers, only some limits do. Revised the same day after the independent review of #56
-(four required changes and five lower findings; the PR's reply lists what changed for each).
+**Status:** **approved by the owner on 2026-10-22** (Decisions form, item w24: answers Q1 to Q3 "yes", the
+recommended answers). Drafted on 2026-10-21 from the owner's ruling w20 (b): "limit by time instead of by input
+number"; revised the same day after two independent reviews of #56. With Q1 answered "yes", `T-037-23` is in scope.
+The audit and export codes 57 to 60 are numbered as this text proposes: the drafter's numbering, accepted by default
+with the approval, with no further decision. **Not yet applied to `SPEC.md`**: applying R1 to R5 is a later pass, and
+until then the code and the plan cite this amendment as `[PENDING AMENDMENT 0038]`. Nothing here is applied to
+`SPEC.md`, `PLAN.md` or `tasks.md`, and no code is changed.
 **Target:** `SPEC.md` v0.4.28 as on `develop` (at `c3461c0`); `PLAN.md` `DEC-26` (b) and (b′); `F-037`.
 **Date:** 2026-10-21
 **Number:** 0037 is taken by PR #52 (per-transaction approval at ingress); this is the next free one.
@@ -194,8 +196,8 @@ library, so a call's decision must never change in place. So:
   and `Action::UpgradeAt { code, from_time }`, appended after `Call::Upgrade` and before the conformance ports, so
   no existing tag moves. Their audit and export codes are proposed as 58, 59 and 60 (`upgrade_at`,
   `reschedule_upgrade_at`, `propose_upgrade_at`), the next free ones after amendment 0035's numbering and
-  `Upgrade`'s 57. **Like 57, they await the owner's numbering** before the genesis code freezes
-  (`[PENDING AMENDMENT]`, `audit/mod.rs`); PR #52's new code is a refusal code and does not collide.
+  `Upgrade`'s 57. With the approval (w24), 57 to 60 are numbered as proposed here, the drafter's numbering accepted
+  by default; PR #52's new code is a refusal code and does not collide.
 - An old-form input behaves differently only in a state that only new-form inputs can create (a pending
   record), so every archived input replays as it was decided.
 
@@ -440,7 +442,7 @@ What follows names plan facts (the hot row, the call format, the ticker), so it 
 | Where | What |
 |---|---|
 | `crates/ledger-core/src/call.rs` | `Call::UpgradeAt`, `Call::RescheduleUpgradeAt`, appended after `Call::Upgrade`; method names |
-| `crates/ledger-core/src/state.rs`, `audit/mod.rs`, `export/records.rs` | `Command::UpgradeAt` (58), `RescheduleUpgradeAt` (59), `ProposeUpgradeAt` (60), `[PENDING AMENDMENT]` like 57 |
+| `crates/ledger-core/src/state.rs`, `audit/mod.rs`, `export/records.rs` | `Command::UpgradeAt` (58), `RescheduleUpgradeAt` (59), `ProposeUpgradeAt` (60), numbered as proposed (approved, w24), as is 57 |
 | `crates/ledger-core/src/leaves.rs`, the store | The `upgrade-at` leaf kind and its slot, its encoding opening with its form (1); absent while empty; `Ledger::pending_upgrade_at`, a read |
 | `crates/ledger-core/src/code/authority.rs` | `Action::UpgradeAt` of `Kind::Upgrade` |
 | `crates/core-binding/src/staging.rs`, `host.rs`, `core.rs` (on top of PR #55) | Staging (`T-037-04`) refuses code without the capability while the code in force has it; after `Driver::recover_*`, stage the pending record's *H* again; retry on the parked back-off; `aledgent_upgrade_pending_unstaged`; the capability check the door asks |
@@ -489,7 +491,7 @@ fixing tick.
 | ID | Task | Traces | Done when |
 |---|---|---|---|
 | T-037-22 | Upgrades scheduled by time (amendment 0038): the `upgrade-at` record; `UpgradeAt`, `RescheduleUpgradeAt`, `ProposeUpgradeAt` (codes 58 to 60) beside the number forms, which keep their decisions; the fixing in the tick (*n* = the later of the fixing input + 1 and `not_before`); the longest lead of 91 days and the shortest (later than the book clock); a book with no clock refuses; the way-out and upgrade tables; `next_due` includes *T*; the door's time form, offered only when the code in force (and any scheduled *H*) lists the capability, and only once `T-037-21` is merged; the number form kept as the break-glass route; no upgrade to code without the capability; the second re-stage step after the replica is rebuilt, its retry and `aledgent_upgrade_pending_unstaged`; `aledgent_book_clock_ahead_seconds` and the jumped-clock procedure; the record versioned from form 1; the in-input check for a tick and a time-form call; the export's interim refusal covers it | `REQ-RT-16`, `REQ-RT-20`, `REQ-RT-17`, `REQ-RT-18`, `REQ-RT-7` | `AC-K7.24` to `AC-K7.29` pass, and the plan criteria above; the `code-history` fixtures (`T-037-12`, D18) include a move by time decided by both generations; an `UpgradeAt` whose code cannot be staged is refused before it is logged; a `RescheduleUpgradeAt` logged behind a carried row reaches a fenced writer first (as `ac_k7_12_a_way_out_overtakes_a_row_carried_from_an_ambiguous_send` shows for the number form); a core host restarted while an upgrade is pending by time has *H* staged again at start, and the switch at *n* finds it; an export of a book with a pending record is refused |
-| T-037-23 | *Only if the owner answers Q1 "yes":* the mode's delay and changes of mode by time: `Mode` gains a delay in milliseconds under a new mode domain (`aledgent/upgrade-authority/v2`), `SetAuthority` gains a time form, `MAX_DELAY` and `MAX_LEAD` for modes become 45 and 91 days | `REQ-RT-18` | `AC-K7.7` and `AC-K7.8` pass under the time form; a mode with a delay gives the same refusals at any input rate |
+| T-037-23 | *In scope: Q1 answered "yes" (w24, 2026-10-22).* the mode's delay and changes of mode by time: `Mode` gains a delay in milliseconds under a new mode domain (`aledgent/upgrade-authority/v2`), `SetAuthority` gains a time form, `MAX_DELAY` and `MAX_LEAD` for modes become 45 and 91 days | `REQ-RT-18` | `AC-K7.7` and `AC-K7.8` pass under the time form; a mode with a delay gives the same refusals at any input rate |
 
 ### Existing rows that change (proposed, not applied)
 
@@ -525,7 +527,8 @@ jumped-clock signal and procedure. Review rounds on this repository have taken o
 
 ## Questions for the owner
 
-Each is explained from zero; the draft takes the default if there is no answer.
+**Answered on 2026-10-22 (w24): Q1, Q2 and Q3 "yes", the recommended answers.** The questions are kept as they
+were asked.
 
 - **Q1. Should the "waiting period" and changes of who may upgrade also be measured in time?** A mode can say "an
   upgrade must wait at least *d* inputs after it is approved", so that the other members have time to react. A
