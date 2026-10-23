@@ -80,8 +80,8 @@ pub enum AnchorCheck {
         stored: Vec<(Sequence, [u8; 32])>,
     },
     /// No anchor read carries the commitment, and a sequence that may hold the number could not
-    /// be read (an earlier book's anchors need a node that keeps past state): neither final nor
-    /// missing, unknown.
+    /// be read (an anchor that is no longer its sequence's latest needs a node that keeps past
+    /// state): neither final nor missing, unknown.
     Unknown {
         /// What the sequences that were read hold, none of it the commitment.
         stored: Vec<(Sequence, [u8; 32])>,
@@ -290,8 +290,8 @@ impl Report {
             AnchorCheck::Unknown { stored, unread } => {
                 let mut line = String::from(
                     "[FAIL] unknown: the commitment is in no anchor read, and an anchor sequence that may hold \
-                     this number could not be read (an earlier book's anchors need a node that keeps past \
-                     state); neither final nor missing:",
+                     this number could not be read (an anchor that is no longer its sequence's latest needs a \
+                     node that keeps past state); neither final nor missing:",
                 );
                 for u in unread {
                     line.push_str(&match u {
@@ -1060,5 +1060,22 @@ mod tests {
         let r = verify(&d.to_bytes(), Some(pk), &src).unwrap();
         assert!(matches!(r.anchor, AnchorCheck::Unknown { .. }) && !r.passed());
         assert!(r.render().contains("unknown"), "{}", r.render());
+        // The current book's own superseded anchor, unread: the same, and no earlier book blamed.
+        let mut src = MemAnchors::new();
+        src.put_numbered(
+            contract,
+            n,
+            NumberedAnchors {
+                current_epoch: 1,
+                found: vec![],
+                unread: vec![Unread::Anchor {
+                    sequence: p2,
+                    why: "State already discarded".into(),
+                }],
+            },
+        );
+        let r = verify(&d.to_bytes(), Some(pk), &src).unwrap();
+        assert!(matches!(r.anchor, AnchorCheck::Unknown { .. }) && !r.passed());
+        assert!(!r.render().contains("earlier book"), "{}", r.render());
     }
 }

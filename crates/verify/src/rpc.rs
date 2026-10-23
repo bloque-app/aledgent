@@ -1280,11 +1280,12 @@ mod tests {
         // A number neither book has reached: missing.
         let read = find_contract_anchors(&archive, 22, 6).unwrap();
         assert_eq!((read.found, read.unread), (vec![], vec![]));
-        // `anchor` gives the one anchor, or an error rather than a guess.
-        assert_eq!(
-            find_contract_anchors(&archive, 22, 5).unwrap().single(),
-            Ok(Some(first(5, 15, 22).1))
-        );
+        // `anchor` means the current book: the previous book's anchor is an error, not a guess.
+        let err = find_contract_anchors(&archive, 22, 5)
+            .unwrap()
+            .single()
+            .unwrap_err();
+        assert!(err.contains("not the current book's"), "{err}");
         assert!(
             find_contract_anchors(&head_only, 22, 3)
                 .unwrap()
@@ -1325,6 +1326,17 @@ mod tests {
         let head_only = reset_history(0, true, 30);
         let read = find_contract_anchors(&head_only, 30, 2).unwrap();
         assert_eq!(read.found, vec![second(0, 2, 28, 30)]);
+        // Only the current book's: `anchor` gives it.
+        assert_eq!(
+            find_contract_anchors(&after, 30, 11).unwrap().single(),
+            Ok(None)
+        );
+        assert_eq!(
+            find_contract_anchors(&reset_history(10, true, 0), 30, 12)
+                .unwrap()
+                .single(),
+            Ok(Some(second(10, 12, 28, 30).1))
+        );
         assert!(matches!(
             read.unread.as_slice(),
             [Unread::Anchor { sequence, .. }] if *sequence == Sequence::FIRST

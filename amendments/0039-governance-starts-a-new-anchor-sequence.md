@@ -251,8 +251,9 @@ The debug invariant check (`check_invariants`) adds S5 and that no legacy migrat
     A `v3` checkpoint binds the book's genesis, but whether `book` is that digest is q1, still open. The
     commitment alone decides which book an anchor is. Two resets in one block leave the earlier sequence's
     record unreadable at the block before. It is reported unidentified, not guessed.
-  - A caller of the single-anchor read (`AnchorSource::anchor`) gets an error, not a guess, when the
-    number has more than one candidate or one could not be read.
+  - A caller of the single-anchor read (`AnchorSource::anchor`), which cannot tell sequences apart and
+    so means the current book, gets an error, not a guess, when the number has more than one candidate,
+    one could not be read, or its only anchor is a book re-founded since.
 
 ## Failure modes
 

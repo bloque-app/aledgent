@@ -142,9 +142,9 @@ impl NumberedAnchors {
         }
     }
 
-    /// The one anchor of the number, for a caller that cannot tell sequences apart: `None` if no
-    /// sequence holds it, and an error if more than one does or one could not be read, rather than
-    /// a guess.
+    /// The one anchor of the number, for a caller that cannot tell sequences apart and so means
+    /// the venue's current book: `None` if no sequence holds it, and an error rather than a guess
+    /// if more than one does, one could not be read, or the only one is a book re-founded since.
     pub fn single(&self) -> Result<Option<PublicAnchor>, String> {
         if let Some(u) = self.unread.first() {
             return Err(match u {
@@ -159,7 +159,13 @@ impl NumberedAnchors {
         }
         match self.found.as_slice() {
             [] => Ok(None),
-            [(_, a)] => Ok(Some(*a)),
+            [(s, a)] if s.epoch == self.current_epoch => Ok(Some(*a)),
+            [(s, _)] => Err(alloc::format!(
+                "this number's only anchor is anchor sequence {}'s, not the current book's \
+                 (sequence {}); read it with `AnchorSource::anchors`",
+                s.epoch,
+                self.current_epoch
+            )),
             more => Err(alloc::format!(
                 "{} anchor sequences hold this number (books re-founded on one venue); read them \
                  with `AnchorSource::anchors`",
