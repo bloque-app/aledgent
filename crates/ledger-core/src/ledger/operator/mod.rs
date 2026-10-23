@@ -615,6 +615,7 @@ mod registry;
 mod resolution;
 pub(crate) mod reversal;
 mod signals;
+mod upgrade;
 
 pub use external::{ExternalKind, ExternalMismatch, ExternalSource, MismatchReason};
 pub use signals::{Signals, SpecSignal, anchor_incident_name, incident_name};
@@ -624,3 +625,4 @@ pub use export::{ImportFailure, ImportTarget, Imported, openings_of};
 pub use opening::LoadReport;
 pub use registry::{RegisterAsset, ReviewRef};
 pub use resolution::{ResolutionEvidence, Resolve, SubmitEvidence};
+pub use upgrade::CodeInput;

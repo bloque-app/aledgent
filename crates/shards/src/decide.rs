@@ -735,6 +735,7 @@ pub fn heads<St: State>(st: &St, ctx: Ctx<'_>, commit: Option<u64>, root: [u8; 3
         enqueued: of(&|p| st.last_enqueued(p)),
         applied: of(&|p| st.applied_from(p)),
         trimmed: of(&|p| st.trimmed(p)),
+        code: crate::cut::ShardCode::of_build(),
     }
 }
 

@@ -118,6 +118,51 @@ sources = [
 ]
 ```
 
+In the core host the table is a file of its own, in JSON, named by `aledgent-core-host serve --code-config
+<file>` (the deployment file is shared with the front door, which refuses keys it does not know). It has the
+same keys. Today only `fs` is built in; any other `kind` stops the node at start, and without the flag the
+node has no source of code and refuses every `Upgrade`:
+
+```json
+{ "cache": "/srv/aledgent/code-cache",
+  "sources": [ { "kind": "fs", "path": "/srv/aledgent/code-src" } ] }
+```
+
+Paths are absolute. The cache must not be a source, inside one, or inside the state directory. One regular
+file per digest, named by its 64 lowercase hex digits; a symbolic link, a directory or a special file is never
+read. `aledgent_code_source_mismatch_total` has one label, `source`: `cache`, or the kind and position in the
+list (`fs:0`, `fs:1`). It counts wrong answers: bytes that are not the hash's, and a link, a directory or a
+special file where bytes belong. It does not count a source that failed to answer (an I/O error), nor "not
+held here". A manifest longer than 64 KiB cannot be read whole, so it counts as a wrong answer too. Because the
+fetcher never returns bad bytes, a source that lied reads at the door as "not retrievable"; the counter and the
+log carry the difference.
+
+The cache directory belongs to the node's operator: it is created readable by its owner alone (`0700`, files
+`0600`), and a directory found at a digest's place is moved aside, not deleted. A read that fails for a reason
+that does not prove the entry bad (permissions, descriptors, a disk error) leaves the entry in place and asks
+the sources; only a wrong length or hash, or a link or special file, is cleared. A read of a source has no time
+limit yet, and the cache no size bound: both are `T-037-20`'s.
+
+**A restart needs the cache.** The core host keeps the versions it has fetched only in the cache and in
+memory; it writes nothing else for them, and `agent.state` is unchanged. When it starts, it reads the package
+the runtime has installed, which after a switch is a version fetched earlier and not the `--actor` file (that
+stays the genesis package, still checked against the chainspec's genesis code), and attaches the cache's copy
+of it. It then stages again, from the cache, the version the hot row names as the code in force and the
+version of a scheduled upgrade, and runs the start check as before. A node restarted after a switch without
+`--code-config`, or with a cache that lost the version, does not start and says so. A node restarted before
+the input of a scheduled upgrade, with the version gone from the cache, starts, says so, and refuses the
+input that needs it; the way out of the upgrade stays open. It is not the same if the version that is gone is
+the code **in force** (the version after a switch, or a later one than the genesis): then every input is
+refused, a cancel or a reschedule included, because a way out is decided by the code in force. The host says
+so at start; put the version's manifest and files back in the cache or a source and restart.
+
+The cache must be on the same persistent volume as the state. A cache that is lost on its own leaves a node
+that switched unable to start, even after a crash between the install and the input, when a cancel back to the
+genesis version would have been a valid way out. The error names VOS's own reference to the installed package
+(a hash VOS computes, not the digest the cache's files are named by) and how many entries it looked at. Start
+now reads the sources for a version missing from the cache, and a source has no time limit until `T-037-20`: a
+source that hangs holds the start up.
+
 ### Built-in sources
 
 | Kind | What | Notes |

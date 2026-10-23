@@ -5,6 +5,7 @@
 //! ```text
 //! aledgent-core-host serve --config <file> --runtime <runtime.pvm> --actor <actor.vos> --state <dir> [--chainspec <file> [--genesis-manifest <file>] [--unnamed-code] [--unverified-genesis]] [--budget <bytes>] [--batch N]
 //!                     [--archive <spec> [--archive-interval-ms MS] [--checkpoint-every N] [--checkpoint-every-secs S]]
+//!                     [--code-config <file>]
 //!                                    the core Agent behind ingress's boundary::Core, streaming every
 //!                                    decision to the off-node archive (serve.rs)
 //! aledgent-core-host restore --config <file> --runtime <runtime.pvm> --actor <actor.vos> --state <dir> [--budget <bytes>]
@@ -56,6 +57,7 @@ mod diag;
 static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 mod chainspec;
 mod code;
+mod code_source;
 mod driver;
 mod fleet;
 mod keys;
@@ -65,8 +67,12 @@ mod package;
 mod port;
 mod r03gas;
 mod raw;
+mod restart;
 mod serve;
 mod sharded;
+#[cfg(test)]
+mod stateful_fixture;
+mod switch;
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
@@ -86,7 +92,7 @@ use ledger_kernel::posting::OperationRef;
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  aledgent-core-host serve --config <file> --runtime <runtime.pvm> --actor <actor.vos> --state <dir> [--chainspec <file> [--genesis-manifest <file>] [--unnamed-code] [--unverified-genesis]] [--budget <bytes>] [--batch N] [--archive <spec> [--archive-interval-ms MS] [--checkpoint-every N] [--checkpoint-every-secs S]]\n  \
+        "usage:\n  aledgent-core-host serve --config <file> --runtime <runtime.pvm> --actor <actor.vos> --state <dir> [--chainspec <file> [--genesis-manifest <file>] [--unnamed-code] [--unverified-genesis]] [--budget <bytes>] [--batch N] [--archive <spec> [--archive-interval-ms MS] [--checkpoint-every N] [--checkpoint-every-secs S]] [--code-config <file>]\n  \
          aledgent-core-host restore --config <file> --runtime <runtime.pvm> --actor <actor.vos> --state <dir> [--budget <bytes>]\n  \
          aledgent-core-host code-manifest --actor <vos> --runtime <pvm> --profile <json> --out <file>\n  \
          aledgent-core-host check-code --actor <vos> --runtime <pvm> (--chainspec <file> | --manifest <file>) [--code <hex>] [--write-manifest <file>] [--out <file>]\n  \
@@ -100,7 +106,7 @@ fn usage() -> ! {
          aledgent-core-host fleet-key <path>\n  \
          aledgent-core-host agent-server <runtime.pvm> <actor.vos> <host:port>\n  \
          aledgent-core-host runtime-pvm <agent_runtime.elf> <out.pvm>\n  \
-         aledgent-core-host package <actor.elf> <out.vos>\n  \
+         aledgent-core-host package <actor.elf> <out.vos> [--previous <previous.vos>]\n  \
          aledgent-core-host smoke <runtime.pvm> <actor.vos>"
     );
     std::process::exit(2)
@@ -165,13 +171,56 @@ fn main() {
                 }
             );
         }
-        Some("package") if args.len() == 4 => {
+        Some("package") if args.len() == 4 || (args.len() == 6 && args[4] == "--previous") => {
             let elf = std::fs::read(&args[2]).expect("actor ELF");
             let key = ed25519_dalek::SigningKey::from_bytes(&[0x71; 32]);
-            let pkg = package::actor_package(&elf, None, &key).expect("package");
+            // T-037-19: a generation after the first claims to read the state of the previous
+            // generation's program, which the runtime requires to change a stateful actor's
+            // program in place. The genesis (no `--previous`) claims nothing.
+            let previous = args
+                .get(5)
+                .map(|p| std::fs::read(p).expect("previous package"));
+            let claim = match package::state_claim(previous.as_deref()) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("aledgent-core-host: package: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let pkg = match package::actor_package(&elf, None, &key, &claim) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("aledgent-core-host: package: {e}");
+                    std::process::exit(1);
+                }
+            };
             let pvm = package::link(&elf).expect("link");
+            // T-037-01: the build-time check of the compiled code generation. The ELF's record
+            // (`ALEDGENT_CODE_GENERATION`) must be there once, and must survive linking: the
+            // program the package carries, which keeps no sections, holds the same one record in
+            // its read-only data.
+            let generation = match package::generation(&elf, &pvm) {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("aledgent-core-host: package: {e}");
+                    std::process::exit(1);
+                }
+            };
             std::fs::write(&args[3], &pkg).expect("write");
-            println!("package {} B, program {} B", pkg.len(), pvm.len());
+            println!(
+                "package {} B, program {} B, code generation {generation}, state claim {}",
+                pkg.len(),
+                pvm.len(),
+                if claim.is_empty() {
+                    "none (a genesis)".to_string()
+                } else {
+                    claim
+                        .iter()
+                        .map(|p| hex::encode(p.as_bytes()))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                }
+            );
         }
         Some("smoke") if args.len() == 4 => smoke(&args[2], &args[3]),
         Some("measure") if args.len() >= 5 => measure::measure(&args),

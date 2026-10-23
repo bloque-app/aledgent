@@ -82,6 +82,7 @@ pub const MIGRATIONS: &[Migration] = &[
     migration!(6, "0006_latency_columns.sql"),
     migration!(7, "0007_ingress_fleet.sql"),
     migration!(8, "0008_ingress_roster.sql"),
+    migration!(9, "0009_overtakes.sql"),
 ];
 
 /// Where one version stands.

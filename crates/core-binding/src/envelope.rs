@@ -135,6 +135,33 @@ pub struct Pack<'a> {
     pub blobs: Vec<(BlobKey, &'a [u8])>,
 }
 
+/// The code a writer is founded under (`T-037-02`, `REQ-RT-15`, `REQ-RT-18`): the founder's word,
+/// as the driver is. The generation is 0 and the construction the build's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FoundingCode {
+    /// The genesis code version *H₀*: the chainspec's, which the host checked its binaries against
+    /// (`F-036`); zeros for a book whose code is not named (tests, stress books).
+    pub code: [u8; 32],
+    /// The digest of the initial upgrade-authority mode: zeros, the genesis mode, the operator's
+    /// organisation identity alone (`T-037-05`). A chainspec that names another is `F-036`'s.
+    pub authority: [u8; 32],
+}
+
+impl FoundingCode {
+    /// The code a host founds a book under: the genesis code its chainspec names, if the host has
+    /// the chainspec, else none.
+    pub fn of(genesis: &Genesis) -> FoundingCode {
+        FoundingCode {
+            code: genesis
+                .spec
+                .as_deref()
+                .and_then(|s| s.header().code.as_ref())
+                .map_or([0; 32], |c| c.version()),
+            authority: [0; 32],
+        }
+    }
+}
+
 /// The founding invocation.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct GenesisEnvelope {
@@ -150,6 +177,8 @@ pub struct GenesisEnvelope {
     pub witness: BlobKey,
     /// The private inputs (the key-ring root).
     pub private: BlobKey,
+    /// The code it is founded under.
+    pub code: FoundingCode,
 }
 
 /// The founding invocation of a chainspec book (`F-036`, owner ruling `genesis-chainspec`).
@@ -174,6 +203,8 @@ pub struct StateGenesisEnvelope {
     pub limits: crate::hot::Limits,
     /// The genesis state's roots and counters.
     pub state: GenesisState,
+    /// The code it is founded under.
+    pub code: FoundingCode,
 }
 
 /// What the Agent's hot row holds after a genesis state (`StateGenesisEnvelope`).
@@ -387,6 +418,31 @@ pub enum AgentRefusal {
     Fault(String),
     /// An earlier input of the batch was refused: nothing of this one ran (`T-031-02`).
     Skipped,
+    /// The fence (`T-037-15`, `REQ-RT-20`, [`crate::fence`]): the code that received the input is
+    /// not the code the writer's state names for it. Nothing is written and the input's number is
+    /// not taken: the execution node installs the code the code map names, and sends the same
+    /// input again. Appended last, so no earlier refusal's tag moves: a host built before it reads
+    /// it as a reply that does not decode, never as another refusal. The continuation's scoped
+    /// refusal shares it (`T-037-17`).
+    Fenced(Fenced),
+}
+
+/// Why the fence refused an input (`T-037-15`, [`AgentRefusal::Fenced`]): what the refusing code
+/// is, and what the writer's state names. The execution node audits it (its log and the audit
+/// store), never the book.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Fenced {
+    /// The input refused: its number is not taken.
+    pub seq: u64,
+    /// The code generation compiled into the code that refused it.
+    pub code_generation: u64,
+    /// The code generation in force in the writer's state.
+    pub generation: u64,
+    /// The writer's scheduled upgrade, if any: the code version and the input it applies from.
+    pub upgrade: Option<([u8; 32], u64)>,
+    /// The named refusal of a scoped refusal of this kind, if any: none for the fence; the
+    /// continuation's refusal of a way out (`T-037-17`, `ERR-InvalidTransition`) names its own.
+    pub refusal: Option<String>,
 }
 
 /// Encode a value.

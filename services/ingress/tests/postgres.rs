@@ -75,10 +75,65 @@ fn command(n: u8, principal: &str, key: &str, reserves: bool) -> NewRow {
         body: b"{}".to_vec(),
         pass_through: None,
         reserves,
+        overtakes: false,
         synchronous: reserves,
         received_at: 1_000 + u64::from(n),
         arrived_at: Some(999 + u64::from(n)),
     }
+}
+
+/// `T-037-04` (`REQ-RT-20`, amendment 0035) against the real column and ordering: a row that
+/// overtakes goes before reservations and the rest, after the rows already in flight (given a feed
+/// sequence), and the flag survives a round trip through the table.
+#[tokio::test(flavor = "multi_thread")]
+async fn t_037_04_a_row_that_overtakes_is_read_first_by_the_forwarder() {
+    let Some((_pg, url)) = server().await else {
+        return;
+    };
+    let s = store(&url).await;
+    for (n, reserves, overtakes) in [
+        (1, false, false),
+        (2, true, false),
+        (3, false, false),
+        (4, false, true),
+        (5, false, true),
+    ] {
+        let mut r = command(n, "alice", &format!("k{n}"), reserves);
+        r.overtakes = overtakes;
+        let Appended::New(stored) = s.append(r).await.unwrap() else {
+            panic!("a new row");
+        };
+        assert_eq!(stored.new.overtakes, overtakes);
+    }
+    let refs = |rows: Vec<ingress::store::Row>| {
+        rows.into_iter()
+            .map(|r| r.new.op_ref.0[0])
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        refs(s.next_undecided_batch(10).await.unwrap()),
+        vec![4, 5, 2, 1, 3]
+    );
+    assert_eq!(
+        s.next_undecided().await.unwrap().unwrap().new.op_ref,
+        InputKey([4; 16])
+    );
+    assert!(
+        s.get(InputKey([4; 16]))
+            .await
+            .unwrap()
+            .unwrap()
+            .new
+            .overtakes
+    );
+    assert!(
+        !s.get(InputKey([2; 16]))
+            .await
+            .unwrap()
+            .unwrap()
+            .new
+            .overtakes
+    );
 }
 
 /// `T-009-02`: dedup on (principal, surface, client key), commit settings, the forwarder's
@@ -449,6 +504,92 @@ async fn t_038_03_the_feed_lease_on_postgres() {
     assert_eq!(roster.len(), 1, "a lapsed entry leaves the roster");
 }
 
+/// `T-037-18` (amendment 0036, `F-038` §3) on PostgreSQL: giving back the sequences of rows that
+/// were in flight raises the epoch by one in the same transaction and returns it; a stale holder
+/// or epoch is refused and nothing changes; the rows before the position keep their sequences; the
+/// way out, read first, takes the first sequence returned and the rows released follow it; the old
+/// epoch can no longer mark; the plain give back and a renewal leave the epoch alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn t_037_18_a_release_of_rows_in_flight_raises_the_epoch_on_postgres() {
+    use ingress::feed::BOOK;
+    let Some((_pg, url)) = server().await else {
+        return;
+    };
+    let a = store(&url).await;
+    let b = store(&url).await;
+    let long = Duration::from_secs(60);
+    assert_eq!(a.try_feed(BOOK, "a", long).await.unwrap(), Some(1));
+    let mut keys = Vec::new();
+    for n in 1..=4u8 {
+        let row = command(n, "did:aledgent:id:feed", &format!("f-{n}"), false);
+        keys.push(row.op_ref);
+        a.append(row).await.unwrap();
+    }
+    let seqs = |rows: &[ingress::store::Row]| rows.iter().map(|r| r.feed_seq).collect::<Vec<_>>();
+    let fed = a.mark_fed(BOOK, "a", 1, &keys, 7).await.unwrap();
+    assert_eq!(seqs(&fed), vec![Some(1), Some(2), Some(3), Some(4)]);
+    // Not the holder, or not at that epoch: refused, nothing changes.
+    assert!(
+        b.unfeed_in_flight(BOOK, "b", 1, 2)
+            .await
+            .unwrap_err()
+            .is_fenced()
+    );
+    assert!(
+        a.unfeed_in_flight(BOOK, "a", 2, 2)
+            .await
+            .unwrap_err()
+            .is_fenced()
+    );
+    assert_eq!(a.get(keys[1]).await.unwrap().unwrap().feed_seq, Some(2));
+    // Rows 3 and 4 were answered not run: given back, the epoch rises to 2 with them.
+    assert_eq!(a.unfeed_in_flight(BOOK, "a", 1, 3).await.unwrap(), 2);
+    assert_eq!(a.get(keys[0]).await.unwrap().unwrap().feed_seq, Some(1));
+    assert_eq!(a.get(keys[1]).await.unwrap().unwrap().feed_seq, Some(2));
+    assert_eq!(a.get(keys[2]).await.unwrap().unwrap().feed_seq, None);
+    assert_eq!(a.get(keys[3]).await.unwrap().unwrap().feed_seq, None);
+    // The old epoch can no longer mark; the renewal keeps the new one.
+    assert!(
+        a.mark_fed(BOOK, "a", 1, &keys[2..], 8)
+            .await
+            .unwrap_err()
+            .is_fenced()
+    );
+    assert_eq!(a.try_feed(BOOK, "a", long).await.unwrap(), Some(2));
+    // A way out logged now overtakes the rows given back and takes the first sequence returned.
+    let mut way_out = command(9, "did:aledgent:id:operator", "way-out", false);
+    way_out.overtakes = true;
+    let way_out_key = way_out.op_ref;
+    a.append(way_out).await.unwrap();
+    let queue = a.next_undecided_batch(10).await.unwrap();
+    let order: Vec<InputKey> = queue.iter().map(|r| r.new.op_ref).collect();
+    assert_eq!(
+        order,
+        vec![keys[0], keys[1], way_out_key, keys[2], keys[3]],
+        "in flight first, then the way out, then the rest"
+    );
+    // Rows 1 and 2 are decided by the core meanwhile; then the way out takes sequence 3.
+    for (i, k) in keys[..2].iter().enumerate() {
+        a.mark_decided(*k, 1 + i as u64, b"{}".to_vec(), 9)
+            .await
+            .unwrap();
+    }
+    let next: Vec<InputKey> = a
+        .next_undecided_batch(10)
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.new.op_ref)
+        .collect();
+    assert_eq!(next, vec![way_out_key, keys[2], keys[3]]);
+    let fed = a.mark_fed(BOOK, "a", 2, &next, 10).await.unwrap();
+    assert_eq!(seqs(&fed), vec![Some(3), Some(4), Some(5)]);
+    assert_eq!(fed[0].new.op_ref, way_out_key);
+    // The plain give back leaves the epoch alone.
+    a.unfeed(BOOK, "a", 2, 5).await.unwrap();
+    assert_eq!(a.try_feed(BOOK, "a", long).await.unwrap(), Some(2));
+}
+
 /// `T-009-03`, `REQ-AR-7` end to end on PostgreSQL: two replicas share the log; transfers are
 /// acknowledged while the core is down; the leading replica is dropped; the other decides every
 /// row, with gapless input numbers.
@@ -542,6 +683,51 @@ async fn f_028_sign_counts_and_challenges_are_shared_and_durable() {
     assert_eq!(a.sign_count("cred").await.unwrap(), Some(4));
     assert!(a.use_challenge([9; 16], 1_000, 10).await.unwrap());
     assert!(!b.use_challenge([9; 16], 1_000, 20).await.unwrap());
+}
+
+/// `T-040-03` (amendment 0037, `AC-A10.4`): on PostgreSQL, an approval's number is spent once
+/// across instances sharing the database, under a race, and after a restart; it is kept past its
+/// expiry for the margin that covers clock skew between instances, and dropped after it.
+#[tokio::test(flavor = "multi_thread")]
+async fn t_040_03_an_approval_number_is_spent_once_everywhere() {
+    let Some((_pg, url)) = server().await else {
+        return;
+    };
+    let (a, b) = (store(&url).await, store(&url).await);
+    let mut tasks = Vec::new();
+    for i in 0..16u64 {
+        let s = if i % 2 == 0 { a.clone() } else { b.clone() };
+        tasks.push(tokio::spawn(async move {
+            s.use_challenge([3; 16], 1_000, 10 + i).await.unwrap()
+        }));
+    }
+    let mut wins = 0;
+    for t in tasks {
+        wins += usize::from(t.await.unwrap());
+    }
+    assert_eq!(
+        wins, 1,
+        "two instances racing on one number accept exactly one"
+    );
+    // A restart: a new connection still refuses it.
+    let again = store(&url).await;
+    assert!(!again.use_challenge([3; 16], 1_000, 500).await.unwrap());
+    // An instance whose clock runs ahead by less than the margin does not forget it.
+    let margin = ingress::store::SPENT_MARGIN_MS;
+    assert!(
+        !again
+            .use_challenge([3; 16], 1_000, 1_000 + margin - 1)
+            .await
+            .unwrap()
+    );
+    // Past the margin it is dropped (the challenge itself expired long before, so the seal check
+    // refuses it anyway).
+    assert!(
+        again
+            .use_challenge([3; 16], 1_000, 1_000 + margin + 1)
+            .await
+            .unwrap()
+    );
 }
 
 /// `T-009-18` (amendment 0013, `REQ-CS-9`): on PostgreSQL, a principal's answering setting is

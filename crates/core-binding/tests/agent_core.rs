@@ -4,7 +4,8 @@
 //! whose `boundary::Core` is [`AgentCore`] over the native Agent. The same `AgentCore` over VOS
 //! is what `aledgent-core-host serve` runs.
 
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use core_binding::core::{AgentCore, FAILED_ATTEMPTS, Founding, HostLog as _, MemLog};
@@ -1021,4 +1022,233 @@ mod audit {
         assert_eq!(unshipped(&core), waiting, "nothing left the outbox");
         assert_eq!(held(&s), held_before, "the store is unchanged");
     }
+
+    /// `T-037-15`, `REQ-RT-20`, amendment 0033 D25, `NFR-11`: an input the fence refuses (here a
+    /// package of the next generation installed while nothing is scheduled) commits nothing and is
+    /// audited at the execution node, in the audit store's node trail and on standard error, never
+    /// in the book: the book's trail does not move, and the Agent's input number is not taken. It
+    /// never counts toward the halt, however often it is retried; the fenced clock runs from the
+    /// first refused input's time and stops when an input commits.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn t037_15_a_fenced_input_is_audited_at_the_node_never_in_the_book() {
+        let s = store();
+        let (core, mut shipper) = audited(NativePort::new(), MemLog::default(), &s, 100_000);
+        assert!(matches!(core.ship(&mut shipper), Some(Ok(_))));
+        core.set_node_trail(audit_store::NodeTrail::open(&s.config, &writer()).unwrap());
+        let before = agent_inputs(&core);
+        let book_before = held(&s).len();
+        core.with_port(|p| p.generation = 1);
+        let tick = ticks(1, 1).remove(0);
+        for _ in 0..FAILED_ATTEMPTS + 2 {
+            // The fence's refusal is a definite `NotRun` (`T-037-18`, amendment 0036), not the
+            // `Unavailable` of an input the core never reached.
+            assert_eq!(core.apply(&tick).await, Err(CoreError::NotRun));
+        }
+        assert_eq!(core.stopped(), None, "the fence never halts the core");
+        assert_eq!(core.stats().halted.load(Ordering::Relaxed), 0);
+        assert_eq!(agent_inputs(&core), before, "its number is not taken");
+        assert_eq!(
+            core.stats().fenced_since.load(Ordering::Relaxed),
+            T0 + 1_000,
+            "the clock runs from the first refused input's time"
+        );
+        // Audited at the node: one record per refusal, naming the input by key, kind and time.
+        let node = audit_store::NodeTrail::read(&s.config.dir).records;
+        assert_eq!(node.len() as u32, FAILED_ATTEMPTS + 2);
+        for r in &node {
+            assert_eq!(
+                (r.kind.as_str(), r.input, r.at),
+                ("fenced", before + 1, T0 + 1_000)
+            );
+            assert!(r.detail.contains("generation 1") && r.detail.contains("tick at"));
+        }
+        // Never in the book: its trail holds nothing more.
+        assert!(matches!(core.ship(&mut shipper), Some(Ok(_))));
+        assert_eq!(held(&s).len(), book_before);
+        // The code the state names, installed: the same input commits, and the clock stops.
+        core.with_port(|p| p.generation = 0);
+        assert!(core.apply(&tick).await.is_ok());
+        assert_eq!(agent_inputs(&core), before + 1);
+        assert_eq!(core.stats().fenced_since.load(Ordering::Relaxed), 0);
+    }
+}
+
+/// A fence that is a switch on the port's package generation: while it is on, the Agent refuses
+/// every input as fenced and commits nothing (`T-037-15`).
+fn fence_on(core: &AgentCore<Faulty>, on: bool) {
+    core.with_port(|p| p.inner.generation = u64::from(on));
+}
+
+/// Apply `inputs` as the forwarder does: send what is not yet decided, until everything is.
+async fn drive(core: &AgentCore<Faulty>, inputs: &[CoreInput]) {
+    let mut from = 0;
+    for _ in 0..inputs.len() + 1 {
+        let r = core.apply_batch(&inputs[from..]).await;
+        from += r.iter().take_while(|a| a.is_ok()).count();
+        if from == inputs.len() {
+            return;
+        }
+    }
+    panic!("not everything ran");
+}
+
+/// An opened core over a small ring, so that one invocation carries at most two inputs
+/// (`Driver::batch_cap`), and the port that fences on request.
+fn small_core() -> AgentCore<Faulty> {
+    let mut f = founding();
+    f.limits.ring = 2;
+    AgentCore::open(Faulty::new(), f, MemLog::default()).unwrap()
+}
+
+/// `T-037-18`, amendment 0036, N3: an input the core decided is answered `Applied` from the record
+/// even when it comes after the first input the fence refused in the same call. Without the
+/// guard that keeps a decided input's answer, the overlay of the refused tail would turn it into
+/// `NotRun`, a lie about an input the book holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn t037_18_a_decided_input_after_the_first_refusal_is_still_answered() {
+    let core = small_core();
+    let inputs = ticks(1, 3);
+    let decided = core
+        .apply(&inputs[1])
+        .await
+        .expect("decided before the fence");
+    fence_on(&core, true);
+    let before = agent_inputs(&core);
+    // [new, decided, new]: the first and the last are refused, the middle one is the book's.
+    let r = core.apply_batch(&inputs).await;
+    assert_eq!(r[0], Err(CoreError::NotRun));
+    assert_eq!(
+        r[1],
+        Ok(decided),
+        "a decided input is never reported as not run"
+    );
+    assert_eq!(r[2], Err(CoreError::NotRun));
+    assert_eq!(agent_inputs(&core), before, "the refusal committed nothing");
+}
+
+/// `T-037-18`, amendment 0036, N4: the fence's refusal makes the whole rest of the call `NotRun`
+/// even where the rest is past what one invocation carries (here two inputs). If the overflow
+/// answered `Unavailable`, the feeder would see a mix, keep every row in flight and the wedge
+/// would be back on every window longer than one invocation.
+#[tokio::test(flavor = "multi_thread")]
+async fn t037_18_the_not_run_tail_covers_inputs_past_one_invocation() {
+    let core = small_core();
+    fence_on(&core, true);
+    let before = agent_inputs(&core);
+    let r = core.apply_batch(&ticks(1, 5)).await;
+    assert_eq!(r, vec![Err(CoreError::NotRun); 5], "{r:?}");
+    assert_eq!(agent_inputs(&core), before);
+    // Lifted, the same inputs run once and in order.
+    fence_on(&core, false);
+    drive(&core, &ticks(1, 5)).await;
+    assert_eq!(agent_inputs(&core), before + 5, "each ran once");
+}
+
+/// `T-037-18`, amendment 0036, N4: the same for the input the Agent has already failed alone,
+/// which goes first and alone (finding F18): fenced, it is `NotRun` and so is every input behind
+/// it, not `Unavailable`.
+#[tokio::test(flavor = "multi_thread")]
+async fn t037_18_the_not_run_tail_follows_a_head_the_agent_failed_alone() {
+    let core = small_core();
+    let inputs = ticks(1, 4);
+    let s = agent_inputs(&core);
+    // The head fails alone once, for a reason that is not the fence.
+    core.with_port(|p| p.refuse = Some(s + 1));
+    assert_eq!(core.apply(&inputs[0]).await, Err(CoreError::Unavailable));
+    core.with_port(|p| p.refuse = None);
+    assert_eq!(
+        core.stopped(),
+        None,
+        "one failed attempt does not halt the core"
+    );
+    fence_on(&core, true);
+    let r = core.apply_batch(&inputs).await;
+    assert_eq!(r, vec![Err(CoreError::NotRun); 4], "{r:?}");
+    fence_on(&core, false);
+    drive(&core, &inputs).await;
+    assert_eq!(agent_inputs(&core), s + 4, "each ran once");
+}
+
+/// A log whose archive stops reading when told to: a rebuild after a refusal then fails.
+struct FailingArchive {
+    inner: MemLog,
+    broken: Arc<AtomicBool>,
+}
+
+impl core_binding::core::HostLog for FailingArchive {
+    fn entries(&self) -> Result<Vec<RingEntry>, String> {
+        if self.broken.load(Ordering::SeqCst) {
+            return Err("the archive does not read".into());
+        }
+        self.inner.entries()
+    }
+    fn push_entry(&mut self, e: &RingEntry) -> Result<(), String> {
+        self.inner.push_entry(e)
+    }
+    fn replies(&self) -> Result<Vec<(InputKey, ingress::boundary::CoreReply)>, String> {
+        self.inner.replies()
+    }
+    fn push_reply(
+        &mut self,
+        key: &InputKey,
+        reply: &ingress::boundary::CoreReply,
+    ) -> Result<(), String> {
+        self.inner.push_reply(key, reply)
+    }
+}
+
+/// `T-037-18`, amendment 0036, N2: the fence's refusal is a definite "not run" only once the
+/// replica has been rebuilt to what the Agent committed. When the rebuild fails the core stops
+/// and the outcome is not read, so the answer stays `Unavailable`. (The flag was set before the
+/// rebuild, so this answered `NotRun`.)
+#[tokio::test(flavor = "multi_thread")]
+async fn t037_18_a_refusal_whose_rebuild_fails_is_not_certified_not_run() {
+    let broken = Arc::new(AtomicBool::new(false));
+    let log = FailingArchive {
+        inner: MemLog::default(),
+        broken: broken.clone(),
+    };
+    let core = AgentCore::open(NativePort::new(), founding(), log).unwrap();
+    core.with_port(|p| p.generation = 1);
+    broken.store(true, Ordering::SeqCst);
+    let r = core.apply(&ticks(1, 1)[0]).await;
+    assert_eq!(
+        r,
+        Err(CoreError::Unavailable),
+        "the rebuild failed: nothing is certified"
+    );
+    assert!(
+        core.stopped().is_some(),
+        "the core stopped on the unreadable archive"
+    );
+}
+
+/// `T-037-23`: the core writes a line about the writer's code at start (the platform runs the code
+/// of the next input) and none for an input refused and rebuilt after, nor for the retry: the
+/// driver the core builds in its place is told what the platform runs, so its first check is no
+/// install. Without that, every rebuild after a refused input repeated the line, which an operator
+/// reads as an install, during the fence.
+#[tokio::test(flavor = "multi_thread")]
+async fn t037_23_a_rebuild_after_a_refused_input_writes_no_install_line() {
+    let (d, core, _log) = deployment().await;
+    let alice = d.party("alice", 1_000).await;
+    let a = Some(alice.token.as_str());
+    let lines = |c: &AgentCore<NativePort>| c.stats().code_lines.load(Ordering::Relaxed);
+    let at_start = lines(&core);
+    assert_eq!(at_start, 1, "the check at start, once");
+    for (n, fail) in [(1, false), (2, true)] {
+        core.with_port(|p| p.fail_next = Some(fail));
+        let key = format!("rebuild-{n}");
+        let (s, r) = d
+            .call_decided(
+                "POST",
+                "/v1/reservations",
+                a,
+                &[("client-key", &key)],
+                Some(json!({ "payer": alice.account, "asset": USD, "amount": n.to_string() })),
+            )
+            .await;
+        assert_eq!(s.as_u16(), 200, "{r}");
+    }
+    assert_eq!(lines(&core), at_start, "the rebuilds wrote nothing");
 }

@@ -85,7 +85,7 @@ index 902aeb2..e33cb56 100644
 +[[package]]
 +name = "vos-protocol"
 +version = "0.1.0"
-+source = "git+https://codeberg.org/pandres95/VOS.git?rev=c54fc1ff13fcd55b86f2cf4edc77b041b62e245f#c54fc1ff13fcd55b86f2cf4edc77b041b62e245f"
++source = "git+https://codeberg.org/pandres95/VOS.git?rev=bd8d1bb70551391a4c80a96c2249313ab7e0a0fc#bd8d1bb70551391a4c80a96c2249313ab7e0a0fc"
 +dependencies = [
 + "blake2b_simd",
 + "rkyv",
@@ -94,7 +94,7 @@ index 902aeb2..e33cb56 100644
 +[[package]]
 +name = "vos-pvm-precompiles"
 +version = "0.1.0"
-+source = "git+https://codeberg.org/pandres95/VOS.git?rev=c54fc1ff13fcd55b86f2cf4edc77b041b62e245f#c54fc1ff13fcd55b86f2cf4edc77b041b62e245f"
++source = "git+https://codeberg.org/pandres95/VOS.git?rev=bd8d1bb70551391a4c80a96c2249313ab7e0a0fc#bd8d1bb70551391a4c80a96c2249313ab7e0a0fc"
 +dependencies = [
 + "curve25519-dalek",
 +]
@@ -126,10 +126,10 @@ index 417c2a8..9efcccb 100644
  # non-PVM builds the shim's typed API falls through to dalek, so the same code
  # path runs in tests. Enabled by the `pvm-precompile` feature.
 -zkpvm-precompiles = { git = "https://codeberg.org/Virto/VOS.git", rev = "9f5337fb39ccad5b779cf72cbd617e726e325aed", optional = true }
-+zkpvm-precompiles = { package = "vos-pvm-precompiles", git = "https://codeberg.org/pandres95/VOS.git", rev = "c54fc1ff13fcd55b86f2cf4edc77b041b62e245f", optional = true }
++zkpvm-precompiles = { package = "vos-pvm-precompiles", git = "https://codeberg.org/pandres95/VOS.git", rev = "bd8d1bb70551391a4c80a96c2249313ab7e0a0fc", optional = true }
  # VOS's protocol primitives (no_std), for `vos-blake2b`.
 -vos-protocol = { git = "https://codeberg.org/pandres95/VOS.git", rev = "6c794311ba506092be114ff5344fef4e338a8a85", optional = true }
-+vos-protocol = { git = "https://codeberg.org/pandres95/VOS.git", rev = "c54fc1ff13fcd55b86f2cf4edc77b041b62e245f", optional = true }
++vos-protocol = { git = "https://codeberg.org/pandres95/VOS.git", rev = "bd8d1bb70551391a4c80a96c2249313ab7e0a0fc", optional = true }
  
  [dev-dependencies]
  proptest = "1"

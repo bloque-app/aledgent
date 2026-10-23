@@ -53,8 +53,18 @@ the claim of that number, with its record written last. In build order:
 3. **Checkpoint `v3`**: the commitment amendment 0023 fixed, built from aledgent's fields alone.
 4. **`switch(H, n)`**: one host operation, installing only bytes staged and checked before the upgrade
    committed. It is the registry's compare-and-swap on `saga`, signed with the core's package key through
-   the signer. It is an install into the same instance on `vos-core`, and the founding of a continuation
-   across platforms. While an upgrade is scheduled, the host ends its batches at *n* − 1. At start and at
+   the signer. In the in-process runtime
+   the core host embeds (`agents/core-host`), the equivalent is the runtime's in-place upgrade of the
+   installed actor, a compare-and-swap on the installed deployment: its management receipt is signed by the
+   Agent's authority key, as an install's, and the staged package is signed by the package key (its
+   producer), both through the signer, so no key is in the host (a note of `T-037-14`, not a change of the
+   requirement). On `saga` the runtime accepts a program change of a stateful actor only on a claim the
+   target package's producer signs (`state_compatible_with`) and the host copies into the request, in our
+   VOS fork (owner ruling w5; `T-037-19`): the `package` build takes the previous package's program,
+   the first generation claims nothing. The way back after a way-out is the same call with `revert_from`
+   (no claim) and *g*'s original package, accepted by the runtime until a lane write. The patched runtime
+   is a new runtime artefact that enters with a (re)founding, since the core host's driver has no `UpgradeRuntime`. The switch is an install into the
+   same instance on `vos-core`, and the founding of a continuation across platforms. While an upgrade is scheduled, the host ends its batches at *n* − 1. At start and at
    every switch, the host checks every artefact it runs, the runtime included, against the code version the
    code map names for the next input, by digest, and installs that version where any differs. The switch is
    symmetric: it installs a newer generation after an upgrade and the old one again after a way-out input.
@@ -63,8 +73,9 @@ the claim of that number, with its record written last. In build order:
    scheduled `from`, the next one refuses the input, with nothing written. `RescheduleUpgrade` and
    `CancelUpgrade` are decided the same by either generation. The time spent fenced is a metric with an
    alert.
-7. **The modes** and their inputs.
-8. **Retrieval**: `CodeSource`, plugins, Kreivo preimages.
+7. **The modes** and their inputs. A mode names each principal with one of its credentials
+   `[PENDING AMENDMENT 0034]`.
+8. **Retrieval**: `CodeSource`, plugins, Kreivo preimages. The sources are configured in a file of their own, named by `serve --code-config`, with amendment 0023's `[code]` keys, because the deployment file is shared with ingress and refuses unknown fields (`T-037-06`). The core host's `fetch` takes the length as an `Option<u64>` where amendment 0023 has a `u64`: an `Upgrade` names only the manifest's digest, so the manifest's length is unknown. `kreivo-preimage` (`T-037-08`) keys by hash and length, so it will need the manifest's length in the `Upgrade`, or a fixed list of lengths to try; decide that before the `Upgrade` body is frozen.
 9. **Checkpoints as rows and leaf chunks**: the archive's checkpoint, and a snapshot sent to another node,
    hold the writer state and the leaves, never `agent.state`.
 10. **Per-range replay**: native first for the book, under each range's generation; the Agent side under
@@ -85,7 +96,8 @@ the claim of that number, with its record written last. In build order:
 
 - The move to `vos-core` itself. This feature makes it an upgrade; doing it is its own work, once
   `vos-core`'s formats settle.
-- Changes to VOS. A compare-and-swap on install, and a way for an actor to read its own program's hash, would
+- Changes to VOS, except the saga fork's stateful program change (`T-037-19`, owner ruling w5); the same
+  change upstream, and on `vos-core`, stays out. A compare-and-swap on install, and a way for an actor to read its own program's hash, would
   each strengthen the switch on `vos-core`; the fence does not depend on them. That an instance's rows
   survive a re-install on `vos-core` is an assumption, to be shown by the spike before `switch`'s `vos-core`
   form is used.

@@ -194,14 +194,19 @@ async fn ac_k5_1_a_restore_to_an_older_backup_and_replay_yield_the_pre_failure_r
     let root = tmp.path().join("backups");
     let (core_backup, m) = k.backup_core(&root, "b1").await.unwrap();
     let (audit_backup, _, _) = backup::audit::take(&k.audit_dir, &root, "a1", 1).unwrap();
-    // Export format 11 (F-017's six anchoring sections, the signing records of the owner's ruling
+    // Export format 12 (F-017's six anchoring sections, the signing records of the owner's ruling
     // of 2026-09-24, F-027's anchor venues, amendment 0006's resolution cases, F-028's
     // credential schemes, amendment 0011's integrating parties and notification anchor, F-029's
-    // asset bindings and attestations, and F-031's kernel accounts placed in partitions): the
-    // anchoring sections, filled, cross the backup.
+    // asset bindings and attestations, F-031's kernel accounts placed in partitions, and
+    // T-037-03's checkpoint construction and code binding): the anchoring sections, filled, cross
+    // the backup.
     let bundle =
         backup::core::read(&core_backup, &SealingKey::from_bytes(TEST_SEALING_KEY)).unwrap();
-    assert_eq!(bundle.export.manifest.version, 11);
+    assert_eq!(
+        bundle.export.manifest.version,
+        ledger_core::export::FORMAT_VERSION
+    );
+    assert_eq!(bundle.export.manifest.version, 12);
     let anchoring: Vec<_> = bundle
         .export
         .manifest
@@ -366,6 +371,199 @@ async fn ac_k5_1_a_restore_to_an_older_backup_and_replay_yield_the_pre_failure_r
         })
         .unwrap();
     assert_eq!(failed.verdict, Verdict::Failed, "{}", failed.detail);
+    inv_19_per_book(&drilled.core, r, r.replay.import_commits);
+}
+
+/// `T-026-12` (amendment 0039): after a governance reset of the settlement contract the venue
+/// holds one anchor sequence per book, and the restored book's `INV-19` is read per book. The
+/// restored core's own Final checkpoints, against layers as a reset leaves them.
+fn inv_19_per_book(
+    core: &ingress::testkit::TestCore,
+    report: &ops::drill::DrillReport,
+    import_commits: u64,
+) {
+    use verify::{NumberedAnchors, PublicAnchor, Sequence, Unread};
+    let finals: Vec<_> = core
+        .with_ledger(|l| {
+            l.state()
+                .anchoring()
+                .checkpoints()
+                .filter(|c| c.status == ledger_core::anchor::CheckpointStatus::Final)
+                .copied()
+                .collect()
+        })
+        .unwrap();
+    assert!(finals.len() >= 2, "{} Final checkpoints", finals.len());
+    let seq = |epoch: u32| Sequence {
+        epoch,
+        base: 0,
+        book: (epoch > 0).then_some([0xB0 + epoch as u8; 32]),
+    };
+    let anchor = |commitment: [u8; 32]| PublicAnchor {
+        commitment,
+        stored_at: 5,
+        read_at: 9,
+    };
+    let past = |epoch: u32| Unread::Anchor {
+        sequence: seq(epoch),
+        why: "State already discarded".into(),
+    };
+    // The layer, one read per checkpoint number.
+    let layer = |f: &dyn Fn(usize, &ledger_core::anchor::Checkpoint) -> NumberedAnchors| {
+        let mut m = verify::MemAnchors::new();
+        for (i, c) in finals.iter().enumerate() {
+            m.put_numbered(c.anchored_in(), c.number, f(i, c));
+        }
+        m
+    };
+    let run = |m: &verify::MemAnchors| {
+        core.with_ledger(|l| {
+            ops::drill::anchor_check(l, import_commits, m as &dyn verify::AnchorSource)
+        })
+        .unwrap()
+    };
+    let other = |c: &ledger_core::anchor::Checkpoint| {
+        let mut x = c.commitment;
+        x[0] ^= 0xFF;
+        x
+    };
+    let last = finals.len() - 1;
+    let ok = |c: ops::drill::Check| {
+        assert_eq!(c.verdict, Verdict::Passed, "{}", c.detail);
+        c.detail
+    };
+
+    // Reset to base 0: this book is the new one (sequence 1) and its numbers are the old book's too.
+    // Archive node, both books' anchors of each number.
+    let d = ok(run(&layer(&|_, c| NumberedAnchors {
+        current_epoch: 1,
+        found: vec![(seq(1), anchor(c.commitment)), (seq(0), anchor(other(c)))],
+        unread: vec![],
+    })));
+    assert!(
+        d.contains(&format!(
+            "{} in anchor sequence 1, the venue's current one",
+            finals.len()
+        )),
+        "{d}"
+    );
+    // Plain node: the old book's anchors of those numbers are not readable. Still green.
+    ok(run(&layer(&|_, c| NumberedAnchors {
+        current_epoch: 1,
+        found: vec![(seq(1), anchor(c.commitment))],
+        unread: vec![past(0)],
+    })));
+    // A second reset: the sequences before the last cannot be identified. Still green.
+    ok(run(&layer(&|_, c| NumberedAnchors {
+        current_epoch: 2,
+        found: vec![(seq(2), anchor(c.commitment))],
+        unread: vec![Unread::Before {
+            epoch: 2,
+            last_anchor: Some(9),
+            why: "the anchor sequences before 2 could not be identified".into(),
+        }],
+    })));
+    // This is an older book's backup, on an archive node: proven, and said to be a book
+    // re-founded since.
+    let d = ok(run(&layer(&|_, c| NumberedAnchors {
+        current_epoch: 1,
+        found: vec![(seq(1), anchor(other(c))), (seq(0), anchor(c.commitment))],
+        unread: vec![],
+    })));
+    assert!(
+        d.contains("in anchor sequence 0, a book re-founded since"),
+        "{d}"
+    );
+
+    // The same older book on a plain node: only the previous book's last anchor reads, and the
+    // new book's anchors of the other numbers are not this book's. Unknown, never a pass.
+    let c = run(&layer(&|i, c| {
+        if i == last {
+            NumberedAnchors {
+                current_epoch: 1,
+                found: vec![(seq(0), anchor(c.commitment))],
+                unread: vec![],
+            }
+        } else {
+            NumberedAnchors {
+                current_epoch: 1,
+                found: vec![(seq(1), anchor(other(c)))],
+                unread: vec![past(0)],
+            }
+        }
+    }));
+    assert_eq!(c.verdict, Verdict::Unknown, "{}", c.detail);
+    assert!(c.detail.contains("unknown, not passed"), "{}", c.detail);
+    assert!(c.detail.contains("needs an archive node"), "{}", c.detail);
+    // Nothing readable of any book: unknown too, not "no anchor".
+    let c = run(&layer(&|_, _| NumberedAnchors {
+        current_epoch: 1,
+        found: vec![],
+        unread: vec![past(0)],
+    }));
+    assert_eq!(c.verdict, Verdict::Unknown, "{}", c.detail);
+    // ... and an unknown never makes a drill pass.
+    let unknown = ops::drill::DrillReport {
+        checks: vec![
+            ops::drill::Check {
+                name: "INV-6".into(),
+                verdict: Verdict::Passed,
+                detail: String::new(),
+            },
+            c,
+        ],
+        ..report.clone()
+    };
+    assert!(!unknown.passed() && unknown.undecided());
+
+    // The new book's checkpoint the layer does not hold in the new book, while the old book's
+    // anchors of the number are unreadable: with another checkpoint proving the book is the
+    // new one, that is a failure, not an unknown.
+    let c = run(&layer(&|i, c| {
+        if i == last {
+            NumberedAnchors {
+                current_epoch: 1,
+                found: vec![(seq(1), anchor(c.commitment))],
+                unread: vec![past(0)],
+            }
+        } else {
+            NumberedAnchors {
+                current_epoch: 1,
+                found: vec![],
+                unread: vec![past(0)],
+            }
+        }
+    }));
+    assert_eq!(c.verdict, Verdict::Failed, "{}", c.detail);
+    assert!(
+        c.detail
+            .contains("no anchor of this number in anchor sequence 1"),
+        "{}",
+        c.detail
+    );
+    // A contradiction among unknowns still fails the check.
+    let c = run(&layer(&|i, c| {
+        if i == 0 {
+            NumberedAnchors {
+                current_epoch: 1,
+                found: vec![(seq(1), anchor(other(c)))],
+                unread: vec![],
+            }
+        } else {
+            NumberedAnchors {
+                current_epoch: 1,
+                found: vec![],
+                unread: vec![past(0)],
+            }
+        }
+    }));
+    assert_eq!(c.verdict, Verdict::Failed, "{}", c.detail);
+    // The layer cannot be reached: a failure, as before.
+    let mut down = verify::MemAnchors::new();
+    down.fail("the node does not answer");
+    let c = run(&down);
+    assert_eq!(c.verdict, Verdict::Failed, "{}", c.detail);
+    assert!(c.detail.contains("could not be read"), "{}", c.detail);
 }
 
 /// How many checkpoints are final in the running core.

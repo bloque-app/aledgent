@@ -443,6 +443,57 @@ async fn nfr_10_the_restore_refuses_an_archive_the_anchors_or_its_roots_contradi
     down.fail("the node does not answer");
     refused(&down);
 
+    // `T-026-12` (amendment 0039): the layer was reset; this archive is of the new book (sequence
+    // 1), and the old book (sequence 0) holds the same numbers.
+    let seq = |epoch: u32| verify::Sequence {
+        epoch,
+        base: 0,
+        book: (epoch > 0).then_some([0xB0 + epoch as u8; 32]),
+    };
+    let anchor = |commitment: [u8; 32]| verify::PublicAnchor {
+        commitment,
+        stored_at: 9,
+        read_at: 10,
+    };
+    let behind = |next: verify::NumberedAnchors| {
+        let mut layer = verify::MemAnchors::new();
+        // None of this archive's checkpoints is final, so none proves its book on the layer: the
+        // venue's current book (sequence 1) is the archived one. What the layer holds one after
+        // the last checkpoint:
+        layer.put_numbered(last.anchored_in(), last.number + 1, next);
+        ops::agent::verify(&f, &founding(), Some(&layer))
+            .unwrap()
+            .checks
+            .into_iter()
+            .find(|c| c.name == "archive-behind-anchor")
+            .unwrap()
+    };
+    // Only the old book holds the next number (a plain node cannot even read it): not behind.
+    for (found, unread) in [
+        (vec![(seq(0), anchor([7; 32]))], vec![]),
+        (
+            vec![],
+            vec![verify::Unread::Anchor {
+                sequence: seq(0),
+                why: "State already discarded".into(),
+            }],
+        ),
+    ] {
+        let c = behind(verify::NumberedAnchors {
+            current_epoch: 1,
+            found,
+            unread,
+        });
+        assert_eq!(c.verdict, Verdict::Passed, "{}", c.detail);
+    }
+    // The new book holds it: the archive is behind.
+    let c = behind(verify::NumberedAnchors {
+        current_epoch: 1,
+        found: vec![(seq(1), anchor([7; 32])), (seq(0), anchor([8; 32]))],
+        unread: vec![],
+    });
+    assert_eq!(c.verdict, Verdict::Failed, "{}", c.detail);
+
     // A tampered entry, its chain recomputed: the roots it claims are not the book's.
     let mut bad = f.entries.clone();
     let k = bad.len() / 2;

@@ -399,6 +399,34 @@ pub enum Call {
         chunk: Vec<u8>,
         path: Vec<[u8; 32]>,
     },
+    /// The way out of a scheduled upgrade (`T-037-15`, `REQ-RT-20`): move it to input `from`. After
+    /// `ApplySpecChunk` and before the conformance ports, so no production variant's tag moves.
+    RescheduleUpgrade {
+        ctx: Ctx,
+        from: u64,
+        justification: Vec<u8>,
+    },
+    /// The way out of a scheduled upgrade (`T-037-15`, `REQ-RT-20`): cancel it.
+    CancelUpgrade {
+        ctx: Ctx,
+        justification: Vec<u8>,
+    },
+    /// An upgrade-authority input (`F-037`, `T-037-05`): a change of mode, a proposal or an
+    /// approval. After `CancelUpgrade`, so no earlier variant's tag moves.
+    UpgradeAuthority {
+        ctx: Ctx,
+        input: crate::code::authority::Input,
+        justification: Vec<u8>,
+    },
+    /// An upgrade (`T-037-04`, `REQ-RT-16`): the writer's code becomes code version `code` from
+    /// input `from`. After `UpgradeAuthority` and before the conformance ports, so no production
+    /// variant's tag moves.
+    Upgrade {
+        ctx: Ctx,
+        code: [u8; 32],
+        from: u64,
+        justification: Vec<u8>,
+    },
     // The conformance suite's raw ports come last, so that no production variant's index (its
     // postcard tag in the host's archive and in every envelope) depends on whether a build enables
     // `conformance-ports` (T-005-17: a workspace build unifies the feature into every binary, and an
@@ -498,6 +526,10 @@ impl Call {
             Call::PrivilegedRead { .. } => "privileged_read",
             Call::Unsupported { method } => method,
             Call::ApplySpecChunk { .. } => "apply_spec_chunk",
+            Call::RescheduleUpgrade { .. } => "reschedule_upgrade",
+            Call::CancelUpgrade { .. } => "cancel_upgrade",
+            Call::UpgradeAuthority { input, .. } => input.method(),
+            Call::Upgrade { .. } => "upgrade",
         }
     }
 }
@@ -586,6 +618,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
     /// writes (`crate::leaves`), until it returns: exactly what the core Agent's replay of the
     /// call will read, so the host can witness it (`F-005`).
     pub(crate) fn enter(&mut self, call: impl FnOnce() -> Call) -> bool {
+        self.calls_in_input.0 += 1;
         let Some(log) = self.calls.as_mut() else {
             return false;
         };
@@ -601,6 +634,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
 
     /// Close the method `enter` opened without recording it: it changed nothing.
     pub(crate) fn cancel(&mut self, top: bool) {
+        self.calls_in_input.0 = self.calls_in_input.0.saturating_sub(1);
         let Some(log) = self.calls.as_mut() else {
             return;
         };
@@ -615,6 +649,11 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
 
     /// Close the method `enter` opened, with its result's summary.
     pub(crate) fn leave(&mut self, top: bool, summary: impl FnOnce() -> Summary) {
+        // An outermost method decided: one more call of the current input (`T-037-15`).
+        self.calls_in_input.0 = self.calls_in_input.0.saturating_sub(1);
+        if self.calls_in_input.0 == 0 {
+            self.calls_in_input.1 = self.calls_in_input.1.saturating_add(1);
+        }
         let Some(log) = self.calls.as_mut() else {
             return;
         };

@@ -43,6 +43,8 @@ pub struct VosPort {
     /// for every invocation for ever (`T-032-15`, stress finding F15).
     pub samples: Vec<Sample>,
     keep: bool,
+    /// The code this host runs and the versions it may switch to (`T-037-14`), if it tracks them.
+    code: Option<crate::switch::CodeState>,
 }
 
 impl VosPort {
@@ -54,7 +56,34 @@ impl VosPort {
             driver: PrincipalId(driver),
             samples: Vec::new(),
             keep: true,
+            code: None,
         }
+    }
+
+    /// Track the code this port runs (`T-037-14`): the digests of the `package` and `runtime`
+    /// bytes the host loaded, the actor's `name`, and the versions staged for a switch.
+    pub fn track_code(&mut self, state: crate::switch::CodeState) {
+        self.code = Some(state);
+    }
+
+    /// What the port tracks of its code, if anything.
+    pub fn code_state(&self) -> Option<&crate::switch::CodeState> {
+        self.code.as_ref()
+    }
+
+    pub(crate) fn code_state_mut(&mut self) -> Option<&mut crate::switch::CodeState> {
+        self.code.as_mut()
+    }
+
+    /// Upgrade the installed actor `name` to the admitted `package`, in place, and use the
+    /// upgraded actor from now on (`T-037-14`).
+    pub fn upgrade_actor(
+        &mut self,
+        package: &vos::agent::package_admission::AdmittedActorPackage,
+        name: &str,
+    ) -> Result<(), DriverError> {
+        self.actor = self.runtime.upgrade_actor(package, name)?;
+        Ok(())
     }
 
     /// Whether to keep every invocation's measurements in [`VosPort::samples`].
@@ -113,7 +142,9 @@ impl VosPort {
 
 fn map_err(e: DriverError) -> PortError {
     match e {
-        DriverError::Refused(s) | DriverError::Acknowledgement(s) => PortError::Aborted(s),
+        DriverError::Refused(s)
+        | DriverError::RevertClosed(s)
+        | DriverError::Acknowledgement(s) => PortError::Aborted(s),
         DriverError::Runtime(s) => PortError::Unavailable(s),
     }
 }
@@ -291,6 +322,111 @@ impl AgentPort for VosPort {
         Some(self.runtime.unacknowledged())
     }
 
+    /// `switch(H, n)` on `saga` (`T-037-14`): make the Agent run `code`, from the versions staged
+    /// for this port. A port that tracks no code runs what it runs.
+    fn switch_to(&mut self, code: [u8; 32]) -> Result<(), String> {
+        // A monotonic clock: a wall-clock step must not park a healthy host.
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let now = u64::try_from(
+            START
+                .get_or_init(std::time::Instant::now)
+                .elapsed()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        let Some(state) = self.code_state() else {
+            return Ok(());
+        };
+        // A failing install is not retried at once: it would burn the runtime's authority slots.
+        if let Some(why) = state.park.blocked(&code, now) {
+            return Err(why);
+        }
+        let digests = state.staged.digests();
+        let r = core_binding::switch::ensure(code, None, 0, &digests, self);
+        if let Some(c) = self.code_state_mut() {
+            match &r {
+                Ok(_) => c.park.succeeded(&code),
+                Err(e) => c.park.failed(
+                    code,
+                    e.to_string(),
+                    matches!(e, core_binding::switch::SwitchError::Platform(_)),
+                    now,
+                ),
+            }
+        }
+        r.map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    /// Stage a fetched and checked code version for `switch_to` (`T-037-04`): the version is held in
+    /// this port's staged versions, after [`crate::switch::StagedVersions::insert`] checks, once
+    /// more, the bytes against the manifest and the package's compiled generation. The writer's
+    /// generation is read from the Agent now, so the manifest names the one after it. A port that
+    /// tracks no code stages nothing.
+    fn stage_code(
+        &mut self,
+        checked: core_binding::staging::Checked,
+    ) -> Result<(), core_binding::staging::StageRefusal> {
+        use core_binding::staging::StageRefusal;
+        if self.code_state().is_none() {
+            return Err(StageRefusal::NoSource);
+        }
+        let hot = self
+            .hot()
+            .map_err(|e| StageRefusal::Manifest(format!("{e:?}")))?
+            .ok_or_else(|| StageRefusal::Manifest("the Agent is not founded".into()))?;
+        if hot.generation.checked_add(1) != Some(checked.manifest.generation) {
+            return Err(StageRefusal::Generation {
+                writer: hot.generation,
+                manifest: checked.manifest.generation,
+            });
+        }
+        let Some(state) = self.code_state_mut() else {
+            return Err(StageRefusal::NoSource);
+        };
+        // The port never stages what its switch could not install, whatever sits around it: the
+        // question the core asks first (`AgentPort::can_install`) is asked here again, so a
+        // wrapper that forgets to forward it cannot turn the door off (`T-037-22`).
+        state
+            .check_install(&checked)
+            .map_err(StageRefusal::CannotInstall)?;
+        // `saga` runs a runtime of its own beside the package: a version that names none cannot be
+        // installed here.
+        let runtime = checked
+            .runtime
+            .ok_or_else(|| StageRefusal::Manifest("the manifest names no Runtime".into()))?;
+        state
+            .staged
+            .insert(checked.manifest, checked.package, runtime)
+            .map(|_| ())
+            .map_err(StageRefusal::Package)
+    }
+
+    /// Whether the version is staged here, or this port tracks no code (it holds whatever it
+    /// runs).
+    fn holds_code(&self, code: &[u8; 32]) -> bool {
+        self.code_state().is_none_or(|c| c.holds(code))
+    }
+
+    /// Stage again, at start, a version the hot row names (`T-037-21`): [`crate::switch::CodeState::restage`].
+    fn restage_code(
+        &mut self,
+        checked: core_binding::staging::Checked,
+        generation: u64,
+    ) -> Result<(), core_binding::staging::StageRefusal> {
+        match self.code_state_mut() {
+            Some(state) => state.restage(checked, generation),
+            None => Err(core_binding::staging::StageRefusal::NoSource),
+        }
+    }
+
+    /// Whether the switch could install `checked` (`T-037-22`): the checks of
+    /// [`crate::switch::installable`], over the code this port runs. A port that tracks no code
+    /// answers yes; [`AgentPort::stage_code`] refuses it anyway.
+    fn can_install(&self, checked: &core_binding::staging::Checked) -> Result<(), String> {
+        self.code_state()
+            .map_or(Ok(()), |state| state.check_install(checked))
+    }
+
     fn invoke(&mut self, envelope: Vec<u8>, blobs: Vec<Vec<u8>>) -> Result<Vec<u8>, PortError> {
         #[cfg(feature = "composite")]
         if let Some(mode) = composite_mode()
@@ -333,7 +469,9 @@ impl AgentPort for VosPort {
         if b.is_empty() {
             return Ok(None);
         }
-        decode::<Hot>(&b).map(Some).map_err(PortError::Unavailable)
+        core_binding::hot::decode_hot(&b)
+            .map(Some)
+            .map_err(PortError::Unavailable)
     }
 
     fn entry(&mut self, seq: u64) -> Result<Option<RingEntry>, PortError> {

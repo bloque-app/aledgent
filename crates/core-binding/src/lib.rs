@@ -15,6 +15,7 @@
 //!   invocation's writes (`F-031` lever 2).
 //! - [`hot`]: the Agent's state layout and the budget `H` (`T-005-02`).
 //! - [`envelope`]: the invocation's message, its private inputs and the reply (`T-005-03`).
+//! - [`fence`]: the fence, always on, and the way out of a scheduled upgrade (`T-037-15`).
 //! - [`witness`]: the witnessed leaf store the library runs over inside the Agent (`T-005-04`).
 //! - [`service`]: the witnessed service leaves, and the service tree's root, inside the Agent
 //!   (`T-005-13`).
@@ -23,6 +24,9 @@
 //! - [`host`] (feature `std`): the driver that runs each input natively, finds its read set,
 //!   builds its witness and private inputs from `F-006`'s store, invokes the Agent through an
 //!   [`host::AgentPort`], and checks the reply against the native run (`T-005-08`).
+//!
+//! - [`switch`] (feature `std`): `switch(H, n)`, the host's one operation for changing a writer's
+//!   code, behind a platform-neutral installer trait (`T-037-14`).
 //!
 //! - [`core`] (feature `ingress`): ingress's `boundary::Core` over the Agent, with the host's
 //!   durable log: what `aledgent-core-host` serves.
@@ -44,6 +48,7 @@ pub mod calls;
 #[cfg(feature = "mapped")]
 pub mod committed;
 pub mod envelope;
+pub mod fence;
 pub mod hot;
 #[cfg(feature = "mapped")]
 pub mod mapped;
@@ -58,5 +63,13 @@ pub mod witness;
 pub mod core;
 #[cfg(feature = "std")]
 pub mod host;
+#[cfg(feature = "std")]
+pub mod staging;
+#[cfg(feature = "std")]
+pub mod switch;
 #[cfg(feature = "ingress")]
 pub mod verified;
+
+/// The library, for the guest shell (`agents/core`), which links this crate alone: it defines
+/// its compiled code generation with `ledger_core::code_generation!` (`T-037-01`).
+pub use ledger_core;

@@ -894,7 +894,7 @@ pub async fn apply_range<C: Core>(
                     }
                     other => return Err(format!("chainspec chunk {}: {other:?}", at + i)),
                 },
-                Err(CoreError::Unavailable) | Err(CoreError::Ambiguous) => break,
+                Err(CoreError::Unavailable | CoreError::Ambiguous | CoreError::NotRun) => break,
             }
         }
         if advanced == 0 {

@@ -11,8 +11,8 @@ use crate::claim::{Claim, Relation};
 use crate::envelope::{
     Assertion, AssuranceKind, BalanceKind, Bound, Disclosure, FlowDirection, FormatError, Recipient,
 };
-use crate::source::AnchorSource;
-use crate::{SIGNED_ASSERTION_LABEL, commitment, schnorr};
+use crate::source::{AnchorSource, NumberedAnchors, Sequence, Unread};
+use crate::{SIGNED_ASSERTION_LABEL, schnorr};
 
 /// Why nothing could be checked at all.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,6 +51,13 @@ pub enum KeySource {
 }
 
 /// What the anchor read found.
+///
+/// A venue's anchors may run in more than one [`Sequence`] when governance re-founded the book on
+/// it (amendment 0039 `[PENDING AMENDMENT 0039]`), so two books can each hold an anchor of the
+/// number a disclosure names. The commitment decides which one it is: it binds its own book's
+/// state, so it matches one book's anchor at most (bar a hash collision), and the check says which
+/// book that is. It never answers with another book's anchor, and never "not final" for a book it
+/// could not read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AnchorCheck {
     /// The anchor is stored at a finalized block with the commitment the disclosure names.
@@ -59,17 +66,55 @@ pub enum AnchorCheck {
         stored_at: u64,
         /// The finalized block it was read at.
         read_at: u64,
+        /// The anchor sequence it belongs to: the book it anchors.
+        sequence: Sequence,
+        /// Whether that is the venue's current sequence, rather than a book re-founded since.
+        current: bool,
     },
-    /// No anchor of that number is final at the finalized head (`ERR-AnchorNotFinal`'s
-    /// condition, seen from outside).
+    /// No anchor of that number is final at the finalized head, in any sequence
+    /// (`ERR-AnchorNotFinal`'s condition, seen from outside).
     Missing,
-    /// The anchor of that number carries another commitment.
+    /// Every anchor of that number carries another commitment: what each sequence holds.
     Mismatch {
-        /// What the settlement layer holds.
-        stored: [u8; 32],
+        /// What the settlement layer holds, by sequence.
+        stored: Vec<(Sequence, [u8; 32])>,
+    },
+    /// No anchor read carries the commitment, and a sequence that may hold the number could not
+    /// be read (an anchor that is no longer its sequence's latest needs a node that keeps past
+    /// state): neither final nor missing, unknown.
+    Unknown {
+        /// What the sequences that were read hold, none of it the commitment.
+        stored: Vec<(Sequence, [u8; 32])>,
+        /// What could not be read.
+        unread: Vec<Unread>,
     },
     /// The settlement layer could not be read.
     Unreadable(String),
+}
+
+impl AnchorCheck {
+    /// The check of `commitment` against every anchor of its number the venue holds.
+    pub fn of(read: &NumberedAnchors, commitment: &[u8; 32]) -> AnchorCheck {
+        if let Some((sequence, a)) = read.found.iter().find(|(_, a)| a.commitment == *commitment) {
+            return AnchorCheck::Final {
+                stored_at: a.stored_at,
+                read_at: a.read_at,
+                sequence: *sequence,
+                current: sequence.epoch == read.current_epoch,
+            };
+        }
+        let stored: Vec<_> = read.found.iter().map(|(s, a)| (*s, a.commitment)).collect();
+        if !read.unread.is_empty() {
+            AnchorCheck::Unknown {
+                stored,
+                unread: read.unread.clone(),
+            }
+        } else if stored.is_empty() {
+            AnchorCheck::Missing
+        } else {
+            AnchorCheck::Mismatch { stored }
+        }
+    }
 }
 
 /// Everything [`verify()`] found. [`Report::passed`] is the verdict; [`Report::render`] is what
@@ -141,6 +186,15 @@ impl Report {
             c.construction,
             hex(&c.commitment)
         ));
+        match &c.binding {
+            Some(b) => out.push_str(&format!(
+                "code: {} (genesis {}, upgrade-authority mode {}), anchor commitment v3\n",
+                hex(&b.code),
+                hex(&b.genesis),
+                hex(&b.authority)
+            )),
+            None => out.push_str("code: not named (a v2 checkpoint)\n"),
+        }
         out.push_str(&format!(
             "venue: {}\n",
             match d.venue {
@@ -199,16 +253,67 @@ impl Report {
             mark(self.commitment_recomputed)
         ));
         out.push_str(&match &self.anchor {
-            AnchorCheck::Final { stored_at, read_at } => format!(
-                "[ok  ] anchor stored at block {stored_at}, read at finalized block {read_at}\n"
+            AnchorCheck::Final {
+                stored_at,
+                read_at,
+                sequence,
+                current,
+            } => format!(
+                "[ok  ] anchor stored at block {stored_at}, read at finalized block {read_at}{}\n",
+                if sequence.epoch == 0 && *current {
+                    String::new()
+                } else {
+                    format!(
+                        ", in {}, {}",
+                        sequence_name(sequence),
+                        if *current {
+                            "the venue's current one"
+                        } else {
+                            "a book re-founded since on this venue"
+                        }
+                    )
+                }
             ),
             AnchorCheck::Missing => {
                 "[FAIL] no such anchor at the finalized head: it establishes nothing\n".into()
             }
-            AnchorCheck::Mismatch { stored } => format!(
-                "[FAIL] the anchor carries another commitment: {}\n",
-                hex(stored)
-            ),
+            AnchorCheck::Mismatch { stored } => match stored.as_slice() {
+                [(s, c)] if s.epoch == 0 => format!(
+                    "[FAIL] the anchor carries another commitment: {}\n",
+                    hex(c)
+                ),
+                _ => format!(
+                    "[FAIL] every anchor of that number carries another commitment: {}\n",
+                    held(stored)
+                ),
+            },
+            AnchorCheck::Unknown { stored, unread } => {
+                let mut line = String::from(
+                    "[FAIL] unknown: the commitment is in no anchor read, and an anchor sequence that may hold \
+                     this number could not be read (an anchor that is no longer its sequence's latest needs a \
+                     node that keeps past state); neither final nor missing:",
+                );
+                for u in unread {
+                    line.push_str(&match u {
+                        Unread::Anchor { sequence, why } => {
+                            format!(" {} unread ({why});", sequence_name(sequence))
+                        }
+                        Unread::Before {
+                            epoch,
+                            last_anchor,
+                            why,
+                        } => format!(
+                            " the sequences before {epoch} unidentified, the last anchor before it {} ({why});",
+                            last_anchor.map_or("none".into(), |n| format!("{n}"))
+                        ),
+                    });
+                }
+                if !stored.is_empty() {
+                    line.push_str(&format!(" read: {}", held(stored)));
+                }
+                line.push('\n');
+                line
+            }
             AnchorCheck::Unreadable(why) => {
                 format!("[FAIL] the settlement layer could not be read: {why}\n")
             }
@@ -224,6 +329,31 @@ impl Report {
         );
         out
     }
+}
+
+/// An anchor sequence, named for a reader: its number and the book it anchors.
+fn sequence_name(s: &Sequence) -> String {
+    match s.book {
+        None => format!(
+            "anchor sequence {} (the venue's first, no book named)",
+            s.epoch
+        ),
+        Some(b) => format!(
+            "anchor sequence {} (book {}, numbered after {})",
+            s.epoch,
+            hex(&b),
+            s.base
+        ),
+    }
+}
+
+/// What each sequence holds, for a reader.
+fn held(stored: &[(Sequence, [u8; 32])]) -> String {
+    let parts: Vec<String> = stored
+        .iter()
+        .map(|(s, c)| format!("{} holds {}", sequence_name(s), hex(c)))
+        .collect();
+    parts.join("; ")
 }
 
 fn hex(b: &[u8]) -> String {
@@ -389,29 +519,19 @@ pub fn verify(
         .iter()
         .all(|c| *c.claim.state_root() == d.checkpoint.kernel_root);
     let claims_consistent = consistent(&d);
-    // 3. The anchor, at a finalized block, in the venue it lives in (`F-027` T-027-04).
+    // 3. The anchor, at a finalized block, in the venue it lives in (`F-027` T-027-04), in
+    // whichever of its anchor sequences carries the commitment (amendment 0039).
     let c = d.checkpoint;
-    let anchor = match source.anchor(&d.venue, c.number) {
-        Ok(Some(a)) if a.commitment == c.commitment => AnchorCheck::Final {
-            stored_at: a.stored_at,
-            read_at: a.read_at,
-        },
-        Ok(Some(a)) => AnchorCheck::Mismatch {
-            stored: a.commitment,
-        },
-        Ok(None) => AnchorCheck::Missing,
+    let anchor = match source.anchors(&d.venue, c.number) {
+        Ok(read) => AnchorCheck::of(&read, &c.commitment),
         Err(why) => AnchorCheck::Unreadable(why),
     };
     // 4. The commitment, recomputed.
     // The construction must be one this verifier knows (`REQ-PR-10`); the commitment binds it.
-    let commitment_recomputed = crate::construction_known(c.construction)
-        && commitment(
-            c.construction,
-            d.instance,
-            c.number,
-            c.entry_sequence,
-            &c.kernel_root,
-        ) == c.commitment;
+    // A `v3` checkpoint's commitment also binds its genesis, code and mode (`T-037-03`); a `v2`
+    // checkpoint's is recomputed in its own form, so earlier anchors still check.
+    let commitment_recomputed =
+        crate::construction_known(c.construction) && c.recomputed(d.instance) == c.commitment;
     // 5. The label.
     let labelled = d.assurance.kind == AssuranceKind::SignedAssertion
         && d.assurance.summary.contains(SIGNED_ASSERTION_LABEL);
@@ -435,9 +555,17 @@ mod tests {
     use crate::claim::{Filter, SignedClaim};
     use crate::envelope::{Assurance, CheckpointRef, VERSION};
     use crate::source::{MemAnchors, PublicAnchor};
+    use crate::{CodeBinding, commitment, commitment_v3};
     use alloc::string::ToString;
     use alloc::vec;
     use cipher_clerk::crypto::SecretKey;
+
+    /// The fixture's code binding: a `v3` checkpoint's genesis, code and mode.
+    const BINDING: CodeBinding = CodeBinding {
+        genesis: [0x0A; 32],
+        code: [0x0B; 32],
+        authority: [0x0C; 32],
+    };
 
     fn sign(sk: &SecretKey, msg: &[u8]) -> [u8; 64] {
         let s = sk.sign(msg, &mut rand_core::OsRng);
@@ -467,8 +595,9 @@ mod tests {
                 number: 4,
                 entry_sequence: 20,
                 kernel_root: root,
-                commitment: commitment(crate::CONSTRUCTION_V2, 1, 4, 20, &root),
+                commitment: commitment_v3(crate::CONSTRUCTION_V2, &BINDING, 1, 4, 20, &root),
                 construction: crate::CONSTRUCTION_V2,
+                binding: Some(BINDING),
             },
             assurance: Assurance {
                 declaration_digest: [9; 32],
@@ -667,6 +796,44 @@ mod tests {
             let r = verify(&t.to_bytes(), Some(pk), &chain(&d)).unwrap();
             assert!(!r.commitment_recomputed && !r.passed(), "construction {c}");
         }
+        // `T-037-03`: a checkpoint and its anchor bind the code, the construction and the mode.
+        // The same checkpoint naming another code, mode or genesis does not recompute.
+        for f in [
+            |b: &mut CodeBinding| b.code[0] ^= 1,
+            |b: &mut CodeBinding| b.authority[0] ^= 1,
+            |b: &mut CodeBinding| b.genesis[0] ^= 1,
+        ] {
+            let mut t = d.clone();
+            f(t.checkpoint.binding.as_mut().unwrap());
+            t.signature = sign(&sk, &t.signed_bytes());
+            let r = verify(&t.to_bytes(), Some(pk), &chain(&d)).unwrap();
+            assert!(!r.commitment_recomputed && !r.passed());
+        }
+        // Nor does it with the binding dropped: a `v3` anchor is not a `v2` one.
+        let mut t = d.clone();
+        t.checkpoint.binding = None;
+        t.signature = sign(&sk, &t.signed_bytes());
+        let r = verify(&t.to_bytes(), Some(pk), &chain(&d)).unwrap();
+        assert!(!r.commitment_recomputed && !r.passed());
+    }
+
+    /// `T-037-03`: earlier `v2` anchors still check. A disclosure resting on a `v2` checkpoint, in
+    /// a version-4 envelope with no binding or in a version-3 envelope, verifies.
+    #[test]
+    fn t037_03_a_v2_anchor_still_checks() {
+        let sk = SecretKey::from_bytes([5; 32]).unwrap();
+        let pk = sk.public_key().0;
+        let mut d = holds(&sk);
+        let c = &mut d.checkpoint;
+        c.binding = None;
+        c.commitment = commitment(crate::CONSTRUCTION_V2, 1, c.number, 20, &c.kernel_root);
+        for version in [VERSION, crate::envelope::VERSION_3] {
+            let mut t = d.clone();
+            t.version = version;
+            t.signature = sign(&sk, &t.signed_bytes());
+            let r = verify(&t.to_bytes(), Some(pk), &chain(&t)).unwrap();
+            assert!(r.commitment_recomputed && r.passed(), "version {version}");
+        }
     }
 
     #[test]
@@ -798,5 +965,117 @@ mod tests {
                 .unwrap()
                 .claims_bound
         );
+    }
+    /// `T-026-11` (amendment 0039): on a venue whose book was re-founded, a disclosure passes
+    /// against its own book's anchor of a number both books used, and the report names the book;
+    /// one whose book could not be read is unknown, never a pass and never "not final".
+    #[test]
+    fn t_026_11_the_check_names_the_book_and_never_mixes_books() {
+        use crate::source::{NumberedAnchors, Sequence, Unread, Venue};
+        let sk = SecretKey::from_bytes([5; 32]).unwrap();
+        let pk = sk.public_key().0;
+        let contract = Venue::Contract {
+            account: [0xc0; 32],
+        };
+        let mut d = holds(&sk);
+        d.venue = contract;
+        d.signature = sign(&sk, &d.signed_bytes());
+        let p2 = Sequence {
+            epoch: 1,
+            base: 0,
+            book: Some([0xB2; 32]),
+        };
+        let at = |commitment, stored_at| PublicAnchor {
+            commitment,
+            stored_at,
+            read_at: 40,
+        };
+        let both = |ours: (Sequence, [u8; 32])| NumberedAnchors {
+            current_epoch: 1,
+            found: vec![
+                (p2, at(if ours.0 == p2 { ours.1 } else { [0xEE; 32] }, 30)),
+                (
+                    Sequence::FIRST,
+                    at(if ours.0 == p2 { [0xEE; 32] } else { ours.1 }, 10),
+                ),
+            ],
+            unread: vec![],
+        };
+        let n = d.checkpoint.number;
+        // The disclosure is the new book's.
+        let mut src = MemAnchors::new();
+        src.put_numbered(contract, n, both((p2, d.checkpoint.commitment)));
+        let r = verify(&d.to_bytes(), Some(pk), &src).unwrap();
+        assert!(r.passed(), "{}", r.render());
+        assert_eq!(
+            r.anchor,
+            AnchorCheck::Final {
+                stored_at: 30,
+                read_at: 40,
+                sequence: p2,
+                current: true
+            }
+        );
+        assert!(r.render().contains("anchor sequence 1 (book b2b2"));
+        // The disclosure is the old book's: it still checks, and says the book was re-founded.
+        let mut src = MemAnchors::new();
+        src.put_numbered(
+            contract,
+            n,
+            both((Sequence::FIRST, d.checkpoint.commitment)),
+        );
+        let r = verify(&d.to_bytes(), Some(pk), &src).unwrap();
+        assert!(r.passed());
+        assert!(matches!(
+            r.anchor,
+            AnchorCheck::Final {
+                sequence: Sequence::FIRST,
+                current: false,
+                ..
+            }
+        ));
+        assert!(r.render().contains("re-founded since"));
+        // `anchor` alone refuses to pick one.
+        assert!(src.anchor(&contract, n).is_err());
+        // Neither book's: a mismatch that shows both.
+        let mut src = MemAnchors::new();
+        src.put_numbered(contract, n, both((p2, [0xEF; 32])));
+        let r = verify(&d.to_bytes(), Some(pk), &src).unwrap();
+        assert!(matches!(&r.anchor, AnchorCheck::Mismatch { stored } if stored.len() == 2));
+        assert!(!r.passed());
+        // The old book could not be read: unknown, with what was read.
+        let mut src = MemAnchors::new();
+        src.put_numbered(
+            contract,
+            n,
+            NumberedAnchors {
+                current_epoch: 1,
+                found: vec![(p2, at([0xEE; 32], 30))],
+                unread: vec![Unread::Anchor {
+                    sequence: Sequence::FIRST,
+                    why: "State already discarded".into(),
+                }],
+            },
+        );
+        let r = verify(&d.to_bytes(), Some(pk), &src).unwrap();
+        assert!(matches!(r.anchor, AnchorCheck::Unknown { .. }) && !r.passed());
+        assert!(r.render().contains("unknown"), "{}", r.render());
+        // The current book's own superseded anchor, unread: the same, and no earlier book blamed.
+        let mut src = MemAnchors::new();
+        src.put_numbered(
+            contract,
+            n,
+            NumberedAnchors {
+                current_epoch: 1,
+                found: vec![],
+                unread: vec![Unread::Anchor {
+                    sequence: p2,
+                    why: "State already discarded".into(),
+                }],
+            },
+        );
+        let r = verify(&d.to_bytes(), Some(pk), &src).unwrap();
+        assert!(matches!(r.anchor, AnchorCheck::Unknown { .. }) && !r.passed());
+        assert!(!r.render().contains("earlier book"), "{}", r.render());
     }
 }

@@ -51,6 +51,7 @@
 
 pub mod anchoring;
 pub mod answering;
+pub mod approval;
 pub mod archived;
 pub mod audit_ship;
 pub mod auth;
@@ -71,6 +72,7 @@ pub mod pass_through;
 pub mod probe;
 pub mod query;
 pub mod readiness;
+pub mod refusal;
 pub mod remote;
 pub mod service;
 pub mod settlement;

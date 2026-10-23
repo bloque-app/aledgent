@@ -140,8 +140,14 @@ pub struct NewRow {
     /// The command's pass-through data (`REQ-PO-5`), exactly as sent: part of the request's
     /// digest, never part of `body`, so the core never receives it.
     pub pass_through: Option<PassThrough>,
-    /// Whether it reserves: first in the forwarder's queue.
+    /// Whether it reserves: first in the forwarder's queue, after the rows that overtake it.
     pub reserves: bool,
+    /// Whether it overtakes the queue (`T-037-04`, `REQ-RT-20`, amendment 0035): a way out of a
+    /// scheduled upgrade, from a caller the core said may take it. Before every row not yet given a
+    /// feed sequence, reservations included: a fenced writer refuses every other input, and the
+    /// forwarder would retry the refused one first for ever. Set at the door, only after the caller
+    /// is authorised; a caller that is not is logged as an ordinary row.
+    pub overtakes: bool,
     /// Whether its reply waits for the decision.
     pub synchronous: bool,
     /// When it was logged.
@@ -313,6 +319,10 @@ impl std::fmt::Display for StoreError {
 
 impl std::error::Error for StoreError {}
 
+/// How long a spent challenge number is kept past its expiry (amendment 0037, F2): the margin for
+/// the clock difference between ingress instances. Sixty seconds.
+pub const SPENT_MARGIN_MS: Time = 60_000;
+
 /// What a [`StoreError`] from [`Store::mark_fed`] says when the caller no longer holds the feed
 /// lease under its epoch (`F-038`).
 pub const FENCED: &str = "fenced: the feed lease is another holder's or another epoch's";
@@ -353,8 +363,11 @@ pub trait Store: Clone + Send + Sync + 'static {
         count: u32,
     ) -> impl Future<Output = Result<bool, StoreError>> + Send;
 
-    /// Use a challenge (`F-028`): `true` the first time its nonce is seen, `false` after. It is
-    /// kept until `expires_at`; expired ones are dropped as of `now`.
+    /// Use a challenge (`F-028`, and an approval's, amendment 0037 `T-040-03`): `true` the first
+    /// time its nonce is seen, `false` after, on every instance that shares the store (one
+    /// statement decides it, so two racing on one nonce get one `true`). It is kept until
+    /// `expires_at` plus [`SPENT_MARGIN_MS`]: an instance whose clock runs ahead of another's by
+    /// less than the margin does not forget a number the other still accepts.
     fn use_challenge(
         &self,
         nonce: [u8; 16],
@@ -419,13 +432,15 @@ pub trait Store: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
     /// The next row to forward: an undecided row already given a feed sequence (`F-038`), lowest
-    /// first; else undecided, reservations first, then in arrival order.
+    /// first; else undecided, rows that overtake first (`T-037-04`), then reservations, then in
+    /// arrival order.
     fn next_undecided(&self) -> impl Future<Output = Result<Option<Row>, StoreError>> + Send;
 
     /// Up to `n` rows to forward, in the order successive calls of [`Store::next_undecided`]
     /// would give them: undecided rows in flight (given a feed sequence) by that sequence
-    /// (`F-038`), then undecided reservations in arrival order, then the other undecided rows in
-    /// arrival order (`T-031-04`). The default gives the one `next_undecided` gives.
+    /// (`F-038`), then undecided rows that overtake (`T-037-04`) in arrival order, then undecided
+    /// reservations in arrival order, then the other undecided rows in arrival order (`T-031-04`).
+    /// The default gives the one `next_undecided` gives.
     fn next_undecided_batch(
         &self,
         n: usize,
@@ -569,7 +584,8 @@ pub trait Store: Clone + Send + Sync + 'static {
 
     /// Take or renew the feed lease of `partition` as `holder`, for `lease` on the store's clock
     /// (`F-038` §3): its epoch, or `None` while another holder's lease runs. The epoch rises every
-    /// time the lease changes holder or lapses, never on a renewal.
+    /// time the lease changes holder or lapses, and when its holder gives back rows that were in
+    /// flight ([`Store::unfeed_in_flight`]); never on a renewal.
     fn try_feed(
         &self,
         partition: &str,
@@ -613,6 +629,20 @@ pub trait Store: Clone + Send + Sync + 'static {
         epoch: u64,
         from: u64,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// [`Store::unfeed`] for rows an earlier copy of which may still reach the core (`F-038` §3,
+    /// amendment 0036): the rows from `from` on were sent before, or carried a sequence into this
+    /// call, and the core has now answered them `NotRun`. The same transaction raises the lease's
+    /// epoch by one, so the core refuses every copy sent under the old one once the next feed has
+    /// reached it, and returns the epoch the lease now has. Only under the lease `holder` holds at
+    /// `epoch` (else [`StoreError::fenced`], and nothing changes).
+    fn unfeed_in_flight(
+        &self,
+        partition: &str,
+        holder: &str,
+        epoch: u64,
+        from: u64,
+    ) -> impl Future<Output = Result<u64, StoreError>> + Send;
 
     /// Keep what the book answered for `credential` (`F-038` §7, `DEC-27` (e″)): its public
     /// material, or, for `None` (no working credential), forget it.

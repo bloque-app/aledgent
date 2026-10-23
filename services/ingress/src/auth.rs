@@ -92,6 +92,31 @@ fn bearer(headers: &HeaderMap) -> Result<&str, Refusal> {
         .ok_or(Refusal::CredentialInvalid)
 }
 
+/// How a caller proved who it is (amendment 0037 `[PENDING AMENDMENT 0037]`, "How the door
+/// decides", `T-040-11`). This, and nothing else (not the kind of principal, not the route, not a
+/// credential's scheme), decides whether a command needs an approval.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Proof {
+    /// A session a passkey sign-in issued: it stands for a sign-in with a device-bound credential
+    /// and signs nothing itself. Needs an approval.
+    Session,
+    /// An issued secret (an API key), presented as it is: a bearer secret. Exempt.
+    IssuedSecret,
+    /// A token an operator configured, presented as it is: a bearer secret. Exempt.
+    ConfiguredToken,
+}
+
+impl Proof {
+    /// Its name, for the report-only log and counts. Never a credential.
+    pub fn name(self) -> &'static str {
+        match self {
+            Proof::Session => "session",
+            Proof::IssuedSecret => "issued_secret",
+            Proof::ConfiguredToken => "configured_token",
+        }
+    }
+}
+
 /// An authenticated caller: who it is, and the credential it used. Never the token.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Authenticated {
@@ -101,6 +126,8 @@ pub struct Authenticated {
     pub credential: String,
     /// What kind of principal.
     pub kind: CredentialKind,
+    /// How it proved who it is.
+    pub proof: Proof,
 }
 
 impl Authenticated {
@@ -141,6 +168,7 @@ pub struct Passkeys {
     require_user_verification: bool,
     challenge_ttl: Time,
     session_ttl: Time,
+    approvals: crate::approval::Approvals,
 }
 
 impl Passkeys {
@@ -158,7 +186,19 @@ impl Passkeys {
             require_user_verification,
             challenge_ttl,
             session_ttl,
+            approvals: crate::approval::Approvals::off(),
         }
+    }
+
+    /// With per-command approvals as configured (`T-040-07`): off by default.
+    pub fn with_approvals(mut self, approvals: crate::approval::Approvals) -> Passkeys {
+        self.approvals = approvals;
+        self
+    }
+
+    /// The per-command approval setting (amendment 0037).
+    pub fn approvals(&self) -> &crate::approval::Approvals {
+        &self.approvals
     }
 
     /// The key.
@@ -277,6 +317,7 @@ impl Authenticator {
             principal: c.identity.clone(),
             credential: key.credential.to_did(),
             kind: self.kind_of(&c.identity, &c.kind),
+            proof: Proof::IssuedSecret,
         })
     }
 
@@ -315,6 +356,7 @@ impl Authenticator {
                 principal: e.principal.clone(),
                 credential: e.credential.clone(),
                 kind: e.kind,
+                proof: Proof::ConfiguredToken,
             },
         );
         Ok(())
@@ -375,6 +417,7 @@ impl Authenticator {
                     principal: s.principal.to_did(),
                     credential: s.credential.to_did(),
                     kind: CredentialKind::of(s.kind),
+                    proof: Proof::Session,
                 })
                 .map(Presented::Known);
         }

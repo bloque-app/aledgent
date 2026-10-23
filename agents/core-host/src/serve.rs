@@ -290,6 +290,44 @@ impl AgentPort for Persisting {
         self.port.unacknowledged()
     }
 
+    /// The switch changes the runtime's state (the installed actor): persist it at once, so a
+    /// restart attaches the package the state names.
+    fn switch_to(&mut self, code: [u8; 32]) -> Result<(), String> {
+        self.check().map_err(|e| format!("{e:?}"))?;
+        let before = self.port.code_state().map(|c| c.running);
+        self.port.switch_to(code)?;
+        if self.port.code_state().map(|c| c.running) != before {
+            self.save().map_err(|e| format!("{e:?}"))?;
+        }
+        Ok(())
+    }
+
+    /// Staging changes only what the host holds in memory for the switch (`T-037-04`).
+    fn stage_code(
+        &mut self,
+        checked: core_binding::staging::Checked,
+    ) -> Result<(), core_binding::staging::StageRefusal> {
+        self.port.stage_code(checked)
+    }
+
+    fn holds_code(&self, code: &[u8; 32]) -> bool {
+        self.port.holds_code(code)
+    }
+
+    /// Staging again changes only what the host holds in memory (`T-037-21`).
+    fn restage_code(
+        &mut self,
+        checked: core_binding::staging::Checked,
+        generation: u64,
+    ) -> Result<(), core_binding::staging::StageRefusal> {
+        self.port.restage_code(checked, generation)
+    }
+
+    /// Whether the switch could install `checked` (`T-037-22`): the wrapped port answers.
+    fn can_install(&self, checked: &core_binding::staging::Checked) -> Result<(), String> {
+        self.port.can_install(checked)
+    }
+
     fn invoke(&mut self, envelope: Vec<u8>, blobs: Vec<Vec<u8>>) -> Result<Vec<u8>, PortError> {
         self.check()?;
         let r = self.port.invoke(envelope, blobs);
@@ -324,27 +362,83 @@ fn need(args: &[String], name: &str) -> Result<String, String> {
     arg(args, name).ok_or_else(|| format!("missing {name}"))
 }
 
+/// The runtime, asked to attach what a saved state has installed.
+struct Attaching<'a>(&'a mut Runtime);
+
+impl crate::restart::Attach for Attaching<'_> {
+    type Actor = crate::driver::Actor;
+
+    fn installed_package(&mut self) -> Result<vos::agent_sdk::BlobRef, String> {
+        self.0
+            .installed_package(ACTOR_NAME)
+            .map_err(|e| format!("attach: {e:?}"))
+    }
+
+    fn attach(&mut self, bytes: &[u8]) -> Result<Self::Actor, String> {
+        let package = package::admit_actor(bytes)
+            .map_err(|e| format!("the installed package, from the code cache: {e:?}"))?;
+        self.0
+            .attach(&package, ACTOR_NAME, None)
+            .map_err(|e| format!("attach: {e:?}"))
+    }
+}
+
+impl crate::restart::Tracks for VosPort {
+    fn track(&mut self, state: crate::switch::CodeState) {
+        self.track_code(state);
+    }
+}
+
 /// Open the Agent in `dir`: restore it if it was saved, create and install it if not.
+///
+/// A restart attaches the package the runtime's saved state has installed, which after a switch
+/// is not the `--actor` package but a version found in the code cache `held` (`T-037-21`,
+/// [`crate::restart`]); and it stages again the versions the Agent's hot row names, so the start
+/// check the core runs when it opens finds them. `held` is `None` when the host has no code cache
+/// (no `--code-config`, or `restore`).
 pub fn open_port(
     runtime_pvm: &[u8],
     actor_package: &[u8],
     keys: &AgentKeys,
     dir: &Path,
+    genesis_code: Option<[u8; 32]>,
+    held: Option<&crate::code_source::Fetcher>,
 ) -> Result<Persisting, String> {
     let pkg = package::admit_actor(actor_package).map_err(|e| format!("actor package: {e:?}"))?;
     let mut rt = Runtime::create(runtime_pvm, keys).map_err(|e| format!("runtime: {e:?}"))?;
-    let actor = match Saved::load(dir)? {
-        Some(s) => {
-            rt.restore(s.state, s.linear, s.control, s.slot);
-            rt.attach(&pkg, ACTOR_NAME, None)
-                .map_err(|e| format!("attach: {e:?}"))?
+    let (actor, attached) = match Saved::load(dir)? {
+        Some(saved) => {
+            rt.restore(saved.state, saved.linear, saved.control, saved.slot);
+            crate::restart::attach_installed(
+                &mut Attaching(&mut rt),
+                actor_package,
+                held.map(|f| f as &dyn crate::restart::Held),
+            )?
         }
-        None => rt
-            .install(&pkg, ACTOR_NAME, None)
-            .map_err(|e| format!("install: {e:?}"))?,
+        None => (
+            rt.install(&pkg, ACTOR_NAME, None)
+                .map_err(|e| format!("install: {e:?}"))?,
+            actor_package.to_vec(),
+        ),
     };
     let mut vos = VosPort::new(rt, actor, DRIVER);
     vos.keep_samples(false);
+    // `switch(H, n)` (`T-037-14`): the port tracks the code it runs, so the driver's check before
+    // every send recognises what is attached as already running, and the genesis code is kept to
+    // be installed again after a way out. Versions staged for an upgrade arrive with `T-037-04`
+    // and `T-037-06`, and stay in memory: a restart stages again the ones the book names
+    // (`T-037-21`). A book whose genesis names no code tracks none.
+    if let Some(h0) = genesis_code {
+        crate::restart::track_and_restage(
+            &mut vos,
+            ACTOR_NAME,
+            h0,
+            actor_package,
+            &attached,
+            runtime_pvm,
+            held.map(|f| f as &dyn core_binding::staging::CodeFetch),
+        )?;
+    }
     let mut port = Persisting::new(vos, dir.to_path_buf());
     port.save().map_err(|e| format!("{e:?}"))?;
     Ok(port)
@@ -367,6 +461,9 @@ pub struct Setup {
     pub runtime: Vec<u8>,
     /// The actor package.
     pub actor: Vec<u8>,
+    /// The genesis code version the start check verified the package and the runtime against
+    /// (`F-036`), if the chainspec names one: the code the port tracks as running (`T-037-14`).
+    pub genesis_code: Option<[u8; 32]>,
 }
 
 /// Read the arguments both commands share (`--config`, `--runtime`, `--actor`, `--state`,
@@ -412,6 +509,7 @@ pub fn setup(args: &[String]) -> Result<Setup, String> {
     let actor = fs::read(need(args, "--actor")?).map_err(|e| format!("actor: {e}"))?;
     // F-036, amendment 0023: the chainspec's genesis code. A founding (no replica yet) checks this
     // executable too, since it builds the genesis natively; a restart checks the Agent's code.
+    let mut genesis_code = None;
     if let Some(spec) = founding.genesis.spec.as_deref() {
         let which = if dir.join("replica").exists() {
             crate::code::Check::Agent
@@ -419,6 +517,7 @@ pub fn setup(args: &[String]) -> Result<Setup, String> {
             crate::code::Check::Founding
         };
         if let Some(h0) = crate::code::check(args, spec, Some(&actor), Some(&runtime), which)? {
+            genesis_code = Some(h0);
             let what = match which {
                 crate::code::Check::Founding => "this executable, the package and the runtime are",
                 crate::code::Check::Agent => "the package and the runtime are",
@@ -437,6 +536,7 @@ pub fn setup(args: &[String]) -> Result<Setup, String> {
         dir,
         runtime,
         actor,
+        genesis_code,
     })
 }
 
@@ -463,7 +563,8 @@ fn archiver_config(args: &[String]) -> Result<ArchiverConfig, String> {
 
 /// `serve --config <file> --runtime <runtime.pvm> --actor <actor.vos> --state <dir>
 /// [--chainspec <file> [--genesis-manifest <file>] [--unnamed-code]] [--budget <bytes>] [--batch <inputs>] [--replica-in-memory] [--archive <spec>
-/// [--archive-interval-ms <ms>] [--checkpoint-every <inputs>] [--checkpoint-every-secs <s>]]`.
+/// [--archive-interval-ms <ms>] [--checkpoint-every <inputs>] [--checkpoint-every-secs <s>]]
+/// [--code-config <file>]`.
 /// `--batch` is the most inputs one invocation carries (`T-031-03`); it overrides the
 /// configuration's `core_batch`, and 1 is one input per invocation. The replica's stores are under
 /// `<dir>/replica/` (`T-031-14`) unless `--replica-in-memory`; `--replica-on-disk`, the default, is
@@ -477,6 +578,7 @@ pub fn serve(args: &[String]) -> Result<(), String> {
         dir,
         runtime,
         actor,
+        genesis_code,
     } = setup(args)?;
     let path = need(args, "--config")?;
     // F-038: the socket (`core_endpoint`), the stream (`stream.dial`), or both at once during the
@@ -543,7 +645,28 @@ pub fn serve(args: &[String]) -> Result<(), String> {
         .map(|spec| core_archive::open(&spec, Access::Write))
         .transpose()?;
     let pacing = archiver_config(args)?;
-    let port = open_port(&runtime, &actor, &keys, &dir)?;
+    // T-037-06: where an `Upgrade`'s code is fetched from. Read before anything starts, so a
+    // misconfiguration fails the start; without `--code-config` the node has no source of code and
+    // every `Upgrade` is refused, as before.
+    let code_source = crate::code_source::from_args(args, &dir)?;
+    let port = open_port(
+        &runtime,
+        &actor,
+        &keys,
+        &dir,
+        genesis_code,
+        code_source.as_deref(),
+    )
+    .map_err(|e| {
+        if code_source.is_none() && e.starts_with(crate::restart::NOT_FOUND) {
+            format!(
+                "{e}. Start with --code-config naming the cache that holds the versions it \
+                 switched to (T-037-21)"
+            )
+        } else {
+            e
+        }
+    })?;
     // T-031-14, T-032-15: the replica's stores under the state directory, each with a bounded
     // cache, rebuilt from the log on every start. The default since the 2 h soak of 2026-10-04 on
     // the fleet (run 37192755903): every bound held, and the core host grew 0.46 → 0.65 GB, against
@@ -621,6 +744,13 @@ pub fn serve(args: &[String]) -> Result<(), String> {
             }
         }
     }
+    if let Some(source) = code_source {
+        core.set_code_source(source)?;
+        eprintln!(
+            "aledgent-core-host: code source: an Upgrade's code is fetched from the cache and the \
+             sources of --code-config, each answer checked by length and hash (T-037-06)"
+        );
+    }
     crate::diag::start(core.stats(), dir.clone());
     // The actor gas this host's VOS gives one invocation bounds the batch too.
     core.set_batch_limits(
@@ -670,14 +800,34 @@ fn open_core<L: core_binding::core::HostLog>(
     match audit {
         Some(section) => {
             let sink = section.open(dir)?;
-            AgentCore::open_audited(
+            let core = AgentCore::open_audited(
                 port,
                 founding,
                 log,
                 stores,
                 Box::new(sink),
                 section.max_unshipped(),
-            )
+            )?;
+            // What the core refuses without the book (the fence, `T-037-15`) is audited beside
+            // the book's trail. An audit side file never keeps the core down (review of #44, F3):
+            // whatever it holds, the core starts, says what it found, and the fence still refuses.
+            match section.open_node_trail(dir) {
+                Ok(trail) => {
+                    let damage = trail.damage();
+                    if damage.any() {
+                        eprintln!(
+                            "aledgent-core-host: WARNING: the audit store's node trail was \
+                             damaged and opened past it: {damage:?}"
+                        );
+                    }
+                    core.set_node_trail(trail);
+                }
+                Err(e) => eprintln!(
+                    "aledgent-core-host: WARNING: the audit store's node trail does not open \
+                     ({e}); a refusal by the fence is audited on standard error only"
+                ),
+            }
+            Ok(core)
         }
         None => {
             eprintln!(
@@ -751,6 +901,7 @@ pub fn restore(args: &[String]) -> Result<(), String> {
         dir,
         runtime,
         actor,
+        genesis_code,
         ..
     } = setup(args)?;
     let plan_path = dir.join(core_archive::RESTORE_FILE);
@@ -766,7 +917,16 @@ pub fn restore(args: &[String]) -> Result<(), String> {
         ));
     }
     let started = std::time::Instant::now();
-    let port = open_port(&runtime, &actor, &keys, &dir)?;
+    let port = open_port(&runtime, &actor, &keys, &dir, genesis_code, None).map_err(|e| {
+        if e.starts_with(crate::restart::NOT_FOUND) {
+            format!(
+                "{e}. A restore across an upgrade is not supported yet (T-037-09): restore from a \
+                 checkpoint taken before the switch"
+            )
+        } else {
+            e
+        }
+    })?;
     let entries = FileLog::open(&dir)?.entries()?;
     let stores = ReplicaStores::Disk {
         dir: dir.join("replica"),

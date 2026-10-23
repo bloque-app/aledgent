@@ -27,7 +27,11 @@
 //!
 //! A call that fails says whether the input may have run ([`CoreError::Ambiguous`]) or certainly
 //! did not ([`CoreError::Unavailable`]). The forwarder treats both the same way: it retries the
-//! identical input until the core answers (`REQ-CS-7`).
+//! identical input until the core answers (`REQ-CS-7`). A third answer, [`CoreError::NotRun`], is
+//! the core's definite statement that it holds no decision for the input and refused it because of
+//! the fence (amendment 0036): it also says that no earlier copy of the input was committed, which
+//! `Unavailable` does not, and it is what lets the sequenced forwarder give the input's feed
+//! sequence back (`F-038` §3).
 //!
 //! Every type that crosses the boundary is serialisable, so an implementation behind a network
 //! call (a VOS Agent's HTTP ingress) carries the same values an in-process one does. This crate
@@ -197,6 +201,20 @@ pub struct CoreReply {
     pub outcome: Outcome,
 }
 
+/// What staging a code version came to (`T-037-04`, [`Core::stage_code`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "staged", rename_all = "snake_case")]
+pub enum Staged {
+    /// The code version's manifest and artefacts were fetched and checked, and are held for the
+    /// switch.
+    Staged,
+    /// They were not: nothing was kept. `reason` is for the operator's log, never a client's body.
+    Refused {
+        /// Why.
+        reason: String,
+    },
+}
+
 /// Why a call into the core did not answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CoreError {
@@ -205,6 +223,13 @@ pub enum CoreError {
     /// The call failed in a way that does not prove the input did not run (a 503 or a 504 from a
     /// VOS ingress, a dropped connection). Retry the identical input.
     Ambiguous,
+    /// The core refused the input because of the fence (`REQ-RT-20`) and holds no decision for it:
+    /// nothing was committed and the input number was not taken, and the record of replies, read
+    /// first, has none for this input. Given for nothing else, and never for an input the core
+    /// decided (amendment 0036, N1 to N3). A core answers every input of a call from the first
+    /// one it refused to the end this way, since it takes inputs in order. To a caller that does
+    /// not give sequences back, it is `Unavailable`.
+    NotRun,
 }
 
 /// One notification in the core's outbox.
@@ -334,6 +359,14 @@ pub enum Query {
         /// The identity.
         identity: String,
     },
+    /// Whether the caller may now put the writer's code in hand (`T-037-04`, `REQ-RT-16`,
+    /// `REQ-RT-18`): the core answers with the authority function the matching input is decided
+    /// with. Ingress asks at the door of the code routes, to stage code and to give a way out
+    /// priority only for an authorised caller; the writer decides the input all the same.
+    CodeAuthority {
+        /// Which input: `upgrade`, or `way_out`.
+        input: String,
+    },
 }
 
 /// A query's answer.
@@ -404,6 +437,11 @@ pub enum QueryReply {
     Account(crate::wire::AccountViewBody),
     /// `grants(identity)` (amendment 0026).
     IdentityGrants(crate::wire::IdentityGrantsBody),
+    /// Whether the caller may put the writer's code in hand (`T-037-04`).
+    CodeAuthority {
+        /// It may.
+        authorised: bool,
+    },
 }
 
 /// One working credential, as ingress needs it to authenticate a caller (`F-028`): the identity it
@@ -440,8 +478,8 @@ pub trait Core: Send + Sync + 'static {
 
     /// Apply several inputs in order, as [`Core::apply`] applies each (`T-031-04`, `REQ-CS-7`):
     /// one answer per input, in order. An input never runs before the ones ahead of it: once one
-    /// fails, every later one answers [`CoreError::Unavailable`] without running, and the caller
-    /// retries from the first failure. A core that batches its own work (the core Agent, `F-031`)
+    /// fails, every later one answers [`CoreError::Unavailable`] (or [`CoreError::NotRun`], after
+    /// one that did) without running, and the caller retries from the first failure. A core that batches its own work (the core Agent, `F-031`)
     /// overrides this; the default applies them one by one.
     fn apply_batch(
         &self,
@@ -457,7 +495,11 @@ pub trait Core: Send + Sync + 'static {
                     break;
                 }
             }
-            out.resize(inputs.len(), Err(CoreError::Unavailable));
+            let rest = match out.last() {
+                Some(Err(CoreError::NotRun)) => CoreError::NotRun,
+                _ => CoreError::Unavailable,
+            };
+            out.resize(inputs.len(), Err(rest));
             out
         }
     }
@@ -511,6 +553,23 @@ pub trait Core: Send + Sync + 'static {
     /// it stays `true`.
     fn genesis_open(&self) -> impl Future<Output = Result<bool, CoreError>> + Send {
         async { Ok(true) }
+    }
+
+    /// Fetch the code version `code` (its manifest and artefacts) from the node's sources, check
+    /// everything, and hold it for the switch (`T-037-04`, `REQ-RT-16`, `REQ-RT-20`): what the
+    /// execution node does **before** an `Upgrade` naming `code` is logged. The default stages
+    /// nothing: a core that is not a node driving a writer's code (the in-process core, a test's)
+    /// refuses, so that no upgrade is logged that no node has staged.
+    fn stage_code(
+        &self,
+        code: &[u8; 32],
+    ) -> impl Future<Output = Result<Staged, CoreError>> + Send {
+        let _ = code;
+        async {
+            Ok(Staged::Refused {
+                reason: "this core stages no code".to_owned(),
+            })
+        }
     }
 
     /// Take a sequenced, signed feed (`F-038`, [`crate::feed`]). The default is a core no link

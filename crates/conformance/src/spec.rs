@@ -541,12 +541,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_catalogue_holds_25_invariants_41_errors_and_the_v0_acceptance_criteria() {
+    fn the_catalogue_holds_25_invariants_42_errors_and_the_v0_acceptance_criteria() {
         let c = parse_spec(SPEC_MD).unwrap();
         assert_eq!(c.invariants.len(), 25);
         // Amendment 0021 added ERR-MalformedCommand, amendment 0022 (draft) ERR-InitialStateNotSealed,
-        // amendment 0024 ERR-IdentifierArchived.
-        assert_eq!(c.errors.len(), 41);
+        // amendment 0024 ERR-IdentifierArchived, amendment 0037 ERR-CommandApprovalRequired.
+        assert_eq!(c.errors.len(), 42);
         // 164 criteria in §6 (amendment 0006 added AC-K1.3 and AC-K2.3,
         // amendment 0008 AC-M5.1, amendment 0010 AC-N1.1 to AC-N1.4,
         // amendment 0011 AC-F5.1 to AC-F5.5 and AC-M2.4, amendment 0012
@@ -555,9 +555,9 @@ mod tests {
         // AC-K6.1 to AC-K6.3, and amendment 0020 AC-B3.4, AC-M7.1 to AC-M7.4,
         // AC-M8.1 to AC-M8.4, and amendment 0019 AC-J1.5, and amendment 0022 (draft) AC-N2.1 to
         // AC-N2.5, and amendment 0023 AC-K7.1 to AC-K7.8, and amendment 0031 AC-E4.3 and AC-E4.4,
-        // and amendment 0033 AC-K7.9 to AC-K7.20), less the 12 of US-C5, US-G4, US-I2,
+        // and amendment 0033 AC-K7.9 to AC-K7.20, and amendment 0037 AC-A10.1 to AC-A10.16), less the 12 of US-C5, US-G4, US-I2,
         // US-I3 and US-J2, which §15 puts beyond V0.
-        assert_eq!(c.acceptance.len(), 179);
+        assert_eq!(c.acceptance.len(), 195);
         for beyond in ["US-C5", "US-F2", "US-G4", "US-I2", "US-I3", "US-J2"] {
             assert!(c.acceptance.iter().all(|a| a.story != beyond), "{beyond}");
         }

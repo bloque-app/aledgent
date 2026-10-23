@@ -791,6 +791,8 @@ layout survives code upgrades and a reader needs no metadata.
 | `bound[asset]` | `07000000` ++ `FungibleAssetLocation` | `u64` (the inbox position of the asset's `Bound` entry) | an applied bind (decision 24); never removed |
 | `latest_anchor` | `08000000` | `LatestAnchor { number: u64, commitment, at: u32, seq: u64 }` | an applied anchor, overwriting it in place; the migration's start (decision 25) |
 | `anchor_migration` | `09000000` | `AnchorMigration { next: u64, end: u64 }` | the migration, while it runs; removed when it ends (decision 26) |
+| `anchor_epoch` | `0a000000` | `AnchorEpoch { epoch: u32, base: u64, from_seq: u64, at: u32, book: [u8; 32], previous: Option<LatestAnchor> }` | `set_anchor_head`, overwritten by each later one; absent for the instance's first sequence (amendment 0039, `T-026-10`) |
+| `governance` | `0b000000` | `AccountId` | `set_governance` (amendment 0039, `T-026-10`) |
 
 `InboxEvent` is `Deposited { from, account_ref, asset, amount }` (0), `Withdrawn { operation_ref,
 to, asset, amount }` (1), `Anchored { operation_ref, number, commitment }` (2), `Refused {

@@ -31,6 +31,7 @@ pub mod f028;
 pub mod f029;
 pub mod f036;
 pub mod f037;
+pub mod f040;
 
 use crate::case::Case;
 
@@ -56,6 +57,7 @@ const TABLES: &[&[Case]] = &[
     f029::CASES,
     f036::CASES,
     f037::CASES,
+    f040::CASES,
 ];
 
 /// Every registered case.

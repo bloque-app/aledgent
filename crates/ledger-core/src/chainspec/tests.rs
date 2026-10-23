@@ -245,8 +245,21 @@ fn a0023_the_header_names_the_genesis_code() {
         a.seed
             .clone()
             .with_code(GenesisCode {
-                manifest,
+                manifest: manifest.clone(),
                 construction: 1,
+            })
+            .unwrap_err(),
+        SpecError::Code
+    );
+    // T-037-01: the genesis code is H₀, generation 0; a later generation is not a genesis's.
+    let mut later = manifest;
+    later.generation = 1;
+    assert_eq!(
+        a.seed
+            .clone()
+            .with_code(GenesisCode {
+                manifest: later,
+                construction: 2,
             })
             .unwrap_err(),
         SpecError::Code
@@ -310,4 +323,44 @@ fn chain_balance_authority_the_header_commits_the_reconciliation_journal() {
         journal.clone().with_reconcile([0xC1; 32]).digest(),
         journal.digest()
     );
+}
+
+fn unhex(s: &str) -> Vec<u8> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+/// Review of #36 (`T-037-01`): a format-4 chainspec, written by the build before amendment 0033's
+/// manifest, still decodes in every path that only reads one. Its digest and commitment are the
+/// ones that build computed (so a running book's genesis still matches it), its *H₀* is the one
+/// its header named, it re-encodes to its own bytes, and its genesis replays into the same facts.
+#[test]
+fn t037_01_a_format_4_chainspec_is_still_read() {
+    use super::fixture_v4::{BYTES, CHUNKS, DIGEST, H0};
+    let bytes = unhex(BYTES);
+    let spec = ChainSpec::from_bytes(&bytes).unwrap();
+    assert_eq!(spec.header().version, SPEC_VERSION_V4);
+    assert!(spec.header().code.is_none());
+    let code = spec.header().code_v4.as_ref().expect("its genesis code");
+    assert_eq!(code.version().to_vec(), unhex(H0));
+    assert_eq!(spec.header().genesis_code(), Some((code.version(), 2)));
+    let c = spec.commitment();
+    assert_eq!(c.digest.to_vec(), unhex(DIGEST));
+    assert_eq!(c.chunks, CHUNKS);
+    assert_eq!(spec.to_bytes(), bytes);
+    // Its chunks prove against its commitment, as genesis's chunks are checked.
+    for (i, chunk) in spec.chunk_bytes().iter().enumerate() {
+        let path = merkle::path(NODE_DOMAIN, &spec.leaves(), i).unwrap();
+        assert!(chunk_in_spec(&c, i as u32, chunk, &path));
+    }
+    // The format this build writes is 5, and a format it does not know is refused.
+    assert_eq!(small().seed.header().version, SPEC_VERSION);
+    // The header's version follows the file's magic.
+    let at = FILE_MAGIC.len();
+    assert_eq!(bytes[at..at + 2], SPEC_VERSION_V4.to_be_bytes());
+    let mut other = bytes.clone();
+    other[at..at + 2].copy_from_slice(&6u16.to_be_bytes());
+    assert!(ChainSpec::from_bytes(&other).is_err());
 }

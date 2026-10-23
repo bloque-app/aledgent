@@ -23,7 +23,11 @@
 //! - `anchors[number]` (**legacy**): `k = 03000000 ‖ number (u64 LE)` → `{ commitment, at: u32,
 //!   seq: u64 }`, every anchor by number, as the code before 2026-10-11 kept them; present on a
 //!   deployment of that code until its migration removes them;
-//! - `registration`: `k = 01000000` → `{ admin, keys, attestation_key: Option<[u8; 32]> }`
+//! - `registration`: `k = 01000000` → `{ admin, keys, attestation_key: Option<[u8; 32]> }`;
+//! - `anchor_epoch`: `k = 0a000000` → `{ epoch: u32, base: u64, from_seq: u64, at: u32, book:
+//!   [u8; 32], previous: Option<latest anchor> }`, the anchor sequence governance started last
+//!   (amendment 0039 `[PENDING AMENDMENT 0039]`), overwritten by each later start; absent on an
+//!   instance that was never reset
 //!
 //! read with `childstate_getStorage`, which a node serves; a light client does not (smoldot
 //! 0.19 answers "not implemented"), so the contract venue needs a node's RPC.
@@ -37,6 +41,21 @@
 //! archive node). A node that has discarded it answers with an error, reported as unreadable,
 //! never as a missing anchor.
 //!
+//! **After a reset** (amendment 0039) anchor numbers start again above a base, so "the first block
+//! that holds this number or a later one" no longer names one anchor: two books can each hold an
+//! anchor of the number. [`find_contract_anchors`] reads `anchor_epoch` at the finalized head and
+//! searches each [`Sequence`] only within its own blocks, from the block that started it to the
+//! block before the next one started, where the search is monotonic again. A sequence is a
+//! candidate for a number only if its numbers run past it (`base < number ≤ its last anchor`), so
+//! every candidate holds exactly one anchor of the number and the disclosure's commitment decides
+//! which one it is ([`crate::check`]). What it can read:
+//!
+//! - **from current state alone** (any node): the current sequence's latest anchor, and the last
+//!   anchor of the book before it, which the reset keeps in `anchor_epoch.previous`;
+//! - **with past state** (an archive node): every other anchor of every sequence, and the earlier
+//!   sequences' records (`anchor_epoch` read at the block before each reset). Without it, those
+//!   are reported unread ([`Unread`]), never missing and never another book's.
+//!
 //! The block number is the runtime's; Kreivo's is `u32`. Any node of the network will do: the read
 //! is taken at the head the node reports as finalized, so an anchor that is not final is reported
 //! missing (`REQ-PR-8`).
@@ -48,7 +67,7 @@ use alloc::vec::Vec;
 use serde_json::{Value, json};
 use twox_hash::XxHash64;
 
-use crate::source::{AnchorSource, PublicAnchor, Venue};
+use crate::source::{AnchorSource, NumberedAnchors, PublicAnchor, Sequence, Unread, Venue};
 
 /// The pallet's name in the runtime (`construct_runtime`): Kreivo's patch names it so.
 pub const PALLET: &str = "AledgentSettlement";
@@ -67,6 +86,10 @@ pub const CONTRACT_INBOX: [u8; 4] = [4, 0, 0, 0];
 
 /// The settlement contract's root key of `latest_anchor` (`ManualKey<0x0000_0008>`, LE).
 pub const CONTRACT_LATEST_ANCHOR: [u8; 4] = [8, 0, 0, 0];
+
+/// The settlement contract's root key of `anchor_epoch` (`ManualKey<0x0000_000A>`, LE; amendment
+/// 0039).
+pub const CONTRACT_ANCHOR_EPOCH: [u8; 4] = [0x0A, 0, 0, 0];
 
 /// `blake2_128(data)`.
 pub fn blake2_128(data: &[u8]) -> [u8; 16] {
@@ -116,6 +139,11 @@ pub fn contract_latest_anchor_key() -> Vec<u8> {
     contract_item_key(&CONTRACT_LATEST_ANCHOR)
 }
 
+/// The child-trie key of the contract's `anchor_epoch`.
+pub fn contract_anchor_epoch_key() -> Vec<u8> {
+    contract_item_key(&CONTRACT_ANCHOR_EPOCH)
+}
+
 /// The child-trie key of the contract's `inbox[seq]`.
 pub fn contract_inbox_key(seq: u64) -> Vec<u8> {
     let mut k = CONTRACT_INBOX.to_vec();
@@ -151,6 +179,44 @@ pub fn decode_contract_latest_anchor(bytes: &[u8]) -> Option<ContractLatestAncho
     })
 }
 
+/// The anchor sequence governance started last on a contract, as stored (amendment 0039).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContractAnchorEpoch {
+    /// The sequence's number, 1 for the first one governance starts.
+    pub epoch: u32,
+    /// The number it starts after.
+    pub base: u64,
+    /// The inbox position of its first entry: every entry from here on was written in it.
+    pub from_seq: u64,
+    /// The block that started it.
+    pub at: u64,
+    /// The name of the book it anchors.
+    pub book: [u8; 32],
+    /// The latest anchor before it started: the previous sequence's, or one an earlier sequence
+    /// carried forward if the previous one never anchored.
+    pub previous: Option<ContractLatestAnchor>,
+}
+
+/// Decode a stored contract `AnchorEpoch { epoch: u32, base: u64, from_seq: u64, at: u32, book,
+/// previous: Option<LatestAnchor> }`: 57 bytes, or 109 with a previous anchor.
+pub fn decode_contract_anchor_epoch(bytes: &[u8]) -> Option<ContractAnchorEpoch> {
+    let previous = match (bytes.len(), bytes.get(56)) {
+        (57, Some(0)) => None,
+        (109, Some(1)) => Some(decode_contract_latest_anchor(&bytes[57..])?),
+        _ => return None,
+    };
+    let mut book = [0u8; 32];
+    book.copy_from_slice(&bytes[24..56]);
+    Some(ContractAnchorEpoch {
+        epoch: u32::from_le_bytes(bytes[..4].try_into().ok()?),
+        base: u64::from_le_bytes(bytes[4..12].try_into().ok()?),
+        from_seq: u64::from_le_bytes(bytes[12..20].try_into().ok()?),
+        at: u64::from(u32::from_le_bytes(bytes[20..24].try_into().ok()?)),
+        book,
+        previous,
+    })
+}
+
 /// Decode a stored contract inbox entry if it is `Anchored`: `{ at: u32, 02 ‖ operation_ref ‖
 /// number (u64 LE) ‖ commitment }`. Returns the number, the commitment and the block.
 pub fn decode_contract_anchored_entry(bytes: &[u8]) -> Option<(u64, [u8; 32], u64)> {
@@ -182,12 +248,18 @@ enum AtBlock {
     Superseded { latest_seq: u64 },
 }
 
+/// What the contract holds about anchor `number` at `block`. `legacy`: whether the records the code
+/// before 2026-10-11 kept by number count, which they do only in the instance's first sequence.
 fn contract_at_block<R: ContractReader + ?Sized>(
     r: &R,
     block: u64,
     number: u64,
+    legacy_counts: bool,
 ) -> Result<AtBlock, String> {
     let legacy = || -> Result<Option<([u8; 32], u64)>, String> {
+        if !legacy_counts {
+            return Ok(None);
+        }
         match r.item_at(block, &contract_anchor_key(number))? {
             None => Ok(None),
             Some(raw) => decode_contract_anchor(&raw)
@@ -231,7 +303,7 @@ pub fn find_contract_anchor<R: ContractReader + ?Sized>(
     finalized: u64,
     number: u64,
 ) -> Result<Option<([u8; 32], u64)>, String> {
-    match contract_at_block(r, finalized, number)? {
+    match contract_at_block(r, finalized, number, true)? {
         AtBlock::Anchor(c, at) => return Ok(Some((c, at))),
         AtBlock::NotYet => return Ok(None),
         AtBlock::Superseded { .. } => {}
@@ -239,7 +311,7 @@ pub fn find_contract_anchor<R: ContractReader + ?Sized>(
     let (mut lo, mut hi) = (0u64, finalized);
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        let at = contract_at_block(r, mid, number)
+        let at = contract_at_block(r, mid, number, true)
             .map_err(|e| format!("anchor {number} is no longer the latest; reading it at block {mid} (it needs a node that keeps past state): {e}"))?;
         if at == AtBlock::NotYet {
             lo = mid + 1;
@@ -247,38 +319,239 @@ pub fn find_contract_anchor<R: ContractReader + ?Sized>(
             hi = mid;
         }
     }
-    match contract_at_block(r, hi, number)? {
+    match contract_at_block(r, hi, number, true)? {
         AtBlock::Anchor(c, at) => Ok(Some((c, at))),
         AtBlock::NotYet => Err(format!(
             "anchor {number}: no block holds it, yet a later one does"
         )),
-        AtBlock::Superseded { latest_seq } => {
-            // Every entry written in block `hi`, from the latest's down: several extrinsics of
-            // that block (other batches, deposits) may lie between the two anchors.
-            let mut seq = latest_seq;
-            while let Some(below) = seq.checked_sub(1) {
-                seq = below;
-                let Some(raw) = r.item_at(hi, &contract_inbox_key(seq))? else {
-                    break;
-                };
-                let written_at = raw
-                    .get(..4)
-                    .and_then(|b| b.try_into().ok())
-                    .map(|b| u64::from(u32::from_le_bytes(b)));
-                if written_at != Some(hi) {
-                    break;
-                }
-                if let Some((n, c, at)) = decode_contract_anchored_entry(&raw) {
-                    if n == number {
-                        return Ok(Some((c, at)));
-                    }
-                }
+        AtBlock::Superseded { latest_seq } => in_block_inbox(r, hi, latest_seq, number).map(Some),
+    }
+}
+
+/// Anchor `number`'s `Anchored` entry among those written in `block` below inbox position
+/// `above`: several extrinsics of that block (other batches, deposits) may lie between it and the
+/// anchor that superseded it in the same block.
+fn in_block_inbox<R: ContractReader + ?Sized>(
+    r: &R,
+    block: u64,
+    above: u64,
+    number: u64,
+) -> Result<([u8; 32], u64), String> {
+    let mut seq = above;
+    while let Some(below) = seq.checked_sub(1) {
+        seq = below;
+        let Some(raw) = r.item_at(block, &contract_inbox_key(seq))? else {
+            break;
+        };
+        let written_at = raw
+            .get(..4)
+            .and_then(|b| b.try_into().ok())
+            .map(|b| u64::from(u32::from_le_bytes(b)));
+        if written_at != Some(block) {
+            break;
+        }
+        if let Some((n, c, at)) = decode_contract_anchored_entry(&raw) {
+            if n == number {
+                return Ok((c, at));
             }
-            Err(format!(
-                "anchor {number}: superseded in block {hi}, and its entry is not in that block's inbox"
-            ))
         }
     }
+    Err(format!(
+        "anchor {number}: superseded in block {block}, and its entry is not in that block's inbox"
+    ))
+}
+
+/// Anchor `number` of one sequence, which holds it: the sequence ran over blocks `from..=to` and
+/// its last anchor (within them, or stored in the block after `to`, the reset's own, before the
+/// reset) is `last`, numbered `number` or above.
+///
+/// Within one sequence numbers only rise, so the search of [`find_contract_anchor`] holds there:
+/// the first block of the range at which the sequence's latest anchor is `number` or later. If no
+/// block of the range is, the anchor was stored and superseded in `last`'s own block, after `to`,
+/// and is read from that block's inbox.
+fn find_in_sequence<R: ContractReader + ?Sized>(
+    r: &R,
+    from: u64,
+    to: u64,
+    last: &ContractLatestAnchor,
+    number: u64,
+    legacy: bool,
+) -> Result<([u8; 32], u64), String> {
+    if number == last.number {
+        return Ok((last.commitment, last.at));
+    }
+    let past = |block: u64| {
+        contract_at_block(r, block, number, legacy).map_err(|e| {
+            format!(
+                "anchor {number} is no longer its sequence's latest; reading it at block {block} \
+                 (it needs a node that keeps past state): {e}"
+            )
+        })
+    };
+    let end = last.at.min(to);
+    if from > end || past(end)? == AtBlock::NotYet {
+        return in_block_inbox(r, last.at, last.seq, number);
+    }
+    let (mut lo, mut hi) = (from, end);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if past(mid)? == AtBlock::NotYet {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    match past(hi)? {
+        AtBlock::Anchor(c, at) => Ok((c, at)),
+        AtBlock::NotYet => Err(format!(
+            "anchor {number}: no block holds it, yet a later one does"
+        )),
+        AtBlock::Superseded { latest_seq } => in_block_inbox(r, hi, latest_seq, number),
+    }
+}
+
+/// Every anchor numbered `number` of a settlement contract, as final at block `finalized`, one per
+/// anchor sequence that used the number (amendment 0039), and what could not be read.
+///
+/// An instance that was never reset (no `anchor_epoch`) has one sequence, read exactly as
+/// [`find_contract_anchor`] reads it. Otherwise each sequence is searched within its own blocks
+/// (module documentation): the current one from the block that started it to `finalized`, each
+/// earlier one from its start to the block before the next one started, its last anchor being the
+/// `previous` the next one's record kept (when that anchor was written in it: at or after its
+/// `from_seq`). Earlier sequences' records are read at the block before each reset; a node that
+/// keeps no past state leaves them, and the anchors that are not a sequence's last, unread.
+pub fn find_contract_anchors<R: ContractReader + ?Sized>(
+    r: &R,
+    finalized: u64,
+    number: u64,
+) -> Result<NumberedAnchors, String> {
+    let Some(raw) = r.item_at(finalized, &contract_anchor_epoch_key())? else {
+        return find_contract_anchor(r, finalized, number).map(|found| {
+            NumberedAnchors::first_sequence(found.map(|(commitment, stored_at)| PublicAnchor {
+                commitment,
+                stored_at,
+                read_at: finalized,
+            }))
+        });
+    };
+    let current = decode_contract_anchor_epoch(&raw)
+        .ok_or("the contract's anchor sequence record does not decode")?;
+    let mut out = NumberedAnchors {
+        current_epoch: current.epoch,
+        found: Vec::new(),
+        unread: Vec::new(),
+    };
+    let search = |sequence: Sequence,
+                  from: u64,
+                  to: u64,
+                  last: Option<ContractLatestAnchor>,
+                  out: &mut NumberedAnchors| {
+        let Some(last) = last else { return };
+        if number <= sequence.base || number > last.number {
+            return;
+        }
+        match find_in_sequence(r, from, to, &last, number, sequence.epoch == 0) {
+            Ok((commitment, stored_at)) => out.found.push((
+                sequence,
+                PublicAnchor {
+                    commitment,
+                    stored_at,
+                    read_at: finalized,
+                },
+            )),
+            Err(why) => out.unread.push(Unread::Anchor { sequence, why }),
+        }
+    };
+    // The current sequence: its latest in place, never a legacy record.
+    let latest = match r.item_at(finalized, &contract_latest_anchor_key())? {
+        None => None,
+        Some(raw) => Some(
+            decode_contract_latest_anchor(&raw)
+                .ok_or("the contract's latest anchor does not decode")?,
+        ),
+    };
+    search(
+        Sequence {
+            epoch: current.epoch,
+            base: current.base,
+            book: Some(current.book),
+        },
+        current.at,
+        finalized,
+        latest,
+        &mut out,
+    );
+    // The earlier ones, latest first. `next` started the sequence after the one looked at.
+    let mut next = current;
+    while let Some(epoch) = next.epoch.checked_sub(1) {
+        let this = if epoch == 0 {
+            ContractAnchorEpoch {
+                epoch: 0,
+                base: 0,
+                from_seq: 0,
+                at: 0,
+                book: [0; 32],
+                previous: None,
+            }
+        } else {
+            let read = next
+                .at
+                .checked_sub(1)
+                .ok_or_else(|| "a reset at block 0".to_string())
+                .and_then(|before| {
+                    let raw = r.item_at(before, &contract_anchor_epoch_key())?;
+                    match raw.as_deref() {
+                        None => Err(format!(
+                            "no sequence record (`anchor_epoch`) is stored at block {before}, the \
+                             block before sequence {} started",
+                            next.epoch
+                        )),
+                        Some(bytes) => match decode_contract_anchor_epoch(bytes) {
+                            None => Err(format!(
+                                "the sequence record stored at block {before} ({} bytes) does not \
+                                 decode as an `AnchorEpoch`",
+                                bytes.len()
+                            )),
+                            Some(e) if e.epoch == epoch => Ok(e),
+                            Some(e) => Err(format!(
+                                "block {before} holds sequence {}'s record, not sequence {epoch}'s \
+                                 (two resets in one block?)",
+                                e.epoch
+                            )),
+                        },
+                    }
+                });
+            match read {
+                Ok(this) => this,
+                Err(why) => {
+                    out.unread.push(Unread::Before {
+                        epoch: next.epoch,
+                        last_anchor: next.previous.map(|p| p.number),
+                        why: format!(
+                            "reading the anchor sequences before {} (it needs a node that keeps \
+                             past state): {why}",
+                            next.epoch
+                        ),
+                    });
+                    break;
+                }
+            }
+        };
+        let last = next.previous.filter(|p| p.seq >= this.from_seq);
+        search(
+            Sequence {
+                epoch,
+                base: this.base,
+                book: (epoch > 0).then_some(this.book),
+            },
+            this.at,
+            next.at.saturating_sub(1),
+            last,
+            &mut out,
+        );
+        next = this;
+    }
+    Ok(out)
 }
 
 /// Decode a stored contract `AnchorRecord { commitment, at: u32, seq: u64 }` (legacy): the
@@ -517,32 +790,39 @@ impl ContractReader for RpcContract<'_> {
 
 impl AnchorSource for RpcAnchors {
     fn anchor(&self, venue: &Venue, number: u64) -> Result<Option<PublicAnchor>, String> {
-        let (hash, read_at) = self.finalized()?;
-        let (commitment, stored_at) = match venue {
-            Venue::Pallet { instance } => {
-                let Some(raw) =
-                    self.storage(&anchor_key(&self.pallet, *instance, number), &hash)?
-                else {
-                    return Ok(None);
-                };
-                decode_anchor(&raw, self.block_bytes).ok_or("the anchor record does not decode")?
-            }
-            Venue::Contract { account } => {
-                let reader = RpcContract {
-                    rpc: self,
-                    account: *account,
-                };
-                let Some(found) = find_contract_anchor(&reader, read_at, number)? else {
-                    return Ok(None);
-                };
-                found
-            }
+        let instance = match venue {
+            Venue::Pallet { instance } => *instance,
+            // One anchor of the number, or an error if the contract's sequences make it
+            // ambiguous (amendment 0039).
+            Venue::Contract { .. } => return self.anchors(venue, number)?.single(),
         };
+        let (hash, read_at) = self.finalized()?;
+        let Some(raw) = self.storage(&anchor_key(&self.pallet, instance, number), &hash)? else {
+            return Ok(None);
+        };
+        let (commitment, stored_at) =
+            decode_anchor(&raw, self.block_bytes).ok_or("the anchor record does not decode")?;
         Ok(Some(PublicAnchor {
             commitment,
             stored_at,
             read_at,
         }))
+    }
+
+    fn anchors(&self, venue: &Venue, number: u64) -> Result<NumberedAnchors, String> {
+        match venue {
+            Venue::Pallet { .. } => self
+                .anchor(venue, number)
+                .map(NumberedAnchors::first_sequence),
+            Venue::Contract { account } => {
+                let (_, read_at) = self.finalized()?;
+                let reader = RpcContract {
+                    rpc: self,
+                    account: *account,
+                };
+                find_contract_anchors(&reader, read_at, number)
+            }
+        }
     }
 
     fn attestation_key(&self, venue: &Venue) -> Result<Option<[u8; 32]>, String> {
@@ -819,6 +1099,443 @@ mod tests {
         k.extend_from_slice(&3u64.to_le_bytes());
         assert_eq!(contract_inbox_key(3)[16..], k[..]);
         assert_eq!(contract_latest_anchor_key()[16..], [8, 0, 0, 0]);
+    }
+
+    // ---- T-026-11: anchor sequences (amendment 0039) ----
+
+    /// The second book's commitment of anchor `n`: never the first book's (`[n; 32]`).
+    fn p2c(n: u64) -> [u8; 32] {
+        [0x80 | n as u8; 32]
+    }
+
+    fn latest_with(n: u64, c: [u8; 32], at: u32, seq: u64) -> Vec<u8> {
+        let mut v = n.to_le_bytes().to_vec();
+        v.extend_from_slice(&c);
+        v.extend_from_slice(&at.to_le_bytes());
+        v.extend_from_slice(&seq.to_le_bytes());
+        v
+    }
+
+    fn anchored_with(n: u64, c: [u8; 32], at: u32) -> Vec<u8> {
+        let mut v = at.to_le_bytes().to_vec();
+        v.push(2);
+        v.extend_from_slice(&[0xAA; 32]);
+        v.extend_from_slice(&n.to_le_bytes());
+        v.extend_from_slice(&c);
+        v
+    }
+
+    /// An `AnchorEpoch`, in the contract's SCALE encoding.
+    fn epoch_record(
+        epoch: u32,
+        base: u64,
+        from_seq: u64,
+        at: u32,
+        book: [u8; 32],
+        previous: Option<Vec<u8>>,
+    ) -> Vec<u8> {
+        let mut v = epoch.to_le_bytes().to_vec();
+        v.extend_from_slice(&base.to_le_bytes());
+        v.extend_from_slice(&from_seq.to_le_bytes());
+        v.extend_from_slice(&at.to_le_bytes());
+        v.extend_from_slice(&book);
+        match previous {
+            None => v.push(0),
+            Some(p) => {
+                v.push(1);
+                v.extend_from_slice(&p);
+            }
+        }
+        v
+    }
+
+    const BOOK: [u8; 32] = [0xB2; 32];
+
+    /// The first book, `p1`, under today's code: anchor 1 at block 5, 2 at 8, 3 and 4 in one batch
+    /// at 12, 5 at 15 (inbox 0 to 4). Governance resets at block 20 to `base`, naming `BOOK`; the
+    /// second book, `p2`, anchors `base + 1` at block 25 and `base + 2` at 28 (inbox 5 and 6) if
+    /// `p2_anchors`.
+    fn reset_history(base: u64, p2_anchors: bool, pruned_below: u64) -> History {
+        let set = |b: u64, k: Vec<u8>, v: Vec<u8>| (b, k, Some(v));
+        let mut changes = vec![
+            set(5, contract_inbox_key(0), anchored(1, 5)),
+            set(5, contract_latest_anchor_key(), latest(1, 5, 0)),
+            set(8, contract_inbox_key(1), anchored(2, 8)),
+            set(8, contract_latest_anchor_key(), latest(2, 8, 1)),
+            set(12, contract_inbox_key(2), anchored(3, 12)),
+            set(12, contract_inbox_key(3), anchored(4, 12)),
+            set(12, contract_latest_anchor_key(), latest(4, 12, 3)),
+            set(15, contract_inbox_key(4), anchored(5, 15)),
+            set(15, contract_latest_anchor_key(), latest(5, 15, 4)),
+            set(
+                20,
+                contract_anchor_epoch_key(),
+                epoch_record(1, base, 5, 20, BOOK, Some(latest(5, 15, 4))),
+            ),
+            (20, contract_latest_anchor_key(), None),
+        ];
+        if p2_anchors {
+            let (a, b) = (base + 1, base + 2);
+            changes.extend([
+                set(25, contract_inbox_key(5), anchored_with(a, p2c(a), 25)),
+                set(
+                    25,
+                    contract_latest_anchor_key(),
+                    latest_with(a, p2c(a), 25, 5),
+                ),
+                set(28, contract_inbox_key(6), anchored_with(b, p2c(b), 28)),
+                set(
+                    28,
+                    contract_latest_anchor_key(),
+                    latest_with(b, p2c(b), 28, 6),
+                ),
+            ]);
+        }
+        History {
+            changes,
+            pruned_below,
+        }
+    }
+
+    fn first(n: u64, stored_at: u64, read_at: u64) -> (Sequence, PublicAnchor) {
+        (
+            Sequence::FIRST,
+            PublicAnchor {
+                commitment: [n as u8; 32],
+                stored_at,
+                read_at,
+            },
+        )
+    }
+
+    fn second(base: u64, n: u64, stored_at: u64, read_at: u64) -> (Sequence, PublicAnchor) {
+        (
+            Sequence {
+                epoch: 1,
+                base,
+                book: Some(BOOK),
+            },
+            PublicAnchor {
+                commitment: p2c(n),
+                stored_at,
+                read_at,
+            },
+        )
+    }
+
+    /// `T-026-11`: an instance that was never reset reads exactly as before, every number at every
+    /// head, on an archive node and on one that keeps little past state.
+    #[test]
+    fn t_026_11_without_a_reset_the_read_is_unchanged() {
+        for pruned in [0, 15] {
+            let h = history(pruned);
+            for finalized in [9, 10, 11, 14, 15, 20] {
+                for n in 0..=8 {
+                    let before = find_contract_anchor(&h, finalized, n).map(|f| {
+                        NumberedAnchors::first_sequence(f.map(|(commitment, stored_at)| {
+                            PublicAnchor {
+                                commitment,
+                                stored_at,
+                                read_at: finalized,
+                            }
+                        }))
+                    });
+                    assert_eq!(
+                        find_contract_anchors(&h, finalized, n),
+                        before,
+                        "anchor {n} at {finalized}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `T-026-11`: from the reset until the new book's first anchor, an old number is the previous
+    /// book's: its last anchor from current state on any node, earlier ones from past state, and
+    /// on a node without it "unread", never "not final".
+    #[test]
+    fn t_026_11_after_a_reset_an_old_number_is_the_previous_books() {
+        let archive = reset_history(0, false, 0);
+        // The read before T-026-11, which assumed numbers never fall: every old anchor but the
+        // last read "not final" while the latest anchor cell was empty.
+        assert_eq!(find_contract_anchor(&archive, 22, 3), Ok(None));
+        let read = find_contract_anchors(&archive, 22, 3).unwrap();
+        assert_eq!(read.current_epoch, 1);
+        assert_eq!(read.found, vec![first(3, 12, 22)]);
+        assert!(read.unread.is_empty());
+        assert_eq!(
+            find_contract_anchors(&archive, 22, 1).unwrap().found,
+            vec![first(1, 5, 22)]
+        );
+        // The previous book's last anchor needs no past state: the reset kept it.
+        let head_only = reset_history(0, false, 22);
+        let read = find_contract_anchors(&head_only, 22, 5).unwrap();
+        assert_eq!((read.found, read.unread), (vec![first(5, 15, 22)], vec![]));
+        // An earlier one does: unread, and said to be the first sequence's.
+        let read = find_contract_anchors(&head_only, 22, 3).unwrap();
+        assert!(read.found.is_empty());
+        assert!(
+            matches!(
+                read.unread.as_slice(),
+                [Unread::Anchor { sequence, why }]
+                    if *sequence == Sequence::FIRST && why.contains("past state")
+            ),
+            "{:?}",
+            read.unread
+        );
+        assert!(matches!(
+            crate::AnchorCheck::of(&read, &[3; 32]),
+            crate::AnchorCheck::Unknown { .. }
+        ));
+        // A number neither book has reached: missing.
+        let read = find_contract_anchors(&archive, 22, 6).unwrap();
+        assert_eq!((read.found, read.unread), (vec![], vec![]));
+        // `anchor` means the current book: the previous book's anchor is an error, not a guess.
+        let err = find_contract_anchors(&archive, 22, 5)
+            .unwrap()
+            .single()
+            .unwrap_err();
+        assert!(err.contains("not the current book's"), "{err}");
+        assert!(
+            find_contract_anchors(&head_only, 22, 3)
+                .unwrap()
+                .single()
+                .is_err()
+        );
+    }
+
+    /// `T-026-11`: a new book's number before its first anchor is only the old book's; after it,
+    /// both books' anchors are read, each named by its sequence, the current one first.
+    #[test]
+    fn t_026_11_a_new_books_number_before_and_after_its_first_anchor() {
+        let before = reset_history(0, false, 0);
+        let read = find_contract_anchors(&before, 22, 1).unwrap();
+        assert_eq!(read.found, vec![first(1, 5, 22)]);
+        let after = reset_history(0, true, 0);
+        // The read before T-026-11 answered with whichever book its search landed in.
+        assert_eq!(find_contract_anchor(&after, 30, 2), Ok(Some((p2c(2), 28))));
+        for (n, p1_at, p2_at) in [(1, 5, 25), (2, 8, 28)] {
+            let read = find_contract_anchors(&after, 30, n).unwrap();
+            assert_eq!(
+                read.found,
+                vec![second(0, n, p2_at, 30), first(n, p1_at, 30)],
+                "anchor {n}"
+            );
+            assert!(read.unread.is_empty());
+            assert!(read.single().is_err(), "ambiguous: never one book's guess");
+        }
+        // Between p2's two anchors, its first is the latest and its second not yet final.
+        let read = find_contract_anchors(&after, 26, 2).unwrap();
+        assert_eq!(read.found, vec![first(2, 8, 26)]);
+        // Numbers only the old book reached.
+        for (n, at) in [(3, 12), (4, 12), (5, 15)] {
+            let read = find_contract_anchors(&after, 30, n).unwrap();
+            assert_eq!(read.found, vec![first(n, at, 30)], "anchor {n}");
+        }
+        // p2's latest needs no past state; p1's 1 then does.
+        let head_only = reset_history(0, true, 30);
+        let read = find_contract_anchors(&head_only, 30, 2).unwrap();
+        assert_eq!(read.found, vec![second(0, 2, 28, 30)]);
+        // Only the current book's: `anchor` gives it.
+        assert_eq!(
+            find_contract_anchors(&after, 30, 11).unwrap().single(),
+            Ok(None)
+        );
+        assert_eq!(
+            find_contract_anchors(&reset_history(10, true, 0), 30, 12)
+                .unwrap()
+                .single(),
+            Ok(Some(second(10, 12, 28, 30).1))
+        );
+        assert!(matches!(
+            read.unread.as_slice(),
+            [Unread::Anchor { sequence, .. }] if *sequence == Sequence::FIRST
+        ));
+    }
+
+    /// `T-026-11`: a number both books used is decided by the commitment, and the check names the
+    /// book; a commitment of neither is a mismatch that shows both.
+    #[test]
+    fn t_026_11_a_number_both_books_used_is_decided_by_the_commitment() {
+        use crate::AnchorCheck;
+        let read = find_contract_anchors(&reset_history(0, true, 0), 30, 2).unwrap();
+        assert_eq!(
+            AnchorCheck::of(&read, &[2; 32]),
+            AnchorCheck::Final {
+                stored_at: 8,
+                read_at: 30,
+                sequence: Sequence::FIRST,
+                current: false
+            }
+        );
+        assert_eq!(
+            AnchorCheck::of(&read, &p2c(2)),
+            AnchorCheck::Final {
+                stored_at: 28,
+                read_at: 30,
+                sequence: second(0, 2, 28, 30).0,
+                current: true
+            }
+        );
+        assert_eq!(
+            AnchorCheck::of(&read, &[0xEE; 32]),
+            AnchorCheck::Mismatch {
+                stored: vec![(second(0, 2, 28, 30).0, p2c(2)), (Sequence::FIRST, [2; 32])]
+            }
+        );
+    }
+
+    /// `T-026-11`: a reset to a base above 0: the numbers up to the base are the old book's only.
+    #[test]
+    fn t_026_11_a_reset_to_a_higher_base() {
+        let h = reset_history(10, true, 0);
+        assert_eq!(
+            find_contract_anchors(&h, 30, 3).unwrap().found,
+            vec![first(3, 12, 30)]
+        );
+        assert_eq!(
+            find_contract_anchors(&h, 30, 11).unwrap().found,
+            vec![second(10, 11, 25, 30)]
+        );
+        for n in [6, 10, 13] {
+            assert_eq!(find_contract_anchors(&h, 30, n).unwrap().found, vec![]);
+        }
+    }
+
+    /// `T-026-11`: a second reset before any anchor of the first (a wrong book name, say) carries
+    /// the old book's last anchor forward; it is attributed to the sequence that wrote it, not to
+    /// the one in between. Without past state, the earlier sequences are unidentified: unknown.
+    #[test]
+    fn t_026_11_a_second_reset_before_any_anchor() {
+        let mut h = reset_history(0, false, 0);
+        h.changes.push((
+            23,
+            contract_anchor_epoch_key(),
+            Some(epoch_record(
+                2,
+                0,
+                5,
+                23,
+                [0xB3; 32],
+                Some(latest(5, 15, 4)),
+            )),
+        ));
+        let read = find_contract_anchors(&h, 24, 5).unwrap();
+        assert_eq!(read.current_epoch, 2);
+        assert_eq!((read.found, read.unread), (vec![first(5, 15, 24)], vec![]));
+        assert_eq!(
+            find_contract_anchors(&h, 24, 2).unwrap().found,
+            vec![first(2, 8, 24)]
+        );
+        h.pruned_below = 24;
+        let read = find_contract_anchors(&h, 24, 5).unwrap();
+        assert!(read.found.is_empty());
+        assert!(matches!(
+            read.unread.as_slice(),
+            [Unread::Before {
+                epoch: 2,
+                last_anchor: Some(5),
+                ..
+            }]
+        ));
+    }
+
+    /// `T-026-12`: why an earlier sequence's record could not be read says what was seen: no
+    /// record, a record that does not decode, or another sequence's record (the one case that
+    /// can be two resets in one block).
+    #[test]
+    fn t_026_12_an_unreadable_sequence_record_says_what_was_seen() {
+        let why = |at_22: Option<Vec<u8>>| {
+            let mut h = reset_history(0, false, 0);
+            // In block order: what block 22 holds, then the second reset at 23.
+            h.changes.push((22, contract_anchor_epoch_key(), at_22));
+            h.changes.push((
+                23,
+                contract_anchor_epoch_key(),
+                Some(epoch_record(
+                    2,
+                    0,
+                    5,
+                    23,
+                    [0xB3; 32],
+                    Some(latest(5, 15, 4)),
+                )),
+            ));
+            match find_contract_anchors(&h, 24, 5).unwrap().unread.as_slice() {
+                [Unread::Before { why, .. }] => why.clone(),
+                other => panic!("{other:?}"),
+            }
+        };
+        let absent = why(None);
+        assert!(absent.contains("no sequence record"), "{absent}");
+        assert!(!absent.contains("two resets"), "{absent}");
+        let garbled = why(Some(std::vec![1, 2, 3]));
+        assert!(garbled.contains("does not decode"), "{garbled}");
+        assert!(garbled.contains("(3 bytes)"), "{garbled}");
+        assert!(!garbled.contains("two resets"), "{garbled}");
+        let other = why(Some(epoch_record(2, 0, 5, 22, [0xB3; 32], None)));
+        assert!(
+            other.contains("holds sequence 2's record, not sequence 1's"),
+            "{other}"
+        );
+        assert!(other.contains("two resets in one block?"), "{other}");
+    }
+
+    /// `T-026-11`: old anchors stored in the reset's own block, before the reset: the last from
+    /// the record, the one it superseded in that block from the block's inbox.
+    #[test]
+    fn t_026_11_anchors_in_the_resets_own_block() {
+        let mut h = reset_history(0, false, 0);
+        h.changes.retain(|(b, _, _)| *b < 20);
+        let set = |b: u64, k: Vec<u8>, v: Vec<u8>| (b, k, Some(v));
+        h.changes.extend([
+            set(20, contract_inbox_key(5), anchored(6, 20)),
+            set(20, contract_inbox_key(6), anchored(7, 20)),
+            set(
+                20,
+                contract_anchor_epoch_key(),
+                epoch_record(1, 0, 7, 20, BOOK, Some(latest(7, 20, 6))),
+            ),
+            (20, contract_latest_anchor_key(), None),
+        ]);
+        assert_eq!(
+            find_contract_anchors(&h, 22, 7).unwrap().found,
+            vec![first(7, 20, 22)]
+        );
+        assert_eq!(
+            find_contract_anchors(&h, 22, 6).unwrap().found,
+            vec![first(6, 20, 22)]
+        );
+        assert_eq!(
+            find_contract_anchors(&h, 22, 4).unwrap().found,
+            vec![first(4, 12, 22)]
+        );
+    }
+
+    #[test]
+    fn t_026_11_the_sequence_record_decodes() {
+        let rec = epoch_record(1, 0, 17, 300, BOOK, Some(latest(17, 290, 16)));
+        assert_eq!(rec.len(), 109);
+        assert_eq!(
+            decode_contract_anchor_epoch(&rec),
+            Some(ContractAnchorEpoch {
+                epoch: 1,
+                base: 0,
+                from_seq: 17,
+                at: 300,
+                book: BOOK,
+                previous: decode_contract_latest_anchor(&latest(17, 290, 16)),
+            })
+        );
+        let none = epoch_record(2, 5, 9, 7, BOOK, None);
+        assert_eq!(none.len(), 57);
+        assert_eq!(decode_contract_anchor_epoch(&none).unwrap().previous, None);
+        // A wrong tag or length is not a record.
+        let mut bad = none.clone();
+        bad[56] = 1;
+        assert_eq!(decode_contract_anchor_epoch(&bad), None);
+        assert_eq!(decode_contract_anchor_epoch(&rec[..108]), None);
+        assert_eq!(contract_anchor_epoch_key()[16..], [0x0A, 0, 0, 0]);
     }
 
     /// Against a node the tester runs: `ALEDGENT_VERIFY_RPC=http://127.0.0.1:9944 cargo test -p

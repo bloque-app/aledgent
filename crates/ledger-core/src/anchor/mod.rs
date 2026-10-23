@@ -5,16 +5,25 @@
 //! ## Checkpoints
 //!
 //! A [`Checkpoint`] binds a stated entry sequence to the kernel's composite root at that
-//! sequence, under a number:
+//! sequence, under a number, and (`v3`, `T-037-03`, `DEC-26` (a)) to the book's genesis, the code
+//! version that produced that state, its construction and the upgrade-authority mode in force:
 //!
 //! ```text
-//! commitment = blake2b-256("aledgent/anchor/v2" ‖ construction ‖ instance ‖ number ‖ entry_sequence ‖ kernel_root)
+//! commitment = blake2b-256("aledgent/anchor/v3" ‖ construction ‖ genesis ‖ code ‖ authority ‖ instance ‖ number ‖ entry_sequence ‖ kernel_root)
 //! ```
 //!
-//! ([`verify::commitment`], the verifier's own function). `construction` names the state
-//! commitment's construction ([`construction`], `REQ-PR-10`, `DEC-25`); construction 1 (the
-//! opt-in feature `smt-v1`, owner ruling cs-q04) keeps the version-1 form, `"aledgent/anchor/v1"`
-//! without the byte. It is created inside one core invocation, from the kernel's root and its
+//! ([`verify::commitment_v3`], the verifier's own function). Every field is aledgent's own: the
+//! genesis is the chainspec's seed digest, the code the digest of the writer's code manifest, the
+//! mode a digest of the book's record; nothing a platform supplies (`REQ-RT-19`). `construction`
+//! names the state commitment's construction ([`construction`], `REQ-PR-10`, `DEC-25`), and a
+//! checkpoint carries its own, so [`Checkpoint::consistent`] checks it in the construction it was
+//! made in, not the build's.
+//!
+//! A checkpoint with no [`Checkpoint::binding`] is a `v2` checkpoint, made before `v3`:
+//! `blake2b-256("aledgent/anchor/v2" ‖ construction ‖ instance ‖ number ‖ entry_sequence ‖
+//! kernel_root)` ([`verify::commitment`]), or for construction 1 (the opt-in feature `smt-v1`, owner
+//! ruling cs-q04) the version-1 form, `"aledgent/anchor/v1"` without the byte. It still checks.
+//! Every checkpoint created now is `v3`. It is created inside one core invocation, from the kernel's root and its
 //! posting sequence read in the same committed state, so the two belong to each other (`INV-19`, `REQ-PR-7`). `entry_sequence` is the sequence of the
 //! **last** entry it covers: every entry up to and including it, and nothing else.
 //!
@@ -59,7 +68,9 @@ use crate::id::OperationId;
 use crate::leaves::{LeafHost, LeafMap, Leaves, Slot, kind};
 use crate::settlement::{Coordinate, Venue};
 
-pub use verify::{SIGNED_ASSERTION_LABEL, commitment};
+pub use verify::{
+    CodeBinding, SIGNED_ASSERTION_LABEL, checkpoint_commitment, commitment, commitment_v3,
+};
 
 /// The construction of the book's state commitment (`REQ-PR-10`, `DEC-25`): the root version of
 /// the build: [`verify::CONSTRUCTION_V2`] by default, [`verify::CONSTRUCTION_V1`] with the opt-in
@@ -138,6 +149,11 @@ pub struct Checkpoint {
     pub entry_sequence: u64,
     /// The kernel's composite root at that sequence.
     pub kernel_root: [u8; 32],
+    /// The construction of the state commitment it was made in (`REQ-PR-10`, `T-037-03`).
+    pub construction: u8,
+    /// What a `v3` checkpoint binds beside (`T-037-03`): the book's genesis, the code version and
+    /// the upgrade-authority mode. `None` for a `v2` checkpoint (module documentation).
+    pub binding: Option<CodeBinding>,
     /// The commitment the anchor carries.
     pub commitment: [u8; 32],
     /// When the core created it.
@@ -177,10 +193,13 @@ impl Checkpoint {
         }
     }
 
-    /// Whether its fields produce its commitment.
+    /// Whether its fields produce its commitment, in its own construction and form
+    /// ([`checkpoint_commitment`]): a `v3` checkpoint's binds its code, construction and mode, and a
+    /// `v2` checkpoint's still checks.
     pub fn consistent(&self) -> bool {
-        commitment(
-            construction(),
+        checkpoint_commitment(
+            self.construction,
+            self.binding.as_ref(),
             self.instance,
             self.number,
             self.entry_sequence,

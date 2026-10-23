@@ -556,3 +556,20 @@ fn req_rc_3_the_settlement_adapter_its_status_and_its_records_cross_an_export() 
         assert!(c.identical(), "{:?}", c.differences.first());
     }
 }
+
+/// `T-037-03`, review of #38: format 12 carries each checkpoint's construction and code binding, so
+/// an export of an earlier format (11, whose checkpoints have neither) is refused at the version,
+/// both when its bytes are read and when it is verified, and never decoded as format 12.
+#[test]
+fn t037_03_an_export_of_format_11_is_refused() {
+    let mut b = random(0x037, 120);
+    let mut anchors = Checkpoints::new();
+    let e = export(&mut b, &mut anchors);
+    assert_eq!(e.manifest.version, ledger_core::export::FORMAT_VERSION);
+    assert_eq!(ledger_core::export::FORMAT_VERSION, 12);
+    let mut old = e.clone();
+    old.manifest.version = 11;
+    assert_eq!(old.verify(), Err(ExportError::Format));
+    assert!(Export::from_bytes(&old.to_bytes()).is_err());
+    assert!(Export::from_bytes(&e.to_bytes()).is_ok());
+}

@@ -132,6 +132,24 @@ const SURFACE: &[(&str, &str)] = &[
         "operator command: the operator's policy authority alone (REQ-RC-7, amendment 0024)",
     ),
     ("revoke_operator", "operator command"),
+    // T-037-15: the way out of a scheduled upgrade, under the upgrade-authority mode in force
+    // (a stand-in for the genesis mode, `Single` naming the operator, until T-037-05). It writes
+    // only its record, request entry and audit record; the writer applies what it took to its
+    // scheduled upgrade.
+    (
+        "reschedule_upgrade",
+        "operator command: the upgrade-authority mode in force (REQ-RT-20, REQ-RT-18)",
+    ),
+    (
+        "cancel_upgrade",
+        "operator command: the upgrade-authority mode in force (REQ-RT-20, REQ-RT-18)",
+    ),
+    // T-037-04: the upgrade itself, under the same mode; it writes only the same records, and the
+    // writer schedules what it took.
+    (
+        "upgrade",
+        "operator command: the upgrade-authority mode in force (REQ-RT-16, REQ-RT-18)",
+    ),
     ("resume", "operator command"),
     ("resolve_operation", "operator command"),
     (
@@ -193,6 +211,68 @@ const SURFACE: &[(&str, &str)] = &[
     // book: they turn the recorder on and hand back what it holds.
     ("record_calls", "turns call recording on or off (F-005)"),
     ("take_calls", "takes the recorded calls (F-005)"),
+    // T-037-03: the writer's code version and mode, from its hot row. It sets what the next
+    // checkpoint record binds (a service leaf, under the service root, and anchored): the content of
+    // that record, never a balance or any other record. An unauthenticated writer-side setter: no
+    // command reaches it (`calls::apply` has no variant for it), and only `core-binding` calls it,
+    // from the Agent's hot row, the founding, and each archived entry's code.
+    (
+        "set_code",
+        "sets the code version and mode the next checkpoint record binds (T-037-03)",
+    ),
+    // T-037-15: the input number the commands that follow take, as the writer numbers its inputs,
+    // and the way out they took. Neither writes the book: a way out is decided against the first,
+    // and the writer reads the second to apply it to its own scheduled upgrade. Only `core-binding`
+    // calls them.
+    (
+        "set_input",
+        "sets the input number a way out of an upgrade is decided against (T-037-15)",
+    ),
+    (
+        "take_way_out",
+        "takes the way out of a scheduled upgrade the last commands took (T-037-15)",
+    ),
+    // T-037-05: the upgrade-authority inputs, operator commands of `CTR-OPS` decided under the
+    // writer's mode (`REQ-RT-18`, `DEC-26` (b′)). Each writes only the writer's upgrade-authority
+    // record and its audit record.
+    (
+        "set_authority",
+        "operator command: change the upgrade-authority mode, under the mode in force (REQ-RT-18, T-037-05)",
+    ),
+    (
+        "propose_upgrade",
+        "operator command: propose an upgrade, under the upgrade-authority mode (REQ-RT-16, REQ-RT-18, T-037-05)",
+    ),
+    (
+        "approve_upgrade",
+        "operator command: approve a proposed upgrade, migration or change of mode (REQ-RT-18, T-037-05)",
+    ),
+    (
+        "propose_migration",
+        "operator command: propose a migration of construction, under the upgrade-authority mode (REQ-PR-11, REQ-RT-18, T-037-05)",
+    ),
+    (
+        "upgrade_authority",
+        "operator command: any of the four upgrade-authority inputs, as Call::UpgradeAuthority replays them (T-037-05)",
+    ),
+    // T-037-05: the writer's scheduled change of mode, as `set_code` is: no command reaches it,
+    // it writes nothing to the book, and only `core-binding` calls it, from the Agent's hot row.
+    // `set_input` (above) is where a scheduled change takes force.
+    (
+        "set_authority_next",
+        "sets the scheduled change of mode as the writer's hot row holds it (T-037-05)",
+    ),
+    // T-037-05, owner ruling w6: the writer's scheduled upgrade, as `set_authority_next` is: the
+    // hot row's, given by `core-binding` before each input, and only what a move of it is checked
+    // against. It writes nothing to the book.
+    (
+        "set_scheduled_upgrade",
+        "sets the upgrade the writer has scheduled, which a move of it must go strictly later than (T-037-05)",
+    ),
+    (
+        "take_upgrade",
+        "takes the upgrade the last commands scheduled, for the writer to schedule (T-037-04)",
+    ),
     // T-031-19: when the kernel's leaves are committed, not what is written. Every command still
     // decides alone, through the command surface; these only group the kernel's commits.
     (

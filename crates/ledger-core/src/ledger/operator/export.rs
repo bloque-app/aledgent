@@ -123,6 +123,20 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
     ) -> Result<Export, ExportError> {
         #[allow(clippy::redundant_closure_call)]
         let r: Result<Export, ExportError> = (|| {
+            // An export does not carry the writer's upgrade-authority record yet (`T-037-05`;
+            // `T-037-17` carries it): a book under any mode but its genesis one, or with a change
+            // of it scheduled, is not exported at all, rather than imported under its genesis mode.
+            // Proposals pending under the genesis mode are not carried, and need not be: nothing
+            // of them is scheduled.
+            if self
+                .state
+                .upgrade_authority()
+                .is_some_and(|r| r.mode.is_some() || r.next.is_some())
+                || self.authority() != crate::code::authority::GENESIS
+                || self.authority_next().is_some()
+            {
+                return Err(ExportError::UpgradeAuthority);
+            }
             self.privileged_read(ctx, ReadKind::Export, Vec::new(), justification, sink)
                 .map_err(ExportError::Refused)?;
             // The export reads the store: an open batch is committed first (`T-031-19`).
@@ -241,6 +255,13 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             config,
             fault: None,
             calls: None,
+            code: ([0; 32], [0; 32]),
+            input: 0,
+            way_out: None,
+            upgrade: None,
+            scheduled: None,
+            calls_in_input: (0, 0),
+            writer: crate::code::authority::Position::default(),
         };
         // At least once: a record the store does not take now stays in the outbox.
         let _ = ledger.ship_audit(sink);

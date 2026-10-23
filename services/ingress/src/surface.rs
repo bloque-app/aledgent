@@ -46,13 +46,15 @@ use serde::de::DeserializeOwned;
 
 use crate::anchoring::AnchoringRoute;
 use crate::answering;
+use crate::approval;
 use crate::auth::Authenticated;
-use crate::boundary::{Core, CoreError, CoreReply, InputKey, Outcome, Query, QueryReply};
+use crate::boundary::{Core, CoreError, CoreReply, InputKey, Outcome, Query, QueryReply, Staged};
 use crate::command::{
     Command, Intake, MAX_COMMAND_BYTES, derived_client_key, identity_id, request_digest_with,
 };
 use crate::credentials::{self, Pending};
 use crate::metrics::Metrics;
+use crate::operator::OperatorOp;
 use crate::pass_through::{Echo, key_of};
 use crate::query::{AssetParams, MovementBody, StatementParams};
 use crate::service::{Shared, mint};
@@ -160,6 +162,12 @@ pub enum CommandRoute {
     TiePrincipal,
     /// `POST /v1/ops/accounts/{account}/aliases` (`REQ-RC-7`, amendment 0024).
     RegisterAlias,
+    /// `POST /v1/ops/upgrade` (`REQ-RT-16`, `T-037-04`).
+    Upgrade,
+    /// `POST /v1/ops/upgrade/reschedule` (`REQ-RT-20`, `T-037-15`).
+    RescheduleUpgrade,
+    /// `POST /v1/ops/upgrade/cancel` (`REQ-RT-20`, `T-037-15`).
+    CancelUpgrade,
     /// A settlement route (`F-016`): `submit_outbound`, `configure_settlement`, or the
     /// adapter's.
     Settlement(crate::settlement::SettlementRoute),
@@ -506,6 +514,24 @@ pub const ROUTES: &[Route] = &[
         "Operator: every registered integrating party and the principals tied to it (REQ-ID-7).",
     ),
     command(
+        "/v1/ops/upgrade",
+        CommandRoute::Upgrade,
+        "upgrade",
+        "Operator: the writer's code becomes a code version from an input. The execution node fetches and checks the version's manifest and artefacts, and its generation, before the command is logged; ERR-InvalidTransition if it cannot (REQ-RT-16, REQ-RT-17, REQ-RT-20). Decided under the upgrade-authority mode in force (REQ-RT-18).",
+    ),
+    command(
+        "/v1/ops/upgrade/reschedule",
+        CommandRoute::RescheduleUpgrade,
+        "reschedule_upgrade",
+        "Operator: move the scheduled upgrade to a later input. The way out of a switch that cannot be taken: it is given priority over the inputs waiting to be forwarded when the mode in force lets the caller take it, and the writer decides it under either generation of code (REQ-RT-20, amendment 0035).",
+    ),
+    command(
+        "/v1/ops/upgrade/cancel",
+        CommandRoute::CancelUpgrade,
+        "cancel_upgrade",
+        "Operator: cancel the scheduled upgrade. A way out, like reschedule_upgrade (REQ-RT-20, amendment 0035).",
+    ),
+    command(
         "/v1/ops/accounts/{account}/aliases",
         CommandRoute::RegisterAlias,
         "register_alias",
@@ -818,7 +844,7 @@ pub fn status_of(r: Refusal) -> StatusCode {
 #[derive(Clone)]
 struct Logged {
     principal: String,
-    route: &'static str,
+    route: std::borrow::Cow<'static, str>,
 }
 
 /// The `Retry-After` an `ERR-DecisionUnavailable` carries, in seconds (`DEC-27` (g), the owner's
@@ -843,7 +869,17 @@ pub fn refusal(r: Refusal) -> Response {
     resp
 }
 
-fn logged(mut resp: Response, who: Option<&Authenticated>, route: &'static str) -> Response {
+fn logged(resp: Response, who: Option<&Authenticated>, route: &'static str) -> Response {
+    logged_as(resp, who, std::borrow::Cow::Borrowed(route))
+}
+
+/// [`logged`] under a name that is not a route's: step (a) of an approval is logged as
+/// `approve_<route>`, apart from the command's own route (amendment 0037).
+fn logged_as(
+    mut resp: Response,
+    who: Option<&Authenticated>,
+    route: std::borrow::Cow<'static, str>,
+) -> Response {
     resp.extensions_mut().insert(Logged {
         principal: who.map_or_else(|| "-".to_owned(), |a| a.principal.clone()),
         route,
@@ -860,13 +896,15 @@ async fn access_log(req: Request, next: Next) -> Response {
     let (principal, route) = resp
         .extensions()
         .get::<Logged>()
-        .map_or(("-".to_owned(), "-"), |l| (l.principal.clone(), l.route));
+        .map_or(("-".to_owned(), "-".into()), |l| {
+            (l.principal.clone(), l.route.clone())
+        });
     tracing::info!(
         target: "aledgent_ingress::access",
         request_id = %id,
         principal = %principal,
         method = %method,
-        route = route,
+        route = route.as_ref(),
         status = resp.status().as_u16(),
         "access"
     );
@@ -1096,6 +1134,24 @@ fn operator_command(
                 justification: b.justification,
             }
         }
+        CommandRoute::Upgrade => {
+            let b: crate::wire::UpgradeBody = json(bytes)?;
+            OperatorCommand::Upgrade {
+                code: b.code,
+                from: b.from,
+                justification: b.justification,
+            }
+        }
+        CommandRoute::RescheduleUpgrade => {
+            let b: crate::wire::RescheduleUpgradeBody = json(bytes)?;
+            OperatorCommand::RescheduleUpgrade {
+                from: b.from,
+                justification: b.justification,
+            }
+        }
+        CommandRoute::CancelUpgrade => OperatorCommand::CancelUpgrade {
+            justification: justification()?,
+        },
         _ => return Err(Refusal::NotAuthorised),
     })
 }
@@ -1333,32 +1389,37 @@ struct Arrival {
     auth_us: u64,
 }
 
-async fn command_reply<S: Store, C: Core>(
+/// A command request, read and validated as submission reads it: what step (a) of an approval
+/// (`T-040-05`) and the command route itself both compute, by this one function, so that the
+/// client key and the canonical text cannot drift between the two.
+struct Prepared {
+    body: CommandBody,
+    pending: Option<Pending>,
+    pass_through: Option<PassThrough>,
+    command: Command,
+    canonical: Vec<u8>,
+    on_behalf_of: Option<String>,
+    obo: Option<ledger_core::id::IdentityId>,
+    digest: ledger_core::lifecycle::keys::RequestDigest,
+    client_key: String,
+    derived: bool,
+}
+
+fn prepare_request<S: Store, C: Core>(
     shared: &Shared<S, C>,
     route: CommandRoute,
     param: Option<String>,
     headers: &HeaderMap,
-    body: Body,
+    bytes: &[u8],
     who: &Authenticated,
-    arrival: Arrival,
-) -> Response {
-    let Arrival {
-        at: arrived,
-        clock: arrived_at,
-        auth_us,
-    } = arrival;
-    let Ok(bytes) = axum::body::to_bytes(body, MAX_COMMAND_BYTES).await else {
-        return refusal(too_large(route));
-    };
+) -> Result<Prepared, Refusal> {
     // REQ-RC-7: a prior system's identifier the initial state left out is answered for what it
     // is, wherever the request names it; nothing of it is logged.
-    if let Err(r) = shared.config.archived.check(param.as_deref(), None, &bytes) {
-        return refusal(r);
-    }
-    let (mut body, pending) = match build(route, param, &bytes) {
-        Ok(x) => x,
-        Err(r) => return refusal(r),
-    };
+    shared
+        .config
+        .archived
+        .check(param.as_deref(), None, bytes)?;
+    let (mut body, pending) = build(route, param, bytes)?;
     // REQ-PO-5: the caller's pass-through data comes off the command here. It is part of the
     // request (its digest) and of the row, never of the canonical body the core receives.
     let pass_through = take_pass_through(&mut body);
@@ -1383,29 +1444,16 @@ async fn command_reply<S: Store, C: Core>(
         }
         b => b.clone(),
     };
-    let command = match Command::parse(&shape) {
-        Ok(c) => c,
-        Err(r) => return refusal(r),
-    };
+    let command = Command::parse(&shape)?;
     let canonical = command.canonical();
     if canonical.len() > MAX_COMMAND_BYTES {
-        return refusal(too_large(route));
+        return Err(too_large(route));
     }
     // Only passkeys of an accepted relying party are imported (`REQ-MG-7`, `DEC-19`).
-    if let Err(r) = credentials::check_import(shared, &body) {
-        return refusal(r);
-    }
-    let on_behalf_of = match header_str(headers, ON_BEHALF_OF) {
-        Ok(v) => v,
-        Err(r) => return refusal(r),
-    };
-    let obo = match on_behalf_of.as_deref().map(identity_id).transpose() {
-        Ok(v) => v,
-        Err(r) => return refusal(r),
-    };
-    let Ok(principal) = identity_id(&who.principal) else {
-        return refusal(Refusal::CredentialInvalid);
-    };
+    credentials::check_import(shared, &body)?;
+    let on_behalf_of = header_str(headers, ON_BEHALF_OF)?;
+    let obo = on_behalf_of.as_deref().map(identity_id).transpose()?;
+    let principal = identity_id(&who.principal).map_err(|_| Refusal::CredentialInvalid)?;
     let digest = request_digest_with(
         &principal,
         obo.as_ref(),
@@ -1413,13 +1461,58 @@ async fn command_reply<S: Store, C: Core>(
         basis.as_deref().unwrap_or(&canonical),
         pass_through.as_ref(),
     );
-    let (client_key, derived) = match header_str(headers, CLIENT_KEY) {
-        Err(r) => return refusal(r),
-        Ok(Some(k)) if k.is_empty() || k.len() > MAX_CLIENT_KEY => {
-            return refusal(Refusal::MalformedCommand);
+    let (client_key, derived) = match header_str(headers, CLIENT_KEY)? {
+        Some(k) if k.is_empty() || k.len() > MAX_CLIENT_KEY => {
+            return Err(Refusal::MalformedCommand);
         }
-        Ok(Some(k)) => (k, false),
-        Ok(None) => (derived_client_key(command.surface(), &digest), true),
+        Some(k) => (k, false),
+        None => (derived_client_key(command.surface(), &digest), true),
+    };
+    Ok(Prepared {
+        body,
+        pending,
+        pass_through,
+        command,
+        canonical,
+        on_behalf_of,
+        obo,
+        digest,
+        client_key,
+        derived,
+    })
+}
+
+async fn command_reply<S: Store, C: Core>(
+    shared: &Shared<S, C>,
+    route: CommandRoute,
+    param: Option<String>,
+    headers: &HeaderMap,
+    body: Body,
+    who: &Authenticated,
+    arrival: Arrival,
+) -> Response {
+    let Arrival {
+        at: arrived,
+        clock: arrived_at,
+        auth_us,
+    } = arrival;
+    let Ok(bytes) = axum::body::to_bytes(body, MAX_COMMAND_BYTES).await else {
+        return refusal(too_large(route));
+    };
+    let Prepared {
+        mut body,
+        pending,
+        pass_through,
+        command,
+        canonical,
+        on_behalf_of,
+        obo,
+        digest,
+        client_key,
+        derived,
+    } = match prepare_request(shared, route, param, headers, &bytes, who) {
+        Ok(p) => p,
+        Err(r) => return refusal(r),
     };
     // The client key's domain (`REQ-OP-10`, T-009-16): the principal's integrating party, or the
     // principal itself. A key the principal used before it was tied stays in its own domain, and
@@ -1447,6 +1540,24 @@ async fn command_reply<S: Store, C: Core>(
             Ok(None) => {}
             Err(_) => return refusal(Refusal::DecisionUnavailable),
         }
+    }
+    // Amendment 0037 (`T-040-05`): a command that needs an approval is checked here, after its
+    // shape and a retry, and before anything single-use (a registration's challenge, a code
+    // version) is spent and before it is logged.
+    if let Some(r) = approve(
+        shared,
+        who,
+        headers,
+        &domain,
+        &client_key,
+        &digest,
+        obo.as_ref(),
+        pending.as_ref(),
+        &command,
+    )
+    .await
+    {
+        return r;
     }
     let mut issued = None;
     // F-038 §7: a `key` proof is checked at the door, like a passkey's.
@@ -1498,6 +1609,39 @@ async fn command_reply<S: Store, C: Core>(
             }
         }
     };
+    // The writer's code (`T-037-04`): an upgrade's code version is staged before the command is
+    // logged, and a way out overtakes the forwarder's queue; both only for a caller the core says
+    // may take the code in hand (`code_door`).
+    // A repeat of a code command is answered from its first decision, before the door looks at it
+    // again: the code it named may be in force by now (so no longer one the writer's next
+    // generation), and its source may be down (`REQ-OP-10`, `INV-18`).
+    if is_code_input(&command) {
+        match shared
+            .store
+            .find(&domain, command.surface(), &client_key)
+            .await
+        {
+            Ok(Some(row)) if row.new.body_digest != digest.0 => {
+                return refusal(Refusal::ClientKeyReused);
+            }
+            Ok(Some(row)) => {
+                return answer(
+                    shared,
+                    &who.principal,
+                    row,
+                    None,
+                    shared.config.decision_wait,
+                )
+                .await;
+            }
+            Ok(None) => {}
+            Err(_) => return refusal(Refusal::DecisionUnavailable),
+        }
+    }
+    let overtakes = match code_door(shared, &command, who, on_behalf_of.as_deref()).await {
+        Ok(o) => o,
+        Err(r) => return refusal(r),
+    };
     let intake = command.intake();
     // REQ-CS-9 (amendment 0013): a principal's answering setting may have its transfers and
     // reservations answered with their decision. Read only for those two.
@@ -1529,6 +1673,7 @@ async fn command_reply<S: Store, C: Core>(
         body: canonical,
         pass_through,
         reserves: intake == Intake::Reserve,
+        overtakes,
         synchronous,
         received_at: shared.clock.now(),
         arrived_at: Some(arrived_at),
@@ -1593,6 +1738,268 @@ async fn command_reply<S: Store, C: Core>(
     reply
 }
 
+/// The approval of a command (amendment 0037, `T-040-05`), or `None` when the command may go on to
+/// be logged. While the switch is off, for a bearer secret, and for a command the policy exempts,
+/// this reads nothing and changes nothing. Otherwise, in this order: a first result under the
+/// client key (a retry, answered; another command under it, `ERR-ClientKeyReused`); then the
+/// approval the request carries. Under enforce, none is `ERR-CommandApprovalRequired` and a bad
+/// one `ERR-CredentialInvalid`; under report only, either is logged and the command goes on.
+#[allow(clippy::too_many_arguments)]
+async fn approve<S: Store, C: Core>(
+    shared: &Shared<S, C>,
+    who: &Authenticated,
+    headers: &HeaderMap,
+    domain: &str,
+    client_key: &str,
+    request: &ledger_core::lifecycle::keys::RequestDigest,
+    obo: Option<&ledger_core::id::IdentityId>,
+    pending: Option<&Pending>,
+    command: &Command,
+) -> Option<Response> {
+    let pk = shared.auth.passkeys()?;
+    if !approval::needed(pk.approvals(), who, command) {
+        return None;
+    }
+    let mode = pk.approvals().mode();
+    // A retry is answered from the first result and asks for no approval (`REQ-OP-10`).
+    match shared
+        .store
+        .find(domain, command.surface(), client_key)
+        .await
+    {
+        Ok(Some(row)) if row.new.body_digest != request.0 => {
+            return Some(refusal(Refusal::ClientKeyReused));
+        }
+        Ok(Some(row)) => {
+            let wait = answering::wait_for(shared, command, &who.principal).await;
+            return Some(answer(shared, &who.principal, row, None, wait).await);
+        }
+        Ok(None) => {}
+        // Report only refuses nothing: the command goes on as with the switch off.
+        Err(_) if mode != approval::ApprovalMode::Enforce => return None,
+        Err(_) => return Some(refusal(Refusal::DecisionUnavailable)),
+    }
+    let kind = approval::kind_of(command);
+    let presented = headers
+        .get(approval::APPROVAL_HEADER)
+        .map(|v| v.to_str().map(str::to_owned));
+    let outcome = match presented {
+        None => Err(None),
+        Some(Err(_)) => Err(Some(Refusal::CredentialInvalid)),
+        Some(Ok(h)) => {
+            match approval::digest_of(pk.approvals(), who, obo, client_key, pending, command) {
+                Err(r) => Err(Some(r)),
+                Ok((_, d)) => match approval::verify(shared, &pk, who, kind, &d, &h).await {
+                    Ok(c) => Ok(c),
+                    Err(approval::Rejected::Refused(r)) => Err(Some(r)),
+                    // The number is spent: by this same request's first attempt, still in flight,
+                    // or by another. A retry of the first gets its result once it is logged.
+                    Err(approval::Rejected::NumberSpent) => {
+                        if let Some(r) =
+                            in_flight(shared, who, domain, client_key, request, command).await
+                        {
+                            return Some(r);
+                        }
+                        Err(Some(Refusal::CredentialInvalid))
+                    }
+                },
+            }
+        }
+    };
+    match (mode, outcome) {
+        (_, Ok(_credential)) => None,
+        (approval::ApprovalMode::Enforce, Err(None)) => Some(approval::approval_required()),
+        (approval::ApprovalMode::Enforce, Err(Some(r))) => Some(refusal(r)),
+        (_, Err(why)) => {
+            approval::report(kind, who.proof, why.is_some());
+            None
+        }
+    }
+}
+
+/// How long a request whose approval's number is already spent waits for the first attempt of the
+/// same request (same client key, same command) to be logged, before it is refused.
+const IN_FLIGHT_WAIT: Duration = Duration::from_millis(500);
+
+/// The first attempt of this request, if it is logged within [`IN_FLIGHT_WAIT`]: answered from its
+/// result, as any retry is (`REQ-OP-10`). `None` if it does not appear, or the store does not answer.
+async fn in_flight<S: Store, C: Core>(
+    shared: &Shared<S, C>,
+    who: &Authenticated,
+    domain: &str,
+    client_key: &str,
+    request: &ledger_core::lifecycle::keys::RequestDigest,
+    command: &Command,
+) -> Option<Response> {
+    let until = Instant::now() + IN_FLIGHT_WAIT;
+    loop {
+        match shared
+            .store
+            .find(domain, command.surface(), client_key)
+            .await
+        {
+            Ok(Some(row)) if row.new.body_digest == request.0 => {
+                let wait = answering::wait_for(shared, command, &who.principal).await;
+                return Some(answer(shared, &who.principal, row, None, wait).await);
+            }
+            Ok(Some(_)) => return Some(refusal(Refusal::ClientKeyReused)),
+            Ok(None) if Instant::now() < until => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// The access log's name of step (a) for the route `name`.
+fn step_a(name: &'static str) -> std::borrow::Cow<'static, str> {
+    std::borrow::Cow::Owned(format!("approve_{name}"))
+}
+
+/// Step (a) of an approval (`T-040-05`): the command route's request, read and validated exactly
+/// as submission reads it, answered with whether it needs an approval and, if so, the challenge to
+/// sign. It takes nothing in: no row, no operation reference, no state.
+async fn handle_approval<S: Store, C: Core>(
+    shared: Arc<Shared<S, C>>,
+    route: CommandRoute,
+    name: &'static str,
+    param: Option<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let who = match credentials::authenticate(&shared, &headers).await {
+        Ok(a) => a,
+        Err(r) => return logged_as(refusal(r), None, step_a(name)),
+    };
+    let Ok(bytes) = axum::body::to_bytes(body, MAX_COMMAND_BYTES).await else {
+        return logged_as(refusal(too_large(route)), Some(&who), step_a(name));
+    };
+    let p = match prepare_request(&shared, route, param, &headers, &bytes, &who) {
+        Ok(p) => p,
+        Err(r) => return logged_as(refusal(r), Some(&who), step_a(name)),
+    };
+    let pk = shared.auth.passkeys();
+    let approvals = pk
+        .as_ref()
+        .map_or_else(approval::Approvals::off, |p| p.approvals().clone());
+    let mut reply = approval::ApprovalChallengeReply {
+        required: false,
+        mode: approvals.mode().name().to_owned(),
+        client_key: p.client_key.clone(),
+        client_key_derived: p.derived,
+        command: None,
+        command_digest: None,
+        challenge: None,
+        expires_at: None,
+    };
+    if let Some(pk) = pk.as_deref()
+        && approval::needed(&approvals, &who, &p.command)
+    {
+        let (text, d) = match approval::digest_of(
+            &approvals,
+            &who,
+            p.obo.as_ref(),
+            &p.client_key,
+            p.pending.as_ref(),
+            &p.command,
+        ) {
+            Ok(x) => x,
+            Err(r) => return logged_as(refusal(r), Some(&who), step_a(name)),
+        };
+        let (challenge, expires_at) = match approval::issue(pk, &who, &d, shared.clock.now()) {
+            Ok(x) => x,
+            Err(r) => return logged_as(refusal(r), Some(&who), step_a(name)),
+        };
+        reply.required = true;
+        reply.command = Some(String::from_utf8_lossy(&text).into_owned());
+        reply.command_digest = Some(hex::encode(d));
+        reply.challenge = Some(challenge);
+        reply.expires_at = Some(expires_at);
+    }
+    logged_as(
+        (StatusCode::OK, axum::Json(reply)).into_response(),
+        Some(&who),
+        step_a(name),
+    )
+}
+
+/// The door of the writer's code (`T-037-04`; `REQ-RT-16`, `REQ-RT-20`, amendment 0035; review of
+/// #44, F1 and N5): whether `command` puts the writer's code in hand, and if it does, what the
+/// execution node must do before it is logged. Returns whether the row overtakes the forwarder's
+/// queue.
+///
+/// The core is asked first whether the caller may take the code in hand, by the authority function
+/// the writer will decide the input with ([`Query::CodeAuthority`]). Only then:
+///
+/// - an **upgrade** has its code version staged: the node fetches the manifest and artefacts and
+///   checks them, and the writer's generation (`REQ-RT-16`, `REQ-RT-20`). If it cannot, the command
+///   is refused here, `ERR-InvalidTransition`, and nothing is logged;
+/// - a **way out** overtakes the queue, so that a fenced writer, which refuses every other input,
+///   still takes it.
+///
+/// A caller the core says may not is logged as any command is, and the writer refuses it and
+/// records the refusal (amendment 0035, `ERR-NotAuthorised`): it stages nothing and gets no
+/// priority, so it can neither make the node fetch code nor starve the queue. A core that cannot
+/// answer is `ERR-DecisionUnavailable`, and nothing is logged.
+async fn code_door<S: Store, C: Core>(
+    shared: &Shared<S, C>,
+    command: &Command,
+    who: &Authenticated,
+    on_behalf_of: Option<&str>,
+) -> Result<bool, Refusal> {
+    let Some(input) = code_input_of(command) else {
+        return Ok(false);
+    };
+    let Command::Operator(j) = command else {
+        return Ok(false);
+    };
+    let caller = who.caller(on_behalf_of.map(str::to_owned));
+    let asked = Query::CodeAuthority {
+        input: match input {
+            ledger_core::ledger::operator::CodeInput::Upgrade => "upgrade",
+            ledger_core::ledger::operator::CodeInput::WayOut => "way_out",
+        }
+        .to_owned(),
+    };
+    let authorised = match shared.core.query(&caller, &asked, shared.clock.now()).await {
+        Ok(QueryReply::CodeAuthority { authorised }) => authorised,
+        // The core refused the question itself (a credential that does not resolve): the caller is
+        // not one it lets in, and the writer will say so.
+        Ok(QueryReply::Refused { .. }) => false,
+        // An answer to another question, or none: nothing is staged and nothing is logged.
+        Ok(_) | Err(_) => return Err(Refusal::DecisionUnavailable),
+    };
+    if !authorised {
+        return Ok(false);
+    }
+    match &j.op {
+        OperatorOp::Upgrade { code, from, .. } => match shared.core.stage_code(code).await {
+            Ok(Staged::Staged) => Ok(false),
+            Ok(Staged::Refused { reason }) => {
+                // For the operator's log; the client is told the condition and no more. It names
+                // the input the upgrade asked to apply from (`T-037-23`).
+                let (code, from) = (hex::encode(code), *from);
+                tracing::warn!(%reason, %code, from_input = from, "an upgrade was refused before it was logged: its code is not staged");
+                Err(Refusal::InvalidTransition)
+            }
+            Err(_) => Err(Refusal::DecisionUnavailable),
+        },
+        _ => Ok(true),
+    }
+}
+
+/// Which input of the writer's code `command` is, if it is one (`T-037-04`).
+fn code_input_of(command: &Command) -> Option<ledger_core::ledger::operator::CodeInput> {
+    match command {
+        Command::Operator(j) => j.op.code_input(),
+        _ => None,
+    }
+}
+
+fn is_code_input(command: &Command) -> bool {
+    code_input_of(command).is_some()
+}
+
 /// Ask the core, retrying while it does not answer, for at most `NFR-16`; then the answer is
 /// `ERR-DecisionUnavailable` (a 503 with `Retry-After`), never a request held open: an instance with
 /// no stream to a core yet, or a core restarting, answers at once and the caller retries
@@ -1608,7 +2015,7 @@ async fn ask<S: Store, C: Core>(
     loop {
         match shared.core.query(&caller, query, shared.clock.now()).await {
             Ok(r) => return r,
-            Err(CoreError::Unavailable | CoreError::Ambiguous) => {
+            Err(CoreError::Unavailable | CoreError::Ambiguous | CoreError::NotRun) => {
                 if tokio::time::Instant::now() + wait > until {
                     return QueryReply::Refused {
                         error: Refusal::DecisionUnavailable,
@@ -1790,6 +2197,8 @@ fn query_response(reply: QueryReply) -> Response {
         QueryReply::CanSpend(c) => json(serde_json::to_value(c)),
         QueryReply::Undelivered { items } => json(serde_json::to_value(items)),
         QueryReply::Refused { error } => refusal(error),
+        // The door's own question (`T-037-04`): no route answers it to a caller.
+        QueryReply::CodeAuthority { .. } => refusal(Refusal::NotAuthorised),
         QueryReply::RecoveryMechanisms(m) => json(serde_json::to_value(m)),
         QueryReply::Custody(c) => json(serde_json::to_value(c)),
         QueryReply::Instructions { items } => json(serde_json::to_value(items)),
@@ -2168,6 +2577,37 @@ pub fn router<S: Store, C: Core>(shared: Arc<Shared<S, C>>) -> Router {
     let mut r: Router<Arc<Shared<S, C>>> = Router::new();
     for route in ROUTES {
         let name = route.name;
+        // Step (a) of an approval (amendment 0037): every command route, mirrored under
+        // `/v1/approvals`.
+        if let Handler::Command(c) = route.handler
+            && let Some(rest) = route.path.strip_prefix("/v1")
+        {
+            let path = format!("{}{rest}", approval::APPROVAL_PREFIX);
+            r = if route.path.contains('{') {
+                r.route(
+                    &path,
+                    post(
+                        move |State(s): State<Arc<Shared<S, C>>>,
+                              Path(p): Path<String>,
+                              headers: HeaderMap,
+                              body: Body| {
+                            handle_approval(s, c, name, Some(p), headers, body)
+                        },
+                    ),
+                )
+            } else {
+                r.route(
+                    &path,
+                    post(
+                        move |State(s): State<Arc<Shared<S, C>>>,
+                              headers: HeaderMap,
+                              body: Body| {
+                            handle_approval(s, c, name, None, headers, body)
+                        },
+                    ),
+                )
+            };
+        }
         r = match route.handler {
             Handler::Command(c) if route.path.contains('{') => r.route(
                 route.path,

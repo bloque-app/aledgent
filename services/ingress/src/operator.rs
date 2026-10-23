@@ -101,6 +101,35 @@ pub enum OperatorOp {
         /// The name within it.
         name: String,
     },
+    /// The writer's code becomes `code` from input `from` (`REQ-RT-16`, `T-037-04`).
+    Upgrade {
+        /// The code version.
+        code: [u8; 32],
+        /// The input it applies from.
+        from: u64,
+    },
+    /// Move the scheduled upgrade to input `from` (`REQ-RT-20`, `T-037-15`).
+    RescheduleUpgrade {
+        /// The input it now applies from.
+        from: u64,
+    },
+    /// Cancel the scheduled upgrade (`REQ-RT-20`, `T-037-15`).
+    CancelUpgrade,
+}
+
+impl OperatorOp {
+    /// Which input of the writer's code this is, if it is one (`T-037-04`): the door stages the
+    /// code of an upgrade, and gives a way out priority, only to a caller the core says may.
+    pub fn code_input(&self) -> Option<ledger_core::ledger::operator::CodeInput> {
+        use ledger_core::ledger::operator::CodeInput;
+        match self {
+            OperatorOp::Upgrade { .. } => Some(CodeInput::Upgrade),
+            OperatorOp::RescheduleUpgrade { .. } | OperatorOp::CancelUpgrade => {
+                Some(CodeInput::WayOut)
+            }
+            _ => None,
+        }
+    }
 }
 
 /// An alias's source as the wire names it: 16 bytes as 32 hex digits, or a name of at most 16
@@ -500,6 +529,27 @@ impl Justified {
                 ),
                 j(justification),
             ),
+            OperatorCommand::Upgrade {
+                code,
+                from,
+                justification,
+            } => (
+                OperatorOp::Upgrade {
+                    code: review(code)?.0,
+                    from: *from,
+                },
+                j(justification),
+            ),
+            OperatorCommand::RescheduleUpgrade {
+                from,
+                justification,
+            } => (
+                OperatorOp::RescheduleUpgrade { from: *from },
+                j(justification),
+            ),
+            OperatorCommand::CancelUpgrade { justification } => {
+                (OperatorOp::CancelUpgrade, j(justification))
+            }
         };
         Ok(Justified { op, justification })
     }
@@ -661,6 +711,16 @@ impl Justified {
                 approval: custody::signature_hex(sig),
                 justification,
             },
+            OperatorOp::Upgrade { code, from } => OperatorCommand::Upgrade {
+                code: hex::encode(code),
+                from: *from,
+                justification,
+            },
+            OperatorOp::RescheduleUpgrade { from } => OperatorCommand::RescheduleUpgrade {
+                from: *from,
+                justification,
+            },
+            OperatorOp::CancelUpgrade => OperatorCommand::CancelUpgrade { justification },
         }
     }
 

@@ -80,6 +80,40 @@ fn row_mut(inner: &mut Inner, op_ref: InputKey) -> Result<&mut Row, StoreError> 
         .ok_or_else(|| StoreError("no such row".into()))
 }
 
+/// Give back the feed sequences from `from` on, under the lease `holder` holds at `epoch`.
+fn unfeed_locked(
+    inner: &mut Inner,
+    partition: &str,
+    holder: &str,
+    epoch: u64,
+    from: u64,
+) -> Result<(), StoreError> {
+    let now = Instant::now();
+    match inner.feeds.get(partition) {
+        Some(l) if l.holder == holder && l.epoch == epoch && l.until > now => {}
+        _ => return Err(StoreError::fenced()),
+    }
+    let tail = inner
+        .rows
+        .values()
+        .filter(|r| r.feed_seq.is_some_and(|s| s >= from));
+    if tail.clone().any(|r| r.status == Status::Decided) {
+        return Err(StoreError(
+            "a decided row holds a sequence to give back".into(),
+        ));
+    }
+    let keys: Vec<u64> = tail.map(|r| r.seq).collect();
+    for k in keys {
+        if let Some(r) = inner.rows.get_mut(&k) {
+            r.feed_seq = None;
+        }
+    }
+    if let Some(l) = inner.feeds.get_mut(partition) {
+        l.next_seq = l.next_seq.min(from);
+    }
+    Ok(())
+}
+
 impl Store for MemStore {
     async fn sign_count(&self, credential: &str) -> Result<Option<u32>, StoreError> {
         Ok(self.lock().counters.get(credential).copied())
@@ -102,8 +136,16 @@ impl Store for MemStore {
         now: Time,
     ) -> Result<bool, StoreError> {
         let mut inner = self.lock();
-        inner.challenges.retain(|_, exp| *exp > now);
-        Ok(inner.challenges.insert(nonce, expires_at).is_none())
+        let cutoff = now.saturating_sub(super::SPENT_MARGIN_MS);
+        inner.challenges.retain(|_, exp| *exp > cutoff);
+        // As PostgreSQL's `ON CONFLICT DO NOTHING`: a refused second use keeps the first expiry.
+        match inner.challenges.entry(nonce) {
+            std::collections::hash_map::Entry::Occupied(_) => Ok(false),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(expires_at);
+                Ok(true)
+            }
+        }
     }
 
     async fn find(
@@ -232,8 +274,9 @@ impl Store for MemStore {
         let fresh = || undecided().filter(|r| r.feed_seq.is_none());
         Ok(in_flight
             .into_iter()
-            .chain(fresh().filter(|r| r.new.reserves))
-            .chain(fresh().filter(|r| !r.new.reserves))
+            .chain(fresh().filter(|r| r.new.overtakes))
+            .chain(fresh().filter(|r| !r.new.overtakes && r.new.reserves))
+            .chain(fresh().filter(|r| !r.new.overtakes && !r.new.reserves))
             .take(n)
             .cloned()
             .collect())
@@ -517,31 +560,25 @@ impl Store for MemStore {
         epoch: u64,
         from: u64,
     ) -> Result<(), StoreError> {
+        unfeed_locked(&mut self.lock(), partition, holder, epoch, from)
+    }
+
+    async fn unfeed_in_flight(
+        &self,
+        partition: &str,
+        holder: &str,
+        epoch: u64,
+        from: u64,
+    ) -> Result<u64, StoreError> {
+        // One lock, so the sequences and the epoch move together.
         let mut inner = self.lock();
-        let now = Instant::now();
-        match inner.feeds.get(partition) {
-            Some(l) if l.holder == holder && l.epoch == epoch && l.until > now => {}
-            _ => return Err(StoreError::fenced()),
-        }
-        let tail = inner
-            .rows
-            .values()
-            .filter(|r| r.feed_seq.is_some_and(|s| s >= from));
-        if tail.clone().any(|r| r.status == Status::Decided) {
-            return Err(StoreError(
-                "a decided row holds a sequence to give back".into(),
-            ));
-        }
-        let keys: Vec<u64> = tail.map(|r| r.seq).collect();
-        for k in keys {
-            if let Some(r) = inner.rows.get_mut(&k) {
-                r.feed_seq = None;
-            }
-        }
-        if let Some(l) = inner.feeds.get_mut(partition) {
-            l.next_seq = l.next_seq.min(from);
-        }
-        Ok(())
+        unfeed_locked(&mut inner, partition, holder, epoch, from)?;
+        let lease = inner
+            .feeds
+            .get_mut(partition)
+            .ok_or_else(StoreError::fenced)?;
+        lease.epoch += 1;
+        Ok(lease.epoch)
     }
 
     async fn copy_verifier(
@@ -617,8 +654,18 @@ mod passkey_tests {
             assert_eq!(s.sign_count("c").await.unwrap(), Some(5));
             assert!(s.use_challenge([1; 16], 100, 10).await.unwrap());
             assert!(!s.use_challenge([1; 16], 100, 20).await.unwrap());
-            // Pruned once expired; an expired challenge never checks anyway.
-            assert!(s.use_challenge([1; 16], 300, 150).await.unwrap());
+            // Kept past its expiry for the margin (amendment 0037, `T-040-03`), pruned after it;
+            // an expired challenge never checks anyway.
+            assert!(
+                !s.use_challenge([1; 16], 300, 99 + crate::store::SPENT_MARGIN_MS)
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                s.use_challenge([1; 16], 300, 100 + crate::store::SPENT_MARGIN_MS)
+                    .await
+                    .unwrap()
+            );
         });
     }
 }
@@ -640,6 +687,7 @@ mod tests {
             body: Vec::new(),
             pass_through: None,
             reserves,
+            overtakes: false,
             synchronous: false,
             received_at: u64::from(n),
             arrived_at: None,
@@ -670,6 +718,43 @@ mod tests {
             s.next_undecided().await.unwrap().map(|r| r.new.op_ref.0[0]),
             Some(2)
         );
+    }
+
+    /// `T-037-04` (`REQ-RT-20`, amendment 0035): a row that overtakes goes before reservations and
+    /// every other row not yet sent, however late it was logged; a row already given a feed
+    /// sequence (it may have run) still goes before it; decided rows are left out.
+    #[tokio::test]
+    async fn t_037_04_a_row_that_overtakes_goes_before_the_queue_but_not_before_rows_in_flight() {
+        use crate::feed::BOOK;
+        let s = MemStore::new(Duration::from_secs(1));
+        let long = Duration::from_secs(60);
+        assert_eq!(s.try_feed(BOOK, "a", long).await.unwrap(), Some(1));
+        let refs = |rows: Vec<Row>| rows.iter().map(|r| r.new.op_ref.0[0]).collect::<Vec<_>>();
+        let k = |n: u8| InputKey([n; 16]);
+        for (n, reserves) in [(1, false), (2, true), (3, false)] {
+            s.append(row(n, reserves)).await.unwrap();
+        }
+        // 1 was sent already, and is in flight with its sequence.
+        s.mark_fed(BOOK, "a", 1, &[k(1)], 5).await.unwrap();
+        // Two way outs are logged behind everything; a decided one is left out.
+        for n in [4, 5, 6] {
+            let mut r = row(n, false);
+            r.overtakes = true;
+            s.append(r).await.unwrap();
+        }
+        s.mark_decided(k(5), 1, Vec::new(), 9).await.unwrap();
+        assert_eq!(
+            refs(s.next_undecided_batch(10).await.unwrap()),
+            vec![1, 4, 6, 2, 3],
+            "in flight, then the way outs in arrival order, then reservations, then the rest"
+        );
+        assert_eq!(
+            s.next_undecided().await.unwrap().map(|r| r.new.op_ref.0[0]),
+            Some(1)
+        );
+        // Once the row in flight is given back, the way out is first.
+        s.unfeed(BOOK, "a", 1, 1).await.unwrap();
+        assert_eq!(refs(s.next_undecided_batch(2).await.unwrap()), vec![4, 6]);
     }
 
     /// `T-038-03` (`DEC-27` (d)): one holder of a partition's feed lease at a time; its epoch

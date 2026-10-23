@@ -73,6 +73,10 @@ pub struct Invocation<'a> {
     pub message: &'a [u8],
     /// The caller blobs, by content (`ctx.invocation_blob`).
     pub blob: &'a dyn Fn(&BlobKey) -> Option<Vec<u8>>,
+    /// The code generation compiled into the code that runs this transition (`T-037-15`): the
+    /// guest's `code_generation()`, the record `ledger_core::code::generation_of` reads. The fence
+    /// compares it with the writer's state at every input ([`crate::fence`]).
+    pub generation: u64,
 }
 
 /// Buffered writes, applied only when the transition succeeds.
@@ -135,7 +139,7 @@ fn blob(inv: &Invocation<'_>, key: &BlobKey, what: &str) -> Result<Vec<u8>, Agen
 
 fn read_hot(rows: &dyn Rows) -> Result<Option<Hot>, AgentRefusal> {
     rows.get(HOT)
-        .map(|b| decode::<Hot>(&b).map_err(AgentRefusal::Malformed))
+        .map(|b| hot::decode_hot(&b).map_err(AgentRefusal::Malformed))
         .transpose()
 }
 
@@ -280,6 +284,13 @@ fn genesis(
         limits: g.limits,
         config_len: config.len() as u64,
         observed_slot: inv.slot.unwrap_or(0),
+        code: g.code.code,
+        generation: 0,
+        construction: ledger_core::anchor::construction(),
+        upgrade: None,
+        authority: g.code.authority,
+        authority_next: None,
+        continued_at: None,
     };
     let bytes = hot.bytes();
     if bytes > hot.limits.budget {
@@ -342,6 +353,13 @@ fn state_genesis(
         limits: g.limits,
         config_len: config.len() as u64,
         observed_slot: inv.slot.unwrap_or(0),
+        code: g.code.code,
+        generation: 0,
+        construction: ledger_core::anchor::construction(),
+        upgrade: None,
+        authority: g.code.authority,
+        authority_next: None,
+        continued_at: None,
     };
     let bytes = hot.bytes();
     if bytes > hot.limits.budget {
@@ -463,6 +481,10 @@ fn input(
             expected: hot.inputs + 1,
         });
     }
+    // The fence (`T-037-15`, `crate::fence`): at every input, before anything of it runs.
+    let way_out = crate::fence::way_out_input(&i.calls, i.deliveries.len())?;
+    let mut code = crate::fence::WriterCode::of(&hot);
+    crate::fence::admit(inv.generation, &code, i.seq, way_out)?;
     // Backpressure (`T-005-07`): nothing more until the driver archives.
     if hot.inputs - hot.archived >= hot.limits.ring {
         return Err(AgentRefusal::RingFull);
@@ -520,6 +542,16 @@ fn input(
         return Err(AgentRefusal::OutboxFull);
     }
     let mut ledger = Ledger::from_parts(book, state, config);
+    // What a checkpoint this input creates binds (`T-037-03`): the code that executes it, as the
+    // code map names it (`crate::fence`), and the hot row's mode. The input's own number, which a
+    // way out is decided against (`T-037-15`), and at which a scheduled change of mode takes force
+    // (`T-037-05`).
+    ledger.set_code(code.code_for(i.seq), hot.authority);
+    ledger.set_authority_next(hot.authority_next);
+    // The scheduled upgrade as this input finds it: a move of it goes strictly later than it
+    // (owner ruling w6, `T-037-05`), the same for code of either generation.
+    ledger.set_scheduled_upgrade(code.upgrade);
+    ledger.set_input(i.seq);
     let clerk_ref = private.clerk.as_ref().map(|c| c as &dyn ClerkSigner);
     let mut summaries = Vec::with_capacity(i.calls.len());
     for c in &i.calls {
@@ -532,6 +564,10 @@ fn input(
         }
         summaries.push(s);
     }
+    // What the input did to the writer's code (`T-037-15`), decided the same by either generation.
+    let taken = ledger.take_way_out();
+    crate::fence::decide(&mut code, i.seq, way_out, taken, ledger.take_upgrade());
+    code.store(&mut hot);
     // Deliveries: recorded once, for notifications the core committed (`REQ-RT-4`). Both the
     // notification and its delivery leaf must be witnessed.
     let mut delivered = Vec::new();
@@ -552,6 +588,9 @@ fn input(
         return Err(AgentRefusal::UnprovenRead);
     }
     hot.notified += ledger.state().operations().outbox_created() as u64;
+    // The mode in force and any scheduled change of it, as the input leaves them (`T-037-05`).
+    hot.authority = ledger.authority();
+    hot.authority_next = ledger.authority_next();
 
     // The service root after, from the same proof, over every leaf given or created.
     let mut after = ledger.state().witnessed_leaves();
@@ -574,6 +613,7 @@ fn input(
     hot.audit_shipped = audit.shipped;
     let entry = RingEntry {
         seq: i.seq,
+        code: hot.code,
         calls: i.calls,
         deliveries: delivered,
         roots: hot.roots(),
@@ -663,6 +703,7 @@ fn batch(
             slot: inv.slot,
             message: inv.message,
             blob: &fetch,
+            generation: inv.generation,
         };
         for i in run {
             if stopped {

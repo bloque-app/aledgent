@@ -72,6 +72,33 @@ pub struct Heads {
     pub applied: Vec<(ShardId, u64)>,
     /// Per peer, the sequence through which its outbox to that peer is trimmed.
     pub trimmed: Vec<(ShardId, u64)>,
+    /// The construction of its state commitment, its code version and its upgrade-authority
+    /// mode's digest, as its anchor leaf binds them (`T-037-03`). A shard Agent's own writer state
+    /// does not hold a code version yet (`T-037-02` gave the core's hot row one): it reports the
+    /// build's construction and no code or mode (zeros).
+    pub code: ShardCode,
+}
+
+/// What a shard's anchor leaf binds of its code (`T-037-03`, `DEC-26` (a)).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShardCode {
+    /// The construction of its state commitment.
+    pub construction: u8,
+    /// Its code version.
+    pub code: [u8; 32],
+    /// Its upgrade-authority mode's digest.
+    pub authority: [u8; 32],
+}
+
+impl ShardCode {
+    /// The build's construction, with no code or mode named: what a shard reports today.
+    pub fn of_build() -> ShardCode {
+        ShardCode {
+            construction: ledger_kernel::compact_smt::Version::ACTIVE.byte(),
+            code: [0; 32],
+            authority: [0; 32],
+        }
+    }
 }
 
 fn head_of(v: &[(ShardId, u64)], peer: ShardId) -> u64 {
@@ -86,6 +113,7 @@ impl Heads {
         Heads {
             shard,
             root,
+            code: ShardCode::of_build(),
             ..Heads::default()
         }
     }
@@ -127,6 +155,9 @@ impl Heads {
             commit: self.commit,
             root: self.root,
             heads: self.digest(),
+            construction: self.code.construction,
+            code: self.code.code,
+            authority: self.code.authority,
         }
     }
 }
@@ -517,6 +548,7 @@ mod tests {
             enqueued: v(enq),
             applied: v(app),
             trimmed: v(trim),
+            code: ShardCode::of_build(),
         }
     }
 

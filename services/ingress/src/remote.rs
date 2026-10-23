@@ -112,6 +112,11 @@ pub enum Request {
         /// The feed.
         feed: Feed,
     },
+    /// [`Core::stage_code`] (`T-037-04`): fetch, check and hold a code version.
+    StageCode {
+        /// The code version, hex.
+        code: String,
+    },
 }
 
 /// The first frame of every connection (`F-035`): the link's token. Never formatted.
@@ -269,6 +274,11 @@ pub enum Response {
         /// The answer.
         reply: FeedReply,
     },
+    /// What staging a code version came to (`T-037-04`).
+    Staged {
+        /// The answer.
+        staged: crate::boundary::Staged,
+    },
     /// The core did not run the request.
     Unavailable,
     /// The core may have run it.
@@ -292,6 +302,11 @@ pub enum BatchAnswer {
     Unavailable,
     /// The core may have run it.
     Ambiguous,
+    /// The core refused it because of the fence and holds no decision for it, definitely
+    /// (amendment 0036): [`CoreError::NotRun`]. Given for the first input a call did not commit,
+    /// because of the fence, and for every later one of that call. A peer that reads it as
+    /// anything else reads it as `Unavailable`.
+    NotRun,
 }
 
 impl BatchAnswer {
@@ -301,6 +316,7 @@ impl BatchAnswer {
             Ok(reply) => BatchAnswer::Applied { reply },
             Err(CoreError::Unavailable) => BatchAnswer::Unavailable,
             Err(CoreError::Ambiguous) => BatchAnswer::Ambiguous,
+            Err(CoreError::NotRun) => BatchAnswer::NotRun,
         }
     }
 
@@ -310,13 +326,15 @@ impl BatchAnswer {
             BatchAnswer::Applied { reply } => Ok(reply),
             BatchAnswer::Unavailable => Err(CoreError::Unavailable),
             BatchAnswer::Ambiguous => Err(CoreError::Ambiguous),
+            BatchAnswer::NotRun => Err(CoreError::NotRun),
         }
     }
 }
 
 fn error_response(e: CoreError) -> Response {
     match e {
-        CoreError::Unavailable => Response::Unavailable,
+        // `NotRun` is a batch's answer; for a single call it says what `Unavailable` says.
+        CoreError::Unavailable | CoreError::NotRun => Response::Unavailable,
         CoreError::Ambiguous => Response::Ambiguous,
     }
 }
@@ -393,6 +411,22 @@ pub async fn answer<C: Core>(core: &C, request: Request) -> Response {
         Request::Feed { feed } => Response::Fed {
             reply: core.feed(&feed).await,
         },
+        Request::StageCode { code } => {
+            let Some(code) = hex::decode(&code)
+                .ok()
+                .and_then(|b| <[u8; 32]>::try_from(b).ok())
+            else {
+                return Response::Staged {
+                    staged: crate::boundary::Staged::Refused {
+                        reason: "a code version is 32 bytes of hex".into(),
+                    },
+                };
+            };
+            match core.stage_code(&code).await {
+                Ok(staged) => Response::Staged { staged },
+                Err(e) => error_response(e),
+            }
+        }
     }
 }
 
@@ -714,5 +748,38 @@ impl Core for RemoteCore {
             Ok(r) => Err(Self::read_error(r)),
             Err(_) => Err(CoreError::Unavailable),
         }
+    }
+
+    async fn stage_code(&self, code: &[u8; 32]) -> Result<crate::boundary::Staged, CoreError> {
+        let request = Request::StageCode {
+            code: hex::encode(code),
+        };
+        match self.call(&request).await {
+            Ok(Response::Staged { staged }) => Ok(staged),
+            Ok(r) => Err(Self::read_error(r)),
+            Err(_) => Err(CoreError::Unavailable),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `T-037-18`, amendment 0036: the fence's definite "not run" is a batch answer of its own on
+    /// the wire, and comes out as [`CoreError::NotRun`]; for a single call it reads as
+    /// `Unavailable`.
+    #[test]
+    fn t_037_18_not_run_is_a_batch_answer_of_its_own() {
+        let json = serde_json::to_string(&BatchAnswer::NotRun).unwrap();
+        assert_eq!(json, r#"{"answer":"not_run"}"#);
+        let back: BatchAnswer = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.clone().result(), Err(CoreError::NotRun));
+        assert_eq!(BatchAnswer::of(Err(CoreError::NotRun)), back);
+        assert_ne!(BatchAnswer::NotRun, BatchAnswer::Unavailable);
+        assert!(matches!(
+            error_response(CoreError::NotRun),
+            Response::Unavailable
+        ));
     }
 }

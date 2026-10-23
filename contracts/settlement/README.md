@@ -22,7 +22,9 @@ choices, the storage layout and how the adapter reads it are in
 | `set_keys(keys, attestation_key)` | the admin | Rotate keys |
 | `set_withdrawal_bound(asset, Option<bound>)` | the admin | Bound withdrawals per asset per window; an asset with no bound cannot leave (`NoWithdrawalBound`) |
 | `prune_inbox(up_to)` | the admin | Remove old movement, refusal and superseded anchor entries; bind entries and the latest anchor's entry stay. **Never past the adapter's cursor**: an unread `Anchored` entry is what makes its checkpoint final |
-| `registration`, `head`, `inbox_entry`, `latest_anchor`, `position`, `withdrawal_window`, `bound` | anyone | Reads (`bound(asset)`: the inbox position of the asset's `Bound` entry, if bound; `latest_anchor()`, selector `0x0000_0307`, replaces `anchor_record(number)`) |
+| `set_governance(account)` | the admin while none is set; then governance only | Name the deployment's governance (on Kreivo: the licence-owning community's account, reached by a referendum through `Communities.dispatch_as_account`). Amendment 0039 |
+| `set_anchor_head(expected_last, base, book)` | governance only | Start a new anchor sequence for a re-founded book: the next anchor is `base + 1`; refused `HeadMoved` unless the head's `last_anchor` is `expected_last`. Moves no value; touches no position, bound, binding, key or inbox entry. Amendment 0039 |
+| `registration`, `head`, `inbox_entry`, `latest_anchor`, `position`, `withdrawal_window`, `bound`, `anchor_epoch`, `governance` | anyone | Reads (`bound(asset)`: the inbox position of the asset's `Bound` entry, if bound; `latest_anchor()`, selector `0x0000_0307`, replaces `anchor_record(number)`; `anchor_epoch()` (`0x0000_0308`): the sequence governance started last, `None` for the instance's first) |
 
 Calls (`Call`): `Withdraw { to: Account(..) | Deployment { contract, account_ref }, asset, amount }`
 (0), `Anchor { number, commitment }` (1) and `Bind { asset, amount }` (2). A bind runs inline,
@@ -165,6 +167,10 @@ runtime in production carries every upstream fix to the communities pallet that 
       origin, `Communities(RawOrigin { community_id, subset: None })`. `Communities.CommunityIdFor`
       no longer maps the old signed origin, and a dry run of `ContractsStore.upgrade` signed by the
       old key fails with `BadOrigin`.
+- [ ] **Governance named** (amendment 0039): the contract's admin has called
+      `set_governance(<the community's account>)`, and `governance()` reads it back. Until then
+      nobody can start an anchor sequence; after it, the admin cannot change it. On an upgraded
+      instance this is the first message after `ContractsStore.upgrade`.
 - [ ] A first referendum has replaced the default track (`CommunityTracks.update`): the default one
       passes a proposal with a single aye in about 25 minutes.
 - [ ] The community id, members, decision method and track are recorded with the deployment, and

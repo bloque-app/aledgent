@@ -327,9 +327,11 @@ fn inv_19_an_anchor_commits_to_a_stated_sequence_and_nothing_else__service(
         check(leaves.root() == c.kernel_root, || {
             "the rebuilt root is not the checkpoint's".into()
         })?;
+        // `v3` (`T-037-03`): the checkpoint's own construction and code binding.
         check(
-            verify::commitment(
-                ledger_core::anchor::construction(),
+            verify::checkpoint_commitment(
+                c.construction,
+                c.binding.as_ref(),
                 INSTANCE,
                 c.number,
                 c.entry_sequence,
@@ -585,10 +587,18 @@ fn ac_j1_5__service(_: &mut dyn Harness) -> Outcome {
         check(verify::construction_known(named), || {
             format!("construction {named} is not one a recipient can check")
         })?;
+        check(c.construction == named, || {
+            format!(
+                "the checkpoint names construction {}, not {named}",
+                c.construction
+            )
+        })?;
         let anchored = k.chain.anchor_at_finalized(INSTANCE, 1).map(|a| a.0);
+        // `v3` (`T-037-03`): the same checkpoint, code binding included, under each construction.
         let under = |construction: u8| {
-            verify::commitment(
+            verify::checkpoint_commitment(
                 construction,
+                c.binding.as_ref(),
                 INSTANCE,
                 c.number,
                 c.entry_sequence,

@@ -17,8 +17,25 @@
 //! No clock, randomness or network is used here or in anything it links (`REQ-RT-7`,
 //! `tools/ci/check-guest-deps.sh`): time comes in the library calls, keys and blindings derive
 //! from the private input's root.
+//!
+//! **The code generation** (`T-037-01`; amendment 0033, D1, D13): the package is built as
+//! `GENERATION`, its record `ALEDGENT_CODE_GENERATION` in the section `.aledgent.generation`
+//! (kept first in `.rodata` by `pvm.ld`), defined once by `ledger_core::code_generation!`.
+//! `GENERATION` is private, and only the macro reads it, so the record is the one copy anything
+//! in the guest can read: through `code_generation()`, which every invocation hands the
+//! transition, so the fence compares that very record with the writer's state at every input
+//! (`T-037-15`, `core_binding::fence`). The
+//! manifest that names this package must name the same generation: `check-code` and the
+//! `package` step refuse it otherwise. *H₀* is generation 0; every upgrade's package is built
+//! with this constant raised by one.
 
 use core_binding::envelope::BlobKey;
+
+/// The code generation this package is built as (module documentation). Private: only the record
+/// the macro defines from it is read.
+const GENERATION: u64 = 0;
+
+core_binding::ledger_core::code_generation!(GENERATION);
 use core_binding::transition::{Invocation, Rows, transition};
 use vos::prelude::*;
 
@@ -81,6 +98,8 @@ impl AledgentCore {
             slot,
             message: &envelope,
             blob: &fetch,
+            // The fence (`T-037-15`): this package's compiled generation, the record itself.
+            generation: crate::code_generation(),
         };
         let mut rows = ActorRows {
             map: &mut self.rows,

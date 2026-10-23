@@ -914,6 +914,7 @@ mod schemes;
 mod seeding;
 mod settle_adapter;
 mod transfers;
+mod upgrade;
 
 #[cfg(feature = "sim")]
 mod settlement;

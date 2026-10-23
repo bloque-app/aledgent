@@ -315,3 +315,109 @@ pub fn spec_of(
     };
     ChainSpec::build(op, at, assets, records, Some(rec), None, limits).unwrap()
 }
+
+// ------------------------------------------------------------------- code versions (`T-037-04`)
+
+use core_binding::staging::CodeFetch;
+use ledger_core::code::{
+    Artefact, BuildProfile, CodeManifest, KernelIdentity, Platform, Role, WriterKind,
+    artefact_digest, generation_record,
+};
+
+/// A package of code generation `generation`: a standard PVM program with the generation's record
+/// in its read-only data, which `ledger_core::code::generation_of` reads. The runtime is a
+/// constant.
+pub fn code_package(generation: u64) -> Vec<u8> {
+    let ro = generation_record(generation);
+    let mut p = Vec::new();
+    // E3(|o|) ‖ E3(|w|) ‖ E2(z) ‖ E3(s) ‖ o ‖ w ‖ E4(|c|) ‖ c
+    p.extend_from_slice(&(ro.len() as u32).to_le_bytes()[..3]);
+    p.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+    p.extend_from_slice(&ro);
+    p.extend_from_slice(&1u32.to_le_bytes());
+    p.push(0);
+    p
+}
+
+/// The runtime of every test code version.
+pub const CODE_RUNTIME: &[u8] = b"agent-runtime";
+
+/// A manifest that names `generation`, over the given package and runtime.
+pub fn code_manifest(generation: u64, package: &[u8], runtime: &[u8]) -> CodeManifest {
+    let profile = || BuildProfile {
+        target: "riscv64em-vos".into(),
+        toolchain: "nightly".into(),
+        opt_level: "s".into(),
+        features: Vec::new(),
+        source_revision: "0123abcd".into(),
+        cargo_lock: [0; 32],
+    };
+    let art = |role, b: &[u8]| Artefact {
+        role,
+        digest: artefact_digest(b),
+        len: b.len() as u64,
+        identities: Vec::new(),
+        profile: profile(),
+    };
+    CodeManifest {
+        writer: WriterKind::Core,
+        platform: Platform {
+            name: "vos-saga".into(),
+            revision: "c54fc1ff".into(),
+            identities: Vec::new(),
+        },
+        generation,
+        artefacts: vec![art(Role::Package, package), art(Role::Runtime, runtime)],
+        kernel: KernelIdentity {
+            revision: "e9a7b08".into(),
+            checksum: None,
+        },
+        constructions: Vec::new(),
+        messages: Vec::new(),
+    }
+}
+
+/// A source of code that holds what it was given, by digest. Untrusted, like any: a test makes it
+/// lie with [`HeldCode::lie`].
+#[derive(Default, Clone)]
+pub struct HeldCode(std::sync::Arc<std::sync::Mutex<BTreeMap<[u8; 32], Vec<u8>>>>);
+
+impl HeldCode {
+    pub fn put(&self, bytes: &[u8]) -> [u8; 32] {
+        let d = artefact_digest(bytes);
+        self.0.lock().unwrap().insert(d, bytes.to_vec());
+        d
+    }
+
+    /// Hold `bytes` under `digest`, which is not theirs.
+    pub fn lie(&self, digest: [u8; 32], bytes: &[u8]) {
+        self.0.lock().unwrap().insert(digest, bytes.to_vec());
+    }
+
+    pub fn forget(&self, digest: &[u8; 32]) {
+        self.0.lock().unwrap().remove(digest);
+    }
+
+    /// A whole code version of `generation`: its manifest, package and runtime. Returns the version.
+    pub fn version(&self, generation: u64) -> [u8; 32] {
+        let (p, r) = (code_package(generation), CODE_RUNTIME.to_vec());
+        let m = code_manifest(generation, &p, &r);
+        self.put(&p);
+        self.put(&r);
+        self.put(&m.to_bytes());
+        m.version()
+    }
+}
+
+impl CodeFetch for HeldCode {
+    fn name(&self) -> &str {
+        "held"
+    }
+    fn fetch(&self, digest: &[u8; 32], _: Option<u64>) -> Option<Vec<u8>> {
+        self.0.lock().unwrap().get(digest).cloned()
+    }
+    /// What a fetcher with a cache and one source that once lied would report (`T-037-06`).
+    fn mismatches(&self) -> Vec<(String, u64)> {
+        vec![("cache".into(), 0), ("fs:0".into(), 2)]
+    }
+}

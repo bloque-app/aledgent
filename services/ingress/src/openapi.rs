@@ -24,6 +24,7 @@ use crate::query::{
     AssetBody, AssetParams, BalancesBody, BalancesParams, CanSpendBody, MovementsParams, PageBody,
     StatementBody, StatementParams, TrialBalanceBody,
 };
+use crate::refusal::IngressRefusal;
 use crate::surface::{
     AnsweringRoute, AuthRoute, CLIENT_KEY, CommandRoute, Handler, ON_BEHALF_OF, QueryRoute, ROUTES,
     status_of,
@@ -89,6 +90,20 @@ pub fn refusal_schema() -> Value {
                 "x-http-status": status_of(*r).as_u16(),
             })
         })
+        .chain(IngressRefusal::ALL.iter().map(|r| {
+            // Refusals only ingress sends until the next core carries them (amendment 0037, R2).
+            json!({
+                "title": r.code(),
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["error", "description"],
+                "properties": {
+                    "error": { "const": r.code() },
+                    "description": { "const": r.description() },
+                },
+                "x-http-status": r.status().as_u16(),
+            })
+        }))
         .collect();
     json!({
         "title": "Refusal",
@@ -118,6 +133,7 @@ fn request_schema(route: CommandRoute) -> &'static str {
         | CommandRoute::ProposeReversal
         | CommandRoute::ApproveReversal
         | CommandRoute::RevokeIssuance
+        | CommandRoute::CancelUpgrade
         | CommandRoute::RevokeOperator => "JustifiedBody",
         CommandRoute::Resolve => "ResolveBody",
         CommandRoute::SubmitEvidence => "SubmitEvidenceBody",
@@ -140,6 +156,8 @@ fn request_schema(route: CommandRoute) -> &'static str {
         CommandRoute::RegisterIntegratingParty => "RegisterIntegratingPartyBody",
         CommandRoute::TiePrincipal => "TiePrincipalBody",
         CommandRoute::RegisterAlias => "RegisterAliasBody",
+        CommandRoute::Upgrade => "UpgradeBody",
+        CommandRoute::RescheduleUpgrade => "RescheduleUpgradeBody",
         CommandRoute::Settlement(s) => s.schema(),
         CommandRoute::Anchoring(a) => a.schema(),
     }
@@ -453,6 +471,8 @@ fn schemas() -> Map<String, Value> {
     add::<crate::wire::TiePrincipalBody>(&mut g);
     add::<crate::wire::IntegratingPartiesBody>(&mut g);
     add::<crate::wire::RegisterAliasBody>(&mut g);
+    add::<crate::wire::UpgradeBody>(&mut g);
+    add::<crate::wire::RescheduleUpgradeBody>(&mut g);
     add::<crate::wire::AliasBody>(&mut g);
     add::<crate::wire::GrantsBody>(&mut g);
     add::<crate::wire::AccountViewBody>(&mut g);

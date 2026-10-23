@@ -933,7 +933,7 @@ new genesis.
 *Decision:*
 
 - **(a) `:code` in hot state.** A **code version** *H* is `blake2b-256` of a canonical manifest
-  (`aledgent/code/v1`) that names its **platform** (name and revision, e.g. `vos-saga@c54fc1ff`) and lists,
+  (`aledgent/code/v1`) that names its **platform** (name and revision, e.g. `vos-saga@bd8d1bb7`) and lists,
   for one writer kind, its **code generation** (`generation: u64`) and each artefact that decides a
   transition (`package`, optionally `runtime`, and `native-decide` wherever a host decides natively) with
   its unkeyed `blake2b-256`, length, **identities** on the platform (VOS `ProgramId` today; on `vos-core`
@@ -941,7 +941,8 @@ new genesis.
   toolchain, `opt-level`, features, source revision, `Cargo.lock` digest), the kernel's identity, the
   constructions it reads and the message formats it accepts and emits (amendment 0033). Every package is
   built with a `GENERATION` constant equal to the manifest's `generation`: a 16-byte record (`ALGGEN01` and a
-  little-endian `u64`) in its own ELF section, `.aledgent.generation`, exported as
+  little-endian `u64`) in its own ELF section, `.aledgent.generation` (or that section placed first in
+  `.rodata` where the platform's program linker keeps only `.rodata`, found by the symbol), exported as
   `ALEDGENT_CODE_GENERATION`; the symbol is that record, defined once by a `ledger-core` macro, and the fence
   reads that very static, so there is no second constant to compare. One reader, `ledger_core::code::generation_of`, reads it in `check-code`
   ([`T-038-25`](features/F-038-ingress-fleet/tasks.md)), which fails the build when it differs, in staging, and in the host's checks at start and
@@ -984,10 +985,15 @@ new genesis.
   code; on `vos-core`, which has no compare-and-swap and no way for an actor to read its program's hash, the
   fence is the only in-book check. The fence identifies code up to its generation; byte identity within a
   generation is the host's staging check. **The way out:** `RescheduleUpgrade { from: m }` (`m` later than
-  its own number) and `CancelUpgrade`, authorised under the mode in force (an unauthorised one is refused),
-  are the only inputs the fenced code takes; they take their numbers like any input and are decided the
-  same by code of either generation (the upgrade does not take effect, `generation` stays *g*), after which
-  the host reinstalls *g*'s staged package if it had switched. The `code-history` gate decides every way-out
+  its own number) and `CancelUpgrade`, authorised under the mode in force, are the only inputs the fenced
+  code takes; every one is decided, the same by code of either generation, refusals included (an
+  unauthorised one, or a move not later than its own number, is a recorded refusal that takes its number,
+  and the upgrade stays scheduled; amendment 0035); none makes the upgrade take effect (`generation` stays
+  *g*), after which the host installs the code the code map names. An input that holds a way out and
+  anything else is refused whole as `ERR-MalformedCommand`, nothing of it applied, by every generation
+  alike (amendment 0035). Their audit and export command codes are fixed once in *H₀*: `RescheduleUpgrade`
+  51, `CancelUpgrade` 52, `SetAuthority` 53, `ProposeUpgrade` 54, `ApproveUpgrade` 55, `ProposeMigration`
+  56. The `code-history` gate decides every way-out
   fixture input under each staged *H* and under *g* and requires the same committed state. The code map derives from the `Upgrade`,
   `RescheduleUpgrade` and `CancelUpgrade` inputs alone, and native replay takes each input's generation from
   it. `aledgent_writer_fenced_seconds` alerts past `fence_alert_after` (a deployment setting, default five
@@ -1262,6 +1268,8 @@ Each feature names its exit criterion by spec identifier. If a feature's tests d
 | `F-037` | **Code history and upgrades** (`DEC-26`, amendment 0023, ruled 2026-10-08; independent of the platform, amendment 0033, ruled 2026-10-17). The manifest with its platform, identities, optional runtime and code generation; the hot-row and ring-entry fields, with nothing of the platform hashed, and checkpoint `v3`; the one `switch` operation, the fence and its way out; the `Upgrade`, `MigrateConstruction` and `SetAuthority` inputs and the modes; `CodeSource` with `fs`, `s3`, `https`, `exec`, C-ABI plugins (`aledgent-code-fetch`) and, in the open-source distribution, `kreivo-preimage`; checkpoints as rows and leaf chunks; per-range restore, native first, with a replayer per range kept beside each code version, under the frozen call format; the continuation, founded once per input number; snapshots and the per-shard archive; the `code-history` gate; the legal hold and the break-glass role (`features/F-037-code-history/plan.md`). After `F-036` (the chainspec names *H₀* and the initial mode), before `F-021` (warp sync admits a fresh replica) | `REQ-RT-3`, `REQ-RT-15`–`REQ-RT-21`, `REQ-PR-11`, `NFR-22`, `US-K7` | `AC-K7.1`–`AC-K7.20` pass; the `code-history` gate replays a fixture archive across an upgrade, a construction migration and a continuation from genesis, at every input; a fast and a full resync reach the same roots; a checkpoint restores with no VOS crate linked |
 | `F-038` | **Ingress fleet and the core stream** (`DEC-27`, proposed). Ingress as at least two instances across failure domains, released blue/green; the acknowledgement on the received log alone; core hosts connecting out over mutual TLS and receiving their partitions' commands in log order; one feeder lease per partition, a go-away drain and de-duplication by sequence; ingress's signature on every forwarded command, checked by the core host; `ERR-DecisionUnavailable` (a 503 with its named body and `Retry-After`) instead of a bare gateway error when no core decides in time; every ingress instance reading from its region's cores over a stream of its own (the roster); a provider-neutral reference deployment beside Bloque's; an operator's deployment guide in the documentation site's Operate section, one page for AWS (the shape Bloque runs, with no Bloque names or accounts) and one for a single machine, each written from what was applied and verified. The Agent and its genesis bytes are unchanged | `NFR-1`, `NFR-5`, `NFR-16`, `NFR-17`, `NFR-21`, `REQ-AR-7`, `REQ-CS-7` | A node reboot, a core restart and an ingress blue/green release, each under the stress suite's load, refuse no request and acknowledge every command within `NFR-1`; no command is decided twice or out of order across a handover; a command answered with its decision gets its decision or `ERR-DecisionUnavailable`, never a 5xx with nothing behind it; a forwarded command without a valid ingress signature never reaches the Agent |
 | `F-039` | **Documentation** (`M-3D`, proposed). The documentation site's Concepts, Integrate and Operate sections as `M-3D` lists them, written from `SPEC.md`, `PLAN.md` and what is built, each page citing the identifiers it explains; an error catalogue generated from §10 and kept in sync by CI; the one-machine walkthrough as a CI job. Operator-neutral: no page names an operator's accounts, hosts or internal tools | `NFR-11`, `REQ-AR-5`, §10, every epic | `M-3D`'s gate |
+| `F-040` | **Per-transaction approval at ingress** (amendment 0037, `REQ-AU-23`, `US-A10`; approved by the owner 2026-10-22; Feature A). A command that moves or reserves value, names where value goes, or changes who may act or a credential, under a session, needs the approval of one of the person's own device-bound credentials over that one command: ingress asks for it in a first call that takes nothing in and checks it in the second. Policy of which commands, the door by how the caller proved who it is, one-time use durable across instances, a switch with three positions (off, report only, enforce), the refusal `ERR-CommandApprovalRequired` held in ingress's own type until the next core (`features/F-040-passkey-approval-ingress/plan.md`). No core code changes | `REQ-AU-23`, `REQ-AU-20`, `REQ-CS-8`, `NFR-1`, `NFR-7`, `US-A10` | `AC-A10.1`–`AC-A10.16` pass; a session without an approval is refused and nothing is logged; approvals meet `NFR-1` at p99 in enforce on x86 or CI |
+| `F-041` | **The core records the approval** (amendment 0037, Feature B, a stub). Blocked by `F-040` and by the throughput measurement that is its first task: the core refuses a command that needs an approval and has none, and writes the record into the book, as a core upgrade (`F-037`) in the next core (`features/F-041-passkey-approval-core/plan.md`). Carries the core's line for `ERR-CommandApprovalRequired`, and ends the conformance allowance for it | `REQ-AU-23`, `REQ-AU-7`, `REQ-ER-1` | Not planned in detail; the measurement first |
 
 ### Track C: the settlement pallet
 

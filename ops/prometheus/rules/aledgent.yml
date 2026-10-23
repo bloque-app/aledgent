@@ -212,7 +212,7 @@ groups:
         expr: aledgent_drill_passed == 0
         labels: { severity: page, owner: platform, signal: drill }
         annotations:
-          summary: The last restore drill failed a check.
+          summary: The last restore drill failed a check, or could not decide one (an anchor unreadable on a node without past state, so read it from an archive node).
           runbook: ops/runbooks/restore.md
       - alert: AledgentDrillOverdue
         expr: aledgent_drill_last_age_ms > 2764800000
@@ -296,6 +296,17 @@ groups:
         annotations:
           summary: The audit outbox is at its bound; the core decides nothing until the store takes records.
           runbook: ops/runbooks/release/audit-shipping.md
+
+      # REQ-RT-20, T-037-15: the writer is fenced. The code installed is not the code its state
+      # names (a switch missed or not yet made, or a stale package), so it takes no input until
+      # the code map's code is installed, or the upgrade is moved or cancelled. The line is
+      # `fence_alert_after`: five minutes unless the deployment sets another here.
+      - alert: AledgentWriterFenced
+        expr: aledgent_writer_fenced_seconds > 300
+        labels: { severity: page, owner: platform, signal: writer-fence }
+        annotations:
+          summary: The core's writer has been fenced for longer than fence_alert_after (five minutes); it takes no input until the code its state names is installed, or the upgrade is moved or cancelled.
+          runbook: ops/runbooks/release/writer-fenced.md
 
       # VOS: Authority decisions issued for invocations not yet acknowledged. VOS's Authority
       # issuer refuses past 256 (MAX_AUTHORITY_OPERATION_ISSUER_RECORDS), a Local lane past 32

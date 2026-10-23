@@ -244,6 +244,32 @@ pub struct Ledger<S: LeafStore, V: VaultBackend> {
     fault: Option<lifecycle::FaultAt>,
     /// The calls recorded while recording is on (`crate::call`, `F-005`).
     pub(crate) calls: Option<crate::call::CallLog>,
+    /// The writer's code version and the digest of its upgrade-authority mode, as its hot row
+    /// holds them (`T-037-02`): what a checkpoint binds beside the book's genesis (`T-037-03`). Not
+    /// service state: whoever runs the ledger as a writer sets it ([`Ledger::set_code`]).
+    code: ([u8; 32], [u8; 32]),
+    /// The input number the commands that follow take, as the writer that runs the ledger numbers
+    /// its inputs ([`Ledger::set_input`]); 0 when nothing says. What a way out of a scheduled
+    /// upgrade is checked against (`T-037-15`). Not service state.
+    input: u64,
+    /// The way out of a scheduled upgrade an input took, until the writer reads it
+    /// ([`Ledger::take_way_out`], `T-037-15`). Not service state.
+    way_out: Option<crate::code::WayOut>,
+    /// The upgrade an input scheduled (the code version and the input number it applies from),
+    /// until the writer reads it ([`Ledger::take_upgrade`], `T-037-04`). Not service state.
+    upgrade: Option<([u8; 32], u64)>,
+    /// The upgrade the writer has scheduled, as its hot row holds it (the code version and the
+    /// input number it applies from): what a move of it is checked against
+    /// ([`Ledger::set_scheduled_upgrade`], `T-037-05`, owner ruling w6). Not service state.
+    scheduled: Option<([u8; 32], u64)>,
+    /// How deep the public methods that change the book are nested now, and how many outermost
+    /// ones have returned since [`Ledger::set_input`]: the calls of the current input decided so
+    /// far (`T-037-15`: a way out must be its input's first call). Kept whether or not calls are
+    /// recorded, so the Agent, the replica and a replay count alike. Not service state.
+    pub(crate) calls_in_input: (u32, u32),
+    /// The writer's upgrade-authority position (`T-037-05`): any scheduled change of mode, and
+    /// what this input has decided. Not service state either.
+    writer: crate::code::authority::Position,
 }
 
 fn policy_used(p: &Principal) -> AuthorityUsed {
@@ -360,6 +386,13 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             config,
             fault: None,
             calls: None,
+            code: ([0; 32], [0; 32]),
+            input: 0,
+            way_out: None,
+            upgrade: None,
+            scheduled: None,
+            calls_in_input: (0, 0),
+            writer: crate::code::authority::Position::default(),
         };
         if let Some(sp) = spec {
             ledger.build_genesis_state(&founded, &sp)?;
@@ -406,6 +439,84 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             config,
             fault: None,
             calls: None,
+            code: ([0; 32], [0; 32]),
+            input: 0,
+            way_out: None,
+            upgrade: None,
+            scheduled: None,
+            calls_in_input: (0, 0),
+            writer: crate::code::authority::Position::default(),
+        }
+    }
+
+    /// The writer's code version and its upgrade-authority mode's digest, as its hot row holds
+    /// them (`T-037-02`): every checkpoint created from here binds them ([`Ledger::code_binding`],
+    /// `T-037-03`). The core Agent sets them from its hot row before each input, and the host's
+    /// replica from the code each entry names. A ledger whose writer names no code binds zeros.
+    pub fn set_code(&mut self, code: [u8; 32], authority: [u8; 32]) {
+        self.code = (code, authority);
+    }
+
+    /// The input number the commands that follow take (`T-037-15`, `T-037-05`), as the writer that
+    /// runs the ledger numbers its inputs: the core Agent sets it from the input before running its
+    /// calls, the host's replica from the input it will stage next, a replay from each entry, and
+    /// the in-process core from its journal's numbering. A way out of a scheduled upgrade is
+    /// decided against it ([`Ledger::reschedule_upgrade`]), a delay of the upgrade-authority mode
+    /// counts it, and a scheduled change of mode whose input has come is the mode in force from
+    /// it ([`crate::code::authority::Position::begin`], the one place that does so). A writer
+    /// that has the hot row gives the scheduled change first ([`Ledger::set_authority_next`]).
+    pub fn set_input(&mut self, input: u64) {
+        self.input = input;
+        self.calls_in_input.1 = 0;
+        self.writer.begin(&mut self.code.1, input);
+    }
+
+    /// The upgrade the writer has scheduled, as its hot row holds it, before the input that
+    /// follows (`T-037-05`, owner ruling w6): the code version and the input number it applies
+    /// from. A move of it ([`Ledger::reschedule_upgrade`]) must go strictly later than that input
+    /// number, so that one member alone cannot pull an approved upgrade earlier than the input the
+    /// approvers and the delay agreed to. Whoever runs the ledger as a writer sets it before
+    /// [`Ledger::set_input`], from the code it holds (the core Agent from its hot row, the host's
+    /// replica and a replay from the code the inputs before have left); a ledger never told has
+    /// nothing scheduled, and the move is checked against its own input alone. It writes nothing
+    /// to the book.
+    pub fn set_scheduled_upgrade(&mut self, scheduled: Option<([u8; 32], u64)>) {
+        self.scheduled = scheduled;
+    }
+
+    /// How many calls of the current input were decided before the one running now
+    /// ([`Ledger::set_input`] starts an input).
+    pub(crate) fn calls_before(&self) -> u32 {
+        self.calls_in_input.1
+    }
+
+    /// The way out of a scheduled upgrade the last commands took, if one did (`T-037-15`): a
+    /// [`Ledger::reschedule_upgrade`] or [`Ledger::cancel_upgrade`] accepted, not the replay of an
+    /// earlier one. The writer applies it to its scheduled upgrade, which it holds, not the
+    /// ledger.
+    pub fn take_way_out(&mut self) -> Option<crate::code::WayOut> {
+        self.way_out.take()
+    }
+
+    /// The upgrade the last commands scheduled, if one did (`T-037-04`): an [`Ledger::upgrade`]
+    /// accepted, not the replay of an earlier one. The writer schedules it, as the one writer step
+    /// (`core_binding::fence::decide`); the ledger holds no writer state.
+    pub fn take_upgrade(&mut self) -> Option<([u8; 32], u64)> {
+        self.upgrade.take()
+    }
+
+    /// What a checkpoint created now binds beside a `v2` one (`T-037-03`, `REQ-RT-15`): the book's
+    /// genesis (its chainspec's seed digest, or zeros for a book founded without one), and the code
+    /// version and mode [`Ledger::set_code`] gave. All of them aledgent's own values (`REQ-RT-19`).
+    pub fn code_binding(&self) -> crate::anchor::CodeBinding {
+        crate::anchor::CodeBinding {
+            genesis: self
+                .state
+                .chainspec()
+                .progress()
+                .map_or([0; 32], |p| p.commitment.digest),
+            code: self.code.0,
+            authority: self.code.1,
         }
     }
 
@@ -1256,6 +1367,7 @@ pub mod seeding;
 pub mod settle_adapter;
 pub mod settlement;
 pub mod transfers;
+mod upgrade_authority;
 
 pub use transfers::{Leg, Transfer};
 

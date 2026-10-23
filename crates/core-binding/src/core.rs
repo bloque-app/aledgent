@@ -72,7 +72,7 @@ use ledger_core::id::OperationId;
 use ledger_core::ledger::{Founded, Genesis};
 use ledger_core::lifecycle::keys::NotificationId;
 
-use crate::envelope::{decode, encode};
+use crate::envelope::{AgentRefusal, Fenced, decode, encode};
 use crate::host::{
     AgentPort, BatchLimits, DriveError, Driver, HostStore, HostVault, PortError, ReplicaStores,
 };
@@ -563,6 +563,17 @@ pub struct CoreStats {
     /// The runtime's unacknowledged Authority decisions, after the last decision; `u64::MAX`
     /// while the port does not count them ([`AgentPort::unacknowledged`]).
     pub unacknowledged: AtomicU64,
+    /// While the writer is fenced (`T-037-15`): the newest time input offered to the core when the
+    /// fence first refused an input since an input last committed; 0 when it is not fenced. The signals report how long
+    /// ago that was (`aledgent_writer_fenced_seconds`, `NFR-11`).
+    pub fenced_since: AtomicU64,
+    /// The writer's code as of the last input committed (`T-037-23`): its version, generation and
+    /// scheduled upgrade, kept here so the signals read it without the execution lock, and never
+    /// ahead of a commit. `None` until the driver is open.
+    pub writer_code: Mutex<Option<crate::fence::WriterCode>>,
+    /// How many lines about the writer's code the core has written (`T-037-23`): tests count them,
+    /// since the lines themselves go to standard error.
+    pub code_lines: AtomicU64,
     read_wait_us: Window,
     hold_us: Window,
     native_us: Window,
@@ -686,6 +697,13 @@ struct Inner<P: AgentPort> {
     /// A `verify-genesis` segment's chainspec and first chunk: what a rebuild applies natively
     /// before the segment's archive ([`Driver::recover_segment`]).
     segment: Option<(ledger_core::chainspec::SpecRef, u32)>,
+    /// The node's own trail in the audit store (`T-037-15`, amendment 0033 D25), where an input
+    /// the fence refused is audited, never in the book. Beside it, always, a line on standard
+    /// error.
+    node_trail: Option<audit_store::NodeTrail>,
+    /// The latest time input of any input offered to the core (`T-037-15`): where the fenced clock
+    /// starts, so that an input logged long before it was refused does not age the fence.
+    latest_time: Time,
 }
 
 /// The core's two locks (`T-031-12`, finding F3 of `F-032`). An input takes `ctl`, then the
@@ -707,6 +725,9 @@ struct Parts<P: AgentPort> {
     ship: OnceLock<ShipHandle>,
     /// A chainspec book's `verify-genesis` gate (`T-036-25`), once the host sets it.
     genesis_gate: OnceLock<crate::verified::GenesisGate>,
+    /// Where this node fetches code from, once the host sets it (`T-037-04`): without one, no
+    /// upgrade can be staged, so none is logged.
+    code_source: OnceLock<Arc<dyn crate::staging::CodeFetch>>,
 }
 
 /// A decision, sent to the decider thread.
@@ -866,6 +887,13 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
         )
     }
 
+    /// Audit what the execution node refuses without the book (an input the fence refused,
+    /// `T-037-15`) in the audit store's node trail too, beside the line on standard error that
+    /// every refusal has.
+    pub fn set_node_trail(&self, trail: audit_store::NodeTrail) {
+        lock(&self.inner.ctl).node_trail = Some(trail);
+    }
+
     /// The audit shipping's shared state, when the core ships.
     pub fn audit(&self) -> Option<AuditShared> {
         self.inner.audit.clone()
@@ -953,6 +981,16 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
             .map_err(|e| format!("{e:?}"))?
         };
         check_genesis(&founding, &driver)?;
+        // The artefact check at start (`T-037-14`): the platform runs the code that executes the
+        // next input. A failure does not stop the host from opening: the same call precedes every
+        // send and refuses the input, while reads and a way-out input (which never needs the
+        // version it leaves) stay possible.
+        if let Err(e) = driver.ensure_code() {
+            std::eprintln!(
+                "aledgent-core: the code of the next input cannot be run yet, inputs that need it \
+                 are not sent: {e:?}"
+            );
+        }
         driver.archived();
         let mut inner = Inner {
             running: None,
@@ -970,7 +1008,11 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
             failing: None,
             audit,
             segment: segment.map(|(spec, start)| (spec.clone(), start)),
+            node_trail: None,
+            latest_time: 0,
         };
+        // The code the writer is in, and the platform's check at start (`T-037-23`).
+        inner.report_code();
         let mut running = inner.executor(replica)?;
         // A book founded here emitted genesis's records: the store may hold them already.
         if let Some(f) = floor {
@@ -995,6 +1037,7 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
                 audit: inner_audit,
                 ship: OnceLock::new(),
                 genesis_gate: OnceLock::new(),
+                code_source: OnceLock::new(),
             }),
         })
     }
@@ -1039,6 +1082,22 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
             .set(gate)
             .map_err(|_| "the verify-genesis gate is set already".to_string())?;
         Ok(Some(now))
+    }
+
+    /// Set where this node fetches code from, to stage an `Upgrade`'s code version before the
+    /// upgrade is logged (`T-037-04`, [`Core::stage_code`]). Set once.
+    ///
+    /// # Errors
+    ///
+    /// A source was set already.
+    pub fn set_code_source(
+        &self,
+        source: Arc<dyn crate::staging::CodeFetch>,
+    ) -> Result<(), String> {
+        self.inner
+            .code_source
+            .set(source)
+            .map_err(|_| "the code source is set already".to_string())
     }
 
     /// What genesis created.
@@ -1100,6 +1159,9 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
         inner.running = slot.take();
         let out = f(inner);
         *slot = inner.running.take();
+        // What happened to the writer's code and the platform in this decision, in the log, and
+        // the signals' view of the writer's code (`T-037-23`).
+        inner.report_code();
         // The committed credentials, before any read sees the new state (`Credentials`), with
         // the ones this decision created: their holders' first requests would otherwise each wait
         // for an invocation.
@@ -1188,6 +1250,20 @@ impl<P: AgentPort> Inner<P> {
         Ok(running)
     }
 
+    /// Write one plain line for everything the driver recorded about the writer's code since the
+    /// last call, and publish the code the writer is in as of the last commit (`T-037-23`). The
+    /// lines name the input; they are for the operator, never in the book, and none is written
+    /// while an archive is replayed (the driver records nothing then).
+    fn report_code(&mut self) {
+        let Some(driver) = self.driver.as_mut() else {
+            return;
+        };
+        write_code_events(&self.stats, driver.take_code_events());
+        if let Some(w) = driver.committed_writer() {
+            *lock(&self.stats.writer_code) = Some(w);
+        }
+    }
+
     /// Stop on an incident: every later call is `Unavailable` until the core is reopened.
     fn stop(&mut self, why: String) -> CoreError {
         self.stopped = Some(why);
@@ -1198,9 +1274,13 @@ impl<P: AgentPort> Inner<P> {
     /// Rebuild the replica and the executor from the log and the Agent. `Ok(n)`: the Agent's
     /// input number after the rebuild.
     fn rebuild(&mut self) -> Result<u64, CoreError> {
-        let Some(driver) = self.driver.take() else {
+        let Some(mut driver) = self.driver.take() else {
             return Err(CoreError::Unavailable);
         };
+        // What the old driver recorded before it is dropped (`T-037-23`).
+        write_code_events(&self.stats, driver.take_code_events());
+        // The platform keeps running what it ran: the next check is no install (`T-037-23`).
+        let running_code = driver.running_code();
         let port = driver.into_port();
         let mut archive = match self.log.entries() {
             Ok(a) => a,
@@ -1246,8 +1326,10 @@ impl<P: AgentPort> Inner<P> {
                 }
                 driver.archived();
                 driver.set_batch_limits(self.batch);
+                driver.set_running_code(running_code);
                 let seq = driver.seq();
                 self.driver = Some(driver);
+                self.report_code();
                 match self.executor(replica) {
                     Ok(r) => self.running = Some(r),
                     Err(e) => return Err(self.stop(e)),
@@ -1255,6 +1337,51 @@ impl<P: AgentPort> Inner<P> {
                 Ok(seq)
             }
             Err(e) => Err(self.stop(format!("the replica cannot be rebuilt: {e:?}"))),
+        }
+    }
+
+    /// The fence refused `input` (`T-037-15`, `crate::fence`): start the fenced clock if it is not
+    /// running, and audit the refusal at the execution node, on standard error and in the audit
+    /// store's node trail (amendment 0033 D25), never in the book. The line and the record name the
+    /// input by key, kind and time, never by its body (`REQ-AU-8`).
+    fn fenced(&mut self, input: Option<&CoreInput>, f: &Fenced) {
+        // The newest time input the core has been offered, not the refused input's own, which may
+        // have waited long before it was first refused. With no time known yet (only seed chunks,
+        // which carry none), the clock does not start: it would read as decades.
+        let at = input
+            .and_then(input_time)
+            .unwrap_or(0)
+            .max(self.latest_time);
+        if at > 0 {
+            let _ = self.stats.fenced_since.compare_exchange(
+                0,
+                at,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
+        let what = input.map_or_else(|| "an input".to_string(), describe);
+        let upgrade = f.upgrade.map_or_else(
+            || "none".to_string(),
+            |(h, n)| {
+                let h: String = h.iter().map(|b| format!("{b:02x}")).collect();
+                format!("{h} from input {n}")
+            },
+        );
+        let detail = format!(
+            "input {} refused by the fence: the code installed is generation {}, the writer's \
+             state names generation {} (scheduled upgrade: {upgrade}); {what}",
+            f.seq, f.code_generation, f.generation
+        );
+        std::eprintln!("aledgent-core: AUDIT: {detail}");
+        if let Some(trail) = self.node_trail.as_mut()
+            && let Err(e) = trail.append(at, "fenced", f.seq, &detail)
+        {
+            std::eprintln!(
+                "aledgent-core: WARNING: the audit store's node trail did not take the fence's \
+                 refusal of input {}: {e:?}",
+                f.seq
+            );
         }
     }
 
@@ -1318,7 +1445,8 @@ impl<P: AgentPort> Inner<P> {
             if ok && all.len() > 1 {
                 out.extend(self.apply_chunk(&all[1..]));
             }
-            out.resize_with(all.len(), || Err(CoreError::Unavailable));
+            let rest = not_reached(&out);
+            out.resize_with(all.len(), || Err(rest));
             return out;
         }
         self.apply_chunk(all)
@@ -1356,15 +1484,25 @@ impl<P: AgentPort> Inner<P> {
                 break;
             }
         }
-        out.resize_with(all.len(), || Err(CoreError::Unavailable));
+        // What was not reached answers as the last input reached did (amendment 0036, N4): after
+        // the fence's refusal, `NotRun`; otherwise `Unavailable`.
+        let rest = not_reached(&out);
+        out.resize_with(all.len(), || Err(rest));
         out
     }
 
     /// Run `inputs` as one batch. Returns every input's answer and, if some did not commit, the
-    /// index of the first: it and everything after it answer `Unavailable`.
+    /// index of the first: it and everything after it answer `Unavailable`, or `NotRun` when the
+    /// fence refused it (`T-037-18`, amendment 0036): the Agent's refusal as fenced, read after
+    /// the replica was rebuilt to what the Agent committed, and nothing else. The record of
+    /// replies was read for every input before it was staged, so an input the core decided is
+    /// `Ok` here, never `NotRun`.
     fn run(&mut self, inputs: &[CoreInput]) -> (Vec<Result<CoreReply, CoreError>>, Option<usize>) {
         let mut out: Vec<Result<CoreReply, CoreError>> =
             inputs.iter().map(|_| Err(CoreError::Unavailable)).collect();
+        if let Some(t) = inputs.iter().filter_map(input_time).max() {
+            self.latest_time = self.latest_time.max(t);
+        }
         // Back-pressure (`T-013-13`): the audit store has not taken records, and the outbox is at
         // its bound. Nothing runs; every input waits `Received`, in order, and is retried.
         if self.audit.as_ref().is_some_and(|a| a.stats.full()) {
@@ -1375,6 +1513,8 @@ impl<P: AgentPort> Inner<P> {
         let mut runs: Vec<(usize, Outcome, Option<u64>)> = Vec::new();
         let mut failed: Option<(usize, DriveError)> = None;
         let mut down: Option<usize> = None;
+        // The call ended in the fence's refusal (amendment 0036): what did not commit is `NotRun`.
+        let mut fenced_out = false;
         self.stats
             .inputs
             .fetch_add(inputs.len() as u64, Ordering::Relaxed);
@@ -1481,6 +1621,8 @@ impl<P: AgentPort> Inner<P> {
                 }
                 if !runs.is_empty() {
                     self.failing = None;
+                    // An input committed: the writer is not fenced (`T-037-15`).
+                    self.stats.fenced_since.store(0, Ordering::Relaxed);
                 }
                 (runs.len(), down)
             }
@@ -1493,11 +1635,19 @@ impl<P: AgentPort> Inner<P> {
                     "aledgent-core: the decision of {} inputs did not commit at input {at}: {why}",
                     inputs.len(),
                 );
+                // The fence (`T-037-15`): the code installed is not the code the writer's state
+                // names. Nothing committed and the input's number is not taken; it is retried once
+                // the code map's code is installed, or a way out is taken, so it never counts
+                // toward the halt. It is audited here, at the execution node, never in the book.
+                let fence = match &e {
+                    DriveError::Refused(AgentRefusal::Fenced(f)) => Some(f.clone()),
+                    _ => None,
+                };
                 // The Agent ran it and committed nothing, and would again (finding F18).
                 let definitive = matches!(
                     e,
                     DriveError::Refused(_) | DriveError::Port(PortError::Aborted(_))
-                );
+                ) && !matches!(e, DriveError::Refused(AgentRefusal::Fenced(_)));
                 let after = match e {
                     DriveError::Diverged(e) | DriveError::Replica(e) => {
                         self.stop(format!("incident: {e}"));
@@ -1511,6 +1661,9 @@ impl<P: AgentPort> Inner<P> {
                     // what the Agent committed beyond the log.
                     DriveError::Refused(_) | DriveError::Port(_) => self.rebuild().ok(),
                 };
+                // Only a refusal read after the replica was rebuilt is a definite "not run": a
+                // rebuild that failed leaves the outcome unknown (amendment 0036, N2).
+                fenced_out = fence.is_some() && after.is_some();
                 let n = match after {
                     Some(after) => runs
                         .iter()
@@ -1519,6 +1672,13 @@ impl<P: AgentPort> Inner<P> {
                     None => 0,
                 };
                 let first = runs.get(n).map_or(at, |(i, _, _)| *i);
+                if let Some(f) = &fence {
+                    // A prefix of the batch committed: the fence starts again at this input.
+                    if n > 0 {
+                        self.stats.fenced_since.store(0, Ordering::Relaxed);
+                    }
+                    self.fenced(inputs.get(first), f);
+                }
                 // Which input it was (finding F18): the index above is where staging stopped,
                 // and a flush inside staging fails the inputs staged before it.
                 if let Some(input) = inputs.get(first) {
@@ -1569,12 +1729,43 @@ impl<P: AgentPort> Inner<P> {
             }
         }
         if let Some(f) = first {
+            // The first input that did not commit and every one after it: the fence's refusal
+            // says nothing ran from there (the core takes inputs in order, amendment 0036, N4).
+            let rest = if fenced_out {
+                CoreError::NotRun
+            } else {
+                CoreError::Unavailable
+            };
             for o in out.iter_mut().skip(f) {
-                *o = Err(CoreError::Unavailable);
+                // An input the record of replies answered stays answered (N3): the core never
+                // reports a decided input as not run.
+                if fenced_out && o.is_ok() {
+                    continue;
+                }
+                *o = Err(rest);
             }
         }
         self.stats.log_us.push(micros(logged));
         (out, first)
+    }
+}
+
+/// What the inputs a call did not reach answer (amendment 0036, N4): `NotRun` once the fence has
+/// refused one input of the call, `Unavailable` otherwise.
+fn not_reached(answered: &[Result<CoreReply, CoreError>]) -> CoreError {
+    if answered.contains(&Err(CoreError::NotRun)) {
+        CoreError::NotRun
+    } else {
+        CoreError::Unavailable
+    }
+}
+
+/// An input's time input, where it has one (`T-037-15`: the fenced clock starts at it).
+fn input_time(input: &CoreInput) -> Option<Time> {
+    match &input.body {
+        InputBody::Command { now, .. } | InputBody::Tick { now } => Some(*now),
+        InputBody::RecordDelivery { at, .. } => Some(*at),
+        InputBody::SpecChunk { .. } => None,
     }
 }
 
@@ -1697,6 +1888,19 @@ impl<P: AgentPort + Send + 'static> Core for AgentCore<P> {
             s.audit = self.inner.audit.as_ref().map(|a| a.stats.body(now));
             let u = stats.unacknowledged.load(Ordering::Relaxed);
             s.vos_unacknowledged = (u != u64::MAX).then_some(u);
+            // Which program the writer runs, as of the last input committed (`T-037-23`).
+            s.writer_code = (*lock(&stats.writer_code)).map(|w| Box::new(writer_code_body(&w)));
+            // How long the writer has been fenced (`T-037-15`, `NFR-11`).
+            let since = stats.fenced_since.load(Ordering::Relaxed);
+            s.writer_fenced_age = (since != 0).then(|| now.saturating_sub(since));
+            // What the code fetcher discarded as not its digest's bytes (`T-037-06`).
+            if let Some(source) = self.inner.code_source.get() {
+                s.code_source_mismatches = source
+                    .mismatches()
+                    .into_iter()
+                    .map(|(source, count)| ingress::query::CodeSourceMismatchBody { source, count })
+                    .collect();
+            }
         }
         Ok(reply)
     }
@@ -1732,11 +1936,170 @@ impl<P: AgentPort + Send + 'static> Core for AgentCore<P> {
             .is_none_or(crate::verified::GenesisGate::is_open))
     }
 
+    async fn stage_code(&self, code: &[u8; 32]) -> Result<ingress::boundary::Staged, CoreError> {
+        use ingress::boundary::Staged;
+        let Some(source) = self.inner.code_source.get().cloned() else {
+            return Ok(Staged::Refused {
+                reason: crate::staging::StageRefusal::NoSource.to_string(),
+            });
+        };
+        let (core, code) = (self.clone(), *code);
+        // Retrieval is slow: it runs off the async runtime and outside the core's locks. Only
+        // the writer's generation is read before it and the staging done after it, each briefly
+        // under the lock, so decisions are not held up by a fetch.
+        tokio::task::spawn_blocking(move || {
+            let generation = {
+                let mut inner = lock(&core.inner.ctl);
+                if inner.stopped.is_some() {
+                    return Err(CoreError::Unavailable);
+                }
+                inner
+                    .driver
+                    .as_mut()
+                    .and_then(|d| d.port_mut().hot().ok().flatten())
+                    .map(|h| h.generation)
+                    .ok_or(CoreError::Unavailable)?
+            };
+            let checked = match crate::staging::fetch(&*source, &code, generation) {
+                Ok(c) => c,
+                Err(r) => {
+                    return Ok(Staged::Refused {
+                        reason: r.to_string(),
+                    });
+                }
+            };
+            let mut inner = lock(&core.inner.ctl);
+            let Some(driver) = inner.driver.as_mut() else {
+                return Err(CoreError::Unavailable);
+            };
+            // Could the switch install it? Asked before the version is staged, under the same lock
+            // as the staging, so a version it would refuse at its input is refused at the door
+            // (`T-037-22`, owner ruling w16): nothing is staged and, the door refusing it, nothing
+            // is logged.
+            if let Err(why) = driver.port_mut().can_install(&checked) {
+                let refusal = crate::staging::StageRefusal::CannotInstall(why).to_string();
+                std::eprintln!(
+                    "aledgent-core: refused an upgrade to code {} before it was logged (the last \
+                     committed input is {}): {refusal}",
+                    crate::switch::short(&code),
+                    driver.seq()
+                );
+                return Ok(Staged::Refused { reason: refusal });
+            }
+            match driver.port_mut().stage_code(checked) {
+                Ok(()) => Ok(Staged::Staged),
+                Err(r) => Ok(Staged::Refused {
+                    reason: r.to_string(),
+                }),
+            }
+        })
+        .await
+        .unwrap_or(Err(CoreError::Unavailable))
+    }
+
     async fn party_of(&self, principal: &str) -> Result<Option<String>, CoreError> {
         // From the replica too (`DEC-4`). A tie is never undone, so a replica behind the Agent
         // can only answer "none" for a tie it has not seen yet.
         let principal = String::from(principal);
         self.read(move |r| r.party_of(&principal)).await
+    }
+}
+
+/// Write one line for each event of the writer's code, and count them (`T-037-23`).
+fn write_code_events(stats: &CoreStats, events: Vec<crate::fence::CodeEvent>) {
+    for event in events {
+        std::eprintln!("aledgent-core: {}", describe_code_event(&event));
+        stats.code_lines.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A code version's digest in lower-case hex (`T-037-23`).
+fn hex32(code: &[u8; 32]) -> String {
+    code.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The writer's code as the signals carry it (`T-037-23`).
+fn writer_code_body(w: &crate::fence::WriterCode) -> ingress::query::WriterCodeBody {
+    ingress::query::WriterCodeBody {
+        code: hex32(&w.code),
+        generation: w.generation,
+        upgrade: w
+            .upgrade
+            .map(|(code, from)| ingress::query::ScheduledUpgradeBody {
+                code: hex32(&code),
+                from,
+            }),
+    }
+}
+
+/// The line the operator reads for an event of the writer's code (`T-037-23`): plain, naming the
+/// input, with a version as its first eight bytes in hex, the way the fence's refusal does not
+/// (it names all of it) and the signals' label does.
+fn describe_code_event(event: &crate::fence::CodeEvent) -> String {
+    use crate::fence::CodeEvent;
+    use crate::switch::short;
+    match event.clone() {
+        CodeEvent::Installed {
+            input,
+            code,
+            from: Some(from),
+        } => format!(
+            "the platform now runs code {} (it ran {}) for input {input}",
+            short(&code),
+            short(&from)
+        ),
+        CodeEvent::Installed {
+            input,
+            code,
+            from: None,
+        } => format!("the platform runs code {} for input {input}", short(&code)),
+        CodeEvent::Switched {
+            input,
+            from,
+            to,
+            generation,
+        } => format!(
+            "input {input} is the first to run code {} (generation {generation}), after code {}: \
+             the scheduled upgrade took effect",
+            short(&to),
+            short(&from)
+        ),
+        CodeEvent::WayOut {
+            input,
+            taken,
+            upgrade,
+        } => {
+            let scheduled = upgrade.map_or_else(
+                || "no upgrade was scheduled".to_string(),
+                |(code, from)| {
+                    format!(
+                        "the upgrade to code {} was scheduled from input {from}",
+                        short(&code)
+                    )
+                },
+            );
+            let done = match taken {
+                ledger_core::code::WayOut::Cancel => "it is cancelled".to_string(),
+                ledger_core::code::WayOut::Reschedule { from } => {
+                    format!("it now applies from input {from}")
+                }
+            };
+            format!("input {input} took the way out: {scheduled}, {done}")
+        }
+        CodeEvent::Scheduled { input, code, from } => format!(
+            "input {input} scheduled an upgrade to code {}, to apply from input {from}",
+            short(&code)
+        ),
+        CodeEvent::UpgradeRefused {
+            input,
+            code,
+            from,
+            condition,
+        } => format!(
+            "input {input} was an upgrade to code {} from input {from} that the writer refused \
+             and recorded: {condition}",
+            short(&code)
+        ),
     }
 }
 
