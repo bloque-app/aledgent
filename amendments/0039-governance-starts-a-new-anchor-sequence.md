@@ -7,7 +7,7 @@ SPDX-License-Identifier: CC-BY-4.0
 
 **Status:** **draft**, for the owner's review. Nothing here is applied to `SPEC.md` or `PLAN.md`; the code
 cites it as `[PENDING AMENDMENT 0039]`. The owner's requirement it serves was stated on 2026-10-22 (below).
-**Target:** `SPEC.md` v0.4.28 as on `develop` (at `85432f5`); `PLAN.md` `DEC-17`; `F-026` (`T-026-10`).
+**Target:** `SPEC.md` v0.4.28 as on `develop` (at `85432f5`); `PLAN.md` `DEC-17`; `F-026` (`T-026-10`, `T-026-11`).
 **Date:** 2026-10-22
 **Number:** 0038 is the last on `develop`; no open PR or remote branch claims 0039.
 **Amends:** `REQ-SL-1` (one paragraph); closes `OQ-68` for the contract venue. No command, query, error
@@ -89,7 +89,8 @@ later for the Spaces venue (`OQ-68`, amendment 0022, `DEC-17`).
     yet final: asked for `p1`'s anchor *n* while `p2`'s latest is *n*, it returns `p2`'s commitment; while
     `p2`'s latest is below *n*, it answers "not final"; once `p2` is past *n*, the search may land in either
     book. A commitment binds its own book's state, so the result is a false mismatch or a false "not
-    anchored", never a false match (bar a hash collision).
+    anchored", never a false match (bar a hash collision). This was the verifier before `T-026-11`; "The
+    verifier" below says what it does now.
 
 **Assumptions** (not verified here):
 
@@ -213,12 +214,46 @@ The debug invariant check (`check_invariants`) adds S5 and that no legacy migrat
   (base 0), so `T-036-14`'s base is no longer needed for that case; a book that does carry a base gets it by
   a reset to that base. `T-036-16` (`aledgent/anchor/v3`, the commitment binds the book's genesis) stays
   useful: it lets a verifier check an anchor's book from the commitment alone.
-- **The verifier (`T-026-11`, a precondition of the reset's referendum).** Its search assumes numbers never
-  fall (fact 11): after a reset it can answer with the other book's commitment, or "not final". It must read
-  `anchor_epoch` (and, for a sequence before the last, the `AnchorHeadSet` events) and search for a book's
-  anchor only within that book's sequence: blocks before the reset (`at`) for an earlier one, from it for
-  the current one. It is not built here; the reset's referendum waits for it, so that no verifier of `p1`
-  or `p2` is answered wrongly.
+- **The verifier (`T-026-11`, a precondition of the reset's referendum).** Its search assumed numbers never
+  fall (fact 11): after a reset it could answer with the other book's commitment, or "not final". It now
+  reads `anchor_epoch` at the finalized head and treats each sequence as a range of blocks: the current one
+  from its `at` to the head, each earlier one from its own start to the block before the next one's `at`.
+  Within one sequence numbers only rise, so the earlier search holds there again.
+  - **Which sequences may hold a number.** A sequence holds *n* exactly when `base < n ≤` its last anchor.
+    The current sequence's last anchor is `latest_anchor`. An earlier sequence's is the `previous` that the
+    next sequence's record kept, when that anchor's inbox position is at or after the earlier sequence's
+    `from_seq`; otherwise the earlier sequence never anchored and the anchor was carried forward from one
+    before it. With a base of 0, numbers both books used have two candidates; the rule "at most the
+    previous last anchor, so the previous book's" would be wrong for them.
+  - **The commitment decides.** The verifier reads every candidate and passes only if one of them carries
+    the disclosure's commitment. A commitment binds its own book's state, so at most one matches (bar a
+    hash collision). The result names that anchor's sequence: its number, its base and the book name
+    governance gave it (none for the instance's first), and whether it is the current sequence or a book
+    re-founded since. When no candidate matches and all were read, it is a mismatch that shows what each
+    book holds. When none were found, it is missing.
+  - **Earlier records.** The verifier reads an earlier sequence's record from `anchor_epoch` at the block
+    before the next reset: the cell is overwritten by each reset, so that block holds the one before. It
+    does not decode `AnchorHeadSet` events. Events need the same archive node as past state, and the cell
+    is already decoded.
+  - **What it proves from current state alone (any node).** The current sequence's latest anchor, and the
+    previous book's last anchor, which the reset kept in `anchor_epoch.previous`. After one reset, that is
+    `p1`'s anchor 17 on prod.
+  - **What needs past state (an archive node).** Every other anchor of either book, and, after more than
+    one reset, the records of the sequences before the last. On a node without past state these are
+    **unknown**, never "not final" and never the other book's anchor. The result says which sequence
+    could not be read, or that the sequences before a given one could not be identified, with the last
+    anchor before it. As before the reset, a superseded anchor needs past state; the reset adds nothing to
+    that for `p1` beyond its last anchor, which it moves into current state.
+  - **Old anchors in the reset's own block** (the previous book anchored in the block that enacted the
+    reset, before it). The latest anchor kept in `previous` is read from the record. One it superseded in
+    that block is read from that block's inbox, as the earlier search already did for a batch.
+  - **What it cannot tell.** The verifier does not compare the sequence's book name with the disclosure.
+    A `v3` checkpoint binds the book's genesis, but whether `book` is that digest is q1, still open. The
+    commitment alone decides which book an anchor is. Two resets in one block leave the earlier sequence's
+    record unreadable at the block before. It is reported unidentified, not guessed.
+  - A caller of the single-anchor read (`AnchorSource::anchor`), which cannot tell sequences apart and
+    so means the current book, gets an error, not a guess, when the number has more than one candidate,
+    one could not be read, or its only anchor is a book re-founded since.
 
 ## Failure modes
 
@@ -226,7 +261,8 @@ The debug invariant check (`check_invariants`) adds S5 and that no legacy migrat
 |---|---|
 | An anchor lands between proposal and enactment | `HeadMoved`; nothing changes; a new referendum with the new `expected_last` |
 | Referendum 2's gas or deposit limit too low at enactment | `Contracts.call` fails, nothing changes; a day is lost (step 4 sizes them from a dry run) |
-| A verifier reads the instance before `T-026-11` | it can answer with the other book's commitment or "not final" (fact 11): never a false match. Hence the precondition |
+| A verifier without `T-026-11` reads the instance after a reset | it can answer with the other book's commitment or "not final" (fact 11): never a false match. Hence the precondition: verifiers are told to upgrade before the referendum |
+| A verifier with `T-026-11` reads an old anchor on a node without past state | "unknown" (the old book's anchor needs an archive node), never "not final" and never the other book's. The previous book's last anchor reads without one |
 | The previous book's adapter anchors after the reset | its next number (`last + 1` of the old sequence) is a gap: refused `AnchorOutOfOrder`, recorded. With a base equal to the old latest, it would land as the new sequence's first: the runbook stops the old adapter first (A2) |
 | Governance never named | nobody can reset; the instance runs on as before |
 | Admin names itself governance before the community | the reset becomes a single-key power, as before this change: the checklist names the community's account as the first message after the upgrade, and `governance()` is read back |
@@ -260,7 +296,8 @@ The debug invariant check (`check_invariants`) adds S5 and that no legacy migrat
    (app 3) should take the same code first, as a rehearsal.
 3. **At once after enactment**, the admin (`HUf7`) signs `Contracts.call(Da1u…, set_governance(<community
    1201's account>))`, and `governance()` is read back.
-4. **Referendum 2** (about 26 hours), once `T-026-11` is released: `Communities.dispatch_as_account(
+4. **Referendum 2** (about 26 hours), once a release of the verifier (`aledgent-verify`, `crates/verify`)
+   carries `T-026-11`: `Communities.dispatch_as_account(
    Contracts.call(Da1u…, set_anchor_head(17, 0, <p2's chainspec digest>)))`. `Contracts.call` fixes its
    `gas_limit` and `storage_deposit_limit` when it is proposed, about a day before it runs: dry-run the
    exact enacted call as `Communities { 1201, None }` at the finalized head, set the gas limit from the dry
@@ -286,6 +323,7 @@ code>)` and `upgrade(4, 0)` by referendum; the old code ignores the two new cell
 
 ## Plan and code
 
-`F-026` `T-026-10` (this change, `contracts/settlement`); `T-026-11` (later: the verifier reads sequences).
+`F-026` `T-026-10` (this change, `contracts/settlement`); `T-026-11` (the verifier reads sequences,
+`crates/verify`).
 `PLAN.md` §4's `OQ-68` paragraph is to read, once this is ruled: the V0 contract's governance can start a new
 anchor sequence (`[PENDING AMENDMENT 0039]`).
