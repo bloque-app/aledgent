@@ -42,7 +42,10 @@ The production-class drill below still runs by hand, on the deployment's own arc
 - [ ] A read-only role on the archive's bucket, and `kms:Decrypt` on its key.
 - [ ] The Kreivo node for `--anchors-rpc` is an **archive node**: `INV-19` reads each anchor's state at
   the block it was anchored in, and a node that prunes state (the public RPC endpoints do) answers "State
-  already discarded". The drill then fails `INV-19` for the older anchors although the book is intact.
+  already discarded". The drill then reports `INV-19` as **Unknown** for the older anchors ("needs an
+  archive node"), which is not a pass: the book is intact as far as was read, and the drill is run again on
+  an archive node. After a governance reset of the settlement contract the previous book's anchors are in
+  the same position (`restore.md`, "Checks").
 - [ ] The keys for the drill come from Vault's own backup into the drill's signer only, never an
   environment.
 
@@ -65,7 +68,7 @@ The production-class drill below still runs by hand, on the deployment's own arc
 ## Verification (a pass)
 
 - [ ] The drill's five checks: `INV-6`, `INV-5`, composite root, `INV-19`, `NFR-4` ([restore](../restore.md),
-  "Checks").
+  "Checks"). A check that is `Unknown` is not a pass.
 - [ ] Recovery time and the data-loss window recorded, against the stated RTO and an RPO of 0 for
   acknowledged operations: the archive's point, and the received-log's tail replayed after it with every
   reply as recorded. For the Agent core, the archive's lag at the "failure" is the window that would be

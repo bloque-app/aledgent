@@ -330,10 +330,18 @@ async fn restore_core(args: &[String]) -> Result<(), Error> {
     );
     if report.passed() {
         Ok(())
+    } else if report.undecided() {
+        Err(Error::Restore(UNDECIDED.into()))
     } else {
         Err(Error::Restore("a check failed: see above".into()))
     }
 }
+
+/// What a run that found nothing wrong but could not decide a check says (`Verdict::Unknown`):
+/// not a pass, and not a fault of the book.
+const UNDECIDED: &str = "no check failed, but an anchor could not be read (a check above is \
+    Unknown, needs an archive node): not a pass. Run it again with --anchors-rpc naming a node \
+    that keeps every block's state";
 
 /// The most segments `--fetch-concurrency` reads at once.
 const MAX_FETCH_CONCURRENCY: usize = 256;
@@ -585,9 +593,11 @@ fn restore_core_from(args: &[String]) -> Result<(), Error> {
     };
     if !verified.passed() {
         record(&report)?;
-        return Err(Error::Restore(
-            "refused: a check failed (above); nothing was laid out".into(),
-        ));
+        return Err(Error::Restore(if verified.undecided() {
+            format!("refused: {UNDECIDED}; nothing was laid out")
+        } else {
+            "refused: a check failed (above); nothing was laid out".into()
+        }));
     }
     let plan = core_archive::lay_out(
         &state,
@@ -890,6 +900,8 @@ async fn run(args: &[String]) -> Result<(), Error> {
             let (_, _, verified, _) = archive_verified(args)?;
             if verified.passed() {
                 Ok(())
+            } else if verified.undecided() {
+                Err(Error::Restore(UNDECIDED.into()))
             } else {
                 Err(Error::Restore("a check failed: see above".into()))
             }

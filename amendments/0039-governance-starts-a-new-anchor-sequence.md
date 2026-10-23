@@ -7,7 +7,7 @@ SPDX-License-Identifier: CC-BY-4.0
 
 **Status:** **draft**, for the owner's review. Nothing here is applied to `SPEC.md` or `PLAN.md`; the code
 cites it as `[PENDING AMENDMENT 0039]`. The owner's requirement it serves was stated on 2026-10-22 (below).
-**Target:** `SPEC.md` v0.4.28 as on `develop` (at `85432f5`); `PLAN.md` `DEC-17`; `F-026` (`T-026-10`, `T-026-11`).
+**Target:** `SPEC.md` v0.4.28 as on `develop` (at `85432f5`); `PLAN.md` `DEC-17`; `F-026` (`T-026-10`, `T-026-11`, `T-026-12`).
 **Date:** 2026-10-22
 **Number:** 0038 is the last on `develop`; no open PR or remote branch claims 0039.
 **Amends:** `REQ-SL-1` (one paragraph); closes `OQ-68` for the contract venue. No command, query, error
@@ -254,6 +254,15 @@ The debug invariant check (`check_invariants`) adds S5 and that no legacy migrat
   - A caller of the single-anchor read (`AnchorSource::anchor`), which cannot tell sequences apart and
     so means the current book, gets an error, not a guess, when the number has more than one candidate,
     one could not be read, or its only anchor is a book re-founded since.
+- **The operations readers (`T-026-12`, a precondition of the reset's referendum beside `T-026-11`).**
+  The restore drill's `INV-19` and the Agent restore's `archive-behind-anchor` called the single-anchor
+  read, which after a reset errors for every number both books used (and for the old book's numbers on a
+  node without past state), so both would have stayed red for good. They now read every sequence that used
+  a number and let the checkpoint's commitment name the book's sequence, as the verifier does; only that
+  sequence's anchors count for the book. An anchor the node cannot read (the old book's, or a superseded
+  one) is **unknown**, a status of its own in the drill (`Verdict::Unknown`): not a pass, and it blocks one,
+  but not a failure either; an archive node decides it. A checkpoint missing from its own book's sequence
+  fails whatever the other book holds.
 
 ## Failure modes
 
@@ -263,6 +272,7 @@ The debug invariant check (`check_invariants`) adds S5 and that no legacy migrat
 | Referendum 2's gas or deposit limit too low at enactment | `Contracts.call` fails, nothing changes; a day is lost (step 4 sizes them from a dry run) |
 | A verifier without `T-026-11` reads the instance after a reset | it can answer with the other book's commitment or "not final" (fact 11): never a false match. Hence the precondition: verifiers are told to upgrade before the referendum |
 | A verifier with `T-026-11` reads an old anchor on a node without past state | "unknown" (the old book's anchor needs an archive node), never "not final" and never the other book's. The previous book's last anchor reads without one |
+| The restore drill or the Agent restore, without `T-026-12`, reads the instance after a reset | the single-anchor read errors for every number both books used: `INV-19` fails for good (a restore refused) and `archive-behind-anchor` stays red while the new book's numbers are at or below the old book's last anchor. Fail-closed, never a wrong pass; hence the precondition |
 | The previous book's adapter anchors after the reset | its next number (`last + 1` of the old sequence) is a gap: refused `AnchorOutOfOrder`, recorded. With a base equal to the old latest, it would land as the new sequence's first: the runbook stops the old adapter first (A2) |
 | Governance never named | nobody can reset; the instance runs on as before |
 | Admin names itself governance before the community | the reset becomes a single-key power, as before this change: the checklist names the community's account as the first message after the upgrade, and `governance()` is read back |
@@ -297,7 +307,7 @@ The debug invariant check (`check_invariants`) adds S5 and that no legacy migrat
 3. **At once after enactment**, the admin (`HUf7`) signs `Contracts.call(Da1u…, set_governance(<community
    1201's account>))`, and `governance()` is read back.
 4. **Referendum 2** (about 26 hours), once a release of the verifier (`aledgent-verify`, `crates/verify`)
-   carries `T-026-11`: `Communities.dispatch_as_account(
+   carries `T-026-11` and the operations tooling (`opsctl`) carries `T-026-12`: `Communities.dispatch_as_account(
    Contracts.call(Da1u…, set_anchor_head(17, 0, <p2's chainspec digest>)))`. `Contracts.call` fixes its
    `gas_limit` and `storage_deposit_limit` when it is proposed, about a day before it runs: dry-run the
    exact enacted call as `Communities { 1201, None }` at the finalized head, set the gas limit from the dry
@@ -324,6 +334,6 @@ code>)` and `upgrade(4, 0)` by referendum; the old code ignores the two new cell
 ## Plan and code
 
 `F-026` `T-026-10` (this change, `contracts/settlement`); `T-026-11` (the verifier reads sequences,
-`crates/verify`).
+`crates/verify`); `T-026-12` (the operations readers read per book, `ops`).
 `PLAN.md` §4's `OQ-68` paragraph is to read, once this is ruled: the V0 contract's governance can start a new
 anchor sequence (`[PENDING AMENDMENT 0039]`).
