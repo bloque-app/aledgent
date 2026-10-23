@@ -38,7 +38,8 @@
 //! - [`schnorr`]: the clerk's signature: CipherClerk's Schnorr over Ristretto255.
 //! - [`claim`]: CipherClerk's four disclosure claims, parsed from their wire form.
 //! - [`envelope`]: the disclosure envelope and its one canonical encoding.
-//! - [`source`]: [`AnchorSource`], the public read, and [`MemAnchors`], a fake.
+//! - [`source`]: [`AnchorSource`], the public read, and [`MemAnchors`], a fake; a venue's anchor
+//!   [`Sequence`]s (amendment 0039).
 //! - [`check`]: [`verify()`] and its [`Report`].
 //! - `rpc` (feature `rpc`): the settlement layer read over a node's JSON-RPC.
 //! - `cli` (feature `std`): the command-line verifier's logic; the `aledgent-verify` binary
@@ -68,7 +69,9 @@ pub use envelope::{
     FlowDirection, Recipient,
 };
 pub use hash::{blake2b_256, blake2b_512};
-pub use source::{AnchorSource, MemAnchors, PublicAnchor, Venue};
+pub use source::{
+    AnchorSource, MemAnchors, NumberedAnchors, PublicAnchor, Sequence, Unread, Venue,
+};
 
 /// The domain of the anchor commitment of construction 1 (CipherClerk's full-depth tree).
 pub const COMMITMENT_DOMAIN: &[u8] = b"aledgent/anchor/v1";
