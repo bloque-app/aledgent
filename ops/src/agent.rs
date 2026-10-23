@@ -14,7 +14,11 @@
 //!    against the settlement layer's anchors, and `NFR-4` against every archived reply. One more
 //!    check reads the layer: an anchor **after** the book's last checkpoint means the layer saw
 //!    a book this archive does not reach, and the restore is refused (`archive-behind-anchor`).
-//!    Any failed check refuses the restore before anything is laid out.
+//!    Both read the layer **per book** ([`behind_anchor`], [`crate::drill::anchor_check`]): after
+//!    a governance reset of the settlement contract (amendment 0039) the venue holds one anchor
+//!    sequence per book, and another book's anchor of the same number is not this book's.
+//!    Any failed check refuses the restore before anything is laid out, and so does a check that
+//!    is [`Verdict::Unknown`] (an anchor the node cannot read: read from an archive node).
 //! 3. **Lay it out** on the fresh node ([`core_archive::lay_out`]) and, with `--core-host`, run
 //!    `aledgent-core-host restore` there: the Agent, from the archive's latest checkpoint or
 //!    founded afresh, is re-sent every archived input after it, each checked against its entry.
@@ -36,10 +40,10 @@ use ledger_core::export::rederive::Acknowledgement;
 use ledger_core::id::OperationId;
 use ledger_kernel::store::LeafStore as _;
 use serde::{Deserialize, Serialize};
-use verify::AnchorSource;
+use verify::{AnchorSource, NumberedAnchors, Unread};
 
 use crate::Error;
-use crate::drill::{Check, Verdict, checks};
+use crate::drill::{Check, Verdict, checks, pinned_epoch};
 use crate::restore::{RebuildReport, decided_inputs, rebuild_leaf_store};
 
 /// The acknowledgements the archived replies show (`NFR-4`): every decided operation, and the
@@ -100,11 +104,92 @@ pub struct Verified {
 }
 
 impl Verified {
-    /// Whether every check that can run passed.
+    /// Whether every check that can run passed. A check that is [`Verdict::Unknown`] is not a
+    /// pass: nothing is laid out until it is decided.
     pub fn passed(&self) -> bool {
-        self.checks.iter().all(|c| c.verdict != Verdict::Failed)
+        self.checks
+            .iter()
+            .all(|c| !matches!(c.verdict, Verdict::Failed | Verdict::Unknown))
             && self.checks.iter().any(|c| c.verdict == Verdict::Passed)
     }
+
+    /// Whether no check failed and some could not decide ([`Verdict::Unknown`]).
+    pub fn undecided(&self) -> bool {
+        crate::drill::undecided(&self.checks)
+    }
+}
+
+/// `archive-behind-anchor` (module documentation): is there an anchor of the **archived book**
+/// after its last checkpoint, `last_number`? `next` is every sequence's anchor of
+/// `last_number + 1`. `book` is the anchor sequence the archived book lives in, when one of its
+/// checkpoints proves it ([`pinned_epoch`]); without one the archive is taken to be of the
+/// venue's current book, which is the only one that is still anchoring (and the detail says so).
+///
+/// Only the book's own sequence counts: after a reset, the previous book's anchor of the same
+/// number is no sign that this archive is behind.
+///
+/// - an anchor of that number in the book's sequence, read or not (an anchor that is no longer the
+///   latest is proven to exist even if the node cannot read it): `Failed`;
+/// - the sequences before the first one identified could not be identified and may include the
+///   book's: `Unknown`, read from an archive node;
+/// - otherwise `Passed`.
+pub fn behind_anchor(
+    last_number: u64,
+    next: &NumberedAnchors,
+    book: Option<u32>,
+) -> (Verdict, String) {
+    let epoch = book.unwrap_or(next.current_epoch);
+    let after = last_number + 1;
+    let of = if next.current_epoch > 0 {
+        format!(
+            " in anchor sequence {epoch}{}",
+            if book.is_some() {
+                ""
+            } else {
+                " (the venue's current one: no checkpoint of the archived book is proven on the layer to say otherwise)"
+            }
+        )
+    } else {
+        String::new()
+    };
+    if next.found.iter().any(|(s, _)| s.epoch == epoch) {
+        return (
+            Verdict::Failed,
+            format!(
+                "the settlement layer holds anchor {after}{of}, after the archive's last checkpoint \
+                 {last_number}: the archive does not reach the book the layer anchored"
+            ),
+        );
+    }
+    for u in &next.unread {
+        match u {
+            Unread::Anchor { sequence, .. } if sequence.epoch == epoch => {
+                return (
+                    Verdict::Failed,
+                    format!(
+                        "the settlement layer holds anchor {after}{of} (this node cannot read it: it \
+                         is no longer the latest), after the archive's last checkpoint \
+                         {last_number}: the archive does not reach the book the layer anchored"
+                    ),
+                );
+            }
+            Unread::Before { epoch: first, .. } if epoch < *first => {
+                return (
+                    Verdict::Unknown,
+                    format!(
+                        "the anchor sequences before {first} could not be identified (read from an \
+                         archive node): whether the book's sequence {epoch} holds anchor {after} \
+                         is unknown"
+                    ),
+                );
+            }
+            _ => {}
+        }
+    }
+    (
+        Verdict::Passed,
+        format!("no anchor after checkpoint {last_number}{of}"),
+    )
 }
 
 /// Step 2 (module documentation): re-derive the archived book on `founding` and run the checks.
@@ -154,32 +239,27 @@ pub fn verify(
     });
     // An anchor after the book's last checkpoint: the archive is behind what the layer saw.
     if let Some(layer) = layer {
-        let last = replica
-            .state()
-            .anchoring()
-            .checkpoints()
-            .max_by_key(|c| c.number)
-            .copied();
+        let checkpoints = replica.state().anchoring();
+        let last = checkpoints.checkpoints().max_by_key(|c| c.number).copied();
         let (verdict, detail) = match last {
-            Some(c) => match layer.anchor(&c.anchored_in(), c.number + 1) {
-                Ok(Some(_)) => (
-                    Verdict::Failed,
-                    format!(
-                        "the settlement layer holds anchor {}, after the archive's last checkpoint {}: \
-                         the archive does not reach the book the layer anchored",
-                        c.number + 1,
-                        c.number
+            Some(c) => {
+                // The book's own anchor sequence, from the latest checkpoint the layer proves.
+                let book = checkpoints
+                    .checkpoints()
+                    .filter(|f| f.status == ledger_core::anchor::CheckpointStatus::Final)
+                    .max_by_key(|f| f.number)
+                    .and_then(|f| {
+                        let read = layer.anchors(&f.anchored_in(), f.number).ok()?;
+                        pinned_epoch(&read, &f.commitment)
+                    });
+                match layer.anchors(&c.anchored_in(), c.number + 1) {
+                    Ok(next) => behind_anchor(c.number, &next, book),
+                    Err(e) => (
+                        Verdict::Failed,
+                        format!("the settlement layer could not be read: {e}"),
                     ),
-                ),
-                Ok(None) => (
-                    Verdict::Passed,
-                    format!("no anchor after checkpoint {}", c.number),
-                ),
-                Err(e) => (
-                    Verdict::Failed,
-                    format!("the settlement layer could not be read: {e}"),
-                ),
-            },
+                }
+            }
             None => (
                 Verdict::Passed,
                 "the archived book has no checkpoint yet".into(),
@@ -239,4 +319,120 @@ pub async fn replay_tail<C: Core>(core: &C, rows: &[Row], after: u64) -> Result<
         replayed,
         last,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use verify::{PublicAnchor, Sequence};
+
+    fn seq(epoch: u32) -> Sequence {
+        Sequence {
+            epoch,
+            base: 0,
+            book: (epoch > 0).then_some([0xB0 + epoch as u8; 32]),
+        }
+    }
+
+    fn anchor() -> PublicAnchor {
+        PublicAnchor {
+            commitment: [1; 32],
+            stored_at: 3,
+            read_at: 4,
+        }
+    }
+
+    fn unread(epoch: u32) -> Unread {
+        Unread::Anchor {
+            sequence: seq(epoch),
+            why: "State already discarded".into(),
+        }
+    }
+
+    /// No reset: as it always was, and the texts are the ones the operator knows.
+    #[test]
+    fn t_026_12_without_a_reset_an_anchor_after_the_last_checkpoint_refuses_the_restore() {
+        let (v, d) = behind_anchor(4, &NumberedAnchors::first_sequence(None), Some(0));
+        assert_eq!(
+            (v, d.as_str()),
+            (Verdict::Passed, "no anchor after checkpoint 4")
+        );
+        let (v, d) = behind_anchor(4, &NumberedAnchors::first_sequence(Some(anchor())), Some(0));
+        assert_eq!(v, Verdict::Failed, "{d}");
+        assert!(
+            d.contains("anchor 5, after the archive's last checkpoint 4"),
+            "{d}"
+        );
+        // The anchor is no longer the latest and the node cannot read it: it exists all the same.
+        let gone = NumberedAnchors {
+            current_epoch: 0,
+            found: vec![],
+            unread: vec![unread(0)],
+        };
+        assert_eq!(behind_anchor(4, &gone, Some(0)).0, Verdict::Failed);
+    }
+
+    /// After a reset the old book's anchor of the same number is another book's: not a sign the
+    /// archive of the new book is behind; the new book's own anchor of it is.
+    #[test]
+    fn t_026_12_after_a_reset_only_the_archived_books_own_sequence_counts() {
+        // Archive of the new book (sequence 1) at checkpoint 4; the old book (sequence 0) held up
+        // to 17, so both numbers 5 exist there. Archive node:
+        let old_only = NumberedAnchors {
+            current_epoch: 1,
+            found: vec![(seq(0), anchor())],
+            unread: vec![],
+        };
+        let (v, d) = behind_anchor(4, &old_only, Some(1));
+        assert_eq!(v, Verdict::Passed, "{d}");
+        // Plain node: the old book's anchor of 5 is unreadable. Still not this book's.
+        let plain = NumberedAnchors {
+            current_epoch: 1,
+            found: vec![],
+            unread: vec![unread(0)],
+        };
+        assert_eq!(behind_anchor(4, &plain, Some(1)).0, Verdict::Passed);
+        // The new book has anchored 5: the archive is behind, read or not.
+        let both = NumberedAnchors {
+            current_epoch: 1,
+            found: vec![(seq(1), anchor()), (seq(0), anchor())],
+            unread: vec![],
+        };
+        assert_eq!(behind_anchor(4, &both, Some(1)).0, Verdict::Failed);
+        let superseded = NumberedAnchors {
+            current_epoch: 1,
+            found: vec![(seq(0), anchor())],
+            unread: vec![unread(1)],
+        };
+        assert_eq!(behind_anchor(4, &superseded, Some(1)).0, Verdict::Failed);
+        // No checkpoint of the book is proven on the layer yet (the new book before its first
+        // anchor): the venue's current book is taken, and the text says so.
+        let (v, d) = behind_anchor(0, &plain, None);
+        assert_eq!(v, Verdict::Passed, "{d}");
+        assert!(
+            d.contains("anchor sequence 1") && d.contains("current one"),
+            "{d}"
+        );
+        // The archive is of the old book: its own sequence's next anchor counts.
+        let (v, _) = behind_anchor(17, &both, Some(0));
+        assert_eq!(v, Verdict::Failed);
+    }
+
+    /// The sequences before the first identified one may include the book's: unknown, which is
+    /// not a pass; a book in an identified sequence is not excused by it.
+    #[test]
+    fn t_026_12_a_book_in_an_unidentified_sequence_is_unknown() {
+        let second = NumberedAnchors {
+            current_epoch: 2,
+            found: vec![],
+            unread: vec![Unread::Before {
+                epoch: 2,
+                last_anchor: Some(5),
+                why: "past state".into(),
+            }],
+        };
+        let (v, d) = behind_anchor(4, &second, Some(0));
+        assert_eq!(v, Verdict::Unknown, "{d}");
+        assert_eq!(behind_anchor(4, &second, Some(2)).0, Verdict::Passed);
+    }
 }

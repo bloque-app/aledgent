@@ -498,18 +498,28 @@ pub fn find_contract_anchors<R: ContractReader + ?Sized>(
                 .at
                 .checked_sub(1)
                 .ok_or_else(|| "a reset at block 0".to_string())
-                .and_then(|before| r.item_at(before, &contract_anchor_epoch_key()))
-                .and_then(|raw| {
-                    raw.as_deref()
-                        .and_then(decode_contract_anchor_epoch)
-                        .filter(|e| e.epoch == epoch)
-                        .ok_or_else(|| {
-                            format!(
-                                "sequence {epoch}'s record is not at the block before sequence {} \
-                                 started (two resets in one block?)",
-                                next.epoch
-                            )
-                        })
+                .and_then(|before| {
+                    let raw = r.item_at(before, &contract_anchor_epoch_key())?;
+                    match raw.as_deref() {
+                        None => Err(format!(
+                            "no sequence record (`anchor_epoch`) is stored at block {before}, the \
+                             block before sequence {} started",
+                            next.epoch
+                        )),
+                        Some(bytes) => match decode_contract_anchor_epoch(bytes) {
+                            None => Err(format!(
+                                "the sequence record stored at block {before} ({} bytes) does not \
+                                 decode as an `AnchorEpoch`",
+                                bytes.len()
+                            )),
+                            Some(e) if e.epoch == epoch => Ok(e),
+                            Some(e) => Err(format!(
+                                "block {before} holds sequence {}'s record, not sequence {epoch}'s \
+                                 (two resets in one block?)",
+                                e.epoch
+                            )),
+                        },
+                    }
                 });
             match read {
                 Ok(this) => this,
@@ -1428,6 +1438,47 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    /// `T-026-12`: why an earlier sequence's record could not be read says what was seen: no
+    /// record, a record that does not decode, or another sequence's record (the one case that
+    /// can be two resets in one block).
+    #[test]
+    fn t_026_12_an_unreadable_sequence_record_says_what_was_seen() {
+        let why = |at_22: Option<Vec<u8>>| {
+            let mut h = reset_history(0, false, 0);
+            // In block order: what block 22 holds, then the second reset at 23.
+            h.changes.push((22, contract_anchor_epoch_key(), at_22));
+            h.changes.push((
+                23,
+                contract_anchor_epoch_key(),
+                Some(epoch_record(
+                    2,
+                    0,
+                    5,
+                    23,
+                    [0xB3; 32],
+                    Some(latest(5, 15, 4)),
+                )),
+            ));
+            match find_contract_anchors(&h, 24, 5).unwrap().unread.as_slice() {
+                [Unread::Before { why, .. }] => why.clone(),
+                other => panic!("{other:?}"),
+            }
+        };
+        let absent = why(None);
+        assert!(absent.contains("no sequence record"), "{absent}");
+        assert!(!absent.contains("two resets"), "{absent}");
+        let garbled = why(Some(std::vec![1, 2, 3]));
+        assert!(garbled.contains("does not decode"), "{garbled}");
+        assert!(garbled.contains("(3 bytes)"), "{garbled}");
+        assert!(!garbled.contains("two resets"), "{garbled}");
+        let other = why(Some(epoch_record(2, 0, 5, 22, [0xB3; 32], None)));
+        assert!(
+            other.contains("holds sequence 2's record, not sequence 1's"),
+            "{other}"
+        );
+        assert!(other.contains("two resets in one block?"), "{other}");
     }
 
     /// `T-026-11`: old anchors stored in the reset's own block, before the reset: the last from

@@ -74,7 +74,7 @@ reporting, usually because anchoring stopped (above).
 ## Exercised
 
 In CI against the fake layer: the drill's `INV-19` check passes over anchors before and after the backup
-point, and fails against a layer that holds none (`ops/tests/restore.rs`, `ops/tests/postgres.rs`); the
+point, and fails against a layer that holds none (`ops/tests/restore.rs`, `ops/tests/postgres.rs`); after a governance reset of the settlement contract (amendment 0039, `T-026-12`) it reads per book: green over the new book's checkpoints numbered at or below the old book's last anchor, `Unknown` (never a pass) for an older book's anchors on a node without past state, `ops/tests/restore.rs` and `ops/tests/agent_drill.rs`; the
 daily comparison reconciles, and one minor unit sent to the position outside the pallet's calls fails axis 3
 and pages (`ops/tests/reconcile.rs`); each anchoring alert pages (`ops/tests/alerts.rs`). Setting the
 attestation key needs the live chain: deferred to staging.

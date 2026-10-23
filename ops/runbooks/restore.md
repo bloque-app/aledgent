@@ -100,9 +100,23 @@ result; the exporter reads the latest drill record (`aledgent_drill_passed`, `al
 
 **`--anchors-rpc` must be an archive node.** `INV-19` reads the anchors' state at the block each was
 anchored in, which can be long ago. A node that prunes state (the public Kreivo RPC endpoints do)
-answers "State already discarded" for those blocks, and `INV-19` then fails for the older anchors with a
-message that reads like a fault of the book. It is the node, not the book: name a node that keeps every
-block's state and run the check again.
+answers "State already discarded" for those blocks. Since `T-026-12` that is no longer reported as a
+fault of the book: the check is **`Unknown`** (below), says "needs an archive node", and the drill has
+not passed. It is the node, not the book: name a node that keeps every block's state and run the check
+again.
+
+**`Unknown` is not a pass and not a failure** (`T-026-12`). A check is `Unknown` when nothing it read
+contradicts the book and some anchor it needed is in state the node no longer keeps. `INV-19` is the check
+that can be: an anchor that is no longer its anchor sequence's latest, and, after a governance reset of the
+settlement contract (amendment 0039), the previous book's anchors, of which only the last is kept in
+current state. An `Unknown` check never counts towards a pass and blocks one: the drill's record is not
+`passed` (so `aledgent_drill_passed` is 0 and `AledgentDrillFailed` fires), and `opsctl restore core --from`
+and `opsctl archive verify` refuse, with a message that says "not a pass" and names the remedy, never "a
+check failed". An `Unknown` never hides a failure: a checkpoint the layer contradicts fails the check even
+when others are unknown. A venue that was reset is read **per book**: the checkpoint's commitment names
+which anchor sequence is the book's (the way the verifier names it); numbers the old book also used are
+not read as this book's. The detail says which sequences the anchors were found in: the venue's current
+one, or "a book re-founded since" (what a restore of an older book's backup finds).
 
 A failing check's detail in the report (and on the console) is the count of what it found and at most 20
 examples, not every item: the count says how widespread it is, the examples say what kind.
