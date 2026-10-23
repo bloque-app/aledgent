@@ -3939,3 +3939,32 @@ fn t_026_10_the_deployed_layout_upgrades_with_nothing_to_migrate() {
     );
     contract.check_invariants();
 }
+
+/// A sequence reset again before its first anchor (a wrong `book`, say) keeps the earlier book's
+/// last anchor in current state: the new record carries it forward.
+#[ink::test]
+fn t_026_10_a_second_reset_before_any_anchor_keeps_the_previous_latest() {
+    let mut contract = busy();
+    name_governance(&mut contract);
+    let old_latest = contract.latest_anchor();
+    assert_eq!(old_latest.map(|a| a.number), Some(3));
+    reset_head(&mut contract, 3, 0, 0xB0).expect("first reset, wrong book");
+    reset_head(&mut contract, 0, 0, 0xB1).expect("second reset, right book");
+    let record = contract.anchor_epoch().expect("sequence 2");
+    assert_eq!((record.epoch, record.book), (2, [0xB1; 32]));
+    assert_eq!(record.previous, old_latest);
+    assert_eq!(head_set_events().len(), 2);
+    assert_eq!(head_set_events()[1].previous, old_latest);
+    contract.check_invariants();
+    // Once the new sequence anchors, a further reset records that sequence's latest instead.
+    execute_one(&mut contract, 0x21, anchor(1, 0xC1));
+    reset_head(&mut contract, 1, 0, 0xB2).expect("third reset");
+    assert_eq!(
+        contract
+            .anchor_epoch()
+            .and_then(|r| r.previous)
+            .map(|a| a.commitment),
+        Some([0xC1; 32])
+    );
+    contract.check_invariants();
+}

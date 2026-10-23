@@ -50,7 +50,8 @@ later for the Spaces venue (`OQ-68`, amendment 0022, `DEC-17`).
    aside (diffed by the chain-facts handover above). So the "deployed layout" is today's layout: cells
    `01`, `02`, `04` to `08`; `03` and `09` absent.
 4. **Prod's state** (chain read 2026-10-22, same handover §1): head `{ last_anchor: 17, next_seq: 17,
-   pruned_to: 0 }`; 17 inbox entries, all `Anchored`; every position 0; nothing bound; no withdrawal bound;
+   pruned_to: 0 }` (not 14, as the settle database read earlier that day said: anchors 15 to 17 were
+   written around 00:30–02:30 UTC); 17 inbox entries, all `Anchored`; every position 0; nothing bound; no withdrawal bound;
    the account holds 185,371.97 COPM and 1,873.944283 DUSD by plain transfer.
 5. **An anchor is accepted only as `last_anchor + 1`**; the latest again with its commitment is a no-op
    replay at its original position (`contracts/settlement/src/lib.rs`, `try_anchor`, before this change
@@ -66,7 +67,11 @@ later for the Spaces venue (`OQ-68`, amendment 0022, `DEC-17`).
    and dispatches `call` as `Signed(community_account)` (frame-contrib at Kreivo's pin `0b57691`,
    `pallets/communities/src/lib.rs:601-607`, `functions.rs:217-226`). So a passed referendum enacting
    `dispatch_as_account(Contracts::call(..))` reaches a contract message with the community's account as
-   the caller.
+   the caller. **Dry-run on prod** (Kreivo mainnet, spec 134, at the finalized head on 2026-10-22,
+   `DryRunApi`, nothing signed): as `Communities { 1201, None }`, `Contracts.call` directly fails
+   `BadOrigin`; through `dispatch_as_account` the contract is `Called` with caller `Signed(F3opxRaMq…)`
+   (community 1201's account), and an admin-only message is refused by the contract (`ContractReverted`),
+   so it ran.
 8. **Community 1201's track** decides one referendum at a time; prepare 600, confirm 14,400, minimum
    enactment 600 relay-chain blocks: about 26 hours each with the one voting member's aye (same handover §5).
 9. **The adapter needs no change to drive the contract after a reset.** It reads `last_anchor` from the
@@ -77,15 +82,20 @@ later for the Spaces venue (`OQ-68`, amendment 0022, `DEC-17`).
 10. **A book's first checkpoint is 1.** The anchor store refuses any other first number
     (`crates/ledger-core/src/anchor/tests.rs:46-49`; `anchor/mod.rs:619`). A reset to base 0 lets `p2`
     anchor as founded, with no change to the core (`T-036-14` stays as it is).
-11. **The verifier assumes anchor numbers never fall.** It finds an earlier anchor by a binary search for
-    the first finalized block holding its number or a later one (`crates/verify/src/rpc.rs:225-227`). A
-    reset breaks that predicate for blocks after the reset.
+11. **The verifier assumes anchor numbers never fall.** It reads the latest at the finalized head and
+    finds an earlier anchor by a binary search for the first finalized block holding its number or a later
+    one (`crates/verify/src/rpc.rs:185-276`). After a reset that predicate is no longer monotonic, and the
+    verifier can return **the other book's commitment** for a number both books used, or call an anchor not
+    yet final: asked for `p1`'s anchor *n* while `p2`'s latest is *n*, it returns `p2`'s commitment; while
+    `p2`'s latest is below *n*, it answers "not final"; once `p2` is past *n*, the search may land in either
+    book. A commitment binds its own book's state, so the result is a false mismatch or a false "not
+    anchored", never a false match (bar a hash collision).
 
 **Assumptions** (not verified here):
 
-- *A1.* Kreivo spec 134 (live) keeps `ContractsStore::upgrade`, `Communities::dispatch_as_account` and
-  `pallet-contracts`' call semantics as read at spec 133 and frame-contrib `0b57691`. The dry runs of fact 1
-  were at spec 134; `dispatch_as_account` was not dry-run.
+- *A1.* Kreivo spec 134 (live) keeps `ContractsStore::upgrade` and `publish_upgrade` as read at spec 133.
+  The origin checks of `upgrade` and the community's route to a contract call were dry-run at spec 134
+  (facts 1 and 7); a `publish_upgrade` of new code and a `set_code` that actually swaps it were not.
 - *A2.* The p1 adapter is stopped for good and nothing it signed is still in flight when the reset is enacted.
 - *A3.* The WASM built by CI from this branch is what would be published; its code hash is not computed here.
 
@@ -135,7 +145,8 @@ everyone while none is named).
     Option<LatestAnchor> }`. `epoch` is 1 for the first reset and one more for each later one.
     `from_seq` is `next_seq` at the reset: the new sequence's first inbox position. `book` is an opaque
     32-byte name of the re-founded book, its chainspec (seed) digest. `previous` is the old latest anchor,
-    kept in current state;
+    kept in current state; a sequence reset again before its first anchor (a wrong `book`, say) carries
+    its own `previous` forward, so the last anchor of the book before is never dropped;
   - if a prune had already passed the old latest's inbox entry (kept while it was the latest), that entry
     is removed, since nothing else would reach it and `previous` keeps the anchor. Otherwise it stays,
     prunable like any superseded anchor's.
@@ -176,8 +187,9 @@ No new `INV-*` identifier is proposed; these are the contract's properties for a
 - **S2, coordinates are written once** (`REQ-SL-2`, `REQ-SL-9`): `next_seq` never decreases and no entry is
   rewritten, so `(instance, seq)` names one entry for good; a settled withdrawal's entry cannot be replaced
   or re-executed by a reset.
-- **S3, non-revision** (`REQ-PR-3`, `INV-19`): no recorded commitment is changed; the previous latest stays
-  in current state; earlier ones stay in their entries until pruned, their events and finalized history.
+- **S3, non-revision** (`REQ-PR-3`, `INV-19`): no recorded commitment is changed; the last anchor before a
+  reset stays in current state, across further resets until a new sequence anchors; earlier ones stay in
+  their entries until pruned, their events and finalized history.
 - **S4, no cross-sequence replay**: an anchor of an earlier sequence never answers `Applied` at its old
   position after a reset.
 - **S5, the sequence is identifiable** (`REQ-SL-1` as amended): every entry at or after `from_seq` belongs
@@ -201,17 +213,20 @@ The debug invariant check (`check_invariants`) adds S5 and that no legacy migrat
   (base 0), so `T-036-14`'s base is no longer needed for that case; a book that does carry a base gets it by
   a reset to that base. `T-036-16` (`aledgent/anchor/v3`, the commitment binds the book's genesis) stays
   useful: it lets a verifier check an anchor's book from the commitment alone.
-- **The verifier (follow-up, `T-026-11`).** Its binary search assumes numbers never fall (fact 11). It must
-  read `anchor_epoch` and bound the search for an anchor of an earlier sequence to blocks before the reset
-  (`at`), and for the current sequence to blocks from it. Until then it can misreport an earlier book's
-  older anchors as unreadable; the latest of each earlier sequence stays readable from `previous` (the last
-  one) or the `AnchorHeadSet` events.
+- **The verifier (`T-026-11`, a precondition of the reset's referendum).** Its search assumes numbers never
+  fall (fact 11): after a reset it can answer with the other book's commitment, or "not final". It must read
+  `anchor_epoch` (and, for a sequence before the last, the `AnchorHeadSet` events) and search for a book's
+  anchor only within that book's sequence: blocks before the reset (`at`) for an earlier one, from it for
+  the current one. It is not built here; the reset's referendum waits for it, so that no verifier of `p1`
+  or `p2` is answered wrongly.
 
 ## Failure modes
 
 | Case | What happens |
 |---|---|
 | An anchor lands between proposal and enactment | `HeadMoved`; nothing changes; a new referendum with the new `expected_last` |
+| Referendum 2's gas or deposit limit too low at enactment | `Contracts.call` fails, nothing changes; a day is lost (step 4 sizes them from a dry run) |
+| A verifier reads the instance before `T-026-11` | it can answer with the other book's commitment or "not final" (fact 11): never a false match. Hence the precondition |
 | The previous book's adapter anchors after the reset | its next number (`last + 1` of the old sequence) is a gap: refused `AnchorOutOfOrder`, recorded. With a base equal to the old latest, it would land as the new sequence's first: the runbook stops the old adapter first (A2) |
 | Governance never named | nobody can reset; the instance runs on as before |
 | Admin names itself governance before the community | the reset becomes a single-key power, as before this change: the checklist names the community's account as the first message after the upgrade, and `governance()` is read back |
@@ -222,8 +237,8 @@ The debug invariant check (`check_invariants`) adds S5 and that no legacy migrat
 ## Rejected alternatives
 
 - **The admin resets.** One signed call, but the admin is one personal key (fact 6): that is not the
-  governance gate the owner asked for, and amendment 0022 already ruled that a single key must not hold power
-  over anchoring. Moving the whole admin to the community instead would put the incident responses (empty the
+  governance gate the owner asked for, nor what `OQ-68` describes ("by the venue's own governance"), and
+  amendment 0022's analysis found that only a community vote guards a live book's anchoring. Moving the whole admin to the community instead would put the incident responses (empty the
   keys) behind a 26-hour vote.
 - **Zero the inbox with the head** (0022's option (b)). Positions would repeat; an observation's coordinate
   `(instance, seq)` would name two entries, and a settled withdrawal's evidence could be replaced. S2 forbids it.
@@ -245,8 +260,13 @@ The debug invariant check (`check_invariants`) adds S5 and that no legacy migrat
    (app 3) should take the same code first, as a rehearsal.
 3. **At once after enactment**, the admin (`HUf7`) signs `Contracts.call(Da1u…, set_governance(<community
    1201's account>))`, and `governance()` is read back.
-4. **Referendum 2** (about 26 hours): `Communities.dispatch_as_account(Contracts.call(Da1u…,
-   set_anchor_head(17, 0, <p2's chainspec digest>)))`. Before submitting, dry-run it as the community.
+4. **Referendum 2** (about 26 hours), once `T-026-11` is released: `Communities.dispatch_as_account(
+   Contracts.call(Da1u…, set_anchor_head(17, 0, <p2's chainspec digest>)))`. `Contracts.call` fixes its
+   `gas_limit` and `storage_deposit_limit` when it is proposed, about a day before it runs: dry-run the
+   exact enacted call as `Communities { 1201, None }` at the finalized head, set the gas limit from the dry
+   run with a margin and the deposit limit to the net charge (the new 109-byte record, less the cleared
+   `latest_anchor`) with a margin, and check that the community's account (0.173 KSM on 2026-10-22)
+   covers it. An anchor landing meanwhile makes it fail `HeadMoved` and change nothing.
 5. Seed `p2`'s settle cursor at `from_seq` (17), then start `p2`'s adapter; its first anchor is 1.
 
 Nothing in flight: the p1 adapter is stopped (A2). The withdrawal-to-deployment check compares code

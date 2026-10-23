@@ -213,8 +213,9 @@ pub struct AnchorEpoch {
     /// governance gave it. Never interpreted and never a storage key (`REQ-SL-5`); it carries no
     /// personal data (`INV-17`).
     pub book: Commitment,
-    /// The previous sequence's latest anchor, as it stood when this one started: kept in current
-    /// state, so that its last commitment stays readable without a history reader.
+    /// The latest anchor before this sequence started: the previous sequence's, or, if that one
+    /// was reset again before its first anchor, the one it carried. Kept in current state, so that
+    /// the last commitment of the book before stays readable without a history reader.
     pub previous: Option<LatestAnchor>,
 }
 

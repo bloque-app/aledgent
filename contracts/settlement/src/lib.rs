@@ -607,7 +607,12 @@ pub mod settlement {
                 .map_or(0, |e| e.epoch)
                 .checked_add(1)
                 .ok_or(Error::EpochOverflow)?;
-            let previous = self.load_latest_anchor(&head);
+            // The latest anchor of the most recent sequence that has one: a sequence reset again
+            // before its first anchor (a wrong `book`, say) carries its own `previous` forward,
+            // so the last anchor of the book before stays in current state.
+            let previous = self
+                .load_latest_anchor(&head)
+                .or_else(|| current.and_then(|e| e.previous));
             if let Some(old) = previous {
                 if old.seq < head.pruned_to {
                     self.inbox.remove(old.seq);
