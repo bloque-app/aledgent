@@ -3229,3 +3229,713 @@ fn the_migration_keeps_the_latests_entry_below_the_watermark() {
     assert_eq!(contract.latest_anchor().map(|a| a.seq), Some(2));
     contract.check_invariants();
 }
+
+// ---------------------------------------------------------------------------------------------
+// Governance and anchor sequences (amendment 0039, T-026-10; OQ-68)
+// ---------------------------------------------------------------------------------------------
+
+/// The deployment's governance: on Kreivo, the licence-owning community's account, which a
+/// passed referendum reaches through `Communities::dispatch_as_account`.
+fn governance() -> AccountId {
+    acc(0x60)
+}
+
+/// The admin names `governance()`.
+fn name_governance(contract: &mut Settlement) {
+    caller(admin());
+    contract
+        .set_governance(governance())
+        .expect("the admin names governance");
+}
+
+/// Governance starts a new sequence after `base`, expecting the head at `expected`.
+fn reset_head(
+    contract: &mut Settlement,
+    expected: AnchorNumber,
+    base: AnchorNumber,
+    book: u8,
+) -> Result<(), Error> {
+    caller(governance());
+    contract.set_anchor_head(expected, base, [book; 32])
+}
+
+/// An asset's position, withdrawal window and binding cells, as stored.
+type AssetCells = (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>);
+
+/// `AnchorEpoch` as raw SCALE: epoch, base, from_seq, at, book, previous `LatestAnchor`.
+type RawEpoch = (
+    u32,
+    u64,
+    u64,
+    u32,
+    [u8; 32],
+    Option<(u64, [u8; 32], u32, u64)>,
+);
+
+/// A cell's bytes exactly as stored, read by key: what "byte-identical" compares.
+struct Raw(Vec<u8>);
+
+impl Encode for Raw {
+    fn encode_to<T: scale::Output + ?Sized>(&self, dest: &mut T) {
+        dest.write(&self.0)
+    }
+}
+
+impl Decode for Raw {
+    fn decode<I: scale::Input>(input: &mut I) -> Result<Self, scale::Error> {
+        let len = input.remaining_len()?.ok_or("a cell has a known length")?;
+        let mut bytes = vec![0u8; len];
+        input.read(&mut bytes)?;
+        Ok(Raw(bytes))
+    }
+}
+
+fn raw<K: Encode>(key: &K) -> Option<Vec<u8>> {
+    ink::env::get_contract_storage::<K, Raw>(key)
+        .expect("a cell reads as bytes")
+        .map(|r| r.0)
+}
+
+/// Everything a reset must leave byte for byte as it was: the value the contract holds, its
+/// registration (admin, keys, attestation key: the grants), governance, each asset's position,
+/// withdrawal window and binding, every inbox entry but the superseded latest anchor's, and the
+/// inbox's numbering.
+#[derive(Debug, PartialEq, Eq)]
+struct Untouched {
+    held: Vec<Balance>,
+    registration: Option<Vec<u8>>,
+    governance: Option<Vec<u8>>,
+    /// Per asset: its position, withdrawal window and binding cells.
+    assets: Vec<AssetCells>,
+    inbox: Vec<Option<Vec<u8>>>,
+    next_seq: InboxSeq,
+    pruned_to: InboxSeq,
+}
+
+fn untouched(contract: &Settlement, skip: Option<InboxSeq>) -> Untouched {
+    let head = contract.head();
+    Untouched {
+        held: [DUSD, COPM]
+            .iter()
+            .map(|a| mock::balance(*a, me()))
+            .collect(),
+        registration: raw(&1u32),
+        governance: raw(&0x0Bu32),
+        assets: [DUSD, COPM]
+            .iter()
+            .map(|a| (raw(&(5u32, *a)), raw(&(6u32, *a)), raw(&(7u32, *a))))
+            .collect(),
+        inbox: (0..head.next_seq + 1)
+            .filter(|seq| Some(*seq) != skip)
+            .map(|seq| raw(&(4u32, seq)))
+            .collect(),
+        next_seq: head.next_seq,
+        pruned_to: head.pruned_to,
+    }
+}
+
+fn head_set_events() -> Vec<crate::settlement::AnchorHeadSet> {
+    let topic =
+        <crate::settlement::AnchorHeadSet as ink::env::Event>::SIGNATURE_TOPIC.expect("a topic");
+    events()
+        .into_iter()
+        .filter(|e| e.topics.first().map(Vec::as_slice) == Some(&topic[..]))
+        .map(|e| crate::settlement::AnchorHeadSet::decode(&mut &e.data[..]).expect("decodes"))
+        .collect()
+}
+
+/// A deployment with value in it and every kind of state a reset must not touch: a DUSD position
+/// from a deposit with a bound and a withdrawal against it, a COPM binding, three anchors and a
+/// pruned prefix.
+fn busy() -> Settlement {
+    let mut contract = funded(1_000, 500);
+    // 0: Deposited (by `funded`). 1: Withdrawn.
+    assert_eq!(
+        execute_one(&mut contract, 0x10, to_payee(100)),
+        Outcome::Applied { seq: 1 }
+    );
+    // 2: Bound.
+    fund_contract(COPM, 70);
+    assert_eq!(
+        execute_one(&mut contract, 0x11, bind(COPM, 70)),
+        Outcome::Applied { seq: 2 }
+    );
+    // 3, 4, 5: anchors 1 to 3.
+    for number in 1..=3u64 {
+        execute_one(
+            &mut contract,
+            number as u8,
+            anchor(number, 0xA0 + number as u8),
+        );
+    }
+    caller(admin());
+    contract
+        .prune_inbox(2)
+        .expect("prunes the deposit and the withdrawal");
+    contract.check_invariants();
+    contract
+}
+
+#[ink::test]
+fn t_026_10_the_admin_names_governance_once_then_only_governance_replaces_it() {
+    let mut contract = setup();
+    assert_eq!(contract.governance(), None);
+    for who in [stranger(), key(), governance()] {
+        caller(who);
+        assert_eq!(contract.set_governance(who), Err(Error::NotAdmin));
+    }
+    name_governance(&mut contract);
+    assert_eq!(contract.governance(), Some(governance()));
+    assert_eq!(
+        last_event::<crate::settlement::GovernanceSet>(),
+        crate::settlement::GovernanceSet {
+            governance: governance()
+        }
+    );
+    // Once named, the admin can no longer touch it.
+    caller(admin());
+    assert_eq!(contract.set_governance(admin()), Err(Error::NotGovernance));
+    caller(stranger());
+    assert_eq!(
+        contract.set_governance(stranger()),
+        Err(Error::NotGovernance)
+    );
+    assert_eq!(contract.governance(), Some(governance()));
+    // Governance hands over to another account.
+    caller(governance());
+    contract
+        .set_governance(acc(0x61))
+        .expect("governance replaces itself");
+    assert_eq!(contract.governance(), Some(acc(0x61)));
+    caller(governance());
+    assert_eq!(
+        contract.set_governance(governance()),
+        Err(Error::NotGovernance)
+    );
+}
+
+#[ink::test]
+fn t_026_10_only_governance_resets_the_anchor_head() {
+    let mut contract = busy();
+    // No governance named: nobody can, the admin included.
+    for who in [admin(), key(), stranger(), governance()] {
+        caller(who);
+        assert_eq!(
+            contract.set_anchor_head(3, 0, [0xB0; 32]),
+            Err(Error::NotGovernance)
+        );
+    }
+    name_governance(&mut contract);
+    let before = untouched(&contract, None);
+    let events_before = event_count();
+    // Named: still not the admin, a key or a stranger.
+    for who in [admin(), key(), stranger()] {
+        caller(who);
+        assert_eq!(
+            contract.set_anchor_head(3, 0, [0xB0; 32]),
+            Err(Error::NotGovernance)
+        );
+    }
+    assert_eq!(untouched(&contract, None), before);
+    assert_eq!(contract.head().last_anchor, 3);
+    assert_eq!(contract.anchor_epoch(), None);
+    assert_eq!(event_count(), events_before);
+    // Governance can.
+    assert_eq!(reset_head(&mut contract, 3, 0, 0xB0), Ok(()));
+    assert_eq!(contract.head().last_anchor, 0);
+    contract.check_invariants();
+}
+
+/// The reset moves no value and changes no position, window, binding, grant or inbox entry: the
+/// cells are byte-identical before and after. Only the head's `last_anchor`, the latest anchor
+/// (moved into the sequence's record) and the sequence's record change.
+#[ink::test]
+fn t_026_10_a_reset_leaves_funds_binds_positions_windows_and_grants_byte_identical() {
+    let mut contract = busy();
+    name_governance(&mut contract);
+    let old_latest = contract.latest_anchor().expect("anchor 3");
+    assert_eq!(old_latest.seq, 5);
+    let before = untouched(&contract, None);
+    let window = contract.withdrawal_window(DUSD);
+    test::set_block_number::<Env>(50);
+
+    assert_eq!(reset_head(&mut contract, 3, 0, 0xB0), Ok(()));
+
+    assert_eq!(untouched(&contract, None), before, "nothing else changed");
+    assert_eq!(contract.withdrawal_window(DUSD), window);
+    assert_eq!(contract.position(DUSD), 900);
+    assert_eq!(contract.position(COPM), 70);
+    assert_eq!(contract.bound(COPM), Some(2));
+    assert_eq!(
+        contract.head(),
+        Head {
+            last_anchor: 0,
+            next_seq: 6,
+            pruned_to: 2
+        }
+    );
+    assert_eq!(contract.latest_anchor(), None);
+    assert_eq!(ink::env::contains_contract_storage(&8u32), None);
+    let record = AnchorEpoch {
+        epoch: 1,
+        base: 0,
+        from_seq: 6,
+        at: 50,
+        book: [0xB0; 32],
+        previous: Some(old_latest),
+    };
+    assert_eq!(contract.anchor_epoch(), Some(record));
+    assert_eq!(
+        head_set_events(),
+        vec![crate::settlement::AnchorHeadSet {
+            epoch: 1,
+            base: 0,
+            from_seq: 6,
+            book: [0xB0; 32],
+            previous: Some(old_latest),
+        }]
+    );
+    // The sequence's number is the event's topic (ink! pads a short topic to 32 bytes).
+    let mut topic = 1u32.encode();
+    topic.resize(32, 0);
+    assert_eq!(last_topics()[1], topic);
+    contract.check_invariants();
+
+    // The deployment works as before: a withdrawal within the same window, a deposit.
+    assert_eq!(
+        execute_one(&mut contract, 0x12, to_payee(50)),
+        Outcome::Applied { seq: 6 }
+    );
+    fund_and_deposit(&mut contract, depositor(), reference(0xA1), DUSD, 5).expect("deposit");
+    assert_eq!(contract.position(DUSD), 855);
+    contract.check_invariants();
+}
+
+/// After a reset the sequence runs from the new base: `base + 1` is next; the base itself, an
+/// older number and a gap are refused, never trapped; a second reset starts sequence 2.
+#[ink::test]
+fn t_026_10_the_sequence_continues_from_the_new_base() {
+    let mut contract = busy();
+    name_governance(&mut contract);
+    reset_head(&mut contract, 3, 0, 0xB0).expect("reset to 0");
+    // A gap, and the old sequence's next number, are refused.
+    assert_refused(&mut contract, anchor(2, 0x01), Refusal::AnchorOutOfOrder);
+    assert_refused(&mut contract, anchor(4, 0x01), Refusal::AnchorOutOfOrder);
+    let seq = contract.head().next_seq;
+    assert_eq!(
+        execute_one(&mut contract, 0x21, anchor(1, 0xC1)),
+        Outcome::Applied { seq }
+    );
+    assert_eq!(
+        contract.latest_anchor(),
+        Some(LatestAnchor {
+            number: 1,
+            commitment: [0xC1; 32],
+            at: 1,
+            seq
+        })
+    );
+    // A replay of the new latest is a no-op at its own position, as before.
+    assert_eq!(
+        execute_one(&mut contract, 0x22, anchor(1, 0xC1)),
+        Outcome::Applied { seq }
+    );
+    assert_eq!(
+        execute_one(&mut contract, 0x23, anchor(2, 0xC2)),
+        Outcome::Applied { seq: seq + 1 }
+    );
+    contract.check_invariants();
+
+    // A second reset, to a base above zero (a book seeded with a settlement base).
+    reset_head(&mut contract, 2, 41, 0xB1).expect("reset to 41");
+    let record = contract.anchor_epoch().expect("sequence 2");
+    assert_eq!(
+        (record.epoch, record.base, record.book),
+        (2, 41, [0xB1; 32])
+    );
+    assert_eq!(
+        record.previous.map(|a| (a.number, a.commitment)),
+        Some((2, [0xC2; 32]))
+    );
+    assert_eq!(contract.latest_anchor(), None);
+    contract.check_invariants();
+    // The base names no anchor of this sequence: refused, not a replay and not a trap.
+    assert_refused(&mut contract, anchor(41, 0x01), Refusal::AnchorOutOfOrder);
+    assert_refused(&mut contract, anchor(1, 0xC1), Refusal::AnchorOutOfOrder);
+    let seq = contract.head().next_seq;
+    assert_eq!(
+        execute_one(&mut contract, 0x24, anchor(42, 0xD2)),
+        Outcome::Applied { seq }
+    );
+    assert_eq!(contract.head().last_anchor, 42);
+    contract.check_invariants();
+}
+
+/// The old sequence's anchors stay readable where they were: their entries (until pruned), their
+/// events, and the previous sequence's latest in current state, in the sequence's record.
+#[ink::test]
+fn t_026_10_old_anchors_remain_verifiable_after_a_reset() {
+    let mut contract = busy();
+    name_governance(&mut contract);
+    let entries: Vec<_> = (3..6).map(|seq| contract.inbox_entry(seq)).collect();
+    let anchored_before: Vec<_> = events()
+        .into_iter()
+        .filter(|e| {
+            e.topics.first().map(Vec::as_slice)
+                == Some(&<Anchored as ink::env::Event>::SIGNATURE_TOPIC.expect("topic")[..])
+        })
+        .map(|e| e.data)
+        .collect();
+    assert_eq!(anchored_before.len(), 3);
+    reset_head(&mut contract, 3, 0, 0xB0).expect("reset");
+    execute_one(&mut contract, 0x21, anchor(1, 0xC1));
+
+    // The entries of anchors 1 to 3 are unchanged, numbers and commitments included.
+    for (i, seq) in (3..6).enumerate() {
+        assert_eq!(contract.inbox_entry(seq), entries[i]);
+        match contract.inbox_entry(seq).expect("kept").event {
+            InboxEvent::Anchored {
+                number, commitment, ..
+            } => assert_eq!((number, commitment), (i as u64 + 1, [0xA1 + i as u8; 32])),
+            other => panic!("{other:?}"),
+        }
+    }
+    // Their events stand.
+    let anchored_after: Vec<_> = events()
+        .into_iter()
+        .filter(|e| {
+            e.topics.first().map(Vec::as_slice)
+                == Some(&<Anchored as ink::env::Event>::SIGNATURE_TOPIC.expect("topic")[..])
+        })
+        .map(|e| e.data)
+        .collect();
+    assert_eq!(&anchored_after[..3], &anchored_before[..]);
+    // The old latest is in current state, in the record; the new latest is the new sequence's.
+    let record = contract.anchor_epoch().expect("record");
+    assert_eq!(
+        record.previous.map(|a| (a.number, a.commitment, a.seq)),
+        Some((3, [0xA3; 32], 5))
+    );
+    assert_eq!(contract.latest_anchor().map(|a| a.number), Some(1));
+    // An entry from the new sequence is told from the old one's by its position.
+    assert!(contract.latest_anchor().expect("latest").seq >= record.from_seq);
+    // Old anchor entries are now prunable like any superseded anchor; the record keeps the last.
+    caller(admin());
+    contract.prune_inbox(6).expect("prune to the reset");
+    assert_eq!(contract.inbox_entry(5), None);
+    assert_eq!(contract.anchor_epoch(), Some(record));
+    contract.check_invariants();
+}
+
+/// An old latest anchor's entry that a prune passed while it was the latest (so kept) goes with
+/// the reset: nothing else would reach it, and the sequence's record keeps the anchor.
+#[ink::test]
+fn t_026_10_a_reset_releases_the_old_latests_entry_below_the_watermark() {
+    let mut contract = busy();
+    caller(admin());
+    contract.prune_inbox(6).expect("prune everything");
+    assert!(
+        contract.inbox_entry(5).is_some(),
+        "the latest's entry is kept"
+    );
+    assert!(
+        contract.inbox_entry(2).is_some(),
+        "the bind's entry is kept"
+    );
+    name_governance(&mut contract);
+    let before = untouched(&contract, Some(5));
+    reset_head(&mut contract, 3, 0, 0xB0).expect("reset");
+    assert_eq!(contract.inbox_entry(5), None);
+    assert_eq!(untouched(&contract, Some(5)), before);
+    assert_eq!(
+        contract
+            .anchor_epoch()
+            .and_then(|r| r.previous)
+            .map(|a| a.seq),
+        Some(5)
+    );
+    contract.check_invariants();
+}
+
+/// A reset cannot be used to replay what already happened. The inbox's numbering never goes
+/// back, so the entry that recorded a settled withdrawal, and the anchor that followed it, keep
+/// their coordinates for good: no later entry can take them, and nothing re-executes the
+/// withdrawal. An anchor of the old sequence submitted again after a reset is a new anchor of
+/// the new sequence, at a new position, never `Applied` at the old one's; and at a base equal to
+/// the old latest number, it is refused instead of replaying.
+#[ink::test]
+fn t_026_10_a_reset_cannot_replay_an_anchor_or_a_settled_withdrawal() {
+    let mut contract = funded(1_000, 500);
+    name_governance(&mut contract);
+    // 1: the withdrawal settles. 2: anchor 1 commits to the book that includes it.
+    assert_eq!(
+        execute_one(&mut contract, 0x10, to_payee(100)),
+        Outcome::Applied { seq: 1 }
+    );
+    assert_eq!(
+        execute_one(&mut contract, 0x11, anchor(1, 0xA1)),
+        Outcome::Applied { seq: 2 }
+    );
+    let withdrawal = raw(&(4u32, 1u64)).expect("withdrawal entry");
+    let anchored = raw(&(4u32, 2u64)).expect("anchor entry");
+    let paid = mock::balance(DUSD, payee());
+    let held = mock::balance(DUSD, me());
+
+    // A reset to the old latest number: the old anchor does not replay as `Applied { seq: 2 }`.
+    reset_head(&mut contract, 1, 1, 0xB0).expect("reset at 1");
+    assert_refused(&mut contract, anchor(1, 0xA1), Refusal::AnchorOutOfOrder);
+    // A reset to zero: the same anchor again is a new anchor, at a new position.
+    let last = contract.head().last_anchor;
+    reset_head(&mut contract, last, 0, 0xB1).expect("reset to 0");
+    let seq = contract.head().next_seq;
+    assert!(seq > 2);
+    assert_eq!(
+        execute_one(&mut contract, 0x11, anchor(1, 0xA1)),
+        Outcome::Applied { seq }
+    );
+    // The withdrawal's and the old anchor's entries are byte-identical, at the same coordinates;
+    // no value moved again and no second `Withdrawn` exists.
+    assert_eq!(raw(&(4u32, 1u64)), Some(withdrawal));
+    assert_eq!(raw(&(4u32, 2u64)), Some(anchored));
+    assert_eq!(mock::balance(DUSD, payee()), paid);
+    assert_eq!(mock::balance(DUSD, me()), held);
+    let withdrawn = (0..contract.head().next_seq)
+        .filter(|s| {
+            matches!(
+                contract.inbox_entry(*s).map(|e| e.event),
+                Some(InboxEvent::Withdrawn { .. })
+            )
+        })
+        .count();
+    assert_eq!(withdrawn, 1);
+    // Every coordinate is written once: next_seq only grew.
+    assert_eq!(contract.head().next_seq, seq + 1);
+    contract.check_invariants();
+}
+
+/// A reset decided against a head that has since moved is refused and changes nothing; after a
+/// reset, the old sequence's next anchor (one still in flight from its adapter) is refused.
+#[ink::test]
+fn t_026_10_a_stale_reset_and_an_old_books_next_anchor_are_refused() {
+    let mut contract = busy();
+    name_governance(&mut contract);
+    let before = untouched(&contract, None);
+    assert_eq!(reset_head(&mut contract, 2, 0, 0xB0), Err(Error::HeadMoved));
+    assert_eq!(reset_head(&mut contract, 4, 0, 0xB0), Err(Error::HeadMoved));
+    assert_eq!(untouched(&contract, None), before);
+    assert_eq!(contract.head().last_anchor, 3);
+    assert_eq!(contract.anchor_epoch(), None);
+    assert!(head_set_events().is_empty());
+
+    reset_head(&mut contract, 3, 0, 0xB0).expect("reset");
+    // The old book's adapter would submit 4 next: a gap in the new sequence.
+    assert_refused(&mut contract, anchor(4, 0xA4), Refusal::AnchorOutOfOrder);
+    contract.check_invariants();
+}
+
+#[ink::test]
+fn t_026_10_a_base_with_no_next_number_is_refused() {
+    let mut contract = setup();
+    name_governance(&mut contract);
+    assert_eq!(
+        reset_head(&mut contract, 0, u64::MAX, 0xB0),
+        Err(Error::InvalidAnchorBase)
+    );
+    assert_eq!(reset_head(&mut contract, 0, u64::MAX - 1, 0xB0), Ok(()));
+    // The largest base leaves exactly one number.
+    assert_eq!(
+        execute_one(&mut contract, 0x21, anchor(u64::MAX, 0x01)),
+        Outcome::Applied { seq: 0 }
+    );
+    contract.check_invariants();
+}
+
+/// A deployment of the code before 2026-10-11 whose anchor records are not all migrated cannot
+/// start a sequence until they are: the legacy records belong to its first sequence, and a later
+/// sequence never starts their migration.
+#[ink::test]
+fn t_026_10_a_reset_waits_for_the_legacy_migration() {
+    let n = 2 * MIGRATION_STEP + 5;
+    let mut contract = upgraded(n, 0);
+    // Naming governance is an admin message: it takes the first migration step.
+    name_governance(&mut contract);
+    assert!(ink::env::contains_contract_storage(&9u32).is_some());
+    assert_eq!(
+        reset_head(&mut contract, n, 0, 0xB0),
+        Err(Error::MigrationPending)
+    );
+    // The admin's next messages finish it.
+    caller(admin());
+    contract.set_keys(vec![key()], None).expect("step 2");
+    contract.set_keys(vec![key()], None).expect("step 3");
+    assert_eq!(legacy_left(n), 0);
+    assert_eq!(reset_head(&mut contract, n, 0, 0xB0), Ok(()));
+    assert_eq!(
+        contract
+            .anchor_epoch()
+            .and_then(|r| r.previous)
+            .map(|a| a.number),
+        Some(n)
+    );
+    // In the new sequence, no admin or key message starts a migration.
+    caller(admin());
+    contract.set_keys(vec![key()], None).expect("no migration");
+    execute_one(&mut contract, 0x21, anchor(1, 0xC1));
+    assert_eq!(ink::env::contains_contract_storage(&9u32), None);
+    contract.check_invariants();
+}
+
+/// A reset to a base above zero on an instance whose legacy records were never written (a fresh
+/// one): no message afterwards mistakes the base for an unmigrated legacy anchor.
+#[ink::test]
+fn t_026_10_a_base_above_zero_never_starts_a_legacy_migration() {
+    let mut contract = setup();
+    name_governance(&mut contract);
+    reset_head(&mut contract, 0, 17, 0xB0).expect("reset to 17");
+    caller(admin());
+    contract
+        .set_keys(vec![key()], None)
+        .expect("would panic if it migrated");
+    contract
+        .set_withdrawal_bound(
+            DUSD,
+            Some(WithdrawalBound {
+                amount: 1,
+                period: 1,
+            }),
+        )
+        .expect("bound");
+    assert_refused(&mut contract, anchor(17, 0x01), Refusal::AnchorOutOfOrder);
+    execute_one(&mut contract, 0x21, anchor(18, 0xC1));
+    assert_eq!(ink::env::contains_contract_storage(&9u32), None);
+    contract.check_invariants();
+}
+
+#[ink::test]
+fn t_026_10_the_root_keys_of_the_sequence_cells_are_fixed() {
+    use crate::settlement::{ANCHOR_EPOCH_KEY, GOVERNANCE_KEY};
+    assert_eq!(ANCHOR_EPOCH_KEY, 0x0000_000A);
+    assert_eq!(GOVERNANCE_KEY, 0x0000_000B);
+    let mut contract = setup();
+    name_governance(&mut contract);
+    assert_eq!(raw(&0x0Bu32), Some(governance().encode()));
+    execute_one(&mut contract, 1, anchor(1, 0xA1));
+    test::set_block_number::<Env>(7);
+    reset_head(&mut contract, 1, 0, 0xB0).expect("reset");
+    // AnchorEpoch { epoch: u32, base: u64, from_seq: u64, at: u32, book, previous: Some(52 B) }.
+    assert_eq!(
+        ink::env::contains_contract_storage(&0x0Au32),
+        Some(4 + 8 + 8 + 4 + 32 + 1 + 52)
+    );
+    let raw_record: RawEpoch = ink::env::get_contract_storage(&0x0Au32)
+        .expect("decodes")
+        .expect("stored");
+    assert_eq!(
+        raw_record,
+        (1, 0, 1, 7, [0xB0; 32], Some((1, [0xA1; 32], 1, 0)))
+    );
+}
+
+/// The prod instance runs the code of 2026-10-11 (`0xa43bfd98…`, T-026-09): the latest anchor in
+/// place, no legacy records, no governance and no sequence record. Written here by raw key and
+/// raw SCALE as that code stores it (17 anchors, all in the inbox, nothing pruned, a bound and a
+/// position besides), it reads unchanged under the new code, which needs no migration: the first
+/// message after `ContractsStore.upgrade` (the admin naming governance) writes the governance cell
+/// and nothing else, and governance can then reset the head.
+#[ink::test]
+fn t_026_10_the_deployed_layout_upgrades_with_nothing_to_migrate() {
+    let mut contract = setup();
+    for number in 1..=17u64 {
+        let seq = number - 1;
+        // InboxEntry { at: u32, event: Anchored (2) { operation_ref, number, commitment } }
+        ink::env::set_contract_storage(
+            &(4u32, seq),
+            &(
+                100 + number as u32,
+                2u8,
+                [0xAAu8; 32],
+                number,
+                [number as u8; 32],
+            ),
+        );
+    }
+    // Head { last_anchor, next_seq, pruned_to }
+    ink::env::set_contract_storage(&2u32, &(17u64, 17u64, 0u64));
+    // LatestAnchor { number, commitment, at: u32, seq }
+    ink::env::set_contract_storage(&8u32, &(17u64, [17u8; 32], 117u32, 16u64));
+    // positions[DUSD]: u128; bounds[DUSD]: WithdrawalWindow { { amount, period }, started, spent }
+    ink::env::set_contract_storage(&(5u32, DUSD), &25u128);
+    ink::env::set_contract_storage(&(6u32, DUSD), &((9u128, 10u32), 1u32, 0u128));
+    mock::mint(DUSD, me(), 25);
+
+    // It reads unchanged.
+    assert_eq!(
+        contract.head(),
+        Head {
+            last_anchor: 17,
+            next_seq: 17,
+            pruned_to: 0
+        }
+    );
+    assert_eq!(
+        contract.latest_anchor(),
+        Some(LatestAnchor {
+            number: 17,
+            commitment: [17; 32],
+            at: 117,
+            seq: 16
+        })
+    );
+    assert_eq!(contract.anchor_epoch(), None);
+    assert_eq!(contract.governance(), None);
+    assert_eq!(contract.position(DUSD), 25);
+    contract.check_invariants();
+    // A replay of the latest still answers at its position (the adapter's view is unchanged).
+    assert_eq!(
+        execute_one(&mut contract, 0x30, anchor(17, 17)),
+        Outcome::Applied { seq: 16 }
+    );
+
+    let cells = |c: &Settlement| {
+        (
+            raw(&1u32),
+            raw(&2u32),
+            raw(&8u32),
+            raw(&(5u32, DUSD)),
+            raw(&(6u32, DUSD)),
+            (0..c.head().next_seq + 1)
+                .map(|s| raw(&(4u32, s)))
+                .collect::<Vec<_>>(),
+        )
+    };
+    let before = cells(&contract);
+    name_governance(&mut contract);
+    assert_eq!(
+        cells(&contract),
+        before,
+        "the first message migrates nothing"
+    );
+    for key in [3u32, 9, 0x0A] {
+        assert_eq!(ink::env::contains_contract_storage(&key), None, "{key}");
+    }
+    assert_eq!(raw(&0x0Bu32), Some(governance().encode()));
+
+    // Governance resets, as p2 needs: its first checkpoint is 1.
+    let held = mock::balance(DUSD, me());
+    reset_head(&mut contract, 17, 0, 0xB2).expect("reset");
+    assert_eq!(
+        execute_one(&mut contract, 0x31, anchor(1, 0xC1)),
+        Outcome::Applied { seq: 17 }
+    );
+    assert_eq!(mock::balance(DUSD, me()), held);
+    assert_eq!(contract.position(DUSD), 25);
+    assert_eq!(raw(&(6u32, DUSD)), before.4);
+    assert_eq!(
+        contract
+            .anchor_epoch()
+            .and_then(|r| r.previous)
+            .map(|a| a.number),
+        Some(17)
+    );
+    contract.check_invariants();
+}

@@ -32,6 +32,14 @@
 //! - **An ordered inbox**: every movement, anchor, binding and refusal is one entry, numbered from
 //!   zero with no gaps, readable by position (`REQ-SL-9`).
 //! - **Keys and an admin.** The admin rotates keys, sets bounds and prunes the inbox.
+//! - **Governance, and anchor sequences** (amendment 0039, `[PENDING AMENDMENT 0039]`). A
+//!   deployment's governance (an account the admin names once, then only governance replaces:
+//!   on Kreivo, the licence-owning community's account, reached by a referendum) can start a new
+//!   anchor sequence for a re-founded book, as a relay chain's governance sets a parachain's head
+//!   ([`set_anchor_head`](settlement::Settlement::set_anchor_head)). It sets the next anchor
+//!   number and names the book; it moves no value and touches no position, bound, binding, key or
+//!   inbox entry, and the inbox's numbering runs on. The previous sequence's latest anchor stays in
+//!   current state; earlier ones stay where they were.
 //!
 //! Nothing is keyed by an account reference, an operation reference or anything a holder supplies
 //! (`REQ-SL-5`, `REQ-SL-10`). Storage is keyed by inbox sequence and asset only (and, until a
@@ -96,12 +104,24 @@ pub mod settlement {
         latest_anchor: Lazy<LatestAnchor, ManualKey<0x0000_0008>>,
         /// The legacy `anchors` map's removal, while it runs; absent before and after.
         anchor_migration: Lazy<AnchorMigration, ManualKey<0x0000_0009>>,
+        /// The anchor sequence governance started last; absent while the instance runs the
+        /// sequence it began with (amendment 0039). Absence is the earlier code's state, so a
+        /// deployment of it needs no migration.
+        anchor_epoch: Lazy<AnchorEpoch, ManualKey<0x0000_000A>>,
+        /// The deployment's governance: the only caller of `set_anchor_head`. Absent until the
+        /// admin names it; from then on only governance replaces it.
+        governance: Lazy<AccountId, ManualKey<0x0000_000B>>,
     }
 
     /// The root key of `latest_anchor`.
     pub(crate) const LATEST_ANCHOR_KEY: u32 = 0x0000_0008;
     /// The root key of `anchor_migration`.
     pub(crate) const ANCHOR_MIGRATION_KEY: u32 = 0x0000_0009;
+    /// The root key of `anchor_epoch`.
+    pub(crate) const ANCHOR_EPOCH_KEY: u32 = 0x0000_000A;
+    /// The root key of `governance` (read by the tests that pin the layout).
+    #[cfg(test)]
+    pub(crate) const GOVERNANCE_KEY: u32 = 0x0000_000B;
 
     /// The deployment registered: the contract was instantiated.
     #[ink(event)]
@@ -218,6 +238,33 @@ pub mod settlement {
     pub struct AnchorsMigrated {
         /// The last anchor when the migration started.
         pub through: AnchorNumber,
+    }
+
+    /// The deployment's governance was named or replaced.
+    #[ink(event)]
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct GovernanceSet {
+        /// The new governance.
+        pub governance: AccountId,
+    }
+
+    /// Governance started a new anchor sequence: the next anchor is `base + 1`, and inbox entries
+    /// from `from_seq` on belong to it. Nothing else changed. A verifier reads this event (or
+    /// `anchor_epoch()`) to tell one book's anchors from another's on the same instance.
+    #[ink(event)]
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct AnchorHeadSet {
+        /// The new sequence's number. Also the event's topic.
+        #[ink(topic)]
+        pub epoch: u32,
+        /// The number the new sequence starts after.
+        pub base: AnchorNumber,
+        /// The inbox position of the new sequence's first entry.
+        pub from_seq: InboxSeq,
+        /// The opaque name of the book the new sequence anchors.
+        pub book: Commitment,
+        /// The previous sequence's latest anchor, if it had one.
+        pub previous: Option<LatestAnchor>,
     }
 
     /// Movement, refusal and superseded anchor entries in `[from, to)` were pruned; `removed` of
@@ -486,6 +533,121 @@ pub mod settlement {
             Ok(removed)
         }
 
+        /// Name or replace the deployment's governance (amendment 0039). While none is set, the
+        /// admin names it; once set, only governance replaces it, and the admin can no longer
+        /// touch it. On Kreivo, governance is the licence-owning community's account, which a
+        /// passed referendum reaches through `Communities::dispatch_as_account` (the call then
+        /// runs signed by that account).
+        ///
+        /// *Trade-off, stated plainly.* Until the admin names governance, nobody can start an
+        /// anchor sequence; the admin could name itself, which is why naming the community's
+        /// account is one step of the deployment checklist, right after the upgrade or the
+        /// instantiation.
+        #[ink(message, selector = 0x0000_0400)]
+        pub fn set_governance(&mut self, governance: AccountId) -> Result<(), Error> {
+            let caller = self.env().caller();
+            match self.governance.get() {
+                Some(current) if current == caller => {}
+                Some(_) => return Err(Error::NotGovernance),
+                None => {
+                    self.ensure_admin()?;
+                }
+            }
+            self.migrate_anchors(&self.load_head());
+            self.governance.set(&governance);
+            self.env().emit_event(GovernanceSet { governance });
+            Ok(())
+        }
+
+        /// Start a new anchor sequence for a re-founded book: the next anchor is `base + 1`.
+        /// Governance only (amendment 0039; `OQ-68`).
+        ///
+        /// `expected_last` must be the head's `last_anchor` as it stands (`HeadMoved` otherwise),
+        /// so a reset decided days before it is enacted cannot land after an anchor it did not
+        /// know of. `book` is an opaque 32-byte name of the book the new sequence anchors (its
+        /// genesis or seed digest).
+        ///
+        /// It writes the head's `last_anchor` (to `base`), the sequence's record and nothing else
+        /// of the contract's state: no position, bound, binding, key, attestation key or
+        /// governance changes, no value moves, the inbox's `next_seq` and `pruned_to` stay, and no
+        /// inbox entry is written or rewritten. The previous sequence's latest anchor moves from
+        /// `latest_anchor` into the sequence's record (`previous`), so it stays in current state;
+        /// its inbox entry, which `prune_inbox` kept while it was the latest, is removed if a prune
+        /// has already passed it (nothing else would reach it), and is prunable otherwise. Earlier
+        /// anchors are where they were: in their entries until pruned, their events and the
+        /// layer's finalized history.
+        ///
+        /// Refused while the earlier code's anchor records are unmigrated (`MigrationPending`).
+        #[ink(message, selector = 0x0000_0401)]
+        pub fn set_anchor_head(
+            &mut self,
+            expected_last: AnchorNumber,
+            base: AnchorNumber,
+            book: Commitment,
+        ) -> Result<(), Error> {
+            if self.governance.get() != Some(self.env().caller()) {
+                return Err(Error::NotGovernance);
+            }
+            let mut head = self.load_head();
+            if head.last_anchor != expected_last {
+                return Err(Error::HeadMoved);
+            }
+            if base.checked_add(1).is_none() {
+                return Err(Error::InvalidAnchorBase);
+            }
+            let current = self.anchor_epoch.get();
+            if self.anchor_migration.get().is_some()
+                || (current.is_none()
+                    && head.last_anchor > 0
+                    && ink::env::contains_contract_storage(&LATEST_ANCHOR_KEY).is_none())
+            {
+                return Err(Error::MigrationPending);
+            }
+            let epoch = current
+                .map_or(0, |e| e.epoch)
+                .checked_add(1)
+                .ok_or(Error::EpochOverflow)?;
+            let previous = self.load_latest_anchor(&head);
+            if let Some(old) = previous {
+                if old.seq < head.pruned_to {
+                    self.inbox.remove(old.seq);
+                }
+            }
+            ink::env::clear_contract_storage(&LATEST_ANCHOR_KEY);
+            head.last_anchor = base;
+            self.head.set(&head);
+            let record = AnchorEpoch {
+                epoch,
+                base,
+                from_seq: head.next_seq,
+                at: self.env().block_number(),
+                book,
+                previous,
+            };
+            self.anchor_epoch.set(&record);
+            self.env().emit_event(AnchorHeadSet {
+                epoch,
+                base,
+                from_seq: record.from_seq,
+                book,
+                previous,
+            });
+            Ok(())
+        }
+
+        /// The anchor sequence governance started last, if any (amendment 0039). `None`: the
+        /// instance still runs the sequence it began with.
+        #[ink(message, selector = 0x0000_0308)]
+        pub fn anchor_epoch(&self) -> Option<AnchorEpoch> {
+            self.anchor_epoch.get()
+        }
+
+        /// The deployment's governance, if named.
+        #[ink(message, selector = 0x0000_0309)]
+        pub fn governance(&self) -> Option<AccountId> {
+            self.governance.get()
+        }
+
         /// The deployment's identity.
         #[ink(message, selector = 0x0000_0300)]
         pub fn registration(&self) -> Registration {
@@ -548,6 +710,8 @@ pub mod settlement {
                 bound: Mapping::new(),
                 latest_anchor: Lazy::new(),
                 anchor_migration: Lazy::new(),
+                anchor_epoch: Lazy::new(),
+                governance: Lazy::new(),
             }
         }
 
@@ -563,11 +727,20 @@ pub mod settlement {
 
         /// The latest anchor: its record in place, or, on a deployment of the earlier code that
         /// no message has migrated yet, the legacy record of `head.last_anchor`.
+        ///
+        /// In a sequence governance started (amendment 0039), only the record in place counts:
+        /// absent, the sequence has no anchor yet and `last_anchor` is its base, which names no
+        /// anchor of this sequence. The legacy records belong to the instance's first sequence.
         fn load_latest_anchor(&self, head: &Head) -> Option<LatestAnchor> {
             if head.last_anchor == 0 {
                 return None;
             }
-            self.latest_anchor.get().or_else(|| {
+            let latest = self.latest_anchor.get();
+            if latest.is_some() || ink::env::contains_contract_storage(&ANCHOR_EPOCH_KEY).is_some()
+            {
+                return latest;
+            }
+            latest.or_else(|| {
                 self.anchors.get(head.last_anchor).map(|r| LatestAnchor {
                     number: head.last_anchor,
                     commitment: r.commitment,
@@ -603,8 +776,12 @@ pub mod settlement {
             let mut migration = match self.anchor_migration.get() {
                 Some(migration) => migration,
                 None => {
+                    // Never in a sequence governance started: `set_anchor_head` refuses to start
+                    // one before the legacy records are gone, and a started sequence's
+                    // `last_anchor` may be a base with no record in place.
                     if head.last_anchor == 0
                         || ink::env::contains_contract_storage(&LATEST_ANCHOR_KEY).is_some()
+                        || ink::env::contains_contract_storage(&ANCHOR_EPOCH_KEY).is_some()
                     {
                         return;
                     }
@@ -942,9 +1119,12 @@ pub mod settlement {
             commitment: Commitment,
         ) -> Result<Option<InboxSeq>, Refusal> {
             if number != 0 && number == head.last_anchor {
-                let latest = self
-                    .load_latest_anchor(head)
-                    .unwrap_or_else(|| panic!("the latest anchor is stored"));
+                // No record: `last_anchor` is the base of a sequence governance started, which
+                // names no anchor of this sequence (amendment 0039). An anchor of an earlier
+                // sequence never replays into a later one.
+                let Some(latest) = self.load_latest_anchor(head) else {
+                    return Err(Refusal::AnchorOutOfOrder);
+                };
                 return if latest.commitment == commitment {
                     Ok(Some(latest.seq))
                 } else {
@@ -1426,7 +1606,10 @@ pub mod settlement {
                     }
                 }
             }
-            if head.last_anchor > 0 && migration.is_none() && latest.is_some() {
+            // In the instance's first sequence only: a later one starts only once the legacy
+            // records are gone (`set_anchor_head`), and its numbers say nothing about them.
+            let first_sequence = self.anchor_epoch.get().is_none();
+            if first_sequence && head.last_anchor > 0 && migration.is_none() && latest.is_some() {
                 // A fresh deployment, or a migrated one: no legacy record is left.
                 for number in 1..=head.last_anchor {
                     assert!(
@@ -1445,7 +1628,9 @@ pub mod settlement {
                 }
             }
             assert!(
-                self.anchors.get(head.last_anchor + 1).is_none(),
+                self.anchors
+                    .get(head.last_anchor.saturating_add(1))
+                    .is_none(),
                 "an anchor is stored past the last one"
             );
             for seq in head.pruned_to..head.next_seq {
@@ -1486,6 +1671,46 @@ pub mod settlement {
                 self.inbox.get(head.next_seq).is_none(),
                 "an entry past next_seq"
             );
+            // A sequence governance started (amendment 0039): it starts within the inbox, its
+            // anchors are numbered from its base and written from its first position, no legacy
+            // migration runs in it, and the previous sequence's latest is not the current one.
+            if let Some(e) = self.anchor_epoch.get() {
+                assert!(e.epoch > 0, "sequence 0 is never stored");
+                assert!(
+                    e.from_seq <= head.next_seq,
+                    "a sequence starts past the inbox"
+                );
+                assert!(
+                    e.base <= head.last_anchor,
+                    "an anchor below the sequence's base"
+                );
+                assert!(
+                    migration.is_none(),
+                    "a legacy migration in a later sequence"
+                );
+                match latest {
+                    None => assert_eq!(
+                        head.last_anchor, e.base,
+                        "anchors in the sequence but none in place"
+                    ),
+                    Some(latest) => {
+                        assert!(latest.number > e.base, "the latest is not of this sequence");
+                        assert!(latest.seq >= e.from_seq, "the latest predates its sequence");
+                    }
+                }
+                for seq in e.from_seq..head.next_seq {
+                    if let Some(InboxEntry {
+                        event: InboxEvent::Anchored { number, .. },
+                        ..
+                    }) = self.inbox.get(seq)
+                    {
+                        assert!(
+                            number > e.base,
+                            "anchor {number} at {seq} is below the base"
+                        );
+                    }
+                }
+            }
         }
     }
 }

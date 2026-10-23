@@ -186,6 +186,38 @@ pub struct AnchorMigration {
     pub end: AnchorNumber,
 }
 
+/// The anchor sequence the contract runs now, once governance has started one
+/// (`set_anchor_head`, amendment 0039 `[PENDING AMENDMENT 0039]`). Stored at
+/// `ManualKey<0x0000_000A>` and overwritten by each later start; **absent means sequence 0**, the
+/// one the instance began with (base 0, from inbox position 0, no book named), so a deployment of
+/// the earlier code needs nothing written to read it.
+///
+/// A start never moves value and never touches the inbox: the inbox's numbering runs on across
+/// sequences, so every coordinate `(instance, seq)` names one entry for good. What it changes is
+/// which anchor number comes next: `base + 1`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[ink::scale_derive(Encode, Decode, TypeInfo)]
+#[cfg_attr(feature = "std", derive(ink::storage::traits::StorageLayout))]
+pub struct AnchorEpoch {
+    /// The sequence's number: 1 for the first one governance starts, and one more for each later
+    /// one. Sequence 0 is never stored.
+    pub epoch: u32,
+    /// The number the sequence starts after: its first anchor is `base + 1`.
+    pub base: AnchorNumber,
+    /// The inbox position of the sequence's first entry: `next_seq` when it started. Every
+    /// entry from here on was written in this sequence; every entry below it, in an earlier one.
+    pub from_seq: InboxSeq,
+    /// The block at which it started.
+    pub at: BlockNumber,
+    /// An opaque 32-byte name of the book the sequence anchors (its genesis or seed digest), as
+    /// governance gave it. Never interpreted and never a storage key (`REQ-SL-5`); it carries no
+    /// personal data (`INV-17`).
+    pub book: Commitment,
+    /// The previous sequence's latest anchor, as it stood when this one started: kept in current
+    /// state, so that its last commitment stays readable without a history reader.
+    pub previous: Option<LatestAnchor>,
+}
+
 /// An anchor as the code before 2026-10-11 stored it, one per number (`anchors[n]`). **Legacy**:
 /// never written now; read only to seed [`LatestAnchor`] and removed by the migration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -594,4 +626,17 @@ pub enum Error {
     UnexpectedAmount,
     /// `execute_with_limits` was given a number of limits other than its number of calls.
     LimitsMismatch,
+    /// The caller is not the deployment's governance, or no governance is set
+    /// (`set_anchor_head`, `set_governance` once set).
+    NotGovernance,
+    /// The anchor head is not the one the caller expected: an anchor landed since the reset was
+    /// proposed. Nothing changed.
+    HeadMoved,
+    /// The base would leave no next anchor number (`u64::MAX`).
+    InvalidAnchorBase,
+    /// The earlier code's anchor records are not migrated yet: the admin's next message
+    /// (`set_keys`) migrates them first.
+    MigrationPending,
+    /// No further anchor sequence can be started.
+    EpochOverflow,
 }
