@@ -40,6 +40,16 @@ fn count<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error
     Ok(Some(s.parse::<u64>().unwrap_or(u64::MAX)))
 }
 
+/// A count as it is read: a string of digits (see [`count`]). The core stream carries the query as
+/// JSON, so a count must be written the way it is read, or the core cannot decode the request and
+/// drops the stream.
+fn count_out<S: serde::Serializer>(v: &Option<u64>, s: S) -> Result<S::Ok, S::Error> {
+    match v {
+        Some(n) => s.serialize_str(&n.to_string()),
+        None => s.serialize_none(),
+    }
+}
+
 /// Reads the balances of one subject, from one view. Name exactly one subject: `account` for one
 /// account, or `identity` for every account of that identity the caller reaches. Naming both, or
 /// neither, is refused as `ERR-QueryUnbounded`. `asset` narrows the answer to one asset; without it, a row
@@ -109,7 +119,8 @@ pub struct MovementsParams {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "count"
+        deserialize_with = "count",
+        serialize_with = "count_out"
     )]
     pub limit: Option<u64>,
     /// The previous page's `next`, passed back unchanged. It belongs to the request that made
