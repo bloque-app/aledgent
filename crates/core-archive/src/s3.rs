@@ -204,18 +204,28 @@ impl S3Store {
             return Ok(c.clone());
         }
         let fresh = match &self.source {
-            CredentialSource::Fixed(c) => c.clone(),
-            CredentialSource::File(path) => from_file(path)?,
+            CredentialSource::Fixed(c) => Ok(c.clone()),
+            CredentialSource::File(path) => from_file(path),
             CredentialSource::Default => match std::env::var_os(CREDENTIALS_FILE_ENV) {
-                Some(path) if !path.is_empty() => from_file(std::path::Path::new(&path))?,
+                Some(path) if !path.is_empty() => from_file(std::path::Path::new(&path)),
                 _ => match from_env() {
-                    Some(c) => c,
-                    None => from_imds(&self.agent)?,
+                    Some(c) => Ok(c),
+                    None => from_imds(&self.agent),
                 },
             },
         };
-        *cached = Some(fresh.clone());
-        Ok(fresh)
+        match fresh {
+            Ok(fresh) => {
+                *cached = Some(fresh.clone());
+                Ok(fresh)
+            }
+            // A source that fails while the credentials held are still valid (a credentials file
+            // caught mid-rewrite, a slow metadata service): keep using them until they expire.
+            Err(e) => match cached.as_ref() {
+                Some(c) if c.expires.is_some_and(|x| x > now) => Ok(c.clone()),
+                _ => Err(e),
+            },
+        }
     }
 
     fn key(&self, name: &str) -> String {
@@ -817,6 +827,20 @@ mod tests {
         // Fresh ones are cached: a later rewrite is not read until they near expiry.
         credentials_file("rotate", "AKIALATER", unix_now() + 3600);
         assert_eq!(s.credentials().unwrap().access_key, "AKIANEW");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// A credentials file caught mid-rewrite near expiry: the credentials held, still valid, are
+    /// used; once they have expired, the failure is the caller's.
+    #[test]
+    fn a_torn_credentials_file_keeps_the_valid_credentials_held() {
+        let path = credentials_file("torn", "AKIAHELD", unix_now() + 60);
+        let s = store(CredentialSource::File(path.clone()));
+        assert_eq!(s.credentials().unwrap().access_key, "AKIAHELD");
+        std::fs::write(&path, r#"{"AccessKeyId":"AKIAN"#).unwrap();
+        assert_eq!(s.credentials().unwrap().access_key, "AKIAHELD");
+        let expired = store(CredentialSource::File(path.clone()));
+        assert!(expired.credentials().is_err());
         std::fs::remove_file(path).unwrap();
     }
 
