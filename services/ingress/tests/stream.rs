@@ -1251,3 +1251,27 @@ async fn t_038_13_readiness_turns_on_drain() {
         .await;
     assert_eq!(s, StatusCode::OK);
 }
+
+/// A movements read rides the stream: the query is written as JSON for the core, and its `limit`
+/// must be written the way the core reads it (a string of digits), or the core cannot decode the
+/// request, drops the stream, and the read ends as `ERR-DecisionUnavailable` (found on prod, 2026-10-24).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_movements_read_rides_the_stream() {
+    let a = instance("ingress-a").await;
+    let h = host();
+    let dial = h.dial(vec![target(a.addr, "core")]);
+    let d = deployment(&h, &a, "ingress-a").await;
+    let alice = d.party("alice", 100).await;
+    let from = alice.account.clone().unwrap();
+    let path = format!("/v1/movements?account={from}&limit=10");
+    let (s, v) = d.call("GET", &path, Some(&alice.token), &[], None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(
+        v["movements"].as_array().is_some_and(|m| !m.is_empty()),
+        "alice's opening deposit is listed: {v}"
+    );
+    // The stream is still the one the read rode on: a second read goes through at once.
+    let (s, v) = d.call("GET", &path, Some(&alice.token), &[], None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    dial.abort();
+}
