@@ -757,7 +757,10 @@ jobs:
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
       # The pull request's refusals, from the builder's cache (the host is built): the tampered
-      # copy fails the manifest check, and a genesis named by tag fails before it.
+      # copy fails check-code, and a genesis named by tag fails before it. Where the flipped byte
+      # lands decides which check refuses it: inside one of the package's artifacts, decoding the
+      # package refuses it (`ArtifactMismatch`, since v0.3.0's layout); elsewhere, the manifest's
+      # digest does. Either is the refusal this test is for.
       - name: A tampered genesis, and one named by tag, fail the build
         if: github.event_name == 'pull_request' && steps.genesis.outputs.refused != 'true'
         env:
@@ -776,7 +779,7 @@ jobs:
             cat "$RUNNER_TEMP/tampered.log"
             echo "::error::a tampered genesis built"; exit 1
           fi
-          grep -E 'check-code: the package and runtime are not the genesis code [0-9a-f]{64} \(Digest\(Package\)\)' \
+          grep -E 'check-code: (the package and runtime are not the genesis code [0-9a-f]{64} \(Digest\(Package\)\)|actor package: PackageError\("Package\(ArtifactMismatch\)"\))' \
             "$RUNNER_TEMP/tampered.log" || { tail -100 "$RUNNER_TEMP/tampered.log"; exit 1; }
           by_tag="${TAMPERED%@*}:ci"
           if build "$by_tag" > "$RUNNER_TEMP/by-tag.log" 2>&1; then
