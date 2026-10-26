@@ -4,7 +4,7 @@
 //!
 //! A component asks for a key by **scheme** ([`crate::proto::Scheme`]) and gets a [`KeyHandle`], whatever
 //! holds the key: the memory of its own process ([`in_process`]), the signer service on its socket
-//! ([`sidecar`]), or an API provider such as Vault Transit ([`crate::transit`]). A handle answers the
+//! ([`sidecar`]), or an API provider such as Vault Transit (`crate::transit`, feature `transit`). A handle answers the
 //! calls the signer's wire protocol carries ([`crate::proto::Op`]), bytes in and bytes out, and has no
 //! way to be asked for its secret.
 //!

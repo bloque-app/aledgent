@@ -1,9 +1,8 @@
 // Copyright (c) 2026 Pagos Cube LLC
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Where Vault is and how a process logs in to it, as a configuration file names it: the signer's
-//! (`vault`, where it reads its KV keys) and a component's own (`transit`, where it signs through
-//! Vault Transit, `F-042`). Plain data and its checks; the client is `crate::vault_session`
-//! (feature `vault-session`).
+//! (`vault`, where it reads its KV keys) and a Vault Transit engine's (`F-042`). Plain data and its
+//! checks; the client is `crate::vault_session` (feature `vault-session`).
 
 use std::path::PathBuf;
 
@@ -72,36 +71,8 @@ impl VaultConfig {
     }
 }
 
-/// An Ed25519 key in Vault Transit, used in place by the component that signs (`F-042`): the
-/// alternative to a key behind the signer service. The key never leaves Vault (it is not
-/// exportable) and each signature is a call to Vault.
-///
-/// ```json
-/// {
-///   "vault": { "address": "https://vault.example.com",
-///              "auth": { "aws_iam": { "mount": "aws", "role": "feed-signer",
-///                                     "region": "us-east-1", "server_id": "vault.example.com" } } },
-///   "mount": "transit",
-///   "key": "lane-1",
-///   "version": 1
-/// }
-/// ```
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TransitConfig {
-    /// Vault, and the login.
-    pub vault: VaultConfig,
-    /// The Transit engine's mount (`transit`).
-    pub mount: String,
-    /// The key's name in that mount. It must be an `ed25519` key and not exportable.
-    pub key: String,
-    /// The key version to sign with and publish. Required, never zero, never "the latest": a new
-    /// version is a new public key, so a rotation is a decision, and it is made in this file.
-    #[serde(default)]
-    pub version: u32,
-}
-
-fn name_ok(s: &str, slash: bool) -> bool {
+#[cfg(any(test, feature = "transit"))]
+pub(crate) fn name_ok(s: &str, slash: bool) -> bool {
     !s.is_empty()
         && s.split('/').all(|seg| {
             !seg.is_empty()
@@ -114,86 +85,36 @@ fn name_ok(s: &str, slash: bool) -> bool {
         && (slash || !s.contains('/'))
 }
 
-impl TransitConfig {
-    /// Check the key's address, the pinned version and Vault's login.
-    pub fn check(&self, development: bool) -> Result<(), String> {
-        if !name_ok(&self.mount, true) {
-            return Err(format!(
-                "transit.mount {:?}: letters, digits, - _ . and / between names",
-                self.mount
-            ));
-        }
-        if !name_ok(&self.key, false) {
-            return Err(format!(
-                "transit.key {:?}: letters, digits, - _ and .",
-                self.key
-            ));
-        }
-        if self.version == 0 {
-            return Err(
-                "transit.version is required and not zero: pin the key version to sign with \
-                 (a new version is a new public key)"
-                    .into(),
-            );
-        }
-        self.vault.check(development)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn config() -> TransitConfig {
-        serde_json::from_value(serde_json::json!({
-            "vault": { "address": "https://vault.example",
-                       "auth": { "aws_iam": { "mount": "aws", "role": "r", "region": "us-east-1" } } },
-            "mount": "transit", "key": "lane-1", "version": 1
-        }))
-        .unwrap()
+    fn config() -> VaultConfig {
+        VaultConfig {
+            address: "https://vault.example".into(),
+            auth: VaultAuth::AwsIam {
+                mount: "aws".into(),
+                role: "r".into(),
+                region: Some("us-east-1".into()),
+                server_id: None,
+            },
+        }
     }
 
     #[test]
-    fn nfr_8_a_transit_key_names_a_pinned_version_and_a_safe_address() {
+    fn nfr_8_vault_needs_https_a_region_and_no_token_file_outside_development() {
         assert_eq!(config().check(false), Ok(()));
         let mut c = config();
-        c.version = 0;
-        assert!(c.check(false).unwrap_err().contains("pin the key version"));
-        // A missing version is zero.
-        let missing: TransitConfig = serde_json::from_value(serde_json::json!({
-            "vault": { "address": "https://v", "auth": { "token_file": { "path": "/t" } } },
-            "mount": "transit", "key": "k"
-        }))
-        .unwrap();
-        assert_eq!(missing.version, 0);
-        for (mount, key) in [
-            ("", "k"),
-            ("transit/../sys", "k"),
-            ("transit", "a/b"),
-            ("transit", "k?x"),
-            ("transit", ""),
-            ("/transit", "k"),
-        ] {
-            let mut c = config();
-            c.mount = mount.into();
-            c.key = key.into();
-            assert!(c.check(false).is_err(), "{mount:?} {key:?}");
-        }
-        let mut c = config();
-        c.mount = "team/transit".into();
-        assert_eq!(c.check(false), Ok(()));
-        // Vault's own rules apply: https, a region, a token file only in development.
-        let mut c = config();
-        c.vault.address = "http://vault.example".into();
+        c.address = "http://vault.example".into();
         assert!(c.check(false).unwrap_err().contains("https"));
         assert_eq!(c.check(true), Ok(()));
-        c.vault.auth = VaultAuth::TokenFile { path: "/t".into() };
-        assert!(c.check(false).is_err());
+        c.auth = VaultAuth::TokenFile { path: "/t".into() };
+        assert!(c.check(false).unwrap_err().contains("development only"));
         let mut c = config();
-        c.vault.auth = VaultAuth::AwsIam {
+        c.auth = VaultAuth::AwsIam {
             mount: "aws".into(),
             role: "r".into(),
-            region: None,
+            region: Some(" ".into()),
             server_id: None,
         };
         assert!(
@@ -201,5 +122,16 @@ mod tests {
                 .unwrap_err()
                 .contains("\"region\" is required")
         );
+    }
+
+    #[test]
+    fn a_mount_or_key_name_is_plain() {
+        for ok in ["transit", "team/transit", "a.b-c_d"] {
+            assert!(name_ok(ok, true), "{ok}");
+        }
+        for bad in ["", "transit/../sys", "/transit", "a?b", "a b", "a//b"] {
+            assert!(!name_ok(bad, true), "{bad:?}");
+        }
+        assert!(!name_ok("a/b", false));
     }
 }

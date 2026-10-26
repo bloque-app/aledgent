@@ -111,11 +111,13 @@ pub struct Registry {
 }
 
 impl Registry {
-    /// The built-in kinds this build has: the sidecar and in-process.
+    /// The built-in kinds this build has: the sidecar, in-process, and (feature `transit`) Vault Transit.
     pub fn builtin() -> Registry {
-        Registry {
-            kinds: vec![&SIDECAR, &IN_PROCESS],
-        }
+        #[allow(unused_mut)]
+        let mut kinds: Vec<&'static KindInfo> = vec![&SIDECAR, &IN_PROCESS];
+        #[cfg(feature = "transit")]
+        kinds.push(&crate::transit::VAULT_TRANSIT);
+        Registry { kinds }
     }
 
     /// With one more kind registered.
@@ -488,5 +490,74 @@ mod tests {
             .unwrap_err()
             .contains("keys.feed")
         );
+    }
+
+    #[cfg(feature = "transit")]
+    #[test]
+    fn nfr_8_transit_serves_the_feed_key_and_nothing_of_the_core_hosts() {
+        let r = Registry::builtin();
+        let transit = json!({ "vault_transit": {
+            "vault": { "address": "https://vault.example",
+                       "auth": { "aws_iam": { "mount": "aws", "role": "r", "region": "us-east-1" } } },
+            "mount": "transit" } });
+        let (e, k) = maps(
+            json!({ "vault": transit }),
+            json!({
+                "feed": { "engine": "vault", "key": { "name": "lane-1", "version": 1 } },
+                "key_ring": { "engine": "vault", "key": { "name": "lane-1", "version": 1 } },
+                "agent_authority": { "engine": "vault", "key": { "name": "lane-1", "version": 1 } },
+            }),
+        );
+        let s = Section {
+            engines: &e,
+            keys: &k,
+        };
+        assert_eq!(check(&r, &s, &[ED], false), Ok(()));
+        // Transit lacks the key ring's scheme, and the core host's Ed25519 keys may not use it.
+        let err = check(&r, &s, &CORE[..1], false).unwrap_err();
+        assert!(
+            err.contains("keys.key_ring") && err.contains("does not offer"),
+            "{err}"
+        );
+        let err = check(&r, &s, &CORE[1..], false).unwrap_err();
+        assert!(
+            err.contains("keys.agent_authority")
+                && err.contains("kind api_provider")
+                && err.contains("may use: sidecar"),
+            "{err}"
+        );
+        // A version is required.
+        let (e2, k2) = maps(
+            json!({ "vault": transit }),
+            json!({ "feed": { "engine": "vault", "key": { "name": "lane-1" } } }),
+        );
+        let err = check(
+            &r,
+            &Section {
+                engines: &e2,
+                keys: &k2,
+            },
+            &[ED],
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("pin the key version"), "{err}");
+        // Outside development a Vault is https and logs in with AWS IAM.
+        let (e3, _) = maps(
+            json!({ "vault": { "vault_transit": { "vault": { "address": "http://v",
+                "auth": { "token_file": { "path": "/t" } } }, "mount": "transit" } } }),
+            json!({}),
+        );
+        let err = check(
+            &r,
+            &Section {
+                engines: &e3,
+                keys: &k2,
+            },
+            &[ED],
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("development only"), "{err}");
     }
 }

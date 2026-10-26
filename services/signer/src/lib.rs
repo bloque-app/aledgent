@@ -57,3 +57,6 @@ pub mod vault_config;
 
 #[cfg(feature = "vault-session")]
 pub mod vault_session;
+
+#[cfg(feature = "transit")]
+pub mod transit;

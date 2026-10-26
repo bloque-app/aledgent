@@ -29,6 +29,10 @@ vault-session = ["dep:tokio", "dep:tracing", "dep:aws-config", "dep:aws-credenti
 # under AWS IAM auth, signed with the instance's or task's role. Without it, a `vault` key source
 # fails the start.
 vault = ["server", "vault-session"]
+# The Vault Transit engine (F-042): an Ed25519 key that never leaves Vault, which the component that
+# signs with it uses in place, beside the sidecar. A component that links it holds a Vault role, so the
+# core host's build does not enable it.
+transit = ["vault-session"]
 # AWS KMS, opt-in per key, for secp256k1 lane and anchor keys only. Without it, a `kms` key source
 # fails the start.
 kms = ["server", "dep:aws-config", "dep:aws-sdk-kms"]
@@ -62,7 +66,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 base64 = { version = "0.22", optional = true }
 
 [dev-dependencies]
-signer = { path = ".", features = ["testing"] }
+signer = { path = ".", features = ["testing", "transit"] }
 tempfile = "3"
 sha2 = "0.10"
 # tests/key_absent.rs: the book over the core Agent, its keys in the signer's process.
