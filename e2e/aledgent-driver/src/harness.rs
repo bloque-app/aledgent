@@ -302,6 +302,8 @@ impl Harness {
             // The suite's PostgreSQL has no TLS.
             profile: ingress::config::Profile::Development,
             adapter,
+            engines: Default::default(),
+            keys: Default::default(),
             connection: Connection::LightClient,
             chain_spec: Some("/cfg/kreivo.json".into()),
             relay_chain_spec: Some("/cfg/relay.json".into()),

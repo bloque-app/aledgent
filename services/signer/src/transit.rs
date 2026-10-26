@@ -186,7 +186,14 @@ pub fn parse_key_info(body: &str) -> Result<TransitKeyInfo, VaultError> {
         .as_bool()
         .ok_or_else(|| malformed("the key: no exportable flag"))?;
     let mut public_keys = BTreeMap::new();
-    for (k, entry) in d["keys"].as_object().into_iter().flatten() {
+    // Only an Ed25519 key's public halves are read: another type's are in other encodings (an ECDSA
+    // key's is a PEM text), and such a key is refused for its type before anything else.
+    let versions = if key_type == "ed25519" {
+        d["keys"].as_object()
+    } else {
+        None
+    };
+    for (k, entry) in versions.into_iter().flatten() {
         let (Ok(version), Some(b64)) = (k.parse::<u32>(), entry["public_key"].as_str()) else {
             continue;
         };
@@ -661,6 +668,11 @@ mod tests {
         assert_eq!((k.latest_version, k.min_encryption_version), (2, 1));
         assert_eq!(k.public_keys.keys().copied().collect::<Vec<_>>(), [1, 2]);
         assert!(parse_key_info("{}").is_err());
+        let pem = serde_json::json!({ "data": { "type": "ecdsa-p256", "exportable": false,
+            "keys": { "1": { "public_key": "-----BEGIN PUBLIC KEY-----\nMFk\n-----END PUBLIC KEY-----\n" } } }});
+        let k = parse_key_info(&pem.to_string()).unwrap();
+        assert_eq!(k.key_type, "ecdsa-p256");
+        assert!(k.public_keys.is_empty());
         let sym = serde_json::json!({ "data": { "type": "aes256-gcm96", "exportable": false,
                                                  "keys": { "1": 1700000000 } }});
         assert!(
