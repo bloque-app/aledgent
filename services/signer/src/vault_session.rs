@@ -214,6 +214,10 @@ pub struct Policy {
     pub renew_retry: Duration,
     /// How often a Transit key checks Vault and keeps the token fresh while idle. Zero: never.
     pub heartbeat: Duration,
+    /// How long Vault must go on not answering before the process reports itself not ready
+    /// ([`Readiness`]). One failed request, or a blip of a few seconds, must not take every replica
+    /// out of a load balancer at once. Zero: at the first failure.
+    pub unready_after: Duration,
 }
 
 impl Default for Policy {
@@ -226,6 +230,7 @@ impl Default for Policy {
             relogin_cooldown: Duration::from_secs(1),
             renew_retry: Duration::from_secs(5),
             heartbeat: Duration::from_secs(15),
+            unready_after: Duration::from_secs(30),
         }
     }
 }
@@ -269,7 +274,10 @@ pub struct Metrics {
     pub logins: AtomicU64,
     /// Logins made because Vault refused the token (403).
     pub relogins_after_refusal: AtomicU64,
-    unreachable: AtomicBool,
+    unready_after: Duration,
+    /// When Vault first stopped answering and when it last failed to, while it has not answered since.
+    failing: Mutex<Option<(Instant, Instant)>>,
+    flagged: AtomicBool,
     key_drifted: AtomicBool,
     consecutive_failures: AtomicU64,
     last_answer: Mutex<Option<Instant>>,
@@ -277,6 +285,14 @@ pub struct Metrics {
 
 impl Default for Metrics {
     fn default() -> Metrics {
+        Metrics::new(Policy::default().unready_after)
+    }
+}
+
+impl Metrics {
+    /// Metrics that report not ready once Vault has gone `unready_after` without answering
+    /// ([`Policy::unready_after`]). Every failure is counted whatever the window.
+    pub fn new(unready_after: Duration) -> Metrics {
         Metrics {
             buckets: Default::default(),
             sum_us: AtomicU64::new(0),
@@ -285,15 +301,15 @@ impl Default for Metrics {
             signs: AtomicU64::new(0),
             logins: AtomicU64::new(0),
             relogins_after_refusal: AtomicU64::new(0),
-            unreachable: AtomicBool::new(false),
+            unready_after,
+            failing: Mutex::new(None),
+            flagged: AtomicBool::new(false),
             key_drifted: AtomicBool::new(false),
             consecutive_failures: AtomicU64::new(0),
             last_answer: Mutex::new(None),
         }
     }
-}
 
-impl Metrics {
     /// One signature request took `elapsed` (retries and logins included) and ended in `failure`
     /// or not.
     pub fn observe(&self, elapsed: Duration, failure: Option<Reason>) {
@@ -332,16 +348,43 @@ impl Metrics {
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
         self.consecutive_failures.store(0, Ordering::Relaxed);
-        if self.unreachable.swap(false, Ordering::Relaxed) {
+        *self.failing.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        if self.flagged.swap(false, Ordering::Relaxed) {
             tracing::info!("vault is reachable again");
         }
     }
 
-    /// Vault did not answer. Logs the way to unreachable, once.
+    /// Vault did not answer. This counts the failure; readiness changes only when failures have
+    /// gone on for [`Policy::unready_after`] (and still go on), and that is logged once.
     pub fn vault_silent(&self, why: &str) {
         self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
-        if !self.unreachable.swap(true, Ordering::Relaxed) {
-            tracing::warn!(why, "vault is unreachable: not ready");
+        let now = Instant::now();
+        {
+            let mut f = self.failing.lock().unwrap_or_else(PoisonError::into_inner);
+            let first = f.map_or(now, |(first, _)| first);
+            *f = Some((first, now));
+        }
+        if self.sustained() && !self.flagged.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                why,
+                after_ms = u64::try_from(self.unready_after.as_millis()).unwrap_or(u64::MAX),
+                "vault has not answered for the window: not ready"
+            );
+        } else {
+            tracing::debug!(why, "vault did not answer");
+        }
+    }
+
+    /// Whether Vault has been failing for the whole window and failed within it: a failure from long
+    /// ago that nothing has repeated says nothing now.
+    fn sustained(&self) -> bool {
+        let f = *self.failing.lock().unwrap_or_else(PoisonError::into_inner);
+        match f {
+            None => false,
+            Some(_) if self.unready_after.is_zero() => true,
+            Some((first, last)) => {
+                first.elapsed() >= self.unready_after && last.elapsed() < self.unready_after
+            }
         }
     }
 
@@ -356,7 +399,7 @@ impl Metrics {
 
     /// Whether this process is ready (see [`Readiness`]).
     pub fn readiness(&self) -> Readiness {
-        let down = self.unreachable.load(Ordering::Relaxed);
+        let down = self.sustained();
         Readiness {
             ready: !down && !self.key_drifted.load(Ordering::Relaxed),
             vault_unreachable: down,
@@ -501,6 +544,7 @@ impl VaultSession {
 
     /// With another [`Policy`].
     pub fn with_policy(mut self, policy: Policy) -> VaultSession {
+        self.metrics = Arc::new(Metrics::new(policy.unready_after));
         self.policy = policy;
         self
     }
@@ -920,9 +964,39 @@ mod tests {
         assert!(text.contains("signer_vault_ready 1"), "{text}");
     }
 
+    /// One failed request, or a blip, does not take a replica out of its load balancer: not ready only
+    /// after Vault has not answered for the whole window, and every failure counts all the same.
+    #[test]
+    fn readiness_waits_for_the_window_and_every_failure_still_counts() {
+        let m = Metrics::new(Duration::from_millis(80));
+        for _ in 0..3 {
+            m.vault_silent("connection refused");
+        }
+        let r = m.readiness();
+        assert!(
+            r.ready && !r.vault_unreachable && r.consecutive_failures == 3,
+            "{r:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        // Failed long ago and not since: it says nothing now.
+        assert!(m.readiness().ready);
+        // Failing since the window began, and still: not ready.
+        m.vault_silent("connection refused");
+        let r = m.readiness();
+        assert!(
+            !r.ready && r.vault_unreachable && r.consecutive_failures == 4,
+            "{r:?}"
+        );
+        m.vault_answered();
+        assert!(m.readiness().ready);
+        // An answer in between starts the window again.
+        m.vault_silent("timeout");
+        assert!(m.readiness().ready);
+    }
+
     #[test]
     fn readiness_follows_whether_vault_answers() {
-        let m = Metrics::default();
+        let m = Metrics::new(Duration::ZERO);
         assert!(m.readiness().ready);
         m.vault_silent("connection refused");
         m.vault_silent("connection refused");

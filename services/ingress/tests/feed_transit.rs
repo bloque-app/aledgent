@@ -105,6 +105,8 @@ fn deployment(address: &str, token_file: &std::path::Path) -> DeploymentConfig {
     v["engines"] = serde_json::json!({ "vault": { "vault_transit": {
         "vault": { "address": address, "auth": { "token_file": { "path": token_file } } },
         "mount": "transit",
+        // Not ready after a second of Vault not answering (30 s by default).
+        "unready_after_ms": 1000,
     }}});
     v["keys"] = serde_json::json!({
         "feed": { "engine": "vault", "key": { "name": "ingress-feed", "version": 1 } },
@@ -154,8 +156,21 @@ async fn nfr_8_a_feed_key_in_transit_signs_for_the_core_host_and_reports_vault()
             .unwrap()
     };
     assert!(failed.unwrap_err().contains("unavailable"));
+    // One failed request does not take ingress out of the load balancer; the failures are counted.
+    assert!(signer.ready(), "one failed request");
+    assert!(signer.metrics_text().contains("reason=\"unavailable\"} 1"));
+    // Vault going on not answering for the window does.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let failed = {
+        let signer = Arc::clone(&signer);
+        tokio::task::spawn_blocking(move || signer.sign(&msg))
+            .await
+            .unwrap()
+    };
+    assert!(failed.is_err());
     assert!(!signer.ready());
     assert!(signer.metrics_text().contains("signer_vault_ready 0"));
+    assert!(signer.metrics_text().contains("reason=\"unavailable\"} 2"));
     // And back: the same key signs again, and ingress is ready.
     v.down.store(false, Ordering::SeqCst);
     let again = {

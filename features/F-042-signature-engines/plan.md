@@ -13,7 +13,7 @@ SPDX-License-Identifier: CC-BY-4.0
 | Depends on | `F-035` (the key boundary and its Vault login), `F-038` (ingress's feed key) |
 | Unblocks | The settlement adapter's Ed25519 keys in Transit, in the feature that moves it to native accounts; AWS KMS and other providers as engines, without touching a component |
 | Realises | `NFR-8`, `REQ-SA-8`, `REQ-AR-3`, `REQ-AU-8`, `REQ-RT-6` |
-| Status | **Design, revised after the design review of 2026-10-25** (rulings on D1 to D7 recorded at the end; D6 changed). No `SPEC.md` change: `NFR-8` is unchanged, and a key that never leaves Vault meets it more strictly than a key read into a process. It is an amendment to the plan (`F-035`'s sentence on where keys rest, and this feature's row) |
+| Status | **Built** (the pull request that carries this file), from the design as ruled on 2026-10-25 (rulings on D1 to D7 recorded at the end; D6 changed; S1 ruled after the code review). No `SPEC.md` change: `NFR-8` is unchanged, and a key that never leaves Vault meets it more strictly than a key read into a process. It is an amendment to the plan (`F-035`'s sentence on where keys rest, and this feature's row) |
 
 ## Goal
 
@@ -82,19 +82,19 @@ key.
 | | `agent_authority` | `ed25519` | sidecar | The core host cannot reach Vault or AWS credentials (the node's metadata service is locked to it), so Transit is not reachable from it; and `NFR-8` bars key material in the book's process, so in-process is out |
 | | `agent_package` | `ed25519` | sidecar | The same |
 | Ingress | `feed` | `ed25519` | sidecar, Transit, in-process | The feed key signs what ingress forwards; ingress holds no book |
-| Settlement adapter | its lane and anchor keys | `secp256k1` | sidecar (see S1 below) | Unchanged from today; nothing else offers the scheme yet |
+| Settlement adapter | its lane and anchor keys | `secp256k1` | sidecar (S1, ruled) | Unchanged from today; nothing else offers the scheme yet |
 
 The **cargo features stay as defence in depth** (the core host's build has no Transit engine and no Vault
 client), but they are not the rule. The root workspace builds `ingress`, `ops` and `signer` in one command, so
 their features unify, and `opsctl`, which reads `core_keys`, gets whatever ingress enables. The rule is the
 check.
 
-**S1, for the owner (does not block).** `NFR-8` says settlement-layer key material is held "in a boundary
-that is separate from the book and can be audited separately". An in-process lane or anchor key in the
-adapter has no audit apart from the adapter's. The table gives the adapter's keys the sidecar only, which is
-today's behaviour and the stricter reading. If the owner rules that ruling D6 covers them, the table gains
-"in-process" for those keys and nothing else changes. The signer service's own `file` key source stays
-development only; this feature does not touch it.
+**S1, ruled.** `NFR-8` says settlement-layer key material is held "in a boundary that is separate from the
+book and can be audited separately", and an in-process lane or anchor key in the adapter has no audit apart
+from the adapter's. So in `F-042` the adapter's keys use the sidecar only, which is today's behaviour. Vault
+Transit opens for them in the feature that moves the adapter to native accounts (Ed25519 keys, which Transit
+offers), not here; the table then gains "Transit" for those keys and nothing else changes. The signer
+service's own `file` key source stays development only; this feature does not touch it.
 
 ## The interface
 
@@ -339,9 +339,13 @@ in `services/`):
   `version_mismatch`, `bad_signature`, `malformed`;
 - signatures, logins, logins after a refusal, and `vault_ready` (1 or 0).
 
-**Readiness** is the engine's `health()`: not ready while Vault does not answer (the last request or
-heartbeat was a network error, a timeout or a 5xx), or while the key is not what was pinned; ready again as
-soon as Vault answers. A component that serves readiness reports it: ingress's `/ready` is 503 and its
+**Readiness** is the engine's `health()`: not ready once Vault has gone on not answering (network errors,
+timeouts, 5xx) for longer than a window, **30 seconds by default** (`unready_after_ms` in the engine's
+configuration; zero means the first failure), and is still failing, or while the key is not what was pinned;
+ready again as soon as Vault answers. **One failed request, or a blip, does not make a replica not ready**: a
+Vault blip would otherwise drop every replica from the load balancer at once. The failure metrics count every
+failure whatever the window, and the heartbeat (15 s) keeps probing while idle, so a real outage is seen
+within the window plus a beat. A component that serves readiness reports it: ingress's `/ready` is 503 and its
 `/metrics` carries the engine's text. The signer service gets **no new listener**: it serves no HTTP, and a
 listener on the key boundary is an attack surface this feature does not need.
 
@@ -503,7 +507,7 @@ directly), and it is not in the first steps. The signer's configuration (`keys[]
 | **D5** | Does the old configuration keep working? | **Yes**, read as a sidecar engine |
 | **D6** | In-process keys in a component? | **Changed by the ruling:** a supported engine kind, not development only, for every component but the core host; the key comes from a file and never from the environment. `NFR-8` still applies, so the config check refuses an in-process key in the core host and any in-process key whose material would come from the environment. Today's environment reads are listed as known gaps, each with a follow-up |
 | **D7** | Does the signer host Transit keys over its socket? | **Not now** |
-| **D8** | (From the review.) Beyond schemes, which engine kinds may each key use? | Each component declares it, and the check enforces it. The core host's four keys: the sidecar only. Ingress's feed key: sidecar, Transit or in-process. The adapter's keys: the sidecar (S1 open for the owner) |
+| **D8** | (From the review.) Beyond schemes, which engine kinds may each key use? | Each component declares it, and the check enforces it. The core host's four keys: the sidecar only. Ingress's feed key: sidecar, Transit or in-process. The adapter's keys: the sidecar (S1 ruled: Transit opens for them in the native-accounts feature) |
 | **D9** | (From the review.) Does one file serve several components? | Yes. Each component checks only the keys it declares; other entries stay unparsed JSON |
 
 ## Out of scope

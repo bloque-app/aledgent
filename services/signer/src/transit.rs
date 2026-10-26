@@ -30,6 +30,11 @@
 //!   or floor has changed, makes the engine not ready. Signatures are still verified, so none that is
 //!   wrong gets out.
 //!
+//! **Readiness** ([`Engine::health`]) is not ready once Vault has gone [`Policy::unready_after`] (30 s,
+//! `unready_after_ms` in the engine's configuration) without answering and is still failing, or when the
+//! key is no longer what was pinned. One failed request, or a blip, does not take a replica out of a load
+//! balancer; every failure is counted in the metrics all the same.
+//!
 //! **Failure ends a request, not the process.** The error is a [`ClientError`]: Vault not answering is
 //! `Refused(Unavailable)`, which is transient; a refusal that remains after one new login is
 //! `Refused(NotGranted)`; a wrong or unreadable answer is `Protocol`. What a caller does next is its own
@@ -80,6 +85,12 @@ pub struct TransitConfig {
     pub vault: VaultConfig,
     /// The Transit engine's mount (`transit`).
     pub mount: String,
+    /// How long, in milliseconds, Vault must go on not answering before the process reports itself
+    /// not ready (default 30 000). One failed request, or a blip, must not take every replica out of
+    /// a load balancer at once; every failure is counted in the metrics whatever this is. Zero: at the
+    /// first failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unready_after_ms: Option<u64>,
 }
 
 impl TransitConfig {
@@ -140,7 +151,11 @@ pub static VAULT_TRANSIT: KindInfo = KindInfo {
     connect: |c, development| {
         let config = TransitConfig::deserialize(c).map_err(|e| e.to_string())?;
         config.check(development)?;
-        let session = VaultSession::new(&config.vault)?;
+        let mut policy = Policy::default();
+        if let Some(ms) = config.unready_after_ms {
+            policy.unready_after = Duration::from_millis(ms);
+        }
+        let session = VaultSession::new(&config.vault)?.with_policy(policy);
         TransitEngine::with_session(session, &config.mount).map(|e| Arc::new(e) as Arc<dyn Engine>)
     },
 };

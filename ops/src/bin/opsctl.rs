@@ -422,8 +422,9 @@ fn founding(
         }
         genesis.spec = Some(std::sync::Arc::new(spec));
     }
+    // The key ring and the clerk key, as before F-042: the Agent's keys are not this command's.
     let keys = match config
-        .core_key_handles()
+        .host_key_handles()
         .map_err(|e| Error::Config(e.to_string()))?
     {
         Some(h) => {

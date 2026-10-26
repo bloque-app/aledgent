@@ -220,6 +220,8 @@ fn fast() -> Policy {
         relogin_cooldown: Duration::ZERO,
         renew_retry: Duration::from_millis(50),
         heartbeat: Duration::ZERO,
+        // Not ready at the first failure, so these tests see it at once; the window has its own test.
+        unready_after: Duration::ZERO,
     }
 }
 
@@ -579,4 +581,38 @@ async fn nfr_8_a_key_that_changes_under_the_pin_makes_the_engine_not_ready() {
     }
     assert!(!ready, "the heartbeat did not notice");
     assert!(try_sign(&k, b"x").await.is_ok());
+}
+
+/// One failed request, or a blip, does not make the engine not ready (every replica would leave its load
+/// balancer at once); Vault failing for the whole window does, and every failure is counted either way.
+#[tokio::test(flavor = "multi_thread")]
+async fn nfr_8_one_failed_request_does_not_make_the_engine_not_ready() {
+    let (m, at) = mock().await;
+    let policy = Policy {
+        unready_after: Duration::from_millis(400),
+        ..fast()
+    };
+    let k = connect(&at, 1, policy).await.unwrap();
+    m.set(|k| k.sign = SignMode::Status(503));
+    // A whole request failed (three attempts): still ready, and counted.
+    assert!(try_sign(&k, b"x").await.is_err());
+    assert!(k.ready(), "one failed request");
+    assert_eq!(k.metrics().failures(Reason::Unavailable), 1);
+    assert!(k.metrics().readiness().consecutive_failures >= 3);
+    // A blip that ends: ready throughout, and the next request succeeds.
+    m.set(|k| k.sign = SignMode::Good);
+    assert!(try_sign(&k, b"x").await.is_ok());
+    assert!(k.ready());
+    // Failing for the whole window, and still: not ready, with every failure counted.
+    m.set(|k| k.sign = SignMode::Status(503));
+    assert!(try_sign(&k, b"x").await.is_err());
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    assert!(try_sign(&k, b"x").await.is_err());
+    assert!(!k.ready(), "failing for longer than the window");
+    assert_eq!(k.metrics().failures(Reason::Unavailable), 3);
+    assert!(k.engine.metrics_text().contains("signer_vault_ready 0"));
+    // Vault answers again: ready at once.
+    m.set(|k| k.sign = SignMode::Good);
+    assert!(try_sign(&k, b"x").await.is_ok());
+    assert!(k.ready());
 }

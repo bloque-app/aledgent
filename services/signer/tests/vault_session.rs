@@ -97,6 +97,8 @@ fn fast() -> Policy {
         relogin_cooldown: Duration::ZERO,
         renew_retry: Duration::from_millis(50),
         heartbeat: Duration::ZERO,
+        // Not ready at the first failure, so these tests see it at once; the window has its own test.
+        unready_after: Duration::ZERO,
     }
 }
 

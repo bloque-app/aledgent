@@ -488,6 +488,15 @@ pub const CORE_AGENT_PACKAGE: signer::engine::config::KeyNeed = signer::engine::
     kinds: SIDECAR_ONLY,
 };
 
+/// The key ring and the clerk key, open: what a process that opens the book without running the Agent
+/// needs (`opsctl restore-core`). The Agent's keys are not among them.
+pub struct HostKeyHandles {
+    /// The key ring.
+    pub key_ring: std::sync::Arc<dyn signer::engine::KeyHandle>,
+    /// The clerk key, if disclosures are issued.
+    pub clerk: Option<std::sync::Arc<dyn signer::engine::KeyHandle>>,
+}
+
 /// The core's keys, open (`F-042`): where they are is the deployment's `core_keys` (the signer
 /// service) or its `keys`, each on an engine.
 pub struct CoreKeyHandles {
@@ -979,6 +988,17 @@ impl DeploymentConfig {
         needs
     }
 
+    /// The keys a process that opens the book without running the Agent needs: the key ring, and the
+    /// clerk key when the file gives one. A deployment whose grants for that process are narrower than
+    /// the core host's (no Agent keys) must keep working.
+    pub fn host_needs(&self) -> Vec<signer::engine::config::KeyNeed<'static>> {
+        let mut needs = vec![CORE_KEY_RING];
+        if self.keys.contains_key(CORE_CLERK.name) {
+            needs.push(CORE_CLERK);
+        }
+        needs
+    }
+
     /// Whether the file gives the core's keys in the engines' form.
     fn core_keys_in_keys(&self) -> bool {
         self.keys.contains_key(CORE_KEY_RING.name)
@@ -1052,6 +1072,52 @@ impl DeploymentConfig {
             clerk: opened.handle(CORE_CLERK.name),
             agent_authority: get(CORE_AGENT_AUTHORITY.name)?,
             agent_package: get(CORE_AGENT_PACKAGE.name)?,
+        }))
+    }
+
+    /// The key ring and the clerk key only, open (`opsctl restore-core`): the same two keys it opened
+    /// before `F-042` and no others, whichever form the file is in. `None` when the file gives neither
+    /// form. In the form written before `F-042` it opens the key ring and, if named, the clerk, and
+    /// does not touch `agent_authority` or `agent_package`; in the engines' form only the keys of
+    /// [`DeploymentConfig::host_needs`] are checked and opened.
+    pub fn host_key_handles(&self) -> Result<Option<HostKeyHandles>, String> {
+        use signer::proto::Scheme;
+        if self.core_keys.is_some() && self.core_keys_in_keys() {
+            return Err("core_keys and keys.key_ring: one of them".into());
+        }
+        if let Some(k) = &self.core_keys {
+            let engine = signer::engine::sidecar::SidecarEngine::connect(&k.signer)
+                .map_err(|e| e.to_string())?;
+            let open = |id: &str, scheme: Scheme, what: &str| {
+                engine
+                    .handle(id, scheme)
+                    .map(|h| h as std::sync::Arc<dyn signer::engine::KeyHandle>)
+                    .map_err(|e| format!("core_keys.{what}: {e}"))
+            };
+            let clerk = match &k.clerk {
+                Some(id) => Some(open(id, Scheme::Clerk, "clerk")?),
+                None => None,
+            };
+            return Ok(Some(HostKeyHandles {
+                key_ring: open(&k.key_ring, Scheme::KeyRing, "key_ring")?,
+                clerk,
+            }));
+        }
+        if !self.core_keys_in_keys() {
+            return Ok(None);
+        }
+        let needs = self.host_needs();
+        let opened = signer::engine::config::open(
+            &signer::engine::config::Registry::builtin(),
+            &self.engine_section(),
+            &needs,
+            self.profile == Profile::Development,
+        )?;
+        Ok(Some(HostKeyHandles {
+            key_ring: opened
+                .handle(CORE_KEY_RING.name)
+                .ok_or("keys.key_ring: not opened")?,
+            clerk: opened.handle(CORE_CLERK.name),
         }))
     }
 
@@ -1527,6 +1593,60 @@ mod tests {
         // The form written before F-042, alone, still checks.
         assert_eq!(deployment(template()).check_core_keys(), Ok(()));
         assert!(deployment(template()).core_keys.is_some());
+    }
+
+    /// `F-042`: `opsctl restore-core` opens the key ring and the clerk key and no other. The keys it
+    /// needs are pinned here, and a file that gives it no Agent keys (narrower grants than the core
+    /// host's) still serves it, in the engines' form.
+    #[test]
+    fn f_042_opsctl_needs_the_key_ring_and_the_clerk_key_and_no_others() {
+        let sidecar = serde_json::json!({ "sidecar": {
+            "socket": "/run/aledgent-signer/signer.sock", "client": "ops", "token_file": "/t" } });
+        let file = |with_clerk: bool, with_agent_keys: bool| {
+            let mut v = template();
+            v.as_object_mut().unwrap().remove("core_keys");
+            v["engines"] = serde_json::json!({ "local": sidecar });
+            let mut keys = serde_json::Map::new();
+            let entry = |id: &str| serde_json::json!({ "engine": "local", "key": { "id": id } });
+            keys.insert("key_ring".into(), entry("keyring"));
+            if with_clerk {
+                keys.insert("clerk".into(), entry("clerk"));
+            }
+            if with_agent_keys {
+                keys.insert("agent_authority".into(), entry("agent-authority"));
+                keys.insert("agent_package".into(), entry("agent-package"));
+            }
+            v["keys"] = serde_json::Value::Object(keys);
+            deployment(v)
+        };
+        let names =
+            |c: &DeploymentConfig| c.host_needs().iter().map(|n| n.name).collect::<Vec<_>>();
+        assert_eq!(names(&file(false, true)), ["key_ring"]);
+        assert_eq!(names(&file(true, true)), ["key_ring", "clerk"]);
+        // The core host's four are a different, larger set.
+        let core = file(true, true).core_needs();
+        assert_eq!(
+            core.iter().map(|n| n.name).collect::<Vec<_>>(),
+            ["key_ring", "agent_authority", "agent_package", "clerk"]
+        );
+        // The checks of the two sets agree on a file with all four, and the narrow one passes where the
+        // core host's refuses: grants without the Agent keys.
+        let narrow = file(true, false);
+        assert!(
+            narrow
+                .check_core_keys()
+                .unwrap_err()
+                .contains("agent_authority: not given")
+        );
+        assert_eq!(
+            signer::engine::config::check(
+                &signer::engine::config::Registry::builtin(),
+                &narrow.engine_section(),
+                &narrow.host_needs(),
+                false,
+            ),
+            Ok(())
+        );
     }
 
     /// `T-038-14` (`REQ-AU-8`, `NFR-7`): a stream section missing what its transport needs, a
