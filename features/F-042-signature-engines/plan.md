@@ -416,10 +416,12 @@ registers it under a name (`"vault_transit"`, `"aws_kms"`) in the table the comp
 from. The component's code does not change, because it only knows schemes and `KeyHandle`; its configuration
 changes by naming the new engine's kind. What keeps that true:
 
-- **Engines are looked up by kind name from a registry**, not named in component code. The built-ins register
-  themselves behind cargo features (`in_process`, `sidecar`, `vault_transit`), so a build that lacks one
-  refuses a file that names it (the core host's build has no Transit engine, as today it has no Vault
-  client).
+- **Engines are looked up by kind name from a registry** (`engine::config::Registry`), not named in
+  component code. The sidecar and in-process kinds are always there; Vault Transit is behind the cargo
+  feature `transit`, so a build that lacks it refuses a file whose own keys name it (the core host's build
+  has no Transit engine, as today it has no Vault client; the root workspace's builds do, because their
+  features unify, which is why the check is the rule and the build only a second line). A compiled-in kind
+  is added with `Registry::with`.
 - **The trait is bytes in, bytes out** (`Op`, a public key in a documented encoding, text errors). Nothing in
   it is a Rust type that could not cross a process boundary.
 - **The sidecar protocol is already a plugin protocol.** A program that speaks the signer's socket protocol

@@ -748,11 +748,13 @@ mod tests {
                 && e.contains("may use: sidecar"),
             "{e}"
         );
-        // Transit: this build has none (the adapter holds no Vault credential).
+        // Transit: the adapter's own build has none (it holds no Vault credential), and in a build
+        // that does (the workspace's, where features unify) Transit does not offer the scheme.
         c.engines = engines(serde_json::json!({ "vault_transit": {} }));
         let e = c.check_key_sources().unwrap_err();
         assert!(
-            e.contains("vault_transit") && e.contains("does not have"),
+            e.contains("vault_transit")
+                && (e.contains("does not have") || e.contains("does not offer")),
             "{e}"
         );
         // The two forms.

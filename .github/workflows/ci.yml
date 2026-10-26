@@ -224,9 +224,9 @@ jobs:
             echo "::error::a release build accepted test-vault-auth"; exit 1; }
           echo "$out" | grep -q 'cannot be built without debug assertions' || {
             echo "$out" | tail -n 20; echo "::error::the release build failed for another reason"; exit 1; }
-          n=$(cargo tree --workspace -e normal,build,features | grep -c 'test-vault-auth' || true)
+          n=$(cargo tree --workspace -e normal,build,features -i signer | grep -c 'test-vault-auth' || true)
           [ "$n" = 0 ] || { echo "::error::the workspace's own feature graph enables test-vault-auth"; exit 1; }
-          m=$(cargo tree --workspace -e normal,build,features -F signer/test-vault-auth | grep -c 'test-vault-auth' || true)
+          m=$(cargo tree -p signer -F test-vault-auth -e normal,build,features -i signer | grep -c 'test-vault-auth' || true)
           [ "$m" != 0 ] || { echo "::error::the feature-graph check does not see test-vault-auth: it cannot bite"; exit 1; }
           echo "test-vault-auth: refused in a release, absent from the shipped feature graph"
 
