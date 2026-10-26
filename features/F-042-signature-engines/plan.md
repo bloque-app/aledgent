@@ -178,7 +178,7 @@ The wrappers stay, with their names, their constructors and their behaviour, and
 | `RemoteCustody` (`Custody`) | The same, scheme `key_ring`. It still caches the public answers |
 | `RemoteSecp256k1`, used by the adapter's `signer.rs` | The same, scheme `secp256k1`, with its recovery check |
 | `SignerClient` | Becomes the sidecar engine's connection. Its public API stays |
-| The signer's KMS backend (`Backend::Secp256k1Kms`, `Kms`, `AwsKms`) | Unchanged in the signer. Wrapped later as the KMS engine, so that a component can use it without the sidecar; the signer's own use of it is not touched |
+| The signer's KMS backend (`Backend::Secp256k1Kms`, `Kms`, `AwsKms`) | Unchanged in the signer. Wrapped later as the KMS engine, so that a component can use it without the sidecar; the signer's own use of it is not touched. One thing to align then: the backend reports a signature that does not recover to the key as `Unavailable`, which is transient, where an engine reports it as `Protocol` (not worth waiting for) |
 | The signer's own `Key` (`Key::answer(&Op)`, which is async) | The in-process engine reuses `Key::from_secret`'s in-memory backends on a synchronous path. Hosting any engine's handles inside the signer is later, and needs `spawn_blocking` around a blocking handle (see "What the signer service becomes") |
 
 The first pull request changes where these types get their key from and nothing about what they do; every
