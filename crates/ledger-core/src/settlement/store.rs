@@ -20,7 +20,9 @@
 //!   2026-09-24): the one transaction signed for it, or the adapter's word that it never will
 //!   sign one. **Its nonce fact is decided once** and never changes.
 //! - **The finalised head never goes back.**
-//! - **Gaps and incidents are appended, never removed.**
+//! - **Gaps and incidents are appended, never removed.** A re-scan's difference (`Missing`,
+//!   `Unknown`) is one incident however many re-scans find it: the store indexes the ones
+//!   recorded by key, so a re-scan that finds nothing new reads that index, never the incidents.
 //! - **The latest attestation of each location** replaces the last (`DEC-20`).
 //! - **One binding of an asset in flight at a time**, and a binding's outcome is decided once: a
 //!   pending binding becomes bound or refused, and never changes after (`REQ-AS-8`).
@@ -213,6 +215,7 @@ pub(crate) enum SettlementUndo {
     Head(Option<FinalisedHead>),
     PopGap,
     PopIncident,
+    PopRescanned((u8, Coordinate)),
     Status(Option<AdapterStatus>),
     Attested(AssetLocation, Option<Attested>),
     AssetBind(AssetId, Option<AssetBind>),
@@ -262,6 +265,30 @@ pub struct SettlementStore {
     /// cursor. A settling posting of one of them made later is added to the tally as it is
     /// written (`crate::state::State`). Derived, never exported.
     counted: Leaves<OperationId, (), { kind::POSITION_COUNTED }>,
+    /// The re-scan differences recorded in `incidents`, by [`rescan_key`]: how a re-scan that
+    /// finds a difference again knows it is recorded without reading every incident (`REQ-IN-5`;
+    /// finding F18's class: before, each re-scan appended its differences again, and the one
+    /// leaf holding every incident grew with every re-scan until the Agent's heap ran out).
+    /// Derived, never exported.
+    rescanned: Leaves<(u8, Coordinate), (), { kind::RESCAN_RECORDED }>,
+}
+
+/// The key of a re-scan difference in the index of those recorded, on instance `instance`;
+/// `None` for an incident of another kind. A `Missing` record is keyed by the coordinate the
+/// layer holds, an `Unknown` one by the coordinate aledgent holds.
+pub(crate) fn rescan_key(instance: u32, i: &Incident) -> Option<(u8, Coordinate)> {
+    match i {
+        Incident::Missing { seq, digest } => Some((
+            0,
+            Coordinate {
+                instance,
+                seq: *seq,
+                digest: *digest,
+            },
+        )),
+        Incident::Unknown { coordinate } => Some((1, *coordinate)),
+        _ => None,
+    }
 }
 
 /// Take `c` out of `op`'s set in an index of coordinates by operation, and the set once empty.
@@ -346,6 +373,10 @@ impl SettlementStore {
             }
             SettlementUndo::PopIncident => {
                 self.incidents.get_mut().pop();
+            }
+            SettlementUndo::PopRescanned(k) => {
+                self.incidents.get_mut().pop();
+                self.rescanned.remove(&k);
             }
             SettlementUndo::Status(s) => {
                 self.status.set(s);
@@ -568,8 +599,24 @@ impl SettlementStore {
                 Ok(SettlementUndo::PopGap)
             }
             SettlementWrite::Incident(i) => {
+                let key = self
+                    .config
+                    .get()
+                    .as_ref()
+                    .and_then(|c| rescan_key(c.instance, i));
+                if let Some(k) = key
+                    && self.rescanned.contains_key(&k)
+                {
+                    return Err(SettlementRefusal::Duplicate);
+                }
                 self.incidents.get_mut().push(*i);
-                Ok(SettlementUndo::PopIncident)
+                Ok(match key {
+                    Some(k) => {
+                        self.rescanned.insert(k, ());
+                        SettlementUndo::PopRescanned(k)
+                    }
+                    None => SettlementUndo::PopIncident,
+                })
             }
             SettlementWrite::Status(s) => {
                 let before = self.status.set(Some(*s));
@@ -725,9 +772,10 @@ impl SettlementStore {
         self.awaiting.keys_unrecorded()
     }
 
-    /// Derive the index by reference, by position and the operations the tally counts again
-    /// after an import: every binding's reference, every ingested record's position, and every
-    /// operation with a final deposit or withdrawal record below the tally's cursor.
+    /// Derive the index by reference, by position, the operations the tally counts and the
+    /// re-scan differences recorded again after an import: every binding's reference, every
+    /// ingested record's position, every operation with a final deposit or withdrawal record
+    /// below the tally's cursor, and every `Missing` and `Unknown` incident.
     pub(crate) fn rebuild_indexes(&mut self) {
         let binds: Vec<AssetBind> = self.binds.values().copied().collect();
         for b in binds {
@@ -741,6 +789,17 @@ impl SettlementStore {
         }
         for op in self.counted_below(self.tally.get().0) {
             self.counted.insert(op, ());
+        }
+        if let Some(instance) = self.config().map(|c| c.instance) {
+            let keys: Vec<(u8, Coordinate)> = self
+                .incidents
+                .get()
+                .iter()
+                .filter_map(|i| rescan_key(instance, i))
+                .collect();
+            for k in keys {
+                self.rescanned.insert(k, ());
+            }
         }
     }
 
@@ -904,6 +963,12 @@ impl SettlementStore {
         self.incidents.get()
     }
 
+    /// Whether the re-scan difference `i` on instance `instance` is recorded already: a read by
+    /// key, never of the incidents whole. `false` for an incident of another kind.
+    pub fn rescan_recorded(&self, instance: u32, i: &Incident) -> bool {
+        rescan_key(instance, i).is_some_and(|k| self.rescanned.contains_key(&k))
+    }
+
     /// The unassociated bucket: ingested records that relate to no operation, anchors (and
     /// refused anchor calls, `F-027`) aside. It reads every record: for queries only.
     pub fn unassociated(&self) -> impl Iterator<Item = &Ingested> {
@@ -956,6 +1021,7 @@ impl LeafHost for SettlementStore {
         out.push(&self.at_position);
         out.push(&self.tally);
         out.push(&self.counted);
+        out.push(&self.rescanned);
     }
     fn leaf_maps_mut<'a>(&'a mut self, out: &mut Vec<&'a mut dyn LeafMap>) {
         out.push(&mut self.config);
@@ -979,6 +1045,7 @@ impl LeafHost for SettlementStore {
         out.push(&mut self.at_position);
         out.push(&mut self.tally);
         out.push(&mut self.counted);
+        out.push(&mut self.rescanned);
     }
 }
 

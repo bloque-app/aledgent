@@ -33,6 +33,7 @@ impl SettlementStore {
             at_position: _,
             tally,
             counted: _,
+            rescanned: _,
         } = self;
         alloc::vec![
             canon::to_bytes(config),
@@ -107,6 +108,7 @@ impl SettlementStore {
             at_position: Default::default(),
             tally: canon::from_bytes(tally)?,
             counted: Default::default(),
+            rescanned: Default::default(),
         })
     }
 }
