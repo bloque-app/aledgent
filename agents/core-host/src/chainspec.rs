@@ -213,11 +213,8 @@ fn deployment(args: &[String]) -> Result<(Founding, crate::driver::AgentKeys), S
     let config: ingress::config::DeploymentConfig =
         serde_json::from_str(&text).map_err(|e| format!("{path}: {e}"))?;
     crate::serve::refuse_keys_in_environment()?;
-    let core_keys = config
-        .core_keys
-        .as_ref()
-        .ok_or_else(|| format!("{path}: core_keys is required (F-035): the signer service"))?;
-    let (host_keys, keys) = crate::serve::signer_keys(core_keys)?;
+    let (host_keys, keys) =
+        crate::serve::signer_keys(&config).map_err(|e| format!("{path}: {e}"))?;
     let (genesis, op, at) = config.genesis.agent_genesis()?;
     let mut founding = Founding {
         genesis,
