@@ -1,0 +1,398 @@
+<!--
+Copyright (c) 2026 Pagos Cube LLC
+SPDX-License-Identifier: CC-BY-4.0
+-->
+
+# F-042 — Signature engines (Vault Transit first)
+
+| | |
+|---|---|
+| Milestone | M-3 — Production V0 (a stronger form of the `M-3` exit's "no key material in the book's process", for the keys that can use it; nothing in it is on `M-3`'s critical path) |
+| Track | B |
+| Home | `services/signer` (the engine seam, beside `client`), `services/ingress`, `services/settle`, `agents/core-host`, `ops` (their key configuration, one step at a time), `deploy/templates`, `ops/runbooks/release/key-rotation.md`, `.github/workflows/ci.yml` |
+| Depends on | `F-035` (the key boundary and its Vault login), `F-038` (ingress's feed key) |
+| Unblocks | The settlement adapter's Ed25519 keys in Transit, in the feature that moves it to native accounts; AWS KMS and other providers as engines, without touching a component |
+| Realises | `NFR-8`, `REQ-SA-8`, `REQ-AR-3`, `REQ-AU-8`, `REQ-RT-6` |
+| Status | **Design, for review, 2026-10-25. No code is in this pull request.** No `SPEC.md` change: `NFR-8` is unchanged, and a key that never leaves Vault meets it more strictly than a key read into a process. It is an amendment to the plan (`F-035`'s sentence on where keys rest, and this feature's row) |
+
+## Goal
+
+Every key a component signs with is reached through one common interface, a **signature engine**, and a
+component's configuration says, key by key, which engine holds the key. The engines that exist at first:
+
+- **in-process**: the key is in the memory of the process that uses it. For development and tests;
+- **sidecar**: today's `aledgent-signer`, on its Unix socket;
+- **Vault Transit**: an API provider. The key rests in Vault, never leaves it, and each signature is a call to Vault.
+
+Later engines (AWS KMS used directly, an HSM, an operating system keystore) are added without changing a
+component. The reason to do it now: the first ask was "put ingress's feed key in Transit". Doing that as one
+more special case beside the signer would be the third key path in the tree (the signer's client, KMS inside
+the signer, Transit), each with its own configuration and its own checks. One interface makes the third path
+the same as the first two.
+
+## The kinds of engine
+
+| Kind | Where the key is | Built first? | Production? |
+|---|---|---|---|
+| **In-process** | In the memory of the process that signs, from a file, or from Vault KV read at start | Yes (it is the code behind the signer's own keys and the development key files) | **In a component: development and tests only** (`NFR-8`, guardrail 13). Inside the signer service it is what the signer is, and it is allowed |
+| **Sidecar** | In another process on the same host: the signer service | Yes (today's `SignerClient` and its typed wrappers) | Yes. The default |
+| **API provider** | In a service the component calls over the network: Vault Transit first; later AWS KMS, an HSM's API, others | Vault Transit only | Yes, for the schemes the provider has |
+| **In-system** | In the operating system's keystore, or a local agent | No | Supported by the seam, **not recommended**: another process of the same user can often ask it to sign, and it has no audit of its own. Not built; it needs a reason and an owner's ruling |
+
+## What an engine offers: schemes
+
+A scheme is a kind of key and the question it answers. The four that exist (`signer::proto::Scheme`) and the
+call each answers (`signer::proto::Op`):
+
+| Scheme | The call it answers | Answer |
+|---|---|---|
+| `key_ring` | A kernel key request (registrar key, account key, signatures, blindings) | An encoded answer |
+| `clerk` | `sign(bytes)`: CipherClerk's Schnorr signature over Ristretto | 64 bytes |
+| `ed25519` | `sign(bytes)`: pure Ed25519 over the bytes | 64 bytes |
+| `secp256k1` | `sign_digest(32 bytes)`: a recoverable ECDSA signature, `s` low | 65 bytes: `r ‖ s ‖ v` |
+
+Every key also answers `public`. **Which engine offers which scheme** (an engine says so; a component never
+guesses):
+
+| Engine | `key_ring` | `clerk` | `ed25519` | `secp256k1` |
+|---|---|---|---|---|
+| In-process | yes | yes | yes | yes |
+| Sidecar | yes | yes | yes | yes, for the keys the signer holds |
+| Vault Transit | no | no | yes | no |
+| AWS KMS (later) | no | no | only if the provider has it | yes: KMS signs a digest, and the engine makes `s` low and finds the recovery id, as the signer's KMS backend does today |
+
+A **key ring** is not a signature at all but the core's key derivation, which is why only an engine that
+holds a root secret in memory can offer it: the sidecar and in-process. A **clerk** signature is a scheme of
+the CipherClerk library that no provider implements. So the core host, which needs both, qualifies for the
+sidecar and in-process only, and needs no special case: its configuration asks for `key_ring` and `clerk`,
+and the check refuses an engine that does not offer them. The core host also keeps away from Vault and AWS
+credentials, as it does today; this follows from the engines it can pick, and from the build (below).
+
+## The interface
+
+Two traits, small on purpose, because the same traits are what a later engine has to implement and what a
+plugin would be held to (see "The seam for more engines").
+
+```rust
+/// One way of holding keys and signing with them.
+pub trait Engine: Send + Sync {
+    /// Its kind: in-process, in-system, sidecar, api provider.
+    fn kind(&self) -> EngineKind;
+    /// The schemes it can answer at all.
+    fn schemes(&self) -> &'static [Scheme];
+    /// Check an entry's key locator without touching the network (config check).
+    fn check_locator(&self, scheme: Scheme, locator: &serde_json::Value) -> Result<(), String>;
+    /// Find the key and check it now: that it exists, is of this scheme, and cannot leave. A
+    /// component that needs a key does not start without it.
+    fn open(&self, scheme: Scheme, locator: &serde_json::Value) -> Result<Arc<dyn KeyHandle>, ClientError>;
+    /// Whether the engine can sign now, with no I/O. Ready unless said otherwise.
+    fn health(&self) -> Health { Health::ready() }
+    /// The engine's own metrics, as Prometheus text. None unless said otherwise.
+    fn metrics_text(&self) -> String { String::new() }
+}
+
+/// One open key. There is no way to ask it for its secret.
+pub trait KeyHandle: Send + Sync {
+    fn scheme(&self) -> Scheme;
+    /// The public half, in the scheme's encoding (32 bytes for Ed25519, 33 for secp256k1, ...).
+    fn public(&self) -> Vec<u8>;
+    /// The same call the signer's wire protocol carries: bytes in, bytes out.
+    fn call(&self, op: &Op) -> Result<Vec<u8>, ClientError>;
+}
+```
+
+The decisions in it, and the reason for each (D1 to D5 in "Decisions for the reviewer"):
+
+- **Blocking, not async.** Every caller is blocking today: `Custody::answer`, `ClerkSigner::sign`,
+  `FeedSigner::sign`, the adapter's signer, the core host's Agent thread. The sidecar's client is blocking
+  I/O on a Unix socket. An engine that is async inside (Transit, KMS) keeps a thread of its own with a small
+  runtime and the caller waits on it, so a caller on an async runtime's blocking pool, or off any runtime,
+  signs the same way. The cost is a thread per API engine, not per request.
+- **One call, the existing `Op`.** `call(&Op)` is what the signer's wire protocol already carries
+  (`Public`, `KeyRing`, `Sign`, `SignDigest`), bytes in and bytes out. It keeps the trait four
+  operations wide however many schemes there are, and it means an engine can sit on the far side of a
+  process boundary without a second description of its calls (the plugin seam relies on this). The typed
+  wrappers below give callers the typed methods they have today.
+- **The error is `ClientError`, as now.** It already has `is_transient()`, which is what `Patience` uses to
+  decide between waiting and stopping. An engine maps its failures: a provider that does not answer (network,
+  timeout, 5xx, a lease running out) is `Refused(Unavailable)`, and so transient; a signature that does not
+  verify, a version that is not the pinned one, a key that became exportable are `Protocol`, and not. No new
+  error type, and no caller changes how it handles one.
+- **No secret crosses it.** `KeyHandle` has no export, no `Debug` that shows more than the identifier, and
+  every engine verifies what a provider returns against the public key it read, before it hands it on.
+- **`health` and `metrics_text` are optional** and cost nothing to an engine that has nothing to say. A
+  component that serves `/ready` and `/metrics` (ingress does) asks each engine it uses.
+
+### Typed wrappers: how today's callers move without changing
+
+The wrappers stay, with their names, their constructors and their behaviour, and sit on `KeyHandle`:
+
+| Today | After |
+|---|---|
+| `RemoteEd25519::new(client, id, patience)`, `public()`, `try_sign()`, `sign()` | Holds an `Arc<dyn KeyHandle>` of scheme `ed25519` and a `Patience`. The old constructor builds the handle from the sidecar engine; a new `RemoteEd25519::from_key(handle, patience)` takes any. Same signature check against the public key. The core host's `AgentSigner` impl and ingress's `FeedSigner` impl are untouched |
+| `RemoteClerk` (`ClerkSigner`) | The same, scheme `clerk` |
+| `RemoteCustody` (`Custody`) | The same, scheme `key_ring`. It still caches the public answers |
+| `RemoteSecp256k1`, used by the adapter's `signer.rs` | The same, scheme `secp256k1`, with its recovery check |
+| `SignerClient` | Becomes the sidecar engine's connection. Its public API stays |
+| The signer's KMS backend (`Backend::Secp256k1Kms`, `Kms`, `AwsKms`) | Unchanged in the signer. Wrapped later as the KMS engine, so that a component can use it without the sidecar; the signer's own use of it is not touched |
+| The signer's own `Key` (`Key::answer(&Op)`) | Already has the shape of `KeyHandle`. It implements it, so that the signer can host any engine's key (see "What the signer service becomes") |
+
+The first pull request changes where these types get their key from and nothing about what they do; every
+existing test of them (`services/signer/tests`, the adapter's `signer_service`, the core host's) passes
+unchanged, which is the proof.
+
+## How a component says which engine holds which key
+
+A component **declares what it needs** in code: a name and a scheme for each key.
+
+| Component | Keys it needs | Schemes |
+|---|---|---|
+| Core host (and `opsctl` restore and drill) | `key_ring`, `clerk` (optional), `agent_authority`, `agent_package` | `key_ring`, `clerk`, `ed25519`, `ed25519` |
+| Ingress | `feed` (when it forwards to a core in another process) | `ed25519` |
+| Settlement adapter | its lane and anchor keys | `secp256k1` now; `ed25519` after its move to native accounts |
+
+Its configuration then has two parts, written once per file: the **engines** it uses, with their connection
+details, and the **keys**, each naming an engine and the engine's own locator for the key.
+
+```json
+{
+  "engines": {
+    "local-signer": { "sidecar": { "socket": "/run/aledgent-signer/signer.sock",
+                                   "client": "ingress", "token_file": "/etc/aledgent/ingress-signer.token" } },
+    "vault":        { "vault_transit": { "vault": { "address": "https://vault.example.com",
+                                          "auth": { "aws_iam": { "mount": "aws", "role": "feed-signer",
+                                                                 "region": "us-east-1", "server_id": "vault.example.com" } } },
+                                         "mount": "transit" } }
+  },
+  "keys": {
+    "feed": { "engine": "vault", "key": { "name": "lane-1", "version": 1 } }
+  }
+}
+```
+
+The same key on the sidecar would be `"feed": { "engine": "local-signer", "key": { "id": "ingress-feed" } }`.
+
+**The config check** (offline, at load, so a bad file does not start) refuses:
+
+1. a key the component needs and the file does not give, or one it does not need;
+2. an engine name that is not declared, or declared with a kind this build does not have;
+3. **a key whose scheme the chosen engine does not offer**: `keys.clerk: the engine "vault" (vault_transit)
+   offers ed25519 only; clerk needs the sidecar or in-process`;
+4. a locator the engine rejects (`Engine::check_locator`): for Transit, a missing or zero `version`, a
+   mount or key name with `..` or `?`; for a sidecar, an empty id;
+5. the rules of the kind: an in-process engine in a component outside the development profile; a Vault
+   address that is not `https://`, or a Vault token in a file, outside development; a missing STS `region`.
+
+**The start** (online) calls `open` for every key, so a key that is absent, of another type, or exportable
+stops the process before it serves.
+
+**The configuration written today keeps working.** `core_keys.signer` with `key_ring`, `clerk`, `agent_*`
+and `stream.feed_key.signer` with `key` are read as a sidecar engine with those keys, for as long as a
+release says, so nobody has to rewrite a file to upgrade. A file that gives both the old and the new form is
+refused. Each component moves to the new form in its own step (see the tasks).
+
+## Vault Transit as an engine
+
+Scheme: `ed25519` only. This is what the prototype already proved on mock servers, to be re-landed on the
+interface above.
+
+- **The locator is `name` and `version`; the engine is the mount and the Vault.** The version is required and
+  never zero: there is no "latest". A new version is a new public key, and a rotation is a decision made in
+  the configuration. A file with no version, or version zero, does not load.
+- **At open**, with the version pinned: read `<mount>/keys/<name>`; the type is `ed25519`; the key is **not
+  exportable**; version `<version>` exists; take its public key. Any other type, an exportable key, or a
+  missing version refuses the start with the reason in words.
+- **To sign**: `POST <mount>/sign/<name>` with `{"input": base64(payload), "key_version": <version>}`, and no
+  `prehashed` and no `hash_algorithm`, so Vault signs the bytes as they are, pure Ed25519. The answer is
+  `vault:v<N>:<base64>`: the engine checks that `N` is the pinned version and **verifies the signature
+  against the public key it read, before it returns it**. A Vault, or anything between, that gives a wrong
+  signature or a wrong version is caught.
+- **While idle**, a heartbeat keeps the token fresh and reads the key again. A key that became exportable, or
+  whose pinned version's public key changed, makes the engine not ready. Signatures are still verified, so
+  none that is wrong gets out.
+- **The payload, the signature and the token are never logged** at `info` or above, nor put in an error.
+- **Failure ends the request, not the process.** On 5xx, 429 or a timeout: bounded retries with a doubling
+  backoff (three attempts of at most two seconds, from 100 ms), and the whole signature is bounded at eight
+  seconds, inside the ten seconds the signer client allows. Then that one request fails with a clear error.
+  The next request tries again. Ed25519 is deterministic, so a repeat is safe.
+
+### The token's life (the Vault session)
+
+The Vault roles issue short tokens (60 s, 120 s at most). A session object, shared by every user of Vault in
+the crate, does this:
+
+- **The AWS IAM login is written once.** The code that signs the STS request and logs in today
+  (`signer/src/vault.rs`) moves into a module the signer's KV reads and the Transit engine both use. The
+  signer's KV reads move onto the session; their tests are the proof that nothing changed.
+- It keeps the token with its lease and logs in again at about **two thirds of the lease**, before sending a
+  request that finds the token past that, and in the heartbeat while idle. If the renewal fails and the
+  token still has life, the token is used and the renewal tried again soon.
+- When Vault refuses the token (403: `permission denied` or `invalid token`), the request logs in and tries
+  **once more**; a second 403 is the answer. A token issued less than a second ago is not replaced because
+  Vault refused it: a policy that denies a request is not a reason to log in on every request.
+- **One login at a time.** Requests that meet an expired token together wait for the login in flight and
+  share its token. A login that failed is not tried again for a second by the requests queued behind it.
+
+### Metrics and readiness
+
+Integers only, on atomics, in the style of the signer's counters and of ingress's metrics (no floating point
+in `services/`):
+
+- the latency of each signature as a **histogram in microseconds**, retries and logins included;
+- **failures by reason**: `unreachable`, `timeout`, `unavailable`, `denied`, `login`, `rejected`,
+  `version_mismatch`, `bad_signature`, `malformed`;
+- signatures, logins, logins after a refusal, and `vault_ready` (1 or 0).
+
+**Readiness** is the engine's `health()`: not ready while Vault does not answer (the last request or
+heartbeat was a network error, a timeout or a 5xx), or while the key is not what was pinned; ready again as
+soon as Vault answers. A component that serves readiness reports it: ingress's `/ready` is 503 and its
+`/metrics` carries the engine's text. The signer service gets **no new listener**: it serves no HTTP, and a
+listener on the key boundary is an attack surface this feature does not need.
+
+### Keeping the test-only login out of a release
+
+The end-to-end test logs in to a dev-mode Vault, where the AWS login cannot run, through a constructor on the
+session (`with_test_login`) that exists only under the cargo feature `test-vault-auth`. Three guards, and CI
+proves each on every change:
+
+1. **The crate does not compile with the feature unless debug assertions are on** (`compile_error!`), so no
+   release profile builds it. CI: a release `cargo check` with the feature must fail with that message.
+2. **No configuration can name it.** It is a constructor, not a login method in the file's vocabulary: a
+   binary built with it, which only a debug build can be, still takes its login from the file alone.
+3. **Nothing enables it but a command line.** The feature is in no `default`, no dependency's feature list
+   and no dev-dependency. CI: the workspace's feature graph without dev-dependencies must not contain it, and
+   the same query must find it when asked for it (so the check can fail).
+
+The honest limit: a release profile with `debug-assertions = true` defeats (1), and a source change defeats
+anything. The gate is against an accident, not against someone with write access to the repository.
+
+## Testing
+
+- **A common test suite for every engine**, run against each built-in: a round trip for each scheme the
+  engine offers, checked against the public key; a scheme it lacks refused; an unknown key refused; failures
+  classified as transient or not as documented; no secret in an error or in `Debug`. A later engine must
+  pass the same suite, which is how it is accepted.
+- **The existing tests** of the sidecar path, unchanged: `services/signer/tests/signer.rs` and
+  `key_absent.rs`, the adapter's `signer_service.rs`, the core host's. They are the proof that moving the
+  wrappers onto the interface changes nothing.
+- **Transit against a mock Vault** (unit tests with an HTTP server in the test process): a good signature; a
+  version mismatch; a bad signature from the server, caught by the local check; an expired token, a new
+  login, and the request succeeding; twelve concurrent requests meeting one expired token, one login;
+  renewal at two thirds of the lease; a 5xx, three attempts, the request failed and the process still signing
+  afterwards; a denied request that does not log in again and again; a login Vault refuses; an exportable key,
+  a key of another type and a missing version refused; the heartbeat noticing a key that changed. TTLs and
+  backoff are values a test sets, so none of these sleep long; none uses a paused clock with real sockets.
+- **Config check tests** per component: the scheme the engine lacks (the core host naming Transit for
+  `key_ring` is refused), a missing version, both old and new forms, an in-process engine in production.
+- **The end-to-end CI job `vault transit (F-042)`**, against a real Vault:
+  - The image is `public.ecr.aws/hashicorp/vault:2.0.3` (ECR Public, not Docker Hub, which rate-limited CI
+    before, #220). The tag is in ECR Public's list; if a later run finds it gone, the nearest `2.0.x`.
+  - Vault runs in **dev mode** (`server -dev -dev-listen-address=0.0.0.0:8200 -dev-root-token-id=…`); the job
+    mounts Transit and creates an Ed25519 key with `exportable=false`, with `curl` (the runner has no
+    `vault` command). The test adds a second version, an exportable key and an ECDSA key, and a policy that
+    lets a role read and sign with the one key.
+  - It proves: signatures that verify independently (with `ed25519-dalek`) and through Vault's own
+    `transit/verify`, per pinned version; an exportable or non-Ed25519 key refused; a role's policy that
+    reaches its own key and no other; a token renewed at two thirds of a short lease; a token **revoked in
+    Vault** and met with a real 403, one new login, and a signature.
+  - The login is the test-only one above. The job's last step runs the three release guards.
+  - Without `ALEDGENT_TEST_VAULT` the test skips locally; `ALEDGENT_REQUIRE_VAULT_TEST=1`, which CI sets,
+    makes a missing Vault a failure, as the S3 job does.
+- **A prototype exists**, outside this pull request: the Transit client as a stand-alone key type, with 13
+  mock-server tests and the end-to-end test, written against the earlier design. Its mock tests pass; its
+  end-to-end test **has not yet run against a real Vault**. Its code is re-landed on the interface here, not
+  merged as it is.
+
+## The seam for more engines
+
+What a new engine is, concretely: a type that implements `Engine` and `KeyHandle`, and one line that
+registers it under a name (`"vault_transit"`, `"aws_kms"`) in the table the component builds its engines
+from. The component's code does not change, because it only knows schemes and `KeyHandle`; its configuration
+changes by naming the new engine's kind. What keeps that true:
+
+- **Engines are looked up by kind name from a registry**, not named in component code. The built-ins register
+  themselves behind cargo features (`in_process`, `sidecar`, `vault_transit`), so a build that lacks one
+  refuses a file that names it (the core host's build has no Transit engine, as today it has no Vault
+  client).
+- **The trait is bytes in, bytes out** (`Op`, a public key in a documented encoding, text errors). Nothing in
+  it is a Rust type that could not cross a process boundary.
+- **The sidecar protocol is already a plugin protocol.** A program that speaks the signer's socket protocol
+  (versioned by `proto::VERSION`, authenticated by peer credentials and a token) is an engine to every
+  component through the sidecar engine, in any language, with no change here. For an engine that is not
+  Rust, or that should not run in the component's process, this is the route, and it is the recommended one.
+- **Loading code at run time** (a dynamic library, WebAssembly) is possible later on the same traits, and
+  is **not built, not designed here, and not wanted for production keys without an owner's ruling**: a
+  library loaded into the process that signs runs with that process's access. If it is ever built, it has
+  to be in the open, versioned and reviewed like a built-in, and subject to the same common test suite.
+
+## What the signer service becomes
+
+The signer service already is an engine host: its `Key` holds a scheme, a public half and answers an `Op`,
+from a Vault KV field, a file, or AWS KMS. In a later step it hosts `KeyHandle`s from any engine, so a key
+that rests in Transit can be served over the sidecar socket as well. That is **possible but not
+recommended** (a network hop and a Vault role in the signer for no gain over a component using Transit
+directly), and it is not in the first steps. The signer's configuration (`keys[].source`: `vault`, `kms`,
+`file`) does not change in this feature.
+
+## Trade-offs, stated plainly
+
+- **Vault is in the path of every signature.** The sidecar's call is on a local socket; Transit's is a
+  network round trip, a few milliseconds when Vault is near and an outage's worth when it is not. Vault
+  down is the component down. Ingress signs the items of a feed one by one, so a batch of 32 is 32 round
+  trips one after another. The cost lands on the decision latency (`NFR-16`), not on the acknowledgement
+  (`NFR-1`: a command is acknowledged when it is durably taken in, before it is forwarded and signed).
+  Transit takes a batch in one request (`batch_input`); using it is the first thing to do if the figure
+  matters, and it is not done here. **Nothing is measured yet.** The CI job proves behaviour, not speed.
+- **A component that uses Transit holds a Vault role.** Ingress then holds a credential that reaches one key:
+  it may read it and sign with it, and nothing else. The signer's model (a token per caller, grants per
+  key, revocation on the next request) is replaced, for that key, by Vault's: the role's policy, its audit
+  log (which records each signature) and the token's lease.
+- **A stronger key and a process no safer.** Transit protects the key: it cannot be copied out of Vault by
+  ingress or by anyone. A compromised ingress can still ask Vault to sign anything while it runs, exactly
+  as a compromised caller can ask the signer.
+- **An interface has a price.** Four operations behind one call (`Op`) is less typed than four methods, and
+  an engine that does not offer a scheme is found when the file loads and not by the compiler. The typed
+  wrappers and the config check keep the callers' view as typed and as early as it is today. The price is
+  one more layer between a component and the signer's socket, which the first pull request must show costs
+  nothing a test can see.
+- **Rotation is never automatic.** A new Transit version is a new public key; for a key that names an
+  account on a chain, it is a new account. A pinned version signs until the file moves; `auto_rotate_period`
+  stays off.
+- **More ways to hold a key are more to operate.** The sidecar over Vault KV stays the default.
+
+## Operator notes (for the pull request that adds the Transit engine)
+
+- Create the key with `exportable=false` (it cannot be changed after) and `auto_rotate_period=0`. Do not
+  rotate it unless a rotation is intended; if it is, the runbook is
+  [key rotation](../../ops/runbooks/release/key-rotation.md), which gets a row for a Transit key.
+- The role the component logs in with needs `read` on `<mount>/keys/<name>` and `update` on
+  `<mount>/sign/<name>`, and nothing else on that mount.
+- Pin the version in the file; it is required. The core host's `stream.ingress_keys` lists the public key of
+  the pinned version (hex), as for the signer's feed key; `vault read transit/keys/<name>` shows it in
+  base64.
+- An example of a Transit key entry goes in `deploy/templates` as a file of its own: the existing templates
+  are strict JSON that tests parse, and JSON holds no comment.
+
+## Decisions for the reviewer
+
+| | Question | Proposed | The other way, and what it costs |
+|---|---|---|---|
+| **D1** | Is the interface blocking or async? | **Blocking.** Every caller and the sidecar's client are blocking; API engines keep a thread and a small runtime | Async everywhere: the core host's Agent thread and `Custody` would need a runtime, and the sidecar client would be rewritten for no gain |
+| **D2** | Does the interface get a new error type? | **No.** Reuse `ClientError`, with its `is_transient()` | A richer type with reasons for metrics: better labels, a change in every caller's error handling. The engine keeps the reasons in its own metrics instead |
+| **D3** | One call (`call(&Op)`) or a method per operation? | **One call**, with typed wrappers | Four methods: more typed, and a new scheme is a change to the trait and to every engine; and the plugin seam loses a bytes-only boundary |
+| **D4** | Engines declared once and keys point at them, or connection details inside each key? | **Declared once.** The core host has four keys on one signer; repeating the socket four times invites drift | Inline: simpler files for one key (ingress); more noise for the core host |
+| **D5** | Does the old configuration keep working? | **Yes**, read as a sidecar engine, until a release says otherwise | A clean break: no legacy path to carry, and every deployment rewrites its files in one release |
+| **D6** | Do in-process keys in a component ever pass in production? | **No**, development and tests only, as a key file does today | Allow it with a flag for non-book components: not needed by anything planned |
+| **D7** | Does the signer host Transit keys over its socket? | **Not now**; possible later on the same traits | Now: a hop and a Vault role in the signer for no gain |
+
+## Out of scope
+
+- The plugin loader. The seam is described above; nothing loads code.
+- An operating system keystore engine, an HSM engine, AWS KMS used directly by a component (the interface
+  makes them possible; each is a feature with its own owner's ruling).
+- The settlement adapter's change to Ed25519 keys and native accounts (a feature of its own). Its
+  secp256k1 path moves onto the interface in the first steps, unchanged in behaviour.
+- Batching Transit signatures; measuring the cost.
+- A listener on the signer for metrics or readiness.
+- Any change to the signer's wire protocol or its configuration.
+- Reading a key's material from any engine: there is no such call.
