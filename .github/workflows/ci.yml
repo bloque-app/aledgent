@@ -193,6 +193,13 @@ jobs:
       - name: Vault in dev mode, with Transit and a non-exportable Ed25519 key
         run: |
           set -eu
+          # ECR Public rate-limits anonymous pulls from shared runners ("toomanyrequests"): retry, then
+          # fail; the digest-pinned image is never swapped for another.
+          for i in 1 2 3 4 5 6; do
+            docker pull -q "$VAULT_IMAGE" && break
+            [ "$i" = 6 ] && { echo "::error::could not pull $VAULT_IMAGE"; exit 1; }
+            echo "::warning::pull of the Vault image failed (attempt $i)"; sleep $((i * 20))
+          done
           docker run -d --name vault --cap-add=IPC_LOCK -p 127.0.0.1:8200:8200 "$VAULT_IMAGE" \
             server -dev -dev-listen-address=0.0.0.0:8200 -dev-root-token-id="$ALEDGENT_TEST_VAULT_TOKEN"
           for _ in $(seq 1 60); do
