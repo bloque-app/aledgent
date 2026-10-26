@@ -2488,7 +2488,11 @@ async fn handle_metrics<S: Store, C: Core>(
         .ok()
         .flatten()
         .map(|t| now.saturating_sub(t));
-    let text = shared.metrics.render(oldest, tick_age);
+    let mut text = shared.metrics.render(oldest, tick_age);
+    if let Some(k) = &shared.config.feed_signer {
+        // The feed key's own (`F-042`): Vault Transit's latency and failures, when it is there.
+        text.push_str(&k.0.metrics_text());
+    }
     let resp = (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],

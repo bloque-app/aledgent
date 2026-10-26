@@ -5,7 +5,8 @@
 //!
 //! - `GET /ready`: 200 once this replica serves (it starts after the store is connected and its
 //!   migrations are applied or verified) and the store answers now; 503 while it drains
-//!   ([`crate::service::Replica::drain`]) or when the store does not answer. A release goes out
+//!   ([`crate::service::Replica::drain`]), when the store does not answer, or when the feed key is
+//!   held by an API provider (Vault Transit, `F-042`) that does not answer. A release goes out
 //!   blue/green on it: the new set is ready before the old one drains (`DEC-27` (a)).
 //! - `GET /live`: 200 while the process runs.
 //!
@@ -26,7 +27,13 @@ use crate::store::Store;
 
 /// Whether `shared`'s replica is ready now.
 pub async fn ready<S: Store, C: Core>(shared: &Shared<S, C>) -> bool {
-    !shared.draining() && shared.store.oldest_undecided().await.is_ok()
+    !shared.draining()
+        && shared
+            .config
+            .feed_signer
+            .as_ref()
+            .is_none_or(|s| s.0.ready())
+        && shared.store.oldest_undecided().await.is_ok()
 }
 
 async fn handle_ready<S: Store, C: Core>(

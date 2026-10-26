@@ -411,6 +411,17 @@ pub struct DeploymentConfig {
     /// its environment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub core_keys: Option<CoreKeys>,
+    /// The signature engines this deployment's components use (`F-042`), by name: each
+    /// `{ "<kind>": { … } }`, with `sidecar`, `in_process` or `vault_transit` for a kind. One file
+    /// serves several components, and each checks and builds only the engines its own keys name;
+    /// the rest stay unparsed.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub engines: std::collections::BTreeMap<String, serde_json::Value>,
+    /// The keys, each on an engine (`F-042`): ingress's `feed` here (`{ "engine": "<name>", "key":
+    /// { … } }`, the key's locator in that engine). Another component's keys in the same file are
+    /// neither parsed nor refused.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub keys: std::collections::BTreeMap<String, serde_json::Value>,
     /// The prior system's identifiers the initial state left out (`REQ-RC-7`, amendment 0024):
     /// the migration's `excluded.jsonl`, checked against the digest the book's chainspec commits
     /// (`T-036-29`). A request naming one is answered `ERR-IdentifierArchived` (410), for good
@@ -432,6 +443,18 @@ pub struct DeploymentConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readiness_listen: Option<String>,
 }
+
+/// Ingress's feed key as a component declares its needs (`F-042`): an Ed25519 key, on the signer
+/// service, in a key file, or in Vault Transit. It holds no book.
+pub const FEED_KEY: signer::engine::config::KeyNeed = signer::engine::config::KeyNeed {
+    name: "feed",
+    scheme: signer::proto::Scheme::Ed25519,
+    kinds: &[
+        signer::engine::EngineKind::Sidecar,
+        signer::engine::EngineKind::ApiProvider,
+        signer::engine::EngineKind::InProcess,
+    ],
+};
 
 /// The variable holding the core host's token for a stream over a Unix socket (`F-038`): its
 /// SHA-256 is what `stream.link.token_sha256` lists on ingress's side.
@@ -539,6 +562,12 @@ impl StreamSection {
     /// Check the section for `profile` (`T-038-14`): every file a transport needs, a feed key for
     /// a production listener, a development key only in development, the keys a dialer checks.
     pub fn check(&self, profile: Profile) -> Result<(), String> {
+        self.check_with(profile, false)
+    }
+
+    /// [`StreamSection::check`], when the feed key may instead be the deployment's `keys.feed`
+    /// (`F-042`): `feed_key_in_keys` is whether the file gives it.
+    pub fn check_with(&self, profile: Profile, feed_key_in_keys: bool) -> Result<(), String> {
         if let Some(l) = &self.listen {
             match crate::stream::Address::parse(l)? {
                 crate::stream::Address::Tls(_) if self.tls.is_none() => {
@@ -549,10 +578,10 @@ impl StreamSection {
                 }
                 _ => {}
             }
-            if profile == Profile::Production && self.feed_key.is_none() {
+            if profile == Profile::Production && self.feed_key.is_none() && !feed_key_in_keys {
                 return Err(
-                    "stream.listen in production needs stream.feed_key: every forwarded command \
-                     is signed (F-038)"
+                    "stream.listen in production needs stream.feed_key or keys.feed: every \
+                     forwarded command is signed (F-038)"
                         .into(),
                 );
             }
@@ -850,6 +879,75 @@ impl DeploymentConfig {
         Ok(keys)
     }
 
+    /// Whether the file gives a feed key that goes through the signer service or an engine:
+    /// `stream.feed_key` (the form written before `F-042`) or `keys.feed`.
+    pub fn has_feed_key(&self) -> bool {
+        self.stream.as_ref().is_some_and(|s| s.feed_key.is_some())
+            || self.keys.contains_key(FEED_KEY.name)
+    }
+
+    fn engine_section(&self) -> signer::engine::config::Section<'_> {
+        signer::engine::config::Section {
+            engines: &self.engines,
+            keys: &self.keys,
+        }
+    }
+
+    /// Check the `stream` section and the feed key (`F-042`): the section as it was, and `keys.feed`
+    /// on its engine (a scheme the engine offers, a kind the key may use, a locator it accepts),
+    /// not given together with `stream.feed_key` or `stream.development_feed_key`. Only the keys
+    /// ingress declares are read; the rest of `engines` and `keys` is another component's.
+    pub fn check_stream(&self) -> Result<(), String> {
+        let in_keys = self.keys.contains_key(FEED_KEY.name);
+        if let Some(s) = &self.stream {
+            s.check_with(self.profile, in_keys)?;
+            if in_keys && s.feed_key.is_some() {
+                return Err(
+                    "keys.feed and stream.feed_key: one of them (the engines' form and the form \
+                     written before F-042)"
+                        .into(),
+                );
+            }
+            if in_keys && s.development_feed_key.is_some() {
+                return Err("keys.feed and stream.development_feed_key: one of them".into());
+            }
+        }
+        if in_keys && self.stream.is_some() {
+            signer::engine::config::check(
+                &signer::engine::config::Registry::builtin(),
+                &self.engine_section(),
+                &[FEED_KEY],
+                self.profile == Profile::Development,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Ingress's feed signer (`F-038` §5): `keys.feed` opened on its engine, or the form written
+    /// before `F-042`, or a development file, or none (the legacy link, which signs nothing).
+    pub fn feed_signer(&self) -> Result<Option<crate::service::SharedFeedSigner>, String> {
+        let Some(stream) = &self.stream else {
+            return Ok(None);
+        };
+        self.check_stream()?;
+        if self.keys.contains_key(FEED_KEY.name) {
+            let opened = signer::engine::config::open(
+                &signer::engine::config::Registry::builtin(),
+                &self.engine_section(),
+                &[FEED_KEY],
+                self.profile == Profile::Development,
+            )?;
+            let handle = opened
+                .handle(FEED_KEY.name)
+                .ok_or("keys.feed: not opened")?;
+            let key = crate::feed::EngineFeedKey::new(handle, opened)?;
+            return Ok(Some(crate::service::SharedFeedSigner(std::sync::Arc::new(
+                key,
+            ))));
+        }
+        stream.feed_signer(self.profile)
+    }
+
     /// Check that ingress signs what it forwards to a core in another process (`F-038` §5, §12):
     /// in production, an ingress on `core_endpoint` with the new link configured (a `stream`
     /// section, [`DeploymentConfig::forward_link`]) needs `stream.feed_key`, as one with
@@ -857,7 +955,7 @@ impl DeploymentConfig {
     /// unsigned inputs. Without a `stream` section ingress forwards on the legacy link, which
     /// carries no feed and no signature, and needs no feed key (`F-038` §12 step 0).
     pub fn check_forward_signing(&self) -> Result<(), String> {
-        let signs = self.stream.as_ref().is_some_and(|s| s.feed_key.is_some());
+        let signs = self.has_feed_key();
         let sequenced = self.forward_link() == crate::service::ForwardLink::Sequenced;
         if self.profile == Profile::Production
             && self.core_endpoint.is_some()
@@ -1126,6 +1224,91 @@ pub fn secret_hex32(var: &str) -> Result<[u8; 32], String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The deployment template with its numbers filled, as JSON.
+    fn template() -> serde_json::Value {
+        serde_json::from_str(&fill_numbers(include_str!(
+            "../../../deploy/templates/ingress.json"
+        )))
+        .unwrap()
+    }
+
+    fn deployment(v: serde_json::Value) -> DeploymentConfig {
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// `F-042`: the feed key on an engine. The example (`ingress-feed-key-transit.json`) put in the
+    /// template's place checks in production, with `stream.feed_key` taken out; the kind and the
+    /// scheme are checked; `keys.feed` and `stream.feed_key` are one or the other; and an in-process
+    /// key is a file, never the environment.
+    #[test]
+    fn f_042_the_feed_key_is_on_an_engine_and_the_check_reads_only_ingresss_keys() {
+        let example: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../deploy/templates/ingress-feed-key-transit.json"
+        ))
+        .unwrap();
+        let with = |edit: &dyn Fn(&mut serde_json::Value)| {
+            let mut v = template();
+            v["stream"].as_object_mut().unwrap().remove("feed_key");
+            v["engines"] = example["engines"].clone();
+            v["keys"] = example["keys"].clone();
+            edit(&mut v);
+            deployment(v)
+        };
+        // The example, in production.
+        assert_eq!(with(&|_| {}).check_stream(), Ok(()));
+        assert!(with(&|_| {}).has_feed_key());
+        // Another component's keys in the same file are neither parsed nor refused.
+        let c = with(&|v| {
+            v["keys"]["key_ring"] = serde_json::json!({ "engine": "ghost", "key": 7 });
+            v["engines"]["elsewhere"] = serde_json::json!({ "no_such_kind": {} });
+        });
+        assert_eq!(c.check_stream(), Ok(()));
+        // Both forms of the feed key: refused.
+        let both = with(&|v| {
+            v["stream"]["feed_key"] = serde_json::json!({
+                "signer": { "socket": "/run/signer.sock", "client": "ingress", "token_file": "/t" },
+                "key": "ingress-feed",
+            });
+        });
+        assert!(both.check_stream().unwrap_err().contains("one of them"));
+        // An engine that is not declared, an http:// Vault in production, a version not pinned.
+        let e = with(&|v| v["keys"]["feed"]["engine"] = "ghost".into())
+            .check_stream()
+            .unwrap_err();
+        assert!(e.contains("keys.feed") && e.contains("not declared"), "{e}");
+        let e = with(&|v| {
+            v["engines"]["vault"]["vault_transit"]["vault"]["address"] = "http://v".into()
+        })
+        .check_stream()
+        .unwrap_err();
+        assert!(e.contains("https"), "{e}");
+        let e = with(&|v| {
+            v["keys"]["feed"]["key"]
+                .as_object_mut()
+                .unwrap()
+                .remove("version");
+        })
+        .check_stream()
+        .unwrap_err();
+        assert!(e.contains("pin the key version"), "{e}");
+        // In process: a file is accepted in production; the environment is not an option anywhere.
+        let file = |v: &mut serde_json::Value| {
+            v["engines"] = serde_json::json!({ "files": { "in_process": {} } });
+            v["keys"] = serde_json::json!({ "feed": { "engine": "files", "key": { "file": "/etc/feed.key" } } });
+        };
+        assert_eq!(with(&file).check_stream(), Ok(()));
+        let env = with(&|v| {
+            file(v);
+            v["keys"]["feed"]["key"] = serde_json::json!({ "env": "FEED_KEY" });
+        });
+        assert!(env.check_stream().unwrap_err().contains("env"));
+        // The old form, alone, still checks.
+        let mut old = template();
+        old["keys"] = serde_json::Value::Null;
+        old.as_object_mut().unwrap().remove("keys");
+        assert_eq!(deployment(old).check_stream(), Ok(()));
+    }
 
     /// `T-038-14` (`REQ-AU-8`, `NFR-7`): a stream section missing what its transport needs, a
     /// production listener without the signer's feed key, a file key outside development, and a
