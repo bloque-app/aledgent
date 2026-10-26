@@ -1852,7 +1852,8 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
 
     /// A re-scan of the inbox positions `[from, to)` (`REQ-IN-5`): `layer` is every position of
     /// the range and the digest the layer holds there. It is compared with what was ingested;
-    /// every difference is an incident naming the coordinate, never a silent repair.
+    /// every difference is an incident naming the coordinate, never a silent repair. The report
+    /// names every difference found; a difference already recorded is not recorded again.
     pub fn rescan(
         &mut self,
         source: SourceId,
@@ -1907,6 +1908,10 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                         .count()
                 })
                 .sum();
+            // The report names every difference; the book records each once, however many
+            // re-scans find it. Before, every re-scan appended its differences again to the one
+            // leaf that holds every incident, and a range re-scanned on a schedule grew it until
+            // the Agent's heap could not hold it (finding F18's class, `REQ-RT-1`).
             let writes: Vec<Write> = report
                 .missing
                 .iter()
@@ -1920,6 +1925,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                         .iter()
                         .map(|c| Incident::Unknown { coordinate: *c }),
                 )
+                .filter(|i| !store.rescan_recorded(config.instance, i))
                 .map(|i| Write::Settlement(SettlementWrite::Incident(i)))
                 .collect();
             if !writes.is_empty() {

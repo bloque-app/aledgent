@@ -180,6 +180,9 @@ pub mod kind {
     pub const INGESTED_AT: u8 = 58;
     pub const POSITION_TALLY: u8 = 59;
     pub const POSITION_COUNTED: u8 = 39;
+    // A re-scan's differences already recorded (`REQ-IN-5`), read by key instead of the
+    // incidents whole.
+    pub const RESCAN_RECORDED: u8 = 38;
     // The operator records.
     pub const OPERATOR_GRANT: u8 = 60;
     pub const OPERATOR_GRANTS_BY_PRINCIPAL: u8 = 61;

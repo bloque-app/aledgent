@@ -416,6 +416,62 @@ fn req_in_5_a_rescan_reports_every_difference_by_coordinate() {
     );
 }
 
+/// `REQ-IN-5`, `REQ-RT-1`: a re-scan that finds a difference again reports it again, and the book
+/// keeps the one incident it raised; a new difference is still recorded. The index of the
+/// differences recorded is derived again from the incidents after an import.
+#[test]
+fn req_in_5_a_difference_found_again_is_one_incident() {
+    let mut lx = Lx::new();
+    let a = empty(&mut lx.fx);
+    for n in 1..=3 {
+        lx.sim.deposit(crate::id::account_reference(&a), usd(), n);
+    }
+    lx.settle();
+    let mut layer: Vec<(u64, [u8; 32])> = (0..3)
+        .map(|s| match lx.sim.read(s) {
+            Read::Record(r) => (s, r.digest),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    layer[1].1 = [0xEE; 32];
+    layer.pop();
+    let first = lx.fx.ledger.rescan(ADAPTER, 0, 3, &layer, 10).unwrap();
+    let recorded = lx.incidents().len();
+    assert_eq!(recorded, 3, "one missing, two unknown");
+    for _ in 0..5 {
+        let again = lx.fx.ledger.rescan(ADAPTER, 0, 3, &layer, 10).unwrap();
+        assert_eq!(
+            again, first,
+            "the report names every difference, every time"
+        );
+    }
+    assert_eq!(lx.incidents().len(), recorded, "each recorded once");
+    // Another record at 1: a new difference, recorded.
+    layer[1].1 = [0xEF; 32];
+    let other = lx.fx.ledger.rescan(ADAPTER, 0, 3, &layer, 10).unwrap();
+    assert_eq!(other.missing, vec![(1, [0xEF; 32])]);
+    assert_eq!(lx.incidents().len(), recorded + 1);
+    // The index after an import: what it was before, so the differences stay recorded once.
+    let s = lx.fx.ledger.state();
+    let head = crate::export::AuditHead {
+        emitted: s.audit().emitted(),
+        head: s.audit().head_hash(),
+        shipped: s.audit().shipped(),
+    };
+    let back = crate::state::State::from_sections(&s.sections(), &head).unwrap();
+    let instance = s.settlement().config().unwrap().instance;
+    for i in s.settlement().incidents() {
+        assert_eq!(
+            back.settlement().rescan_recorded(instance, i),
+            s.settlement().rescan_recorded(instance, i),
+            "{i:?}"
+        );
+        if matches!(i, Incident::Missing { .. } | Incident::Unknown { .. }) {
+            assert!(back.settlement().rescan_recorded(instance, i), "{i:?}");
+        }
+    }
+}
+
 /// `REQ-SA-7`: a range pruned before it was read is recorded as a gap, visibly, and its positions
 /// are never marked ingested.
 #[test]
