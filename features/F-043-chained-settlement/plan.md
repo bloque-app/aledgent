@@ -9,195 +9,174 @@ SPDX-License-Identifier: CC-BY-4.0
 |---|---|
 | Milestone | M-3 — Production V0 (settlement cost and completeness; a test book halted on the path this removes) |
 | Track | B |
-| Home | `contracts/settlement` (v3), `services/settle` (sync verification), `crates/ledger-core` (the chain record; the re-scan path and the completeness incidents removed), `services/ingress` (the head report; the re-scan route withdrawn), `crates/verify`, `ops` (runbooks, alerts), `deploy/templates/settle.json` |
-| Depends on | `F-026` `T-026-10` (contract v2, `set_anchor_head`), `F-037` (an upgrade of a running core; `T-037-19` for a stateful migration) |
-| Unblocks | #74 items 1 to 3; `T-036-15` (the adapter reads its first position from the contract) |
-| Realises | `REQ-IN-5`, `REQ-SL-9`, `REQ-SL-10`, `REQ-SA-7`, `AC-D2.1`, `AC-D2.2` as amendment 0040 restates them; `REQ-SL-5`, `REQ-PR-9`, `REQ-AT-3`, `NFR-22` unchanged |
-| Status | **Proposed** (amendment 0040, `[PENDING AMENDMENT 0040]`, draft). Docs only in this pull request. Nothing is built until the owner rules the open questions |
+| Home | `contracts/settlement` (v3, then v4), `services/settle` (sync verification), `crates/ledger-core` (the re-scan path removed; incidents and gaps to the audit trail), `services/ingress` (the re-scan route withdrawn), `crates/verify`, `ops` |
+| Depends on | `F-026` `T-026-10` (contract v2, `set_anchor_head`), `F-037` `T-037-19` (a stateful in-place upgrade of a running core) |
+| Realises | `REQ-IN-5`, `REQ-SL-9`, `REQ-SL-10`, `REQ-SA-7`, `REQ-AT-1`, `AC-D2.1` as amendment 0040 restates them; `REQ-SL-5`, `REQ-PR-9`, `NFR-6`, `NFR-22` unchanged |
+| Status | **Proposed** (amendment 0040, `[PENDING AMENDMENT 0040]`; the owner ruled the design on 2026-10-26). Docs only in this pull request |
 
 ## Goal
 
-The settlement contract stops storing an entry per movement. Each entry's digest includes the digest of the
-entry before it, and the contract keeps only the latest digest, its position and the book it belongs to. The
-adapter checks completeness at each sync by reading that one head, and it recomputes digests only for entries
-that are new since the head it last accepted. The core keeps one fixed-size record of where the chain stands,
-or where it broke, in place of its growing list of re-scan incidents. The re-scan timer, the re-scan input and
-the completeness incidents go away.
+The settlement contract stops storing an entry per movement. It keeps one head cell, `(position, digest)`,
+where each entry's digest covers the one before it. The adapter checks completeness by reading that head at
+each sync, and folds only the entries that are new since the head it last accepted. The core trusts that
+check. The re-scan goes. Settlement incidents and gaps leave the book's state for the audit trail.
 
-This is not a blockchain. It is one running digest in the contract's state. The settlement layer already
-orders and finalizes entries.
+This is not a blockchain: it is one running digest in the contract's state, over entries Kreivo already orders
+and finalises.
 
-## Design summary
+## Design summary (amendment 0040)
 
-The rule set is amendment 0040. In short:
-
-- `e_n = blake2b-256(SCALE(InboxEntry))`, unchanged and already the coordinate's digest.
-- `d_n = blake2b-256("aledgent/settlement-entry/v1" ‖ d_(n-1) ‖ n_be ‖ e_n)`.
-- The genesis is `blake2b-256("aledgent/settlement-genesis/v1" ‖ contract account ‖ epoch ‖ book ‖ from_seq)`.
-  A reset starts a new chain.
-- The contract stores `EntryHead { epoch, book, from_seq, next_seq, digest }` at `0x0000_000C` and emits
-  `Entry { seq, entry }` per entry. It stores no entry.
-- The adapter, at each step:
-  - reads the head;
-  - is done if the head equals the one it accepted;
-  - otherwise verifies only the new entries from the `Entry` events of the blocks since it last read;
-  - accepts the new head only after the core has taken each entry in;
-  - on a mismatch, stops at `n` and reports a break.
-- The core keeps `SettlementChain { epoch, book, from_seq, seq, digest, break }`, one leaf per instance. It
-  recomputes over only the newly final positions on each head report (amendment 0040, Q1).
-- An archive node is needed only to catch up past what an ordinary node keeps (about 256 blocks), or to restore.
-  Routine settlement never needs one.
+- `e_n = blake2b-256(SCALE(InboxEntry { at, event }))`, as today. `d_n = blake2b-256(d_(n-1) ‖ n ‖ e_n)`, with `n`
+  as 8 bytes big-endian. A chain starts at `(0, 32 zero bytes)`.
+- A reset (`set_anchor_head`) starts a new chain at position 0. Resets come only with a book re-founding.
+- `Deposited` gains `from` and `Refused` gains `call`. With those, every entry can be rebuilt from its event
+  and the event's block number. No new event, and no digest in events.
+- v3 keeps `prune_inbox` for the entries v2 stored. v4 removes it and the storage v3 no longer uses.
+- The core keeps one `u64`, the end of the highest gap, so `proof` (`ledger/settlement.rs:1689`) keeps its
+  answer without the gaps list.
 
 ## Work, by component
 
 ### 1. Contract v3 (`contracts/settlement`)
 
-- `append` (`lib.rs:834-846`) computes `e_n` and `d_n`, writes `entry_head`, emits `Entry`, and stops writing
-  `inbox`.
-  - It reads and writes `entry_head` in storage every time, so a frame that is rolled back takes the write with
-    it (`run_batch`, `isolate`, `lib.rs:849-952`).
-  - `Head` and `apply` do not change.
-- Lazy genesis on the first `append` with no `entry_head`, and a new genesis in `set_anchor_head`
-  (`lib.rs:581-643`). Event `EntryChainStarted`.
-- A new read-only message `entry_head()`. `inbox_entry(seq)` stays for entries written before v3.
-- `prune_inbox` limited to positions below the chain's `from_seq` (amendment 0040, Q7).
-- `check_invariants` (`lib.rs:1578`):
-  - `entry_head.next_seq == head.next_seq`;
-  - no stored entry at or above `from_seq`;
-  - the digest recomputed from the test's recorded events equals the head.
-- The per-kind events stay unless Q5 rules otherwise.
+- A head cell at `0x0000_000C` and a read-only message for it. An absent cell reads as `(0, zeros)`.
+- `append` (`lib.rs:834-846`) folds the entry into the cell and stops writing `inbox`. The cell is read and
+  written in storage on every append, so a frame that is rolled back (`run_batch`, `isolate`) drops the write.
+- `set_anchor_head` (`lib.rs:582-641`) writes `(0, zeros)`, and `AnchorEpoch.from_seq` = 0.
+- Events: `from` on `Deposited` (`lib.rs:149-160`), `call` on `Refused` (`lib.rs:211-222`).
+- Positions restart, so:
+  - `Head.next_seq` stays where v2 left it, as the end of what v2 stored;
+  - `Outcome`, `LatestAnchor.seq` and `bound[asset]` take chain positions;
+  - the removals of a superseded anchor's stored entry (`lib.rs:618`, `:1001`) go;
+  - the overflow checks on `Head.next_seq` (`lib.rs:398`, `:431`, `:870`) move to the chain position.
+- `prune_inbox` works only below the frozen `Head.next_seq`. It no longer spares the latest anchor's position or
+  bind entries (amendment 0040's addition, not a ruling), so the stored map can be emptied for v4.
+- `check_invariants` (`lib.rs:1578`) is rewritten for the chain: nothing is stored at chain positions, and the
+  head equals a fold of the test's recorded events.
 
 ### 2. Settle (`services/settle`)
 
-- `Chain` gains `entry_head(at)` and `entries(from_block, to_block)`, which reads the `Entry` events and walks
-  back by parent hash, because the light client has no lookup by number (`chain/rpc.rs:980-981`).
-  - It is implemented for `rpc`, the light client and `fake`.
-  - It is configured with an optional `history_endpoint` (an RPC of a node that keeps history), which is used
-    only to catch up.
-- The store keeps the accepted head beside the cursor: `settle_cursors` gains `digest` and `block`, in a new
-  migration.
-- `observe` (`adapter.rs:2403-2560`):
-  - the cursor read by position becomes: read the head, compare it, verify the new entries, then report them in
-    order, as now;
-  - the provisional check (`adapter.rs:2430-2442`) compares against the verified range;
-  - the read by position is kept only for the range below the chain's `from_seq` that v2 stored.
-- **The re-scan is removed:**
-  - `Adapter::rescan` (`adapter.rs:3388-3478`);
-  - the step's timer (`adapter.rs:1161-1166`);
-  - `rescan_every` and `rescan_window` (`config.rs:103-106`). Kept as accepted and ignored for one release,
-    with a warning, then refused;
+- `Chain` gains a head read and an events read for a block range. The events read walks back by parent hash,
+  because the light client has no lookup by number (`chain/rpc.rs:980-981`). It is implemented for rpc, the
+  light client and `fake`. An optional history endpoint is used only to catch up.
+- `settle_cursors` gains the accepted digest and block (a new migration).
+- **Every reader of the next position uses the chain's.** The instance view takes `next_seq` from the head cell
+  rather than `head()` (`chain/rpc.rs:583-599`). That covers the cursor loop (`adapter.rs:2468`), the check at
+  `:1845`, the positions cut (`:1866-1897`), the provisional range (`:2544-2545`) and the head report
+  (`:2588`), whose `next_seq` becomes the core's `FinalisedHead` (`HeadBody`,
+  `services/ingress/src/settlement.rs:558-567`), from which `proof` builds its range. In `ops`, the reconcile
+  cut (`ops/src/reconcile.rs:154`) and the cursor-lag signal (`ops/src/signals.rs:772`) change with it.
+- `observe` (`adapter.rs:2403`):
+  - the read by position becomes: read the head; done if unchanged; otherwise fold the new entries from the
+    accepted digest and compare;
+  - on a match, report in order and accept the head after the core has taken in every entry;
+  - on a mismatch, read once more, then alert and stop at the first new position;
+  - the provisional check compares against events above finality.
+- The first start for a book is `(0, zeros)`: just after the reset's `AnchorHeadSet` event, or at
+  instantiation for an instance never reset (`anchor_epoch()` is `None`).
+- **The operator's gap** (a40-q3): when no reader can serve a range, the operator has the adapter record it
+  through its own authoritative source (`record_gap`, `ledger/settlement.rs:1830`, refuses any other), and
+  the adapter then accepts the layer's head as it stands, unverified for that range. The adapter's own
+  `Pruned` gap (`adapter.rs:2531`) goes, since nothing is pruned any more.
+- **Removed:**
+  - `Adapter::rescan` (`adapter.rs:3388`) and its timer (`:1161-1166`);
+  - `rescan_every` and `rescan_window` (`config.rs:103-106`), accepted with a warning for one release, then refused;
   - `settle.json:29-30`.
-- On a break: re-read once (from the history node, if configured), then report the break, raise
-  `chain:{instance}:{n}`, and stop the read at `n`. Anchoring goes on (`REQ-PR-9`).
-- On first start against v3: the cursor is the chain's `from_seq`, read from `entry_head` (`T-036-15`).
 
-### 3. The core (`crates/ledger-core`) and ingress (`services/ingress`)
+### 3. The core (`crates/ledger-core`) and ingress
 
-- `SettlementChain` leaf per instance in `SettlementStore` (`settlement/store.rs`). `HeadBody`
-  (`ingress/src/settlement.rs:558-567`) gains `digest`.
-- On a head report:
-  - recompute over `[seq, reported)` from `final_at`, with a cap per input in the manner of `T-032-19`;
-  - a position that is not yet final means wait;
-  - a different digest means `Break`;
-  - the first head is accepted only if its genesis names this book (0039's q1);
-  - observations below `from_seq` are refused.
-- **Clearing a break:** a re-read that verifies, or an operator intervention with its own authority and a
-  justification (`REQ-AT-3`). An audit record either way.
-- **Remove:**
-  - `Ledger::rescan` (`ledger/settlement.rs:1856-1930`);
-  - `Incident::Missing`, `Incident::Unknown` and `Incident::Gap`, for new writes;
-  - the ingress route `POST /v1/settlement/rescans` (`ingress/src/surface.rs:625`, `settlement.rs:870`,
-    `:1474`).
+- **Removed:**
+  - `Ledger::rescan` (`ledger/settlement.rs:1857-1938`) and the route `POST /v1/settlement/rescans`
+    (`services/ingress/src/surface.rs:625`, `settlement.rs:870`, `:1474`);
+  - `Incident::Missing` and `Incident::Unknown`;
+  - the indexes `RESCAN_RECORDED` and `INGESTED_AT` (`settlement/store.rs:258`, `:273`).
   - `Call::Rescan` stays decodable (`call.rs:260-266`), and the new code refuses it.
-- **The incidents that remain** move to keyed leaves (Q2, `T-032-26`).
-- The open break and the counts of the remaining incidents appear on `/v1/ops/signals` (#74 item 3).
-- The state layout changes:
-  - incidents (kind 51) and gaps (Q12) move, and `RESCAN_RECORDED` goes if #73 merged;
-  - export records (`export/records.rs`) and the state image (`state/image.rs:297-306`) change with them;
-  - a running book takes the change through `F-037`, with `T-037-19`, or at a re-founding (Q11).
+- **Incidents and gaps go to the audit trail.** Each is written as an audit record in the batch that would have
+  written the leaf, under a new audit class (`audit/mod.rs:58-68` has none for them). The leaves `gaps` and
+  `incidents` (`store.rs:245-246`) go. `RecordGap` keeps its input and also sets the gap end.
+- **`proof`** tests `from_seq < gap end` in place of `gap_within` (`store.rs:957`).
+- The export records (`export/records.rs`, `settlement/store/canon.rs`) change with the leaves.
+- The sim driver (`settlement/driver.rs:310-313`) keeps its own list of gaps.
 
-### 4. Readers and operations
+### 4. The core change for running books
 
-- `crates/verify`: the superseded anchor in a reset's own block is read from that block's `Entry` events, no
-  longer from the stored inbox (amendment 0039, "The verifier").
-- Runbooks that name the re-scan:
-  - `ops/runbooks/release/divergence.md` (`AledgentRescanDifference`);
-  - `gap-filling.md`, `crank-outage.md`, `restore.md`, `release/settlement-adapter-outage.md` and
-    `release/total-loss-recovery.md`.
-  - The alert becomes `AledgentSettlementChainBroken`.
-- `features/F-018-operations/plan.md`: an adapter restore no longer "re-scans the inbox". It resumes from the
-  accepted head, and catches up from the history node if it is behind.
+- An `F-037` in-place upgrade with a stateful migration (`T-037-19`). It writes the existing incidents and gaps
+  as audit records, sets the gap end from the gaps, and drops the leaves.
+- The leaf kinds are keys in the actor's one map of rows (`agents/core/src/lib.rs:68-73`), so the runtime's
+  state-layout check passes (`agents/core-host/src/switch.rs:373-375`).
+- It needs the release gate that replays the previous generation's state under the new core, which
+  `T-037-19` names as still to be ruled.
+
+### 5. Readers and operations
+
+- `crates/verify`:
+  - it reads an anchor superseded in the same block from that block's `Anchored` events, no longer from the
+    stored entries (`in_block_inbox`, `crates/verify/src/rpc.rs:334-358`);
+  - it assigns a carried anchor to a sequence by inbox position (`p.seq >= this.from_seq`, `rpc.rs:540`). With
+    positions restarting and `from_seq` always 0, that compares blocks instead (`LatestAnchor.at` against
+    `AnchorEpoch.at`).
+- `ops`: the restore's re-scan step (`ops/src/restore.rs:373-376`, `ops/src/kit.rs:848`) becomes "resume from
+  the accepted head, and catch up from the history endpoint if behind".
+- The alert `AledgentRescanDifference` (`ops/prometheus/rules/aledgent.yml:38`) becomes
+  `AledgentSettlementChainMismatch`. Every runbook that names the re-scan is rewritten:
+  - `gap-filling.md`, `crank-outage.md` and `restore.md`;
+  - under `release/`: `divergence.md`, `kreivo-finality-stall.md`, `settlement-adapter-outage.md` and
+    `total-loss-recovery.md`;
+  - the restore step in `features/F-018-operations/plan.md`.
+
+### 6. Contract v4 (later)
+
+- Removes `prune_inbox` and the storage v3 no longer uses: `inbox`, and the legacy `anchors` and
+  `anchor_migration`.
+- Ships once every instance has pruned its v2 entries.
 
 ## Test plan
 
-**Contract (unit, then a local Kreivo).**
-
-- Unit tests (`contracts/settlement/src/tests.rs`):
-  - the digest after every message that appends, against an independent implementation in the test;
-  - a frame that fails (a withdrawal to another deployment that traps) leaves `entry_head` as it was before
-    the frame, and the refusal's entry extends it;
+- **Contract unit tests** (`contracts/settlement/src/tests.rs`):
+  - the head after every kind of entry, against an independent fold in the test;
+  - a frame that fails leaves the head as before the frame, and the refusal extends it;
   - `deposit` and `credit` extend the chain;
-  - lazy genesis on the v2 layout written by raw key, with every existing cell byte-identical afterwards;
-  - `set_anchor_head` starts a new genesis, and an old digest does not extend it;
-  - `prune_inbox` refuses any position at or above `from_seq`;
+  - the v2 layout written by raw key is byte-identical after the first v3 message;
+  - a reset writes `(0, zeros)`;
+  - `prune_inbox` refuses at or above the frozen end, and empties the range including bind entries;
   - no stored entry is written.
-- **zombienet** (the `F-026` suite) or **Chopsticks** (a fork of a live network, for the upgrade path):
-  - instantiate v2;
-  - write entries;
-  - `publish_upgrade` and `upgrade` to v3;
-  - write more entries, including a batch with a failing frame;
-  - read the head and the events, and recompute;
-  - reset, and check the new chain.
-  - On Chopsticks, also dry-run the exact upgrade calls with the origin each one requires (licence owner,
-    governance) against a fork of each live instance.
-
-**The adapter against a forked chain.**
-
-- **Chopsticks forks of the test and prod networks with v3 upgraded in.**
-  - The adapter syncs: one read when idle.
-  - A burst of deposits is verified once.
-  - An entry hidden by a reader stub, an extra one, and an altered one each give "broken at `n`" at the next
-    sync, with no advance past `n`.
-  - The adapter is stopped for more than 256 blocks with no history endpoint: unreadable, an alert, never
-    "missing".
-  - The same with a history endpoint: it catches up.
-  - A reset: the new book's adapter starts at `from_seq`, and no old entry is reported.
-- `services/settle/tests`: `flow.rs`, `contract.rs` and `anchoring.rs` move to the head read, and the re-scan
-  cases become chain cases.
-
-**The core.**
-
-- `ledger-core` tests:
-  - a head that extends the record;
-  - a position not yet final (a wait);
-  - a different coordinate (a break at `n`);
-  - a first head of another book (refused);
-  - an observation below `from_seq` (refused);
-  - a break cleared by a re-read, and by an operator with an audit record;
-  - `Call::Rescan` refused by the new code and replayed by the old.
-- `core-binding` heap test:
-  - 10,000 entries over many head reports keep the guest's arena flat. This replaces `rescan_incidents.rs`,
-    which #73 added.
-- Conformance:
-  - `f010`, `f013`, `f016` and `f017` re-scan cases become chain cases;
-  - `AC-D2.1` and `AC-D2.2` as restated.
-- `ops/tests/restore.rs`: a restored adapter resumes from the accepted head.
+- **Events rebuild entries:**
+  - for each kind, an `InboxEntry` built from the event and its block hashes to the same `e_n` the v2 code
+    stores;
+  - on a local Kreivo (zombienet), the events of a failed frame are gone with it.
+- **Upgrade, rehearsed:**
+  - zombienet: v2, entries, v3, more entries (including a failing frame), a reset, and the fold equals the
+    head at every step;
+  - Chopsticks forks of test and prod: `publish_upgrade`, `upgrade` and `set_anchor_head` dry-run with the
+    origin each requires.
+- **Settle** (`services/settle/tests`: `flow.rs`, `contract.rs`, `anchoring.rs`):
+  - an idle sync is one read;
+  - a burst is folded once;
+  - an entry hidden, added or altered by a reader stub stops the adapter at the first new position, with an
+    alert;
+  - behind more than 256 blocks: unreadable without a history endpoint, caught up with one;
+  - after a reset, no entry of the old chain is reported.
+- **Core:**
+  - `Call::Rescan` refused by the new code and replayed by the old;
+  - an incident and a gap each produce an audit record and no leaf;
+  - `proof` gives the same answers with the gap end as with the list;
+  - the migration of a book with incidents and gaps;
+  - `rescan_incidents.rs` and the re-scan cases of conformance (`f010`, `f016`) are replaced by chain cases.
 
 ## Rollout
 
-1. **Test** (fast track).
-   - The contract's admin is a key, so the admin's calls are each one signed call.
-   - The code upgrade is made by the test instance's licence owner on its fast track.
-   - Then settle and the core with `F-043`, on the re-founded test book.
-   - Watch two syncs that are idle (one read each) and one that is not.
-2. **Prod, after the Root referendum enacts.** That referendum moves prod to v2 and gives the licence-owning
-   community the default track.
-   - The community's referendum: `publish_upgrade` and `upgrade` to v3, on the code hash CI built.
-   - If prod's book is not yet reset, its reset is made under v3 (amendment 0040, Q8).
-   - Then settle and the core with `F-043`.
-   - Until then, prod's settle stays off, or runs with `rescan_every: 0`, and #73 is the stopgap.
+On test, then on prod. Each environment: the v3 upgrade, then the head reset for the current book, then settle
+and the core with `F-043`.
+
+- **Test:** the code upgrade is made by the test instance's licence owner. Settle stays off until v3
+  (a40b-test-now). Done when two idle syncs read once each, and one sync with new entries folds them.
+- **Prod (v2 since Root ref 63):**
+  - the licence-owning community's referendum `publish_upgrade` + `upgrade` to v3, on the code hash CI built;
+  - then the reset as governance;
+  - then settle, which has never run on `p2`, and the core.
+- **Running books** take the core change in place (section 4).
 
 ## Not in this feature
 
-A Merkle proof of one entry; a stored entry window; moving the anchors (they stay in `latest_anchor`); the
+A proof of one entry without the rest; a window of stored entries; moving anchors out of `latest_anchor`; the
 Spaces venue (it inherits the rule through `REQ-SL-9`).
