@@ -110,8 +110,6 @@ pub trait Engine: Send + Sync {
     /// answer for what that provider has. What a given sidecar or plugin actually holds is known only
     /// at `open`.
     fn schemes(&self) -> &[Scheme];
-    /// Check an entry's key locator without touching the network (config check).
-    fn check_locator(&self, scheme: Scheme, locator: &serde_json::Value) -> Result<(), String>;
     /// Find the key and check it now: that it exists, is of this scheme, and cannot leave. A
     /// component that needs a key does not start without it.
     fn open(&self, scheme: Scheme, locator: &serde_json::Value) -> Result<Arc<dyn KeyHandle>, ClientError>;
@@ -122,7 +120,9 @@ pub trait Engine: Send + Sync {
 }
 
 /// One open key. There is no way to ask it for its secret.
-pub trait KeyHandle: Send + Sync {
+pub trait KeyHandle: Send + Sync + Debug {
+    /// The kind of engine it came from (the patience rule below reads it).
+    fn kind(&self) -> EngineKind;
     fn scheme(&self) -> Scheme;
     /// The public half, in the scheme's encoding (32 bytes for Ed25519, 33 for secp256k1, ...).
     fn public(&self) -> Vec<u8>;
@@ -130,6 +130,13 @@ pub trait KeyHandle: Send + Sync {
     fn call(&self, op: &Op) -> Result<Vec<u8>, ClientError>;
 }
 ```
+
+What the configuration check needs *before* anything is connected is not on `Engine` (an engine is
+connected to the network when it is built): each kind has a static description, `KindInfo`, which the
+registry holds: its name in the file (`"sidecar"`, `"in_process"`, `"vault_transit"`), its kind, the
+schemes it can offer, and three functions: check the engine's own configuration, check a key's locator,
+and connect. A component's needs are `KeyNeed { name, scheme, kinds }`, with the name borrowed so that a
+component can name keys at run time (the adapter's lanes).
 
 The decisions in it, and the reason for each (D1 to D5 in "Decisions for the reviewer"):
 
@@ -232,7 +239,7 @@ deployment file as ingress. So a component's check:
    offers ed25519 only; clerk needs the sidecar`;
 4. **a key whose engine kind is not allowed for it** (previous section): `keys.agent_authority: the engine
    "vault" is of kind vault_transit; this key may use: sidecar`;
-5. a locator the engine rejects (`Engine::check_locator`): for Transit, a missing or zero `version`, a mount
+5. a locator the kind rejects (`KindInfo::check_locator`): for Transit, a missing or zero `version`, a mount
    or key name with `..` or `?`; for in-process, anything but `file`; for a sidecar, an empty id;
 6. the rules of the engine's connection: a Vault address that is not `https://`, a Vault token in a file, or
    a missing STS `region`, outside the development profile.
@@ -244,7 +251,8 @@ opened. The offline check cannot see the second; the start does (next).
 **The start** (online) calls `open` for every one of the component's own keys, so a key that is absent, of
 another type, or exportable stops the process before it serves.
 
-**The configuration written today keeps working.** `core_keys.signer` with `key_ring`, `clerk`, `agent_*`
+**The configuration written today keeps working.** The adapter names an engine key with
+`{ "engine": "<key>" }` as a lane's `device`, beside `{ "signer": { "key": … } }`. `core_keys.signer` with `key_ring`, `clerk`, `agent_*`
 and `stream.feed_key.signer` with `key` are read as a sidecar engine with those keys, for as long as a
 release says, so nobody has to rewrite a file to upgrade. A file that gives both the old and the new form for
 one component is refused. Each component moves to the new form in its own step (see the tasks).
