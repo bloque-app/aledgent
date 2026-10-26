@@ -30,6 +30,10 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+#[cfg(feature = "test-vault-auth")]
+use std::future::Future;
+#[cfg(feature = "test-vault-auth")]
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -451,6 +455,14 @@ struct Session {
     expires_at: Option<Instant>,
 }
 
+#[cfg(feature = "test-vault-auth")]
+type LoginFuture = Pin<Box<dyn Future<Output = Result<(String, Option<Duration>), String>> + Send>>;
+
+/// A login that is not one of Vault's: a token from wherever a test gets it. Only with the cargo
+/// feature `test-vault-auth`, which release builds refuse (see the crate documentation).
+#[cfg(feature = "test-vault-auth")]
+pub type TestLogin = Arc<dyn Fn() -> LoginFuture + Send + Sync>;
+
 /// A logged-in session with Vault (module documentation).
 pub struct VaultSession {
     address: String,
@@ -462,6 +474,8 @@ pub struct VaultSession {
     session: Mutex<Option<Arc<Session>>>,
     generations: AtomicU64,
     gate: tokio::sync::Mutex<Option<(Instant, VaultError)>>,
+    #[cfg(feature = "test-vault-auth")]
+    test_login: Option<TestLogin>,
 }
 
 impl VaultSession {
@@ -480,6 +494,8 @@ impl VaultSession {
             session: Mutex::new(None),
             generations: AtomicU64::new(0),
             gate: tokio::sync::Mutex::new(None),
+            #[cfg(feature = "test-vault-auth")]
+            test_login: None,
         })
     }
 
@@ -493,6 +509,15 @@ impl VaultSession {
     #[cfg(any(test, feature = "testing"))]
     pub fn with_credentials(mut self, c: aws_credential_types::Credentials) -> VaultSession {
         self.credentials = Some(c);
+        self
+    }
+
+    /// Log in by calling `login` instead of Vault's auth methods: the end-to-end tests only,
+    /// against a Vault in dev mode, where the AWS login cannot run. It returns a token and its
+    /// lease. Not built into a release (crate documentation).
+    #[cfg(feature = "test-vault-auth")]
+    pub fn with_test_login(mut self, login: TestLogin) -> VaultSession {
+        self.test_login = Some(login);
         self
     }
 
@@ -543,6 +568,13 @@ impl VaultSession {
 
     /// One login attempt: a token and, if it expires, its lease.
     async fn login_once(&self) -> Result<(Zeroizing<String>, Option<Duration>), VaultError> {
+        #[cfg(feature = "test-vault-auth")]
+        if let Some(f) = &self.test_login {
+            return match f().await {
+                Ok((t, ttl)) => Ok((Zeroizing::new(t), ttl)),
+                Err(e) => Err(VaultError::new(Reason::Login, e)),
+            };
+        }
         match &self.auth {
             VaultAuth::TokenFile { path } => {
                 let t = Zeroizing::new(std::fs::read_to_string(path).map_err(|e| {

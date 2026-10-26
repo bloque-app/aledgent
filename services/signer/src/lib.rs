@@ -26,6 +26,20 @@
 //!   and a secp256k1 signer.
 //! - `server` (feature `server`): the listener, the configuration, the backends, Vault (feature
 //!   `vault`) and the KMS client (feature `kms`).
+//! - [`engine`] (`F-042`): **signature engines**, one interface to every way of holding a key and
+//!   signing with it: in-process (a key file), the sidecar (this service), and an API provider,
+//!   `transit` (feature `transit`: Vault Transit, an Ed25519 key that never leaves Vault). A
+//!   component's configuration picks an engine for each key; a key whose scheme the engine lacks, or
+//!   whose engine kind it may not use (the core host's keys: the sidecar only), is refused at load.
+//!   `vault_config` and `vault_session` (feature `vault-session`) are Vault's configuration and the
+//!   session (login under AWS IAM auth, the token's life, retries) that the signer's KV reads and the
+//!   Transit engine share.
+//!
+//! **The test-only login.** The cargo feature `test-vault-auth` adds
+//! `vault_session::VaultSession::with_test_login`, which lets the end-to-end test log in to a
+//! dev-mode Vault, where the AWS login cannot run. The crate does not compile with it unless debug
+//! assertions are on, no configuration can name it (it is a constructor, not a login method), and CI
+//! proves both on every change (`features/F-042-signature-engines/plan.md`).
 //!
 //! **Authentication.** Every connection is checked twice: the peer's user id, from the socket's
 //! peer credentials, must be one the caller is configured with, and the first frame must carry
@@ -60,3 +74,9 @@ pub mod vault_session;
 
 #[cfg(feature = "transit")]
 pub mod transit;
+
+#[cfg(all(feature = "test-vault-auth", not(debug_assertions)))]
+compile_error!(
+    "the cargo feature `test-vault-auth` is a test-only login to Vault and cannot be built \
+     without debug assertions (a release build): see the signer crate's documentation"
+);

@@ -33,6 +33,11 @@ vault = ["server", "vault-session"]
 # signs with it uses in place, beside the sidecar. A component that links it holds a Vault role, so the
 # core host's build does not enable it.
 transit = ["vault-session"]
+# A test-only login to Vault (a token from the test), for the end-to-end test against a Vault in dev
+# mode, where the AWS login cannot run. Never in a release: the crate refuses to compile with it
+# unless debug assertions are on (src/lib.rs), no configuration can name it (it is a constructor, not a
+# login method), and nothing enables it but a command line. CI proves all three.
+test-vault-auth = ["vault-session"]
 # AWS KMS, opt-in per key, for secp256k1 lane and anchor keys only. Without it, a `kms` key source
 # fails the start.
 kms = ["server", "dep:aws-config", "dep:aws-sdk-kms"]
@@ -77,6 +82,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 aws-credential-types = "1"
 base64 = "0.22"
+# tests/transit_e2e.rs: the set-up of a real Vault in CI (keys, a policy, tokens).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 [lints]
 workspace = true
