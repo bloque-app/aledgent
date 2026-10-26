@@ -193,14 +193,20 @@ jobs:
       - name: Vault in dev mode, with Transit and a non-exportable Ed25519 key
         run: |
           set -eu
-          # ECR Public rate-limits anonymous pulls from shared runners ("toomanyrequests"): retry, then
-          # fail; the digest-pinned image is never swapped for another.
-          for i in 1 2 3 4 5 6; do
-            docker pull -q "$VAULT_IMAGE" && break
-            [ "$i" = 6 ] && { echo "::error::could not pull $VAULT_IMAGE"; exit 1; }
-            echo "::warning::pull of the Vault image failed (attempt $i)"; sleep $((i * 20))
+          # ECR Public rate-limits anonymous pulls from shared runners ("toomanyrequests", "Data limit
+          # exceeded"). The same image, by the same digest, is on Docker Hub: try each registry in turn,
+          # a few times. Pinning the digest means a mirror can never serve different bytes.
+          DIGEST="${VAULT_IMAGE#*@}"
+          image=""
+          for i in 1 2 3; do
+            for ref in "$VAULT_IMAGE" "docker.io/hashicorp/vault@$DIGEST"; do
+              if docker pull -q "$ref"; then image="$ref"; break 2; fi
+              echo "::warning::pull of $ref failed (attempt $i)"
+            done
+            sleep $((i * 20))
           done
-          docker run -d --name vault --cap-add=IPC_LOCK -p 127.0.0.1:8200:8200 "$VAULT_IMAGE" \
+          [ -n "$image" ] || { echo "::error::could not pull the Vault image ($DIGEST) from any registry"; exit 1; }
+          docker run -d --name vault --cap-add=IPC_LOCK -p 127.0.0.1:8200:8200 "$image" \
             server -dev -dev-listen-address=0.0.0.0:8200 -dev-root-token-id="$ALEDGENT_TEST_VAULT_TOKEN"
           for _ in $(seq 1 60); do
             curl -sf "$ALEDGENT_TEST_VAULT/v1/sys/health" >/dev/null && break
