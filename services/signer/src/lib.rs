@@ -52,3 +52,8 @@ pub mod kms;
 pub mod server;
 #[cfg(feature = "server")]
 pub mod vault;
+
+pub mod vault_config;
+
+#[cfg(feature = "vault-session")]
+pub mod vault_session;

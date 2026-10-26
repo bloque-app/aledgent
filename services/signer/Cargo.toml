@@ -20,10 +20,15 @@ default = ["server", "vault", "kms"]
 # The service itself: the listener, the backends and the configuration. Clients (the core host,
 # ingress, the adapter) depend on this crate without it: they link the protocol and the client only.
 server = ["dep:tokio", "dep:tracing", "dep:tracing-subscriber", "dep:sha2", "dep:subtle"]
+# The session with Vault that the signer's KV reads and a component's Vault Transit engine share
+# (F-042): the login under AWS IAM auth (signed with the instance's or task's role), the token's
+# lifecycle and the retries. It does not imply `server`: ingress links it for its feed key and not the
+# signer's listener or the KMS SDK.
+vault-session = ["dep:tokio", "dep:tracing", "dep:aws-config", "dep:aws-credential-types", "dep:aws-sigv4", "dep:aws-smithy-runtime-api", "dep:reqwest", "dep:base64"]
 # Vault (the default key source, owner ruling `key-custody-opt-in-kms`): a KV v1 read after a login
 # under AWS IAM auth, signed with the instance's or task's role. Without it, a `vault` key source
 # fails the start.
-vault = ["server", "dep:aws-config", "dep:aws-credential-types", "dep:aws-sigv4", "dep:aws-smithy-runtime-api", "dep:reqwest", "dep:base64"]
+vault = ["server", "vault-session"]
 # AWS KMS, opt-in per key, for secp256k1 lane and anchor keys only. Without it, a `kms` key source
 # fails the start.
 kms = ["server", "dep:aws-config", "dep:aws-sdk-kms"]
