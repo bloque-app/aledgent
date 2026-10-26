@@ -37,13 +37,13 @@ use crate::proto::Scheme;
 
 /// A key a component needs: its name in the configuration, its scheme, and the kinds of engine it may use.
 #[derive(Clone, Copy, Debug)]
-pub struct KeyNeed {
+pub struct KeyNeed<'a> {
     /// The name in the configuration's `keys`.
-    pub name: &'static str,
+    pub name: &'a str,
     /// Its scheme.
     pub scheme: Scheme,
     /// The engine kinds it may use.
-    pub kinds: &'static [EngineKind],
+    pub kinds: &'a [EngineKind],
 }
 
 /// How a kind connects: its configuration, and whether development is allowed.
@@ -158,7 +158,7 @@ struct Entry {
 
 /// One key of the component, resolved offline.
 struct Resolved<'a> {
-    need: &'a KeyNeed,
+    need: &'a KeyNeed<'a>,
     engine_name: String,
     kind: &'static KindInfo,
     engine_config: &'a Value,
@@ -168,7 +168,7 @@ struct Resolved<'a> {
 fn resolve<'a>(
     registry: &Registry,
     section: &Section<'a>,
-    need: &'a KeyNeed,
+    need: &'a KeyNeed<'a>,
     development: bool,
 ) -> Result<Resolved<'a>, String> {
     let at = format!("keys.{}", need.name);
@@ -232,7 +232,7 @@ fn resolve<'a>(
 pub fn check(
     registry: &Registry,
     section: &Section,
-    needs: &[KeyNeed],
+    needs: &[KeyNeed<'_>],
     development: bool,
 ) -> Result<(), String> {
     for need in needs {
@@ -243,7 +243,7 @@ pub fn check(
 
 /// The component's keys, open.
 pub struct OpenKeys {
-    handles: BTreeMap<&'static str, Arc<dyn KeyHandle>>,
+    handles: BTreeMap<String, Arc<dyn KeyHandle>>,
     engines: Vec<Arc<dyn Engine>>,
 }
 
@@ -273,7 +273,7 @@ impl OpenKeys {
 pub fn open(
     registry: &Registry,
     section: &Section,
-    needs: &[KeyNeed],
+    needs: &[KeyNeed<'_>],
     development: bool,
 ) -> Result<OpenKeys, String> {
     let mut connected: BTreeMap<String, Arc<dyn Engine>> = BTreeMap::new();
@@ -292,7 +292,7 @@ pub fn open(
         let h = engine
             .open(r.need.scheme, &r.locator)
             .map_err(|e| format!("keys.{}: {e}", need.name))?;
-        handles.insert(need.name, h);
+        handles.insert(need.name.to_owned(), h);
     }
     Ok(OpenKeys {
         handles,

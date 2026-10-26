@@ -51,6 +51,9 @@ pub enum KeySource {
         /// The key's identifier in the signer's configuration.
         key: String,
     },
+    /// A key entry of the file's `keys` (`F-042`): `{ "engine": "<name>", "key": { … } }`, on an engine
+    /// declared in `engines`. It may use the sidecar only, as the signer's keys do.
+    Engine(String),
 }
 
 /// The adapter's configuration.
@@ -345,6 +348,13 @@ pub struct ProcessConfig {
     /// The signer service (`F-035`): required when a key's source is [`KeySource::Signer`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signer: Option<signer::client::SignerEndpoint>,
+    /// The signature engines the keys use (`F-042`), by name: `{ "<kind>": { … } }`. Read only for the
+    /// keys a source names with [`KeySource::Engine`].
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub engines: std::collections::BTreeMap<String, serde_json::Value>,
+    /// The key entries ([`KeySource::Engine`] names them): `{ "engine": "<name>", "key": { … } }`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub keys: std::collections::BTreeMap<String, serde_json::Value>,
     /// Whether a key may come from a file or the environment (`KeySource::File`,
     /// `KeySource::Env`): development and the canary only. Without it, such a key fails the
     /// start (`NFR-8`: settlement-layer key material is never readable from a process
@@ -377,6 +387,18 @@ pub fn default_contracts_pallet() -> String {
     "Contracts".into()
 }
 
+/// What the adapter needs of each key on an engine (`F-042`): a secp256k1 key, on the signer service.
+/// `NFR-8` says settlement-layer key material is held in a boundary that is separate from the book and
+/// can be audited separately, which only the sidecar is today (an in-process key in the adapter has no
+/// audit apart from the adapter's, and nothing else offers the scheme yet).
+pub fn engine_key_need(name: &str) -> signer::engine::config::KeyNeed<'_> {
+    signer::engine::config::KeyNeed {
+        name,
+        scheme: signer::proto::Scheme::Secp256k1,
+        kinds: &[signer::engine::EngineKind::Sidecar],
+    }
+}
+
 impl ProcessConfig {
     /// Check where the keys come from (`F-035`, `NFR-8`): a file or an environment variable only
     /// with [`ProcessConfig::development_keys`], a signer key only with [`ProcessConfig::signer`].
@@ -392,6 +414,7 @@ impl ProcessConfig {
         for s in sources {
             match s {
                 KeySource::Signer { .. } => wants_signer = true,
+                KeySource::Engine(_) => {}
                 KeySource::File(_) | KeySource::Env(_) if !self.development_keys => {
                     return Err(
                         "a key from a file or the environment is for development only (NFR-8): \
@@ -405,7 +428,48 @@ impl ProcessConfig {
         if wants_signer && self.signer.is_none() {
             return Err("a key of the signer service needs \"signer\"".into());
         }
+        let engine_keys = self.engine_key_names();
+        if !engine_keys.is_empty() {
+            if wants_signer {
+                return Err(
+                    "keys of the signer service (\"signer\") and keys on engines (\"engine\"): one \
+                     form (the form written before F-042, and the engines' form)"
+                        .into(),
+                );
+            }
+            let needs = engine_keys
+                .iter()
+                .map(|name| engine_key_need(name))
+                .collect::<Vec<_>>();
+            signer::engine::config::check(
+                &signer::engine::config::Registry::builtin(),
+                &self.engine_section(),
+                &needs,
+                self.profile == ingress::config::Profile::Development,
+            )?;
+        }
         Ok(wants_signer)
+    }
+
+    /// The key entries the lanes and the anchor name ([`KeySource::Engine`]).
+    pub fn engine_key_names(&self) -> Vec<String> {
+        self.adapter
+            .keys
+            .iter()
+            .chain(self.adapter.anchor_key.as_ref())
+            .filter_map(|k| match &k.device {
+                KeySource::Engine(name) => Some(name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The two maps of key entries.
+    pub fn engine_section(&self) -> signer::engine::config::Section<'_> {
+        signer::engine::config::Section {
+            engines: &self.engines,
+            keys: &self.keys,
+        }
     }
 
     /// Every deployment's contract, as `(instance, account)`; an error names one that is not 32
@@ -639,6 +703,77 @@ mod tests {
         });
         assert!(neither.ingress_token().is_err());
         assert!(neither.database_url().is_err());
+    }
+
+    /// `F-042`: the adapter's lane and anchor keys on an engine. A key entry on the sidecar checks in
+    /// production; an engine of another kind is refused for its kind (`NFR-8`: the adapter's keys are
+    /// held in a boundary that can be audited separately); a kind this build lacks is refused; and the
+    /// two forms are one or the other.
+    #[test]
+    fn f_042_the_adapters_keys_on_an_engine_may_use_the_sidecar_only() {
+        let mut c: ProcessConfig =
+            serde_json::from_str(include_str!("../../../deploy/templates/settle.json")).unwrap();
+        c.development_keys = false;
+        c.profile = ingress::config::Profile::Production;
+        c.adapter.anchor_key = None;
+        for k in c.adapter.keys.iter_mut() {
+            k.device = KeySource::Engine("lane-1".into());
+        }
+        let engines = |kind: serde_json::Value| {
+            [("e".to_owned(), kind)]
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        c.keys = [(
+            "lane-1".to_owned(),
+            serde_json::json!({ "engine": "e", "key": { "id": "lane-1" } }),
+        )]
+        .into_iter()
+        .collect();
+        c.engines = engines(serde_json::json!({ "sidecar": {
+            "socket": "/run/aledgent-signer/signer.sock", "client": "settle",
+            "token_file": "/etc/aledgent/signer_token" } }));
+        assert_eq!(c.check_key_sources(), Ok(false));
+        assert_eq!(c.engine_key_names().len(), c.adapter.keys.len());
+        // In process: the adapter's keys are not for it.
+        c.engines = engines(serde_json::json!({ "in_process": {} }));
+        c.keys.insert(
+            "lane-1".into(),
+            serde_json::json!({ "engine": "e", "key": { "file": "/k" } }),
+        );
+        let e = c.check_key_sources().unwrap_err();
+        assert!(
+            e.contains("keys.lane-1")
+                && e.contains("kind in_process")
+                && e.contains("may use: sidecar"),
+            "{e}"
+        );
+        // Transit: this build has none (the adapter holds no Vault credential).
+        c.engines = engines(serde_json::json!({ "vault_transit": {} }));
+        let e = c.check_key_sources().unwrap_err();
+        assert!(
+            e.contains("vault_transit") && e.contains("does not have"),
+            "{e}"
+        );
+        // The two forms.
+        c.engines = engines(serde_json::json!({ "sidecar": {
+            "socket": "/s", "client": "settle", "token_file": "/t" } }));
+        c.keys.insert(
+            "lane-1".into(),
+            serde_json::json!({ "engine": "e", "key": { "id": "lane-1" } }),
+        );
+        c.signer = Some(signer::client::SignerEndpoint {
+            socket: "/s".into(),
+            client: "settle".into(),
+            token_file: "/t".into(),
+            timeout_ms: None,
+        });
+        let mut other = c.adapter.keys[0].clone();
+        other.device = KeySource::Signer {
+            key: "other".into(),
+        };
+        c.adapter.keys.push(other);
+        assert!(c.check_key_sources().unwrap_err().contains("one form"));
     }
 
     /// The canary's template (`deploy/templates/settle.json`), its `<FILL …>` strings left as they

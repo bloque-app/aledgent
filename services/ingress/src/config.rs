@@ -971,7 +971,7 @@ impl DeploymentConfig {
     /// The core's keys as the engines' form gives them: `keys.key_ring`, `keys.clerk` (optional),
     /// `keys.agent_authority`, `keys.agent_package`. They are the sidecar's only
     /// ([`CORE_KEY_RING`]).
-    fn core_needs(&self) -> Vec<signer::engine::config::KeyNeed> {
+    fn core_needs(&self) -> Vec<signer::engine::config::KeyNeed<'static>> {
         let mut needs = vec![CORE_KEY_RING, CORE_AGENT_AUTHORITY, CORE_AGENT_PACKAGE];
         if self.keys.contains_key(CORE_CLERK.name) {
             needs.push(CORE_CLERK);
