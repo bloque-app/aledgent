@@ -75,41 +75,7 @@ pub struct Config {
     pub vault: Option<VaultConfig>,
 }
 
-/// Where Vault is and how the signer logs in (module documentation).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct VaultConfig {
-    /// Its address, `https://…` (an `http://` address is for development only).
-    pub address: String,
-    /// How the signer logs in.
-    pub auth: VaultAuth,
-}
-
-/// How the signer logs in to Vault.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub enum VaultAuth {
-    /// Vault's AWS auth method, `iam` type: an STS `GetCallerIdentity` signed with the process's
-    /// AWS credentials (the instance's or the ECS task's role), which Vault replays to STS.
-    AwsIam {
-        /// The auth method's mount (`auth/<mount>/login`).
-        mount: String,
-        /// The Vault role, bound to the instance or task role's ARN.
-        role: String,
-        /// The STS region the login is signed for. Required: there is no default, and a
-        /// configuration without it does not start.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        region: Option<String>,
-        /// The `X-Vault-AWS-IAM-Server-ID` value, if the mount requires one.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        server_id: Option<String>,
-    },
-    /// A Vault token in a file: development and tests only.
-    TokenFile {
-        /// The file.
-        path: PathBuf,
-    },
-}
+pub use crate::vault_config::{VaultAuth, VaultConfig};
 
 /// One caller.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -254,25 +220,7 @@ impl Config {
             }
         }
         if let Some(v) = &self.vault {
-            if matches!(v.auth, VaultAuth::TokenFile { .. }) && !self.development {
-                return Err(
-                    "vault: a token in a file is for development only (NFR-8); use aws_iam, or \
-                     set \"development\": true"
-                        .into(),
-                );
-            }
-            if !v.address.starts_with("https://") && !self.development {
-                return Err("vault: the address is https://".into());
-            }
-            if let VaultAuth::AwsIam { region, .. } = &v.auth
-                && !has_region(region)
-            {
-                return Err(
-                    "vault.auth.aws_iam: \"region\" is required, the AWS region the STS login is \
-                     signed for (e.g. \"us-east-1\"); there is no default"
-                        .into(),
-                );
-            }
+            v.check(self.development)?;
         }
         if let Some(m) = &self.socket_mode {
             u32::from_str_radix(m, 8).map_err(|_| format!("socket_mode {m}: octal"))?;

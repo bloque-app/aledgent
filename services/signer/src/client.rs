@@ -29,6 +29,8 @@ use ledger_kernel::keys::{Custody, KeyAnswer, KeyRequest};
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
+use crate::engine::sidecar::SidecarEngine;
+use crate::engine::{EngineKind, KeyHandle};
 use crate::proto::{self, Hello, KeyInfo, Op, Refusal, Request, Response, Scheme, Welcome};
 
 /// Where a caller finds the signer, as its own configuration names it. The token is read from a
@@ -89,7 +91,7 @@ pub enum ClientError {
     Io(String),
     /// The signer refused.
     Refused(Refusal),
-    /// The signer answered something this client cannot read.
+    /// The engine answered something this client cannot read.
     Protocol(String),
 }
 
@@ -107,9 +109,9 @@ impl core::fmt::Display for ClientError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             ClientError::Config(e) => write!(f, "signer client configuration: {e}"),
-            ClientError::Io(e) => write!(f, "the signer is unreachable: {e}"),
-            ClientError::Refused(r) => write!(f, "the signer refused: {r}"),
-            ClientError::Protocol(e) => write!(f, "the signer's answer is unreadable: {e}"),
+            ClientError::Io(e) => write!(f, "the engine is unreachable: {e}"),
+            ClientError::Refused(r) => write!(f, "the engine refused: {r}"),
+            ClientError::Protocol(e) => write!(f, "the engine's answer is unreadable: {e}"),
         }
     }
 }
@@ -314,11 +316,42 @@ impl Patience {
     }
 }
 
-/// The core's key ring behind the signer: a [`Custody`] (`F-035`). Public keys are cached; every
+/// A handle of an API provider is used through `try_*`: a patience that stops the process would
+/// retry the engine's own bounded retries for a minute and then end the process (`F-042`).
+fn patience_fits(handle: &dyn KeyHandle, patience: Patience) -> Result<(), ClientError> {
+    if handle.kind() == EngineKind::ApiProvider && patience.on_failure == OnFailure::Exit {
+        return Err(ClientError::Config(
+            "a key held by an API provider is used through try_* only: a patience that stops the \
+             process would retry the provider's own retries and then end the process"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn handle_of(
+    handle: Arc<dyn KeyHandle>,
+    scheme: Scheme,
+) -> Result<Arc<dyn KeyHandle>, ClientError> {
+    if handle.scheme() == scheme {
+        Ok(handle)
+    } else {
+        Err(ClientError::Refused(Refusal::WrongScheme))
+    }
+}
+
+fn sidecar_key(
+    client: Arc<SignerClient>,
+    key: &str,
+    scheme: Scheme,
+) -> Result<Arc<dyn KeyHandle>, ClientError> {
+    Ok(SidecarEngine::new(client).handle(key, scheme)? as Arc<dyn KeyHandle>)
+}
+
+/// The core's key ring behind an engine: a [`Custody`] (`F-035`). Public keys are cached; every
 /// signature and blinding is asked.
 pub struct RemoteCustody {
-    client: Arc<SignerClient>,
-    key: String,
+    handle: Arc<dyn KeyHandle>,
     patience: Patience,
     public: Mutex<HashMap<Vec<u8>, KeyAnswer>>,
 }
@@ -330,10 +363,18 @@ impl RemoteCustody {
         key: &str,
         patience: Patience,
     ) -> Result<RemoteCustody, ClientError> {
-        client.key_of(key, Scheme::KeyRing)?;
+        RemoteCustody::from_key(sidecar_key(client, key, Scheme::KeyRing)?, patience)
+    }
+
+    /// The key ring `handle`, of any engine that offers one.
+    pub fn from_key(
+        handle: Arc<dyn KeyHandle>,
+        patience: Patience,
+    ) -> Result<RemoteCustody, ClientError> {
+        let handle = handle_of(handle, Scheme::KeyRing)?;
+        patience_fits(&*handle, patience)?;
         Ok(RemoteCustody {
-            client,
-            key: key.to_owned(),
+            handle,
             patience,
             public: Mutex::new(HashMap::new()),
         })
@@ -341,7 +382,7 @@ impl RemoteCustody {
 
     /// [`Custody::answer`], with the error.
     pub fn try_answer(&self, request: &KeyRequest) -> Result<KeyAnswer, ClientError> {
-        let bytes = self.client.call(&self.key, Op::KeyRing(request.encode()))?;
+        let bytes = self.handle.call(&Op::KeyRing(request.encode()))?;
         KeyAnswer::decode(&bytes).ok_or_else(|| ClientError::Protocol("not a key answer".into()))
     }
 }
@@ -381,10 +422,9 @@ fn fixed<const N: usize>(bytes: &[u8]) -> Result<[u8; N], ClientError> {
         .map_err(|_| ClientError::Protocol(format!("expected {N} bytes, got {}", bytes.len())))
 }
 
-/// The clerk key behind the signer: a [`ClerkSigner`] (`F-017`, `F-035`).
+/// The clerk key behind an engine: a [`ClerkSigner`] (`F-017`, `F-035`).
 pub struct RemoteClerk {
-    client: Arc<SignerClient>,
-    key: String,
+    handle: Arc<dyn KeyHandle>,
     public: [u8; 32],
     patience: Patience,
 }
@@ -396,18 +436,26 @@ impl RemoteClerk {
         key: &str,
         patience: Patience,
     ) -> Result<RemoteClerk, ClientError> {
-        let info = client.key_of(key, Scheme::Clerk)?;
+        RemoteClerk::from_key(sidecar_key(client, key, Scheme::Clerk)?, patience)
+    }
+
+    /// The clerk key `handle`, of any engine that offers one.
+    pub fn from_key(
+        handle: Arc<dyn KeyHandle>,
+        patience: Patience,
+    ) -> Result<RemoteClerk, ClientError> {
+        let handle = handle_of(handle, Scheme::Clerk)?;
+        patience_fits(&*handle, patience)?;
         Ok(RemoteClerk {
-            public: fixed(&info.public)?,
-            client,
-            key: key.to_owned(),
+            public: fixed(&handle.public())?,
+            handle,
             patience,
         })
     }
 
     /// [`ClerkSigner::sign`], with the error.
     pub fn try_sign(&self, msg: &[u8]) -> Result<[u8; 64], ClientError> {
-        fixed(&self.client.call(&self.key, Op::Sign(msg.to_vec()))?)
+        fixed(&self.handle.call(&Op::Sign(msg.to_vec()))?)
     }
 }
 
@@ -421,10 +469,10 @@ impl ClerkSigner for RemoteClerk {
     }
 }
 
-/// An Ed25519 key behind the signer: the core host's Agent authority and package keys.
+/// An Ed25519 key behind an engine: the core host's Agent authority and package keys, and ingress's
+/// feed key.
 pub struct RemoteEd25519 {
-    client: Arc<SignerClient>,
-    key: String,
+    handle: Arc<dyn KeyHandle>,
     public: ed25519_dalek::VerifyingKey,
     patience: Patience,
 }
@@ -436,12 +484,21 @@ impl RemoteEd25519 {
         key: &str,
         patience: Patience,
     ) -> Result<RemoteEd25519, ClientError> {
-        let info = client.key_of(key, Scheme::Ed25519)?;
-        let public = ed25519_dalek::VerifyingKey::from_bytes(&fixed(&info.public)?)
+        RemoteEd25519::from_key(sidecar_key(client, key, Scheme::Ed25519)?, patience)
+    }
+
+    /// The Ed25519 key `handle`, of any engine that offers one. A key held by an API provider is used
+    /// through [`RemoteEd25519::try_sign`] with a patience that does not stop the process.
+    pub fn from_key(
+        handle: Arc<dyn KeyHandle>,
+        patience: Patience,
+    ) -> Result<RemoteEd25519, ClientError> {
+        let handle = handle_of(handle, Scheme::Ed25519)?;
+        patience_fits(&*handle, patience)?;
+        let public = ed25519_dalek::VerifyingKey::from_bytes(&fixed(&handle.public())?)
             .map_err(|_| ClientError::Protocol("not an Ed25519 public key".into()))?;
         Ok(RemoteEd25519 {
-            client,
-            key: key.to_owned(),
+            handle,
             public,
             patience,
         })
@@ -454,7 +511,7 @@ impl RemoteEd25519 {
 
     /// A signature over `msg`, checked against the public key before it is returned.
     pub fn try_sign(&self, msg: &[u8]) -> Result<[u8; 64], ClientError> {
-        let sig: [u8; 64] = fixed(&self.client.call(&self.key, Op::Sign(msg.to_vec()))?)?;
+        let sig: [u8; 64] = fixed(&self.handle.call(&Op::Sign(msg.to_vec()))?)?;
         self.public
             .verify_strict(msg, &ed25519_dalek::Signature::from_bytes(&sig))
             .map_err(|_| ClientError::Protocol("the signature does not verify".into()))?;
@@ -467,17 +524,16 @@ impl RemoteEd25519 {
     }
 }
 
-/// A secp256k1 key behind the signer: the adapter's lane and anchor keys (PASS device keys).
+/// A secp256k1 key behind an engine: the adapter's lane and anchor keys (PASS device keys).
 pub struct RemoteSecp256k1 {
-    client: Arc<SignerClient>,
-    key: String,
+    handle: Arc<dyn KeyHandle>,
     public: [u8; 33],
 }
 
 impl core::fmt::Debug for RemoteSecp256k1 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("RemoteSecp256k1")
-            .field("key", &self.key)
+            .field("key", &self.handle)
             .finish_non_exhaustive()
     }
 }
@@ -498,11 +554,15 @@ pub fn recover_secp256k1(digest: &[u8; 32], signature: &[u8; 65]) -> Option<[u8;
 impl RemoteSecp256k1 {
     /// The secp256k1 key `key` of `client`'s signer.
     pub fn new(client: Arc<SignerClient>, key: &str) -> Result<RemoteSecp256k1, ClientError> {
-        let info = client.key_of(key, Scheme::Secp256k1)?;
+        RemoteSecp256k1::from_key(sidecar_key(client, key, Scheme::Secp256k1)?)
+    }
+
+    /// The secp256k1 key `handle`, of any engine that offers one.
+    pub fn from_key(handle: Arc<dyn KeyHandle>) -> Result<RemoteSecp256k1, ClientError> {
+        let handle = handle_of(handle, Scheme::Secp256k1)?;
         Ok(RemoteSecp256k1 {
-            public: fixed(&info.public)?,
-            client,
-            key: key.to_owned(),
+            public: fixed(&handle.public())?,
+            handle,
         })
     }
 
@@ -514,7 +574,7 @@ impl RemoteSecp256k1 {
     /// A recoverable signature over `digest`, `r ‖ s ‖ v` with `s` low, checked to recover to
     /// this key before it is returned.
     pub fn sign_digest(&self, digest: [u8; 32]) -> Result<[u8; 65], ClientError> {
-        let sig: [u8; 65] = fixed(&self.client.call(&self.key, Op::SignDigest(digest))?)?;
+        let sig: [u8; 65] = fixed(&self.handle.call(&Op::SignDigest(digest))?)?;
         if recover_secp256k1(&digest, &sig) != Some(self.public) {
             return Err(ClientError::Protocol(
                 "the signature does not recover to the key".into(),

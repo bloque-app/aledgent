@@ -172,6 +172,71 @@ jobs:
         if: failure()
         run: docker logs minio | tail -n 60
 
+  # F-042: the Vault Transit engine against a real Vault in dev mode: a non-exportable Ed25519 key, two
+  # versions, a role's policy and real tokens (the lease, a revocation). The image is ECR Public's, not
+  # Docker Hub's (#220), pinned by digest: a missing image fails the job, it does not change what it tests.
+  vault-transit:
+    name: vault transit (F-042)
+    runs-on: ubuntu-latest
+    env:
+      VAULT_IMAGE: public.ecr.aws/hashicorp/vault:2.0.3@sha256:a296a888b118615dc01d5f1a6846e6d4a7277946caaed5b447008fff5fe06b54
+      # A dev-mode Vault in the runner, for this job's tests only: not a secret.
+      ALEDGENT_TEST_VAULT: http://127.0.0.1:8200
+      ALEDGENT_TEST_VAULT_TOKEN: aledgent-ci-dev-root
+      ALEDGENT_REQUIRE_VAULT_TEST: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: vault-transit
+      - name: Vault in dev mode, with Transit and a non-exportable Ed25519 key
+        run: |
+          set -eu
+          # ECR Public rate-limits anonymous pulls from shared runners ("toomanyrequests"): retry, then
+          # fail; the digest-pinned image is never swapped for another.
+          for i in 1 2 3 4 5 6; do
+            docker pull -q "$VAULT_IMAGE" && break
+            [ "$i" = 6 ] && { echo "::error::could not pull $VAULT_IMAGE"; exit 1; }
+            echo "::warning::pull of the Vault image failed (attempt $i)"; sleep $((i * 20))
+          done
+          docker run -d --name vault --cap-add=IPC_LOCK -p 127.0.0.1:8200:8200 "$VAULT_IMAGE" \
+            server -dev -dev-listen-address=0.0.0.0:8200 -dev-root-token-id="$ALEDGENT_TEST_VAULT_TOKEN"
+          for _ in $(seq 1 60); do
+            curl -sf "$ALEDGENT_TEST_VAULT/v1/sys/health" >/dev/null && break
+            sleep 1
+          done
+          curl -sf "$ALEDGENT_TEST_VAULT/v1/sys/health" | head -c 300; echo
+          vault_api() {
+            curl -sf -H "X-Vault-Token: $ALEDGENT_TEST_VAULT_TOKEN" -X POST -d "$2" "$ALEDGENT_TEST_VAULT/v1/$1"
+          }
+          vault_api sys/mounts/transit '{"type":"transit"}'
+          vault_api transit/keys/lane-1 '{"type":"ed25519","exportable":false}'
+      # The test-only login (`test-vault-auth`) is what lets these tests log in to a dev-mode Vault. The
+      # AWS IAM login is never run against a real Vault here (dev mode cannot): a staging smoke test with a
+      # real role is required before a deployment uses Transit in production.
+      - run: cargo test -p signer --features test-vault-auth --test transit_e2e -- --nocapture
+      - name: Vault's log
+        if: failure()
+        run: docker logs vault | tail -n 60
+      # The test-only login must not be buildable into anything shipped. Three guards; the first two
+      # must be able to fail: (1) a release build with the feature is refused by the compiler; (2) no
+      # feature graph of the workspace's own builds (dev-dependencies excluded, never --all-features)
+      # enables it, and the same query sees it when asked for it; (3) no configuration names it (it is a
+      # constructor, not a login method), which the session's types show.
+      - name: the test-only login is not built into a release
+        run: |
+          set -u
+          out=$(cargo check --release -p signer --features test-vault-auth 2>&1) && {
+            echo "::error::a release build accepted test-vault-auth"; exit 1; }
+          echo "$out" | grep -q 'cannot be built without debug assertions' || {
+            echo "$out" | tail -n 20; echo "::error::the release build failed for another reason"; exit 1; }
+          n=$(cargo tree --workspace -e normal,build,features -i signer | grep -c 'test-vault-auth' || true)
+          [ "$n" = 0 ] || { echo "::error::the workspace's own feature graph enables test-vault-auth"; exit 1; }
+          m=$(cargo tree -p signer -F test-vault-auth -e normal,build,features -i signer | grep -c 'test-vault-auth' || true)
+          [ "$m" != 0 ] || { echo "::error::the feature-graph check does not see test-vault-auth: it cannot bite"; exit 1; }
+          echo "test-vault-auth: refused in a release, absent from the shipped feature graph"
+
   no-float:
     name: no floating point in crates
     runs-on: ubuntu-latest

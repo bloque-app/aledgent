@@ -157,10 +157,10 @@ const REMOTE_CORE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// log alone whether this instance speaks the new link or the legacy one.
 fn log_link(c: &DeploymentConfig) {
     let listen = c.stream.as_ref().and_then(|s| s.listen.as_deref());
-    let signed = c
-        .stream
-        .as_ref()
-        .is_some_and(|s| s.feed_key.is_some() || s.development_feed_key.is_some());
+    let signed = c.has_feed_key()
+        || c.stream
+            .as_ref()
+            .is_some_and(|s| s.development_feed_key.is_some());
     match (listen, c.forward_link(), c.core_endpoint.as_deref()) {
         (Some(listen), _, _) => tracing::info!(
             listen,
@@ -183,9 +183,7 @@ fn log_link(c: &DeploymentConfig) {
 
 async fn serve(args: &[String]) -> Result<(), String> {
     let c = config(args)?;
-    if let Some(s) = &c.stream {
-        s.check(c.profile)?;
-    }
+    c.check_stream()?;
     // F-038 §5, §12: in production, what goes to a core in another process on the new link is
     // signed; the legacy socket link (no `stream` section) neither signs nor needs a feed key.
     c.check_forward_signing()?;
@@ -193,7 +191,7 @@ async fn serve(args: &[String]) -> Result<(), String> {
     let store = connect(&c).await?;
     // F-038: the stream, when ingress listens for cores; the socket link otherwise.
     if let Some(s) = c.stream.clone().filter(|s| s.listen.is_some()) {
-        let signer = s.feed_signer(c.profile)?;
+        let signer = c.feed_signer()?;
         let listen = s.bind().await?.ok_or("stream.listen")?;
         let core = StreamCore::new(&c.replica, s.timings());
         let hub = core.clone();
@@ -214,10 +212,7 @@ async fn serve(args: &[String]) -> Result<(), String> {
         return run(c, store, core.clone(), signer, Some((core, drain))).await;
     }
     // The socket link signs too once a feed key is configured: the transition (`F-038` §12).
-    let signer = match &c.stream {
-        Some(s) => s.feed_signer(c.profile)?,
-        None => None,
-    };
+    let signer = c.feed_signer()?;
     if let Some(e) = &c.core_endpoint {
         let endpoint = Endpoint::parse(e)
             .ok_or_else(|| format!("core_endpoint {e}: unix:<path> or tcp:<addr>"))?;

@@ -1,0 +1,23 @@
+{
+  "engines": {
+    "vault": {
+      "vault_transit": {
+        "vault": {
+          "address": "https://vault.example.com",
+          "auth": {
+            "aws_iam": {
+              "mount": "aws",
+              "role": "ingress-feed-signer",
+              "region": "us-east-1",
+              "server_id": "vault.example.com"
+            }
+          }
+        },
+        "mount": "transit"
+      }
+    }
+  },
+  "keys": {
+    "feed": { "engine": "vault", "key": { "name": "lane-1", "version": 1 } }
+  }
+}

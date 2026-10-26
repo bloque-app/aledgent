@@ -20,11 +20,10 @@
 
 use std::sync::Arc;
 
-use ledger_core::anchor::clerk::{ClerkSigner, InProcessClerk};
-use ledger_kernel::keys::{Custody, KeyRequest, RootKeys};
 use zeroize::Zeroizing;
 
 use crate::config::{KeyConfig, KeySource};
+use crate::engine::in_process::{LocalKey, recoverable};
 use crate::kms::{Kms, spki_secp256k1};
 use crate::proto::{Op, Refusal, Scheme};
 use crate::vault::SecretStore;
@@ -39,10 +38,8 @@ pub struct Backends {
 }
 
 enum Backend {
-    KeyRing(RootKeys),
-    Clerk(InProcessClerk),
-    Ed25519(ed25519_dalek::SigningKey),
-    Secp256k1(k256::ecdsa::SigningKey),
+    /// A key held in this process: any scheme, answering synchronously (`crate::engine::in_process`).
+    Local(LocalKey),
     Secp256k1Kms {
         key_id: String,
         public: k256::ecdsa::VerifyingKey,
@@ -86,42 +83,13 @@ impl Key {
         secret: Zeroizing<Vec<u8>>,
         origin: &'static str,
     ) -> Result<Key, String> {
-        let bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
-            secret
-                .as_slice()
-                .try_into()
-                .map_err(|_| format!("key {id}: a secret is 32 bytes"))?,
-        );
-        let (backend, public) = match scheme {
-            Scheme::KeyRing => {
-                let r = RootKeys::new(*bytes);
-                let public = r.registrar_key().0.to_vec();
-                (Backend::KeyRing(r), public)
-            }
-            Scheme::Clerk => {
-                let c = InProcessClerk::from_secret(*bytes)
-                    .ok_or_else(|| format!("key {id}: not a canonical, non-zero scalar"))?;
-                let public = c.public_key().to_vec();
-                (Backend::Clerk(c), public)
-            }
-            Scheme::Ed25519 => {
-                let k = ed25519_dalek::SigningKey::from_bytes(&bytes);
-                let public = k.verifying_key().to_bytes().to_vec();
-                (Backend::Ed25519(k), public)
-            }
-            Scheme::Secp256k1 => {
-                let k = k256::ecdsa::SigningKey::from_slice(bytes.as_slice())
-                    .map_err(|_| format!("key {id}: not a secp256k1 secret"))?;
-                let public = compressed(k.verifying_key());
-                (Backend::Secp256k1(k), public)
-            }
-        };
+        let local = LocalKey::from_secret(id, scheme, secret)?;
         Ok(Key {
             id: id.to_owned(),
             scheme,
-            public,
+            public: local.public().to_vec(),
             origin,
-            backend,
+            backend: Backend::Local(local),
         })
     }
 
@@ -193,21 +161,7 @@ impl Key {
     pub async fn answer(&self, op: &Op) -> Result<Vec<u8>, Refusal> {
         match (op, &self.backend) {
             (Op::Public, _) => Ok(self.public.clone()),
-            (Op::KeyRing(r), Backend::KeyRing(root)) => {
-                let request = KeyRequest::decode(r).ok_or(Refusal::Malformed)?;
-                Ok(root.answer(&request).encode())
-            }
-            (Op::Sign(msg), Backend::Clerk(c)) => Ok(c.sign(msg).to_vec()),
-            (Op::Sign(msg), Backend::Ed25519(k)) => {
-                use ed25519_dalek::Signer as _;
-                Ok(k.sign(msg).to_bytes().to_vec())
-            }
-            (Op::SignDigest(d), Backend::Secp256k1(k)) => {
-                let (sig, rec) = k
-                    .sign_prehash_recoverable(d)
-                    .map_err(|_| Refusal::Malformed)?;
-                recoverable(sig, rec)
-            }
+            (_, Backend::Local(k)) => k.answer(op),
             (
                 Op::SignDigest(d),
                 Backend::Secp256k1Kms {
@@ -227,15 +181,6 @@ impl Key {
     }
 }
 
-fn recoverable(
-    sig: k256::ecdsa::Signature,
-    rec: k256::ecdsa::RecoveryId,
-) -> Result<Vec<u8>, Refusal> {
-    let mut out = sig.to_bytes().to_vec();
-    out.push(rec.to_byte());
-    Ok(out)
-}
-
 /// KMS's DER ECDSA signature over `digest` as the chain takes it: `s` made low, the recovery id
 /// found against `public` (`r ‖ s ‖ v`, 65 bytes).
 pub fn from_kms_der(
@@ -249,7 +194,7 @@ pub fn from_kms_der(
     let sig = sig.normalize_s().unwrap_or(sig);
     let rec = RecoveryId::trial_recovery_from_prehash(public, digest, &sig)
         .map_err(|_| bad("the signature does not recover to the key"))?;
-    recoverable(sig, rec)
+    Ok(recoverable(sig, rec))
 }
 
 #[cfg(test)]
@@ -257,6 +202,7 @@ mod tests {
     use super::*;
     use crate::client::recover_secp256k1;
     use crate::kms::testing::FakeKms;
+    use ledger_kernel::keys::RootKeys;
 
     fn kms() -> (Arc<FakeKms>, Arc<dyn Kms>) {
         let f = Arc::new(FakeKms::default());

@@ -42,6 +42,8 @@ fn lanes(config: &ProcessConfig, keys: &Keys) -> Result<Vec<Arc<dyn Signer>>, St
 /// are allowed (`F-035`).
 struct Keys {
     signer: Option<Arc<signer::client::SignerClient>>,
+    /// The keys on engines (`F-042`), open.
+    engines: Option<signer::engine::config::OpenKeys>,
     development: bool,
 }
 
@@ -54,8 +56,24 @@ impl Keys {
             )),
             _ => None,
         };
+        let names = config.engine_key_names();
+        let engines = if names.is_empty() {
+            None
+        } else {
+            let needs = names
+                .iter()
+                .map(|n| settle::config::engine_key_need(n))
+                .collect::<Vec<_>>();
+            Some(signer::engine::config::open(
+                &signer::engine::config::Registry::builtin(),
+                &config.engine_section(),
+                &needs,
+                config.profile == ingress::config::Profile::Development,
+            )?)
+        };
         Ok(Keys {
             signer,
+            engines,
             development: config.development_keys,
         })
     }
@@ -80,6 +98,16 @@ fn signer(k: &KeySource, keys: &Keys) -> Result<Arc<dyn Signer>, String> {
                 .ok_or("a key of the signer service needs \"signer\"")?;
             Ok(Arc::new(
                 ServiceSigner::new(Arc::clone(client), key).map_err(|e| e.to_string())?,
+            ))
+        }
+        KeySource::Engine(name) => {
+            let handle = keys
+                .engines
+                .as_ref()
+                .and_then(|e| e.handle(name))
+                .ok_or_else(|| format!("keys.{name}: not opened"))?;
+            Ok(Arc::new(
+                ServiceSigner::from_key(handle).map_err(|e| e.to_string())?,
             ))
         }
         KeySource::File(path) if keys.development => {

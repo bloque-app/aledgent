@@ -36,7 +36,7 @@
 //! **Keys** (`F-035`, guardrail 13, `NFR-8`): none in this process. The key ring (the root of
 //! every kernel key, blinding and nonce), the clerk key, the Agent's authority key and the
 //! runtime package key are the signer service's (`services/signer`), named by the deployment
-//! file's `core_keys`; this process holds their identifiers and public halves, and asks the
+//! file's `core_keys` (or its `keys`, each on the sidecar: `F-042`); this process holds their identifiers and public halves, and asks the
 //! signer for every signature, key and blinding over a Unix socket authenticated by peer
 //! credentials and a token read from a file. If the signer stops answering for a minute, or
 //! refuses, the process stops (fail closed): nothing half-done reaches the Agent. A key in the
@@ -76,7 +76,7 @@ use core_binding::host::{
 use core_binding::hot::{Hot, Limits, MAX_BUDGET, RingEntry};
 use ingress::config::{DeploymentConfig, ENV_CLERK_KEY, ENV_CORE_ROOT};
 use ingress::remote::Endpoint;
-use signer::client::{Patience, RemoteClerk, RemoteCustody, RemoteEd25519, SignerClient};
+use signer::client::{Patience, RemoteClerk, RemoteCustody, RemoteEd25519};
 use vos::agent_sdk::RuntimeState;
 
 use crate::driver::{AgentKeys, Runtime};
@@ -112,29 +112,33 @@ pub fn refuse_keys_in_environment() -> Result<(), String> {
 }
 
 /// The core's keys behind the signer service (`F-035`): the replica's and the clerk's, and the
-/// Agent's. Nothing here holds a secret.
+/// Agent's. Nothing here holds a secret. They are the deployment's `core_keys`, or its `keys` in the
+/// engines' form (`F-042`), where each of them may use the sidecar only: the core host holds no Vault
+/// or AWS credential, and no key material is in its process.
 pub fn signer_keys(
-    k: &ingress::config::CoreKeys,
+    config: &DeploymentConfig,
 ) -> Result<(core_binding::host::HostKeys, AgentKeys), String> {
-    let client = Arc::new(SignerClient::connect(&k.signer).map_err(|e| e.to_string())?);
+    let handles = config.core_key_handles()?.ok_or(
+        "core_keys is required (F-035), or keys.key_ring, keys.agent_authority and \
+         keys.agent_package (F-042): the signer service",
+    )?;
     let p = Patience::PRODUCTION;
-    let custody = RemoteCustody::new(Arc::clone(&client), &k.key_ring, p)
+    let custody = RemoteCustody::from_key(handles.key_ring, p)
         .map_err(|e| format!("core_keys.key_ring: {e}"))?;
-    let clerk = match &k.clerk {
-        Some(id) => Some(Arc::new(
-            RemoteClerk::new(Arc::clone(&client), id, p)
-                .map_err(|e| format!("core_keys.clerk: {e}"))?,
+    let clerk = match handles.clerk {
+        Some(h) => Some(Arc::new(
+            RemoteClerk::from_key(h, p).map_err(|e| format!("core_keys.clerk: {e}"))?,
         ) as core_binding::host::SharedClerk),
         None => None,
     };
-    let ed = |id: &str, what: &str| {
-        RemoteEd25519::new(Arc::clone(&client), id, p)
+    let ed = |h: Arc<dyn signer::engine::KeyHandle>, what: &str| {
+        RemoteEd25519::from_key(h, p)
             .map(|k| Arc::new(k) as crate::keys::SharedSigner)
             .map_err(|e| format!("core_keys.{what}: {e}"))
     };
     let agent = AgentKeys {
-        package: ed(&k.agent_package, "agent_package")?,
-        authority: ed(&k.agent_authority, "agent_authority")?,
+        package: ed(handles.agent_package, "agent_package")?,
+        authority: ed(handles.agent_authority, "agent_authority")?,
         discriminator: 0x40,
     };
     Ok((
@@ -475,11 +479,7 @@ pub fn setup(args: &[String]) -> Result<Setup, String> {
         serde_json::from_str(&text).map_err(|e| format!("{path}: {e}"))?;
     // F-035: no key in this process; the keys are the signer's.
     refuse_keys_in_environment()?;
-    let core_keys = config
-        .core_keys
-        .as_ref()
-        .ok_or_else(|| format!("{path}: core_keys is required (F-035): the signer service"))?;
-    let (host_keys, keys) = signer_keys(core_keys)?;
+    let (host_keys, keys) = signer_keys(&config).map_err(|e| format!("{path}: {e}"))?;
     let (genesis, op, at) = config.genesis.agent_genesis()?;
     let budget = match arg(args, "--budget") {
         Some(b) => b

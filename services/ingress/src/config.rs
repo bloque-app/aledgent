@@ -411,6 +411,17 @@ pub struct DeploymentConfig {
     /// its environment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub core_keys: Option<CoreKeys>,
+    /// The signature engines this deployment's components use (`F-042`), by name: each
+    /// `{ "<kind>": { … } }`, with `sidecar`, `in_process` or `vault_transit` for a kind. One file
+    /// serves several components, and each checks and builds only the engines its own keys name;
+    /// the rest stay unparsed.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub engines: std::collections::BTreeMap<String, serde_json::Value>,
+    /// The keys, each on an engine (`F-042`): ingress's `feed` here (`{ "engine": "<name>", "key":
+    /// { … } }`, the key's locator in that engine). Another component's keys in the same file are
+    /// neither parsed nor refused.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub keys: std::collections::BTreeMap<String, serde_json::Value>,
     /// The prior system's identifiers the initial state left out (`REQ-RC-7`, amendment 0024):
     /// the migration's `excluded.jsonl`, checked against the digest the book's chainspec commits
     /// (`T-036-29`). A request naming one is answered `ERR-IdentifierArchived` (410), for good
@@ -431,6 +442,72 @@ pub struct DeploymentConfig {
     /// `host:port`, apart from the client surface. Absent: not served.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readiness_listen: Option<String>,
+}
+
+/// Ingress's feed key as a component declares its needs (`F-042`): an Ed25519 key, on the signer
+/// service, in a key file, or in Vault Transit. It holds no book.
+pub const FEED_KEY: signer::engine::config::KeyNeed = signer::engine::config::KeyNeed {
+    name: "feed",
+    scheme: signer::proto::Scheme::Ed25519,
+    kinds: &[
+        signer::engine::EngineKind::Sidecar,
+        signer::engine::EngineKind::ApiProvider,
+        signer::engine::EngineKind::InProcess,
+    ],
+};
+
+/// The kinds of engine the core host's keys may use (`F-042`): the sidecar only. The key ring and
+/// the clerk, because only the sidecar and in-process offer their schemes; and the Agent's keys too,
+/// because the core host cannot reach Vault or AWS credentials (the node's metadata service is locked
+/// to it) and `NFR-8` bars key material in the book's process, so neither an API provider nor an
+/// in-process key is for it.
+const SIDECAR_ONLY: &[signer::engine::EngineKind] = &[signer::engine::EngineKind::Sidecar];
+
+/// The core host's key ring.
+pub const CORE_KEY_RING: signer::engine::config::KeyNeed = signer::engine::config::KeyNeed {
+    name: "key_ring",
+    scheme: signer::proto::Scheme::KeyRing,
+    kinds: SIDECAR_ONLY,
+};
+/// The core host's clerk key, if disclosures are issued.
+pub const CORE_CLERK: signer::engine::config::KeyNeed = signer::engine::config::KeyNeed {
+    name: "clerk",
+    scheme: signer::proto::Scheme::Clerk,
+    kinds: SIDECAR_ONLY,
+};
+/// The Agent's authority key (VOS receipts).
+pub const CORE_AGENT_AUTHORITY: signer::engine::config::KeyNeed = signer::engine::config::KeyNeed {
+    name: "agent_authority",
+    scheme: signer::proto::Scheme::Ed25519,
+    kinds: SIDECAR_ONLY,
+};
+/// The runtime package key.
+pub const CORE_AGENT_PACKAGE: signer::engine::config::KeyNeed = signer::engine::config::KeyNeed {
+    name: "agent_package",
+    scheme: signer::proto::Scheme::Ed25519,
+    kinds: SIDECAR_ONLY,
+};
+
+/// The key ring and the clerk key, open: what a process that opens the book without running the Agent
+/// needs (`opsctl restore-core`). The Agent's keys are not among them.
+pub struct HostKeyHandles {
+    /// The key ring.
+    pub key_ring: std::sync::Arc<dyn signer::engine::KeyHandle>,
+    /// The clerk key, if disclosures are issued.
+    pub clerk: Option<std::sync::Arc<dyn signer::engine::KeyHandle>>,
+}
+
+/// The core's keys, open (`F-042`): where they are is the deployment's `core_keys` (the signer
+/// service) or its `keys`, each on an engine.
+pub struct CoreKeyHandles {
+    /// The key ring.
+    pub key_ring: std::sync::Arc<dyn signer::engine::KeyHandle>,
+    /// The clerk key, if disclosures are issued.
+    pub clerk: Option<std::sync::Arc<dyn signer::engine::KeyHandle>>,
+    /// The Agent's authority key.
+    pub agent_authority: std::sync::Arc<dyn signer::engine::KeyHandle>,
+    /// The runtime package key.
+    pub agent_package: std::sync::Arc<dyn signer::engine::KeyHandle>,
 }
 
 /// The variable holding the core host's token for a stream over a Unix socket (`F-038`): its
@@ -539,6 +616,12 @@ impl StreamSection {
     /// Check the section for `profile` (`T-038-14`): every file a transport needs, a feed key for
     /// a production listener, a development key only in development, the keys a dialer checks.
     pub fn check(&self, profile: Profile) -> Result<(), String> {
+        self.check_with(profile, false)
+    }
+
+    /// [`StreamSection::check`], when the feed key may instead be the deployment's `keys.feed`
+    /// (`F-042`): `feed_key_in_keys` is whether the file gives it.
+    pub fn check_with(&self, profile: Profile, feed_key_in_keys: bool) -> Result<(), String> {
         if let Some(l) = &self.listen {
             match crate::stream::Address::parse(l)? {
                 crate::stream::Address::Tls(_) if self.tls.is_none() => {
@@ -549,10 +632,10 @@ impl StreamSection {
                 }
                 _ => {}
             }
-            if profile == Profile::Production && self.feed_key.is_none() {
+            if profile == Profile::Production && self.feed_key.is_none() && !feed_key_in_keys {
                 return Err(
-                    "stream.listen in production needs stream.feed_key: every forwarded command \
-                     is signed (F-038)"
+                    "stream.listen in production needs stream.feed_key or keys.feed: every \
+                     forwarded command is signed (F-038)"
                         .into(),
                 );
             }
@@ -850,6 +933,219 @@ impl DeploymentConfig {
         Ok(keys)
     }
 
+    /// Whether the file gives a feed key that goes through the signer service or an engine:
+    /// `stream.feed_key` (the form written before `F-042`) or `keys.feed`.
+    pub fn has_feed_key(&self) -> bool {
+        self.stream.as_ref().is_some_and(|s| s.feed_key.is_some())
+            || self.keys.contains_key(FEED_KEY.name)
+    }
+
+    fn engine_section(&self) -> signer::engine::config::Section<'_> {
+        signer::engine::config::Section {
+            engines: &self.engines,
+            keys: &self.keys,
+        }
+    }
+
+    /// Check the `stream` section and the feed key (`F-042`): the section as it was, and `keys.feed`
+    /// on its engine (a scheme the engine offers, a kind the key may use, a locator it accepts),
+    /// not given together with `stream.feed_key` or `stream.development_feed_key`. Only the keys
+    /// ingress declares are read; the rest of `engines` and `keys` is another component's.
+    pub fn check_stream(&self) -> Result<(), String> {
+        let in_keys = self.keys.contains_key(FEED_KEY.name);
+        if let Some(s) = &self.stream {
+            s.check_with(self.profile, in_keys)?;
+            if in_keys && s.feed_key.is_some() {
+                return Err(
+                    "keys.feed and stream.feed_key: one of them (the engines' form and the form \
+                     written before F-042)"
+                        .into(),
+                );
+            }
+            if in_keys && s.development_feed_key.is_some() {
+                return Err("keys.feed and stream.development_feed_key: one of them".into());
+            }
+        }
+        if in_keys && self.stream.is_some() {
+            signer::engine::config::check(
+                &signer::engine::config::Registry::builtin(),
+                &self.engine_section(),
+                &[FEED_KEY],
+                self.profile == Profile::Development,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The core's keys as the engines' form gives them: `keys.key_ring`, `keys.clerk` (optional),
+    /// `keys.agent_authority`, `keys.agent_package`. They are the sidecar's only
+    /// ([`CORE_KEY_RING`]).
+    fn core_needs(&self) -> Vec<signer::engine::config::KeyNeed<'static>> {
+        let mut needs = vec![CORE_KEY_RING, CORE_AGENT_AUTHORITY, CORE_AGENT_PACKAGE];
+        if self.keys.contains_key(CORE_CLERK.name) {
+            needs.push(CORE_CLERK);
+        }
+        needs
+    }
+
+    /// The keys a process that opens the book without running the Agent needs: the key ring, and the
+    /// clerk key when the file gives one. A deployment whose grants for that process are narrower than
+    /// the core host's (no Agent keys) must keep working.
+    pub fn host_needs(&self) -> Vec<signer::engine::config::KeyNeed<'static>> {
+        let mut needs = vec![CORE_KEY_RING];
+        if self.keys.contains_key(CORE_CLERK.name) {
+            needs.push(CORE_CLERK);
+        }
+        needs
+    }
+
+    /// Whether the file gives the core's keys in the engines' form.
+    fn core_keys_in_keys(&self) -> bool {
+        self.keys.contains_key(CORE_KEY_RING.name)
+    }
+
+    /// Check the core's keys (`F-042`): `core_keys` or `keys`, not both; in the engines' form, each
+    /// key on an engine that offers its scheme and is of the sidecar's kind. Only the keys the core
+    /// host declares are read; ingress's `feed` in the same file is not.
+    pub fn check_core_keys(&self) -> Result<(), String> {
+        if self.core_keys.is_some() && self.core_keys_in_keys() {
+            return Err(
+                "core_keys and keys.key_ring: one of them (the form written before F-042, and the \
+                 engines' form)"
+                    .into(),
+            );
+        }
+        if self.core_keys_in_keys() {
+            signer::engine::config::check(
+                &signer::engine::config::Registry::builtin(),
+                &self.engine_section(),
+                &self.core_needs(),
+                self.profile == Profile::Development,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The core's keys, open: connect to the signer (or the engines the file names) and open each
+    /// key. `None` when the file gives neither form. No key is read here: the handles hold
+    /// identifiers and public halves.
+    pub fn core_key_handles(&self) -> Result<Option<CoreKeyHandles>, String> {
+        use signer::proto::Scheme;
+        self.check_core_keys()?;
+        if let Some(k) = &self.core_keys {
+            let engine = signer::engine::sidecar::SidecarEngine::connect(&k.signer)
+                .map_err(|e| e.to_string())?;
+            let open = |id: &str, scheme: Scheme, what: &str| {
+                engine
+                    .handle(id, scheme)
+                    .map(|h| h as std::sync::Arc<dyn signer::engine::KeyHandle>)
+                    .map_err(|e| format!("core_keys.{what}: {e}"))
+            };
+            let clerk = match &k.clerk {
+                Some(id) => Some(open(id, Scheme::Clerk, "clerk")?),
+                None => None,
+            };
+            return Ok(Some(CoreKeyHandles {
+                key_ring: open(&k.key_ring, Scheme::KeyRing, "key_ring")?,
+                clerk,
+                agent_authority: open(&k.agent_authority, Scheme::Ed25519, "agent_authority")?,
+                agent_package: open(&k.agent_package, Scheme::Ed25519, "agent_package")?,
+            }));
+        }
+        if !self.core_keys_in_keys() {
+            return Ok(None);
+        }
+        let needs = self.core_needs();
+        let opened = signer::engine::config::open(
+            &signer::engine::config::Registry::builtin(),
+            &self.engine_section(),
+            &needs,
+            self.profile == Profile::Development,
+        )?;
+        let get = |n: &str| {
+            opened
+                .handle(n)
+                .ok_or_else(|| format!("keys.{n}: not opened"))
+        };
+        Ok(Some(CoreKeyHandles {
+            key_ring: get(CORE_KEY_RING.name)?,
+            clerk: opened.handle(CORE_CLERK.name),
+            agent_authority: get(CORE_AGENT_AUTHORITY.name)?,
+            agent_package: get(CORE_AGENT_PACKAGE.name)?,
+        }))
+    }
+
+    /// The key ring and the clerk key only, open (`opsctl restore-core`): the same two keys it opened
+    /// before `F-042` and no others, whichever form the file is in. `None` when the file gives neither
+    /// form. In the form written before `F-042` it opens the key ring and, if named, the clerk, and
+    /// does not touch `agent_authority` or `agent_package`; in the engines' form only the keys of
+    /// [`DeploymentConfig::host_needs`] are checked and opened.
+    pub fn host_key_handles(&self) -> Result<Option<HostKeyHandles>, String> {
+        use signer::proto::Scheme;
+        if self.core_keys.is_some() && self.core_keys_in_keys() {
+            return Err("core_keys and keys.key_ring: one of them".into());
+        }
+        if let Some(k) = &self.core_keys {
+            let engine = signer::engine::sidecar::SidecarEngine::connect(&k.signer)
+                .map_err(|e| e.to_string())?;
+            let open = |id: &str, scheme: Scheme, what: &str| {
+                engine
+                    .handle(id, scheme)
+                    .map(|h| h as std::sync::Arc<dyn signer::engine::KeyHandle>)
+                    .map_err(|e| format!("core_keys.{what}: {e}"))
+            };
+            let clerk = match &k.clerk {
+                Some(id) => Some(open(id, Scheme::Clerk, "clerk")?),
+                None => None,
+            };
+            return Ok(Some(HostKeyHandles {
+                key_ring: open(&k.key_ring, Scheme::KeyRing, "key_ring")?,
+                clerk,
+            }));
+        }
+        if !self.core_keys_in_keys() {
+            return Ok(None);
+        }
+        let needs = self.host_needs();
+        let opened = signer::engine::config::open(
+            &signer::engine::config::Registry::builtin(),
+            &self.engine_section(),
+            &needs,
+            self.profile == Profile::Development,
+        )?;
+        Ok(Some(HostKeyHandles {
+            key_ring: opened
+                .handle(CORE_KEY_RING.name)
+                .ok_or("keys.key_ring: not opened")?,
+            clerk: opened.handle(CORE_CLERK.name),
+        }))
+    }
+
+    /// Ingress's feed signer (`F-038` §5): `keys.feed` opened on its engine, or the form written
+    /// before `F-042`, or a development file, or none (the legacy link, which signs nothing).
+    pub fn feed_signer(&self) -> Result<Option<crate::service::SharedFeedSigner>, String> {
+        let Some(stream) = &self.stream else {
+            return Ok(None);
+        };
+        self.check_stream()?;
+        if self.keys.contains_key(FEED_KEY.name) {
+            let opened = signer::engine::config::open(
+                &signer::engine::config::Registry::builtin(),
+                &self.engine_section(),
+                &[FEED_KEY],
+                self.profile == Profile::Development,
+            )?;
+            let handle = opened
+                .handle(FEED_KEY.name)
+                .ok_or("keys.feed: not opened")?;
+            let key = crate::feed::EngineFeedKey::new(handle, opened)?;
+            return Ok(Some(crate::service::SharedFeedSigner(std::sync::Arc::new(
+                key,
+            ))));
+        }
+        stream.feed_signer(self.profile)
+    }
+
     /// Check that ingress signs what it forwards to a core in another process (`F-038` §5, §12):
     /// in production, an ingress on `core_endpoint` with the new link configured (a `stream`
     /// section, [`DeploymentConfig::forward_link`]) needs `stream.feed_key`, as one with
@@ -857,7 +1153,7 @@ impl DeploymentConfig {
     /// unsigned inputs. Without a `stream` section ingress forwards on the legacy link, which
     /// carries no feed and no signature, and needs no feed key (`F-038` §12 step 0).
     pub fn check_forward_signing(&self) -> Result<(), String> {
-        let signs = self.stream.as_ref().is_some_and(|s| s.feed_key.is_some());
+        let signs = self.has_feed_key();
         let sequenced = self.forward_link() == crate::service::ForwardLink::Sequenced;
         if self.profile == Profile::Production
             && self.core_endpoint.is_some()
@@ -1126,6 +1422,232 @@ pub fn secret_hex32(var: &str) -> Result<[u8; 32], String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The deployment template with its numbers filled, as JSON.
+    fn template() -> serde_json::Value {
+        serde_json::from_str(&fill_numbers(include_str!(
+            "../../../deploy/templates/ingress.json"
+        )))
+        .unwrap()
+    }
+
+    fn deployment(v: serde_json::Value) -> DeploymentConfig {
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// `F-042`: the feed key on an engine. The example (`ingress-feed-key-transit.json`) put in the
+    /// template's place checks in production, with `stream.feed_key` taken out; the kind and the
+    /// scheme are checked; `keys.feed` and `stream.feed_key` are one or the other; and an in-process
+    /// key is a file, never the environment.
+    #[test]
+    fn f_042_the_feed_key_is_on_an_engine_and_the_check_reads_only_ingresss_keys() {
+        let example: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../deploy/templates/ingress-feed-key-transit.json"
+        ))
+        .unwrap();
+        let with = |edit: &dyn Fn(&mut serde_json::Value)| {
+            let mut v = template();
+            v["stream"].as_object_mut().unwrap().remove("feed_key");
+            v["engines"] = example["engines"].clone();
+            v["keys"] = example["keys"].clone();
+            edit(&mut v);
+            deployment(v)
+        };
+        // The example, in production.
+        assert_eq!(with(&|_| {}).check_stream(), Ok(()));
+        assert!(with(&|_| {}).has_feed_key());
+        // Another component's keys in the same file are neither parsed nor refused.
+        let c = with(&|v| {
+            v["keys"]["key_ring"] = serde_json::json!({ "engine": "ghost", "key": 7 });
+            v["engines"]["elsewhere"] = serde_json::json!({ "no_such_kind": {} });
+        });
+        assert_eq!(c.check_stream(), Ok(()));
+        // Both forms of the feed key: refused.
+        let both = with(&|v| {
+            v["stream"]["feed_key"] = serde_json::json!({
+                "signer": { "socket": "/run/signer.sock", "client": "ingress", "token_file": "/t" },
+                "key": "ingress-feed",
+            });
+        });
+        assert!(both.check_stream().unwrap_err().contains("one of them"));
+        // An engine that is not declared, an http:// Vault in production, a version not pinned.
+        let e = with(&|v| v["keys"]["feed"]["engine"] = "ghost".into())
+            .check_stream()
+            .unwrap_err();
+        assert!(e.contains("keys.feed") && e.contains("not declared"), "{e}");
+        let e = with(&|v| {
+            v["engines"]["vault"]["vault_transit"]["vault"]["address"] = "http://v".into()
+        })
+        .check_stream()
+        .unwrap_err();
+        assert!(e.contains("https"), "{e}");
+        let e = with(&|v| {
+            v["keys"]["feed"]["key"]
+                .as_object_mut()
+                .unwrap()
+                .remove("version");
+        })
+        .check_stream()
+        .unwrap_err();
+        assert!(e.contains("pin the key version"), "{e}");
+        // In process: a file is accepted in production; the environment is not an option anywhere.
+        let file = |v: &mut serde_json::Value| {
+            v["engines"] = serde_json::json!({ "files": { "in_process": {} } });
+            v["keys"] = serde_json::json!({ "feed": { "engine": "files", "key": { "file": "/etc/feed.key" } } });
+        };
+        assert_eq!(with(&file).check_stream(), Ok(()));
+        let env = with(&|v| {
+            file(v);
+            v["keys"]["feed"]["key"] = serde_json::json!({ "env": "FEED_KEY" });
+        });
+        assert!(env.check_stream().unwrap_err().contains("env"));
+        // The old form, alone, still checks.
+        let mut old = template();
+        old["keys"] = serde_json::Value::Null;
+        old.as_object_mut().unwrap().remove("keys");
+        assert_eq!(deployment(old).check_stream(), Ok(()));
+    }
+
+    /// `F-042`: the core host's keys may use the sidecar only. Transit for the key ring is refused for
+    /// its scheme, Transit for an Agent key and an in-process key for the key ring are refused for their
+    /// kind, the two forms are one or the other, and the core host loads the file in which ingress's
+    /// feed key is on Transit without reading that entry.
+    #[test]
+    fn f_042_the_core_hosts_keys_may_use_the_sidecar_only() {
+        let sidecar = serde_json::json!({ "sidecar": {
+            "socket": "/run/aledgent-signer/signer.sock", "client": "core",
+            "token_file": "/etc/aledgent/core-signer.token" } });
+        let transit = serde_json::json!({ "vault_transit": {
+            "vault": { "address": "https://vault.example",
+                       "auth": { "aws_iam": { "mount": "aws", "role": "r", "region": "us-east-1" } } },
+            "mount": "transit" } });
+        let base = || {
+            let mut v = template();
+            v.as_object_mut().unwrap().remove("core_keys");
+            v["engines"] = serde_json::json!({ "local": sidecar, "vault": transit, "files": { "in_process": {} } });
+            v["keys"] = serde_json::json!({
+                "key_ring": { "engine": "local", "key": { "id": "keyring" } },
+                "clerk": { "engine": "local", "key": { "id": "clerk" } },
+                "agent_authority": { "engine": "local", "key": { "id": "agent-authority" } },
+                "agent_package": { "engine": "local", "key": { "id": "agent-package" } },
+                // Ingress's, on Transit, in the same file.
+                "feed": { "engine": "vault", "key": { "name": "lane-1", "version": 1 } },
+            });
+            v
+        };
+        let check = |edit: &dyn Fn(&mut serde_json::Value)| {
+            let mut v = base();
+            edit(&mut v);
+            deployment(v).check_core_keys()
+        };
+        // The core host loads a file whose feed key is on Transit, and ingress's engines are not its own.
+        assert_eq!(check(&|_| {}), Ok(()));
+        // Transit lacks the key ring's scheme.
+        let e = check(&|v| v["keys"]["key_ring"]["engine"] = "vault".into()).unwrap_err();
+        assert!(
+            e.contains("keys.key_ring") && e.contains("does not offer"),
+            "{e}"
+        );
+        // Transit has Ed25519, but not for the Agent's keys.
+        let e = check(&|v| v["keys"]["agent_authority"]["engine"] = "vault".into()).unwrap_err();
+        assert!(
+            e.contains("keys.agent_authority")
+                && e.contains("kind api_provider")
+                && e.contains("may use: sidecar"),
+            "{e}"
+        );
+        let e = check(&|v| v["keys"]["agent_package"]["engine"] = "files".into()).unwrap_err();
+        assert!(
+            e.contains("keys.agent_package") && e.contains("kind in_process"),
+            "{e}"
+        );
+        let e = check(&|v| v["keys"]["key_ring"]["engine"] = "files".into()).unwrap_err();
+        assert!(
+            e.contains("keys.key_ring") && e.contains("kind in_process"),
+            "{e}"
+        );
+        // An engine of a kind this build lacks, named by one of the core host's own keys.
+        let e = check(&|v| {
+            v["engines"]["local"] = serde_json::json!({ "no_such_kind": {} });
+        })
+        .unwrap_err();
+        assert!(
+            e.contains("keys.key_ring") && e.contains("no_such_kind"),
+            "{e}"
+        );
+        // A key it needs and the file does not give.
+        let e = check(&|v| {
+            v["keys"].as_object_mut().unwrap().remove("agent_package");
+        })
+        .unwrap_err();
+        assert!(e.contains("keys.agent_package: not given"), "{e}");
+        // The form written before F-042 and the engines' form: one or the other.
+        let e = check(&|v| {
+            v["core_keys"] = serde_json::json!({
+                "signer": { "socket": "/s", "client": "core", "token_file": "/t" },
+                "key_ring": "keyring", "agent_authority": "a", "agent_package": "p",
+            });
+        })
+        .unwrap_err();
+        assert!(e.contains("one of them"), "{e}");
+        // The form written before F-042, alone, still checks.
+        assert_eq!(deployment(template()).check_core_keys(), Ok(()));
+        assert!(deployment(template()).core_keys.is_some());
+    }
+
+    /// `F-042`: `opsctl restore-core` opens the key ring and the clerk key and no other. The keys it
+    /// needs are pinned here, and a file that gives it no Agent keys (narrower grants than the core
+    /// host's) still serves it, in the engines' form.
+    #[test]
+    fn f_042_opsctl_needs_the_key_ring_and_the_clerk_key_and_no_others() {
+        let sidecar = serde_json::json!({ "sidecar": {
+            "socket": "/run/aledgent-signer/signer.sock", "client": "ops", "token_file": "/t" } });
+        let file = |with_clerk: bool, with_agent_keys: bool| {
+            let mut v = template();
+            v.as_object_mut().unwrap().remove("core_keys");
+            v["engines"] = serde_json::json!({ "local": sidecar });
+            let mut keys = serde_json::Map::new();
+            let entry = |id: &str| serde_json::json!({ "engine": "local", "key": { "id": id } });
+            keys.insert("key_ring".into(), entry("keyring"));
+            if with_clerk {
+                keys.insert("clerk".into(), entry("clerk"));
+            }
+            if with_agent_keys {
+                keys.insert("agent_authority".into(), entry("agent-authority"));
+                keys.insert("agent_package".into(), entry("agent-package"));
+            }
+            v["keys"] = serde_json::Value::Object(keys);
+            deployment(v)
+        };
+        let names =
+            |c: &DeploymentConfig| c.host_needs().iter().map(|n| n.name).collect::<Vec<_>>();
+        assert_eq!(names(&file(false, true)), ["key_ring"]);
+        assert_eq!(names(&file(true, true)), ["key_ring", "clerk"]);
+        // The core host's four are a different, larger set.
+        let core = file(true, true).core_needs();
+        assert_eq!(
+            core.iter().map(|n| n.name).collect::<Vec<_>>(),
+            ["key_ring", "agent_authority", "agent_package", "clerk"]
+        );
+        // The checks of the two sets agree on a file with all four, and the narrow one passes where the
+        // core host's refuses: grants without the Agent keys.
+        let narrow = file(true, false);
+        assert!(
+            narrow
+                .check_core_keys()
+                .unwrap_err()
+                .contains("agent_authority: not given")
+        );
+        assert_eq!(
+            signer::engine::config::check(
+                &signer::engine::config::Registry::builtin(),
+                &narrow.engine_section(),
+                &narrow.host_needs(),
+                false,
+            ),
+            Ok(())
+        );
+    }
 
     /// `T-038-14` (`REQ-AU-8`, `NFR-7`): a stream section missing what its transport needs, a
     /// production listener without the signer's feed key, a file key outside development, and a

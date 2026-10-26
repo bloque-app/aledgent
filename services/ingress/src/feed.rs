@@ -145,6 +145,15 @@ pub trait FeedSigner: Send + Sync + 'static {
     fn sign(&self, msg: &[u8; 32]) -> Result<[u8; 64], String>;
     /// The public key.
     fn public(&self) -> [u8; 32];
+    /// Whether the key can sign now: a key held by an API provider is not while the provider does
+    /// not answer (`F-042`). What `/ready` reads; no I/O. Always, for a key that cannot be unreachable.
+    fn ready(&self) -> bool {
+        true
+    }
+    /// The key's own metrics, Prometheus text (`F-042`): added to `/metrics`. None by default.
+    fn metrics_text(&self) -> String {
+        String::new()
+    }
 }
 
 /// A feed key held in this process: development and tests only (`F-038` §5; guardrail 13 keeps
@@ -214,6 +223,50 @@ impl FeedSigner for ServiceFeedKey {
 
     fn public(&self) -> [u8; 32] {
         self.0.public()
+    }
+}
+
+/// The feed key, opened through a signature engine (`F-042`): `keys.feed` of the deployment's
+/// configuration, on the sidecar, in a key file, or in Vault Transit. It signs through `try_sign`: a
+/// failed signature is a failed feed, not a stopped process.
+pub struct EngineFeedKey {
+    key: signer::client::RemoteEd25519,
+    keys: signer::engine::config::OpenKeys,
+}
+
+impl EngineFeedKey {
+    /// The feed key `handle`, of `keys`' engines.
+    pub fn new(
+        handle: Arc<dyn signer::engine::KeyHandle>,
+        keys: signer::engine::config::OpenKeys,
+    ) -> Result<EngineFeedKey, String> {
+        // `try_sign` only: the patience is never used, and one that stops the process is refused for
+        // a key held by an API provider.
+        let patience = signer::client::Patience {
+            wait: Duration::ZERO,
+            on_failure: signer::client::OnFailure::Panic,
+        };
+        signer::client::RemoteEd25519::from_key(handle, patience)
+            .map(|key| EngineFeedKey { key, keys })
+            .map_err(|e| format!("keys.feed: {e}"))
+    }
+}
+
+impl FeedSigner for EngineFeedKey {
+    fn sign(&self, msg: &[u8; 32]) -> Result<[u8; 64], String> {
+        self.key.try_sign(msg).map_err(|e| e.to_string())
+    }
+
+    fn public(&self) -> [u8; 32] {
+        self.key.public()
+    }
+
+    fn ready(&self) -> bool {
+        self.keys.ready()
+    }
+
+    fn metrics_text(&self) -> String {
+        self.keys.metrics_text()
     }
 }
 

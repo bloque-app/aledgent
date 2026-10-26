@@ -57,3 +57,5 @@ pub fn dev_config(dir: &Path, uid: u32, core_hash: &str, settle_hash: &str) -> V
         ]
     })
 }
+
+pub mod suite;

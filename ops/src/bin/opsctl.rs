@@ -422,21 +422,18 @@ fn founding(
         }
         genesis.spec = Some(std::sync::Arc::new(spec));
     }
-    let keys = match &config.core_keys {
-        Some(k) => {
-            use signer::client::{Patience, RemoteClerk, RemoteCustody, SignerClient};
-            let client = std::sync::Arc::new(
-                SignerClient::connect(&k.signer).map_err(|e| Error::Config(e.to_string()))?,
-            );
-            let custody = RemoteCustody::new(
-                std::sync::Arc::clone(&client),
-                &k.key_ring,
-                Patience::PRODUCTION,
-            )
-            .map_err(|e| Error::Config(format!("core_keys.key_ring: {e}")))?;
-            let clerk = match &k.clerk {
-                Some(id) => Some(std::sync::Arc::new(
-                    RemoteClerk::new(client, id, Patience::PRODUCTION)
+    // The key ring and the clerk key, as before F-042: the Agent's keys are not this command's.
+    let keys = match config
+        .host_key_handles()
+        .map_err(|e| Error::Config(e.to_string()))?
+    {
+        Some(h) => {
+            use signer::client::{Patience, RemoteClerk, RemoteCustody};
+            let custody = RemoteCustody::from_key(h.key_ring, Patience::PRODUCTION)
+                .map_err(|e| Error::Config(format!("core_keys.key_ring: {e}")))?;
+            let clerk = match h.clerk {
+                Some(c) => Some(std::sync::Arc::new(
+                    RemoteClerk::from_key(c, Patience::PRODUCTION)
                         .map_err(|e| Error::Config(format!("core_keys.clerk: {e}")))?,
                 ) as core_binding::host::SharedClerk),
                 None => None,

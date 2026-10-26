@@ -16,12 +16,17 @@ path = "src/main.rs"
 required-features = ["postgres", "http"]
 
 [features]
-default = ["postgres", "http"]
+default = ["postgres", "http", "vault-transit"]
 # The PostgreSQL received-log (accepted proposal of F-009): several replicas share one log and
 # one uniqueness constraint.
 postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:tokio-postgres-rustls", "dep:webpki-roots"]
 # Notification delivery over HTTPS to configured endpoints.
 http = ["dep:reqwest"]
+# The feed key in Vault Transit (F-042): `keys.feed` on an engine of kind `vault_transit`, beside the
+# signer service's key. It links Vault's client and the AWS login, which the core host, built without
+# default features, does not (the core is kept away from Vault and AWS credentials by design). Without
+# it a configuration whose feed key names Transit does not start.
+vault-transit = ["signer/transit"]
 # v1 roots (CipherClerk's full-depth tree): a supported opt-in beside the default v2 (DEC-25,
 # owner ruling cs-q04). A deployment chooses its roots at genesis and builds every binary of it,
 # the core host and the core's guest included, with the same choice (deploy/docker: ROOTS=v1).

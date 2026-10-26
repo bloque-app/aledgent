@@ -239,6 +239,19 @@ impl ServiceSigner {
     }
 }
 
+impl ServiceSigner {
+    /// The secp256k1 key `handle`, of any engine that offers one (`F-042`).
+    pub fn from_key(
+        handle: std::sync::Arc<dyn signer::engine::KeyHandle>,
+    ) -> Result<ServiceSigner, SignerError> {
+        let key = signer::client::RemoteSecp256k1::from_key(handle)
+            .map_err(|e| SignerError::Key(e.to_string()))?;
+        Ok(ServiceSigner {
+            key: std::sync::Arc::new(key),
+        })
+    }
+}
+
 impl Signer for ServiceSigner {
     fn public(&self) -> [u8; 33] {
         self.key.public()
