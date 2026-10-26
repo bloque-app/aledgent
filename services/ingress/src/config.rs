@@ -1455,7 +1455,6 @@ mod tests {
             "vault": { "address": "https://vault.example",
                        "auth": { "aws_iam": { "mount": "aws", "role": "r", "region": "us-east-1" } } },
             "mount": "transit" } });
-        let on = |engine: &str, id: &str| serde_json::json!({ "engine": engine, "key": { "id": id, "name": id, "version": 1, "file": "/k" } });
         let base = || {
             let mut v = template();
             v.as_object_mut().unwrap().remove("core_keys");
