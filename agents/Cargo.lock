@@ -1891,11 +1891,13 @@ name = "signer"
 version = "0.1.2"
 dependencies = [
  "ed25519-dalek",
+ "hex",
  "k256",
  "ledger-core",
  "ledger-kernel",
  "postcard",
  "serde",
+ "serde_json",
  "zeroize",
 ]
 

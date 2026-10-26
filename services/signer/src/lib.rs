@@ -39,6 +39,7 @@
 //! attributable and logged here, apart from the book, and removing its token ends it.
 
 pub mod client;
+pub mod engine;
 pub mod proto;
 
 #[cfg(feature = "server")]
