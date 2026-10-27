@@ -199,10 +199,11 @@ Kreivo 0.17.0 (spec 133), the runtime mainnet runs from 2026-09-30 (0.16.9 stays
 exactly the steps below, in order, from a test community. What it found is in
 `features/F-026-settlement-contract/NOTES.md`, "The first real run".
 
-**Not yet ported to amendment 0040.** `drive.mjs read` and `e2e.mjs check` (and the `aledgent`
-driver, through settle) still read stored entries (`inbox_entry`, `04000000 ++ seq`), which this
-code no longer writes: against it they fail until they fold the entries from events and compare
-with `chain_head` (`T-043-03`). Run the release gate against this code only after that.
+**Amendment 0040.** The scripts read no stored entries: `drive.mjs read` and every read in `e2e.mjs` fold
+the entries from the contract's events (`scripts/chain.mjs`, the only place that decodes `chain_head`) and
+compare the fold with the head. `e2e.mjs upgrade` takes v2 to this code with entries before and after, a
+failing frame and the full reset; the Chopsticks rehearsal of the upgrade and the reset on forks of the test
+and prod instances is in `scripts/fork/` (`T-043-03`).
 
 `scripts/drive.mjs` takes each step in turn and keeps what it learns (app id, license id, contract
 address) in `scripts/.state.json` (gitignored):
@@ -217,7 +218,7 @@ address) in `scripts/.state.json` (gitignored):
 | `bound` | `ADMIN` | `set_withdrawal_bound(ASSET, { amount: BOUND, period: BOUND_PERIOD })` |
 | `deposit` | `DEPOSITOR` | `deposit(ref, ASSET, DEPOSIT)`: the contract pulls it through the chain extension, no approval |
 | `execute` | `KEY` | A batch: withdraw `WITHDRAW` to `PAYEE` (applied), withdraw `u128::MAX` (refused by the bound), the next anchor (applied) |
-| `read` | nobody | Every unpruned inbox entry, by contract query and by raw child-trie storage at the finalized block; fails if they differ |
+| `read` | nobody | The contract's events folded from the chain's start and compared with `chain_head` at the finalized block; fails if they differ |
 | `events` | nobody | The contract's events in the last `BLOCKS` finalized blocks |
 | `all` | | All of the above, in order |
 
