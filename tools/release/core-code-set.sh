@@ -26,7 +26,7 @@ report=$1 manifest=$2 package=$3 runtime=$4 out=$5 record=$6
 command -v b2sum >/dev/null || { echo "core-code-set: b2sum (coreutils) is required" >&2; exit 1; }
 command -v jq >/dev/null || { echo "core-code-set: jq is required" >&2; exit 1; }
 for f in "$report" "$manifest" "$package" "$runtime"; do
-  [ -f "$f" ] && [ ! -L "$f" ] || { echo "core-code-set: $f is not a regular file" >&2; exit 1; }
+  if [ ! -f "$f" ] || [ -L "$f" ]; then echo "core-code-set: $f is not a regular file" >&2; exit 1; fi
 done
 [ ! -e "$out" ] || { echo "core-code-set: $out exists already" >&2; exit 1; }
 
