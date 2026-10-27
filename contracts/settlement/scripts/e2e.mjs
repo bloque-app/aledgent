@@ -98,7 +98,7 @@ function record(list, name, status, detail) {
   if (at >= 0) report[list][at] = entry;
   else report[list].push(entry);
   saveReport();
-  log(`[${status}] ${name}${detail ? `: ${typeof detail === 'string' ? detail : JSON.stringify(detail)}` : ''}`);
+  log(`[${status}] ${name}${detail ? `: ${typeof detail === 'string' ? detail : JSON.stringify(detail, (_, v) => (typeof v === 'bigint' ? v.toString() : v))}` : ''}`);
 }
 
 /// Run one case; a thrown error is the case's failure, recorded, and the phase carries on so that
