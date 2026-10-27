@@ -214,10 +214,13 @@ layer for native transactions apart from PASS ones (its format recorded as `krei
 When a key's engine does not sign (Vault down past its window, a key that is no longer what was
 pinned), the step that needed the signature fails and says so, nothing is stored or broadcast, and
 the next step asks again; it is not counted as the layer being unreachable, so it does not restart
-the process. `aledgent-settle settle.json keys` opens the keys, prints each lane's and the anchor
-key's account (public halves only) and whether their engines are ready, and exits without reading
-the layer, the store or ingress: the accounts a contract's `set_keys` lists, and a check that Vault's
-login and the keys' reads work, before the adapter is turned on.
+the process; an engine not ready, or three such steps in a row, raise `signer:engines` (written by the
+lease holder only). `aledgent-settle settle.json keys` opens the keys, prints each lane's and the anchor
+key's account (public halves only), has each key sign a probe (`<Bytes>aledgent-settle/keys-probe/v1:…
+</Bytes>`, never a transaction) verified against its pinned public half, and exits, non-zero if a key
+does not sign, without reading the layer, the store or ingress: the accounts a contract's `set_keys`
+lists, and a check that Vault's login, the keys' reads and their signing work, before the adapter is
+turned on.
 
 **Each batch is sized and priced by its dry run** (`T-027-09`): the adapter dry-runs `execute` at
 the finalized head (`ContractsApi_call`, as the lane) and gives the batch the gas the dry run

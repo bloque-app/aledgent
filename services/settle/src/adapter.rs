@@ -315,6 +315,11 @@ pub struct Adapter<C: Chain, S: Store, T: Transport> {
     /// cleared (a store error, a crash in between) would otherwise leave the alert open, paging,
     /// since every later step finds the runtime confirmed and never reaches the clearing.
     alert_settled: BTreeSet<String>,
+    /// Steps in a row that ended because a key's signer did not sign (`F-045`), and the last reason.
+    signer_failures: (u32, String),
+    /// Whether the `signer:engines` alert, as this process last wrote it while holding the lease, is
+    /// open; `None` before it has written it.
+    signer_alert: Option<bool>,
 }
 
 /// The alert of a chain that does not lead to its head (amendment 0040, `REQ-IN-5`):
@@ -489,6 +494,18 @@ fn summary(e: &InboxEvent) -> String {
     }
 }
 
+/// The alert a settlement key that does not sign raises (`F-045`): kind `signer` in the signals.
+pub const SIGNER_ALERT: &str = "signer:engines";
+
+/// After how many steps in a row ended because a key did not sign [`SIGNER_ALERT`] is raised
+/// (`F-045`): about 6 s of the deployment's 2 s steps, past a blip.
+pub const SIGNER_FAILURES_ALERT_AFTER: u32 = 3;
+
+/// Whether `r` ended because a key's signer did not sign (`F-045`).
+fn signer_failed<T>(r: &StepResult<T>) -> bool {
+    matches!(r, Err(AdapterError::Chain(ChainError::Signer(_))))
+}
+
 impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
     /// An adapter over `chain`, `store` and `transport`, signing with `lanes`. It does nothing
     /// until [`Adapter::step`].
@@ -526,6 +543,8 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             refused: BTreeMap::new(),
             not_now: BTreeMap::new(),
             alert_settled: BTreeSet::new(),
+            signer_failures: (0, String::new()),
+            signer_alert: None,
         }
     }
 
@@ -612,6 +631,61 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
     }
 
     // ------------------------------------------------------------------------------ lease
+
+    /// Report the signers' health after a step (`F-045`): the alert [`SIGNER_ALERT`] is open while an
+    /// engine is not ready (`engines`: ready, and why not), or once [`SIGNER_FAILURES_ALERT_AFTER`]
+    /// steps in a row ended because a key did not sign (`stepped`: a Vault that answers but refuses
+    /// `sign/` leaves the engine ready, and only this shows it); a step that ends otherwise resets the
+    /// count. The alert is written only on a change, and **only while this process holds the lease**,
+    /// so a standby never writes over the active instance's alerts. Returns whether it is open, or
+    /// `None` when nothing was written.
+    pub async fn report_signers(
+        &mut self,
+        engines: (bool, &str),
+        stepped: &StepResult<StepReport>,
+    ) -> StepResult<Option<bool>> {
+        match stepped {
+            Err(AdapterError::Chain(ChainError::Signer(e))) => {
+                self.signer_failures = (self.signer_failures.0.saturating_add(1), e.clone());
+            }
+            Ok(_) => self.signer_failures = (0, String::new()),
+            Err(_) => {}
+        }
+        if self.epoch.is_none() || matches!(stepped, Err(AdapterError::LeaseLost)) {
+            // Another instance holds it: its alerts are its own. Written afresh once it is ours.
+            self.signer_alert = None;
+            return Ok(None);
+        }
+        let (n, why) = &self.signer_failures;
+        let detail = if !engines.0 {
+            Some(format!(
+                "a signing key's engine is not ready: {}; nothing is signed until it is",
+                engines.1
+            ))
+        } else if *n >= SIGNER_FAILURES_ALERT_AFTER {
+            Some(format!("{n} steps in a row could not sign: {why}"))
+        } else {
+            None
+        };
+        let open = detail.is_some();
+        if self.signer_alert == Some(open) {
+            return Ok(None);
+        }
+        let now = self.now();
+        match &detail {
+            Some(d) => {
+                self.store.raise(SIGNER_ALERT, d, now).await?;
+                tracing::error!(detail = %d, "a settlement key does not sign");
+            }
+            None => {
+                if self.store.clear(SIGNER_ALERT, now).await? {
+                    tracing::info!("the settlement keys sign again");
+                }
+            }
+        }
+        self.signer_alert = Some(open);
+        Ok(Some(open))
+    }
 
     async fn hold_lease(&mut self) -> StepResult<u64> {
         let now = self.now();
@@ -1239,7 +1313,13 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                 }
                 SettlementCallBody::Withdraw { .. } | SettlementCallBody::Bind { .. } => None,
             });
-            self.anchor(epoch, &fin, &best, anchor).await?;
+            // F-045: the anchor key's signer not signing (Vault Transit down, say) ends the step, but
+            // only after the bindings and the position reports, which it must not starve: the
+            // positions sign nothing.
+            let anchored = self.anchor(epoch, &fin, &best, anchor).await;
+            if !signer_failed(&anchored) {
+                anchored.clone()?;
+            }
             // The bindings in flight (amendment 0011, `REQ-AS-8`), on the anchor key's lane.
             let binds: Vec<BindAsked> = calls
                 .iter()
@@ -1257,8 +1337,13 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                     _ => None,
                 })
                 .collect();
-            self.binds(epoch, &fin, &best, &binds).await?;
+            let bound = self.binds(epoch, &fin, &best, &binds).await;
+            if !signer_failed(&bound) {
+                bound.clone()?;
+            }
             self.positions(&fin).await?;
+            anchored?;
+            bound?;
         }
         Ok(report)
     }

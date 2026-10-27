@@ -335,6 +335,51 @@ impl Signer for DevEd25519 {
     }
 }
 
+/// The domain of the probe [`probe`] signs (`F-045`): wrapped as `<Bytes>…</Bytes>`, the convention for
+/// signing a message that is no transaction, so that no probe signature can ever be read as one (a
+/// signed payload starts with a call's pallet and call indices, and binds the genesis hash and the
+/// runtime's versions; ASCII text does neither).
+pub const PROBE_DOMAIN: &str = "aledgent-settle/keys-probe/v1";
+
+/// The probe message for the key whose account is `account`: `<Bytes>` ‖ [`PROBE_DOMAIN`] ‖ `:` ‖ the
+/// account, hex ‖ `</Bytes>`.
+pub fn probe_message(account: &AccountId32) -> Vec<u8> {
+    format!("<Bytes>{PROBE_DOMAIN}:{}</Bytes>", hex::encode(account)).into_bytes()
+}
+
+/// Have `signer` sign its probe and verify the signature against its own public key, the one pinned
+/// when the key was opened (`F-045`). Opening a key reads its public half only: this is what proves the
+/// key can *sign* (for a Vault Transit key, that the role may use `sign/<key>`, not only `keys/<key>`).
+pub async fn probe(signer: &dyn Signer) -> Result<(), SignerError> {
+    let account = signer.device();
+    let message = probe_message(&account);
+    let signature = signer.sign(message.clone()).await?;
+    if signature.verify(&message, &account) {
+        Ok(())
+    } else {
+        Err(SignerError::Key(
+            "the probe's signature does not verify against the key's public half".into(),
+        ))
+    }
+}
+
+/// Refuse two lanes, or a lane and the anchor key, on one account or one key (`F-045`): each is a nonce
+/// lane of its own, and the contract lists each once (`set_keys` refuses a duplicate).
+pub fn distinct(signers: &[&dyn Signer]) -> Result<(), String> {
+    let mut accounts = std::collections::BTreeSet::new();
+    let mut devices = std::collections::BTreeSet::new();
+    for s in signers {
+        if !accounts.insert(s.account()) || !devices.insert(s.device()) {
+            return Err(format!(
+                "the account {} is configured twice (lanes and the anchor key are each a key of \
+                 their own)",
+                hex::encode(s.account())
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Recover the compressed public key that signed `digest` (for the fake chain's verification
 /// and the tests).
 pub fn recover(digest: &[u8; 32], signature: &[u8; 65]) -> Option<[u8; 33]> {
@@ -498,6 +543,68 @@ mod tests {
         );
         assert!(Signature::Ecdsa(sig).verify(b"payload", &s.account()));
         assert!(!Signature::Ecdsa(sig).verify(b"other", &s.account()));
+    }
+
+    /// A signer that answers with another key's signature, or not at all.
+    struct Wrong(DevEd25519, Option<DevEd25519>);
+
+    impl Signer for Wrong {
+        fn public(&self) -> Public {
+            self.0.public()
+        }
+
+        fn sign(&self, message: Vec<u8>) -> BoxFuture<'_, Result<Signature, SignerError>> {
+            match &self.1 {
+                Some(other) => other.sign(message),
+                None => Box::pin(async {
+                    Err(SignerError::Unavailable(
+                        "POST transit-aledgent-signer/sign/lane-1: 403 permission denied".into(),
+                    ))
+                }),
+            }
+        }
+    }
+
+    /// `F-045`: the probe proves a key signs, and signs as the public half that was pinned: a key that
+    /// reads but may not sign (Vault's 403 on `sign/`), or one that answers with another key, fails it.
+    #[tokio::test]
+    async fn f_045_the_probe_proves_the_key_signs_as_its_pinned_public_half() {
+        let good = DevEd25519::from_secret(&SECRET);
+        assert_eq!(probe(&good).await, Ok(()));
+        assert_eq!(
+            probe(&DevSigner::from_secret(&SECRET).unwrap()).await,
+            Ok(())
+        );
+        let denied = Wrong(DevEd25519::from_secret(&SECRET), None);
+        assert!(matches!(
+            probe(&denied).await,
+            Err(SignerError::Unavailable(e)) if e.contains("403")
+        ));
+        let other = Wrong(
+            DevEd25519::from_secret(&SECRET),
+            Some(DevEd25519::from_secret(&[0x22; 32])),
+        );
+        assert!(matches!(probe(&other).await, Err(SignerError::Key(_))));
+        // The probe is text in `<Bytes>`, bound to the account: never a transaction's payload.
+        let m = probe_message(&good.account());
+        assert!(m.starts_with(b"<Bytes>") && m.ends_with(b"</Bytes>"));
+        assert_ne!(m, probe_message(&[0x11; 32]));
+    }
+
+    /// `F-045`: no account twice among the lanes and the anchor key.
+    #[test]
+    fn f_045_an_account_configured_twice_is_refused() {
+        let a = DevEd25519::from_secret(&SECRET);
+        let a2 = DevEd25519::from_secret(&SECRET);
+        let b = DevEd25519::from_secret(&[0x22; 32]);
+        assert_eq!(distinct(&[&a, &b]), Ok(()));
+        assert!(distinct(&[&a, &b, &a2]).unwrap_err().contains("twice"));
+        // A PASS account and its device are told apart; two PASS accounts on one device are not.
+        let d: std::sync::Arc<dyn Signer> =
+            std::sync::Arc::new(DevSigner::from_secret(&SECRET).unwrap());
+        let p1 = PassAccount::new(std::sync::Arc::clone(&d), [1; 32]);
+        let p2 = PassAccount::new(std::sync::Arc::clone(&d), [2; 32]);
+        assert!(distinct(&[&p1, &p2]).is_err());
     }
 
     /// `F-045`: a native Ed25519 account is its public key, and its signature is over the message's

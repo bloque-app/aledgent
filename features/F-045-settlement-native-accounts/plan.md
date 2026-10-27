@@ -64,13 +64,18 @@ suite still provisions PASS accounts (`e2e/`, owned by other work); `T-045-06` r
 (`ChainError::Signer`): nothing is stored or broadcast, the calls wait, and the next step asks again. It is
 not the layer's unavailability, so it does not count toward the binary's restart after three minutes
 without the layer. The Transit engine's own readiness (Vault down past its window, a key no longer what was
-pinned) raises the adapter's alert `signer:engines` and clears it when it comes back; the signals count it
-(kind `signer`) and `AledgentAdapterSignerNotReady` pages after two minutes. The binary has no readiness
-endpoint.
+pinned) raises the adapter's alert `signer:engines`, and so do three steps in a row that could not sign
+(a Vault that answers but refuses `sign/` leaves the engine ready, and only this shows it); it clears when
+both are well again. Only the instance holding the lease writes it. The signals count it (kind `signer`)
+and `AledgentAdapterSignerNotReady` pages after two minutes. The anchor key not signing does not starve
+the bindings and the position reports that follow it in a step. The binary has no readiness endpoint.
 
-**Operators.** `aledgent-settle <config> keys` opens the keys and prints each lane's and the anchor key's
-account and public key, and exits: no layer, store or ingress. It is the smoke test of the AWS IAM login to
-Vault and of the keys' reads, and the source of the accounts `set_keys` lists.
+**Operators.** `aledgent-settle <config> keys` opens the keys, prints each lane's and the anchor key's
+account and public key, has each key sign a probe (`<Bytes>aledgent-settle/keys-probe/v1:<account
+hex></Bytes>`, text that no transaction payload can be) and verifies it against the pinned public half,
+and exits non-zero if a key does not sign: no layer, store or ingress. It is the smoke test of the AWS IAM
+login to Vault, of the keys' reads and of their signing, and the source of the accounts `set_keys` lists.
+Two lanes, or a lane and the anchor key, on one account are refused at start.
 
 ## Trade-offs, stated plainly
 

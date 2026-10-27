@@ -38,15 +38,11 @@ use settle::chain::rpc::{Names, RpcChain};
 use settle::config::{ChainSource, KeySource, PassKey, ProcessConfig};
 use settle::link::HttpTransport;
 use settle::signer::{DevEd25519, DevSigner, EngineEd25519, PassAccount, ServiceSigner, Signer};
-use settle::store::Store as _;
 use settle::store::pg::PgStore;
 
 /// How long every step may find the settlement layer unreachable before the process ends, for its
 /// supervisor to start a new one.
 const BLIND_RESTART: Duration = Duration::from_secs(180);
-
-/// The alert a signing key's engine that is not ready raises (`F-045`): kind `signer` in the signals.
-const SIGNER_ALERT: &str = "signer:engines";
 
 /// The lanes, in the file's form (`F-045`): native accounts, or PASS accounts.
 fn lanes(config: &ProcessConfig, keys: &Keys) -> Result<Vec<Arc<dyn Signer>>, String> {
@@ -285,9 +281,22 @@ async fn run() -> Result<(), String> {
     let keys = Keys::of(&config)?;
     let lanes = lanes(&config, &keys)?;
     let anchor = anchor(&config, &keys)?;
+    // F-045: each lane and the anchor key on an account of its own.
+    let all: Vec<&dyn Signer> = lanes
+        .iter()
+        .chain(anchor.iter())
+        .map(|s| s.as_ref())
+        .collect();
+    settle::signer::distinct(&all)?;
     if matches!(command, Command::Keys) {
-        // F-045: public halves only; nothing else is opened.
-        let show = |role: &str, s: &Arc<dyn Signer>| {
+        // F-045: public halves only, and a probe each key signs and that is verified against its
+        // pinned public half: opening a key reads it, and only signing proves the key may sign (a
+        // Vault role that reads `keys/` but is refused `sign/` passes the opening). Nothing else is
+        // opened.
+        let mut failed = false;
+        let mut show = async |role: &str, s: &Arc<dyn Signer>| {
+            let probe = settle::signer::probe(s.as_ref()).await;
+            failed |= probe.is_err();
             serde_json::json!({
                 "role": role,
                 "account": hex::encode(s.account()),
@@ -297,20 +306,30 @@ async fn run() -> Result<(), String> {
                     settle::signer::Public::Ecdsa(_) => "secp256k1",
                 },
                 "pass_user": s.pass_user().map(hex::encode),
+                "signs": probe.as_ref().is_ok(),
+                "probe_error": probe.err().map(|e| e.to_string()),
             })
         };
-        let mut out: Vec<serde_json::Value> = lanes.iter().map(|l| show("lane", l)).collect();
-        out.extend(anchor.iter().map(|a| show("anchor", a)));
+        let mut out: Vec<serde_json::Value> = Vec::new();
+        for l in &lanes {
+            out.push(show("lane", l).await);
+        }
+        if let Some(a) = &anchor {
+            out.push(show("anchor", a).await);
+        }
         let (ready, detail) = keys.ready();
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "keys": out,
-                "ready": ready,
+                "ready": ready && !failed,
                 "detail": detail,
             }))
             .map_err(|e| e.to_string())?
         );
+        if failed || !ready {
+            return Err("a key does not sign, or its engine is not ready (see above)".into());
+        }
         return Ok(());
     }
     let assets: Vec<_> = config
@@ -438,7 +457,6 @@ async fn run() -> Result<(), String> {
     // smoldot did not always reconnect after its peers were cut for a minute and a half.
     let mut blind_since: Option<std::time::Instant> = None;
     let mut served = false;
-    let mut keys_ready: Option<bool> = None;
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -456,43 +474,13 @@ async fn run() -> Result<(), String> {
         if let Some(path) = &config.signals_file {
             write_signals(&adapter, path).await;
         }
-        // F-045: an engine that cannot sign (Vault Transit down for its window, or a key no longer
-        // what was pinned) raises the alert `signer:engines`, which the signals count by kind for the
-        // exporter, and clears it when it comes back (the first step clears one a previous process
-        // left). A step that needs a signature fails meanwhile (`ChainError::Signer`), and the next
-        // one asks again; it does not count as the layer being unreachable.
+        // F-045: the signers' health, as the alert `signer:engines` (the signals count it by kind,
+        // and it pages): an engine not ready, or steps in a row that could not sign (a Vault that
+        // answers but refuses `sign/` leaves the engine ready). Written only while this process
+        // holds the lease. A step that could not sign does not count as the layer being unreachable.
         let (ready, detail) = keys.ready();
-        if keys_ready != Some(ready) {
-            use ingress::clock::Clock as _;
-            let now = SystemClock.now();
-            let written = if ready {
-                adapter.store().clear(SIGNER_ALERT, now).await.map(|_| ())
-            } else {
-                adapter
-                    .store()
-                    .raise(
-                        SIGNER_ALERT,
-                        &format!("a signing key's engine is not ready: {detail}; nothing is signed until it is"),
-                        now,
-                    )
-                    .await
-                    .map(|_| ())
-            };
-            match written {
-                Ok(()) => {
-                    if keys_ready.is_some() || !ready {
-                        if ready {
-                            tracing::info!("the signing keys' engines are ready again");
-                        } else {
-                            tracing::error!(detail = %detail, "a signing key's engine is not ready; nothing is signed until it is");
-                        }
-                    }
-                    keys_ready = Some(ready);
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "the signer alert was not written; the next step tries again")
-                }
-            }
+        if let Err(e) = adapter.report_signers((ready, &detail), &stepped).await {
+            tracing::warn!(error = %e, "the signer alert was not written; the next step tries again");
         }
         // Blind: the layer does not answer; or, in a process that has never served, it answers
         // from before the deployment existed (a light client that has not caught up: seen on the

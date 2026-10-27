@@ -220,3 +220,112 @@ async fn f_045_a_restart_keeps_the_native_confirmation() {
     assert_eq!(runtimes.len(), 1, "{runtimes:?}");
     assert!(runtimes[0].format.ends_with("+native"));
 }
+
+/// Whether the `signer:engines` alert is open in `k`'s store.
+async fn signer_alert_open(k: &Kit) -> bool {
+    k.store
+        .alerts()
+        .await
+        .unwrap()
+        .iter()
+        .any(|a| a.key == settle::adapter::SIGNER_ALERT && a.cleared_at.is_none())
+}
+
+/// `F-045`: the signer alert opens while an engine is not ready, and after
+/// `SIGNER_FAILURES_ALERT_AFTER` steps in a row that could not sign (a Vault that answers but refuses
+/// `sign/` leaves the engine ready, so only this shows it); it clears when both are well again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f_045_a_key_that_does_not_sign_raises_the_signer_alert() {
+    let mut k = serving_kit(native()).await;
+    let ok: settle::adapter::StepResult<settle::StepReport> = Ok(Default::default());
+    let refused: settle::adapter::StepResult<settle::StepReport> =
+        Err(settle::AdapterError::Chain(ChainError::Signer(
+            "POST sign/lane-1: 403 permission denied".into(),
+        )));
+    // The engine is ready and nothing failed: nothing to raise.
+    assert_eq!(
+        k.adapter.report_signers((true, ""), &ok).await.unwrap(),
+        Some(false)
+    );
+    assert!(!signer_alert_open(&k).await);
+    // An engine not ready: open at once.
+    assert_eq!(
+        k.adapter
+            .report_signers((false, "Vault does not answer"), &ok)
+            .await
+            .unwrap(),
+        Some(true)
+    );
+    assert!(signer_alert_open(&k).await);
+    assert_eq!(
+        k.adapter.report_signers((true, ""), &ok).await.unwrap(),
+        Some(false)
+    );
+    assert!(!signer_alert_open(&k).await);
+    // The engine ready, but steps that could not sign: open at the threshold, not before.
+    for _ in 1..settle::adapter::SIGNER_FAILURES_ALERT_AFTER {
+        k.adapter
+            .report_signers((true, ""), &refused)
+            .await
+            .unwrap();
+        assert!(!signer_alert_open(&k).await);
+    }
+    k.adapter
+        .report_signers((true, ""), &refused)
+        .await
+        .unwrap();
+    assert!(signer_alert_open(&k).await);
+    let detail = k
+        .store
+        .alerts()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|a| a.key == settle::adapter::SIGNER_ALERT)
+        .unwrap()
+        .detail;
+    assert!(detail.contains("403"), "{detail}");
+    // Another kind of failure says nothing of the signer; a step that ends well clears it.
+    let unrelated: settle::adapter::StepResult<settle::StepReport> = Err(
+        settle::AdapterError::Chain(ChainError::Unavailable("no peers".into())),
+    );
+    assert_eq!(
+        k.adapter
+            .report_signers((true, ""), &unrelated)
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(signer_alert_open(&k).await);
+    k.adapter.report_signers((true, ""), &ok).await.unwrap();
+    assert!(!signer_alert_open(&k).await);
+}
+
+/// `F-045`: an instance that does not hold the lease never writes the signer alert: the active
+/// instance's alerts are its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f_045_the_signer_alert_is_written_only_under_the_lease() {
+    let mut k = Kit::start_with(native()).await;
+    // Another instance holds the lease before this one ever steps.
+    let now = k.now();
+    assert!(
+        k.store
+            .acquire("settle-other", now, 600_000)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let stepped = k.step().await;
+    assert!(
+        matches!(stepped, Err(settle::AdapterError::LeaseLost)),
+        "{stepped:?}"
+    );
+    assert_eq!(
+        k.adapter
+            .report_signers((false, "Vault does not answer"), &stepped)
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(!signer_alert_open(&k).await);
+}
