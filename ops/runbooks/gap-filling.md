@@ -59,7 +59,9 @@ Incidents and gaps are written to the audit trail (`NFR-6`, `REQ-AT-1`), not to 
    - **Record a gap.** Ask the owner of settlement-operations to have the adapter record the range as a gap
      through its own authoritative source (the core refuses a gap from any other, `REQ-AT-3`). The adapter
      then accepts the layer's head as it stands, **unverified for that range**, and the gap is on the audit
-     trail. `proof` answers `Unprovable` for a position inside it (`REQ-SA-7`).
+     trail. The book keeps only the end of its highest gap, so `proof` answers
+     `Unprovable` for any range that starts below that end, not only for positions inside the gap
+     (`REQ-SA-7`).
 6. **Ingest what the gap hid.** `TODO(F-016)`: reporting a skipped range's records to the core from an
    archive is not built (`F-016` Deferred: "Filling a gap from an archive is not built"). Until it is:
    - a missing **withdrawal** record leaves its operation in `Submitted` until its deadline, then in

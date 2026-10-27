@@ -20,9 +20,9 @@
 //!   anchor the contract keeps, overwritten by each new one (owner's ruling of 2026-10-11);
 //! - `inbox[seq]`: `k = 04000000 ‖ seq (u64 LE)` → `{ at: u32, event }`, an `Anchored` event
 //!   being `02 ‖ operation_ref ‖ number (u64 LE) ‖ commitment`. **Only the code before amendment
-//!   0040 wrote it**: that code stores no entry (its chain is one head, `0x0C`, and the entries
-//!   are in the contract's events), so a block after the upgrade holds none and this reader takes
-//!   the anchors of a block from its `Anchored` events instead ([`ContractReader::chain_events_at`]);
+//!   0040 wrote it**: the code of 0040 stores no entry (its chain is one head, `0x0C`, and the
+//!   entries are in the contract's events), so a block after the upgrade holds none and this
+//!   reader takes the anchors of a block from its `Anchored` events instead ([`ContractReader::chain_events_at`]);
 //! - `anchors[number]` (**legacy**): `k = 03000000 ‖ number (u64 LE)` → `{ commitment, at: u32,
 //!   seq: u64 }`, every anchor by number, as the code before 2026-10-11 kept them; present on a
 //!   deployment of that code until its migration removes them;
