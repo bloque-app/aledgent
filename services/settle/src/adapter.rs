@@ -33,10 +33,15 @@
 //! 4. **Track.** Decide each uncertain transaction at the finalized head, once for the whole
 //!    batch it carries: included (its nonce is spent), its era ended with its nonce unspent, or
 //!    still uncertain. A nonce stays reserved while its transaction is uncertain.
-//! 5. **Observe** (`REQ-SA-7`, `REQ-SI-1`–`SI-5`). Check what was reported provisionally; read
-//!    the inbox from the cursor at the finalized head, 32 positions a page, reporting every entry
-//!    with its canonical check; record a pruned range as an explicit gap; report the adapter's own
-//!    extrinsics seen above finality as provisional; report the finalised head **with the
+//! 5. **Observe** (`REQ-SA-7`, `REQ-IN-5`, `REQ-SI-1`–`SI-5`; amendment 0040). **Sync**: read the
+//!    head of the contract's chain of entries at the finalized head; if it is the head last
+//!    accepted, that is the only read. Otherwise fold the entries of the blocks since, rebuilt
+//!    from their events, from the accepted digest; if they lead to the head, report each from the
+//!    cursor with its canonical check and accept the head once the core took in all of them; if
+//!    not, read once more, then raise `chain:<instance>:<position>` and report nothing past the
+//!    first new position. Check what was reported provisionally; report the adapter's own
+//!    extrinsics seen above finality as provisional, while one is in flight; report the finalised
+//!    head **with the
 //!    account nonce of every signing key, read at that same finalized block** (the owner's
 //!    ruling of 2026-09-24: the core releases on non-inclusion only if the transaction's nonce
 //!    agrees).
@@ -55,7 +60,7 @@
 //!    core did not take in: a nonce freed by a dead transaction is reused only after the core has
 //!    seen the head that proves it dead. Broadcast every stored, uncertain transaction again:
 //!    after a restart the same bytes go out, never a second transaction.
-//! 7. **Re-scan** (`REQ-IN-5`), every so many steps.
+//! 7. (The periodic re-scan is gone, `T-043-05`: the sync shows completeness at every step.)
 //! 8. **Anchor** (`F-017`, with an anchor key only). Decide the anchor key's transaction at the
 //!    finalized head; take the checkpoint in flight from the call outbox; store it, then
 //!    acknowledge it; unless the finalized deployment already holds it, sign the anchor call in a
@@ -63,8 +68,8 @@
 //!    no value and the contract takes a replay of its latest anchor as a no-op, so a transaction
 //!    that provably did not store it (not included, failed, or the contract refused the call) is
 //!    reported (`AnchorNotExecuted`, the core emits the anchor again) and a new one is signed.
-//! 9. **Positions** (`F-017`, `REQ-PR-5`, with an anchor key only). Once the cursor has read
-//!    the whole finalized inbox, report the instance's positions at the finalized head, when the
+//! 9. **Positions** (`F-017`, `REQ-PR-5`, with an anchor key only). Once the cursor has reached
+//!    the finalized chain's head, report the instance's positions at the finalized head, when the
 //!    core says a comparison is due or they changed.
 //!
 //! The adapter reports observations only. It never tells the core an outcome (`INV-11`), and
@@ -2357,7 +2362,7 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
         tracing::warn!(
             from,
             to,
-            "an inbox range could not be read: recorded as a gap"
+            "a range of positions could not be read: recorded as a gap"
         );
         let now = self.now();
         let reason_text = match reason {
@@ -2376,7 +2381,7 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
         self.store
             .raise(
                 &format!("gap:{}:{from}", self.config.instance),
-                &format!("inbox positions [{from}, {to}) were {reason_text} before they were read"),
+                &format!("positions [{from}, {to}) are a gap: {reason_text}"),
                 now,
             )
             .await?;
@@ -2445,11 +2450,11 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                     Ok(b) => Ok(b),
                     Err(e) => {
                         own_client = false;
-                        self.from_history(&at, &e.to_string()).await?
+                        self.history_read(&at, &e.to_string()).await?
                     }
                 }
             } else {
-                self.from_history(&at, "older than the adapter's client serves")
+                self.history_read(&at, "older than the adapter's client serves")
                     .await?
             };
             let b = match read {
@@ -2493,7 +2498,7 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
 
     /// `block`'s events from the history endpoint, after the adapter's own client could not
     /// serve them (`why`).
-    async fn from_history(
+    async fn history_read(
         &self,
         block: &BlockRef,
         why: &str,
