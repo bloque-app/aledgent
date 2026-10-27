@@ -21,14 +21,16 @@
 //! parts. They stage a code version on the port as the execution node does before it logs an
 //! upgrade (`core_binding::staging`), then drive the input itself.
 //!
-//! **Still pending, with the clause that remains** (each one's other clauses are checked by
+//! **Run (`T-037-09`, per-range replay):** `AC-K7.3` and `AC-K7.18`. A history that crosses
+//! upgrades, a way out after the platform was already switched, and a reschedule is replayed from
+//! genesis, and from a checkpoint, by `core_binding::core::roll_forward_agent` over a fresh native
+//! port, natively and with no runtime: each range under its own generation, read from the inputs.
+//!
+//! **Still pending, with the clause that remains** (its other clauses are checked by
 //! `core-binding`'s `tests/fence.rs` under the case's name):
 //! - `AC-K7.13`: "an execution node whose runtime is not the one the current range's code version
 //!   names refuses to drive the writer" (`T-037-14`). Checked: every upgrade raises the
 //!   generation, carried in the package's bytes, and a missed switch refuses input `n`.
-//! - `AC-K7.18`: "a replay assigns every input the generation the code map, read from the inputs
-//!   alone, names" (`T-037-09`). Checked: a move or cancel at `n`, authorised or not, commits the
-//!   same state under either generation.
 
 // Case names end in `__<layer>`, so a test can be found by id and layer.
 #![allow(non_snake_case)]
@@ -77,12 +79,10 @@ pub const CASES: &[Case] = &[
         ac_k7_2_an_upgrade_whose_code_cannot_be_fetched_is_refused__service,
         &["REQ-RT-16", "REQ-RT-17"]
     ),
-    Case::pending(
+    service_case!(
         "AC-K7.3",
-        "ac_k7_3_a_history_across_upgrades_replays_under_its_code_map__service",
-        Layer::Service,
-        Feature::F037,
-        &["REQ-RT-3", "REQ-RT-17"],
+        ac_k7_3_a_history_across_upgrades_replays_under_its_code_map__service,
+        &["REQ-RT-3", "REQ-RT-17"]
     ),
     Case::pending(
         "AC-K7.4",
@@ -178,12 +178,10 @@ pub const CASES: &[Case] = &[
         ac_k7_17_an_unauthorised_reschedule_or_cancel_is_refused__service,
         &["REQ-RT-20", "REQ-RT-18"]
     ),
-    Case::pending(
+    service_case!(
         "AC-K7.18",
-        "ac_k7_18_input_n_is_decided_the_same_by_either_generation__service",
-        Layer::Service,
-        Feature::F037,
-        &["REQ-RT-20", "REQ-RT-17"],
+        ac_k7_18_input_n_is_decided_the_same_by_either_generation__service,
+        &["REQ-RT-20", "REQ-RT-17"]
     ),
     Case::pending(
         "AC-K7.19",
@@ -1350,5 +1348,265 @@ fn ac_k7_16_a_stale_package_or_a_wrong_generation_is_refused__service(
             "something was staged".into()
         })?;
         check(b.hot()? == before, || "the writer changed".into())
+    })())
+}
+
+// ------------------------------------------------------------ per-range replay (`T-037-09`)
+
+/// What [`Book::new`] founds on, as a restore takes it ([`roll_forward_agent`]).
+fn founding() -> core_binding::core::Founding {
+    core_binding::core::Founding {
+        genesis: service_genesis(),
+        op: SERVICE_GENESIS_OP,
+        at: 1,
+        keys: HostKeys::local(IN_PROCESS_ROOT, None),
+        limits: Limits::DEFAULT,
+        genesis_roots: None,
+    }
+}
+
+/// A fresh native port that models a platform holding the code versions `versions` (version,
+/// generation): it runs each as its generation once switched to it.
+fn holding(versions: &[([u8; 32], u64)]) -> NativePort {
+    let mut p = NativePort::new();
+    p.code_map = versions.iter().copied().collect();
+    p
+}
+
+/// Re-send `archive` to `port`, from what the port holds, and require it to end at the archive's
+/// last entry.
+fn roll(
+    port: NativePort,
+    archive: &[RingEntry],
+) -> Checked<(NativePort, core_binding::core::RolledForward)> {
+    use core_binding::host::ReplicaStores;
+    let (port, rolled) =
+        core_binding::core::roll_forward_agent(port, &founding(), archive, &ReplicaStores::Memory)?;
+    let last = archive.last().ok_or("an empty archive")?;
+    check(
+        rolled.to == last.seq && rolled.log_head == last.log_hash() && rolled.roots == last.roots,
+        || format!("rolled to {rolled:?}, the archive ends at {}", last.seq),
+    )?;
+    Ok((port, rolled))
+}
+
+fn range(from: u64, to: u64, code: [u8; 32], generation: u64) -> core_binding::code_map::CodeRange {
+    core_binding::code_map::CodeRange {
+        from,
+        to,
+        code,
+        generation,
+    }
+}
+
+impl Book {
+    /// Ordinary inputs until the next one is numbered `n`.
+    fn until(&mut self, n: u64) -> Checked<()> {
+        let mut i = 0u8;
+        while self.hot()?.inputs + 1 < n {
+            i = i.wrapping_add(1);
+            committed(self.open(100u8.wrapping_add(i)))?;
+        }
+        Ok(())
+    }
+}
+
+fn ac_k7_3_a_history_across_upgrades_replays_under_its_code_map__service(
+    _: &mut dyn Harness,
+) -> Outcome {
+    outcome((|| {
+        let mut b = Book::new()?;
+        b.fund()?;
+        let g = b.hot()?.code;
+        let source = Held::default();
+        let op = b.operator();
+        // An upgrade to H1, taken at n1.
+        let h1 = source.version(1);
+        b.stage(&source, &h1).map_err(|e| format!("{e}"))?;
+        let n1 = b.hot()?.inputs + 3;
+        committed(b.upgrade(h1, n1))?;
+        b.until(n1 + 2)?;
+        check(b.hot()?.generation == 1, || "H1 was not taken".into())?;
+        let checkpoint = b.driver.port().rows.clone();
+        // An upgrade to H2, the platform switched to it ahead of n2 (a start check at n2), and a
+        // cancel at n2: decided by H1's generation, and H1 installed again before it.
+        let h2 = source.version(2);
+        b.stage(&source, &h2).map_err(|e| format!("{e}"))?;
+        let n2 = b.hot()?.inputs + 2;
+        committed(b.upgrade(h2, n2))?;
+        b.driver.ensure_code().map_err(|e| format!("{e:?}"))?;
+        check(b.driver.port().switched.last() == Some(&h2), || {
+            "the start check did not switch to H2".into()
+        })?;
+        let c = committed(b.way_out(op, None))?;
+        check(c.seq == n2 && b.hot()?.generation == 1, || format!("{c:?}"))?;
+        check(b.driver.port().switched.last() == Some(&h1), || {
+            "H1 was not installed again for the way out".into()
+        })?;
+        // H2 again from n3, moved by a reschedule to m, and taken there.
+        let n3 = b.hot()?.inputs + 3;
+        committed(b.upgrade(h2, n3))?;
+        let m = n3 + 2;
+        let c = committed(b.way_out(op, Some(m)))?;
+        check(c.summaries == vec![Summary::Accepted], || format!("{c:?}"))?;
+        b.until(m + 3)?;
+        let h = b.hot()?;
+        check((h.code, h.generation) == (h2, 2), || format!("{h:?}"))?;
+        let archive = b.archive.clone();
+        let last = archive.last().ok_or("no archive")?.seq;
+        let all = [(g, 0), (h1, 1), (h2, 2)];
+
+        // From genesis, natively, with no runtime: every input reaches its archived roots and log
+        // hash (the roll forward checks each), each range under its own generation.
+        let want = vec![
+            range(1, n1 - 1, g, 0),
+            range(n1, m - 1, h1, 1),
+            range(m, last, h2, 2),
+        ];
+        let (port, rolled) = roll(holding(&all), &archive)?;
+        check(rolled.code_map.ranges == want, || {
+            format!("{:?}", rolled.code_map.ranges)
+        })?;
+        check(port.switched == [h1, h2], || {
+            format!("switched {:?}", port.switched)
+        })?;
+        // The way out at n2 ran under H1, the generation in force, never under H2 (AC-K7.18).
+        check(
+            rolled.code_map.range_of(n2).map(|r| (r.code, r.generation)) == Some((h1, 1)),
+            || "the way out is not in H1's range".into(),
+        )?;
+
+        // As a restore stages them: the versions the entries claim, fetched from the (untrusted)
+        // source and checked against the generation the map gives each, before anything is sent.
+        let mut port = holding(&all[..1]);
+        let claimed = core_binding::core::claimed_code_map(&mut port, &founding(), &archive)?;
+        let staged = core_binding::staging::stage_versions(&mut port, &source, &claimed.versions());
+        check(
+            staged.iter().all(|r| {
+                matches!(r, core_binding::staging::Restaged::Held(c) if *c == g)
+                    || matches!(r, core_binding::staging::Restaged::Staged(c) if *c == h1 || *c == h2)
+            }),
+            || format!("{staged:?}"),
+        )?;
+        let (_, rolled) = roll(port, &archive)?;
+        check(rolled.code_map.ranges == want, || {
+            format!("{:?}", rolled.code_map.ranges)
+        })?;
+
+        // From the checkpoint taken under H1.
+        let mut port = holding(&all);
+        port.rows = checkpoint;
+        let from = port
+            .hot()
+            .map_err(|e| format!("{e:?}"))?
+            .ok_or("the checkpoint")?
+            .inputs;
+        let (_, rolled) = roll(port, &archive)?;
+        check(
+            rolled.from == from
+                && rolled.code_map.ranges
+                    == vec![range(from + 1, m - 1, h1, 1), range(m, last, h2, 2)],
+            || format!("{rolled:?}"),
+        )?;
+
+        // Under one code version, as a restore was before: refused at n1, the fence.
+        check(roll(NativePort::new(), &archive).is_err(), || {
+            "a history across upgrades replayed under one version".into()
+        })?;
+        // A platform that does not hold H2: refused before anything is re-sent, naming the range
+        // and its replayer.
+        let e = roll(holding(&all[..2]), &archive).err().unwrap_or_default();
+        let h2_hex = core_binding::code_map::hex(&h2);
+        check(
+            e.contains(&format!("inputs {m}..={last}"))
+                && e.contains(&format!("replayer/{h2_hex}")),
+            || format!("not refused up front: {e}"),
+        )?;
+        // An entry that names the next version before the upgrade applies is refused: the map is
+        // read from the inputs, and the entry's word is held to it.
+        let mut forged = archive.clone();
+        let i = usize::try_from(n1 - 2).map_err(|e| e.to_string())?;
+        forged[i].code = h1;
+        let e = roll(holding(&all), &forged).err().unwrap_or_default();
+        check(e.contains("code map read from the inputs"), || {
+            format!("the forged entry was not refused by the map: {e}")
+        })
+    })())
+}
+
+fn ac_k7_18_input_n_is_decided_the_same_by_either_generation__service(
+    _: &mut dyn Harness,
+) -> Outcome {
+    outcome((|| {
+        let source = Held::default();
+        for (by_operator, to) in [
+            (true, None),
+            (true, Some(40)),
+            (false, None),
+            (false, Some(40)),
+        ] {
+            // Two books, input for input the same, with an upgrade to H1 from n.
+            type Scheduled = (Book, Caller, [u8; 32], [u8; 32], u64);
+            let book = || -> Checked<Scheduled> {
+                let mut b = Book::new()?;
+                let p = b.person()?;
+                let g = b.hot()?.code;
+                let h1 = source.version(1);
+                b.stage(&source, &h1).map_err(|e| format!("{e}"))?;
+                let n = b.hot()?.inputs + 2;
+                committed(b.upgrade(h1, n))?;
+                Ok((b, p, g, h1, n))
+            };
+            let (mut old, p, g, h1, n) = book()?;
+            let (mut new, _, _, _, _) = book()?;
+            // The new code decides n: the switch was already made, and nothing installs the old.
+            new.driver.port_mut().code_map.clear();
+            new.generation(1);
+            let by = if by_operator { old.operator() } else { p };
+            let to = to.map(|m| n + m);
+            let a = committed(old.way_out(by, to))?;
+            let z = committed(new.way_out(by, to))?;
+            check(a == z && a.seq == n, || format!("{a:?} / {z:?}"))?;
+            check(old.writer_state()? == new.writer_state()?, || {
+                "the generations decide it differently".into()
+            })?;
+            check(old.hot()?.generation == 0, || "the generation moved".into())?;
+            // The next input that is not a way out, under the code the book names for it.
+            committed(old.open(9))?;
+            let due = old.hot()?.generation == 1;
+            check(due == !by_operator, || {
+                format!("by the operator {by_operator}: the upgrade took effect {due}")
+            })?;
+            // A replay assigns n the generation the code map, read from the inputs alone, names:
+            // the old one, whichever package decided it live.
+            let all = [(g, 0), (h1, 1)];
+            let (_, rolled) = roll(holding(&all), &old.archive)?;
+            let at = |seq| {
+                rolled
+                    .code_map
+                    .range_of(seq)
+                    .map(|r| (r.code, r.generation))
+            };
+            check(at(n) == Some((g, 0)), || format!("n: {:?}", at(n)))?;
+            let next = if due { (h1, 1) } else { (g, 0) };
+            check(at(n + 1) == Some(next), || {
+                format!("n + 1: {:?}", at(n + 1))
+            })?;
+            let (_, live_new) = roll(holding(&all), &new.archive)?;
+            check(
+                live_new
+                    .code_map
+                    .range_of(n)
+                    .map(|r| (r.code, r.generation))
+                    == Some((g, 0))
+                    && new.archive.last().map(RingEntry::log_hash)
+                        == old
+                            .archive
+                            .get(new.archive.len() - 1)
+                            .map(RingEntry::log_hash),
+                || "the book the new code decided replays differently".into(),
+            )?;
+        }
+        Ok(())
     })())
 }

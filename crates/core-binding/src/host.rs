@@ -2066,14 +2066,20 @@ impl<P: AgentPort> Driver<P> {
     /// follows [`Driver::log_head`]. On success the Agent stands at the last entry; the host has
     /// them archived already (they came from its archive), so the next invocation acknowledges
     /// them.
+    ///
+    /// **Per range** (`T-037-09`): each input is sent under the code version the code map names
+    /// for it, read from the inputs before it ([`crate::code_map`]), and the platform is switched
+    /// to that version before the batch that starts its range, as the live upgrade switched it
+    /// (`T-037-14`). An entry naming another version is refused. Returns the map of the entries.
     pub fn roll_forward(
         &mut self,
         replica: &mut Replica,
         entries: &[RingEntry],
-    ) -> Result<(), DriveError> {
+    ) -> Result<crate::code_map::CodeMap, DriveError> {
         // F-035: the recording clerk, so that the Agent receives what it signs.
         let clerk = self.recorder.clerk();
         let chunk = self.batch_cap();
+        let mut map = crate::code_map::CodeMap::default();
         for part in entries.chunks(chunk) {
             for e in part {
                 let (tip, prev) = self.tip();
@@ -2083,13 +2089,16 @@ impl<P: AgentPort> Driver<P> {
                         e.seq
                     )));
                 }
-                // The code that executed it, as the Agent's ring names it (`T-037-02`), is what
-                // its checkpoints bind (`T-037-03`), unless an upgrade takes effect at it: then the
-                // code map's (`T-037-15`). The mode is the one the inputs before it left in force
-                // (`T-037-05`).
-                if !self.writer.due(e.seq) {
-                    self.writer.code = e.code;
-                }
+                // The code that executes it is the one the code map names, read from the inputs
+                // before it as the Agent read them (`T-037-09`, [`crate::fence::decide`]): the
+                // entry's own word is checked, never taken. It is what its checkpoints bind
+                // (`T-037-03`), and the platform is switched to it before it is sent
+                // ([`Driver::stage`] ends a batch where the code changes). The mode is the one the
+                // inputs before it left in force (`T-037-05`).
+                let way_out =
+                    crate::fence::way_out_input(&e.calls, e.deliveries.len()).unwrap_or(false);
+                map.step(&self.writer, e, way_out)
+                    .map_err(|why| DriveError::Diverged(format!("roll forward: {why}")))?;
                 self.prepare(replica, e.seq);
                 for c in &e.calls {
                     let clerk = clerk.as_deref().map(|c| c as &dyn ClerkSigner);
@@ -2119,7 +2128,7 @@ impl<P: AgentPort> Driver<P> {
             // Archived already: the next invocation carries the acknowledgement.
             self.archived();
         }
-        Ok(())
+        Ok(map)
     }
 }
 
