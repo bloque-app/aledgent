@@ -58,7 +58,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { contractEventsOf, decodeChainHead } from './chain.mjs';
+import { contractEventsOf, decodeChainHead, startOf } from './chain.mjs';
 import * as drive from './drive.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -222,7 +222,9 @@ async function entriesAt(api, abi, address, fin) {
   const entries = fold.entries.map((e) => (e.amount === undefined ? e : { ...e, amount: BigInt(e.amount) }));
   return {
     head: { lastAnchor: Number(head.lastAnchor), nextSeq: Number(head.nextSeq), prunedTo: Number(head.prunedTo) },
-    chain: { position: Number(chain.position), digest: chain.digest, start: Number(chain.start) },
+    chain: { position: Number(chain.position), digest: chain.digest, start: startOf(chain) === null ? null : Number(startOf(chain)) },
+    // Where the fold's chain started: at instantiation, at an upgrade, or at the last reset.
+    foldStart: Number(fold.start),
     resets: fold.resets,
     entries,
   };
@@ -306,11 +308,21 @@ async function dryRunWithLimits(ctx, envelopes, limits, gasLimit = gasMax(ctx.ap
   };
 }
 
-/// What `execute` keeps back to record one call as refused (`src/types.rs` `REFUSAL_RESERVE`,
-/// amendment 0040: 0.75 G and 20 KiB), checked here against what recording a refusal costs. The
-/// contract does not expose it: keep this equal to the constant (`REFUSAL_RESERVE=refTime,proofSize`
-/// overrides it, to measure a build with another).
-const REFUSAL_RESERVE = (([r, p]) => ({ refTime: BigInt(r), proofSize: BigInt(p) }))(env('REFUSAL_RESERVE', `750000000,${20 * 1024}`).split(','));
+/// What `execute` keeps back to record one call as refused (`src/types.rs` `REFUSAL_RESERVE`),
+/// checked here against what recording a refusal costs. The contract does not expose it, so it is
+/// read from the source the bundle was built from (`Weight::new(ref_time, proof_size)`, each an
+/// integer or `a * b`); `REFUSAL_RESERVE=refTime,proofSize` overrides it, to measure another build.
+function refusalReserve() {
+  if (env('REFUSAL_RESERVE', '')) {
+    const [r, p] = env('REFUSAL_RESERVE', '').split(',');
+    return { refTime: BigInt(r), proofSize: BigInt(p) };
+  }
+  const source = readFileSync(resolve(here, '../src/types.rs'), 'utf8');
+  const m = /pub const REFUSAL_RESERVE: Weight = Weight::new\(([^,]+),\s*([^)]+)\);/.exec(source) ?? fail('REFUSAL_RESERVE not found in src/types.rs');
+  const value = (expr) => expr.split('*').map((t) => BigInt(t.trim().replace(/_/g, ''))).reduce((a, b) => a * b, 1n);
+  return { refTime: value(m[1]), proofSize: value(m[2]) };
+}
+const REFUSAL_RESERVE = refusalReserve();
 /// The largest asset id a call can carry (`AssetId::External` with an Ethereum network and a
 /// parachain), so that a refusal's event, which carries the call, is as large as it gets.
 const LARGEST_ASSET = { External: { network: { Ethereum: { chainId: '18446744073709551615' } }, child: { id: 65535, pallet: 255, index: 4294967295 } } };
@@ -861,12 +873,13 @@ const phases = {
     let v;
     let head;
     let chain;
+    let foldStart;
     let entries;
     const deadline = Date.now() + 180_000;
     for (;;) {
       fin = await finalized(api);
       v = await view(api, abi, address, fin.hash);
-      ({ head, chain, entries } = await entriesAt(api, abi, address, fin));
+      ({ head, chain, foldStart, entries } = await entriesAt(api, abi, address, fin));
       if (expected(entries) || Date.now() > deadline) break;
       await sleep(6_000);
     }
@@ -949,9 +962,9 @@ const phases = {
       // anywhere a v2 reader would look (`inbox[seq]`, root key 4) for any position of the chain.
       const cell = await v.chainCell();
       const stored = [];
-      for (let seq = chain.start; seq < chain.position; seq++) if (await v.storedEntry(seq)) stored.push(seq);
+      for (let seq = foldStart; seq < chain.position; seq++) if (await v.storedEntry(seq)) stored.push(seq);
       if (stored.length) fail(`entries stored at ${stored.join(', ')}`);
-      const detail = { finalized: fin.number, position: chain.position, start: chain.start, digest: chain.digest, cell: cell ? 'stored' : 'absent (no entry yet)', entries: entries.length };
+      const detail = { finalized: fin.number, position: chain.position, start: foldStart, digest: chain.digest, cell: cell ? 'stored' : 'absent (no entry yet)', entries: entries.length };
       report.findings[tag ? 'foldFinal' : 'fold'] = detail;
       return detail;
     });
@@ -1460,8 +1473,8 @@ phases.upgrade = async (ctx) => {
       const changed = [...new Set([...Object.keys(before.cells), ...Object.keys(after.cells)])].filter((k) => before.cells[k] !== after.cells[k]);
       if (changed.length) fail(`cells changed by the upgrade: ${changed.join(', ')}`);
       const chain = await drive.startFold(api, ctx.abi, address, upgradedAt);
-      if (chain.position !== BigInt(n) || chain.start !== BigInt(n) || chain.digest !== u8aToHex(new Uint8Array(32))) fail(`chain head ${JSON.stringify(chain, drive.big)}, expected (${n}, zeros, ${n})`);
-      out.upgrade = { block: upgradedAt, codeHashBefore: before.codeHash, codeHashAfter: after.codeHash, cells: Object.keys(after.cells).length, chain: { position: Number(chain.position), start: Number(chain.start), digest: chain.digest } };
+      if (chain.position !== BigInt(n) || (startOf(chain) !== null && startOf(chain) !== BigInt(n)) || chain.digest !== u8aToHex(new Uint8Array(32))) fail(`chain head ${JSON.stringify(chain, drive.big)}, expected (${n}, zeros, ${n})`);
+      out.upgrade = { block: upgradedAt, codeHashBefore: before.codeHash, codeHashAfter: after.codeHash, cells: Object.keys(after.cells).length, chain: { position: Number(chain.position), start: startOf(chain) === null ? null : Number(startOf(chain)), digest: chain.digest } };
       return out.upgrade;
     });
     if (!ok) fail('the upgrade did not go through');
@@ -1566,7 +1579,7 @@ phases.upgrade = async (ctx) => {
       if (h.nextSeq !== 0 || h.prunedTo !== 0 || h.lastAnchor !== 0) fail(`head after the reset: ${JSON.stringify(h)}`);
       if (await v.chainCell()) fail('the chain cell is still stored');
       const chain = await v.chainHead();
-      if (chain.position !== 0n || chain.start !== 0n) fail(`chain head after the reset: ${JSON.stringify(chain, drive.big)}`);
+      if (chain.position !== 0n || chain.digest !== u8aToHex(new Uint8Array(32)) || (startOf(chain) !== null && startOf(chain) !== 0n)) fail(`chain head after the reset: ${JSON.stringify(chain, drive.big)}`);
       if (!released.some((r) => pk(r.from) === pk(address) && pk(r.to) === pk(governance.address))) fail(`no deposit released from the contract to the origin: ${JSON.stringify(released)}`);
       const trieAfter = await trieCells(api, address, blockHash);
       const r = await foldNow('afterReset');
@@ -1592,7 +1605,7 @@ phases.upgrade = async (ctx) => {
       await drive.callContract(api, c, accounts.depositor, 'deposit', [ref(), ASSET, DEPOSIT.toString()], 'deposit (after the reset)');
       const r = await foldNow('afterResetEntries');
       if (r.entries.map((e) => `${e.seq}:${e.kind}`).join(',') !== '0:Anchored,1:Deposited') fail(`entries after the reset: ${JSON.stringify(r.entries.map((e) => `${e.seq}:${e.kind}`))}`);
-      return `0:Anchored, 1:Deposited, folded to ${r.chain.digest} = the head (${r.chain.position}, start ${r.chain.start})`;
+      return `0:Anchored, 1:Deposited, folded to ${r.chain.digest} = the head (${r.chain.position}, the chain from ${r.foldStart})`;
     });
   } finally {
     Object.assign(drive.state, saved);

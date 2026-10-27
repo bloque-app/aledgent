@@ -178,7 +178,16 @@ try {
   await fund(admin);
   out.upgradeSignedByAdmin = (({ records, ...r }) => r)(await send(api.tx.utility.batchAll([publish.method, upgrade.method]), admin, 'batch_all(publish_upgrade, upgrade) signed by the admin'));
 
-  // --- the real enactment: the community's referendum
+  // `upgrade` alone, once a new version is published: `publish_upgrade` enacted alone by the
+  // community's referendum, then `upgrade` dry-run as each origin. Without
+  // this, `upgrade` alone reads `AppInstanceUpToDate` as the community and an origin error as
+  // anyone else, which does not show the order of the two checks.
+  const pub = await referendum(publish, 'publish_upgrade alone', (recs) => isEvent(recs, 'contractsStore', 'AppUpdated'));
+  out.upgradeAfterPublish = { publish: pub.enacted ? `enacted by referendum ${pub.index} in #${pub.enacted.block}` : 'not enacted' };
+  for (const [name, o] of Object.entries(origins)) out.upgradeAfterPublish[name] = await dryRun(o, upgrade.method);
+  say('upgrade after publish_upgrade', Object.fromEntries(Object.entries(out.upgradeAfterPublish).map(([k, v]) => [k, typeof v === 'string' ? v : v.ok ? 'ok' : v.error])));
+
+  // --- the real enactment: the community's referendum (it publishes once more and upgrades)
   const up = await referendum(batch, 'upgrade', (recs) => isEvent(recs, 'contracts', 'ContractCodeUpdated', (e) => e.data[0].toString() === C || encodeAddress(e.data[0], 2) === C));
   out.upgradeReferendum = { ...up, enacted: up.enacted && { block: up.enacted.block, events: up.enacted.records.map((r) => `${r.event.section}.${r.event.method}`) } };
   const info1 = (await api.query.contracts.contractInfoOf(C)).unwrap();

@@ -136,32 +136,41 @@ export async function advance(api, abi, address, fold, toNumber, plain) {
   return fold;
 }
 
-/// Whether the fold equals a head (`decodeChainHead`'s): position and digest; `start` too once
-/// the fold knows where its chain started.
+/// Where a decoded head says its chain started, or `null` if the head carries no `start` (the
+/// field is not yet ruled: readers outside this module ask here, never `head.start`).
+export const startOf = (head) => (head.start === undefined ? null : head.start);
+
+/// Whether the fold equals a head (`decodeChainHead`'s): position and digest, and where the chain
+/// started if the head says.
 export function foldMatches(fold, head) {
-  return BigInt(fold.position) === head.position && fold.digest === head.digest && BigInt(fold.start) === head.start;
+  const start = startOf(head);
+  return BigInt(fold.position) === head.position && fold.digest === head.digest && (start === null || BigInt(fold.start) === start);
 }
 
 /// Fail unless the fold equals the head, naming both.
 export function expectFoldEquals(fold, head, label) {
   if (!foldMatches(fold, head)) {
-    fail(`${label}: the events fold to (${fold.position}, ${fold.digest}, start ${fold.start}) at #${fold.number}, the head is (${head.position}, ${head.digest}, start ${head.start})`);
+    fail(`${label}: the events fold to (${fold.position}, ${fold.digest}, start ${fold.start}) at #${fold.number}, the head is (${head.position}, ${head.digest}, start ${startOf(head)})`);
   }
 }
 
 /// Walk back from block `toNumber` to where the current chain started, for a reader that kept no
-/// fold: `start` (from the head) is the first position of the chain. Returns a fold positioned just
-/// before the chain's first entry, ready for `advance`. Stops at the block of the newest
-/// `AnchorHeadSet`, or at the block holding the entry at `start`; fails after `maxBlocks`.
-export async function locateStart(api, abi, address, toNumber, head, maxBlocks) {
-  if (head.position === head.start) return newFold({ number: toNumber, position: head.start, start: head.start });
+/// fold. Returns a fold positioned just before the chain's first entry, ready for `advance`. Stops
+/// at the block of the newest `AnchorHeadSet` (a new chain from 0), or, with the head's `start`, at
+/// the block holding the entry at `start`, or, without it, at the block the contract's code changed
+/// (the chain then starts at `positionAfter(n)`, the head's next position at that block); fails
+/// after `maxBlocks`.
+export async function locateStart(api, abi, address, toNumber, head, maxBlocks, positionAfter) {
+  const start = startOf(head);
+  if (start !== null && head.position === start) return newFold({ number: toNumber, position: start });
   for (let n = toNumber, i = 0; n > 0 && i < maxBlocks; n--, i++) {
     const hash = await api.rpc.chain.getBlockHash(n);
     const events = contractEventsOf(abi, address, await (await api.at(hash)).query.system.events());
-    if (events.some((e) => e.kind === 'AnchorHeadSet')) return newFold({ number: n - 1, position: 0n, start: 0n });
-    if (events.some((e) => e.seq === head.start)) return newFold({ number: n - 1, position: head.start, start: head.start });
+    if (events.some((e) => e.kind === 'AnchorHeadSet')) return newFold({ number: n - 1, position: 0n });
+    if (start !== null && events.some((e) => e.seq === start)) return newFold({ number: n - 1, position: start });
+    if (start === null && events.some((e) => e.kind === 'ContractCodeUpdated')) return newFold({ number: n, position: await positionAfter(n) });
   }
-  return fail(`the chain's start (position ${head.start}) is not within ${maxBlocks} blocks of #${toNumber}`);
+  return fail(`the chain's start is not within ${maxBlocks} blocks of #${toNumber}`);
 }
 
 /// Hex to bytes, for a digest kept as JSON.

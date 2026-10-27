@@ -63,7 +63,7 @@ on:
         type: string
         default: ""
       upgrade_from:
-        description: "Rehearse the upgrade from the contract at this commit (T-043-03; 210ca4b is v2, the code both mainnet instances run): deployed, given entries, upgraded to this code, reset. Empty: skipped"
+        description: "Rehearse the upgrade from the contract at this commit (T-043-03): deployed, given entries, upgraded to this code, reset. 210ca4b is v2's source: its build has the ABI, storage layout and code size of the code both mainnet instances run (0x268de8fb..., built on Linux). Empty: skipped"
         type: string
         default: ""
   # The release gate: a release tag runs the full suite with the script driver and requires the

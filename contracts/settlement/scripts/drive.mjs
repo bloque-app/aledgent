@@ -51,7 +51,7 @@ import { Abi, ContractPromise } from '@polkadot/api-contract';
 import { bnToU8a, compactToU8a, hexToU8a, stringToU8a, u8aConcat, u8aEq, u8aToHex } from '@polkadot/util';
 import { blake2AsU8a, cryptoWaitReady, decodeAddress, encodeAddress } from '@polkadot/util-crypto';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { advance, decodeChainHead, expectFoldEquals, foldFromJson, foldToJson, locateStart, newFold } from './chain.mjs';
+import { advance, decodeChainHead, expectFoldEquals, foldFromJson, foldToJson, locateStart, newFold, startOf } from './chain.mjs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -369,14 +369,19 @@ async function foldAt(api, abi, address, fin) {
   const at = await chainHeadAt(api, abi, address, fin.hash);
   state.folds ??= {};
   let fold = state.folds[address] ? foldFromJson(state.folds[address]) : null;
-  if (!fold || fold.number > fin.number) {
-    fold = await locateStart(api, abi, address, fin.number, at.chain, Number(env('BLOCKS', '256')));
-    log(`fold of ${address}: no fold kept; the chain starts after #${fold.number}`);
+  // A block before the fold kept is read from a fold of its own, and the one kept stays.
+  const keep = !fold || fold.number <= fin.number;
+  if (!fold || !keep) {
+    const positionAfter = async (n) => (await chainHeadAt(api, abi, address, await api.rpc.chain.getBlockHash(n))).head.nextSeq;
+    fold = await locateStart(api, abi, address, fin.number, at.chain, Number(env('BLOCKS', '256')), positionAfter);
+    log(`fold of ${address}: ${keep ? 'no fold kept' : `#${fin.number} is before the fold kept`}; the chain starts after #${fold.number}`);
   }
   await advance(api, abi, address, fold, fin.number, plainEntry);
   expectFoldEquals(fold, at.chain, `${address} at #${fin.number}`);
-  state.folds[address] = foldToJson(fold);
-  save();
+  if (keep) {
+    state.folds[address] = foldToJson(fold);
+    save();
+  }
   return { ...at, fold };
 }
 
@@ -386,7 +391,9 @@ async function startFold(api, abi, address, number) {
   const hash = await api.rpc.chain.getBlockHash(number);
   const { chain } = await chainHeadAt(api, abi, address, hash);
   state.folds ??= {};
-  state.folds[address] = foldToJson(newFold({ number, position: chain.position, digest: chain.digest, start: chain.start }));
+  // The fold starts here, so its chain starts here too: at instantiation (0) or at an upgrade
+  // from code that kept no chain (the head's next position, with the zero digest).
+  state.folds[address] = foldToJson(newFold({ number, position: chain.position, digest: chain.digest }));
   save();
   return chain;
 }
