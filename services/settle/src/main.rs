@@ -13,8 +13,9 @@
 //!
 //! - `aledgent-settle <config.json> gap <from> <to>`: **the operator's gap** (ruling a40-q3). When
 //!   the adapter stopped at position `from` (an `unreadable:` or `chain:` alert) and no reader can
-//!   serve the range, it records `[from, to)` as a gap through its own source and accepts the
-//!   layer's head at `to`, unverified for that range. Any other range is refused.
+//!   serve the range, it records the gap through its own source from `from` to the layer's head
+//!   now (`to` is the range the alert named; the head may have moved since), accepts that head,
+//!   unverified for the range, and prints the range it recorded. Any other range is refused.
 //! - `aledgent-settle <config.json> refound`: the book was re-founded with its instance's reset (a
 //!   `reset:` alert): the cursor and the accepted head of the chain before are reset, and the next
 //!   run starts on the current chain from its start.
@@ -301,11 +302,12 @@ async fn run() -> Result<(), String> {
     match command {
         Command::Run => {}
         Command::Gap { from, to } => {
-            adapter
+            let (from, to) = adapter
                 .record_operator_gap(from, to)
                 .await
                 .map_err(|e| e.to_string())?;
             tracing::warn!(from, to, "the operator's gap is recorded");
+            println!("recorded the gap [{from}, {to}) and accepted the head at {to}");
             return Ok(());
         }
         Command::Refound => {

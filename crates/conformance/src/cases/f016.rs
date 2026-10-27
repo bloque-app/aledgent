@@ -283,8 +283,17 @@ fn ac_d2_2__service(_: &mut dyn Harness) -> Outcome {
             gaps.len() == 1 && gaps[0].from == 0 && gaps[0].to == 3,
             || format!("adapter gaps {gaps:?}"),
         )?;
-        check(open_alerts(&k, "gap:").await? == 1, || {
-            "no gap alert".into()
+        // Visible to operators: in the adapter's store and the core's, and in the alert history
+        // (raised, then cleared, since the operator recorded it), so it does not page on.
+        let alerts = k.store.alerts().await.map_err(|e| e.to_string())?;
+        check(
+            alerts
+                .iter()
+                .any(|a| a.key.starts_with("gap:") && a.cleared_at.is_some()),
+            || format!("no gap alert: {alerts:?}"),
+        )?;
+        check(open_alerts(&k, "gap:").await? == 0, || {
+            "the operator's gap still pages".into()
         })?;
         let core = k.core_settlement(|s| s.gaps().to_vec()).unwrap_or_default();
         check(

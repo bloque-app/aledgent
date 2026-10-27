@@ -347,29 +347,57 @@ async fn t_043_04_behind_more_than_256_blocks_needs_the_history_endpoint() {
 
 /// `T-043-04` (ruling a40-q3): when no reader serves the range, the operator has the adapter
 /// record it as a gap through its own source; the adapter accepts the layer's head as it stands,
-/// and observation goes on from there. A range other than the one it stopped at is refused.
+/// and observation goes on from there. The range the alert named is accepted even after the head
+/// moved, and the gap runs to the head now; one that does not start where the adapter stopped, or
+/// runs past the head, is refused. The gap's own alert is cleared with it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn t_043_04_the_operators_gap_goes_through_the_adapter() {
     let mut k = serving_kit().await;
     deposits(&k, 3);
     k.chain.advance(300);
     k.step().await.unwrap();
-    assert_eq!(open_alerts(&k, "unreadable:").await.len(), 1);
-    assert!(matches!(
-        k.adapter.record_operator_gap(0, 2).await,
-        Err(AdapterError::Refused(_))
-    ));
+    let alerts = open_alerts(&k, "unreadable:").await;
+    assert_eq!(alerts.len(), 1);
+    assert!(alerts[0].detail.contains("gap 0 3"), "{}", alerts[0].detail);
+    // The head moves on after the alert, which still names [0, 3).
+    deposits(&k, 1);
+    k.chain.finalize_all();
+    k.step().await.unwrap();
+    assert!(
+        open_alerts(&k, "unreadable:").await[0]
+            .detail
+            .contains("gap 0 3")
+    );
+    for (from, to) in [(1, 3), (0, 5), (0, 0)] {
+        assert!(
+            matches!(
+                k.adapter.record_operator_gap(from, to).await,
+                Err(AdapterError::Refused(_))
+            ),
+            "[{from}, {to})"
+        );
+    }
     assert!(k.store.gaps().await.unwrap().is_empty());
-    k.adapter.record_operator_gap(0, 3).await.unwrap();
+    assert_eq!(k.adapter.record_operator_gap(0, 3).await.unwrap(), (0, 4));
     let gaps = k.store.gaps().await.unwrap();
     assert_eq!(
         (gaps[0].from, gaps[0].to, gaps[0].reason.as_str()),
-        (0, 3, "unreadable")
+        (0, 4, "unreadable")
     );
     let core = k.core_settlement(|s| s.gaps().to_vec()).unwrap();
-    assert_eq!((core[0].from, core[0].to), (0, 3));
+    assert_eq!((core[0].from, core[0].to), (0, 4));
     assert!(open_alerts(&k, "unreadable:").await.is_empty());
-    assert_eq!(k.store.cursor(INSTANCE).await.unwrap(), 3);
+    // The gap's alert is not left paging: the operator recorded it.
+    assert!(open_alerts(&k, "gap:").await.is_empty());
+    assert!(
+        k.store
+            .alerts()
+            .await
+            .unwrap()
+            .iter()
+            .any(|a| a.key == format!("gap:{INSTANCE}:0"))
+    );
+    assert_eq!(k.store.cursor(INSTANCE).await.unwrap(), 4);
     assert_eq!(
         k.store
             .accepted_head(INSTANCE)
@@ -377,13 +405,13 @@ async fn t_043_04_the_operators_gap_goes_through_the_adapter() {
             .unwrap()
             .unwrap()
             .position,
-        3
+        4
     );
     // From there on, as ever.
     deposits(&k, 1);
     k.chain.finalize_all();
     assert_eq!(k.step().await.unwrap().observed, 1);
-    assert_eq!(core_seqs(&k), vec![3]);
+    assert_eq!(core_seqs(&k), vec![4]);
 }
 
 // ------------------------------------------------------------------------------ resets

@@ -151,8 +151,9 @@ it serves is folded against the head the light client reads):
 
 Without one, it raises `unreadable:<instance>:<position>` and waits. When no reader can serve the
 range, or a mismatch does not clear, the operator has the adapter record it as a gap through its
-own source, after which it accepts the layer's head as it stands, unverified for that range; the
-range must be exactly the one the alert names:
+own source, after which it accepts the layer's head as it stands, unverified for that range. The
+command takes the range the alert names; the gap it records runs from there to the head at the time,
+which may have moved since, and it prints the range it recorded. Its `gap:` alert is cleared with it:
 
 ```sh
 aledgent-settle settle.json gap <from> <to>

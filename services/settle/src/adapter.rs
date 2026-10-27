@@ -3046,11 +3046,14 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
     /// the adapter stopped at, or a mismatch does not clear, the operator has the adapter record it
     /// through its own source, the only one the core takes a gap from (`record_gap`), and the
     /// adapter then takes the layer's head as it stands as verified and accepted, unverified for
-    /// that range. `from` and `to` are what the operator saw in the alert: the position the adapter
-    /// stopped at and the head's at the finalized block; anything else is refused, and nothing is
-    /// written. Refused too while the core has not taken in the entries already verified, or while
-    /// a reset is open. Holds the lease, as a step does.
-    pub async fn record_operator_gap(&mut self, from: u64, to: u64) -> StepResult<()> {
+    /// the range. `[from, to)` is the range the alert names: `from` must be the position the
+    /// adapter stopped at, and `to` at most the head's at the finalized block now. The gap
+    /// recorded runs to that head, which may have moved since the alert; it is returned. Anything
+    /// else is refused and nothing is written; so is a gap while the core has not taken in the
+    /// entries already verified, or while a reset is open. The `gap:` alert the gap raises is
+    /// cleared with it: it is the operator's own act, recorded in the core and the store. Holds
+    /// the lease, as a step does.
+    pub async fn record_operator_gap(&mut self, from: u64, to: u64) -> StepResult<(u64, u64)> {
         self.hold_lease().await?;
         let instance = self.config.instance;
         if self.refounding().await? {
@@ -3066,7 +3069,9 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             .ok_or_else(|| AdapterError::Refused("the instance is not registered".into()))?;
         let epoch = self.chain.chain_epoch(&fin, instance).await?;
         let cursor = self.store.cursor(instance).await?;
-        let stopped_at = match self.store.verified_head(instance).await? {
+        // Where the adapter stopped, and whether a cursor from before the instance's reset goes
+        // back to the chain's start first.
+        let (stopped_at, reset_cursor) = match self.store.verified_head(instance).await? {
             Some(v) if cursor < v.position => {
                 return Err(AdapterError::Refused(format!(
                     "the core has not taken in the verified positions [{cursor}, {}) yet: they \
@@ -3074,14 +3079,9 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                     v.position
                 )));
             }
-            Some(v) => v.position,
-            // A first start: from the cursor if it is behind the chain's start; from the start if
-            // the cursor is a chain's before the instance's reset.
-            None if cursor <= head.start => cursor,
-            None if head.start == 0 && epoch.is_some_and(|e| e.from_seq == 0) => {
-                self.store.reset_chain(instance, 0).await?;
-                0
-            }
+            Some(v) => (v.position, false),
+            None if cursor <= head.start => (cursor, false),
+            None if head.start == 0 && epoch.is_some_and(|e| e.from_seq == 0) => (0, true),
             None => {
                 return Err(AdapterError::Refused(format!(
                     "the cursor stands at {cursor}, past the chain's start at {}, on an instance \
@@ -3090,15 +3090,23 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                 )));
             }
         };
-        if (from, to) != (stopped_at, head.position) || from >= to {
+        if from != stopped_at || from >= to || to > head.position {
             return Err(AdapterError::Refused(format!(
                 "the adapter stands at position {stopped_at} and the head at {} (block #{}): a \
-                 gap is recorded for exactly that range, not [{from}, {to})",
+                 gap starts at {stopped_at} and names a range up to the head, not [{from}, {to})",
                 head.position, fin.number
             )));
         }
+        let to = head.position;
+        if reset_cursor {
+            self.store.reset_chain(instance, 0).await?;
+        }
         self.record_gap(from, to, GapReasonBody::Unreadable).await?;
         self.cleared(from).await?;
+        let now = self.now();
+        self.store
+            .clear(&format!("gap:{instance}:{from}"), now)
+            .await?;
         let h = AcceptedHead {
             position: head.position,
             digest: head.digest,
@@ -3113,7 +3121,7 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             block = fin.number,
             "the operator's gap: the head is accepted unverified for the range"
         );
-        Ok(())
+        Ok((from, to))
     }
 
     /// **The re-founding's reset** (amendment 0040): the book this adapter serves was re-founded
