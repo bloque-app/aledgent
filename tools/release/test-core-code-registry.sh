@@ -30,11 +30,12 @@ for _ in $(seq 1 30); do curl -fsS "http://localhost:$port/v2/" >/dev/null 2>&1 
 fx="$work/fx"; mkdir -p "$fx"
 for f in package runtime manifest; do head -c 1500 /dev/urandom >"$fx/$f"; done
 version=$(b2 "$fx/manifest")
+pred=$(printf 'a%.0s' $(seq 64))
 jq -n --arg v "$version" --arg pkg "$(b2 "$fx/package")" --arg rt "$(b2 "$fx/runtime")" '
   {version: $v, generation: 1, platform: {name: "vos-saga", revision: "r", identities: []},
    artefacts: [{role: "package", digest: $pkg, len: 1500, profile: {source_revision: "s"}},
                {role: "runtime", digest: $rt, len: 1500, profile: {source_revision: "s"}}]}' >"$fx/report.json"
-"$here/core-code-set.sh" "$fx/report.json" "$fx/manifest" "$fx/package" "$fx/runtime" "$work/set" "$work/set.json" >/dev/null
+"$here/core-code-set.sh" "$fx/report.json" "$fx/manifest" "$fx/package" "$fx/runtime" "$pred" "$work/set" "$work/set.json" >/dev/null
 python3 -I "$here/pack-code-layer.py" "$work/set" "$work/layer.tar" "$work/set.json"
 
 d1=$("$here/core-code-publish.sh" "$repo" "$version" "$work/set" "$work/layer.tar" 2>"$work/p1.log")

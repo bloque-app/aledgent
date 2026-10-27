@@ -29,6 +29,7 @@ head -c 1200 /dev/urandom >"$fx/runtime"
 head -c 800 /dev/urandom >"$fx/host"
 head -c 700 /dev/urandom >"$fx/manifest"
 version=$(b2 "$fx/manifest")
+pred=$(printf 'a%.0s' $(seq 64))
 report() { # <out> [package digest] [runtime len]
   jq -n --arg v "$version" --arg pkg "${2:-$(b2 "$fx/package")}" --arg rt "$(b2 "$fx/runtime")" \
         --arg host "$(b2 "$fx/host")" --argjson pkglen "$(wc -c <"$fx/package" | tr -d ' ')" \
@@ -44,31 +45,33 @@ report "$fx/report.json"
 set_sh="$here/core-code-set.sh"
 
 # --- a good set ----------------------------------------------------------------------------------
-"$set_sh" "$fx/report.json" "$fx/manifest" "$fx/package" "$fx/runtime" "$work/set" "$work/set.json" >/dev/null
+"$set_sh" "$fx/report.json" "$fx/manifest" "$fx/package" "$fx/runtime" "$pred" "$work/set" "$work/set.json" >/dev/null
 [ "$(find "$work/set" -type f | wc -l | tr -d ' ')" = 3 ] || fail "a set holds three files"
 for f in "$work"/set/*; do [ "$(b2 "$f")" = "$(basename "$f")" ] || fail "$f is not named by its digest"; done
 [ -f "$work/set/$version" ] || fail "the manifest is not named by the code version"
-jq -e --arg v "$version" '.code == $v and .generation == 1 and (.files | length == 3)
+jq -e --arg v "$version" --arg p "$pred" '.code == $v and .predecessor == $p and .generation == 1 and (.files | length == 3)
   and .platform.name == "vos-saga" and .source_revision == "abc"' "$work/set.json" >/dev/null || fail "set.json"
 mode=$(python3 -I -c 'import os, stat, sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode))[2:])' "$work/set/$version")
 [ "$mode" = 444 ] || fail "files are read-only (mode $mode)"
 
 # --- refusals ------------------------------------------------------------------------------------
-refuses "exists already" "$set_sh" "$fx/report.json" "$fx/manifest" "$fx/package" "$fx/runtime" "$work/set" "$work/x.json"
+refuses "exists already" "$set_sh" "$fx/report.json" "$fx/manifest" "$fx/package" "$fx/runtime" "$pred" "$work/set" "$work/x.json"
 report "$work/wrong-pkg.json" "$(printf '%064d' 7)"
-refuses "package .* hashes to" "$set_sh" "$work/wrong-pkg.json" "$fx/manifest" "$fx/package" "$fx/runtime" "$work/o1" "$work/x.json"
+refuses "package .* hashes to" "$set_sh" "$work/wrong-pkg.json" "$fx/manifest" "$fx/package" "$fx/runtime" "$pred" "$work/o1" "$work/x.json"
 report "$work/wrong-len.json" "" 1199
-refuses "runtime .* is [0-9]+ bytes, the host reports 1199" "$set_sh" "$work/wrong-len.json" "$fx/manifest" "$fx/package" "$fx/runtime" "$work/o2" "$work/x.json"
-refuses "manifest .* hashes to" "$set_sh" "$fx/report.json" "$fx/host" "$fx/package" "$fx/runtime" "$work/o3" "$work/x.json"
+refuses "runtime .* is [0-9]+ bytes, the host reports 1199" "$set_sh" "$work/wrong-len.json" "$fx/manifest" "$fx/package" "$fx/runtime" "$pred" "$work/o2" "$work/x.json"
+refuses "manifest .* hashes to" "$set_sh" "$fx/report.json" "$fx/host" "$fx/package" "$fx/runtime" "$pred" "$work/o3" "$work/x.json"
 jq 'del(.artefacts[] | select(.role == "runtime"))' "$fx/report.json" >"$work/no-runtime.json"
-refuses "one package and one runtime" "$set_sh" "$work/no-runtime.json" "$fx/manifest" "$fx/package" "$fx/runtime" "$work/o4" "$work/x.json"
+refuses "one package and one runtime" "$set_sh" "$work/no-runtime.json" "$fx/manifest" "$fx/package" "$fx/runtime" "$pred" "$work/o4" "$work/x.json"
 jq '.version = "ABC"' "$fx/report.json" >"$work/bad-version.json"
-refuses "one package and one runtime" "$set_sh" "$work/bad-version.json" "$fx/manifest" "$fx/package" "$fx/runtime" "$work/o5" "$work/x.json"
+refuses "one package and one runtime" "$set_sh" "$work/bad-version.json" "$fx/manifest" "$fx/package" "$fx/runtime" "$pred" "$work/o5" "$work/x.json"
 ln -s "$fx/package" "$fx/package-link"
-refuses "not a regular file" "$set_sh" "$fx/report.json" "$fx/manifest" "$fx/package-link" "$fx/runtime" "$work/o6" "$work/x.json"
+refuses "not a regular file" "$set_sh" "$fx/report.json" "$fx/manifest" "$fx/package-link" "$fx/runtime" "$pred" "$work/o6" "$work/x.json"
+refuses "not a code version" "$set_sh" "$fx/report.json" "$fx/manifest" "$fx/package" "$fx/runtime" ABC "$work/o8" "$work/x.json"
+refuses "follows itself" "$set_sh" "$fx/report.json" "$fx/manifest" "$fx/package" "$fx/runtime" "$version" "$work/o9" "$work/x.json"
 head -c 70000 /dev/urandom >"$work/big-manifest"
 jq --arg v "$(b2 "$work/big-manifest")" '.version = $v' "$fx/report.json" >"$work/big.json"
-refuses "64 KiB" "$set_sh" "$work/big.json" "$work/big-manifest" "$fx/package" "$fx/runtime" "$work/o7" "$work/x.json"
+refuses "64 KiB" "$set_sh" "$work/big.json" "$work/big-manifest" "$fx/package" "$fx/runtime" "$pred" "$work/o7" "$work/x.json"
 
 # --- the layer: the same bytes every time, and only digest-named files ----------------------------
 pack="$here/pack-code-layer.py"

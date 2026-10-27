@@ -399,9 +399,10 @@ jobs:
         if: steps.gen.outputs.proceed == 'true'
         env:
           W: ${{ steps.in.outputs.w }}
+          PRED: ${{ steps.pred.outputs.code }}
         run: |
           set -euo pipefail
-          tools/release/core-code-set.sh "$W/report.json" "$W/manifest.bin" "$W/new/core.vos" "$W/new/agent_runtime.pvm" "$W/set" "$W/set.json"
+          tools/release/core-code-set.sh "$W/report.json" "$W/manifest.bin" "$W/new/core.vos" "$W/new/agent_runtime.pvm" "$PRED" "$W/set" "$W/set.json"
           python3 -I tools/release/pack-code-layer.py "$W/set" "$W/layer.tar" "$W/set.json"
           echo "layer_sha256=$(sha256sum "$W/layer.tar" | cut -d' ' -f1)" >>"$GITHUB_OUTPUT"
 

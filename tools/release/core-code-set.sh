@@ -10,18 +10,19 @@
 # digest and the length the host's own report (`code-manifest`'s output) gives for it. The core host
 # checks every byte again when it fetches them, so what this protects is the release, not the node.
 #
-#   tools/release/core-code-set.sh <report.json> <manifest> <package> <runtime> <out-dir> <set.json>
+#   tools/release/core-code-set.sh <report.json> <manifest> <package> <runtime> <predecessor> <out-dir> <set.json>
 #
 #   report.json   what `aledgent-core-host code-manifest` printed (the manifest as JSON)
+#   predecessor   the code version in force that this one follows (64 hex)
 #   out-dir       created; holds exactly the three files
 #   set.json      written: the record of the release (code version, generation, platform, files)
 set -euo pipefail
 
-if [ "$#" -ne 6 ]; then
+if [ "$#" -ne 7 ]; then
   sed -n '/^#   tools/,/^#   set.json/p' "$0" | sed 's/^# \{0,3\}//' >&2
   exit 2
 fi
-report=$1 manifest=$2 package=$3 runtime=$4 out=$5 record=$6
+report=$1 manifest=$2 package=$3 runtime=$4 predecessor=$5 out=$6 record=$7
 
 command -v b2sum >/dev/null || { echo "core-code-set: b2sum (coreutils) is required" >&2; exit 1; }
 command -v jq >/dev/null || { echo "core-code-set: jq is required" >&2; exit 1; }
@@ -31,6 +32,7 @@ done
 [ ! -e "$out" ] || { echo "core-code-set: $out exists already" >&2; exit 1; }
 
 hex64='^[0-9a-f]{64}$'
+[[ $predecessor =~ $hex64 ]] || { echo "core-code-set: the predecessor '$predecessor' is not a code version (64 lowercase hex)" >&2; exit 1; }
 b2() { b2sum -l 256 "$1" | cut -d' ' -f1; }
 size() { wc -c <"$1" | tr -d ' '; }
 
@@ -50,6 +52,7 @@ want() { jq -r --arg role "$1" --arg field "$2" '.artefacts[] | select(.role == 
 version=$(jq -r .version "$report")
 pkg_digest=$(want package digest) pkg_len=$(want package len)
 rt_digest=$(want runtime digest) rt_len=$(want runtime len)
+[ "$predecessor" != "$version" ] || { echo "core-code-set: the code version follows itself: nothing changed" >&2; exit 1; }
 for d in "$version" "$pkg_digest" "$rt_digest"; do
   [[ $d =~ $hex64 ]] || { echo "core-code-set: '$d' is not a lowercase blake2b-256 digest" >&2; exit 1; }
 done
@@ -89,11 +92,12 @@ for f in "$out"/*; do
   [ "$(b2 "$f")" = "$(basename "$f")" ] || { echo "core-code-set: $f is not named by its digest" >&2; exit 1; }
 done
 
-jq -n --slurpfile report "$report" --arg package "$pkg_digest" --arg runtime "$rt_digest" \
+jq -n --slurpfile report "$report" --arg predecessor "$predecessor" --arg package "$pkg_digest" --arg runtime "$rt_digest" \
       --argjson pkg_len "$pkg_len" --argjson rt_len "$rt_len" --argjson man_len "$(size "$manifest")" '
   $report[0] as $r | {
     format: "aledgent/core-code-set/v1",
     code: $r.version,
+    predecessor: $predecessor,
     generation: $r.generation,
     platform: {name: $r.platform.name, revision: $r.platform.revision},
     files: [
