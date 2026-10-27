@@ -5,8 +5,8 @@ SPDX-License-Identifier: CC-BY-4.0
 
 # Amendment 0040 — Chained settlement entries: the contract keeps one head, not a list
 
-**Status:** **draft**. The owner ruled the design on 2026-10-26 (below). Nothing here is applied to `SPEC.md`;
-the plan and the code cite it as `[PENDING AMENDMENT 0040]`.
+**Status:** **draft**. The owner ruled the design on 2026-10-26, in two rounds (below). Nothing here is applied
+to `SPEC.md`; the plan and the code cite it as `[PENDING AMENDMENT 0040]`. The contract is built (`T-043-02`).
 **Target:** `SPEC.md` v0.4.29 as on `develop` (at `c79d12d`); `F-016`, `F-026`, `F-027`; amendment 0039.
 **Date:** 2026-10-26
 **Number:** 0039 is the last on `develop`; no open PR or remote branch claims 0040.
@@ -19,8 +19,8 @@ entry, so the contract need not store the entries and the core need not re-scan 
 
 ## The problem
 
-1. **Cost.** The contract stores every entry (`inbox`, `contracts/settlement/src/lib.rs:94`, written by
-   `append`, `:834-846`), each at a storage deposit until the admin prunes it (`prune_inbox`, `:502-534`).
+1. **Cost.** The contract (v2) stores every entry (`inbox`, written by `append`), each at a storage deposit
+   until the admin prunes it (`prune_inbox`).
 2. **The re-scan grows the book's state.** Settle re-reads recent positions on a timer
    (`services/settle/src/adapter.rs:1161-1166`). Each difference is an incident in one leaf that is rewritten
    whole on every write (`crates/ledger-core/src/settlement/store.rs:246`), and a test book halted on it. #73
@@ -39,8 +39,8 @@ entry, so the contract need not store the entries and the core need not re-scan 
    `types.rs:485-494`), and `Refused` no `call` (`lib.rs:211-222`; entry, `types.rs:520-527`). `Withdrawn`,
    `Anchored` and `Bound` carry every field (`lib.rs:163-207`). Nothing decodes the contract's events today:
    no code matches `ContractEmitted`, and settle reads only `System` events (`chain/rpc.rs:1011-1020`).
-4. **`Head` cannot change encoding** (`types.rs:143-156`), and `prune_inbox` bounds itself by `Head.next_seq`
-   (`lib.rs:506`). The next free storage key is `0x0000_000C` (`lib.rs:113`).
+4. **`Head` cannot change encoding** (`types.rs:143-156`): deployed instances store it and frames pass it.
+   The next free storage key is `0x0000_000C` (`lib.rs:113`).
 5. **The book's logic reads the gaps; it never reads the settlement incidents.** `proof` answers
    `Unprovable` when a gap overlaps `[from_seq, head.next_seq)` (`crates/ledger-core/src/ledger/settlement.rs:1689`).
    Outside export and the re-scan's index rebuild (`store.rs:793-802`), no code reads `incidents`.
@@ -48,31 +48,51 @@ entry, so the contract need not store the entries and the core need not re-scan 
    (`agents/core/src/lib.rs:68-73`), and the leaf kinds are keys in it, not the layout the runtime checks on an
    in-place upgrade (`agents/core-host/src/switch.rs:373-375`). The founding records of the test book and of
    `p2` both name the patched runtime (`24d9f451…`, VOS `bd8d1bb7`) that `T-037-19` needs.
+7. **The deployed instances hold few entries, all anchors** (read-only, finalized #40,151,145, 2026-10-26).
+   Test: head `{ last_anchor 1, next_seq 13, pruned_to 0 }`, 13 stored `Anchored` entries, governance named
+   (community 1200's account). Prod: `{ 17, 17, 0 }`, 17 stored `Anchored` entries, **no governance named**.
+   Neither has a deposit, a withdrawal or a bind.
 
 ## The design
 
 This is not a blockchain: no consensus, no blocks of our own. Kreivo already orders and finalises the entries
 (`REQ-SL-3`). This adds one 40-byte value to the contract's state, so a reader can tell it read them all.
 
-### The contract (v3)
+### The contract (one release)
 
-- **One head cell** at `0x0000_000C`: `(position, digest)`. `position` is the number of entries in the chain,
-  which is the next entry's position; `digest` is the chain digest after the last one. `(0, 32 zero bytes)`
-  is a chain with no entry yet, and an absent cell reads as that.
-- **Each entry `n`** sets the cell to `(n + 1, d_n)`, with `d_n = blake2b-256(d_(n-1) ‖ n ‖ e_n)`, `n` as 8 bytes
-  big-endian and `d_(-1)` the 32 zero bytes. Nothing else is stored. The cell is read and written in storage
-  each time, so a frame that is rolled back takes its write with it.
-- **A reset** (`set_anchor_head`, `lib.rs:582-641`) sets the cell to `(0, zeros)`. Resets come only with a book
-  re-founding, so each book sees one chain from position 0. This reverses 0039's rule that positions run on
-  across a reset (`types.rs:195-196`).
+There is no intermediate version: the contract that replaces v2 is the final one (26 Oct evening ruling).
+
+- **One new cell** at `0x0000_000C`: `(position, digest, start)`. `position` is the next entry's position,
+  always `Head.next_seq`; `digest` is the chain digest after the last entry; `start` is where the chain began
+  from the zero digest. An absent cell reads as `(next_seq, zeros, next_seq)`, which is `(0, zeros, 0)` on any
+  instance this code instantiated or reset.
+- **Each entry `n`** sets the cell to `(n + 1, d_n, start)`, with
+  `d_n = blake2b-256("aledgent/settlement-entry/v1" ‖ d_(n-1) ‖ n ‖ e_n)`: the label as ASCII bytes with no
+  length prefix (a40c-domain-tag), `n` as 8 bytes big-endian, `d_(start-1)` the 32 zero bytes. Nothing else is
+  stored. The cell is written in the frame that appends, so a frame that is rolled back takes its write with it.
+- **The reset is a full reset** (`set_anchor_head`, governance only). It removes every entry v2 stored, the
+  positions `[0, start)`; sets `Head` to `{ last_anchor: base, next_seq: 0, pruned_to: 0 }`; and clears the
+  cell. `Head` keeps its encoding and `next_seq` runs from 0 in the new chain, so readers of `next_seq` read
+  the chain's position with no change. The storage deposits it releases go to the origin of the call: the
+  governance account (on Kreivo, the community account a referendum dispatches as). It removes at most 64
+  entries and refuses an instance that may hold more (`TooManyStoredEntries`), changing nothing. Measured on a
+  fork of Kreivo (spec 134): 1.71 G of ref time and 186 KB of proof with nothing to remove, plus 0.167 G and
+  10.3 KB per entry; 4.55 G and 362 KB for prod's 17.
+- **Why `start`.** Between the upgrade and the reset an instance can still append (an anchor), which advances
+  `next_seq` and stores nothing. `next_seq` then no longer marks the end of what v2 stored, and an instance
+  that was reset once has nothing stored at all. `start` is that end.
+- **Removed:** `prune_inbox` and the read `inbox_entry`. Their selectors (`0x0000_0202`, `0x0000_0302`) are
+  never reused, so an old reader fails to dispatch rather than reading "absent". The read `chain_head`
+  (`0x0000_030A`) is new. `Error` keeps every variant's index; one is appended.
 - **Events gain the two missing fields:** `from` on `Deposited`, `call` on `Refused`; no new event, no digest
-  (a40-q4). Nothing reads these events yet (fact 3). A reader rebuilds `e_n` as `InboxEntry { at, event }`
-  from the event's fields and its block's number, never from the event's bytes, and orders entries by `seq`.
-- **v2's stored entries stay apart.** `Head.next_seq` stops where v2 left it and marks the end of what v2
-  stored. Every reader of the next position, in the contract and in settle, uses the cell's instead.
-  `prune_inbox` stays for v2's entries (a40b-prune). This amendment adds that it also prunes bind entries
-  and the latest anchor's entry, both already held in current state, so that v4 finds the map empty.
-- **v4** removes `prune_inbox` and the storage v3 no longer uses, once every instance has pruned.
+  (a40-q4). A reader rebuilds `e_n` as `InboxEntry { at, event }` from the event's fields and its block's
+  number, never from the event's bytes, and orders entries by position. This holds for all five append sites
+  (the contract's unit tests fold the events of every kind, a failed frame and a credit, to the head).
+- **`bound[asset]`** stays: it is the once-ever guard of `REQ-AS-8`, and a reset does not touch it, as it does
+  not touch positions. Its value is the position of the `Bound` entry in the chain it was bound in, which after
+  a reset is an earlier chain's; the `Bound` event, in its block, says which. No instance has a bind today.
+- **Positions restart at 0 per chain** (a40b-positions). A coordinate is `(instance, sequence, position)`. This
+  reverses 0039's rule that positions run on across a reset (`types.rs:195-196`).
 
 ### The adapter
 
@@ -91,10 +111,12 @@ A full node keeps about 256 blocks of events (`rpc.rs:992-995`), so **routine se
 node**. An adapter further behind catches up from a node that keeps history. If none can serve a block, the
 position is unreadable: an alert and no advance, until a reader serves it or an operator records a gap and the
 adapter accepts the layer's head unverified for that range (a40-q3). Only observation past it waits. Nothing
-is pruned any more, so the adapter's own `Pruned` gap (`adapter.rs:2531`) goes.
+is pruned any more, so the adapter's own `Pruned` gap (`adapter.rs:2531`) goes. The contract no longer answers
+`inbox_entry`, so the adapter's read by position goes with it.
 
 A book's adapter starts at `(0, zeros)`: just after the reset's `AnchorHeadSet` event, or at instantiation on
-an instance never reset. **The re-scan is removed:** `Adapter::rescan` (`adapter.rs:3388`), its timer, and
+an instance never reset. A cursor kept from before the reset (test's sits at 13) is reset with the re-founding.
+**The re-scan is removed:** `Adapter::rescan` (`adapter.rs:3388`), its timer, and
 `rescan_every` and `rescan_window` (`services/settle/src/config.rs:103-106`).
 
 ### The core
@@ -106,7 +128,7 @@ an instance never reset. **The re-scan is removed:** `Adapter::rescan` (`adapter
 - **Settlement incidents and gaps leave the book's state** (a40-q2, a40b-gaps). Each is written as an audit
   record (`NFR-6`, `crates/ledger-core/src/audit/`), in the batch that would have written it. No audit class
   covers them today (`audit/mod.rs:58-68`), so `F-043` adds one. The leaves at `store.rs:245-246` go.
-- **One number stays for the gaps** (this amendment's addition): the end of the highest gap, a `u64`. `proof`
+- **One number stays for the gaps** (a40c-gaps-watermark): the end of the highest gap, a `u64`. `proof`
   (fact 5) answers `Unprovable` when `from_seq` is below it. Once the head has passed the gap, that is the
   answer the list gives. Before then it can be `Unprovable` where the list would say `NotIncluded`: never less
   cautious.
@@ -144,11 +166,14 @@ incident (`REQ-IN-5`, `NFR-9`)."
 
 ## Migration and rollout
 
-- **v2 to v3** is `ContractsStore.publish_upgrade` then `ContractsStore.upgrade`, by the licence owner. No code
-  runs at upgrade. Every existing cell keeps its key and encoding, and the new cell reads as the chain start.
-- **Order, on test and then on prod:** upgrade to v3, then reset the head for the current book
-  (a40b-prod-order). Settle stays off on test until then (a40b-test-now), and has never run on `p2`. Entries
-  written between the upgrade and the reset belong to the book before, as in 0039, and no book reads them.
+- **v2 to this code** is `ContractsStore.publish_upgrade` then `ContractsStore.upgrade`, by the licence owner. No
+  code runs at upgrade; every existing cell keeps its key and its bytes (tested on both instances' live cells).
+- **Then the reset**, by governance, in the same window: on test (governance named) before the next settlement
+  there; on prod after the admin names governance (none is named today), then the reset (a40b-prod-order).
+  Entries written between the upgrade and the reset belong to the book before; the reset removes what v2
+  stored and starts the new book's chain at 0.
+- **Settle stays off on both** until the adapter verifies the chain (`T-043-04`): v2's adapter reads stored
+  entries, which this code does not write.
 - **Running books take the core change in place** (a40b-existing-books, fact 6): the stateful migration
   (`T-037-19`) writes their incidents and gaps to the audit trail, sets the gap end, and drops the leaves.
 - **Rollback:** before the reset, the same two calls put v2 back. After it, fixes go forward.
@@ -159,6 +184,8 @@ incident (`REQ-IN-5`, `NFR-9`)."
   every entry up to it, so a second fold would check the same bytes again.
 - **A new event carrying the whole entry:** two added fields are enough (facts 2 and 3).
 - **Prune the list, keep the last N entries, or re-scan less often:** each still pays for, or re-reads, every entry.
+- **An intermediate version that keeps v2's entries and `prune_inbox`, with `next_seq` frozen** (a40b-prune): a
+  partial reset leaves stored entries and a second counter behind; the owner ruled a full reset instead.
 
 ## Rulings (2026-10-26)
 
@@ -168,10 +195,23 @@ incident (`REQ-IN-5`, `NFR-9`)."
 - **a40-q4:** no digest in events.
 - **a40b-positions:** positions restart at 0 for each chain.
 - **a40b-gaps:** gaps go to the audit trail too.
-- **a40b-prune:** `prune_inbox` stays in v3 for the entries v2 stored; v4 removes it.
 - **a40b-existing-books:** running books upgrade in place (`T-037-19`), not by re-founding.
-- **a40b-prod-order:** on prod, upgrade to v3 first, then one reset.
-- **a40b-test-now:** no reset on test under v2; settle on test waits for v3.
+- **a40b-prod-order:** on prod, upgrade first, then one reset.
+- **a40c-domain-tag:** a fixed label in front of the chain digest.
+- **a40c-gaps-watermark:** the book keeps one number, the end of the highest gap; the history goes to the audit
+  trail.
+- **a40c-prune-all:** everything v2 stored goes, bind entries and the latest anchor's entry included.
+- **Evening of 26 Oct** (supersedes a40b-prune, a40b-test-now and a40c-positions-cost): keeping the prior
+  entries and not resetting `next_seq` "sounds like a bug". One release, no intermediate version, published
+  before the next settlement on test; the reset is full.
+
+## Open, for the owner
+
+- **Prod has no governance named.** The admin names it (the community 1201 account) before the reset can run.
+- **Re-binding after a re-founding.** A reset keeps every binding, so a re-founded book cannot bind an asset the
+  earlier book bound. Today no instance has a bind.
+- **The chain cell has a third field, `start`**, beyond the `(position, digest)` ruled. It is what lets the reset
+  know where v2's stored entries end once the head has moved past them.
 
 ## Plan and code
 
