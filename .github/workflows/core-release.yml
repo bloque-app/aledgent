@@ -59,6 +59,7 @@ on:
       - "tools/release/core-*"
       - "tools/release/test-core-*"
       - "tools/release/pack-code-layer.py"
+      - ".github/workflows/code-history.yml"
   workflow_dispatch:
     inputs:
       host_image:
@@ -118,10 +119,22 @@ jobs:
           mkdir -p "$RUNNER_TEMP/bin" && tar -xzf /tmp/crane.tar.gz -C "$RUNNER_TEMP/bin" crane
           PATH="$RUNNER_TEMP/bin:$PATH" tools/release/test-core-code-registry.sh
 
+  # The code-history gate (T-037-12, bloque-app/bloque-ledgent#286): this tree must still replay the
+  # recorded history, every range under its own generation, and decide every way out at an upgrade's
+  # input the same under either generation. No code version is built, let alone published and
+  # attested, from a tree that fails it, so the provenance attestation the deployment check
+  # (bloque-ledgent#297) verifies implies the gate passed.
+  code-history:
+    name: code history
+    uses: ./.github/workflows/code-history.yml
+    permissions:
+      contents: read
+
   core-code:
     name: core code (${{ matrix.case }})
-    # The scripts first: a bad layout should not cost a core build.
-    needs: scripts
+    # The scripts and the code history first: a bad layout, or a tree that no longer replays its
+    # history, should not cost a core build.
+    needs: [scripts, code-history]
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
