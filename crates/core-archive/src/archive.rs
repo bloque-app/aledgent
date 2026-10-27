@@ -259,14 +259,31 @@ fn seal_options(query: &str) -> Result<(SealOptions, String), String> {
 /// Credentials and keys never appear here: S3's come from the environment, a file or the instance
 /// role ([`crate::s3`]); a reader's Vault token and recovery identity from the files the
 /// environment names ([`Keys::from_env`]). The seal file holds public keys only.
+///
+/// **A writer is given no key** (`F-044`): whatever the environment names, the core host never
+/// holds a key or a token that opens the archive. It reads back only what the seal keeps in clear.
 pub fn open(spec: &str, access: Access) -> Result<Archive, String> {
+    open_with(spec, access, keys_for(spec, access, Keys::from_env)?)
+}
+
+/// The keys [`open`] gives: none to a writer; to a reader, those `from_env` finds for the spec's
+/// Vault.
+fn keys_for(
+    spec: &str,
+    access: Access,
+    from_env: impl FnOnce(Option<(&str, &str)>) -> Result<Keys, String>,
+) -> Result<Keys, String> {
     let (_, query) = split_spec(spec)?;
     let (options, _) = seal_options(query)?;
-    let vault = options
-        .vault
-        .as_deref()
-        .zip(options.transit_mount.as_deref());
-    open_with(spec, access, Keys::from_env(vault)?)
+    match access {
+        Access::Write => Ok(Keys::none()),
+        Access::Read => from_env(
+            options
+                .vault
+                .as_deref()
+                .zip(options.transit_mount.as_deref()),
+        ),
+    }
 }
 
 fn split_spec(spec: &str) -> Result<(&str, &str), String> {
@@ -420,6 +437,28 @@ mod tests {
         assert_eq!(contiguous_end(&[1, 2, 3, 5]), 3);
         assert_eq!(contiguous_end(&[2, 3]), 0);
         assert_eq!(contiguous_end(&[]), 0);
+    }
+
+    /// `F-044`: a writer is never given a key, whatever the environment names; a reader is given
+    /// what it names, for the spec's Vault.
+    #[test]
+    fn f_044_a_writer_is_given_no_key() {
+        let spec = "s3://b/p?region=us-east-2&vault=https://v.example&transit-mount=t";
+        let found = |vault: Option<(&str, &str)>| {
+            assert_eq!(vault, Some(("https://v.example", "t")));
+            Ok(Keys {
+                transit: None,
+                recovery: vec![crate::age::Identity::generate()],
+            })
+        };
+        assert_eq!(
+            keys_for(spec, Access::Write, found).unwrap().recovery.len(),
+            0
+        );
+        assert_eq!(
+            keys_for(spec, Access::Read, found).unwrap().recovery.len(),
+            1
+        );
     }
 
     /// `T-036-25`: the verify-genesis report is kept beside its chainspec, once, and read back.

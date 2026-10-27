@@ -67,7 +67,8 @@ The age file (`age-encryption.org/v1`, C2SP) carries:
 
 Then the payload: a fresh 16-byte nonce and STREAM over ChaCha20-Poly1305 in 64 KiB chunks, as `age` writes it.
 The code is ours (`core_archive::age`, about 450 lines, RustCrypto primitives), checked against the reference
-Rust implementation both ways in the tests.
+Rust implementation (rage) both ways in the tests; and the Go reference CLI (`age` v1.2.1) opened a sealed
+segment's age part, cut with the recipe below, with the recovery identity (2026-10-26, by hand).
 
 - **Versioned header:** the magic line (`aledgent-seal/v1`) and age's own version line.
 - **Key id and version:** the Transit stanza's arguments; an X25519 stanza names no key, and a reader tries each
@@ -139,7 +140,9 @@ A reader opens with whichever it is given, recovery identities first (local), th
   names (kept fresh by Vault Agent's token sink; read again before every call, and again once after a 403);
 - the recovery identity file `ALEDGENT_ARCHIVE_RECOVERY_IDENTITY` names (an `age-keygen` file).
 
-Neither key is ever in the spec, the environment itself, a log or an error (`REQ-AU-8`). Vault not answering is
+Neither key is ever in the spec, the environment itself, a log or an error (`REQ-AU-8`). **A writer is given
+neither**, whatever the environment names (`open` gives `Access::Write` no keys): the core host never holds a
+key or a token that opens the archive. Vault not answering is
 `Unavailable` (retried); Vault refusing is `Sealed` (not retried), naming the key and version, never the token.
 With neither key, only what is in clear reads, and anything else says what would open it.
 
@@ -172,6 +175,13 @@ or with an unknown field):
 The default retention is **180 days, compliance** (David, 2026-10-25, relaxing 400). Retention stays forever
 (`NFR-22`): no lifecycle rule deletes current versions. If the archive enters PCI DSS scope, 365 days
 (requirement 10.5.1); Colombia's ten years later. Each is `retain-days` in the spec, not a code change.
+
+**The running deployment is unchanged by this release.** Its node passes `kms-key-id`, `lock-mode=COMPLIANCE`
+and `retain-days=400` explicitly (infrastructure, `app_aledgent_node.tf`, from the `services` outputs), and no
+seal option, so it keeps writing as today: the layer passes objects through unsealed. The new default only
+applies to a spec without `retain-days`. The old bucket's policy also denies any PUT not under its KMS key
+(`ArchiveKeyOnly`), so a sealed writer into the old bucket must keep `kms-key-id`; the new bucket has no such
+statement (D9).
 
 ### Rotation
 
