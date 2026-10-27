@@ -123,6 +123,7 @@ fi
 # The publish script writes to the one repository it is given, never to a tag of anything else.
 pub="$here/core-code-publish.sh"
 [ "$(grep -cE '^ *crane (append|copy|cp|tag|push|mutate|delete)' "$pub")" = 1 ] || fail "core-code-publish.sh writes in more than one place"
+# shellcheck disable=SC2016  # the script's text, not ours
 grep -qE '^ *crane append -f "\$layer" -t "\$ref" >&2$' "$pub" || fail "core-code-publish.sh does not append to its own tag"
 ! grep -qE 'ghcr\.io/bloque-app/aledgent-core:' "$wf" || fail "the workflow names a tag of the core image"
 ! grep -qE '^[^#]*(aws-actions|configure-aws-credentials|role-to-assume|ssm send-command|aws )' "$wf" \
