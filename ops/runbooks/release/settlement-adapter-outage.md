@@ -98,7 +98,7 @@ settlement-operations.
      ends released when its expiry passes; nothing can hold it past that (`REQ-SL-4`). Payers can
      retry once the runtime is confirmed.
 6. **Database.** If the adapter cannot reach `aledgent_settle`, follow the database server's own failover.
-   The adapter resumes from its cursor.
+   The adapter resumes from the head it last accepted.
 7. **Keys.** If signing fails, read the signer's log: a signer that cannot log in to Vault or read its
    secret does not start (check its Vault role's binding to the task's identity); for a lane opted into
    KMS, check KMS reachability and the task role's `kms:Sign` grant. Do not fall back to a key in the
@@ -112,8 +112,9 @@ contract's admin clears a bound or empties the key set.
 ## Verification
 
 - [ ] `aledgent_adapter_serving == 1`, and the signals are fresh.
-- [ ] `aledgent_observation_cursor_lag` returns to about 0. The re-scan finds no difference; if it does,
-  follow [gap-filling](../gap-filling.md).
+- [ ] `aledgent_observation_cursor_lag` returns to about 0 and the adapter accepts the layer's head. If it
+  raises `AledgentSettlementChainMismatch`, or cannot read the range it missed, follow
+  [gap-filling](../gap-filling.md).
 - [ ] Parked withdrawals resume by themselves; nothing is resubmitted by hand. The oldest non-terminal
   age falls.
 - [ ] Anchors resume, and the anchor lag falls under the interval.

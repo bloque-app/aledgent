@@ -194,14 +194,10 @@ fn nfr_11_each_signal_over_its_line_pages_the_test_route() {
             s.adapter.as_mut().unwrap().alerts.insert("gap".into(), 1);
         }),
         (
-            "AledgentRescanDifference",
+            "AledgentSettlementChainMismatch",
             "observation-completeness",
             |s| {
-                s.adapter
-                    .as_mut()
-                    .unwrap()
-                    .alerts
-                    .insert("incident".into(), 1);
+                s.adapter.as_mut().unwrap().alerts.insert("chain".into(), 1);
             },
         ),
         ("AledgentObservationLag", "observation-completeness", |s| {

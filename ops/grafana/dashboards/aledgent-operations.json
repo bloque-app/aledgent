@@ -127,7 +127,7 @@
       "id": 3,
       "type": "timeseries",
       "title": "Observation completeness (REQ-SA-7, REQ-IN-5)",
-      "description": "NFR-11: the adapter's cursor lag behind the finalized inbox, open gaps, and differences its re-scans raised. Any gap or difference pages.",
+      "description": "NFR-11: the adapter's cursor lag behind the finalized inbox, open gaps, and chain mismatches (the entries read do not lead to the head the layer holds). Any gap or mismatch pages.",
       "gridPos": {
         "x": 0,
         "y": 6,
@@ -151,8 +151,8 @@
         },
         {
           "refId": "C",
-          "expr": "aledgent_observation_rescan_differences",
-          "legendFormat": "re-scan differences"
+          "expr": "aledgent_observation_chain_mismatches",
+          "legendFormat": "chain mismatches"
         },
         {
           "refId": "D",

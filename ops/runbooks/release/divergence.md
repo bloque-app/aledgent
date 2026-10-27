@@ -8,7 +8,7 @@ SPDX-License-Identifier: CC-BY-4.0
 `NFR-9`, `INV-5`, `INV-6`, `INV-18`, `INV-19`, `REQ-RT-11`, `REQ-AT-3`, guardrail 7 · **Pages:**
 `AledgentReconciliationDifference`, `AledgentReconciliationNotRun`, `AledgentSettlementDifference`,
 `AledgentSuspenseNotReconciled`, `AledgentAnchorCommitmentMismatch`, `AledgentUnknownAnchor`,
-`AledgentRescanDifference` · **Owner:** finance-operations with platform; security for anchors.
+`AledgentSettlementChainMismatch` · **Owner:** finance-operations with platform; security for anchors.
 
 **A divergence is an incident, never a ticket** (`NFR-9`). Tolerance is zero, at a resolution of one minor
 unit.
@@ -28,7 +28,7 @@ unit.
 | Axis 1(a), 1(b) or 2 (`commitment`, `rebuild`, `unbalanced`, `trial-balance`) | The book's own consistency: storage corruption or a kernel defect | [reconciliation-failure](../reconciliation-failure.md), step 2 |
 | Axis 2 with credits in transit (sharded) | A pair's in-transit positions do not match the credits enqueued and not applied, at a consistent cut (`REQ-RT-14`) | Steps below. Suspect a forged or lost stream message (`R-03`) |
 | Axis 3 (`settlement`) | The book's position against Kreivo's contract holding, per asset | [reconciliation-failure](../reconciliation-failure.md); [anchoring](../anchoring.md) (daily comparison) |
-| Re-scan difference | The inbox, the adapter's store and what the core ingested disagree | [gap-filling](../gap-filling.md) |
+| Settlement chain mismatch | The entries the adapter read do not lead to the head the layer holds, or the range cannot be read | [gap-filling](../gap-filling.md) |
 | Anchor commitment mismatch, or an unknown anchor | Someone else wrote under the instance's keys, or the anchors came from another book | [anchoring](../anchoring.md). Page security |
 | A replay reply differs from the received-log's recorded reply | Restore or failover produced a different decision for an answered command (`INV-18`) | Stop serving. Steps below |
 

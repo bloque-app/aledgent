@@ -28,18 +28,18 @@ groups:
           summary: Ingress holds a row the core has not decided within the decision bound.
           runbook: ops/runbooks/restore.md
 
-      # REQ-SA-7, REQ-IN-5: observation completeness. Any gap or re-scan difference pages.
+      # REQ-SA-7, REQ-IN-5: observation completeness. Any gap or chain mismatch pages.
       - alert: AledgentObservationGap
         expr: aledgent_adapter_alerts{kind="gap"} > 0
         labels: { severity: page, owner: settlement-operations, signal: observation-completeness }
         annotations:
           summary: The adapter skipped a range of the settlement layer's inbox.
           runbook: ops/runbooks/gap-filling.md
-      - alert: AledgentRescanDifference
-        expr: aledgent_observation_rescan_differences > 0
+      - alert: AledgentSettlementChainMismatch
+        expr: aledgent_observation_chain_mismatches > 0
         labels: { severity: page, owner: settlement-operations, signal: observation-completeness }
         annotations:
-          summary: A re-scan found a record aledgent never ingested, or one the layer no longer shows.
+          summary: The entries the adapter read do not lead to the head the settlement layer holds, and a second read did not change that.
           runbook: ops/runbooks/gap-filling.md
       - alert: AledgentObservationLag
         expr: aledgent_observation_cursor_lag > 100

@@ -55,8 +55,10 @@ one node is not this runbook ([replace-node](replace-node.md)).
    holds undecided. Rows decided after the last certified commit come back with **the reply the log
    recorded**; an exact retry answers from the retained result (`INV-18`). A different reply is a
    divergence: **stop** ([divergence](divergence.md)).
-5. **The adapter** starts on its database. It reads Kreivo from its cursor (the layer is the truth for
-   settlement), and its re-scan compares the inbox with what the core ingested.
+5. **The adapter** starts on its database. It resumes from the head it last accepted (the layer is the
+   truth for settlement), reads the events since and folds them to check them against the head Kreivo
+   holds; behind what a full node keeps, it catches up from the history endpoint. A difference raises
+   `AledgentSettlementChainMismatch` ([gap-filling](../gap-filling.md)).
 6. **The audit store** is restored into an empty directory, on media apart from the book
    (`opsctl restore audit`).
    - Restore it from a backup taken **at or before** the core's restore point. The core ships from the

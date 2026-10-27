@@ -52,7 +52,8 @@ included.
 ## Verification
 
 - [ ] The finalised height moves. `aledgent_finalized_stall_ms` returns to about the block time.
-- [ ] The adapter's cursor catches up. The re-scan finds no difference.
+- [ ] The adapter's cursor catches up and it accepts the layer's head with no chain mismatch (a stall past
+  what a full node keeps of events needs a node with history: [gap-filling](../gap-filling.md)).
 - [ ] The anchor in flight goes final, and the anchor lag falls.
 - [ ] Operations that reached `Needs-Review` are resolved one by one, with the layer's records as evidence
   (`POST /v1/ops/operations/{reference}/resolve`, justified). Record how many, and how long each waited.
