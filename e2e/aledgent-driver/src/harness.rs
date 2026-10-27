@@ -327,6 +327,7 @@ impl Harness {
                 .unwrap_or_else(settle::config::default_wake_poll),
             signals_file: None,
             dry_run_endpoint: None,
+            history_endpoint: None,
             // A zombienet run's lane keys are test values in files (F-035: development keys,
             // declared as such; production's are the signer service's).
             signer: None,

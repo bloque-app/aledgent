@@ -26,6 +26,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
     (3, include_str!("../../migrations/0003_batches.sql")),
     (4, include_str!("../../migrations/0004_binds.sql")),
     (5, include_str!("../../migrations/0005_runtimes.sql")),
+    (6, include_str!("../../migrations/0006_chain.sql")),
 ];
 
 /// The adapter's store in PostgreSQL. Clones share the pool.
@@ -589,6 +590,69 @@ impl Store for PgStore {
              ON CONFLICT (instance) DO UPDATE \
              SET next_seq = GREATEST(settle_cursors.next_seq, EXCLUDED.next_seq)",
             &[&i64::from(instance), &i64_of(to)?],
+        )
+        .await
+        .map_err(err)?;
+        Ok(())
+    }
+
+    async fn accepted_head(&self, instance: u32) -> StoreResult<Option<super::AcceptedHead>> {
+        let c = self.client().await?;
+        let Some(r) = c
+            .query_opt(
+                "SELECT head_seq, head_digest, head_block FROM settle_cursors WHERE instance = $1",
+                &[&i64::from(instance)],
+            )
+            .await
+            .map_err(err)?
+        else {
+            return Ok(None);
+        };
+        let seq: Option<i64> = r.try_get("head_seq").map_err(err)?;
+        let digest: Option<String> = r.try_get("head_digest").map_err(err)?;
+        let block: Option<i64> = r.try_get("head_block").map_err(err)?;
+        let (Some(seq), Some(digest), Some(block)) = (seq, digest, block) else {
+            return Ok(None);
+        };
+        let digest = hex::decode(&digest)
+            .ok()
+            .and_then(|v| <[u8; 32]>::try_from(v).ok())
+            .ok_or_else(|| StoreError::Backend("an accepted digest that is not 32 bytes".into()))?;
+        Ok(Some(super::AcceptedHead {
+            position: u64_of(seq)?,
+            digest,
+            block: u64_of(block)?,
+        }))
+    }
+
+    async fn accept_head(&self, instance: u32, head: &super::AcceptedHead) -> StoreResult<()> {
+        let c = self.client().await?;
+        c.execute(
+            "INSERT INTO settle_cursors (instance, next_seq, head_seq, head_digest, head_block) \
+             VALUES ($1, $2, $2, $3, $4) \
+             ON CONFLICT (instance) DO UPDATE \
+             SET head_seq = EXCLUDED.head_seq, head_digest = EXCLUDED.head_digest, \
+                 head_block = EXCLUDED.head_block",
+            &[
+                &i64::from(instance),
+                &i64_of(head.position)?,
+                &hex::encode(head.digest),
+                &i64_of(head.block)?,
+            ],
+        )
+        .await
+        .map_err(err)?;
+        Ok(())
+    }
+
+    async fn reset_chain(&self, instance: u32, start: u64) -> StoreResult<()> {
+        let c = self.client().await?;
+        c.execute(
+            "INSERT INTO settle_cursors (instance, next_seq) VALUES ($1, $2) \
+             ON CONFLICT (instance) DO UPDATE \
+             SET next_seq = EXCLUDED.next_seq, head_seq = NULL, head_digest = NULL, \
+                 head_block = NULL",
+            &[&i64::from(instance), &i64_of(start)?],
         )
         .await
         .map_err(err)?;

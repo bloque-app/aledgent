@@ -6,13 +6,16 @@
 //! is one contract instance, which the adapter names by the deployment's instance number (the
 //! number the book's coordinates carry); every call goes out in a batch, one `execute`
 //! transaction signed as the deployment's community PASS account ([`kreivo`]); outcomes are read
-//! from the contract's inbox in storage, at the finalized head.
+//! from the contract's events, and checked against the one value it keeps of them, the head of its
+//! chain of entries ([`ChainHead`], amendment 0040 `[PENDING AMENDMENT 0040]`), at the finalized
+//! head.
 //!
 //! - [`fake::FakeChain`]: in memory, for most tests. It models blocks, finality, reorgs above the
 //!   finality point, mortal eras and nonces, Kreivo's PASS transactions (built and checked with
 //!   [`kreivo`]), the contract's deployments, positions, withdrawal bounds, batches with one
-//!   outcome per reference, refusals with Kreivo's reasons, its sequenced inbox, pruning, and a
-//!   halt of block production.
+//!   outcome per reference, refusals with Kreivo's reasons, its chain of entries and their events,
+//!   a reset by governance, a node that keeps 256 blocks of events and a history node that keeps
+//!   them all, faulty readers, and a halt of block production.
 //! - `rpc::RpcChain` (feature `rpc`): subxt's smoldot light client (feature `light-client`, the
 //!   default), or a node's RPC when the configuration opts into it. The contract is read with
 //!   `ContractsApi_call` at the finalized block; chain state (nonces, balances, metadata) with the
@@ -100,10 +103,11 @@ pub struct RuntimeVersion {
 pub struct InstanceView {
     /// The keys that may withdraw and anchor.
     pub keys: Vec<AccountId32>,
-    /// The inbox length.
+    /// The position the next entry takes in the current chain: the chain's length since its last
+    /// reset (amendment 0040), as [`ChainHead::position`].
     pub next_seq: u64,
-    /// Entries below this may have been pruned: movements, refusals and anchors other than the
-    /// latest (`F-026` decision 25). Only `Bound` entries and the latest anchor's are kept.
+    /// Written by the contract's earlier code, which stored and pruned its entries; zero after a
+    /// reset. Nothing reads it to decide anything.
     pub pruned_to: u64,
     /// The number of the last anchor stored; zero for none (`F-017`).
     pub last_anchor: u64,
@@ -187,34 +191,130 @@ pub enum InboxEvent {
     },
 }
 
-/// One inbox entry: the block that wrote it, what it records, and its raw SCALE bytes as stored.
+/// One entry: the block that wrote it, what it records, and its SCALE bytes, the contract's
+/// `InboxEntry { at, event }` exactly as the earlier code stored it. Since amendment 0040 nothing
+/// stores it: it is rebuilt from its event and the number of the event's block
+/// ([`kreivo::contract_event`]), and its bytes are the ones the chain's digest covers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InboxEntry {
     /// The block that wrote it.
     pub at: u64,
     /// What it records.
     pub event: InboxEvent,
-    /// The stored bytes.
+    /// Its SCALE bytes.
     pub raw: Vec<u8>,
 }
 
 impl InboxEntry {
-    /// The entry's digest: blake2b-256 of its stored SCALE bytes, which include the block number
-    /// (`F-010`'s coordinate). Anyone who reads the storage can recompute it.
+    /// The entry's digest `e_n`: blake2b-256 of its SCALE bytes, which include the block number
+    /// (`F-010`'s coordinate). Anyone who reads its event and its block can recompute it.
     pub fn digest(&self) -> [u8; 32] {
         blake2_256(&self.raw)
     }
 }
 
-/// What reading one inbox position found.
+/// The label in front of every chain digest (amendment 0040, ruling a40c-domain-tag): ASCII, no
+/// length prefix.
+pub const CHAIN_LABEL: &[u8] = b"aledgent/settlement-entry/v1";
+
+/// The chain digest before a chain's first entry: 32 zero bytes.
+pub const ZERO_DIGEST: [u8; 32] = [0; 32];
+
+/// The chain digest after entry `n`, whose digest is `entry`, on top of `previous`:
+/// `d_n = blake2b-256(CHAIN_LABEL ‖ d_(n-1) ‖ n ‖ e_n)`, `n` as 8 bytes big-endian.
+pub fn chain_digest(previous: &[u8; 32], n: u64, entry: &[u8; 32]) -> [u8; 32] {
+    let mut input = Vec::with_capacity(CHAIN_LABEL.len() + 32 + 8 + 32);
+    input.extend_from_slice(CHAIN_LABEL);
+    input.extend_from_slice(previous);
+    input.extend_from_slice(&n.to_be_bytes());
+    input.extend_from_slice(entry);
+    blake2_256(&input)
+}
+
+/// Whether `entries` lead from position `from`, at chain digest `digest`, to `head` (amendment
+/// 0040): exactly the positions `from, from + 1, .., head.position - 1`, in order, each folded
+/// into the digest, ending at the head's. A position missing is an entry hidden; one repeated, or
+/// past the head, an entry added; a digest that differs, an entry altered. `Err` says which.
+pub fn fold(
+    from: u64,
+    digest: &[u8; 32],
+    entries: &[(u64, InboxEntry)],
+    head: &ChainHead,
+) -> Result<(), String> {
+    let mut position = from;
+    let mut digest = *digest;
+    for (seq, e) in entries {
+        if *seq != position {
+            return Err(format!(
+                "the events give position {seq} where position {position} comes next"
+            ));
+        }
+        digest = chain_digest(&digest, *seq, &e.digest());
+        position += 1;
+    }
+    if position != head.position {
+        return Err(format!(
+            "the events reach position {position}; the head is at {}",
+            head.position
+        ));
+    }
+    if digest != head.digest {
+        return Err(format!(
+            "the events fold to {}; the head holds {}",
+            hex::encode(digest),
+            hex::encode(head.digest)
+        ));
+    }
+    Ok(())
+}
+
+/// The head of an instance's chain of entries (amendment 0040), as its contract's `chain_head()`
+/// gives it at a block: decoded in one place only, [`kreivo::chain_head`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChainHead {
+    /// The position the next entry takes: always the contract's `Head::next_seq`.
+    pub position: u64,
+    /// The chain digest after the entry at `position - 1`; [`ZERO_DIGEST`] for a chain with no
+    /// entry yet.
+    pub digest: [u8; 32],
+    /// The position the chain started at, from the zero digest: 0 on an instance instantiated or
+    /// reset by the contract's current code.
+    pub start: u64,
+}
+
+/// What one of a block's events says of an instance's chain, in the order the block emitted them.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum InboxRead {
-    /// The entry.
-    Entry(InboxEntry),
-    /// Below the instance's prune watermark: the entry is gone (`AC-D2.2`).
-    Pruned,
-    /// No entry, and not pruned.
-    Absent,
+pub enum ChainEvent {
+    /// The entry at position `seq` of the current chain, rebuilt from its event and its block's
+    /// number.
+    Entry {
+        /// Its position.
+        seq: u64,
+        /// The entry.
+        entry: InboxEntry,
+    },
+    /// Governance reset the instance (`AnchorHeadSet`): a new chain starts at position 0 with the
+    /// zero digest after this event. Entries before it in the block belong to the chain before.
+    Reset,
+    /// An entry's event in the shape the contract's earlier code emitted (`Deposited` without its
+    /// sender, `Refused` without its call): its entry cannot be rebuilt, so it folds into no
+    /// chain this code reads.
+    Legacy {
+        /// Its position.
+        seq: u64,
+    },
+}
+
+/// One block's events about one instance's chain, and its parent: what a walk back from a head
+/// reads, block by block, by parent hash (the light client answers no lookup by number).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockEvents {
+    /// The block.
+    pub block: BlockRef,
+    /// Its parent's hash.
+    pub parent: [u8; 32],
+    /// The instance's chain events, in the block's order.
+    pub events: Vec<ChainEvent>,
 }
 
 /// A withdrawal as the adapter stores it (`F-016`), the call envelope's withdrawal in the
@@ -619,14 +719,31 @@ pub trait Chain: Send + Sync + 'static {
         instance: u32,
     ) -> impl Future<Output = ChainResult<Option<InstanceView>>> + Send;
 
-    /// Up to `count` inbox positions of `instance` from `from`, at `at`.
-    fn inbox(
+    /// The head of `instance`'s chain of entries at `at` (`chain_head()`, amendment 0040), if the
+    /// instance is registered. **One read**: an idle sync reads nothing else.
+    fn chain_head(
         &self,
         at: &BlockRef,
         instance: u32,
-        from: u64,
-        count: u32,
-    ) -> impl Future<Output = ChainResult<Vec<(u64, InboxRead)>>> + Send;
+    ) -> impl Future<Output = ChainResult<Option<ChainHead>>> + Send;
+
+    /// The events of `block` about `instance`'s chain, and its parent's hash. Through the
+    /// adapter's own client: a full node keeps about 256 blocks of events, so an older block may
+    /// not be served ([`ChainError::Unavailable`]).
+    fn block_events(
+        &self,
+        block: &BlockRef,
+        instance: u32,
+    ) -> impl Future<Output = ChainResult<BlockEvents>> + Send;
+
+    /// As [`Chain::block_events`], from the history endpoint, a node that keeps every block's
+    /// events, used only to catch up; `None` if none is configured. What it serves is checked as
+    /// anything else is: folded against the head the adapter's own client reads.
+    fn history_events(
+        &self,
+        block: &BlockRef,
+        instance: u32,
+    ) -> impl Future<Output = ChainResult<Option<BlockEvents>>> + Send;
 
     /// What the chain states about the asset at a location (`DEC-20`): its metadata's symbol,
     /// name and decimals, and its status and sufficiency. `None` if there is no asset, or no

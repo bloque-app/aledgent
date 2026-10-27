@@ -43,7 +43,7 @@ use serde::{Deserialize, Serialize};
 use verify::{AnchorCheck, AnchorSource, NumberedAnchors, Unread};
 
 use crate::Error;
-use crate::restore::{RebuildReport, ReplayReport, RescanReport};
+use crate::restore::{RebuildReport, ReplayReport, ResumeReport};
 
 /// One check's result.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,8 +150,10 @@ pub struct DrillReport {
     pub replay: ReplayReport,
     /// The leaf store's rebuild.
     pub rebuild: RebuildReport,
-    /// The adapter's re-scan.
-    pub rescan: Option<RescanReport>,
+    /// The adapter's resumption from the head it accepted (amendment 0040). A record from before it
+    /// carries a re-scan instead, which is not read.
+    #[serde(default)]
+    pub resume: Option<ResumeReport>,
     /// The size of the book restored: postings, kernel accounts, received-log rows.
     pub size: Size,
     /// The checks.
@@ -231,7 +233,8 @@ pub fn acknowledgements(rows: &[Row]) -> Result<(Vec<Acknowledgement>, Vec<Opera
     let mut pending = Vec::new();
     for r in rows.iter().filter(|r| r.new.kind == InputKind::Command) {
         // The settlement adapter's reports are observations at coordinates, not operations: the
-        // core keeps them in its settlement store, and the re-scan checks them (`REQ-IN-5`).
+        // core keeps them in its settlement store, and the adapter's sync shows them complete
+        // (`REQ-IN-5`).
         let body: Option<CommandBody> = serde_json::from_slice(&r.new.body).ok();
         if matches!(body, Some(CommandBody::Adapter(_))) {
             continue;
@@ -926,7 +929,7 @@ mod tests {
             data_loss: DataLoss::default(),
             replay: Default::default(),
             rebuild: Default::default(),
-            rescan: None,
+            resume: None,
             size: Size::default(),
             checks,
         };

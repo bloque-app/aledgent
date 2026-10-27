@@ -9,6 +9,16 @@
 //! is news for it (`wake_poll`, `NFR-15`). Only one instance per
 //! set of keys acts at a time: the others wait for the lease.
 //!
+//! Two operator commands run once, holding the lease, and exit (amendment 0040, `T-043-04`):
+//!
+//! - `aledgent-settle <config.json> gap <from> <to>`: **the operator's gap** (ruling a40-q3). When
+//!   the adapter stopped at position `from` (an `unreadable:` or `chain:` alert) and no reader can
+//!   serve the range, it records `[from, to)` as a gap through its own source and accepts the
+//!   layer's head at `to`, unverified for that range. Any other range is refused.
+//! - `aledgent-settle <config.json> refound`: the book was re-founded with its instance's reset (a
+//!   `reset:` alert): the cursor and the accepted head of the chain before are reset, and the next
+//!   run starts on the current chain from its start.
+//!
 //! Nothing here logs a key, a token or a connection string (`NFR-8`, `REQ-AU-8`).
 
 use std::process::ExitCode;
@@ -128,11 +138,36 @@ fn signer(k: &KeySource, keys: &Keys) -> Result<Arc<dyn Signer>, String> {
     }
 }
 
+/// What the process is asked to do.
+enum Command {
+    /// Run step after step.
+    Run,
+    /// Record the operator's gap `[from, to)` and exit.
+    Gap { from: u64, to: u64 },
+    /// Reset the cursor and the accepted head with the book's re-founding, and exit.
+    Refound,
+}
+
+const USAGE: &str = "usage: aledgent-settle <config.json> [gap <from> <to> | refound]";
+
 async fn run() -> Result<(), String> {
-    let path = std::env::args()
-        .nth(1)
+    let mut args = std::env::args().skip(1);
+    let path = args
+        .next()
         .or_else(|| std::env::var("ALEDGENT_SETTLE_CONFIG").ok())
-        .ok_or("usage: aledgent-settle <config.json>")?;
+        .ok_or(USAGE)?;
+    let command = match args.next().as_deref() {
+        None => Command::Run,
+        Some("gap") => {
+            let mut n = || args.next().and_then(|a| a.parse::<u64>().ok()).ok_or(USAGE);
+            Command::Gap {
+                from: n()?,
+                to: n()?,
+            }
+        }
+        Some("refound") => Command::Refound,
+        Some(_) => return Err(USAGE.into()),
+    };
     let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
     let config: ProcessConfig = serde_json::from_str(&text).map_err(|e| format!("{path}: {e}"))?;
     // F-027 T-027-12 (REQ-SA-9): a format the operator names must be one the adapter can sign in.
@@ -154,6 +189,16 @@ async fn run() -> Result<(), String> {
             spec_versions = ?config.adapter.spec_versions,
             "adapter.spec_versions is informational: the format follows the runtime's transaction \
              surface, confirmed by the layer (T-027-12); the list gates nothing"
+        );
+    }
+    // T-043-05: the periodic re-scan is gone; its settings are accepted for this release only.
+    let retired = config.adapter.retired();
+    if !retired.is_empty() {
+        tracing::warn!(
+            fields = ?retired,
+            "adapter.rescan_every and adapter.rescan_window are ignored: the adapter checks the \
+             settlement layer's chain of entries at every sync (amendment 0040); remove them, the \
+             next release refuses them"
         );
     }
     // F-035: the keys behind the signer service; development keys only if the file says so.
@@ -208,6 +253,17 @@ async fn run() -> Result<(), String> {
         }
         None => chain,
     };
+    // T-043-04: older blocks' events, to catch up only, from a node that keeps them all.
+    let chain = match &config.history_endpoint {
+        Some(url) => {
+            tracing::info!("blocks the client no longer serves are read from a history endpoint");
+            chain
+                .with_history_over(url)
+                .await
+                .map_err(|e| format!("history_endpoint: {e}"))?
+        }
+        None => chain,
+    };
     let database = config.database_url().map_err(|e| format!("{path}: {e}"))?;
     let store = PgStore::connect(&database, 8, config.profile)
         .await
@@ -241,6 +297,21 @@ async fn run() -> Result<(), String> {
         };
         tracing::warn!(?point, "fault injection: the process dies at this point");
         adapter.crash_at(point);
+    }
+    match command {
+        Command::Run => {}
+        Command::Gap { from, to } => {
+            adapter
+                .record_operator_gap(from, to)
+                .await
+                .map_err(|e| e.to_string())?;
+            tracing::warn!(from, to, "the operator's gap is recorded");
+            return Ok(());
+        }
+        Command::Refound => {
+            adapter.refound().await.map_err(|e| e.to_string())?;
+            return Ok(());
+        }
     }
     let interval = Duration::from_millis(config.interval.max(100));
     // `NFR-15`: within the interval, a check for news every `wake_poll` starts a step as soon as

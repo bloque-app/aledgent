@@ -17,7 +17,7 @@ use settle::adapter::{CrashPoint, Refusing};
 use settle::chain::fake::FakeConfig;
 use settle::chain::fake::position_account;
 use settle::chain::kreivo::{self, Envelope};
-use settle::chain::{Chain, InboxEvent, InboxRead, Validity, blake2_256};
+use settle::chain::{Chain, InboxEvent, Validity, blake2_256};
 use settle::signer::recover;
 use settle::store::{ExtrinsicRow, ExtrinsicStatus, InstructionState, NotExecuted, Store};
 use settle::testkit::{ADAPTER_TOKEN, INSTANCE, Kit, KitOptions, PAYEE, TEST_PASS_USER, chain_usd};
@@ -81,19 +81,15 @@ fn envelopes(e: &ExtrinsicRow) -> (kreivo::DecodedTx, [u8; 32], Vec<Envelope>) {
     (tx, contract, calls)
 }
 
-/// Every inbox entry of the deployment at the finalized head.
+/// Every entry of the deployment's chain at the finalized head, rebuilt from its events; checked
+/// against the head the contract holds there (amendment 0040).
 async fn inbox(k: &Kit) -> Vec<(u64, settle::chain::InboxEntry)> {
     let fin = k.chain.finalized().await.unwrap();
-    k.chain
-        .inbox(&fin, INSTANCE, 0, 1_000)
-        .await
-        .unwrap()
-        .into_iter()
-        .filter_map(|(s, r)| match r {
-            InboxRead::Entry(e) => Some((s, e)),
-            _ => None,
-        })
-        .collect()
+    let entries = k.chain.finalized_entries(INSTANCE);
+    let head = k.chain.chain_head(&fin, INSTANCE).await.unwrap().unwrap();
+    settle::chain::fold(0, &settle::chain::ZERO_DIGEST, &entries, &head)
+        .expect("the events fold to the head");
+    entries
 }
 
 // ------------------------------------------------------------------------------ T-027-01

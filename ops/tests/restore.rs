@@ -294,7 +294,12 @@ async fn ac_k5_1_a_restore_to_an_older_backup_and_replay_yield_the_pre_failure_r
     assert!(r.replay.replayed > 0 && r.replay.undecided > 0);
     assert_eq!(r.data_loss.inputs_lost, 0);
     assert!(r.rebuild.is_clean() && r.rebuild.records > 0);
-    assert!(r.rescan.as_ref().unwrap().is_clean());
+    // T-043-05: the restored adapter resumed from the head it had accepted and accepted the
+    // layer's, the outage's deposit included.
+    let resume = r.resume.as_ref().unwrap();
+    assert!(resume.is_clean(), "{resume:?}");
+    assert!(resume.resumed_from.is_some(), "{resume:?}");
+    assert!(resume.accepted > resume.resumed_from, "{resume:?}");
     // The transfer acknowledged at Received was decided by the restored core.
     let op = ledger_core::id::OperationId::parse(&received).unwrap();
     let state = drilled

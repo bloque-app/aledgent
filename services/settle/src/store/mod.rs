@@ -6,8 +6,9 @@
 //! ([`InstructionRow`]), **what the network did** ([`ObservationRow`], [`ExtrinsicRow`] with its
 //! inclusion) and **what it told the core** ([`ReportRow`], with the core's verdict). Besides
 //! those: the signed bytes of every extrinsic, stored before they are broadcast (`REQ-SA-6`); the
-//! nonce lanes; the inbox cursor; explicit gaps (`REQ-SA-7`); alerts; and the single-active
-//! lease.
+//! nonce lanes; the cursor, and the head of the instance's chain of entries the adapter last
+//! accepted ([`AcceptedHead`], amendment 0040); explicit gaps (`REQ-SA-7`); alerts; and the
+//! single-active lease.
 //!
 //! Its rules hold whatever the adapter above does:
 //!
@@ -17,8 +18,9 @@
 //!   is refused, whoever writes it.
 //! - **Fenced writes.** Storing an extrinsic and moving a lane need the current lease epoch: a
 //!   second instance that lost the lease cannot sign into a lane (Kreivo's runtime).
-//! - **The cursor never goes back**, and gaps and alerts are appended, never removed (an alert is
-//!   cleared, and stays).
+//! - **The cursor never goes back**, but with the chain it reads: [`Store::reset_chain`], when the
+//!   adapter starts on a chain whose head it never accepted (a book re-founded with its instance's
+//!   reset). Gaps and alerts are appended, never removed (an alert is cleared, and stays).
 //!
 //! Two implementations: [`mem::MemStore`] (tests; it outlives the adapters a test starts and
 //! stops, as a database would) and `pg::PgStore` (feature `postgres`, the accepted proposal).
@@ -341,6 +343,20 @@ pub struct ReportRow {
     pub answered_at: Option<Time>,
 }
 
+/// The head of an instance's chain of entries the adapter accepted (amendment 0040): the chain's
+/// position and digest, and the finalized block it read them at. It is accepted only once the core
+/// has taken in every entry below `position`; the next sync folds the entries of the blocks after
+/// `block`, from `digest`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptedHead {
+    /// The position the next entry takes.
+    pub position: u64,
+    /// The chain digest after the entry at `position - 1`.
+    pub digest: [u8; 32],
+    /// The finalized block the head was read at.
+    pub block: u64,
+}
+
 /// A range the adapter was forced to skip (`REQ-SA-7`, `AC-D2.2`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GapRow {
@@ -510,6 +526,30 @@ pub trait Store: Clone + Send + Sync + 'static {
         &self,
         instance: u32,
         to: u64,
+    ) -> impl Future<Output = StoreResult<()>> + Send;
+
+    /// The head of `instance`'s chain the adapter last accepted; `None` if it never accepted one
+    /// on this chain (a new store, a cursor written before amendment 0040, or one reset since).
+    fn accepted_head(
+        &self,
+        instance: u32,
+    ) -> impl Future<Output = StoreResult<Option<AcceptedHead>>> + Send;
+
+    /// Accept `head` for `instance`. The cursor is not moved: it is at `head.position` already.
+    fn accept_head(
+        &self,
+        instance: u32,
+        head: &AcceptedHead,
+    ) -> impl Future<Output = StoreResult<()>> + Send;
+
+    /// Start `instance` on a chain from position `start` (amendment 0040): the cursor set to it,
+    /// back if need be, and no head accepted. The only way the cursor goes back: when the adapter
+    /// starts on a chain whose head it never accepted, as after the instance's reset with its
+    /// book's re-founding.
+    fn reset_chain(
+        &self,
+        instance: u32,
+        start: u64,
     ) -> impl Future<Output = StoreResult<()>> + Send;
 
     /// Record a gap (idempotent on `(instance, from)`).

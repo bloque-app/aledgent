@@ -42,9 +42,7 @@ value (the PASS account's user id and the contract's account below are examples)
     "status_lease": 120000,
     "page": 32,
     "max_era": 64,
-    "challenge_window": 256,
-    "rescan_every": 100,
-    "rescan_window": 1024
+    "challenge_window": 256
   },
   "connection": "light-client",
   "chain_spec": "/etc/aledgent/kreivo.json",
@@ -127,6 +125,44 @@ its light client. Optionally, a node can be named for dry runs, and for nothing 
 It then only sizes and prices batches: every read that decides an outcome stays on the light
 client. A dishonest or stale node there can make a batch fail whole (nothing moves; its calls go to
 review), never move value.
+
+**Observation checks the contract's chain of entries at every sync** (`F-043`, `T-043-04`,
+amendment 0040). The contract stores no entry: it keeps one head, `(position, digest, start)`, in
+which each entry's digest covers the one before it, and emits each entry as an event. At each step
+the adapter reads that head at the finalized block (`chain_head()`). If it is the head the adapter
+last accepted, that is all: **an idle sync is one read**. Otherwise it reads the events of the
+blocks since the one it accepted the head at, walking back by parent hash, rebuilds each entry from
+its event and its block's number, and folds them from the accepted digest. If they lead exactly to
+the head, it reports them in order and accepts the head once the core has taken in every one
+(`settle_cursors`, `migrations/0006_chain.sql`). If not, it reads them once more; still not, it
+raises `chain:<instance>:<position>` (kind `chain`, which pages) and reports nothing past that first
+new position, while submitting and anchoring go on. A full node keeps about 256 blocks of events, so
+routine settlement needs no archive node. An adapter further behind reads the older blocks from a
+**history endpoint**, a node that keeps them all, used for nothing else and trusted for nothing (what
+it serves is folded against the head the light client reads):
+
+```jsonc
+  "history_endpoint": "wss://kreivo-archive.example",
+```
+
+Without one, it raises `unreadable:<instance>:<position>` and waits. When no reader can serve the
+range, or a mismatch does not clear, the operator has the adapter record it as a gap through its
+own source, after which it accepts the layer's head as it stands, unverified for that range; the
+range must be exactly the one the alert names:
+
+```sh
+aledgent-settle settle.json gap <from> <to>
+```
+
+A reset of the instance (governance's `set_anchor_head`) comes only with its book's re-founding. The
+first start on a reset instance folds from the reset, and a cursor kept from the chain before it is
+reset to the chain's start. A reset under a running adapter raises `reset:<instance>` and stops
+observation; once the adapter is pointed at the re-founded book, `aledgent-settle settle.json
+refound` resets its cursor and accepted head, and the next run starts on the new chain.
+
+**There is no periodic re-scan** (`T-043-05`): nothing re-reads a range on a timer.
+`adapter.rescan_every` and `adapter.rescan_window`, in a file that still sets them, are accepted
+with a warning for this release, and refused by the next.
 
 **Run it under a supervisor that restarts it.** The binary aborts on any panic, since the embedded
 smoldot panics in its own threads and would otherwise leave a process that serves nothing. A new

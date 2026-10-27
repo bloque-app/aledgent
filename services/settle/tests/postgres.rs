@@ -140,6 +140,28 @@ async fn req_sa_5_the_postgres_store_keeps_its_rules() {
     s.advance_cursor(1, 5).await.unwrap();
     s.advance_cursor(1, 3).await.unwrap();
     assert_eq!(s.cursor(1).await.unwrap(), 5);
+    // T-043-04: a cursor from before the accepted head's columns has no accepted head; one is
+    // accepted beside it; the chain's reset moves the cursor back and forgets the head.
+    assert_eq!(s.accepted_head(1).await.unwrap(), None);
+    let head = settle::store::AcceptedHead {
+        position: 5,
+        digest: [0xD5; 32],
+        block: 40,
+    };
+    s.accept_head(1, &head).await.unwrap();
+    assert_eq!(s.accepted_head(1).await.unwrap(), Some(head));
+    assert_eq!(s.cursor(1).await.unwrap(), 5);
+    s.reset_chain(1, 0).await.unwrap();
+    assert_eq!(
+        (
+            s.cursor(1).await.unwrap(),
+            s.accepted_head(1).await.unwrap()
+        ),
+        (0, None)
+    );
+    s.advance_cursor(1, 5).await.unwrap();
+    s.accept_head(2, &head).await.unwrap();
+    assert_eq!(s.cursor(2).await.unwrap(), 5);
     let gap = GapRow {
         instance: 1,
         from: 0,

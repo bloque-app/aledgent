@@ -77,10 +77,9 @@ use ingress::clock::SharedClock;
 use ingress::settlement::{
     AcknowledgementBody, AnchorAcknowledgementBody, AnchorFactBody, AnchorFailureBody,
     AttestationBody, CallBody, CheckBody, EventKindBody, GapBody, GapReasonBody, HeadBody,
-    KeyNonceBody, LayerAssetFactsBody, LayerAssetStatusBody, LayerEntryBody, MovementBody,
-    ObservationBody, ObservedFinalityBody, PositionBody, PositionsBody, RescanBody,
-    RescanResultBody, SettlementCallBody, SigningBody, SigningRecordBody,
-    destination as parse_destination, venue_body,
+    KeyNonceBody, LayerAssetFactsBody, LayerAssetStatusBody, MovementBody, ObservationBody,
+    ObservedFinalityBody, PositionBody, PositionsBody, SettlementCallBody, SigningBody,
+    SigningRecordBody, destination as parse_destination, venue_body,
 };
 use ingress::wire::{AdapterLegBody, CoordinateBody, OperationKindBody};
 use ledger_core::account::Time;
@@ -93,17 +92,17 @@ use serde::Serialize;
 
 use crate::chain::kreivo;
 use crate::chain::{
-    AccountId32, AnchorCall, BatchCall, BatchFailure, BindCall, BlockRef, Chain, ChainAsset,
-    ChainError, InboxEntry, InboxEvent, InboxRead, Mortality, RuntimeInfo, SignedExtrinsic,
-    Validity, WithdrawCall,
+    AccountId32, AnchorCall, BatchCall, BatchFailure, BindCall, BlockEvents, BlockRef, Chain,
+    ChainAsset, ChainError, ChainEvent, ChainHead, InboxEntry, InboxEvent, Mortality, RuntimeInfo,
+    SignedExtrinsic, Validity, WithdrawCall, ZERO_DIGEST,
 };
 use crate::config::AdapterConfig;
 use crate::link::{Answer, CoreLink, LinkError, Transport};
 use crate::signer::Signer;
 use crate::store::{
-    AnchorExtrinsic, AnchorRow, BindRow, ExtrinsicRow, ExtrinsicStatus, GapRow, Inserted,
-    InstructionRow, InstructionState, LaneRow, NotExecuted, ObservationRow, ParkReason, ReportRow,
-    RuntimeRow, Store, StoreError,
+    AcceptedHead, AnchorExtrinsic, AnchorRow, BindRow, ExtrinsicRow, ExtrinsicStatus, GapRow,
+    Inserted, InstructionRow, InstructionState, LaneRow, NotExecuted, ObservationRow, ParkReason,
+    ReportRow, RuntimeRow, Store, StoreError,
 };
 
 /// The chain's operation reference of a book operation: the call envelope's reference, its 16
@@ -151,6 +150,8 @@ pub enum AdapterError {
     Store(StoreError),
     /// A test's crash point was reached.
     Crashed(CrashPoint),
+    /// An operator's request was refused, with why: nothing was written.
+    Refused(String),
 }
 
 impl std::fmt::Display for AdapterError {
@@ -161,6 +162,7 @@ impl std::fmt::Display for AdapterError {
             AdapterError::Link(e) => e.fmt(f),
             AdapterError::Store(e) => e.fmt(f),
             AdapterError::Crashed(p) => write!(f, "crashed at {p:?}"),
+            AdapterError::Refused(why) => write!(f, "refused: {why}"),
         }
     }
 }
@@ -257,20 +259,10 @@ pub struct StepReport {
     pub best: u64,
 }
 
-/// What a re-scan found.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Rescanned {
-    /// The core's report.
-    pub core: RescanResultBody,
-    /// Positions the layer holds that the adapter's own store never recorded.
-    pub adapter_missing: Vec<u64>,
-}
-
 /// Test hooks. None of them is reachable from configuration.
 #[derive(Clone, Debug, Default)]
 pub struct Faults {
     crash: BTreeSet<CrashPoint>,
-    drop_reports: BTreeSet<u64>,
 }
 
 /// The adapter. See the module documentation.
@@ -318,6 +310,53 @@ pub struct Adapter<C: Chain, S: Store, T: Transport> {
     /// cleared (a store error, a crash in between) would otherwise leave the alert open, paging,
     /// since every later step finds the runtime confirmed and never reaches the clearing.
     alert_settled: BTreeSet<String>,
+}
+
+/// The alert of a chain that does not lead to its head (amendment 0040, `REQ-IN-5`):
+/// `chain:<instance>:<position>`, of kind `chain`, which pages as
+/// `AledgentSettlementChainMismatch` (`aledgent_observation_chain_mismatches`).
+pub const CHAIN_ALERT: &str = "chain";
+
+/// Where a walk back from the finalized head stops (amendment 0040).
+#[derive(Clone, Copy, Debug)]
+enum WalkTo {
+    /// At the blocks after this one: the block the accepted head was read at.
+    After(u64),
+    /// At the chain's start: the block of the reset that began it, or of its entry at this
+    /// position ([`ChainHead::start`]), or the genesis.
+    Start(u64),
+}
+
+/// What a walk read, in the blocks' order.
+#[derive(Debug, Default)]
+struct Walked {
+    /// The current chain's entries.
+    entries: Vec<(u64, InboxEntry)>,
+    /// The block of the last reset read, if any.
+    reset: Option<u64>,
+    /// The positions of events in the earlier code's shape.
+    legacy: Vec<u64>,
+}
+
+/// What a sync found.
+enum Synced {
+    /// The head is the one accepted.
+    Idle,
+    /// The entries since the accepted head, in order: they lead to the head.
+    New {
+        /// The entries.
+        entries: Vec<(u64, InboxEntry)>,
+    },
+}
+
+/// Why a sync stopped at the first new position.
+enum Stop {
+    /// A block's events could not be read, by the adapter's client or the history endpoint.
+    Unreadable(String),
+    /// The events do not lead to the head, read twice.
+    Mismatch(String),
+    /// The instance was reset since the accepted head, at this block.
+    Reset(u64),
 }
 
 /// The format the adapter signs in on a runtime, and that runtime's identity (`T-027-12`).
@@ -546,12 +585,6 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
     /// Die at `point` the next time it is reached (tests).
     pub fn crash_at(&mut self, point: CrashPoint) {
         self.faults.crash.insert(point);
-    }
-
-    /// Read inbox position `seq` but never report it: the core's copy then lacks it (tests,
-    /// `AC-D2.1`).
-    pub fn drop_report_of(&mut self, seq: u64) {
-        self.faults.drop_reports.insert(seq);
     }
 
     fn fault(&mut self, point: CrashPoint) -> StepResult<()> {
@@ -1158,13 +1191,6 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
         report.signed = signed;
         report.parked = parked;
         report.broadcast = broadcast;
-        if self.config.rescan_every > 0 && self.steps % self.config.rescan_every == 0 {
-            let to = self.store.cursor(self.config.instance).await?;
-            let from = to.saturating_sub(self.config.rescan_window);
-            if to > from {
-                self.rescan(from, to).await?;
-            }
-        }
         if self.anchor_signer.is_some() {
             let anchor = calls.iter().find_map(|c| match &c.call {
                 SettlementCallBody::Anchor { number, commitment } => {
@@ -2398,8 +2424,172 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
         Ok(())
     }
 
-    /// Checks, the cursor read, provisional reads, and the head. Returns (reported, gaps, whether
-    /// the core took the head in).
+    /// The events of the blocks back from `fin` that a sync needs (amendment 0040), walking back
+    /// by parent hash, then read forward in the blocks' order: the current chain's entries, a
+    /// reset discarding what came before it. A block the adapter's own client cannot serve (a full
+    /// node keeps about 256 blocks of events) is read from the history endpoint, and so is every
+    /// older one; one neither serves makes the range unreadable (`Err`, with why).
+    async fn walk(&self, fin: &BlockRef, to: WalkTo) -> StepResult<Result<Walked, String>> {
+        let instance = self.config.instance;
+        let mut blocks = Vec::new();
+        let mut at = *fin;
+        let mut own_client = true;
+        loop {
+            if let WalkTo::After(b) = to {
+                if at.number <= b {
+                    break;
+                }
+            }
+            let read = if own_client {
+                match self.chain.block_events(&at, instance).await {
+                    Ok(b) => Ok(b),
+                    Err(e) => {
+                        own_client = false;
+                        self.from_history(&at, &e.to_string()).await?
+                    }
+                }
+            } else {
+                self.from_history(&at, "older than the adapter's client serves")
+                    .await?
+            };
+            let b = match read {
+                Ok(b) => b,
+                Err(why) => return Ok(Err(why)),
+            };
+            let parent = b.parent;
+            let start_here = match to {
+                WalkTo::Start(start) => b.events.iter().any(|e| match e {
+                    ChainEvent::Reset => true,
+                    ChainEvent::Entry { seq, .. } => *seq == start,
+                    ChainEvent::Legacy { .. } => false,
+                }),
+                WalkTo::After(_) => false,
+            };
+            blocks.push(b);
+            if start_here || at.number == 0 {
+                break;
+            }
+            at = BlockRef {
+                number: at.number - 1,
+                hash: parent,
+            };
+        }
+        let mut out = Walked::default();
+        for b in blocks.into_iter().rev() {
+            for e in b.events {
+                match e {
+                    ChainEvent::Entry { seq, entry } => out.entries.push((seq, entry)),
+                    ChainEvent::Reset => {
+                        out.entries.clear();
+                        out.legacy.clear();
+                        out.reset = Some(b.block.number);
+                    }
+                    ChainEvent::Legacy { seq } => out.legacy.push(seq),
+                }
+            }
+        }
+        Ok(Ok(out))
+    }
+
+    /// `block`'s events from the history endpoint, after the adapter's own client could not
+    /// serve them (`why`).
+    async fn from_history(
+        &self,
+        block: &BlockRef,
+        why: &str,
+    ) -> StepResult<Result<BlockEvents, String>> {
+        Ok(
+            match self.chain.history_events(block, self.config.instance).await {
+                Ok(Some(b)) => {
+                    tracing::info!(
+                        block = block.number,
+                        "a block's events read from the history endpoint"
+                    );
+                    Ok(b)
+                }
+                Ok(None) => Err(format!(
+                    "the events of block #{} could not be read ({why}), and no history endpoint \
+                     is configured",
+                    block.number
+                )),
+                Err(e) => Err(format!(
+                    "the events of block #{} could not be read ({why}), nor from the history \
+                     endpoint ({e})",
+                    block.number
+                )),
+            },
+        )
+    }
+
+    /// The sync (amendment 0040, `REQ-IN-5`): does what the layer holds lead, entry by entry, from
+    /// the head the adapter last accepted to the head it holds at `fin`? Unchanged: done, with no
+    /// other read. Otherwise the events of the blocks since are folded from the accepted digest; a
+    /// result that differs is read once more before the sync stops.
+    async fn sync(
+        &self,
+        fin: &BlockRef,
+        head: &ChainHead,
+        accepted: Option<AcceptedHead>,
+    ) -> StepResult<Result<Synced, Stop>> {
+        let (from, digest, to) = match accepted {
+            Some(a) if a.position == head.position && a.digest == head.digest => {
+                return Ok(Ok(Synced::Idle));
+            }
+            Some(a) => (a.position, a.digest, WalkTo::After(a.block)),
+            // A first start: the chain from its start (the reset that began it, or the
+            // instance's instantiation), with the zero digest.
+            None if head.position == head.start && head.digest == ZERO_DIGEST => {
+                return Ok(Ok(Synced::New {
+                    entries: Vec::new(),
+                }));
+            }
+            None => (head.start, ZERO_DIGEST, WalkTo::Start(head.start)),
+        };
+        // On a first start, the entries below the chain's start (an upgrade's block holds the
+        // earlier code's) are not this chain's.
+        let floor = if accepted.is_some() { 0 } else { from };
+        let mut last = String::new();
+        for attempt in 1..=2 {
+            let walked = match self.walk(fin, to).await? {
+                Ok(w) => w,
+                Err(why) => return Ok(Err(Stop::Unreadable(why))),
+            };
+            if accepted.is_some() {
+                if let Some(block) = walked.reset {
+                    return Ok(Err(Stop::Reset(block)));
+                }
+            }
+            let entries: Vec<(u64, InboxEntry)> = walked
+                .entries
+                .into_iter()
+                .filter(|(seq, _)| *seq >= floor)
+                .collect();
+            let checked = match walked.legacy.into_iter().find(|seq| *seq >= floor) {
+                Some(seq) => Err(format!(
+                    "the event of position {seq} has the earlier code's shape: its entry cannot be \
+                     rebuilt"
+                )),
+                None => crate::chain::fold(from, &digest, &entries, head),
+            };
+            match checked {
+                Ok(()) => return Ok(Ok(Synced::New { entries })),
+                Err(why) => {
+                    tracing::warn!(
+                        attempt,
+                        from,
+                        head = head.position,
+                        error = %why,
+                        "the chain's events do not lead to its head"
+                    );
+                    last = why;
+                }
+            }
+        }
+        Ok(Err(Stop::Mismatch(last)))
+    }
+
+    /// Checks, the sync, provisional reads, and the head. Returns (reported, gaps, whether the
+    /// core took the head in).
     async fn observe(
         &mut self,
         fin: &BlockRef,
@@ -2407,18 +2597,23 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
     ) -> StepResult<(usize, usize, bool)> {
         let instance = self.config.instance;
         let now = self.now();
-        let Some(view) = self.chain.instance(fin, instance).await? else {
+        let Some(head) = self.chain.chain_head(fin, instance).await? else {
             self.store
                 .raise("instance", "the instance is not registered", now)
                 .await?;
             return Ok((0, 0, false));
         };
+        let accepted = self.store.accepted_head(instance).await?;
+        // The first new position: the accepted head's, or the chain's start.
+        let from = accepted.map_or(head.start, |a| a.position);
+        let synced = self.sync(fin, &head, accepted).await?;
         // 1. What was reported provisionally and is now below the finality point: its position is
-        // in the finalized inbox, or the finalized head has passed the block that wrote it. In the
-        // second case a position the finalized inbox has not reached was never written by that
+        // in the finalized chain, or the finalized head has passed the block that wrote it. In the
+        // second case a position the finalized chain has not reached was never written by that
         // block on the finalized chain, and never will be (the entry's digest binds its block):
         // the record is orphaned (`F-027`: a batch whose era's birth block was reorged away
-        // otherwise leaves its provisional records unchecked for as long as the inbox is idle).
+        // otherwise leaves its provisional records unchecked for as long as the chain is idle).
+        // A position the sync could not show complete waits for it.
         //
         // Every record that no longer matches is reported before any that does (`F-027`): a
         // transaction whose era is born at the finalized head survives a reorganisation and can
@@ -2426,17 +2621,39 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
         // records of one operation at one position. The core rebinds the operation to the
         // surviving record when the first is orphaned; were the survivor already made final by an
         // earlier check, nothing would promote the operation afterwards.
+        let verified: Option<BTreeMap<u64, String>> = match &synced {
+            Ok(Synced::Idle) => Some(BTreeMap::new()),
+            Ok(Synced::New { entries }) => Some(
+                entries
+                    .iter()
+                    .map(|(seq, e)| (*seq, hex::encode(e.digest())))
+                    .collect(),
+            ),
+            Err(_) => None,
+        };
         let mut checks = Vec::new();
         for obs in self.store.observations().await? {
-            if obs.finalized || (obs.seq >= view.next_seq && fin.number < obs.at) {
+            if obs.finalized {
                 continue;
             }
-            let read = self.chain.inbox(fin, instance, obs.seq, 1).await?;
-            let still_matches = matches!(
-                read.first(),
-                Some((_, InboxRead::Entry(e))) if hex::encode(e.digest()) == obs.digest
-            );
-            checks.push((still_matches, obs));
+            let still_matches = if obs.seq < head.position {
+                if obs.seq < from {
+                    // Below what the sync folds: the final record there was taken in with
+                    // another digest, or belongs to a chain before a reset.
+                    Some(false)
+                } else {
+                    verified
+                        .as_ref()
+                        .map(|v| v.get(&obs.seq) == Some(&obs.digest))
+                }
+            } else if fin.number >= obs.at {
+                Some(false)
+            } else {
+                None
+            };
+            if let Some(still_matches) = still_matches {
+                checks.push((still_matches, obs));
+            }
         }
         checks.sort_by_key(|(still_matches, obs)| (*still_matches, obs.seq));
         for (still_matches, obs) in checks {
@@ -2460,99 +2677,118 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             // Marks the provisional row as settled either way.
             self.store.insert_observation(&done).await?;
         }
-        // 2. The cursor read at the finalized head.
+        // 2. The new entries, shown complete, reported in order from the cursor; the head is
+        // accepted once the core has taken in every one.
         let mut reported = 0;
-        let mut gaps = 0;
-        let mut cursor = self.store.cursor(instance).await?;
-        let mut gap_from: Option<u64> = None;
-        'read: while cursor < view.next_seq {
-            let page = self
-                .chain
-                .inbox(fin, instance, cursor, self.config.page)
-                .await?;
-            if page.is_empty() {
-                break;
-            }
-            for (seq, read) in page {
-                match read {
-                    InboxRead::Pruned => {
-                        gap_from.get_or_insert(seq);
+        let complete = match synced {
+            Ok(Synced::Idle) => true,
+            Ok(Synced::New { entries }) => {
+                if accepted.is_none() {
+                    // A first start on this chain: a cursor kept from a chain before it (the
+                    // instance's reset with its book's re-founding) is reset to its start.
+                    let cursor = self.store.cursor(instance).await?;
+                    if cursor != from {
+                        tracing::warn!(
+                            cursor,
+                            start = from,
+                            "a cursor from before the chain's start is reset to it"
+                        );
+                        self.store.reset_chain(instance, from).await?;
                     }
-                    InboxRead::Absent => {
-                        // Not pruned and not there: never skipped silently, never passed.
+                }
+                let cursor = self.store.cursor(instance).await?;
+                let mut all = true;
+                for (seq, e) in entries {
+                    // Taken in before a restart: the accepted head lags the cursor until the last.
+                    if seq < cursor {
+                        continue;
+                    }
+                    self.store
+                        .insert_observation(&self.observation_row(seq, &e, true))
+                        .await?;
+                    self.fault(CrashPoint::AfterObserve)?;
+                    let body = self.observation_body(seq, &e, true);
+                    let a = self.report_observation(&body).await?;
+                    if !a.ingested() {
+                        // The core did not take it in: do not pass it.
                         self.store
                             .raise(
-                                &format!("unreadable:{instance}:{seq}"),
-                                "an inbox position below the head could not be read",
+                                &format!("report:{instance}:{seq}"),
+                                &format!("the core refused an observation: {}", a.verdict()),
                                 now,
                             )
                             .await?;
-                        break 'read;
-                    }
-                    InboxRead::Entry(e) => {
-                        if let Some(from) = gap_from.take() {
-                            self.record_gap(from, seq, GapReasonBody::Pruned).await?;
-                            gaps += 1;
-                        }
-                        self.store
-                            .insert_observation(&self.observation_row(seq, &e, true))
-                            .await?;
-                        self.fault(CrashPoint::AfterObserve)?;
-                        if !self.faults.drop_reports.contains(&seq) {
-                            let body = self.observation_body(seq, &e, true);
-                            let a = self.report_observation(&body).await?;
-                            if !a.ingested() {
-                                // The core did not take it in: do not pass it.
-                                self.store
-                                    .raise(
-                                        &format!("report:{instance}:{seq}"),
-                                        &format!(
-                                            "the core refused an observation: {}",
-                                            a.verdict()
-                                        ),
-                                        now,
-                                    )
-                                    .await?;
-                                break 'read;
-                            }
-                            self.report_check(&body.coordinate, fin.number, true)
-                                .await?;
-                            reported += 1;
-                        }
-                        self.note_record(&e.event).await?;
-                        self.fault(CrashPoint::AfterVerdict)?;
-                        self.store.advance_cursor(instance, seq + 1).await?;
-                    }
-                }
-                cursor = seq + 1;
-            }
-        }
-        if let Some(from) = gap_from.take() {
-            self.record_gap(from, cursor, GapReasonBody::Pruned).await?;
-            gaps += 1;
-        }
-        // 3. The adapter's own extrinsics seen above the finality point: provisional.
-        if best.number > fin.number {
-            if let Some(best_view) = self.chain.instance(best, instance).await? {
-                let ours: BTreeSet<String> = self
-                    .store
-                    .instructions()
-                    .await?
-                    .into_iter()
-                    .map(|r| r.operation)
-                    .collect();
-                let mut seq = view.next_seq;
-                while seq < best_view.next_seq {
-                    let page = self
-                        .chain
-                        .inbox(best, instance, seq, self.config.page)
-                        .await?;
-                    if page.is_empty() {
+                        all = false;
                         break;
                     }
-                    for (s, read) in page {
-                        seq = s + 1;
-                        let InboxRead::Entry(e) = read else { continue };
+                    self.report_check(&body.coordinate, fin.number, true)
+                        .await?;
+                    reported += 1;
+                    self.note_record(&e.event).await?;
+                    self.fault(CrashPoint::AfterVerdict)?;
+                    self.store.advance_cursor(instance, seq + 1).await?;
+                }
+                all
+            }
+            Err(stop) => {
+                self.stopped(from, &head, stop).await?;
+                false
+            }
+        };
+        if complete {
+            for key in [
+                format!("{CHAIN_ALERT}:{instance}:{from}"),
+                format!("unreadable:{instance}:{from}"),
+            ] {
+                self.store.clear(&key, now).await?;
+            }
+            let a = AcceptedHead {
+                position: head.position,
+                digest: head.digest,
+                block: fin.number,
+            };
+            if accepted != Some(a) {
+                self.store.accept_head(instance, &a).await?;
+            }
+        }
+        // 3. The adapter's own extrinsics seen above the finality point: provisional. Read only
+        // while one of its withdrawals is in flight, so an idle sync reads the head alone.
+        if best.number > fin.number {
+            let ours: BTreeSet<String> = self
+                .store
+                .instructions()
+                .await?
+                .into_iter()
+                .filter(|r| {
+                    matches!(
+                        r.state,
+                        InstructionState::Signed | InstructionState::Broadcast
+                    )
+                })
+                .map(|r| r.operation)
+                .collect();
+            if !ours.is_empty() {
+                let mut blocks = Vec::new();
+                let mut at = *best;
+                while at.number > fin.number {
+                    let b = self.chain.block_events(&at, instance).await?;
+                    at = BlockRef {
+                        number: at.number - 1,
+                        hash: b.parent,
+                    };
+                    blocks.push(b);
+                }
+                'blocks: for b in blocks.into_iter().rev() {
+                    for ev in b.events {
+                        let (s, e) = match ev {
+                            ChainEvent::Entry { seq, entry } => (seq, entry),
+                            // A reset above finality: what follows is another chain's.
+                            ChainEvent::Reset => break 'blocks,
+                            ChainEvent::Legacy { .. } => continue,
+                        };
+                        if s < head.position {
+                            continue;
+                        }
                         let row = self.observation_row(s, &e, false);
                         if !row.operation.as_ref().is_some_and(|o| ours.contains(o)) {
                             continue;
@@ -2568,7 +2804,8 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
         }
         // 4. The finalised head: expiry and non-inclusion are the core's to decide from it, with
         // the nonce of every signing key read at the same finalized block (the owner's ruling of
-        // 2026-09-24).
+        // 2026-09-24). Its `next_seq` is the chain's position, which the contract keeps equal to
+        // its head's.
         let mut nonces = Vec::new();
         for l in self.lanes.iter().chain(self.anchor_signer.iter()) {
             let key = l.account();
@@ -2585,7 +2822,7 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
         }
         let head = HeadBody {
             height: fin.number,
-            next_seq: view.next_seq,
+            next_seq: head.position,
             nonces,
         };
         let key = format!(
@@ -2624,7 +2861,123 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
         } else {
             self.store.clear("head", now).await?;
         }
-        Ok((reported, gaps, taken))
+        Ok((reported, 0, taken))
+    }
+
+    /// A sync that could not show the new entries complete (amendment 0040): an alert naming the
+    /// first new position, which nothing passes until a read shows the range complete or the
+    /// operator records it as a gap ([`Adapter::record_operator_gap`]). The rest of the step goes on:
+    /// submitting and anchoring do not wait for observation (`REQ-PR-9`).
+    async fn stopped(&mut self, from: u64, head: &ChainHead, stop: Stop) -> StepResult<()> {
+        let instance = self.config.instance;
+        let now = self.now();
+        let to = head.position;
+        let (key, detail) = match stop {
+            Stop::Mismatch(why) => (
+                format!("{CHAIN_ALERT}:{instance}:{from}"),
+                format!(
+                    "the settlement layer's events do not lead from the head accepted at position \
+                     {from} to its head at {to}, read twice: {why}. Nothing past position {from} \
+                     is reported until a read shows the range complete, or the operator records it \
+                     as a gap (`aledgent-settle <config> gap {from} {to}`)"
+                ),
+            ),
+            Stop::Unreadable(why) => (
+                format!("unreadable:{instance}:{from}"),
+                format!(
+                    "positions [{from}, {to}) cannot be read: {why}. A history endpoint \
+                     (`history_endpoint`) catches up; else the operator records the range as a \
+                     gap (`aledgent-settle <config> gap {from} {to}`)"
+                ),
+            ),
+            Stop::Reset(block) => (
+                format!("reset:{instance}"),
+                format!(
+                    "the instance was reset at block #{block} (a new chain from position 0): the \
+                     book this adapter serves was re-founded. Nothing of the new chain is \
+                     reported to it; restart the adapter for the new book with \
+                     `aledgent-settle <config> refound`"
+                ),
+            ),
+        };
+        if self.store.raise(&key, &detail, now).await? {
+            tracing::error!(alert = %key, detail = %detail, "the adapter stops at the first new position");
+        }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------------------ operator
+
+    /// **The operator's gap** (amendment 0040, ruling a40-q3): when no reader can serve the range
+    /// the adapter stopped at, or a mismatch does not clear, the operator has the adapter record it
+    /// through its own source, the only one the core takes a gap from (`record_gap`), and the
+    /// adapter then accepts the layer's head as it stands, unverified for that range. `from` and
+    /// `to` are what the operator saw in the alert: the position the adapter stopped at and the
+    /// head's at the finalized block; anything else is refused, and nothing is written. Holds the
+    /// lease, as a step does.
+    pub async fn record_operator_gap(&mut self, from: u64, to: u64) -> StepResult<()> {
+        self.hold_lease().await?;
+        let instance = self.config.instance;
+        let fin = self.chain.finalized().await?;
+        let head = self
+            .chain
+            .chain_head(&fin, instance)
+            .await?
+            .ok_or_else(|| AdapterError::Refused("the instance is not registered".into()))?;
+        let accepted = self.store.accepted_head(instance).await?;
+        let stopped_at = accepted.map_or(head.start, |a| a.position);
+        if (from, to) != (stopped_at, head.position) || from >= to {
+            return Err(AdapterError::Refused(format!(
+                "the adapter stands at position {stopped_at} and the head at {} (block #{}): a \
+                 gap is recorded for exactly that range, not [{from}, {to})",
+                head.position, fin.number
+            )));
+        }
+        if accepted.is_none() {
+            self.store.reset_chain(instance, from).await?;
+        }
+        self.record_gap(from, to, GapReasonBody::Unreadable).await?;
+        let now = self.now();
+        for key in [
+            format!("{CHAIN_ALERT}:{instance}:{from}"),
+            format!("unreadable:{instance}:{from}"),
+        ] {
+            self.store.clear(&key, now).await?;
+        }
+        self.store
+            .accept_head(
+                instance,
+                &AcceptedHead {
+                    position: head.position,
+                    digest: head.digest,
+                    block: fin.number,
+                },
+            )
+            .await?;
+        tracing::warn!(
+            from,
+            to,
+            block = fin.number,
+            "the operator's gap: the head is accepted unverified for the range"
+        );
+        Ok(())
+    }
+
+    /// **The re-founding's reset** (amendment 0040): the book this adapter serves was re-founded
+    /// with its instance's reset, and the adapter is started for the new book. Its cursor and the
+    /// head it accepted belong to the chain before; both are reset, and the next step starts on the
+    /// current chain from its start. Holds the lease, as a step does.
+    pub async fn refound(&mut self) -> StepResult<()> {
+        self.hold_lease().await?;
+        let instance = self.config.instance;
+        self.store.reset_chain(instance, 0).await?;
+        let now = self.now();
+        self.store.clear(&format!("reset:{instance}"), now).await?;
+        tracing::warn!(
+            instance,
+            "the adapter's cursor and accepted head are reset with the book's re-founding"
+        );
+        Ok(())
     }
 
     /// Record with the core what was done about signing `row`'s instruction, once: the stored
@@ -3378,98 +3731,5 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             }
         }
         Ok(())
-    }
-
-    // ------------------------------------------------------------------------------ re-scan
-
-    /// Read `[from, to)` again at the finalized head and have the core compare it with what it
-    /// recorded (`REQ-IN-5`, `AC-D2.1`); compare it with the adapter's own store too. Every
-    /// difference is an alert naming the position: never a repair.
-    pub async fn rescan(&mut self, from: u64, to: u64) -> StepResult<Rescanned> {
-        let instance = self.config.instance;
-        let now = self.now();
-        let fin = self.chain.finalized().await?;
-        let mut layer = Vec::new();
-        let mut seq = from;
-        while seq < to {
-            let count = u32::try_from((to - seq).min(u64::from(self.config.page))).unwrap_or(32);
-            let page = self.chain.inbox(&fin, instance, seq, count).await?;
-            if page.is_empty() {
-                break;
-            }
-            for (s, read) in page {
-                seq = s + 1;
-                if let InboxRead::Entry(e) = read {
-                    layer.push((s, hex::encode(e.digest())));
-                }
-            }
-        }
-        let held: BTreeSet<(u64, String)> = self
-            .store
-            .observations()
-            .await?
-            .into_iter()
-            .filter(|o| o.finalized)
-            .map(|o| (o.seq, o.digest))
-            .collect();
-        let mut out = Rescanned::default();
-        for (s, d) in &layer {
-            if !held.contains(&(*s, d.clone())) {
-                out.adapter_missing.push(*s);
-                self.store
-                    .raise(
-                        &format!("rescan:adapter:{instance}:{s}"),
-                        "the layer holds a record the adapter never stored",
-                        now,
-                    )
-                    .await?;
-            }
-        }
-        let body = RescanBody {
-            from,
-            to,
-            layer: layer
-                .iter()
-                .map(|(seq, digest)| LayerEntryBody {
-                    seq: *seq,
-                    digest: digest.clone(),
-                })
-                .collect(),
-        };
-        let key = format!("settle/rescan/{instance}/{from}/{to}/{}", fin.number);
-        self.report_start(
-            &key,
-            "rescan",
-            serde_json::to_value(&body).unwrap_or_default(),
-        )
-        .await?;
-        let a = self.link.rescan(&key, &body).await?;
-        self.report_end(&key, &a).await?;
-        if let Answer::Decided { result, .. } = a {
-            let r = result.rescan.unwrap_or_default();
-            for m in &r.missing {
-                self.store
-                    .raise(
-                        &format!("incident:missing:{instance}:{}", m.seq),
-                        &format!(
-                            "the core never ingested the record at {} ({})",
-                            m.seq, m.digest
-                        ),
-                        now,
-                    )
-                    .await?;
-            }
-            for u in &r.unknown {
-                self.store
-                    .raise(
-                        &format!("incident:unknown:{instance}:{}", u.seq),
-                        &format!("the layer no longer shows the final record at {}", u.seq),
-                        now,
-                    )
-                    .await?;
-            }
-            out.core = r;
-        }
-        Ok(out)
     }
 }

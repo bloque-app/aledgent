@@ -22,6 +22,7 @@ struct Inner {
     observations: BTreeMap<(u32, u64, String), ObservationRow>,
     reports: BTreeMap<String, ReportRow>,
     cursors: BTreeMap<u32, u64>,
+    heads: BTreeMap<u32, super::AcceptedHead>,
     gaps: BTreeMap<(u32, u64), GapRow>,
     alerts: BTreeMap<String, AlertRow>,
     anchors: BTreeMap<u64, AnchorRow>,
@@ -289,6 +290,22 @@ impl Store for MemStore {
         let mut s = self.lock();
         let c = s.cursors.entry(instance).or_insert(0);
         *c = (*c).max(to);
+        Ok(())
+    }
+
+    async fn accepted_head(&self, instance: u32) -> StoreResult<Option<super::AcceptedHead>> {
+        Ok(self.lock().heads.get(&instance).copied())
+    }
+
+    async fn accept_head(&self, instance: u32, head: &super::AcceptedHead) -> StoreResult<()> {
+        self.lock().heads.insert(instance, *head);
+        Ok(())
+    }
+
+    async fn reset_chain(&self, instance: u32, start: u64) -> StoreResult<()> {
+        let mut s = self.lock();
+        s.cursors.insert(instance, start);
+        s.heads.remove(&instance);
         Ok(())
     }
 

@@ -16,7 +16,10 @@
 //!
 //! - **The settlement contract** (`F-026`, `contracts/settlement`): the types it takes, returns
 //!   and stores, mirrored byte for byte, and its messages by selector — `execute(Vec<Envelope>)`
-//!   and the reads of its inbox, head, registration, anchors and positions.
+//!   and the reads of its chain's head, head, registration, anchors and positions — and **the events
+//!   it emits** for each entry of its chain, by their ink! signature topics ([`topic`],
+//!   [`contract_event`]): every entry is rebuilt from its event and its block's number
+//!   (amendment 0040).
 //! - **`Contracts::call`**, which carries a batch to the contract, and `ContractsApi_call`, the
 //!   runtime API that dry-runs the contract's reads at a block.
 //! - **The transaction** (T-027-03): a **v5 general transaction authorised by Kreivo's
@@ -98,8 +101,9 @@ pub mod selector {
     pub const REGISTRATION: [u8; 4] = [0, 0, 0x03, 0x00];
     /// `head()`.
     pub const HEAD: [u8; 4] = [0, 0, 0x03, 0x01];
-    /// `inbox_entry(seq)`.
-    pub const INBOX_ENTRY: [u8; 4] = [0, 0, 0x03, 0x02];
+    /// `chain_head()` (amendment 0040): the head of the chain of entries. It replaces
+    /// `inbox_entry(seq)` (`0x0000_0302`), which the contract no longer answers.
+    pub const CHAIN_HEAD: [u8; 4] = [0, 0, 0x03, 0x0A];
     /// `latest_anchor()`: the only anchor the contract keeps, overwritten by each new one
     /// (owner's ruling of 2026-10-11). It replaces `anchor_record(number)` (`0x0000_0303`).
     pub const LATEST_ANCHOR: [u8; 4] = [0, 0, 0x03, 0x07];
@@ -424,14 +428,14 @@ pub struct Registration {
 pub struct Head {
     /// The last anchor's number; zero for none.
     pub last_anchor: u64,
-    /// The next inbox position.
+    /// The position the next entry takes in the current chain.
     pub next_seq: u64,
-    /// Entries below this may be pruned.
+    /// The earlier code's prune watermark; zero after a reset.
     pub pruned_to: u64,
 }
 
 /// The latest anchor, as stored (`latest_anchor`, `ManualKey<0x0000_0008>`): the only one the
-/// contract keeps. Earlier anchors are in their `Anchored` inbox entries until pruned.
+/// contract keeps. Earlier anchors are in their `Anchored` events.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct LatestAnchor {
     /// Its number: always the head's `last_anchor`.
@@ -442,6 +446,363 @@ pub struct LatestAnchor {
     pub at: u32,
     /// Its inbox position.
     pub seq: u64,
+}
+
+/// The head of the chain of entries, as `chain_head()` returns it (amendment 0040): `(position,
+/// digest, start)`, 48 bytes.
+///
+/// **The one place it is decoded** ([`chain_head`]): its third field, `start`, is not yet
+/// approved by the owner; if it is dropped, this struct and that function change, and nothing else.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
+pub struct ChainHeadCell {
+    /// The position the next entry takes.
+    pub position: u64,
+    /// The chain digest after the last entry.
+    pub digest: [u8; 32],
+    /// The position the chain started at, from the zero digest.
+    pub start: u64,
+}
+
+/// `chain_head()`'s answer in the adapter's terms.
+pub fn chain_head(cell: &ChainHeadCell) -> super::ChainHead {
+    super::ChainHead {
+        position: cell.position,
+        digest: cell.digest,
+        start: cell.start,
+    }
+}
+
+/// The ink! 5 signature topics of the contract's events: `blake2b-256` of the event's name and
+/// its fields' types as written, `Name(Type,Type,...)` ([`signature_topic`]). The first topic of
+/// every event the contract emits; the event's data is its fields, SCALE-encoded, in order.
+/// Pinned against the contract's own `SIGNATURE_TOPIC`s.
+pub mod topic {
+    /// `Deposited(InboxSeq,AccountId,AccountRef,AssetId,Balance)` (amendment 0040: with `from`).
+    pub const DEPOSITED: [u8; 32] =
+        super::h32("6f3471c2dc5c795f61ba65b3ece7867b0d93ff759c6be6744897e635b030d425");
+    /// `Withdrawn(InboxSeq,OperationRef,Destination,AssetId,Balance)`; unchanged since v2.
+    pub const WITHDRAWN: [u8; 32] =
+        super::h32("f24c44013e1a81be45e81c95af8737894c25aadcb9dfda47a6672528b149075b");
+    /// `Anchored(InboxSeq,OperationRef,AnchorNumber,Commitment)`; unchanged since v2.
+    pub const ANCHORED: [u8; 32] =
+        super::h32("1978d6331d5625c5147056235631ac680e9e1b4bb1294d7aa28780f804555682");
+    /// `Bound(InboxSeq,OperationRef,AssetId,Balance)`; unchanged since v2.
+    pub const BOUND: [u8; 32] =
+        super::h32("044b4c00da4144811ead3b89b304f92d5a58150c29c18a3bb49ebcf449f6b9d1");
+    /// `Refused(InboxSeq,OperationRef,Call,Refusal)` (amendment 0040: with `call`).
+    pub const REFUSED: [u8; 32] =
+        super::h32("abdd66eaa766d1d09a4c48bfd3ef9d5030828d45c111be41c336796e1144ea5a");
+    /// `AnchorHeadSet(u32,AnchorNumber,InboxSeq,Commitment,Option<LatestAnchor>)`: a reset.
+    pub const ANCHOR_HEAD_SET: [u8; 32] =
+        super::h32("7769b2a1fed276d4fb3e485627b9af8e0258c24ad57cf8beb248f5d349ac9a49");
+    /// The earlier code's `Deposited(InboxSeq,AccountRef,AssetId,Balance)`, without `from`.
+    pub const DEPOSITED_V2: [u8; 32] =
+        super::h32("64531aab6a2a1c81575152b6cd256fd30aa7081745fac257467b14bec39c2558");
+    /// The earlier code's `Refused(InboxSeq,OperationRef,Refusal)`, without `call`.
+    pub const REFUSED_V2: [u8; 32] =
+        super::h32("735b10554d195d3829913de561e7b992273d3d561734c8820d824e3e2b21d175");
+}
+
+/// 32 bytes from 64 hex digits, at compile time.
+const fn h32(hex: &str) -> [u8; 32] {
+    const fn digit(c: u8) -> u8 {
+        match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            _ => panic!("not a lowercase hex digit"),
+        }
+    }
+    let b = hex.as_bytes();
+    assert!(b.len() == 64, "64 hex digits");
+    let mut out = [0u8; 32];
+    let mut i = 0;
+    while i < 32 {
+        out[i] = digit(b[2 * i]) << 4 | digit(b[2 * i + 1]);
+        i += 1;
+    }
+    out
+}
+
+/// An ink! 5 event's signature topic: `blake2b-256(name(Type,Type,...))`, the field types as
+/// written in the contract with no spaces (`ink_macro` 5.1.1, `event::signature_topic`).
+pub fn signature_topic(signature: &str) -> [u8; 32] {
+    blake2_256(signature.as_bytes())
+}
+
+/// `Deposited`'s fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct DepositedEvent {
+    /// Its position.
+    pub seq: u64,
+    /// The sender.
+    pub from: AccountId32,
+    /// The account reference.
+    pub account_ref: [u8; 32],
+    /// The asset.
+    pub asset: AssetId,
+    /// The amount.
+    pub amount: u128,
+}
+
+/// `Withdrawn`'s fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct WithdrawnEvent {
+    /// Its position.
+    pub seq: u64,
+    /// The call's reference (also a topic).
+    pub operation_ref: [u8; 32],
+    /// Where it went.
+    pub to: Destination,
+    /// The asset.
+    pub asset: AssetId,
+    /// The amount.
+    pub amount: u128,
+}
+
+/// `Anchored`'s fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct AnchoredEvent {
+    /// Its position.
+    pub seq: u64,
+    /// The call's reference (also a topic).
+    pub operation_ref: [u8; 32],
+    /// The anchor's number.
+    pub number: u64,
+    /// The commitment.
+    pub commitment: [u8; 32],
+}
+
+/// `Bound`'s fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct BoundEvent {
+    /// Its position.
+    pub seq: u64,
+    /// The call's reference (also a topic).
+    pub operation_ref: [u8; 32],
+    /// The asset.
+    pub asset: AssetId,
+    /// The amount bound.
+    pub amount: u128,
+}
+
+/// `Refused`'s fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct RefusedEvent {
+    /// Its position.
+    pub seq: u64,
+    /// The call's reference (also a topic).
+    pub operation_ref: [u8; 32],
+    /// The call, as submitted.
+    pub call: Call,
+    /// Why.
+    pub reason: Refusal,
+}
+
+/// `AnchorHeadSet`'s fields: a reset by governance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct AnchorHeadSetEvent {
+    /// The new sequence's number (also a topic).
+    pub epoch: u32,
+    /// The number it starts after.
+    pub base: u64,
+    /// The position of its first entry: 0.
+    pub from_seq: u64,
+    /// The book it anchors.
+    pub book: [u8; 32],
+    /// The previous sequence's latest anchor.
+    pub previous: Option<LatestAnchor>,
+}
+
+/// An event a contract emitted (`Contracts::ContractEmitted`): its topics, its data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmittedEvent {
+    /// Its topics: the signature first.
+    pub topics: Vec<[u8; 32]>,
+    /// Its fields, SCALE-encoded.
+    pub data: Vec<u8>,
+}
+
+/// The event the contract emits for the entry `event` at position `seq`, as ink! 5 emits it: the
+/// signature topic, then the reference for the events that carry it as a topic.
+pub fn entry_event(seq: u64, event: &InboxEvent) -> EmittedEvent {
+    match *event {
+        InboxEvent::Deposited {
+            from,
+            account_ref,
+            asset,
+            amount,
+        } => EmittedEvent {
+            topics: vec![topic::DEPOSITED],
+            data: DepositedEvent {
+                seq,
+                from,
+                account_ref,
+                asset,
+                amount,
+            }
+            .encode(),
+        },
+        InboxEvent::Withdrawn {
+            operation_ref,
+            to,
+            asset,
+            amount,
+        } => EmittedEvent {
+            topics: vec![topic::WITHDRAWN, operation_ref],
+            data: WithdrawnEvent {
+                seq,
+                operation_ref,
+                to,
+                asset,
+                amount,
+            }
+            .encode(),
+        },
+        InboxEvent::Anchored {
+            operation_ref,
+            number,
+            commitment,
+        } => EmittedEvent {
+            topics: vec![topic::ANCHORED, operation_ref],
+            data: AnchoredEvent {
+                seq,
+                operation_ref,
+                number,
+                commitment,
+            }
+            .encode(),
+        },
+        InboxEvent::Refused {
+            operation_ref,
+            call,
+            reason,
+        } => EmittedEvent {
+            topics: vec![topic::REFUSED, operation_ref],
+            data: RefusedEvent {
+                seq,
+                operation_ref,
+                call,
+                reason,
+            }
+            .encode(),
+        },
+        InboxEvent::Bound {
+            operation_ref,
+            asset,
+            amount,
+        } => EmittedEvent {
+            topics: vec![topic::BOUND, operation_ref],
+            data: BoundEvent {
+                seq,
+                operation_ref,
+                asset,
+                amount,
+            }
+            .encode(),
+        },
+    }
+}
+
+/// Decode `T` from all of `data`; trailing bytes are an error.
+fn exactly<T: Decode>(data: &[u8], what: &str) -> Result<T, String> {
+    let mut input = data;
+    let v = T::decode(&mut input).map_err(|e| format!("a {what} event: {e}"))?;
+    if !input.is_empty() {
+        return Err(format!(
+            "a {what} event with {} bytes left over",
+            input.len()
+        ));
+    }
+    Ok(v)
+}
+
+/// What one of an instance's contract events says of its chain (amendment 0040), from the event's
+/// topics and data and the number `at` of its block; `None` for an event that is not about the
+/// chain (`Registered`, `KeysSet`, ...). Dispatched on the signature topic only, never on a blind
+/// decode. An entry is rebuilt as `InboxEntry { at, event }` from the event's own fields and
+/// encoded; its bytes are what the chain's digest covers and what the earlier code stored.
+pub fn contract_event(
+    topics: &[[u8; 32]],
+    data: &[u8],
+    at: u64,
+    instance_of: impl Fn(&AccountId32) -> Option<u32>,
+) -> Result<Option<super::ChainEvent>, String> {
+    let Some(signature) = topics.first() else {
+        return Ok(None);
+    };
+    let (seq, event) = match *signature {
+        topic::DEPOSITED => {
+            let e: DepositedEvent = exactly(data, "Deposited")?;
+            (
+                e.seq,
+                InboxEvent::Deposited {
+                    from: e.from,
+                    account_ref: e.account_ref,
+                    asset: e.asset,
+                    amount: e.amount,
+                },
+            )
+        }
+        topic::WITHDRAWN => {
+            let e: WithdrawnEvent = exactly(data, "Withdrawn")?;
+            (
+                e.seq,
+                InboxEvent::Withdrawn {
+                    operation_ref: e.operation_ref,
+                    to: e.to,
+                    asset: e.asset,
+                    amount: e.amount,
+                },
+            )
+        }
+        topic::ANCHORED => {
+            let e: AnchoredEvent = exactly(data, "Anchored")?;
+            (
+                e.seq,
+                InboxEvent::Anchored {
+                    operation_ref: e.operation_ref,
+                    number: e.number,
+                    commitment: e.commitment,
+                },
+            )
+        }
+        topic::BOUND => {
+            let e: BoundEvent = exactly(data, "Bound")?;
+            (
+                e.seq,
+                InboxEvent::Bound {
+                    operation_ref: e.operation_ref,
+                    asset: e.asset,
+                    amount: e.amount,
+                },
+            )
+        }
+        topic::REFUSED => {
+            let e: RefusedEvent = exactly(data, "Refused")?;
+            (
+                e.seq,
+                InboxEvent::Refused {
+                    operation_ref: e.operation_ref,
+                    call: e.call,
+                    reason: e.reason,
+                },
+            )
+        }
+        topic::ANCHOR_HEAD_SET => {
+            exactly::<AnchorHeadSetEvent>(data, "AnchorHeadSet")?;
+            return Ok(Some(super::ChainEvent::Reset));
+        }
+        // The earlier code's shapes: the position only; the entry cannot be rebuilt.
+        topic::DEPOSITED_V2 | topic::REFUSED_V2 => {
+            let seq = u64::decode(&mut &data[..]).map_err(|e| format!("an earlier event: {e}"))?;
+            return Ok(Some(super::ChainEvent::Legacy { seq }));
+        }
+        _ => return Ok(None),
+    };
+    let at32 = u32::try_from(at).map_err(|_| format!("a block number past Kreivo's u32: {at}"))?;
+    let raw = InboxEntry { at: at32, event }.encode();
+    let entry = inbox_entry(raw, instance_of)?;
+    Ok(Some(super::ChainEvent::Entry { seq, entry }))
 }
 
 /// The input of a contract message: its selector, then its arguments.
@@ -502,7 +863,7 @@ pub fn envelope(
     })
 }
 
-/// A stored inbox entry, decoded and mapped into the adapter's terms. `instance_of` names the
+/// An entry's SCALE bytes, decoded and mapped into the adapter's terms. `instance_of` names the
 /// instance of another deployment's contract; one it does not know stays a plain account.
 pub fn inbox_entry(
     raw: Vec<u8>,
