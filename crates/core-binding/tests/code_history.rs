@@ -7,8 +7,11 @@
 //! earlier builds and only ever extended: its founding (`founding.bin`), its archived ring entries
 //! (`entries.bin`, each framed by its length, so an extension appends bytes and never rewrites
 //! them) and the code map those entries were recorded under (`code-map.json`). Each extension adds
-//! a range: an upgrade to the next generation, taken, with way-out inputs at the upgrade's input
-//! (an unauthorised cancel, a reschedule) and a later upgrade cancelled at its input.
+//! a range: identities, accounts, issuance, transfers (one refused), a reservation captured and
+//! one released, an anchored checkpoint; then an upgrade to the next generation, taken, with
+//! way-out inputs at the upgrade's input (an unauthorised cancel, a reschedule) and a later upgrade
+//! cancelled at its input. Not in it yet: changes of the upgrade-authority mode, deliveries and
+//! settlement observations.
 //!
 //! **The gate.** This build must replay the whole fixture from genesis, natively and with no
 //! runtime, each range under the generation the code map read from the inputs names
@@ -250,6 +253,50 @@ fn transfer(
     }
 }
 
+/// What a book needs to anchor checkpoints: a settlement configuration and the operator's grant.
+fn anchoring(fx: &mut Fx<NativePort>) {
+    use ledger_core::identity::IdentityKind;
+    use ledger_core::operator::OperatorOpKind;
+    use ledger_core::principal::Verifier;
+    use ledger_core::set::NonEmptySet;
+    use ledger_core::settlement::{SettlementConfig, SourceId};
+    let c = fx.ctx(fx.operator());
+    let o = fx
+        .replica
+        .open_identity(&c, IdentityKind::Organisation, None, Verifier::new(vec![9]))
+        .unwrap()
+        .value;
+    fx.synced();
+    let c = fx.ctx(fx.operator());
+    fx.replica
+        .configure_settlement(
+            &c,
+            SettlementConfig {
+                authoritative: SourceId::of_identity(&o.identity),
+                instance: 1,
+                suspense: None,
+                inbound_deadline: 1_000_000,
+                expiry_window: 1_000,
+                block_time: 1,
+                finality_margin: 1,
+            },
+        )
+        .unwrap();
+    fx.synced();
+    let op = fx.operator();
+    let c = fx.ctx(op);
+    fx.replica
+        .grant_operator(
+            &c,
+            op.principal,
+            NonEmptySet::one(OperatorOpKind::AnchorCheckpoint),
+            None,
+            b"code-history: the operator anchors",
+        )
+        .unwrap();
+    fx.synced();
+}
+
 /// Extend the fixture by one range (module documentation). Run by hand, once per release that adds
 /// a code generation; refuses to run unless `ALEDGENT_CODE_HISTORY_EXTEND=1`.
 #[test]
@@ -314,6 +361,33 @@ fn extend() {
         fx.replica.transfer(&c, &transfer(a, b, 10 + i)).unwrap();
         fx.synced();
     }
+    // A transfer the book refuses (nothing available), recorded with its refusal.
+    let c = fx.ctx(q);
+    let _ = fx.replica.transfer(&c, &transfer(b, a, 1_000_000));
+    fx.synced();
+    // A reservation captured into the other account, and one released.
+    let c = fx.ctx(p);
+    fx.replica.reserve(&c, a, usd(), Minor::new(100)).unwrap();
+    fx.synced();
+    let capture = ledger_core::ledger::Ctx { now: fx.now, ..c };
+    fx.replica.capture(&capture, b, Minor::new(60)).unwrap();
+    fx.synced();
+    let c = fx.ctx(p);
+    fx.replica.reserve(&c, a, usd(), Minor::new(30)).unwrap();
+    fx.synced();
+    let release = ledger_core::ledger::Ctx { now: fx.now, ..c };
+    fx.replica.release(&release).unwrap();
+    fx.synced();
+    // A checkpoint, anchored: the book's settlement configuration and the operator's grant to
+    // anchor, once per book.
+    if g == 0 {
+        anchoring(&mut fx);
+    }
+    let c = fx.ctx(fx.operator());
+    fx.replica
+        .anchor_checkpoint(&c, b"code-history: a checkpoint")
+        .unwrap();
+    fx.synced();
 
     // An upgrade to the next generation, from n.
     let h = source.version(g + 1);

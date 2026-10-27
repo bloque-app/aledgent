@@ -105,5 +105,9 @@ required-features = ["ingress"]
 name = "chainspec"
 required-features = ["ingress"]
 
+[[test]]
+name = "code_history"
+required-features = ["ingress"]
+
 [lints]
 workspace = true

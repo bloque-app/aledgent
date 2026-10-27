@@ -514,3 +514,96 @@ async fn req_rc_6_a_segment_recovers_from_an_invocation_the_agent_did_not_commit
         "the segment ends at the single run's state"
     );
 }
+
+/// `T-037-09`: a book whose chainspec names its genesis code *H₀*, as test's and prod's do, restores
+/// under its code map: the map the entries claim starts at *H₀*, generation 0, and the roll
+/// forward, which holds every entry to the map it derives from the founding's code, reaches the
+/// same map and the archive's end.
+#[test]
+fn t037_09_a_book_on_a_named_genesis_code_restores_under_its_code_map() {
+    use core_binding::code_map::{CodeMap, CodeRange};
+    use core_binding::core::claimed_code_map;
+    use ledger_core::chainspec::GenesisCode;
+    use ledger_core::code::{
+        Artefact, BuildProfile, CodeManifest, KernelIdentity, Platform, Role, WriterKind,
+    };
+    let manifest = CodeManifest {
+        writer: WriterKind::Core,
+        platform: Platform {
+            name: "vos-saga".into(),
+            revision: "bd8d1bb7".into(),
+            identities: Vec::new(),
+        },
+        generation: 0,
+        artefacts: vec![Artefact {
+            role: Role::Package,
+            digest: [0x11; 32],
+            len: 1,
+            identities: Vec::new(),
+            profile: BuildProfile {
+                target: "riscv64em-vos".into(),
+                toolchain: "nightly".into(),
+                opt_level: "s".into(),
+                features: Vec::new(),
+                source_revision: "0123abcd".into(),
+                cargo_lock: [0; 32],
+            },
+        }],
+        kernel: KernelIdentity {
+            revision: "e9a7b08".into(),
+            checksum: None,
+        },
+        constructions: vec![ledger_core::anchor::construction()],
+        messages: Vec::new(),
+    };
+    let h0 = manifest.version();
+    assert_ne!(h0, [0; 32]);
+    let spec = common::spec_of(
+        common::op(0),
+        1,
+        common::genesis().assets,
+        4,
+        ChunkLimits::DEFAULT,
+    )
+    .with_code(GenesisCode {
+        manifest,
+        construction: ledger_core::anchor::construction(),
+    })
+    .unwrap();
+    let mut g = common::genesis();
+    g.chainspec = Some(spec.commitment());
+    g.spec = Some(std::sync::Arc::new(spec));
+    let limits = Limits {
+        budget: MAX_BUDGET,
+        ..Limits::DEFAULT
+    };
+    let mut fx = common::Fx::with_genesis(NativePort::new(), limits, g.clone());
+    let (p, _) = fx.funded(1_000);
+    let _ = fx.account(&p);
+    let last = fx.archive.last().unwrap().clone();
+    let founding = Founding {
+        genesis: g,
+        op: common::op(0),
+        at: 1,
+        keys: common::keys(),
+        limits,
+        genesis_roots: None,
+    };
+    let mut port = NativePort::new();
+    let claimed = claimed_code_map(&mut port, &founding, &fx.archive).unwrap();
+    let want = CodeMap {
+        ranges: vec![CodeRange {
+            from: 1,
+            to: last.seq,
+            code: h0,
+            generation: 0,
+        }],
+    };
+    assert_eq!(claimed, want);
+    let (_, rolled) =
+        roll_forward_agent(port, &founding, &fx.archive, &ReplicaStores::Memory).unwrap();
+    assert_eq!(
+        (rolled.to, rolled.log_head, rolled.code_map),
+        (last.seq, last.log_hash(), want)
+    );
+}
