@@ -4,14 +4,18 @@
 //! `NFR-4`, `NFR-10`): a real deployment (ingress, the Agent core, its log) streaming to a
 //! directory sink; the archive read back, checked, laid out on a fresh node and rolled forward.
 
+mod common;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
+use core_archive::age::Identity;
 use core_archive::archive::{Archive, ArchiveSource};
 use core_archive::native::{STATE_FILE, SavingPort, decode_rows};
 use core_archive::record::decode_segment;
+use core_archive::seal::{Keys, MAGIC_LINE, Sealed, Unsealed};
 use core_archive::store::{FsStore, ObjectStore, Put, StoreError};
 use core_archive::{
     ArchiveStatus, Archiver, ArchiverConfig, ArchivingLog, Fetched, STATUS_FILE, book_of, fetch,
@@ -292,6 +296,99 @@ async fn t_005_15_outages_restarts_and_backlogs_keep_one_chain() {
     )
     .unwrap();
     assert_eq!(hex::encode(rolled.roots.kernel), f.point.kernel_root);
+    drop(d);
+}
+
+/// `F-044`: the core host archives to a sealed store and holds no key that opens it. Restarted on
+/// its disk with a new writer (another file key, nothing remembered), it resumes from what the seal
+/// keeps in clear, one chain. The archive restores with the offline recovery key alone, and with
+/// Transit alone; with neither, nothing of it is read.
+#[tokio::test(flavor = "multi_thread")]
+async fn f_044_a_sealed_archive_resumes_after_a_restart_and_restores_with_either_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (dir, sink) = (tmp.path().join("node"), tmp.path().join("sink"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let recovery = Identity::generate();
+    let writer = || -> Box<dyn ObjectStore> {
+        Box::new(Sealed::new(
+            Box::new(FsStore::open(&sink).unwrap()),
+            Some(common::recipients(1, &recovery)),
+            Keys::none(),
+            Unsealed::Refuse,
+        ))
+    };
+    let reader = |keys: Keys| {
+        Archive::new(Box::new(Sealed::new(
+            Box::new(FsStore::open(&sink).unwrap()),
+            None,
+            keys,
+            Unsealed::Refuse,
+        )))
+    };
+    let small = ArchiverConfig {
+        max_segment_bytes: 700,
+        ..config()
+    };
+    let (mut d, core, archiver) = node(&dir, writer(), small).await;
+    workload(&d, "a", 4).await;
+    assert!(d.quiesce(Duration::from_secs(60)).await);
+    d.replica.kill();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    archiver.stop();
+    drop(d);
+    drop(core);
+    let before = reader(Keys::none()).segments().unwrap().len() as u64;
+    assert!(before > 0);
+    let (d, _core, archiver) = node(&dir, writer(), small).await;
+    workload(&d, "b", 4).await;
+    let answered = lines(&dir.join("replies.jsonl"));
+    archiver.stop();
+    let status = ArchiveStatus::read(&dir.join(STATUS_FILE)).unwrap();
+    assert_eq!(
+        (status.conflict, status.failures),
+        (None, 0),
+        "the restarted writer resumed with no key"
+    );
+    let plain = FsStore::open(&sink).unwrap();
+    for prefix in ["segments/", "checkpoints/"] {
+        for name in plain.list(prefix).unwrap() {
+            assert!(
+                std::fs::read(sink.join(&name))
+                    .unwrap()
+                    .starts_with(MAGIC_LINE),
+                "{name} is sealed"
+            );
+        }
+    }
+
+    let by_recovery = reader(Keys {
+        transit: None,
+        recovery: vec![Identity::parse(&recovery.to_bech32()).unwrap()],
+    });
+    let f = fetch(&by_recovery, Some(&book_of(&founding().op))).unwrap();
+    assert!(!f.damaged, "{:?}", f.notes);
+    assert!(f.segments > before && f.point.inputs >= answered);
+    assert!(f.checkpoint.is_some());
+    let (_, rolled) = roll_forward_agent(
+        NativePort::new(),
+        &founding(),
+        &f.entries,
+        &ReplicaStores::Memory,
+    )
+    .unwrap();
+    assert_eq!(hex::encode(rolled.roots.kernel), f.point.kernel_root);
+
+    let by_transit = reader(Keys {
+        transit: Some(Box::new(common::LocalTransit::default())),
+        recovery: Vec::new(),
+    });
+    let g = fetch(&by_transit, None).unwrap();
+    assert_eq!((g.point, g.segments), (f.point.clone(), f.segments));
+
+    match fetch(&reader(Keys::none()), None) {
+        Err(e) => assert!(e.contains("sealed"), "{e}"),
+        Ok(f) => assert!(f.damaged && f.segments == 0, "nothing read with no key"),
+    }
     drop(d);
 }
 
