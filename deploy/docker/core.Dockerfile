@@ -244,9 +244,10 @@ CMD ["serve", "--config", "/etc/aledgent/ingress.json", \
 #
 # What differs from step 5 of `build`: the package claims the state of the previous package's program
 # (`package --previous`, T-037-19), without which the runtime refuses to switch a stateful actor's
-# program in place; and the guest is built with `--locked`, so the dependencies it resolves are the
-# committed `agents/core/Cargo.lock`'s and a later build of the same commit cannot change the state
-# layout the claim vouches for. The runtime is not built here: an upgrade keeps the runtime the book
+# program in place; and the `Cargo.lock` the build resolved is kept beside the package
+# (`core.Cargo.lock`), because the guest cannot be built with `--locked` (the `--config` patch of VOS
+# makes cargo rewrite the committed lock, as in step 5), so the dependencies a build resolves are known
+# only by that file. The runtime is not built here: an upgrade keeps the runtime the book
 # was founded on, byte for byte (a new runtime is the continuation, T-037-17); the workflow copies it
 # from the code in force. `GENERATION` is the source's (`agents/core/src/lib.rs`): bumping it is a
 # change to the source, reviewed with the change that needs the upgrade, and the workflow refuses
@@ -264,14 +265,15 @@ RUN --mount=type=bind,from=previous-code,target=/previous \
       exit 1; \
     fi \
  && cd /w/aledgent/agents/core \
- && CARGO_TARGET_DIR=/w/target/core cargo actor --locked --config /w/vos-patch.toml $(cat /w/roots-features) \
+ && CARGO_TARGET_DIR=/w/target/core cargo actor --config /w/vos-patch.toml $(cat /w/roots-features) \
  && elf=$(find /w/target/core/riscv64em-vos/release -maxdepth 1 -name 'aledgent_core*.elf' | head -n 1) \
  && if [ -z "$elf" ]; then elf=/w/target/core/riscv64em-vos/release/aledgent_core; fi \
  && /out/bin/aledgent-core-host package "$elf" /out/share/core.vos --previous /previous/core.vos \
- && ls -l /out/share/core.vos
+ && cp /w/aledgent/agents/core/Cargo.lock /out/share/core.Cargo.lock \
+ && ls -l /out/share/core.vos /out/share/core.Cargo.lock
 
 FROM scratch AS core-upgrade
-COPY --from=upgrade /out/share/core.vos /core.vos
+COPY --from=upgrade /out/share/core.vos /out/share/core.Cargo.lock /
 
 # The default target: the core built from source.
 FROM ${RUNTIME_IMAGE} AS core

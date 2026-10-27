@@ -95,20 +95,21 @@ jq -n '{manifest: {artefacts: [
   {role: "package", profile: {target: "riscv64em-vos", toolchain: "t", opt_level: "s", features: [], source_revision: "x", cargo_lock: "0"}},
   {role: "runtime", profile: {target: "riscv64em-vos", toolchain: "nightly-2026-03-20", opt_level: "3", features: [], source_revision: "r", cargo_lock: "0"}},
   {role: "native-decide", profile: {target: "x86_64-unknown-linux-gnu", toolchain: "1.98.0", opt_level: "3", features: ["a"], source_revision: "h", cargo_lock: "0"}}]}}' >"$work/pred.json"
-"$here/core-profile.sh" "$work/pred.json" "$head_rev" "$head_rev" v2 "$work/profile" >/dev/null
+"$here/core-profile.sh" "$work/pred.json" "$head_rev" "$head_rev" v2 agents/core/Cargo.lock "$work/profile" >/dev/null
 jq -e --arg rev "$head_rev" '
   .package.source_revision == $rev and .package.target == "riscv64em-vos" and .package.features == []
   and .package.cargo_lock == "core.Cargo.lock" and .runtime.opt_level == "3"
   and .runtime.cargo_lock == "predecessor.Cargo.lock" and .native_decide.features == ["a"]
   and (.kernel.revision | test("^[0-9a-f]{7}$")) and (.package.toolchain | test("^nightly-"))' "$work/profile/profile.json" >/dev/null || fail "the profile"
 cmp "$work/profile/core.Cargo.lock" agents/core/Cargo.lock || fail "the package's lock"
-"$here/core-profile.sh" "$work/pred.json" "$head_rev" "$head_rev" v1 "$work/profile1" >/dev/null
+"$here/core-profile.sh" "$work/pred.json" "$head_rev" "$head_rev" v1 agents/core/Cargo.lock "$work/profile1" >/dev/null
 jq -e '.package.features == ["smt-v1"]' "$work/profile1/profile.json" >/dev/null || fail "v1 roots"
-refuses "roots must be" "$here/core-profile.sh" "$work/pred.json" "$head_rev" "$head_rev" v3 "$work/p3"
-refuses "not a full commit" "$here/core-profile.sh" "$work/pred.json" abc "$head_rev" v2 "$work/p4"
-refuses "no agents/Cargo.lock at" "$here/core-profile.sh" "$work/pred.json" 0000000000000000000000000000000000000000 "$head_rev" v2 "$work/p5"
+refuses "is empty or missing" "$here/core-profile.sh" "$work/pred.json" "$head_rev" "$head_rev" v2 "$work/none.lock" "$work/p7"
+refuses "roots must be" "$here/core-profile.sh" "$work/pred.json" "$head_rev" "$head_rev" v3 agents/core/Cargo.lock "$work/p3"
+refuses "not a full commit" "$here/core-profile.sh" "$work/pred.json" abc "$head_rev" v2 agents/core/Cargo.lock "$work/p4"
+refuses "no agents/Cargo.lock at" "$here/core-profile.sh" "$work/pred.json" 0000000000000000000000000000000000000000 "$head_rev" v2 agents/core/Cargo.lock "$work/p5"
 jq 'del(.manifest.artefacts[] | select(.role == "runtime"))' "$work/pred.json" >"$work/pred-no-rt.json"
-refuses "no runtime" "$here/core-profile.sh" "$work/pred-no-rt.json" "$head_rev" "$head_rev" v2 "$work/p6"
+refuses "no runtime" "$here/core-profile.sh" "$work/pred-no-rt.json" "$head_rev" "$head_rev" v2 agents/core/Cargo.lock "$work/p6"
 
 # --- the workflow's promises ----------------------------------------------------------------------
 wf="$repo/.github/workflows/core-release.yml"

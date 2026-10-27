@@ -8,17 +8,19 @@
 # place, from facts, and never typed in.
 #
 #   tools/release/core-profile.sh <predecessor-report.json> <predecessor-revision> <source-revision> \
-#                                 <roots> <out-dir>
+#                                 <roots> <package-lock> <out-dir>
 #
 #   predecessor-report.json  `check-code --out` for the code in force (its manifest as JSON)
 #   predecessor-revision     the commit of the image whose host the node runs (its revision label)
 #   source-revision          the commit this upgrade's package is built from
 #   roots                    v1 or v2: the book's roots (smt-v1 is the package's one feature)
+#   package-lock             the Cargo.lock the package's build resolved (the Dockerfile's core.Cargo.lock)
 #   out-dir                  receives profile.json and the lock files it names
 #
 # - package: this build. Target and toolchain are the guest's (agents/core), the opt-level is the one
-#   in agents/core/Cargo.toml, the lock is the committed agents/core/Cargo.lock that `--locked` builds
-#   from, the revision is the commit.
+#   in agents/core/Cargo.toml, the lock is the one the build resolved (the committed
+#   agents/core/Cargo.lock, rewritten as VOS's patch needs; a build cannot use `--locked`), the revision
+#   is the commit.
 # - runtime and native-decide: the code in force's. They are the predecessor's bytes (the runtime is
 #   copied, the host is the one the node runs), so their profiles are the predecessor's, with the
 #   lock file the host's workspace had at the image's revision (agents/Cargo.lock there; the runtime
@@ -29,11 +31,11 @@
 # Run from the repository root, at <source-revision>.
 set -euo pipefail
 
-if [ "$#" -ne 5 ]; then
+if [ "$#" -ne 6 ]; then
   sed -n '/^#   tools/,/^#   out-dir/p' "$0" | sed 's/^# \{0,3\}//' >&2
   exit 2
 fi
-pred=$1 pred_rev=$2 src_rev=$3 roots=$4 out=$5
+pred=$1 pred_rev=$2 src_rev=$3 roots=$4 lock=$5 out=$6
 hex40='^[0-9a-f]{40}$'
 [[ $pred_rev =~ $hex40 ]] || { echo "core-profile: the predecessor's revision is not a full commit: '$pred_rev'" >&2; exit 1; }
 [[ $src_rev =~ $hex40 ]] || { echo "core-profile: the source revision is not a full commit: '$src_rev'" >&2; exit 1; }
@@ -47,7 +49,8 @@ for v in "$toolchain" "$opt" "$kernel"; do
 done
 
 mkdir -p "$out"
-cp agents/core/Cargo.lock "$out/core.Cargo.lock"
+[ -s "$lock" ] || { echo "core-profile: $lock is empty or missing" >&2; exit 1; }
+cp "$lock" "$out/core.Cargo.lock"
 # The host's workspace at the image's revision. A revision that is not in this clone is an error, not
 # a reason to write something else.
 git show "$pred_rev:agents/Cargo.lock" >"$out/predecessor.Cargo.lock" \

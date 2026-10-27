@@ -11,8 +11,8 @@ name: Core release
 # takes in place with `Upgrade { code, from }` and no restart. It
 #
 #   1. builds core.vos from this commit as the generation after the code in force (the target
-#      `core-upgrade` of deploy/docker/core.Dockerfile: `--locked`, claiming the state of the package in
-#      force), keeps the runtime of the code in force byte for byte, and has the host the node runs
+#      `core-upgrade` of deploy/docker/core.Dockerfile: claiming the state of the package in force, and
+#      keeping the Cargo.lock the build resolved), keeps the runtime of the code in force byte for byte, and has the host the node runs
 #      write the code manifest (digests, lengths, build profiles; amendment 0033);
 #   2. refuses unless the result is what an in-place upgrade can take: generation + 1, the same
 #      runtime, the platform the host drives, a manifest the host's own restart check accepts;
@@ -366,7 +366,8 @@ jobs:
           # The runtime of the code in force, byte for byte: a new runtime cannot go in place (#288).
           cp "$W/pred/agent_runtime.pvm" "$W/new/agent_runtime.pvm"
           cmp -s "$W/new/core.vos" "$W/pred/core.vos" && { echo "::error::the new package is the code in force's own: this tree changed nothing the core runs"; exit 1; }
-          tools/release/core-profile.sh "$W/pred-report.json" "$REV" "$(git rev-parse HEAD)" "$ROOTS" "$W/new/profile"
+          test -s "$W/upgrade/core.Cargo.lock"
+          tools/release/core-profile.sh "$W/pred-report.json" "$REV" "$(git rev-parse HEAD)" "$ROOTS" "$W/upgrade/core.Cargo.lock" "$W/new/profile"
           chmod -R a+rX "$W/new"
           docker run --rm --platform linux/amd64 -v "$W/new:/new:ro" -v "$W/io:/io" "$HOST" code-manifest \
             --actor /new/core.vos --runtime /new/agent_runtime.pvm --profile /new/profile/profile.json --out /io/manifest.bin \
