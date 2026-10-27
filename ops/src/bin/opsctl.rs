@@ -24,7 +24,7 @@
 //!                     (--anchors-rpc <node URL> | --no-anchors) [--from-genesis] [--report <dir>]
 //!                     [--accept-damaged-archive] [--fetch-concurrency <n>]
 //!                     [--chainspec <file>] [--genesis-manifest <file>] [--unnamed-code]
-//!                     [--core-host <aledgent-core-host> --runtime <pvm> --actor <vos> [--budget <bytes>]]
+//!                     [--core-host <aledgent-core-host> --runtime <pvm> --actor <vos> [--budget <bytes>] [--code-config <file>]]
 //!                                                 restore the Agent core from its off-node archive
 //!                                                 (T-005-16): check it, re-derive the book and run
 //!                                                 the drill's checks, lay it out on the fresh node,
@@ -629,6 +629,11 @@ fn restore_core_from(args: &[String]) -> Result<(), Error> {
         ];
         if let Some(b) = opt(args, "--budget") {
             v.extend(["--budget".into(), b]);
+        }
+        // T-037-09: a book that has upgraded is re-sent range by range, each range under its own
+        // code version, which the core host fetches through the code sources it is given.
+        if let Some(c) = opt(args, "--code-config") {
+            v.extend(["--code-config".into(), c]);
         }
         // F-036: a chainspec book's core host needs its chainspec too, and the verify-genesis
         // report kept beside it, or the restored book takes no command. It reads both from the
