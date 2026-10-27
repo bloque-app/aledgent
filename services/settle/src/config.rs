@@ -1,7 +1,14 @@
 // Copyright (c) 2026 Pagos Cube LLC
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 //! The adapter's configuration. It names keys by where they are, never by their value (`NFR-8`,
-//! `REQ-AU-8`): a key file, an environment variable's name, a key of the signer service.
+//! `REQ-AU-8`): a key file, an environment variable's name, a key of the signer service, a key entry
+//! on a signature engine (`F-042`).
+//!
+//! **Two forms of lane** (`F-044`), one per file: `keys` and `anchor_key`, the device keys of
+//! community PASS accounts (`F-027`, secp256k1); or `accounts` and `anchor_account`, **native
+//! accounts**: each lane, and the anchor key, is an Ed25519 key's own account, which the contract
+//! lists, and which signs standard transactions. A native account's key may be on the sidecar or on
+//! Vault Transit, where it is made and never leaves; a file only in development.
 
 use std::path::PathBuf;
 
@@ -52,7 +59,8 @@ pub enum KeySource {
         key: String,
     },
     /// A key entry of the file's `keys` (`F-042`): `{ "engine": "<name>", "key": { … } }`, on an engine
-    /// declared in `engines`. It may use the sidecar only, as the signer's keys do.
+    /// declared in `engines`. A PASS device key may use the sidecar only; a native account's key the
+    /// sidecar or Vault Transit (`F-044`, [`engine_key_need`]).
     Engine(String),
 }
 
@@ -83,8 +91,15 @@ pub struct AdapterConfig {
     /// The assets it supports.
     pub assets: Vec<AssetBinding>,
     /// The lanes' keys, one per lane: each a device key of one of the deployment's community PASS
-    /// accounts, which the contract lists as keys (`F-027` T-027-03).
+    /// accounts, which the contract lists as keys (`F-027` T-027-03). Exactly one of this and
+    /// [`AdapterConfig::accounts`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keys: Vec<PassKey>,
+    /// The lanes' keys as **native accounts** (`F-044`), one per lane: each an Ed25519 key whose own
+    /// account the contract lists as a key, and which signs standard transactions. Exactly one of
+    /// this and [`AdapterConfig::keys`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accounts: Vec<KeySource>,
     /// The native balance below which a lane does not sign (`REQ-SN-2`).
     pub fee_floor: u128,
     /// How long the store lease lasts unless renewed, in milliseconds.
@@ -113,6 +128,10 @@ pub struct AdapterConfig {
     /// comparison.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor_key: Option<PassKey>,
+    /// The anchor key as a native account (`F-044`): with [`AdapterConfig::accounts`], in place of
+    /// [`AdapterConfig::anchor_key`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_account: Option<KeySource>,
     /// A lower cap on the gas any batch is given, if set; by default none. What always caps a
     /// batch is the runtime's own normal-extrinsic maximum, read at the block the batch is sized
     /// against (`F-027` NOTES, decision 41): Kreivo `0.17.0`'s moves with its cores. A batch holds
@@ -174,6 +193,44 @@ impl AdapterConfig {
             .values()
             .filter(|name| crate::chain::kreivo::TxFormat::named(name).is_none())
             .cloned()
+            .collect()
+    }
+
+    /// Whether the lanes are native accounts (`F-044`), after checking that the file gives one form
+    /// ([`AdapterConfig::keys`] and [`AdapterConfig::anchor_key`], or [`AdapterConfig::accounts`] and
+    /// [`AdapterConfig::anchor_account`]) and at least one lane. Mixing the two is refused: a
+    /// transaction format is confirmed on the layer for one form at a time.
+    pub fn native(&self) -> Result<bool, String> {
+        let pass = !self.keys.is_empty() || self.anchor_key.is_some();
+        let native = !self.accounts.is_empty() || self.anchor_account.is_some();
+        match (pass, native) {
+            (true, true) => Err(
+                "PASS keys (\"keys\", \"anchor_key\") and native accounts (\"accounts\",                  \"anchor_account\"): one form, not both"
+                    .into(),
+            ),
+            (_, true) if self.accounts.is_empty() => {
+                Err("no lane: \"anchor_account\" needs \"accounts\"".into())
+            }
+            (true, _) if self.keys.is_empty() => {
+                Err("no lane: \"anchor_key\" needs \"keys\"".into())
+            }
+            (false, false) => Err("no lane: configure \"accounts\" (or \"keys\")".into()),
+            (_, native) => Ok(native),
+        }
+    }
+
+    /// Where every lane's key is, then the anchor key's, whatever the form: `(source, native)`.
+    pub fn key_sources(&self) -> Vec<(&KeySource, bool)> {
+        self.keys
+            .iter()
+            .chain(self.anchor_key.as_ref())
+            .map(|k| (&k.device, false))
+            .chain(
+                self.accounts
+                    .iter()
+                    .chain(self.anchor_account.as_ref())
+                    .map(|k| (k, true)),
+            )
             .collect()
     }
 
@@ -412,15 +469,29 @@ pub fn default_contracts_pallet() -> String {
     "Contracts".into()
 }
 
-/// What the adapter needs of each key on an engine (`F-042`): a secp256k1 key, on the signer service.
-/// `NFR-8` says settlement-layer key material is held in a boundary that is separate from the book and
-/// can be audited separately, which only the sidecar is today (an in-process key in the adapter has no
-/// audit apart from the adapter's, and nothing else offers the scheme yet).
-pub fn engine_key_need(name: &str) -> signer::engine::config::KeyNeed<'_> {
-    signer::engine::config::KeyNeed {
-        name,
-        scheme: signer::proto::Scheme::Secp256k1,
-        kinds: &[signer::engine::EngineKind::Sidecar],
+/// What the adapter needs of each key on an engine (`F-042`, `F-044`). `NFR-8` says settlement-layer key
+/// material is held in a boundary that is separate from the book and can be audited separately: the
+/// sidecar, or Vault Transit (whose audit log is Vault's), and never in the adapter's own process (an
+/// in-process key has no audit apart from the adapter's).
+///
+/// - A PASS device key (`native` false): `secp256k1`, on the sidecar only (S1 of `F-042`, ruled), since
+///   nothing else offers the scheme.
+/// - A native account's key (`native` true): `ed25519`, on the sidecar or Vault Transit (S1: Transit
+///   opens for the adapter's keys with native accounts).
+pub fn engine_key_need(name: &str, native: bool) -> signer::engine::config::KeyNeed<'_> {
+    use signer::engine::EngineKind;
+    if native {
+        signer::engine::config::KeyNeed {
+            name,
+            scheme: signer::proto::Scheme::Ed25519,
+            kinds: &[EngineKind::Sidecar, EngineKind::ApiProvider],
+        }
+    } else {
+        signer::engine::config::KeyNeed {
+            name,
+            scheme: signer::proto::Scheme::Secp256k1,
+            kinds: &[EngineKind::Sidecar],
+        }
     }
 }
 
@@ -429,17 +500,21 @@ impl ProcessConfig {
     /// with [`ProcessConfig::development_keys`], a signer key only with [`ProcessConfig::signer`].
     /// `Ok(true)` when a key is the signer service's.
     pub fn check_key_sources(&self) -> Result<bool, String> {
+        let native = self.adapter.native()?;
         let mut wants_signer = false;
-        let sources = self
-            .adapter
-            .keys
-            .iter()
-            .chain(self.adapter.anchor_key.as_ref())
-            .map(|k| &k.device);
-        for s in sources {
+        for (s, _) in self.adapter.key_sources() {
             match s {
                 KeySource::Signer { .. } => wants_signer = true,
                 KeySource::Engine(_) => {}
+                // NFR-8, T-042-09: a native account's key is never read from the environment.
+                KeySource::Env(_) if native => {
+                    return Err(
+                        "a native account's key is never read from the environment (NFR-8): \
+                         name a key entry (\"engine\"), the signer service, or, in development, \
+                         a file"
+                            .into(),
+                    );
+                }
                 KeySource::File(_) | KeySource::Env(_) if !self.development_keys => {
                     return Err(
                         "a key from a file or the environment is for development only (NFR-8): \
@@ -464,7 +539,7 @@ impl ProcessConfig {
             }
             let needs = engine_keys
                 .iter()
-                .map(|name| engine_key_need(name))
+                .map(|name| engine_key_need(name, native))
                 .collect::<Vec<_>>();
             signer::engine::config::check(
                 &signer::engine::config::Registry::builtin(),
@@ -479,10 +554,9 @@ impl ProcessConfig {
     /// The key entries the lanes and the anchor name ([`KeySource::Engine`]).
     pub fn engine_key_names(&self) -> Vec<String> {
         self.adapter
-            .keys
-            .iter()
-            .chain(self.adapter.anchor_key.as_ref())
-            .filter_map(|k| match &k.device {
+            .key_sources()
+            .into_iter()
+            .filter_map(|(k, _)| match k {
                 KeySource::Engine(name) => Some(name.clone()),
                 _ => None,
             })
@@ -773,8 +847,8 @@ mod tests {
                 && e.contains("may use: sidecar"),
             "{e}"
         );
-        // Transit: the adapter's own build has none (it holds no Vault credential), and in a build
-        // that does (the workspace's, where features unify) Transit does not offer the scheme.
+        // Transit, for a PASS device key: Transit does not offer secp256k1 (F-044 opens Transit for
+        // native accounts' Ed25519 keys only).
         c.engines = engines(serde_json::json!({ "vault_transit": {} }));
         let e = c.check_key_sources().unwrap_err();
         assert!(
@@ -801,6 +875,140 @@ mod tests {
         };
         c.adapter.keys.push(other);
         assert!(c.check_key_sources().unwrap_err().contains("one form"));
+    }
+
+    /// A file whose lanes are native accounts (`F-044`) on Vault Transit, as the deployments' are.
+    fn native_on_transit() -> ProcessConfig {
+        let mut c: ProcessConfig =
+            serde_json::from_str(include_str!("../../../deploy/templates/settle.json")).unwrap();
+        c.development_keys = false;
+        c.profile = ingress::config::Profile::Production;
+        c.adapter.keys.clear();
+        c.adapter.anchor_key = None;
+        c.adapter.accounts = vec![KeySource::Engine("lane-1".into())];
+        c.adapter.anchor_account = Some(KeySource::Engine("anchor".into()));
+        c.engines = [(
+            "vault".to_owned(),
+            serde_json::json!({ "vault_transit": {
+                "vault": { "address": "https://vault.example",
+                           "auth": { "aws_iam": { "mount": "aledgent-signer", "role": "aledgent-signer-settle-iam",
+                                                  "region": "us-east-2", "server_id": "vault.example" } } },
+                "mount": "transit-aledgent-signer" } }),
+        )]
+        .into_iter()
+        .collect();
+        c.keys = [
+            (
+                "lane-1".to_owned(),
+                serde_json::json!({ "engine": "vault", "key": { "name": "lane-1", "version": 1 } }),
+            ),
+            (
+                "anchor".to_owned(),
+                serde_json::json!({ "engine": "vault", "key": { "name": "anchor", "version": 1 } }),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        c
+    }
+
+    /// `F-044`: native accounts' keys are Ed25519, on Vault Transit or the sidecar; never in process,
+    /// never from the environment; a file in development only. One form per file.
+    #[test]
+    fn f_044_native_accounts_keys_may_use_transit_or_the_sidecar() {
+        let c = native_on_transit();
+        assert_eq!(c.adapter.native(), Ok(true));
+        assert_eq!(c.check_key_sources(), Ok(false));
+        assert_eq!(c.engine_key_names(), ["lane-1", "anchor"]);
+        // A version is required: a new version is a new account.
+        let mut v = c.clone();
+        v.keys.insert(
+            "anchor".into(),
+            serde_json::json!({ "engine": "vault", "key": { "name": "anchor" } }),
+        );
+        assert!(
+            v.check_key_sources()
+                .unwrap_err()
+                .contains("pin the key version")
+        );
+        // The sidecar, Ed25519.
+        let mut sc = c.clone();
+        sc.engines.insert(
+            "vault".into(),
+            serde_json::json!({ "sidecar": { "socket": "/s", "client": "settle", "token_file": "/t" } }),
+        );
+        sc.keys.insert(
+            "lane-1".into(),
+            serde_json::json!({ "engine": "vault", "key": { "id": "lane-1" } }),
+        );
+        sc.keys.insert(
+            "anchor".into(),
+            serde_json::json!({ "engine": "vault", "key": { "id": "anchor" } }),
+        );
+        assert_eq!(sc.check_key_sources(), Ok(false));
+        // In process: refused for its kind, in production as in development.
+        let mut ip = c.clone();
+        ip.engines
+            .insert("vault".into(), serde_json::json!({ "in_process": {} }));
+        for k in ["lane-1", "anchor"] {
+            ip.keys.insert(
+                k.into(),
+                serde_json::json!({ "engine": "vault", "key": { "file": "/k" } }),
+            );
+        }
+        let e = ip.check_key_sources().unwrap_err();
+        assert!(
+            e.contains("kind in_process") && e.contains("may use: sidecar, api_provider"),
+            "{e}"
+        );
+        // The environment: never, even in development.
+        let mut env = c.clone();
+        env.development_keys = true;
+        env.adapter.accounts = vec![KeySource::Env("LANE".into())];
+        assert!(
+            env.check_key_sources()
+                .unwrap_err()
+                .contains("never read from the environment")
+        );
+        // A file: development only.
+        let mut file = c.clone();
+        file.adapter.accounts = vec![KeySource::File("/k".into())];
+        assert!(
+            file.check_key_sources()
+                .unwrap_err()
+                .contains("development only")
+        );
+        file.development_keys = true;
+        assert_eq!(file.check_key_sources(), Ok(false));
+        // One form: PASS keys beside native accounts are refused, and so is an anchor without lanes.
+        let mut mixed = c.clone();
+        mixed.adapter.anchor_key = Some(PassKey {
+            user: "00".repeat(32),
+            device: KeySource::Engine("anchor".into()),
+        });
+        assert!(mixed.check_key_sources().unwrap_err().contains("one form"));
+        let mut alone = c.clone();
+        alone.adapter.accounts.clear();
+        assert!(
+            alone
+                .check_key_sources()
+                .unwrap_err()
+                .contains("needs \"accounts\"")
+        );
+        // The JSON form: `accounts` and `anchor_account` hold key sources, and a file without
+        // `keys` parses.
+        let text = serde_json::to_value(&c).unwrap();
+        assert!(text["adapter"].get("keys").is_none());
+        assert_eq!(
+            text["adapter"]["accounts"],
+            serde_json::json!([{ "engine": "lane-1" }])
+        );
+        assert_eq!(
+            text["adapter"]["anchor_account"],
+            serde_json::json!({ "engine": "anchor" })
+        );
+        let back: ProcessConfig = serde_json::from_value(text).unwrap();
+        assert_eq!(back, c);
     }
 
     /// The canary's template (`deploy/templates/settle.json`), its `<FILL …>` strings left as they

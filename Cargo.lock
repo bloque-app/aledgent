@@ -5885,6 +5885,7 @@ dependencies = [
  "axum",
  "blake2",
  "deadpool-postgres",
+ "ed25519-dalek",
  "ed25519-zebra",
  "hex",
  "ingress",

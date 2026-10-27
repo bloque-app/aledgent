@@ -372,8 +372,12 @@ struct Chosen {
     /// The runtime's surface.
     surface: kreivo::Surface,
     /// The runtime, as its confirmation is recorded: `spec_version`, the surface's fingerprint
-    /// and the format's name.
+    /// and [`Chosen::format_name`].
     key: String,
+    /// The format's name as the confirmation records it: the format's own for PASS transactions,
+    /// [`kreivo::TxFormat::native_name`] for a native account's (`F-044`), so that a runtime confirmed
+    /// for one form is not taken as confirmed for the other.
+    format_name: String,
     /// The block the runtime was read at ([`RuntimeInfo::at`]): what is signed for it is
     /// validated there (`F-027` NOTES, decision 51).
     at: BlockRef,
@@ -705,11 +709,16 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                 types: runtime.surface.types.map(hex::encode).unwrap_or_default(),
             });
         };
+        let format_name = if self.native() {
+            format.native_name()
+        } else {
+            format.name.to_owned()
+        };
         let key = format!(
             "{}:{}:{}",
             runtime.spec_version,
             hex::encode(runtime.surface.fingerprint()),
-            format.name
+            format_name
         );
         if let Some(r) = self.refused.get(&key) {
             return Err(r.clone());
@@ -722,8 +731,20 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             },
             surface: runtime.surface.clone(),
             key,
+            format_name,
             at: runtime.at,
         })
+    }
+
+    /// Whether the adapter signs as native accounts (`F-044`): its keys are no PASS account's
+    /// devices. The configuration gives every lane and the anchor key one form, so the first lane
+    /// says it for all.
+    fn native(&self) -> bool {
+        self.lanes
+            .iter()
+            .chain(self.anchor_signer.iter())
+            .next()
+            .is_some_and(|l| l.pass_user().is_none())
     }
 
     /// Whether `ext`, just signed for `chosen`, may be broadcast (`T-027-12`, `REQ-SA-9`): **the
@@ -783,7 +804,7 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
         }
         let now = self.now();
         let spec_version = chosen.signing.spec_version;
-        let format = chosen.signing.format.name;
+        let format = chosen.format_name.as_str();
         let alert = format!("runtime:{spec_version}");
         match self.chain.validate(&chosen.at, ext).await? {
             Validity::Valid => {

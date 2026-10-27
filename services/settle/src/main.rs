@@ -9,6 +9,12 @@
 //! is news for it (`wake_poll`, `NFR-15`). Only one instance per
 //! set of keys acts at a time: the others wait for the lease.
 //!
+//! `aledgent-settle <config.json> keys` (`F-044`) opens the keys, prints each lane's and the anchor
+//! key's account and public key as JSON (public halves only), and exits: nothing is read from the
+//! settlement layer, the store or ingress. It is how an operator reads the accounts a contract's
+//! `set_keys` must list, and checks that the keys open (for a Vault Transit key, the AWS IAM login and
+//! the key's read) before the adapter is turned on.
+//!
 //! Two operator commands run once, holding the lease, and exit (amendment 0040, `T-043-04`):
 //!
 //! - `aledgent-settle <config.json> gap <from> <to>`: **the operator's gap** (ruling a40-q3). When
@@ -31,22 +37,35 @@ use settle::adapter::{Adapter, AdapterError};
 use settle::chain::rpc::{Names, RpcChain};
 use settle::config::{ChainSource, KeySource, PassKey, ProcessConfig};
 use settle::link::HttpTransport;
-use settle::signer::{DevSigner, PassAccount, ServiceSigner, Signer};
+use settle::signer::{DevEd25519, DevSigner, EngineEd25519, PassAccount, ServiceSigner, Signer};
 use settle::store::pg::PgStore;
 
 /// How long every step may find the settlement layer unreachable before the process ends, for its
 /// supervisor to start a new one.
 const BLIND_RESTART: Duration = Duration::from_secs(180);
 
+/// The lanes, in the file's form (`F-044`): native accounts, or PASS accounts.
 fn lanes(config: &ProcessConfig, keys: &Keys) -> Result<Vec<Arc<dyn Signer>>, String> {
     let mut out: Vec<Arc<dyn Signer>> = Vec::new();
     for k in &config.adapter.keys {
         out.push(pass(k, keys)?);
     }
+    for k in &config.adapter.accounts {
+        out.push(native(k, keys)?);
+    }
     if out.is_empty() {
         return Err("no lane: configure at least one key".into());
     }
     Ok(out)
+}
+
+/// The anchor key, if any, in the file's form.
+fn anchor(config: &ProcessConfig, keys: &Keys) -> Result<Option<Arc<dyn Signer>>, String> {
+    match (&config.adapter.anchor_key, &config.adapter.anchor_account) {
+        (Some(k), _) => pass(k, keys).map(Some),
+        (None, Some(k)) => native(k, keys).map(Some),
+        (None, None) => Ok(None),
+    }
 }
 
 /// Where the keys come from: the signer service, connected once, and whether development keys
@@ -59,6 +78,21 @@ struct Keys {
 }
 
 impl Keys {
+    /// Whether every engine in use can sign now, and why not (`F-042`'s `Engine::health`: no I/O).
+    fn ready(&self) -> (bool, String) {
+        let Some(open) = &self.engines else {
+            return (true, String::new());
+        };
+        let not: Vec<String> = open
+            .engines()
+            .iter()
+            .map(|e| e.health())
+            .filter(|h| !h.ready)
+            .map(|h| h.detail)
+            .collect();
+        (not.is_empty(), not.join("; "))
+    }
+
     fn of(config: &ProcessConfig) -> Result<Keys, String> {
         let wants_signer = config.check_key_sources()?;
         let signer = match (&config.signer, wants_signer) {
@@ -71,9 +105,10 @@ impl Keys {
         let engines = if names.is_empty() {
             None
         } else {
+            let native = config.adapter.native()?;
             let needs = names
                 .iter()
-                .map(|n| settle::config::engine_key_need(n))
+                .map(|n| settle::config::engine_key_need(n, native))
                 .collect::<Vec<_>>();
             Some(signer::engine::config::open(
                 &signer::engine::config::Registry::builtin(),
@@ -98,6 +133,43 @@ fn pass(k: &PassKey, keys: &Keys) -> Result<Arc<dyn Signer>, String> {
         .and_then(|v| v.try_into().ok())
         .ok_or("a PASS account's user id is 32 bytes of hex")?;
     Ok(Arc::new(PassAccount::new(signer(&k.device, keys)?, user)))
+}
+
+/// A native account (`F-044`): an Ed25519 key, acting as its own account. Its key is on an engine (the
+/// sidecar or Vault Transit), on the signer service, or, in development, in a file; never in the
+/// environment (the configuration's check refuses it first).
+fn native(k: &KeySource, keys: &Keys) -> Result<Arc<dyn Signer>, String> {
+    match k {
+        KeySource::Signer { key } => {
+            let client = keys
+                .signer
+                .as_ref()
+                .ok_or("a key of the signer service needs \"signer\"")?;
+            Ok(Arc::new(
+                EngineEd25519::from_service(Arc::clone(client), key).map_err(|e| e.to_string())?,
+            ))
+        }
+        KeySource::Engine(name) => {
+            let handle = keys
+                .engines
+                .as_ref()
+                .and_then(|e| e.handle(name))
+                .ok_or_else(|| format!("keys.{name}: not opened"))?;
+            Ok(Arc::new(
+                EngineEd25519::from_key(handle).map_err(|e| e.to_string())?,
+            ))
+        }
+        KeySource::File(path) if keys.development => {
+            tracing::warn!("a native account's key is read from a file: development only (NFR-8)");
+            Ok(Arc::new(
+                DevEd25519::from_file(path).map_err(|e| e.to_string())?,
+            ))
+        }
+        KeySource::File(_) => Err("a key from a file is for development only (NFR-8)".into()),
+        KeySource::Env(_) => {
+            Err("a native account's key is never read from the environment (NFR-8)".into())
+        }
+    }
 }
 
 fn signer(k: &KeySource, keys: &Keys) -> Result<Arc<dyn Signer>, String> {
@@ -147,9 +219,11 @@ enum Command {
     Gap { from: u64, to: u64 },
     /// Reset the cursor and the accepted head with the book's re-founding, and exit.
     Refound,
+    /// Open the keys, print the accounts, and exit (`F-044`).
+    Keys,
 }
 
-const USAGE: &str = "usage: aledgent-settle <config.json> [gap <from> <to> | refound]";
+const USAGE: &str = "usage: aledgent-settle <config.json> [gap <from> <to> | refound | keys]";
 
 async fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
@@ -167,6 +241,7 @@ async fn run() -> Result<(), String> {
             }
         }
         Some("refound") => Command::Refound,
+        Some("keys") => Command::Keys,
         Some(_) => return Err(USAGE.into()),
     };
     let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
@@ -205,6 +280,35 @@ async fn run() -> Result<(), String> {
     // F-035: the keys behind the signer service; development keys only if the file says so.
     let keys = Keys::of(&config)?;
     let lanes = lanes(&config, &keys)?;
+    let anchor = anchor(&config, &keys)?;
+    if matches!(command, Command::Keys) {
+        // F-044: public halves only; nothing else is opened.
+        let show = |role: &str, s: &Arc<dyn Signer>| {
+            serde_json::json!({
+                "role": role,
+                "account": hex::encode(s.account()),
+                "public": hex::encode(s.public()),
+                "scheme": match s.public() {
+                    settle::signer::Public::Ed25519(_) => "ed25519",
+                    settle::signer::Public::Ecdsa(_) => "secp256k1",
+                },
+                "pass_user": s.pass_user().map(hex::encode),
+            })
+        };
+        let mut out: Vec<serde_json::Value> = lanes.iter().map(|l| show("lane", l)).collect();
+        out.extend(anchor.iter().map(|a| show("anchor", a)));
+        let (ready, detail) = keys.ready();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "keys": out,
+                "ready": ready,
+                "detail": detail,
+            }))
+            .map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    }
     let assets: Vec<_> = config
         .adapter
         .assets
@@ -282,8 +386,8 @@ async fn run() -> Result<(), String> {
         Arc::new(SystemClock),
     );
     // F-017: anchors are published with a key of their own, used for nothing else.
-    if let Some(k) = &config.adapter.anchor_key {
-        adapter = adapter.with_anchor_signer(pass(k, &keys)?);
+    if let Some(a) = anchor {
+        adapter = adapter.with_anchor_signer(a);
     }
     // Feature `fault-injection` only (the zombienet suite's build, never a release): die the first
     // time the step reaches the point `ALEDGENT_SETTLE_CRASH_AT` names.
@@ -314,6 +418,7 @@ async fn run() -> Result<(), String> {
             adapter.refound().await.map_err(|e| e.to_string())?;
             return Ok(());
         }
+        Command::Keys => return Ok(()),
     }
     let interval = Duration::from_millis(config.interval.max(100));
     // `NFR-15`: within the interval, a check for news every `wake_poll` starts a step as soon as
@@ -329,6 +434,7 @@ async fn run() -> Result<(), String> {
     // smoldot did not always reconnect after its peers were cut for a minute and a half.
     let mut blind_since: Option<std::time::Instant> = None;
     let mut served = false;
+    let mut keys_ready = true;
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -345,6 +451,19 @@ async fn run() -> Result<(), String> {
         let stepped = adapter.step().await;
         if let Some(path) = &config.signals_file {
             write_signals(&adapter, path).await;
+        }
+        // F-044: an engine that cannot sign (Vault Transit down for its window, or a key no longer
+        // what was pinned) is said once when it goes and once when it comes back. A step that needs
+        // a signature fails meanwhile (`ChainError::Signer`), and the next one asks again; it does
+        // not count as the layer being unreachable.
+        let ready = keys.ready();
+        if ready.0 != keys_ready {
+            keys_ready = ready.0;
+            if ready.0 {
+                tracing::info!("the signing keys' engines are ready again");
+            } else {
+                tracing::error!(detail = %ready.1, "a signing key's engine is not ready; nothing is signed until it is");
+            }
         }
         // Blind: the layer does not answer; or, in a process that has never served, it answers
         // from before the deployment existed (a light client that has not caught up: seen on the

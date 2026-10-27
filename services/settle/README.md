@@ -10,8 +10,8 @@ executor of the call outbox (`F-027`, `DEC-18`): the one component of aledgent t
 settlement layer. It holds the signing keys, apart from the core; it reaches the core only through
 ingress, as the principal the settlement configuration names; it takes every external movement and
 anchor from the core's call outbox as an envelope, executes them in batches on the settlement
-contract (`F-026`) as the deployment's community PASS account, and reports what the layer recorded
-as observations, never stating an outcome. `features/F-016-settlement-adapter/NOTES.md` and
+contract (`F-026`) as its lanes' native accounts (`F-044`) or the deployment's community PASS
+account, and reports what the layer recorded as observations, never stating an outcome. `features/F-016-settlement-adapter/NOTES.md` and
 `features/F-027-settlement-extension/NOTES.md` say what was built and why.
 
 ## Running it
@@ -186,6 +186,39 @@ account. Each key is a **device key of that PASS account** (`"user"`: the accoun
 id; the account itself is `blake2_256([0; 32] ‖ user)`, and it is what the contract lists as a
 key, what pays fees and whose nonce moves).
 
+**Or as native accounts** (`F-044`; how deployments run). Each lane, and the anchor key, is an
+Ed25519 key acting as its own account: the account is the public key, the contract lists it, it
+pays its fees, and its own nonce moves. A batch is then a **v4 signed transaction** from that
+account (`MultiAddress::Id`, `MultiSignature::Ed25519` over the signed payload), with
+`PassAuthenticate` carrying no credential, so a signed origin passes through it. The file says so
+with `accounts` and `anchor_account` in place of `keys` and `anchor_key` (one form per file):
+
+```text
+"adapter":  { …, "accounts": [{ "engine": "lane-1" }], "anchor_account": { "engine": "anchor" } },
+"engines":  { "vault": { "vault_transit": {
+                "vault": { "address": "https://vault.example.com",
+                           "auth": { "aws_iam": { "mount": "aledgent-signer", "role": "<settle signer role>",
+                                                  "region": "<region>", "server_id": "vault.example.com" } } },
+                "mount": "transit-aledgent-signer" } } },
+"keys":     { "lane-1": { "engine": "vault", "key": { "name": "lane-1", "version": 1 } },
+              "anchor": { "engine": "vault", "key": { "name": "anchor", "version": 1 } } }
+```
+
+The keys are made in Vault Transit and never leave it: the adapter logs in to Vault under AWS IAM
+auth with its task's role and asks Vault to sign each transaction (`F-042`'s Transit engine: the
+version pinned, the key refused if it is exportable, every signature checked against the public key
+before it is used). A Transit key's version is its account, so a new version is a new account and
+never comes from a rotation by accident. The sidecar may hold them instead (`{ "sidecar": … }`, an
+`ed25519` key); a file only in development; never the environment. A runtime is confirmed by the
+layer for native transactions apart from PASS ones (its format recorded as `kreivo-133+native`).
+When a key's engine does not sign (Vault down past its window, a key that is no longer what was
+pinned), the step that needed the signature fails and says so, nothing is stored or broadcast, and
+the next step asks again; it is not counted as the layer being unreachable, so it does not restart
+the process. `aledgent-settle settle.json keys` opens the keys, prints each lane's and the anchor
+key's account (public halves only) and whether their engines are ready, and exits without reading
+the layer, the store or ingress: the accounts a contract's `set_keys` lists, and a check that Vault's
+login and the keys' reads work, before the adapter is turned on.
+
 **Each batch is sized and priced by its dry run** (`T-027-09`): the adapter dry-runs `execute` at
 the finalized head (`ContractsApi_call`, as the lane) and gives the batch the gas the dry run
 requires, ref time and proof size, plus half again (`batch_gas_margin_percent`, 150), never more
@@ -262,7 +295,8 @@ the adapter's ingress token.
 ```sh
 cargo test -p settle                                  # fake settlement layer; PostgreSQL in Docker
 cargo test -p conformance --test suite -- F-016       # the conformance cases
-# The PASS transaction against Kreivo's own crates, each format in a workspace of its own:
+# The PASS transaction against Kreivo's own crates, each format in a workspace of its own (and, in
+# kreivo-pin, a native account's v4 signed transaction, F-044):
 cargo test --locked --manifest-path services/settle/kreivo-pin/Cargo.toml       # spec 133, 4aef055
 cargo test --locked --manifest-path services/settle/kreivo-pin-132/Cargo.toml   # spec 132, 0.16.9
 ```

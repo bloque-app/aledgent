@@ -27,6 +27,9 @@
 //!   key signs a challenge bound to the exact call and to every extension after
 //!   `PassAuthenticate`; the runtime then dispatches the call as the PASS account, whose ordinary
 //!   nonce it bumps.
+//! - **Or, for a native account** (`F-044`): a **v4 signed transaction**, from the lane's own
+//!   account, its key's `MultiSignature` over the signed payload (below). `PassAuthenticate` carries
+//!   no credential, and a signed origin passes through it unchanged.
 //!
 //! Everything here is plain SCALE, written from Kreivo's source at the pinned revisions, with no
 //! runtime metadata: [`crate::chain::fake`] builds and checks transactions with it, and
@@ -75,11 +78,30 @@
 //! ([`TxFormat::by_surface`]), and the layer itself confirms the format on each runtime before
 //! the first transaction signed in it is broadcast ([`transaction_validity`]): an order flipped
 //! with no change of surface fails there.
+//!
+//! ## The native transaction (`F-044`)
+//!
+//! The same runtime type, in its v4 signed form:
+//!
+//! ```text
+//! compact(len) ‖ 0x84 (v4, signed)
+//!   ‖ MultiAddress::Id(account) ‖ MultiSignature
+//!   ‖ None (PassAuthenticate) ‖ Era ‖ compact(nonce: u32) ‖ compact(tip) ‖ None (fee asset)
+//!   ‖ call
+//! ```
+//!
+//! The key signs `SignedPayload`: `call ‖ explicit ‖ implicit` over every extension (`PassAuthenticate`'s
+//! explicit is the `None` above, its implicit is `()`), replaced by its blake2b-256 when it is longer
+//! than 256 bytes; an Ed25519 key signs those bytes, a secp256k1 key their blake2b-256 again
+//! (`MultiSignature::verify`). Its account is the key's (`MultiSigner::into_account`): an Ed25519
+//! key's own 32 bytes. Nothing of the message order above applies, so one encoding serves both
+//! formats' runtimes; the layer still confirms it on each runtime before anything signed in it is
+//! broadcast, under its own name ([`TxFormat::native_name`]).
 
 use parity_scale_codec::{Compact, Decode, Encode};
 
 use super::{AccountId32, Mortality, SignedExtrinsic, blake2_256};
-use crate::signer::{Signer, SignerError};
+use crate::signer::{Signature, Signer, SignerError};
 
 // ------------------------------------------------------------------------------ the contract
 
@@ -1495,6 +1517,13 @@ impl TxFormat {
         FORMATS.iter().copied().find(|f| f.name == name)
     }
 
+    /// The name the layer's confirmation of a native transaction on a runtime of this format is
+    /// recorded under (`F-044`): `<name>+native`. A runtime confirmed for PASS transactions has not
+    /// confirmed native ones, nor the reverse.
+    pub fn native_name(&self) -> String {
+        format!("{}+native", self.name)
+    }
+
     /// Whether `surface` is this format's: the same `transaction_version`, the same extensions in
     /// the same order, and the same types.
     pub fn matches(&self, surface: &Surface) -> bool {
@@ -1709,15 +1738,16 @@ impl From<SignerError> for SignError {
 impl From<SignError> for super::ChainError {
     fn from(e: SignError) -> Self {
         match e {
-            SignError::Signer(e) => super::ChainError::Unavailable(e.to_string()),
+            SignError::Signer(e) => super::ChainError::Signer(e.to_string()),
         }
     }
 }
 
-/// Sign `call` as the PASS account behind `signer` (its hashed user id, and its device key), with
-/// the challenge's context at block `context` (its number and hash), in `format`: the one the
-/// adapter chose for the runtime's surface (`T-027-12`), never one guessed from `p`. The device
-/// key signs through [`Signer`] and is never seen here.
+/// Sign `call` as `signer`'s account: as the PASS account behind it (its hashed user id, and its
+/// device key) with the challenge's context at block `context` (its number and hash), in `format`:
+/// the one the adapter chose for the runtime's surface (`T-027-12`), never one guessed from `p`;
+/// or, for a native account (`F-044`, no PASS user), as a v4 signed transaction ([`sign_native`]).
+/// The key signs through [`Signer`] and is never seen here.
 pub async fn sign(
     signer: &dyn Signer,
     format: &TxFormat,
@@ -1725,13 +1755,17 @@ pub async fn sign(
     p: &TxParams,
     context: (u32, [u8; 32]),
 ) -> Result<SignedExtrinsic, SignError> {
-    let user_id = signer
-        .pass_user()
-        .ok_or_else(|| SignerError::Unavailable("the key is not a PASS account's device".into()))?;
+    let Some(user_id) = signer.pass_user() else {
+        return sign_native(signer, call, p).await;
+    };
     let xtc = extrinsic_context(call, p);
     let challenge = challenge(&context.1, &xtc);
-    let digest = blake2_256(&signed_message(format, context.0, &challenge));
-    let signature = signer.sign(digest).await?;
+    let Signature::Ecdsa(signature) = signer
+        .sign(signed_message(format, context.0, &challenge))
+        .await?
+    else {
+        return Err(SignerError::Key("a PASS device key is a secp256k1 key".into()).into());
+    };
     let credential = PassCredential {
         device_id: signer.device(),
         user_id,
@@ -1742,6 +1776,201 @@ pub async fn sign(
     let bytes = extrinsic(&credential, p, call);
     let hash = blake2_256(&bytes);
     Ok(SignedExtrinsic { bytes, hash })
+}
+
+// ------------------------------------------------------------------------------ native accounts
+
+/// `0b1000_0100`: extrinsic format version 4, signed.
+pub const SIGNED_V4: u8 = 0x84;
+
+/// `MultiAddress::Id`.
+pub const MULTI_ADDRESS_ID: u8 = 0;
+
+/// Every extension's explicit data, in order, for a native transaction: `PassAuthenticate`'s `None`
+/// (no credential), then [`explicit_after_pass`].
+pub fn explicit_native(p: &TxParams) -> Vec<u8> {
+    let mut out = vec![0u8];
+    out.extend_from_slice(&explicit_after_pass(p));
+    out
+}
+
+/// What a native account's key signs (`SignedPayload`): `call ‖ explicit ‖ implicit` over every
+/// extension, `PassAuthenticate`'s implicit being `()`; its blake2b-256 when longer than 256 bytes.
+pub fn signed_payload(call: &[u8], p: &TxParams) -> Vec<u8> {
+    let mut b = call.to_vec();
+    b.extend_from_slice(&explicit_native(p));
+    b.extend_from_slice(&implicit_after_pass(p));
+    if b.len() > 256 {
+        blake2_256(&b).to_vec()
+    } else {
+        b
+    }
+}
+
+/// A native transaction's bytes, as broadcast: `compact(len) ‖ 0x84 ‖ MultiAddress::Id(account) ‖
+/// MultiSignature ‖ explicit ‖ call`.
+pub fn native_extrinsic(
+    account: &AccountId32,
+    signature: &Signature,
+    p: &TxParams,
+    call: &[u8],
+) -> Vec<u8> {
+    let mut body = vec![SIGNED_V4, MULTI_ADDRESS_ID];
+    body.extend_from_slice(account);
+    body.extend_from_slice(&signature.encode_multi());
+    body.extend_from_slice(&explicit_native(p));
+    body.extend_from_slice(call);
+    let mut out = Compact(u32::try_from(body.len()).unwrap_or(u32::MAX)).encode();
+    out.extend_from_slice(&body);
+    out
+}
+
+/// Sign `call` as `signer`'s own account (`F-044`): a v4 signed transaction (module documentation).
+/// The key's signature is checked against the account before the bytes are built.
+pub async fn sign_native(
+    signer: &dyn Signer,
+    call: &[u8],
+    p: &TxParams,
+) -> Result<SignedExtrinsic, SignError> {
+    if signer.account() != signer.device() {
+        return Err(SignerError::Key("a native account is its key's own account".into()).into());
+    }
+    let account = signer.account();
+    let payload = signed_payload(call, p);
+    let signature = signer.sign(payload.clone()).await?;
+    if !signature.verify(&payload, &account) {
+        return Err(SignerError::Unavailable(
+            "the signature does not verify against the account".into(),
+        )
+        .into());
+    }
+    let bytes = native_extrinsic(&account, &signature, p, call);
+    let hash = blake2_256(&bytes);
+    Ok(SignedExtrinsic { bytes, hash })
+}
+
+/// A native transaction, decoded (for the fake chain, and for the tests).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecodedNative {
+    /// The account that signed it.
+    pub account: AccountId32,
+    /// Its signature.
+    pub signature: Signature,
+    /// Its era's bytes.
+    pub era: [u8; 2],
+    /// Its nonce.
+    pub nonce: u32,
+    /// Its tip.
+    pub tip: u128,
+    /// Its call.
+    pub call: Vec<u8>,
+}
+
+/// Decode a native transaction. Anything else is an error.
+pub fn decode_native(bytes: &[u8]) -> Result<DecodedNative, String> {
+    let mut b = bytes;
+    let len = Compact::<u32>::decode(&mut b).map_err(|e| e.to_string())?.0;
+    if usize::try_from(len).ok() != Some(b.len()) {
+        return Err("the length prefix does not match".into());
+    }
+    let take = |b: &mut &[u8], n: usize| -> Result<Vec<u8>, String> {
+        if b.len() < n {
+            return Err("truncated".into());
+        }
+        let (h, t) = b.split_at(n);
+        *b = t;
+        Ok(h.to_vec())
+    };
+    if take(&mut b, 2)? != [SIGNED_V4, MULTI_ADDRESS_ID] {
+        return Err("not a v4 signed transaction from an account id".into());
+    }
+    let account: AccountId32 = take(&mut b, 32)?.try_into().unwrap_or([0; 32]);
+    let signature = match take(&mut b, 1)?[..] {
+        [0] => Signature::Ed25519(take(&mut b, 64)?.try_into().unwrap_or([0; 64])),
+        [2] => Signature::Ecdsa(take(&mut b, 65)?.try_into().unwrap_or([0; 65])),
+        _ => return Err("a signature neither Ed25519 nor ECDSA".into()),
+    };
+    if take(&mut b, 1)? != [0] {
+        return Err("PassAuthenticate carries a credential".into());
+    }
+    let era: [u8; 2] = take(&mut b, 2)?.try_into().unwrap_or([0; 2]);
+    let nonce = Compact::<u32>::decode(&mut b).map_err(|e| e.to_string())?.0;
+    let tip = Compact::<u128>::decode(&mut b)
+        .map_err(|e| e.to_string())?
+        .0;
+    if take(&mut b, 1)? != [0] {
+        return Err("a fee asset".into());
+    }
+    Ok(DecodedNative {
+        account,
+        signature,
+        era,
+        nonce,
+        tip,
+        call: b.to_vec(),
+    })
+}
+
+/// A transaction of either form, decoded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AnyTx {
+    /// A PASS transaction.
+    Pass(DecodedTx),
+    /// A native account's (`F-044`).
+    Native(DecodedNative),
+}
+
+impl AnyTx {
+    /// Decode a transaction of either form. Anything else is an error.
+    pub fn decode(bytes: &[u8]) -> Result<AnyTx, String> {
+        match decode_extrinsic(bytes) {
+            Ok(t) => Ok(AnyTx::Pass(t)),
+            Err(pass) => decode_native(bytes).map(AnyTx::Native).map_err(|native| {
+                format!("neither a PASS transaction ({pass}) nor a native one ({native})")
+            }),
+        }
+    }
+
+    /// Its era's bytes.
+    pub fn era(&self) -> [u8; 2] {
+        match self {
+            AnyTx::Pass(t) => t.era,
+            AnyTx::Native(t) => t.era,
+        }
+    }
+
+    /// Its nonce.
+    pub fn nonce(&self) -> u32 {
+        match self {
+            AnyTx::Pass(t) => t.nonce,
+            AnyTx::Native(t) => t.nonce,
+        }
+    }
+
+    /// Its tip.
+    pub fn tip(&self) -> u128 {
+        match self {
+            AnyTx::Pass(t) => t.tip,
+            AnyTx::Native(t) => t.tip,
+        }
+    }
+
+    /// Its call.
+    pub fn call(&self) -> &[u8] {
+        match self {
+            AnyTx::Pass(t) => &t.call,
+            AnyTx::Native(t) => &t.call,
+        }
+    }
+
+    /// The account it claims to act as (checked by the layer, not here): the PASS account of its
+    /// user, or the native account that signed.
+    pub fn claimed_account(&self) -> AccountId32 {
+        match self {
+            AnyTx::Pass(t) => pass_account(&t.credential.user_id),
+            AnyTx::Native(t) => t.account,
+        }
+    }
 }
 
 /// A transaction of this form, decoded (for the fake chain, and for the tests).
@@ -2436,16 +2665,158 @@ mod tests {
         );
         let format = FORMAT_133;
         let digest = blake2_256(&signed_message(&format, 9, &tx.credential.challenge));
+        // The device signs the message's blake2b-256 (MultiSignature::Ecdsa).
         let public = crate::signer::recover(&digest, &tx.credential.signature).unwrap();
         assert_eq!(blake2_256(&public), tx.credential.device_id);
         // The PASS account, not the device, is who the call runs as.
         assert_eq!(pass.account(), pass_account(&[0x51; 32]));
         assert_ne!(pass.account(), device.account());
-        // A plain key is not a PASS account's device.
+        // A plain key is no PASS account's device: it signs as its own account (F-044).
+        let plain = sign(device.as_ref(), &FORMAT_133, &call, &p, (9, [0xc0; 32]))
+            .await
+            .unwrap();
+        assert!(decode_extrinsic(&plain.bytes).is_err());
+        assert_eq!(
+            decode_native(&plain.bytes).unwrap().account,
+            device.account()
+        );
+    }
+
+    fn native_params() -> TxParams {
+        TxParams {
+            genesis: [0x6e; 32],
+            spec_version: 134,
+            transaction_version: 13,
+            era: Mortality::at(64, 1_000),
+            birth_hash: [0xb1; 32],
+            nonce: 7,
+            tip: 0,
+        }
+    }
+
+    /// `F-044`: a native account's transaction is v4 signed, from its own account, with no PASS
+    /// credential; its Ed25519 signature is over the signed payload; and it round-trips. The payload
+    /// is hashed only past 256 bytes, as `SignedPayload` does.
+    #[tokio::test]
+    async fn f_044_a_native_transaction_round_trips_and_verifies_against_its_account() {
+        let key = crate::signer::DevEd25519::from_secret(&[0x5e; 32]);
+        let p = native_params();
+        // A short call: the payload is signed as it is.
+        let short = vec![0x50, 0x06, 1, 2, 3];
+        let signed = sign(&key, &FORMAT_133, &short, &p, (9, [0xc0; 32]))
+            .await
+            .unwrap();
+        assert_eq!(signed.hash, blake2_256(&signed.bytes));
+        assert!(decode_extrinsic(&signed.bytes).is_err(), "not PASS");
+        let tx = decode_native(&signed.bytes).unwrap();
+        assert_eq!(tx.account, key.account());
+        assert_eq!((tx.nonce, tx.tip, era_of(tx.era)), (7, 0, (64, 40)));
+        assert_eq!(tx.call, short);
+        let payload = signed_payload(&short, &p);
+        assert!(payload.len() <= 256);
+        assert_eq!(
+            payload,
+            [&short[..], &explicit_native(&p), &implicit_after_pass(&p)].concat()
+        );
+        assert!(tx.signature.verify(&payload, &key.account()));
+        assert!(matches!(tx.signature, Signature::Ed25519(_)));
+        // Another nonce is another payload: the signature does not verify for it.
+        let other = TxParams { nonce: 8, ..p };
         assert!(
-            sign(device.as_ref(), &FORMAT_133, &call, &p, (9, [0xc0; 32]))
-                .await
-                .is_err()
+            !tx.signature
+                .verify(&signed_payload(&short, &other), &key.account())
+        );
+        // A long call: the payload is its blake2b-256.
+        let long = contracts_call(&[9; 32], &CallLimits::default(), &[0x77; 300]);
+        let signed = sign(&key, &FORMAT_133, &long, &p, (9, [0xc0; 32]))
+            .await
+            .unwrap();
+        let tx = decode_native(&signed.bytes).unwrap();
+        let payload = signed_payload(&long, &p);
+        assert_eq!(
+            payload,
+            blake2_256(&[&long[..], &explicit_native(&p), &implicit_after_pass(&p)].concat())
+        );
+        assert!(tx.signature.verify(&payload, &key.account()));
+        assert_eq!(
+            AnyTx::decode(&signed.bytes).unwrap().claimed_account(),
+            key.account()
+        );
+        assert!(AnyTx::decode(&[1, 2, 3]).is_err());
+    }
+
+    /// `F-044`: the native vector (`services/settle/kreivo-pin/vectors-native.json`). `kreivo-pin`
+    /// decodes the same bytes with Kreivo's own types (`sp-runtime` 48.0.0's `UncheckedExtrinsic`, its
+    /// v4 signed preamble, `MultiAddress`, `MultiSignature`) and verifies the signature over the payload
+    /// `UncheckedExtrinsic::check` builds, so this test and that crate pin the native transaction too.
+    #[tokio::test]
+    async fn f_044_the_native_transaction_matches_the_pinned_vector() {
+        let key = crate::signer::DevEd25519::from_secret(&[0x5e; 32]);
+        let p = native_params();
+        let contract = [0xc0; 32];
+        let envelopes = vec![Envelope {
+            operation_ref: [1; 32],
+            call: Call::Withdraw {
+                to: Destination::Account([0xab; 32]),
+                asset: AssetId::Here(9001),
+                amount: 250,
+            },
+        }];
+        let limits = CallLimits {
+            gas_limit: Weight {
+                ref_time: 50_000_000_000,
+                proof_size: 1_000_000,
+            },
+            storage_deposit_limit: Some(1_000_000_000_000),
+        };
+        let data = execute_data(&envelopes);
+        let call = contracts_call(&contract, &limits, &data);
+        let signed = sign_native(&key, &call, &p).await.unwrap();
+        let tx = decode_native(&signed.bytes).unwrap();
+        fn h(b: impl AsRef<[u8]>) -> String {
+            hex::encode(b)
+        }
+        let got = serde_json::json!({
+            "inputs": {
+                "public": h(key.public()),
+                "contract": h(contract),
+                "execute_data": h(&data),
+                "gas_ref_time": limits.gas_limit.ref_time,
+                "gas_proof_size": limits.gas_limit.proof_size,
+                "storage_deposit_limit": limits.storage_deposit_limit.map(|l| l.to_string()),
+                "genesis": h(p.genesis),
+                "spec_version": p.spec_version,
+                "transaction_version": p.transaction_version,
+                "era_period": p.era.period,
+                "era_current": p.era.checkpoint,
+                "birth_hash": h(p.birth_hash),
+                "nonce": p.nonce,
+                "tip": p.tip.to_string(),
+            },
+            "outputs": {
+                "account": h(key.account()),
+                "era": h(era_bytes(&p.era)),
+                "call": h(&call),
+                "explicit": h(explicit_native(&p)),
+                "implicit": h(implicit_after_pass(&p)),
+                "signed_payload": h(signed_payload(&call, &p)),
+                "signature": h(&tx.signature.encode_multi()[1..]),
+                "extrinsic": h(&signed.bytes),
+                "extrinsic_hash": h(signed.hash),
+            },
+        });
+        let path = "kreivo-pin/vectors-native.json";
+        let full = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
+        if std::env::var_os("UPDATE_KREIVO_VECTORS").is_some() {
+            let text = serde_json::to_string_pretty(&got).unwrap() + "\n";
+            std::fs::write(&full, text).unwrap();
+        }
+        let pinned: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&full).unwrap()).unwrap();
+        assert_eq!(
+            got, pinned,
+            "services/settle/{path} is stale: the encoding changed. Rerun with \
+             UPDATE_KREIVO_VECTORS=1 only after its pin crate agrees with Kreivo's types"
         );
     }
 }
