@@ -1,0 +1,491 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+name: Core release
+
+# A core release, separate from the image (bloque-app/bloque-ledgent#285, step 3 of 4 of #282; F-037,
+# REQ-RT-16, REQ-RT-17).
+#
+# The core image (images.yml, aledgent-core) bundles the host binary with core.vos and
+# agent_runtime.pvm, and a deployment pins it by digest: any change to the core costs a new image and a
+# maintenance restart. This workflow builds a core change as a code version instead, which the book
+# takes in place with `Upgrade { code, from }` and no restart. It
+#
+#   1. builds core.vos from this commit as the generation after the code in force (the target
+#      `core-upgrade` of deploy/docker/core.Dockerfile: `--locked`, claiming the state of the package in
+#      force), keeps the runtime of the code in force byte for byte, and has the host the node runs
+#      write the code manifest (digests, lengths, build profiles; amendment 0033);
+#   2. refuses unless the result is what an in-place upgrade can take: generation + 1, the same
+#      runtime, the platform the host drives, a manifest the host's own restart check accepts;
+#   3. publishes the three files, each named by its blake2b-256 digest (the layout of the core host's
+#      `fs` code source), as ONE image by digest, ghcr.io/bloque-app/aledgent-core-code@sha256:..., with a
+#      build provenance attestation signed through GitHub's OIDC (`gh attestation verify`), and records
+#      the code version H in the run's summary and in the artifact core-code-set;
+#   4. prints H: the `code` of the `Upgrade` the operator submits.
+#
+# What it never does. It never pushes, tags or moves the core image (`aledgent-core`) or the
+# deployment's `aledgent_core_image_tag`; it holds no AWS credential and starts nothing elsewhere;
+# it does not restart the host. Putting the files on a node is step 2 of 4 (#284, an SSM document), and
+# running it against test and then prod behind an environment gate is the delivery that follows it;
+# neither exists yet, so nothing in this workflow deploys. Submitting the `Upgrade` stays a manual,
+# authorised step. Host-only releases keep the current path (release.yml, images.yml).
+#
+# Inputs. The code in force is named, never guessed:
+#
+# - host_image: the core image the node runs, by digest. Its host writes the manifest and checks the
+#   result, because `native-decide` in a manifest is whatever binary wrote it, and the node's host is the
+#   one that decides. It is also where the code in force comes from the first time (the genesis).
+# - predecessor_code and predecessor_manifest: the code version in force (64 hex) and its manifest
+#   (hex, `aledgent/code/v1`), as the deployment recorded them. The host checks that the package and
+#   the runtime are that version's before anything is built on them (`check-code`). A later upgrade
+#   instead gives predecessor_set, the previous release's image, and needs no manifest.
+#
+# One code version per deployment. The package claims the state of ONE previous package's program
+# (T-037-19), so the version this builds follows one predecessor. Deployments founded on different
+# packages (test and prod today) each get their own run, with their own host_image and predecessor.
+#
+# A pull request that touches this workflow, the Dockerfile or these scripts runs it as a check, against
+# the newest release's core, publishing nothing: a case that must be refused (this tree's GENERATION
+# is not the predecessor's plus one) and a case that must pass (the same tree with GENERATION bumped in
+# the runner's copy, never published).
+#
+# Running it: `workflow_dispatch` works from main and develop once this file is on the default branch
+# (main); from any other branch it builds and checks and publishes nothing, as images.yml does.
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/core-release.yml"
+      - "deploy/docker/core.Dockerfile"
+      - "tools/release/core-*"
+      - "tools/release/pack-code-layer.py"
+      - "tools/release/test-core-release.sh"
+  workflow_dispatch:
+    inputs:
+      host_image:
+        description: "The core image the node runs, by digest: ghcr.io/bloque-app/aledgent-core@sha256:..."
+        type: string
+        required: true
+      predecessor_code:
+        description: "The code version in force, 64 hex"
+        type: string
+        required: true
+      predecessor_manifest:
+        description: "Its manifest (aledgent/code/v1) in hex. Not needed with predecessor_set"
+        type: string
+        default: ""
+      predecessor_set:
+        description: "A previous release's code set: ghcr.io/bloque-app/aledgent-core-code@sha256:.... Empty: the host image's own package and runtime (the genesis)"
+        type: string
+        default: ""
+      publish:
+        description: "Publish the code set (main and develop only). Off: build and check, publish nothing"
+        type: boolean
+        default: true
+
+permissions: {}
+
+concurrency:
+  group: core-release-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CODE_REPO: ghcr.io/bloque-app/aledgent-core-code
+  CRANE_VERSION: v0.22.1
+  CRANE_SHA256: 0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0
+
+jobs:
+  scripts:
+    name: scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: shellcheck
+        run: shellcheck tools/release/core-code-set.sh tools/release/core-profile.sh tools/release/test-core-release.sh
+      - name: The set's layout, the layer, the profile and this workflow's promises
+        run: tools/release/test-core-release.sh
+
+  core-code:
+    name: core code (${{ matrix.case }})
+    # The scripts first: a bad layout should not cost a core build.
+    needs: scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write # the code set's repository, and nothing else
+      id-token: write # the provenance attestation's signature (GitHub OIDC)
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        case: ${{ fromJSON(github.event_name == 'pull_request' && '["refuse","accept"]' || '["release"]') }}
+    env:
+      CASE: ${{ matrix.case }}
+      # Published only by a dispatch from main or develop that asked for it, and never for a check case.
+      PUBLISH: ${{ github.event_name == 'workflow_dispatch' && inputs.publish && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop') }}
+      HOST_IMAGE: ${{ inputs.host_image }}
+      PRED_CODE: ${{ inputs.predecessor_code }}
+      PRED_MANIFEST: ${{ inputs.predecessor_manifest }}
+      PRED_SET: ${{ inputs.predecessor_set }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # The host image's revision must be in the history: its Cargo.lock is part of a profile.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install crane
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 5 -o /tmp/crane.tar.gz \
+            "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz"
+          echo "${CRANE_SHA256}  /tmp/crane.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin" && tar -xzf /tmp/crane.tar.gz -C "$RUNNER_TEMP/bin" crane
+          echo "$RUNNER_TEMP/bin" >>"$GITHUB_PATH"
+
+      # What is in force, named and validated before anything is pulled or built.
+      - name: Inputs
+        id: in
+        env:
+          EVENT: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          w="$RUNNER_TEMP/core-release"
+          mkdir -p "$w/pred" "$w/pred-pkg" "$w/new" "$w/in"
+          chmod 0777 "$w"
+          mkdir -m 0777 "$w/io"
+          echo "w=$w" >>"$GITHUB_OUTPUT"
+          if [ "$EVENT" = pull_request ]; then
+            # The newest release or pre-release's core: the check runs against what is built now.
+            tag=$(gh release list --repo "$REPO" --limit 1 --json tagName --jq '.[0].tagName')
+            gh release download "$tag" --repo "$REPO" -p images.json -O "$w/in/images.json"
+            HOST_IMAGE=$(jq -er .images.core "$w/in/images.json")
+            echo "The check runs against release $tag's core, $HOST_IMAGE" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "pr_revision=$(jq -er .commit "$w/in/images.json")" >>"$GITHUB_OUTPUT"
+          fi
+          [[ $HOST_IMAGE =~ ^ghcr\.io/bloque-app/aledgent-core@sha256:[0-9a-f]{64}$ ]] \
+            || { echo "::error::host_image must be ghcr.io/bloque-app/aledgent-core@sha256:<64 hex>, not '$HOST_IMAGE'"; exit 1; }
+          if [ -n "$PRED_SET" ]; then
+            [[ $PRED_SET =~ ^ghcr\.io/bloque-app/aledgent-core-code@sha256:[0-9a-f]{64}$ ]] \
+              || { echo "::error::predecessor_set must be ghcr.io/bloque-app/aledgent-core-code@sha256:<64 hex>, not '$PRED_SET'"; exit 1; }
+          fi
+          if [ "$EVENT" != pull_request ]; then
+            PRED_CODE="${PRED_CODE,,}"
+            [[ $PRED_CODE =~ ^[0-9a-f]{64}$ ]] \
+              || { echo "::error::predecessor_code must be the code version in force, 64 hex, not '$PRED_CODE'"; exit 1; }
+            if [ -z "$PRED_SET" ]; then
+              [[ $PRED_MANIFEST =~ ^([0-9a-fA-F]{2})+$ ]] \
+                || { echo "::error::predecessor_manifest (the manifest in hex) is required without predecessor_set"; exit 1; }
+            fi
+            echo "code=$PRED_CODE" >>"$GITHUB_OUTPUT"
+          fi
+          echo "host=$HOST_IMAGE" >>"$GITHUB_OUTPUT"
+
+      - name: Free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          docker system prune -af >/dev/null
+          df -h /
+
+      # The host the node runs, its roots and its commit; and the code in force as files.
+      - name: The code in force
+        id: pred
+        env:
+          W: ${{ steps.in.outputs.w }}
+          HOST: ${{ steps.in.outputs.host }}
+          CODE: ${{ steps.in.outputs.code }}
+          EVENT: ${{ github.event_name }}
+          PR_REVISION: ${{ steps.in.outputs.pr_revision }}
+        run: |
+          set -euo pipefail
+          docker pull --quiet --platform linux/amd64 "$HOST"
+          label() { docker image inspect -f "{{index .Config.Labels \"$1\"}}" "$HOST"; }
+          roots=$(label app.aledgent.roots)
+          case "$roots" in
+            v1 | v2) ;;
+            '' | '<no value>') roots=v2; echo "::notice::the host image has no app.aledgent.roots label: roots v2" ;;
+            *) echo "::error::the host image's roots are '$roots'"; exit 1 ;;
+          esac
+          rev=$(label org.opencontainers.image.revision)
+          [[ $rev =~ ^[0-9a-f]{40}$ ]] || { echo "::error::the host image's revision label is '$rev', not a commit"; exit 1; }
+          git cat-file -e "$rev^{commit}" || { echo "::error::the host image's commit $rev is not in this repository's history"; exit 1; }
+
+          if [ -n "$PRED_SET" ]; then
+            # A previous release's set: its record says which file is which, and the manifest is the file named by H.
+            mkdir "$W/set-in"
+            crane export "$PRED_SET" - | tar -x -C "$W/set-in"
+            jq -e '.format == "aledgent/core-code-set/v1"' "$W/set-in/set.json" >/dev/null \
+              || { echo "::error::$PRED_SET is not a code set of this workflow"; exit 1; }
+            from_set=$(jq -r .code "$W/set-in/set.json")
+            if [ -n "$CODE" ] && [ "$CODE" != "$from_set" ]; then
+              echo "::error::predecessor_code $CODE is not the code of $PRED_SET ($from_set)"; exit 1
+            fi
+            CODE=$from_set
+            file() { jq -er --arg r "$1" '.files[] | select(.role == $r) | .digest' "$W/set-in/set.json"; }
+            cp "$W/set-in/code/$(file manifest)" "$W/pred/manifest.bin"
+            cp "$W/set-in/code/$(file package)" "$W/pred/core.vos"
+            cp "$W/set-in/code/$(file runtime)" "$W/pred/agent_runtime.pvm"
+          else
+            id=$(docker create --platform linux/amd64 "$HOST")
+            docker cp "$id:/usr/share/aledgent/core.vos" "$W/pred/core.vos"
+            docker cp "$id:/usr/share/aledgent/agent_runtime.pvm" "$W/pred/agent_runtime.pvm"
+            docker rm "$id" >/dev/null
+            if [ "$EVENT" = pull_request ]; then
+              # No deployment's manifest: the host writes one for the release's own bytes, with profiles
+              # that are this check's (the check reads digests, lengths and the generation).
+              prof="$W/in/profile"; mkdir -p "$prof"; chmod 0777 "$prof"
+              cp agents/Cargo.lock "$prof/Cargo.lock"
+              jq -n --arg rev "$PR_REVISION" '
+                def p(target; toolchain; opt): {target: target, toolchain: toolchain, opt_level: opt,
+                  features: [], source_revision: $rev, cargo_lock: "Cargo.lock"};
+                {kernel: {revision: "e9a7b08"},
+                 package: p("riscv64em-vos"; "nightly-2026-03-20"; "s"),
+                 runtime: p("riscv64em-vos"; "nightly-2026-03-20"; "3"),
+                 native_decide: p("x86_64-unknown-linux-gnu"; "nightly-2026-03-20"; "3")}' >"$prof/profile.json"
+              docker run --rm --platform linux/amd64 -v "$W/pred:/pred:ro" -v "$prof:/profile:ro" -v "$W/io:/io" "$HOST" code-manifest \
+                --actor /pred/core.vos --runtime /pred/agent_runtime.pvm --profile /profile/profile.json --out /io/pred-manifest.bin \
+                >"$W/io/pred-manifest.json" || { echo "pred_ok=false" >>"$GITHUB_OUTPUT"; echo "::notice::the release's host cannot write a manifest for its own bytes (a release from before amendment 0033?): nothing to check against"; exit 0; }
+              cp "$W/io/pred-manifest.bin" "$W/pred/manifest.bin"
+              CODE=$(jq -er .version "$W/io/pred-manifest.json")
+              jq -e 'has("generation")' "$W/io/pred-manifest.json" >/dev/null \
+                || { echo "pred_ok=false" >>"$GITHUB_OUTPUT"; echo "::notice::the release's manifest has no code generation (a release from before amendment 0033): nothing to check against"; exit 0; }
+            else
+              python3 -I -c 'import sys; sys.stdout.buffer.write(bytes.fromhex(sys.argv[1]))' "$PRED_MANIFEST" >"$W/pred/manifest.bin"
+            fi
+          fi
+          chmod -R a+rX "$W/pred"
+
+          # The host checks the bytes are the version in force's, as a restart checks them.
+          if ! docker run --rm --platform linux/amd64 -v "$W/pred:/pred:ro" -v "$W/io:/io" "$HOST" check-code \
+              --actor /pred/core.vos --runtime /pred/agent_runtime.pvm --manifest /pred/manifest.bin \
+              --code "$CODE" --out /io/pred-report.json; then
+            if [ "$EVENT" = pull_request ]; then
+              echo "pred_ok=false" >>"$GITHUB_OUTPUT"
+              echo "::notice::the release's own host refuses its manifest: nothing to check against"; exit 0
+            fi
+            echo "::error::the host image does not accept these bytes as code $CODE"; exit 1
+          fi
+          cp "$W/io/pred-report.json" "$W/pred-report.json"
+          # The package alone, as the build's named context (the runtime is not built).
+          cp "$W/pred/core.vos" "$W/pred-pkg/core.vos"
+          # The platform this tree's host drives, from the Dockerfile's pin; it must be the code in force's.
+          vos_rev=$(sed -n 's/^ARG VOS_REV=\([0-9a-f]\{40\}\)$/\1/p' deploy/docker/core.Dockerfile | sort -u)
+          [[ $vos_rev =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::deploy/docker/core.Dockerfile must pin exactly one VOS_REV, found: ${vos_rev:-none}"; exit 1; }
+          theirs=$(jq -r .manifest.platform.revision "$W/pred-report.json")
+          if [ "$theirs" != "$vos_rev" ]; then
+            if [ "$EVENT" = pull_request ]; then
+              echo "pred_ok=false" >>"$GITHUB_OUTPUT"
+              echo "::notice::the release's code runs on VOS $theirs, this tree builds on $vos_rev: another platform's code is a continuation (T-037-17), not an upgrade; nothing to check against"; exit 0
+            fi
+            echo "::error::the code in force runs on VOS $theirs, this tree builds on $vos_rev: that is a continuation (T-037-17, #288), not an in-place upgrade"; exit 1
+          fi
+          {
+            echo "pred_ok=true"
+            echo "roots=$roots"
+            echo "rev=$rev"
+            echo "code=$CODE"
+            echo "generation=$(jq -r .generation "$W/pred-report.json")"
+            echo "vos_rev=$vos_rev"
+          } >>"$GITHUB_OUTPUT"
+
+      # Fail before a core build when the source cannot be the next generation. GENERATION is the
+      # source's, changed in the commit that needs the upgrade (agents/core/src/lib.rs).
+      - name: The generation
+        id: gen
+        if: steps.pred.outputs.pred_ok == 'true'
+        env:
+          GENERATION_IN_FORCE: ${{ steps.pred.outputs.generation }}
+        run: |
+          set -euo pipefail
+          have=$(sed -n 's/^const GENERATION: u64 = \([0-9][0-9]*\);$/\1/p' agents/core/src/lib.rs)
+          [ -n "$have" ] || { echo "::error::agents/core/src/lib.rs: no 'const GENERATION: u64 = N;'"; exit 1; }
+          want=$((GENERATION_IN_FORCE + 1))
+          proceed=true
+          if [ "$have" != "$want" ]; then
+            msg="agents/core/src/lib.rs has GENERATION $have; the code in force is generation $GENERATION_IN_FORCE, so an upgrade built from it must be generation $want"
+            case "$CASE" in
+              refuse) echo "Refused, as it must be: $msg" | tee -a "$GITHUB_STEP_SUMMARY"; proceed=false ;;
+              accept)
+                # The runner's copy only: nothing built from it is published (PUBLISH is false on a pull request).
+                echo "::notice::$msg. This check builds a copy with GENERATION $want."
+                sed -i "s/^const GENERATION: u64 = $have;\$/const GENERATION: u64 = $want;/" agents/core/src/lib.rs
+                grep -qx "const GENERATION: u64 = $want;" agents/core/src/lib.rs ;;
+              *) echo "::error::$msg"; exit 1 ;;
+            esac
+          elif [ "$CASE" = refuse ]; then
+            echo "::notice::this tree's GENERATION is already the next ($want): the refusal case has nothing to refuse"
+            proceed=false
+          fi
+          echo "proceed=$proceed" >>"$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        if: steps.gen.outputs.proceed == 'true'
+
+      # core.vos only: the target core-upgrade. The build cache is read, never written, so this
+      # workflow cannot change what the image build finds there.
+      - name: Build the upgrade's package
+        if: steps.gen.outputs.proceed == 'true'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: deploy/docker/core.Dockerfile
+          target: core-upgrade
+          platforms: linux/amd64
+          build-args: ROOTS=${{ steps.pred.outputs.roots }}
+          build-contexts: previous-code=${{ steps.in.outputs.w }}/pred-pkg
+          cache-from: type=gha,scope=core${{ steps.pred.outputs.roots == 'v1' && '-roots-v1' || '' }}
+          outputs: type=local,dest=${{ steps.in.outputs.w }}/upgrade
+          push: false
+
+      # The node's host writes the manifest: its binary is the manifest's `native-decide`.
+      - name: The code manifest
+        id: manifest
+        if: steps.gen.outputs.proceed == 'true'
+        env:
+          W: ${{ steps.in.outputs.w }}
+          HOST: ${{ steps.in.outputs.host }}
+          ROOTS: ${{ steps.pred.outputs.roots }}
+          REV: ${{ steps.pred.outputs.rev }}
+          GEN_IN_FORCE: ${{ steps.pred.outputs.generation }}
+          VOS_REV: ${{ steps.pred.outputs.vos_rev }}
+        run: |
+          set -euo pipefail
+          test -s "$W/upgrade/core.vos"
+          cp "$W/upgrade/core.vos" "$W/new/core.vos"
+          # The runtime of the code in force, byte for byte: a new runtime cannot go in place (#288).
+          cp "$W/pred/agent_runtime.pvm" "$W/new/agent_runtime.pvm"
+          cmp -s "$W/new/core.vos" "$W/pred/core.vos" && { echo "::error::the new package is the code in force's own: this tree changed nothing the core runs"; exit 1; }
+          tools/release/core-profile.sh "$W/pred-report.json" "$REV" "$(git rev-parse HEAD)" "$ROOTS" "$W/new/profile"
+          chmod -R a+rX "$W/new"
+          docker run --rm --platform linux/amd64 -v "$W/new:/new:ro" -v "$W/io:/io" "$HOST" code-manifest \
+            --actor /new/core.vos --runtime /new/agent_runtime.pvm --profile /new/profile/profile.json --out /io/manifest.bin \
+            >"$W/report.json"
+          cp "$W/io/manifest.bin" "$W/manifest.bin"
+          cat "$W/report.json"
+
+          rt() { jq -r '.artefacts[] | select(.role == "runtime") | .digest' "$1"; }
+          pk() { jq -r '.artefacts[] | select(.role == "package") | .digest' "$1"; }
+          want=$((GEN_IN_FORCE + 1))
+          [ "$(jq -r .generation "$W/report.json")" = "$want" ] \
+            || { echo "::error::the package is generation $(jq -r .generation "$W/report.json"), the upgrade must be $want"; exit 1; }
+          [ "$(jq -r .platform.revision "$W/report.json")" = "$VOS_REV" ] \
+            || { echo "::error::the manifest's platform is not VOS $VOS_REV"; exit 1; }
+          [ "$(rt "$W/report.json")" = "$(jq -r '.manifest.artefacts[] | select(.role == "runtime") | .digest' "$W/pred-report.json")" ] \
+            || { echo "::error::the runtime is not the code in force's"; exit 1; }
+          [ "$(pk "$W/report.json")" != "$(jq -r '.manifest.artefacts[] | select(.role == "package") | .digest' "$W/pred-report.json")" ] \
+            || { echo "::error::the package is the code in force's"; exit 1; }
+          # Accepted as a restart accepts the code the book names for its next input.
+          docker run --rm --platform linux/amd64 -v "$W/new:/new:ro" -v "$W/io:/io" "$HOST" check-code \
+            --actor /new/core.vos --runtime /new/agent_runtime.pvm --manifest /io/manifest.bin \
+            --code "$(jq -r .version "$W/report.json")" --out /io/new-report.json >/dev/null
+          echo "code=$(jq -r .version "$W/report.json")" >>"$GITHUB_OUTPUT"
+          echo "generation=$want" >>"$GITHUB_OUTPUT"
+
+      # The files, each named by its digest and hashed again by a tool that shares no code with the host.
+      - name: The code set
+        id: set
+        if: steps.gen.outputs.proceed == 'true'
+        env:
+          W: ${{ steps.in.outputs.w }}
+        run: |
+          set -euo pipefail
+          tools/release/core-code-set.sh "$W/report.json" "$W/manifest.bin" "$W/new/core.vos" "$W/new/agent_runtime.pvm" "$W/set" "$W/set.json"
+          python3 -I tools/release/pack-code-layer.py "$W/set" "$W/layer.tar" "$W/set.json"
+          echo "layer_sha256=$(sha256sum "$W/layer.tar" | cut -d' ' -f1)" >>"$GITHUB_OUTPUT"
+
+      - name: Keep the set
+        if: steps.gen.outputs.proceed == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: core-code-set-${{ matrix.case }}
+          path: |
+            ${{ steps.in.outputs.w }}/set
+            ${{ steps.in.outputs.w }}/set.json
+            ${{ steps.in.outputs.w }}/report.json
+            ${{ steps.in.outputs.w }}/new/profile
+          if-no-files-found: error
+
+      # Only a dispatch from main or develop that asked for it. By digest: the tag is a label, nothing
+      # reads it, and a node never follows it.
+      - name: Publish the code set
+        id: publish
+        if: steps.gen.outputs.proceed == 'true' && env.PUBLISH == 'true'
+        env:
+          W: ${{ steps.in.outputs.w }}
+          H: ${{ steps.manifest.outputs.code }}
+        run: |
+          set -euo pipefail
+          crane auth login ghcr.io -u "$GITHUB_ACTOR" --password-stdin <<<"$GH_TOKEN"
+          ref="$CODE_REPO:code-$H"
+          if existing=$(crane digest "$ref" 2>/dev/null); then
+            # Code version H is a function of its bytes: the same tag must hold the same files.
+            mkdir "$W/existing"
+            crane export "$CODE_REPO@$existing" - | tar -x -C "$W/existing"
+            diff -r "$W/set" "$W/existing/code" \
+              || { echo "::error::$ref holds a different set than this run built: a code version's files never change"; exit 1; }
+            echo "::notice::$ref exists and holds exactly these files; nothing pushed"
+            digest=$existing
+          else
+            crane append -f "$W/layer.tar" -t "$ref" >/dev/null
+            digest=$(crane digest "$ref")
+          fi
+          [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]]
+          # Anonymous pull, as release.yml checks for every image: the node and the delivery pull with no credential.
+          name="${CODE_REPO#ghcr.io/}"
+          token=$(curl -sS "https://ghcr.io/token?scope=repository:$name:pull" | jq -r '.token // empty')
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" \
+            -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+            "https://ghcr.io/v2/$name/manifests/$digest")
+          [ "$code" = 200 ] || { echo "::error::$CODE_REPO@$digest does not pull anonymously (HTTP $code): set ghcr.io/$name public and re-run"; exit 1; }
+          echo "digest=$digest" >>"$GITHUB_OUTPUT"
+          echo "ref=$CODE_REPO@$digest" >>"$GITHUB_OUTPUT"
+
+      - name: Attest the code set's provenance
+        if: steps.publish.outputs.digest != ''
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.CODE_REPO }}
+          subject-digest: ${{ steps.publish.outputs.digest }}
+          push-to-registry: true
+
+      - name: Record
+        if: steps.gen.outputs.proceed == 'true'
+        env:
+          W: ${{ steps.in.outputs.w }}
+          H: ${{ steps.manifest.outputs.code }}
+          GEN: ${{ steps.manifest.outputs.generation }}
+          PRED: ${{ steps.pred.outputs.code }}
+          REF: ${{ steps.publish.outputs.ref }}
+          HOST: ${{ steps.in.outputs.host }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Core code version \`$H\`"
+            echo
+            echo "- generation $GEN, following \`$PRED\` (generation $((GEN - 1)))"
+            echo "- manifest written by the host of \`$HOST\`; commit \`$GITHUB_SHA\`"
+            echo "- files (each named by its blake2b-256 digest):"
+            jq -r '.files[] | "  - \(.role): `\(.digest)` (\(.len) bytes)"' "$W/set.json"
+            echo
+            if [ -n "$REF" ]; then
+              echo "Published: \`$REF\`"
+              echo
+              echo "Verify: \`gh attestation verify oci://$REF -R $GITHUB_REPOSITORY\`"
+              echo
+              echo "The operator submits \`Upgrade { code: $H, from: <an input not yet decided> }\` once the files are on the node"
+              echo "(delivery: #284). Nothing was delivered, deployed or restarted by this run, and the core image and"
+              echo "\`aledgent_core_image_tag\` are untouched."
+            else
+              echo "Checked, not published (case \`$CASE\`)."
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
