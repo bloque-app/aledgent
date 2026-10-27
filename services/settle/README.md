@@ -154,6 +154,9 @@ range must be exactly the one the alert names:
 aledgent-settle settle.json gap <from> <to>
 ```
 
+Both `gap` and `refound` (below) hold the adapter's lease, so the running adapter is stopped first;
+each runs once and exits.
+
 A reset of the instance (governance's `set_anchor_head`) comes only with its book's re-founding. The
 first start on a reset instance folds from the reset, and a cursor kept from the chain before it is
 reset to the chain's start. A reset under a running adapter raises `reset:<instance>` and stops

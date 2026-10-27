@@ -666,10 +666,11 @@ impl Chain for RpcChain {
         }))
     }
 
+    /// One `ContractsApi_call` and nothing else, so that an idle sync is one read. Whether the
+    /// contract is instantiated is not asked first: the step's assertions read the instance
+    /// (`Chain::instance`) before observation runs, and a contract that is not there fails the
+    /// call ([`ChainError::Invalid`]) rather than answer a head.
     async fn chain_head(&self, at: &BlockRef, instance: u32) -> ChainResult<Option<ChainHead>> {
-        if !self.instantiated(at, instance).await? {
-            return Ok(None);
-        }
         let cell: kreivo::ChainHeadCell = self
             .read(at, instance, kreivo::selector::CHAIN_HEAD.to_vec())
             .await?;
