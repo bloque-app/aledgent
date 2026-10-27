@@ -50,7 +50,8 @@ for f in "$work"/set/*; do [ "$(b2 "$f")" = "$(basename "$f")" ] || fail "$f is 
 [ -f "$work/set/$version" ] || fail "the manifest is not named by the code version"
 jq -e --arg v "$version" '.code == $v and .generation == 1 and (.files | length == 3)
   and .platform.name == "vos-saga" and .source_revision == "abc"' "$work/set.json" >/dev/null || fail "set.json"
-[ "$(stat -f %Lp "$work/set/$version" 2>/dev/null || stat -c %a "$work/set/$version")" = 444 ] || fail "files are read-only"
+mode=$(python3 -I -c 'import os, stat, sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode))[2:])' "$work/set/$version")
+[ "$mode" = 444 ] || fail "files are read-only (mode $mode)"
 
 # --- refusals ------------------------------------------------------------------------------------
 refuses "exists already" "$set_sh" "$fx/report.json" "$fx/manifest" "$fx/package" "$fx/runtime" "$work/set" "$work/x.json"
