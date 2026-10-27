@@ -63,9 +63,10 @@ Incidents and gaps are written to the audit trail (`NFR-6`, `REQ-AT-1`), not to 
    - **Wait**, for a node that keeps the range. The rest of the book goes on.
    - **Record a gap.** Have the adapter record the range as a gap through its own authoritative source
      (the core refuses a gap from any other, `REQ-AT-3`): stop the running adapter (the command takes its
-     lease), then run once, with the range **exactly as the alert names it**,
-     `aledgent-settle <config> gap <from> <to>`, and start the adapter again. The adapter then accepts the
-     layer's head as it stands, **unverified for that range**, and the gap is on the audit trail. The book keeps only the end of its highest gap, so `proof` answers
+     lease), then run once `aledgent-settle <config> gap <from> <to>` with the range the alert names, and
+     start the adapter again. Use the range the command reports: it prints what it recorded, and if it
+     refuses the range it says which range it can record. The adapter then accepts the layer's head as it
+     stands, **unverified for that range**, and the gap is on the audit trail. The book keeps only the end of its highest gap, so `proof` answers
      `Unprovable` for any range that starts below that end, not only for positions inside the gap
      (`REQ-SA-7`).
 6. **Ingest what the gap hid.** `TODO(F-016)`: reporting a skipped range's records to the core from an
@@ -74,9 +75,11 @@ Incidents and gaps are written to the audit trail (`NFR-6`, `REQ-AT-1`), not to 
      `Needs-Review` (`REQ-OP-6`); resolve it with the archive's record as evidence:
      `POST /v1/ops/operations/{reference}/resolve` with a justification;
    - a missing **deposit** has no operation yet: escalate to the owner; do not issue by hand.
-7. **Verify.** At the next sync the adapter accepts the head: the alert (`chain` or `unreadable`) closes,
+7. **Verify.** At the next sync the adapter accepts the head: the `chain` or `unreadable` alert closes,
    `aledgent_observation_cursor_lag` returns to about 0, and the instance's accepted position equals the
-   layer's. Clear nothing by hand.
+   layer's. After an operator's gap, the `gap:` alert it raised (`AledgentObservationGap`) closes once the
+   adapter has accepted the head past the range. If it stays open after that, it is the adapter's
+   defect, not the operator's to clear: raise it with settlement-operations. Clear nothing by hand.
 
 ## After a reset
 

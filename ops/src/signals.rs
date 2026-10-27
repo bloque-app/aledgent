@@ -111,7 +111,6 @@ pub const ADAPTER_ALERTS: &[&str] = &[
     "digest",
     "fees",
     "gap",
-    "incident",
     "lane",
     "position",
     "refusing",
@@ -793,9 +792,9 @@ fn adapter(e: &mut Exposition, a: &AdapterSignals, now: u64) {
     let open = |k: &str| a.alerts.get(k).copied().unwrap_or(0);
     e.gauge(
         "aledgent_observation_chain_mismatches",
-        "Open chain mismatches: entries the adapter read that do not lead to the head the layer holds, after a second read (REQ-IN-5).",
+        "Open chain mismatches (alert kind `chain`): entries the adapter read that do not lead to the head the layer holds, after a second read (REQ-IN-5).",
         &[],
-        open("chain") + open("incident"),
+        open("chain"),
     );
     e.gauge(
         "aledgent_observation_stopped",

@@ -241,8 +241,8 @@ pub fn decode_contract_anchored_entry(bytes: &[u8]) -> Option<(u64, [u8; 32], u6
 /// The signature topic of the contract's `Anchored` event (ink! 5.1.1), the first topic of each.
 ///
 /// Pinned from the contract: `<Anchored as ink::env::Event>::SIGNATURE_TOPIC` in
-/// `contracts/settlement`, which a change to the event's name or field types changes (and the
-/// zombienet gate would then fail to find the event).
+/// `contracts/settlement`, which a change to the event's name or field types changes. A test
+/// recomputes it from the contract's source, so such a change fails there.
 pub const ANCHORED_TOPIC: [u8; 32] =
     hex32(b"1978d6331d5625c5147056235631ac680e9e1b4bb1294d7aa28780f804555682");
 
@@ -1991,6 +1991,55 @@ mod tests {
         v.extend_from_slice(&n.to_le_bytes());
         v.extend_from_slice(&c);
         v
+    }
+
+    /// `T-043-09`: the pinned signature topics are the contract's, recomputed here from its source.
+    /// ink! 5.1.1 sets an event's signature topic to `blake2b-256("Name(type1,type2,...)")`, the
+    /// field types as written, spaces removed (`ink_macro::event::signature_topic`). The verifier
+    /// depends on no contract crate, so the check reads `contracts/settlement/src/lib.rs`: a change
+    /// to either event's fields fails here, rather than making the reader report "unreadable".
+    #[test]
+    fn t_043_09_the_pinned_topics_are_the_contracts_event_signatures() {
+        use blake2::Digest;
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../contracts/settlement/src/lib.rs");
+        let source =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let signature = |event: &str| {
+            let start = source
+                .find(&std::format!("pub struct {event} {{"))
+                .unwrap_or_else(|| panic!("the contract has no event {event}"));
+            let body = &source[start..];
+            let body = &body[..body.find("\n    }").expect("the struct ends")];
+            let types: Vec<String> = body
+                .lines()
+                .filter_map(|l| l.trim().strip_prefix("pub "))
+                .filter(|l| !l.starts_with("struct"))
+                .filter_map(|l| l.split_once(':'))
+                .map(|(_, ty)| ty.trim().trim_end_matches(',').replace(' ', ""))
+                .collect();
+            std::format!("{event}({})", types.join(","))
+        };
+        let topic = |event: &str| -> [u8; 32] {
+            blake2::Blake2b::<blake2::digest::consts::U32>::digest(signature(event).as_bytes())
+                .into()
+        };
+        assert_eq!(
+            signature("Anchored"),
+            "Anchored(InboxSeq,OperationRef,AnchorNumber,Commitment)"
+        );
+        assert_eq!(
+            topic("Anchored"),
+            ANCHORED_TOPIC,
+            "{}",
+            signature("Anchored")
+        );
+        assert_eq!(
+            topic("AnchorHeadSet"),
+            ANCHOR_HEAD_SET_TOPIC,
+            "{}",
+            signature("AnchorHeadSet")
+        );
     }
 
     #[test]

@@ -109,8 +109,8 @@ settlement-operations.
 9. **Running, but observation is stopped** (`AledgentObservationStopped`). The adapter serves and signs,
    and waits for an operator on one instance:
    - `unreadable:<instance>:<position>`: no reader serves that range. Give the adapter a history endpoint,
-     or stop it, run once `aledgent-settle <config> gap <from> <to>` with the range exactly as the alert
-     names it, and start it again;
+     or stop it, run once `aledgent-settle <config> gap <from> <to>` with the range the alert names (use the
+     range the command reports if it refuses), and start it again;
    - `reset:<instance>`: governance reset the layer's instance under it, and nothing reaches the book it
      serves. Once the book is re-founded and the configuration points at it, stop the adapter, run once
      `aledgent-settle <config> refound`, and start it again.
