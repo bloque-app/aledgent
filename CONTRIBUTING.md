@@ -111,6 +111,15 @@ are protected alike (one approving review, code owners, the required checks, sig
 - **Images.** A release or a pre-release publishes every image to `ghcr.io/bloque-app/aledgent-<name>`
   (ingress, settle, ops, signer, core, sidecar) as `sha-<commit>` and `v<version>` (`+` becomes `_`
   in an image tag), and attaches `images.json`, each image by digest (`.github/workflows/release.yml`).
+- **Core releases.** A change to the core (`core.vos`) can ship without a new image and without
+  restarting the host: `.github/workflows/core-release.yml` builds it as the next generation of the
+  code a book already runs, has the node's host write the code manifest, and publishes the three
+  files, each named by its blake2b-256 digest, as `ghcr.io/bloque-app/aledgent-core-code@sha256:…`
+  with a provenance attestation. It prints the code version the operator submits as
+  `Upgrade { code, from }`. It never touches the `aledgent-core` image, deploys nothing and holds no
+  cloud credential. A run follows one predecessor (the package it claims the state of), so test and prod,
+  founded on different packages, each get their own run. `GENERATION` in `agents/core/src/lib.rs` is
+  raised in the commit that needs the upgrade. Host-only releases keep the path above.
 - **Versions.** The workspace's crates take their version from `[workspace.package]`, except those
   compiled into a guest program (`core.vos`, the shard's), which keep a fixed one: a crate's version
   reaches the compiled program, whose bytes are its identity, and a release must not change the core
