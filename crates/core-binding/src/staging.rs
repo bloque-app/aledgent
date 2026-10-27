@@ -280,6 +280,33 @@ pub fn restage(
     Ok(out)
 }
 
+/// Before a restore re-sends an archive, stage every code version its code map names that the
+/// port does not hold (`T-037-09`, [`crate::code_map::CodeMap::claimed`]): each fetched and checked
+/// as [`restage`] checks the versions a hot row names, held to the generation the map gives it.
+/// The same untrusted sources, the same checks, the same port call: a restore has no second path
+/// for code. A version that cannot be staged is an entry of the result; the restore that needs it
+/// refuses before it sends anything.
+pub fn stage_versions(
+    port: &mut dyn crate::host::AgentPort,
+    source: &dyn CodeFetch,
+    versions: &alloc::collections::BTreeMap<[u8; 32], u64>,
+) -> Vec<Restaged> {
+    versions
+        .iter()
+        .map(|(code, generation)| {
+            if port.holds_code(code) {
+                return Restaged::Held(*code);
+            }
+            match fetch_generation(source, code, Some(*generation))
+                .and_then(|checked| port.restage_code(checked, *generation))
+            {
+                Ok(()) => Restaged::Staged(*code),
+                Err(refusal) => Restaged::Refused(*code, refusal),
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

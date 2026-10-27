@@ -422,6 +422,43 @@ pub struct RolledForward {
     pub roots: crate::envelope::Roots,
     /// Its log head after.
     pub log_head: [u8; 32],
+    /// The code map of the inputs it re-sent (`T-037-09`): the ranges, each the code version and
+    /// generation the inputs before it named, under which they were re-sent. Empty when nothing
+    /// was re-sent.
+    pub code_map: crate::code_map::CodeMap,
+}
+
+/// The code map a roll-forward of `archive` onto the Agent behind `port` will need, as the
+/// archive's entries claim it ([`crate::code_map::CodeMap::claimed`]): from the Agent's checkpoint
+/// if it holds one, else from the founding's code. What a restore stages before it calls
+/// [`roll_forward_agent`] (`T-037-09`), which checks the port holds it and derives the real map as
+/// it re-sends.
+///
+/// # Errors
+///
+/// The Agent's hot row cannot be read, it stands past the archive, or an entry goes back to an
+/// earlier version.
+pub fn claimed_code_map<P: AgentPort>(
+    port: &mut P,
+    founding: &Founding,
+    archive: &[RingEntry],
+) -> Result<crate::code_map::CodeMap, String> {
+    let (start, from) = match port.hot().map_err(|e| format!("the Agent: {e:?}"))? {
+        Some(hot) => (crate::fence::WriterCode::of(&hot), hot.inputs),
+        None => (
+            crate::fence::WriterCode {
+                code: crate::envelope::FoundingCode::of(&founding.genesis).code,
+                generation: 0,
+                upgrade: None,
+            },
+            0,
+        ),
+    };
+    let from = usize::try_from(from)
+        .ok()
+        .filter(|f| *f <= archive.len())
+        .ok_or_else(|| format!("the checkpoint stands at input {from}, past the archive"))?;
+    crate::code_map::CodeMap::claimed(&start, &archive[from..])
 }
 
 /// Bring the Agent behind `port` to the end of `archive` (`T-005-16`, a restore from the
@@ -436,6 +473,16 @@ pub struct RolledForward {
 /// Either way the inputs after are re-sent through [`Driver::roll_forward`], each checked against
 /// its archived entry, and the Agent must end at the archive's last log hash and roots. The host
 /// writes nothing: `archive` is already its log. Returns the port, and where the Agent stands.
+///
+/// **Per range** (`T-037-09`, amendment 0023 (d)): the archive is split at the code map's
+/// boundaries, and each range is re-sent under its own code version, the platform switched to it
+/// before the range starts, as the live upgrade switched it. Before anything is re-sent, the port
+/// must hold every version the archive's entries name ([`AgentPort::holds_code`]): a version it
+/// does not hold is refused up front, naming its range, and not hours into a restore. The map is
+/// then derived from the inputs as they are re-sent, every entry held to it, and returned. A
+/// range whose platform this host cannot run is re-sent by that range's replayer
+/// (`replayer/<hex H>` in the code archive): give this function the archive up to the range's
+/// end, and the next replayer the Agent it leaves.
 pub fn roll_forward_agent<P: AgentPort>(
     mut port: P,
     founding: &Founding,
@@ -490,7 +537,29 @@ pub fn roll_forward_agent<P: AgentPort>(
     let rest = &archive[usize::try_from(from)
         .unwrap_or(usize::MAX)
         .min(archive.len())..];
-    driver
+    // Every version the entries name, held before anything is sent (`T-037-09`).
+    let claimed = crate::code_map::CodeMap::claimed(&driver.writer(), rest)?;
+    let missing: Vec<String> = claimed
+        .ranges
+        .iter()
+        .filter(|r| !driver.port().holds_code(&r.code))
+        .map(|r| {
+            format!(
+                "inputs {}..={} ran code version {} (generation {}), which this host does not \
+                 hold: stage it from the code sources, or re-send the range under its replayer \
+                 replayer/{}",
+                r.from,
+                r.to,
+                crate::code_map::hex(&r.code),
+                r.generation,
+                crate::code_map::hex(&r.code)
+            )
+        })
+        .collect();
+    if !missing.is_empty() {
+        return Err(missing.join("; "));
+    }
+    let code_map = driver
         .roll_forward(&mut replica, rest)
         .map_err(|e| format!("roll forward: {e:?}"))?;
     let mut port = driver.into_port();
@@ -519,6 +588,7 @@ pub fn roll_forward_agent<P: AgentPort>(
             founded,
             roots: hot.roots(),
             log_head: hot.log_head,
+            code_map,
         },
     ))
 }
