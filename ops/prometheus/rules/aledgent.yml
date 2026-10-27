@@ -41,6 +41,12 @@ groups:
         annotations:
           summary: The entries the adapter read do not lead to the head the settlement layer holds, and a second read did not change that.
           runbook: ops/runbooks/gap-filling.md
+      - alert: AledgentObservationStopped
+        expr: aledgent_observation_stopped > 0
+        labels: { severity: page, owner: settlement-operations, signal: observation-completeness }
+        annotations:
+          summary: Observation waits for an operator, because no reader can serve a range or the settlement layer was reset under the running adapter.
+          runbook: ops/runbooks/gap-filling.md
       - alert: AledgentObservationLag
         expr: aledgent_observation_cursor_lag > 100
         for: 10m

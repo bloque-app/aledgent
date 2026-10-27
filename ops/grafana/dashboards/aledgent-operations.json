@@ -155,6 +155,11 @@
           "legendFormat": "chain mismatches"
         },
         {
+          "refId": "E",
+          "expr": "aledgent_observation_stopped",
+          "legendFormat": "stopped, waiting for an operator"
+        },
+        {
           "refId": "D",
           "expr": "aledgent_observation_gaps_total",
           "legendFormat": "gaps, ever"

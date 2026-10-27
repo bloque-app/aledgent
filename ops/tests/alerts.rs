@@ -200,6 +200,24 @@ fn nfr_11_each_signal_over_its_line_pages_the_test_route() {
                 s.adapter.as_mut().unwrap().alerts.insert("chain".into(), 1);
             },
         ),
+        (
+            "AledgentObservationStopped",
+            "observation-completeness",
+            |s| {
+                s.adapter
+                    .as_mut()
+                    .unwrap()
+                    .alerts
+                    .insert("unreadable".into(), 1);
+            },
+        ),
+        (
+            "AledgentObservationStopped",
+            "observation-completeness",
+            |s| {
+                s.adapter.as_mut().unwrap().alerts.insert("reset".into(), 1);
+            },
+        ),
         ("AledgentObservationLag", "observation-completeness", |s| {
             s.adapter.as_mut().unwrap().cursor = 0;
             s.adapter.as_mut().unwrap().inbox = 101;
