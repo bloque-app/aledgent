@@ -589,7 +589,12 @@ fn t037_09_a_book_on_a_named_genesis_code_restores_under_its_code_map() {
         limits,
         genesis_roots: None,
     };
+    // The port tracks the code it runs, as the core host's does for a named H₀ (`T-037-14`): it
+    // holds H₀ and nothing else, so the roll forward's check that the port holds every version is
+    // a real one (a port with no map holds every version).
     let mut port = NativePort::new();
+    port.code_map = [(h0, 0)].into_iter().collect();
+    assert!(!port.holds_code(&[0xEE; 32]));
     let claimed = claimed_code_map(&mut port, &founding, &fx.archive).unwrap();
     let want = CodeMap {
         ranges: vec![CodeRange {

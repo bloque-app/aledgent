@@ -35,10 +35,6 @@
 //! (`T-037-17`), neither built; and the platform's execution under each range's replayer, which
 //! needs the real packages (the core release job's check).
 
-// The fixture is a book in the default construction (`DEC-25`); a build of another construction
-// (`smt-v1`) founds another book, and a deployment never mixes the two.
-#![cfg(not(feature = "smt-v1"))]
-
 mod common;
 use common::*;
 
@@ -125,6 +121,112 @@ fn fixture() -> Fixture {
     )
 }
 
+/// The fixture is a book in the default construction (`DEC-25`, roots v2). A build in another
+/// construction (`smt-v1`) founds another book from the same genesis, and a deployment never
+/// mixes the two, so the gate cannot run there: it says so and fails, instead of passing with
+/// nothing checked. CI runs the gate in the default construction only
+/// (`.github/workflows/code-history.yml`); the v1-roots test run skips this file by name.
+fn construction_of_the_fixture() {
+    if cfg!(feature = "smt-v1") {
+        panic!(
+            "the code-history fixture is a book in roots v2; this build is roots v1 (smt-v1), which \
+             founds another book: run the gate without smt-v1"
+        );
+    }
+}
+
+/// The `Call` variants serde derives, in declaration order (as `tests/call_tags.rs` reads them).
+fn variants() -> Vec<String> {
+    let e = serde_json::from_str::<ledger_core::call::Call>(r#""__not_a_variant__""#)
+        .expect_err("no such variant")
+        .to_string();
+    e.split("expected one of ")
+        .nth(1)
+        .unwrap_or_else(|| panic!("{e}"))
+        .split(", ")
+        .map(|v| {
+            v.trim()
+                .trim_end_matches(|c: char| c != '`')
+                .trim_matches('`')
+                .to_string()
+        })
+        .collect()
+}
+
+/// The variant of `call`, by serde's name for it.
+fn variant_of(call: &ledger_core::call::Call) -> String {
+    match serde_json::to_value(call).expect("a call serialises") {
+        serde_json::Value::String(s) => s,
+        serde_json::Value::Object(m) => m.keys().next().cloned().expect("a variant"),
+        other => panic!("{other}"),
+    }
+}
+
+/// The `Call` variants the fixture records no input of, yet. Each is a way a transition decides
+/// that the gate does not check: a change to it passes the gate untested. The list only shrinks:
+/// recording one (an extension that exercises it) fails [`t037_12_the_fixture_covers_every_call`]
+/// until it is removed here.
+const NOT_YET_RECORDED: &[&str] = &[
+    // Credentials, custody, recovery and succession.
+    "RegisterCredential",
+    "RemoveCredential",
+    "DelegateCustody",
+    "ReclaimCustody",
+    "InitiateRecovery",
+    "CancelRecovery",
+    "CompleteRecovery",
+    "NameSuccessor",
+    "ClaimSuccession",
+    // The settlement adapter's inputs: observations, deliveries, signing, re-scans.
+    "CompareSettlement",
+    "RecordObservation",
+    "Adapter",
+    "DeclareSupport",
+    "Withdraw",
+    "SubmitOutbound",
+    "Acknowledge",
+    "Verify",
+    "EvidenceChecked",
+    "RecordSigning",
+    "ObserveHead",
+    "RecordGap",
+    "Rescan",
+    "ReceiveTransfer",
+    "ReceiveCommand",
+    "DeclareAdapterSupport",
+    // The lifecycle and operations.
+    "RevokeAuthority",
+    "IssueDisclosure",
+    "Resume",
+    "ReserveUntil",
+    "ResolveOperation",
+    "SubmitEvidence",
+    "ProposeReversal",
+    "ApproveReversal",
+    "PrivilegedRead",
+    // Assets, issuance, openings and integrations.
+    "DeprecateAsset",
+    "ApplySpecChunk",
+    "LoadOpeningBalances",
+    "RegisterAsset",
+    "BindAsset",
+    "GrantIssuance",
+    "RevokeIssuance",
+    "ImportCredentials",
+    "RegisterIntegratingParty",
+    "TiePrincipal",
+    "RegisterAlias",
+    "RevokeOperator",
+    // Changes of the upgrade-authority mode (T-037-05).
+    "UpgradeAuthority",
+    // Not an input the book decides: the call the native run records for a method the Agent does not support.
+    "Unsupported",
+    // The conformance suite's raw ports (feature conformance-ports), never in a book.
+    "PortReceive",
+    "PortArrive",
+    "PortFire",
+];
+
 /// A native port that runs every version `map` names as its generation: the platform modelled.
 fn holding(map: &CodeMap) -> NativePort {
     let mut p = NativePort::new();
@@ -177,6 +279,7 @@ fn decided(port: &mut NativePort) -> Decided {
 /// code map from the inputs.
 #[test]
 fn t037_12_the_fixture_replays_from_genesis_under_its_code_map() {
+    construction_of_the_fixture();
     let f = fixture();
     assert!(
         f.map.ranges.len() >= 2,
@@ -212,6 +315,7 @@ fn t037_12_the_fixture_replays_from_genesis_under_its_code_map() {
 /// and under the next one.
 #[test]
 fn t037_12_every_way_out_at_n_is_decided_the_same_by_either_generation() {
+    construction_of_the_fixture();
     let f = fixture();
     let mut checked = 0;
     for (i, e) in f.entries.iter().enumerate() {
@@ -242,6 +346,37 @@ fn t037_12_every_way_out_at_n_is_decided_the_same_by_either_generation() {
         checked += 1;
     }
     assert!(checked >= 3, "only {checked} way-out inputs at n");
+}
+
+/// `T-037-12`: every `Call` variant has a recorded input, but those [`NOT_YET_RECORDED`] names:
+/// a variant added without one fails here, and so does a variant on the list that the fixture
+/// records (the list only shrinks).
+#[test]
+fn t037_12_the_fixture_covers_every_call() {
+    construction_of_the_fixture();
+    let f = fixture();
+    let recorded: std::collections::BTreeSet<String> = f
+        .entries
+        .iter()
+        .flat_map(|e| e.calls.iter().map(variant_of))
+        .collect();
+    let uncovered: Vec<String> = variants()
+        .into_iter()
+        .filter(|v| !recorded.contains(v) && !NOT_YET_RECORDED.contains(&v.as_str()))
+        .collect();
+    assert!(
+        uncovered.is_empty(),
+        "Call variants with no recorded input in the code-history fixture: {uncovered:?}. Extend the \
+         fixture with an input of each (`extend`), or list them in NOT_YET_RECORDED with the reason"
+    );
+    let stale: Vec<&&str> = NOT_YET_RECORDED
+        .iter()
+        .filter(|v| recorded.contains(**v))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "recorded now, remove from NOT_YET_RECORDED: {stale:?}"
+    );
 }
 
 /// A transfer of `amount` minor units, with a deadline (the fixture's configuration has no
@@ -310,6 +445,7 @@ fn extend() {
         eprintln!("not extending: set ALEDGENT_CODE_HISTORY_EXTEND=1");
         return;
     }
+    construction_of_the_fixture();
     let d = dir();
     fs::create_dir_all(&d).unwrap();
     let f = read().unwrap_or_else(|| {
@@ -382,6 +518,39 @@ fn extend() {
     let release = ledger_core::ledger::Ctx { now: fx.now, ..c };
     fx.replica.release(&release).unwrap();
     fx.synced();
+    // Redemption; an account frozen and unfrozen; an identity restricted and reinstated; an empty
+    // account closed; the clock advanced past the open reservations' deadlines.
+    let issuer = fx.operator();
+    let c = fx.ctx(issuer);
+    let _ = fx.replica.redeem(&c, usd(), a, Minor::new(5));
+    fx.synced();
+    for freeze in [true, false] {
+        let c = fx.ctx(fx.operator());
+        let _ = if freeze {
+            fx.replica.freeze_account(&c, b, b"code-history: freeze")
+        } else {
+            fx.replica
+                .unfreeze_account(&c, b, b"code-history: unfreeze")
+        };
+        fx.synced();
+    }
+    for status in [
+        ledger_core::identity::IdentityStatus::Restricted,
+        ledger_core::identity::IdentityStatus::Active,
+    ] {
+        let c = fx.ctx(fx.operator());
+        let _ = fx.replica.set_identity_status(&c, q.principal, status);
+        fx.synced();
+    }
+    let empty = fx.account(&q);
+    let c = fx.ctx(q);
+    let _ = fx.replica.close_account(&c, empty);
+    fx.synced();
+    let _ = fx.replica.tick(fx.now + 1_000_000);
+    if fx.sync().ok().flatten().is_some() {
+        fx.archive.push(fx.driver.last_entry.clone().unwrap());
+        fx.driver.archived();
+    }
     // A checkpoint, anchored: the book's settlement configuration and the operator's grant to
     // anchor, once per book.
     if g == 0 {
@@ -457,12 +626,19 @@ fn extend() {
     let mut port = NativePort::new();
     let claimed = claimed_code_map(&mut port, &founding, &extended.entries).unwrap();
     let (_, rolled) = roll(&extended, holding(&claimed), extended.entries.len());
-    fs::write(d.join("entries.bin"), bytes).unwrap();
-    fs::write(
-        d.join("code-map.json"),
-        serde_json::to_vec_pretty(&rolled.code_map).unwrap(),
-    )
-    .unwrap();
+    // Each file whole or not at all (written aside, then renamed), the map first: an extension
+    // interrupted between the two leaves a map that names inputs the entries do not hold yet, which
+    // the gate refuses, never entries the map does not cover.
+    let put = |name: &str, bytes: &[u8]| {
+        let tmp = d.join(format!("{name}.tmp"));
+        fs::write(&tmp, bytes).unwrap();
+        fs::rename(&tmp, d.join(name)).unwrap();
+    };
+    put(
+        "code-map.json",
+        &serde_json::to_vec_pretty(&rolled.code_map).unwrap(),
+    );
+    put("entries.bin", &bytes);
     eprintln!(
         "code-history: {} inputs, {} ranges",
         extended.entries.len(),

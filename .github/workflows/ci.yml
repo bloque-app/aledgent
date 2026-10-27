@@ -100,13 +100,16 @@ jobs:
       - run: cargo test -p shards --features native-decide --test native_decide
       # DEC-25, owner ruling cs-q04: v1 roots are a supported opt-in. The crates with a root version,
       # built with v1 (the default run above is v2, and its differential already runs every unit
-      # under both versions). The conformance suite from a v1 genesis is its own job below.
+      # under both versions). The conformance suite from a v1 genesis is its own job below. The
+      # code-history gate (T-037-12) is skipped by name: its recorded book is a v2 book, which a v1
+      # build founds differently, and it fails loudly if run here (code-history.yml runs it, in v2).
       - name: v1 roots (supported opt-in)
         env:
           LEDGER_KERNEL_DIFF_CASES: "1000"
         run: >-
           cargo test -p compact-smt -p ledger-kernel -p ledger-core -p leaf-store -p core-binding -p shards
           --features compact-smt/v1,ledger-kernel/smt-v1,ledger-core/smt-v1,leaf-store/smt-v1,core-binding/smt-v1,core-binding/ingress,shards/smt-v1
+          -- --skip t037_12_
       # The cross-host relay (an experiment, feature net): hosts in threads and as processes.
       - run: cargo test -p shards --features net --test multihost
       - name: disk left after the tests

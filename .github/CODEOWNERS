@@ -15,3 +15,10 @@
 /REUSE.toml             @bloque-app/aledgent-maintainers
 /LICENSES/              @bloque-app/aledgent-spec-owner
 /tools/ci/check-no-vos.sh @bloque-app/aledgent-spec-owner
+
+# The code-history gate (T-037-12): the recorded history every build must replay, and what holds
+# it. A change here changes what "the history still replays" means.
+/crates/core-binding/tests/fixtures/code-history/ @bloque-app/aledgent-spec-owner
+/crates/core-binding/tests/code_history.rs        @bloque-app/aledgent-spec-owner
+/tools/ci/check-code-history-fixture.sh           @bloque-app/aledgent-spec-owner
+/.github/workflows/code-history.yml               @bloque-app/aledgent-spec-owner

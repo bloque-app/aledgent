@@ -14,42 +14,44 @@ name: Code history
 # and requires the same writer state (D18). The recorded part of the history may only grow: a change
 # that rewrote it would pass by re-recording what it breaks.
 #
-# It runs on every change to the core's guest, its host, the kernel, the library or the call format,
-# and it is a reusable workflow: the core release job (core-release.yml) calls it before a code
-# version is built, so no code version is published from a tree that fails it.
+# It runs on every change to Rust anywhere but the paths it lists as skipped, and it is a reusable
+# workflow (workflow_call): the core release job of aledgent#80 calls it before a code version is
+# built, once aledgent#88 wires it in. Until then it is advisory: a red run here blocks nothing by
+# itself, unless the repository makes it a required check.
 #
 # Not here yet: a construction migration (T-037-10) and a continuation (T-037-17), neither built;
 # the platform's execution of each range under its replayer, with the real packages; and the read-only
 # replay of a deployment's archive, which needs read access to the archive.
 
 on:
+  # Every change to Rust, its manifests, its lock files or its toolchain, anywhere: the history a
+  # book replays depends on more than the core's own crates (ledger-core's dependencies, the
+  # kernel, the toolchain). Skipped only for the paths listed after the `!`, which no core links.
   pull_request:
     paths:
-      - "agents/core/**"
-      - "agents/core-host/**"
-      - "crates/core-binding/**"
-      - "crates/ledger-core/**"
-      - "crates/ledger-kernel/**"
-      - "crates/compact-smt/**"
-      - "crates/leaf-store/**"
-      - "Cargo.lock"
-      - "agents/Cargo.lock"
+      - "**.rs"
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - "**/rust-toolchain.toml"
+      - "rust-toolchain.toml"
+      - "crates/core-binding/tests/fixtures/code-history/**"
       - "tools/ci/check-code-history-fixture.sh"
       - ".github/workflows/code-history.yml"
+      - "!spikes/**"
+      - "!e2e/**"
   push:
     branches: [develop, main]
     paths:
-      - "agents/core/**"
-      - "agents/core-host/**"
-      - "crates/core-binding/**"
-      - "crates/ledger-core/**"
-      - "crates/ledger-kernel/**"
-      - "crates/compact-smt/**"
-      - "crates/leaf-store/**"
-      - "Cargo.lock"
-      - "agents/Cargo.lock"
+      - "**.rs"
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - "**/rust-toolchain.toml"
+      - "rust-toolchain.toml"
+      - "crates/core-binding/tests/fixtures/code-history/**"
       - "tools/ci/check-code-history-fixture.sh"
       - ".github/workflows/code-history.yml"
+      - "!spikes/**"
+      - "!e2e/**"
   workflow_call:
   workflow_dispatch:
 
@@ -85,14 +87,24 @@ jobs:
           case "$EVENT" in
             pull_request) base="$PR_BASE" ;;
             push) base="$BEFORE" ;;
-            # A release, or a run by hand: against the newest release tag.
-            *) base=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true) ;;
+            # A release, or a run by hand: against the newest release tag before this commit (a tagged
+            # commit is never compared with its own tag).
+            *) base=$(git describe --tags --abbrev=0 --match 'v*' "$(git rev-parse HEAD)^" 2>/dev/null || true) ;;
           esac
           if [ -z "$base" ] || [ "$base" = 0000000000000000000000000000000000000000 ]; then
             echo "No base to compare the recorded history with: skipped." | tee -a "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          tools/ci/check-code-history-fixture.sh "$base" | tee -a "$GITHUB_STEP_SUMMARY"
+          # The base's copy of the check, not this change's: a change cannot loosen the rule it is
+          # held to. Only where the base has none yet (the change that adds it) is this one used.
+          script=tools/ci/check-code-history-fixture.sh
+          if git cat-file -e "$base:$script" 2>/dev/null; then
+            git show "$base:$script" >"$RUNNER_TEMP/check-code-history-fixture.sh"
+          else
+            echo "::notice::$script is not on the base yet: this change's copy runs"
+            cp "$script" "$RUNNER_TEMP/check-code-history-fixture.sh"
+          fi
+          bash "$RUNNER_TEMP/check-code-history-fixture.sh" "$base" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -100,7 +112,15 @@ jobs:
           shared-key: code-history
 
       - name: This build replays the recorded history, and decides each way out the same by either generation
-        run: cargo test -p core-binding --features ingress --test code_history
+        run: |
+          set -euo pipefail
+          cargo test -p core-binding --features ingress --test code_history 2>&1 | tee "$RUNNER_TEMP/gate.log"
+          # Each check ran and passed: the gate cannot pass by running nothing.
+          for t in t037_12_the_fixture_replays_from_genesis_under_its_code_map \
+                   t037_12_every_way_out_at_n_is_decided_the_same_by_either_generation \
+                   t037_12_the_fixture_covers_every_call; do
+            grep -qx "test $t ... ok" "$RUNNER_TEMP/gate.log" || { echo "::error::$t did not run and pass"; exit 1; }
+          done
 
       - name: Restore and replay across upgrades (AC-K7.3, AC-K7.18), and the code map
         run: |
