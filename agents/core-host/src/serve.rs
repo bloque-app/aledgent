@@ -924,10 +924,15 @@ pub fn restore(args: &[String]) -> Result<(), String> {
             plan.book
         ));
     }
+    // A restore that wrote its result and stopped before it removed the plan is finished: it
+    // is not run again, so a second run cannot replace the result it wrote (T-037-09).
+    if already_restored(&dir, &plan)? {
+        return Ok(());
+    }
     let started = std::time::Instant::now();
     // T-037-09: where the versions an archive across upgrades names are fetched from.
     let code_source = crate::code_source::from_args(args, &dir)?;
-    let mut port = open_port(
+    let port = open_port(
         &runtime,
         &actor,
         &keys,
@@ -946,46 +951,18 @@ pub fn restore(args: &[String]) -> Result<(), String> {
         }
     })?;
     let entries = FileLog::open(&dir)?.entries()?;
-    // T-037-09: every version the archive names, staged before anything is re-sent. The roll
-    // forward refuses up front if one is missing, and holds every entry to the map it derives.
-    let claimed = core_binding::core::claimed_code_map(&mut port, &founding, &entries)?;
-    if let Some(source) = code_source.as_deref() {
-        let staged = core_binding::staging::stage_versions(&mut port, source, &claimed.versions());
-        for line in describe_staged(&staged) {
-            eprintln!("aledgent-core-host: restore: {line}");
-        }
-    }
     let stores = ReplicaStores::Disk {
         dir: dir.join("replica"),
         cache_bytes: REPLICA_CACHE_BYTES,
     };
-    let (port, rolled) = roll_forward_agent(port, &founding, &entries, &stores)?;
+    let source = code_source
+        .as_deref()
+        .map(|f| f as &dyn core_binding::staging::CodeFetch);
+    let (port, rolled) = restore_onto(port, &founding, &entries, source, &stores, &plan)?;
     drop(port);
-    let p = &plan.point;
-    let at_point = rolled.to == p.entries
-        && hex::encode(rolled.log_head) == p.log_head
-        && (p.entries == 0
-            || (hex::encode(rolled.roots.kernel) == p.kernel_root
-                && hex::encode(rolled.roots.service) == p.service_root
-                && hex::encode(rolled.roots.audit) == p.audit));
-    if !at_point {
-        return Err(format!(
-            "the Agent stands at input {} and the plan's point is {}: refused",
-            rolled.to, p.entries
-        ));
-    }
     let done = serde_json::json!({
         "plan": plan,
-        "rolled": {
-            "from": rolled.from,
-            "to": rolled.to,
-            "founded": rolled.founded,
-            "kernel_root": hex::encode(rolled.roots.kernel),
-            "service_root": hex::encode(rolled.roots.service),
-            "audit": hex::encode(rolled.roots.audit),
-            "log_head": hex::encode(rolled.log_head),
-            "code_map": rolled.code_map,
-        },
+        "rolled": rolled,
         "elapsed_ms": started.elapsed().as_millis() as u64,
     });
     let bytes = serde_json::to_vec_pretty(&done).map_err(|e| e.to_string())?;
@@ -1004,6 +981,149 @@ pub fn restore(args: &[String]) -> Result<(), String> {
         serde_json::to_string(&done).map_err(|e| e.to_string())?
     );
     Ok(())
+}
+
+/// Whether the restore laid out in `dir` already finished: its result is written for this plan's
+/// point. Then the plan is removed (the step a crash interrupted) and nothing else is done.
+///
+/// # Errors
+///
+/// A result is there for another point (the layout is not this restore's), or a file cannot be
+/// read or removed.
+fn already_restored(dir: &Path, plan: &core_archive::RestorePlan) -> Result<bool, String> {
+    let done_path = dir.join(RESTORED_FILE);
+    let Ok(bytes) = fs::read(&done_path) else {
+        return Ok(false);
+    };
+    let done: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", done_path.display()))?;
+    let want = serde_json::to_value(&plan.point).map_err(|e| e.to_string())?;
+    if done.pointer("/plan/point") != Some(&want) {
+        return Err(format!(
+            "{} is there for another point than the plan's: the directory is not this restore's",
+            done_path.display()
+        ));
+    }
+    let plan_path = dir.join(core_archive::RESTORE_FILE);
+    fs::remove_file(&plan_path).map_err(|e| format!("{}: {e}", plan_path.display()))?;
+    eprintln!(
+        "aledgent-core-host: restore: already done for this plan ({RESTORED_FILE}); the plan is removed"
+    );
+    Ok(true)
+}
+
+/// The restore once the Agent's port is open (`T-005-16`, `T-037-09`): every version the archive
+/// names staged from `source`, then refused up front if the port does not hold one, before
+/// anything is sent; the archive rolled forward range by range; the Agent held to the plan's
+/// point. Returns the port and what `restore.done.json` records of the roll forward, the code map
+/// whole: the checkpoint's prefix as its entries name it (held to their log-hash chain when the
+/// replica is rebuilt), then the inputs re-sent, as the inputs decide it.
+///
+/// # Errors
+///
+/// A version the port cannot have, an entry the map refuses, a roll forward that does not end at
+/// the plan's point.
+pub(crate) fn restore_onto<P: AgentPort>(
+    mut port: P,
+    founding: &Founding,
+    entries: &[RingEntry],
+    source: Option<&dyn core_binding::staging::CodeFetch>,
+    stores: &ReplicaStores,
+    plan: &core_archive::RestorePlan,
+) -> Result<(P, serde_json::Value), String> {
+    let claimed = core_binding::core::claimed_code_map(&mut port, founding, entries)?;
+    if let Some(source) = source {
+        let staged = core_binding::staging::stage_versions(&mut port, source, &claimed.versions());
+        for line in describe_staged(&staged) {
+            eprintln!("aledgent-core-host: restore: {line}");
+        }
+    }
+    // Before anything is sent, the Agent founded included.
+    let missing: Vec<String> = claimed
+        .ranges
+        .iter()
+        .filter(|r| !port.holds_code(&r.code))
+        .map(|r| {
+            format!(
+                "inputs {}..={} ran code version {} (generation {}), which this host cannot have: \
+                 put it in a source of --code-config, or re-send the range under its replayer \
+                 replayer/{}",
+                r.from,
+                r.to,
+                core_binding::code_map::hex(&r.code),
+                r.generation,
+                core_binding::code_map::hex(&r.code)
+            )
+        })
+        .collect();
+    if !missing.is_empty() {
+        return Err(missing.join("; "));
+    }
+    let (port, rolled) = roll_forward_agent(port, founding, entries, stores)?;
+    let p = &plan.point;
+    let at_point = rolled.to == p.entries
+        && hex::encode(rolled.log_head) == p.log_head
+        && (p.entries == 0
+            || (hex::encode(rolled.roots.kernel) == p.kernel_root
+                && hex::encode(rolled.roots.service) == p.service_root
+                && hex::encode(rolled.roots.audit) == p.audit));
+    if !at_point {
+        return Err(format!(
+            "the Agent stands at input {} and the plan's point is {}: refused",
+            rolled.to, p.entries
+        ));
+    }
+    let code_map = whole_map(founding, entries, &rolled)?;
+    Ok((
+        port,
+        serde_json::json!({
+            "from": rolled.from,
+            "to": rolled.to,
+            "founded": rolled.founded,
+            "kernel_root": hex::encode(rolled.roots.kernel),
+            "service_root": hex::encode(rolled.roots.service),
+            "audit": hex::encode(rolled.roots.audit),
+            "log_head": hex::encode(rolled.log_head),
+            "code_map": code_map,
+        }),
+    ))
+}
+
+/// The code map of the whole archive a restore rolled forward: the checkpoint's prefix, as its
+/// entries name it from the genesis code, then the map of the inputs re-sent.
+fn whole_map(
+    founding: &Founding,
+    entries: &[RingEntry],
+    rolled: &core_binding::core::RolledForward,
+) -> Result<core_binding::code_map::CodeMap, String> {
+    let from = usize::try_from(rolled.from)
+        .ok()
+        .filter(|f| *f <= entries.len())
+        .ok_or("the checkpoint stands past the archive")?;
+    let start = core_binding::fence::WriterCode {
+        code: core_binding::envelope::FoundingCode::of(&founding.genesis).code,
+        generation: 0,
+        upgrade: None,
+    };
+    let mut map = core_binding::code_map::CodeMap::claimed(&start, &entries[..from])?;
+    for r in &rolled.code_map.ranges {
+        if let Some(last) = map.ranges.last()
+            && last.code == r.code
+            && last.generation != r.generation
+        {
+            return Err(format!(
+                "the checkpoint's prefix names code version {} as generation {}, the inputs after \
+                 it as {}",
+                core_binding::code_map::hex(&r.code),
+                last.generation,
+                r.generation
+            ));
+        }
+        for seq in r.from..=r.to {
+            map.push(seq, r.code, r.generation);
+        }
+    }
+    Ok(map)
 }
 
 /// What staging an archive's versions did, one line each for a version that was fetched or could
@@ -1031,6 +1151,339 @@ fn describe_staged(report: &[core_binding::staging::Restaged]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A book on the native Agent with an upgrade to generation 1 taken, its archive, the source
+    /// that holds the version, the genesis code and the version (`T-037-09`'s restore tests).
+    mod across {
+        use std::collections::BTreeMap;
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use core_binding::core::Founding;
+        use core_binding::envelope::BlobKey;
+        use core_binding::host::{AgentPort, Driver, HostKeys, NativePort, PortError};
+        use core_binding::hot::{Hot, Limits, RingEntry};
+        use core_binding::staging::CodeFetch;
+        use ledger_core::code::{
+            Artefact, BuildProfile, CodeManifest, KernelIdentity, Platform, Role, WriterKind,
+            artefact_digest, generation_record,
+        };
+        use ledger_core::identity::IdentityKind;
+        use ledger_core::ledger::Ctx;
+        use ledger_core::principal::{Caller, Verifier};
+
+        #[derive(Default)]
+        pub struct Source(pub Mutex<BTreeMap<[u8; 32], Vec<u8>>>);
+        impl CodeFetch for Source {
+            fn name(&self) -> &str {
+                "test"
+            }
+            fn fetch(&self, digest: &[u8; 32], _: Option<u64>) -> Option<Vec<u8>> {
+                self.0.lock().unwrap().get(digest).cloned()
+            }
+        }
+        impl Source {
+            fn put(&self, b: &[u8]) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .insert(artefact_digest(b), b.to_vec());
+            }
+            /// A whole version of `generation`; its digest.
+            pub fn version(&self, generation: u64) -> [u8; 32] {
+                let ro = generation_record(generation);
+                let mut package = Vec::new();
+                package.extend_from_slice(&(ro.len() as u32).to_le_bytes()[..3]);
+                package.extend_from_slice(&[0; 8]);
+                package.extend_from_slice(&ro);
+                package.extend_from_slice(&1u32.to_le_bytes());
+                package.push(0);
+                let runtime = b"agent-runtime".to_vec();
+                let art = |role, b: &[u8]| Artefact {
+                    role,
+                    digest: artefact_digest(b),
+                    len: b.len() as u64,
+                    identities: Vec::new(),
+                    profile: BuildProfile {
+                        target: "riscv64em-vos".into(),
+                        toolchain: "nightly".into(),
+                        opt_level: "s".into(),
+                        features: Vec::new(),
+                        source_revision: "0123abcd".into(),
+                        cargo_lock: [0; 32],
+                    },
+                };
+                let m = CodeManifest {
+                    writer: WriterKind::Core,
+                    platform: Platform {
+                        name: "vos-saga".into(),
+                        revision: "bd8d1bb7".into(),
+                        identities: Vec::new(),
+                    },
+                    generation,
+                    artefacts: vec![art(Role::Package, &package), art(Role::Runtime, &runtime)],
+                    kernel: KernelIdentity {
+                        revision: "e9a7b08".into(),
+                        checksum: None,
+                    },
+                    constructions: Vec::new(),
+                    messages: Vec::new(),
+                };
+                self.put(&package);
+                self.put(&runtime);
+                self.put(&m.to_bytes());
+                m.version()
+            }
+        }
+
+        /// A native port that counts what it is sent.
+        pub struct Counting(pub NativePort, pub std::sync::Arc<AtomicUsize>);
+        impl AgentPort for Counting {
+            fn invoke(&mut self, m: Vec<u8>, b: Vec<Vec<u8>>) -> Result<Vec<u8>, PortError> {
+                self.1.fetch_add(1, Ordering::SeqCst);
+                self.0.invoke(m, b)
+            }
+            fn blob_key(&self, bytes: &[u8]) -> BlobKey {
+                self.0.blob_key(bytes)
+            }
+            fn hot(&mut self) -> Result<Option<Hot>, PortError> {
+                self.0.hot()
+            }
+            fn entry(&mut self, seq: u64) -> Result<Option<RingEntry>, PortError> {
+                self.0.entry(seq)
+            }
+            fn switch_to(&mut self, code: [u8; 32]) -> Result<(), String> {
+                self.0.switch_to(code)
+            }
+            fn holds_code(&self, code: &[u8; 32]) -> bool {
+                self.0.holds_code(code)
+            }
+            fn restage_code(
+                &mut self,
+                checked: core_binding::staging::Checked,
+                generation: u64,
+            ) -> Result<(), core_binding::staging::StageRefusal> {
+                self.0.restage_code(checked, generation)
+            }
+        }
+
+        pub fn founding() -> Founding {
+            Founding {
+                genesis: crate::genesis(),
+                op: crate::op(0),
+                at: 1,
+                keys: HostKeys::local([0xC5; 32], None),
+                limits: Limits::DEFAULT,
+                genesis_roots: None,
+            }
+        }
+
+        pub struct Book {
+            pub archive: Vec<RingEntry>,
+            pub source: Source,
+            pub g: [u8; 32],
+            pub h1: [u8; 32],
+            pub n: u64,
+            /// The Agent's rows after the upgrade took effect: a checkpoint.
+            pub checkpoint: core_binding::transition::MemRows,
+        }
+
+        pub fn book() -> Book {
+            let f = founding();
+            let (mut driver, mut replica, founded) =
+                Driver::found(NativePort::new(), f.keys, f.genesis, f.op, f.at, f.limits).unwrap();
+            let operator = Caller::new(founded.operator, founded.operator_credential);
+            let mut archive = Vec::new();
+            let mut next = 0u64;
+            let mut step =
+                |driver: &mut Driver<NativePort>,
+                 replica: &mut core_binding::host::Replica,
+                 archive: &mut Vec<RingEntry>,
+                 act: &dyn Fn(&mut core_binding::host::Replica, Ctx)| {
+                    next += 1;
+                    let ctx = Ctx {
+                        caller: operator,
+                        op: crate::op(1_000 + next),
+                        now: 10,
+                    };
+                    act(replica, ctx);
+                    driver.sync(replica, Vec::new()).unwrap().unwrap();
+                    archive.push(driver.last_entry.clone().unwrap());
+                    driver.archived();
+                };
+            let open = |r: &mut core_binding::host::Replica, ctx: Ctx| {
+                let _ = r.open_identity(&ctx, IdentityKind::Person, None, Verifier::new(vec![1]));
+            };
+            step(&mut driver, &mut replica, &mut archive, &open);
+            let g = driver.writer().code;
+            let source = Source::default();
+            let h1 = source.version(1);
+            let checked = core_binding::staging::fetch(&source, &h1, 0).unwrap();
+            driver.port_mut().stage_code(checked).unwrap();
+            let n = driver.seq() + 3;
+            step(&mut driver, &mut replica, &mut archive, &|r, ctx| {
+                r.upgrade(&ctx, h1, n, b"T-037-09: restore").unwrap();
+            });
+            for _ in 0..4 {
+                step(&mut driver, &mut replica, &mut archive, &open);
+            }
+            assert_eq!(driver.writer().generation, 1);
+            let checkpoint = driver.port().rows.clone();
+            step(&mut driver, &mut replica, &mut archive, &open);
+            Book {
+                archive,
+                source,
+                g,
+                h1,
+                n,
+                checkpoint,
+            }
+        }
+
+        pub fn plan(archive: &[RingEntry]) -> core_archive::RestorePlan {
+            let e = archive.last().unwrap();
+            core_archive::RestorePlan {
+                book: core_archive::book_of(&founding().op),
+                source: "test".into(),
+                point: core_archive::record::Point {
+                    inputs: e.seq,
+                    entries: e.seq,
+                    log_head: hex::encode(e.log_hash()),
+                    kernel_root: hex::encode(e.roots.kernel),
+                    service_root: hex::encode(e.roots.service),
+                    audit: hex::encode(e.roots.audit),
+                    at: 0,
+                    archive_bytes: 0,
+                    replies_bytes: 0,
+                },
+                segments: 1,
+                checkpoint: None,
+                at: 0,
+            }
+        }
+    }
+
+    fn holding(versions: &[([u8; 32], u64)]) -> core_binding::host::NativePort {
+        let mut p = core_binding::host::NativePort::new();
+        p.code_map = versions.iter().copied().collect();
+        p
+    }
+
+    /// `T-037-09`: a restore of an archive across an upgrade stages the version it does not hold
+    /// from the code source, re-sends each range under its version, and records the whole map.
+    #[test]
+    fn t037_09_a_restore_stages_from_the_source_and_records_the_whole_map() {
+        let b = across::book();
+        let (_, rolled) = restore_onto(
+            holding(&[(b.g, 0)]),
+            &across::founding(),
+            &b.archive,
+            Some(&b.source),
+            &ReplicaStores::Memory,
+            &across::plan(&b.archive),
+        )
+        .unwrap();
+        let last = b.archive.last().unwrap().seq;
+        let map: core_binding::code_map::CodeMap =
+            serde_json::from_value(rolled["code_map"].clone()).unwrap();
+        let ranges: Vec<_> = map.ranges.iter().map(|r| (r.from, r.to, r.code)).collect();
+        assert_eq!(ranges, [(1, b.n - 1, b.g), (b.n, last, b.h1)]);
+        assert_eq!(rolled["to"], last);
+    }
+
+    /// `T-037-09`: from a checkpoint taken after the switch, the map still covers the whole
+    /// archive: the prefix as its entries name it, then the inputs re-sent.
+    #[test]
+    fn t037_09_from_a_checkpoint_the_map_covers_the_prefix_too() {
+        let b = across::book();
+        let mut port = holding(&[(b.g, 0), (b.h1, 1)]);
+        port.rows = b.checkpoint.clone();
+        let (_, rolled) = restore_onto(
+            port,
+            &across::founding(),
+            &b.archive,
+            None,
+            &ReplicaStores::Memory,
+            &across::plan(&b.archive),
+        )
+        .unwrap();
+        assert!(rolled["from"].as_u64().unwrap() >= b.n);
+        let map: core_binding::code_map::CodeMap =
+            serde_json::from_value(rolled["code_map"].clone()).unwrap();
+        assert_eq!(map.ranges.first().map(|r| (r.from, r.code)), Some((1, b.g)));
+        assert_eq!(
+            map.ranges.last().map(|r| (r.to, r.code)),
+            Some((b.archive.last().unwrap().seq, b.h1))
+        );
+    }
+
+    /// `T-037-09`: staging comes first, and a version no source has refuses the restore before
+    /// anything is sent to the Agent, its founding included, naming the inputs it ran.
+    #[test]
+    fn t037_09_a_version_no_source_has_is_refused_before_anything_is_sent() {
+        let b = across::book();
+        let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let port = across::Counting(holding(&[(b.g, 0)]), sent.clone());
+        let empty = across::Source::default();
+        let e = restore_onto(
+            port,
+            &across::founding(),
+            &b.archive,
+            Some(&empty),
+            &ReplicaStores::Memory,
+            &across::plan(&b.archive),
+        )
+        .err()
+        .unwrap();
+        assert!(e.contains(&format!("inputs {}..=", b.n)), "{e}");
+        assert!(e.contains("replayer/"), "{e}");
+        assert_eq!(sent.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // The same source with the version: staged, then restored.
+        let port = across::Counting(holding(&[(b.g, 0)]), sent.clone());
+        restore_onto(
+            port,
+            &across::founding(),
+            &b.archive,
+            Some(&b.source),
+            &ReplicaStores::Memory,
+            &across::plan(&b.archive),
+        )
+        .unwrap();
+        assert!(sent.load(std::sync::atomic::Ordering::SeqCst) > 0);
+    }
+
+    /// `T-037-09`: a restore that wrote its result and stopped before removing the plan is not
+    /// run again: the plan is removed and the result stays as written.
+    #[test]
+    fn t037_09_a_restore_interrupted_after_its_result_is_not_run_again() {
+        let b = across::book();
+        let plan = across::plan(&b.archive);
+        let dir = std::env::temp_dir().join(format!(
+            "aledgent-restore-done-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        assert!(!already_restored(&dir, &plan).unwrap());
+        let done = serde_json::json!({"plan": plan, "rolled": {"code_map": {"ranges": [1]}}});
+        fs::write(dir.join(RESTORED_FILE), serde_json::to_vec(&done).unwrap()).unwrap();
+        fs::write(
+            dir.join(core_archive::RESTORE_FILE),
+            serde_json::to_vec(&plan).unwrap(),
+        )
+        .unwrap();
+        assert!(already_restored(&dir, &plan).unwrap());
+        assert!(!dir.join(core_archive::RESTORE_FILE).exists());
+        assert_eq!(
+            fs::read(dir.join(RESTORED_FILE)).unwrap(),
+            serde_json::to_vec(&done).unwrap()
+        );
+        // A result for another point: refused, the layout is not this restore's.
+        let mut other = plan.clone();
+        other.point.entries += 1;
+        assert!(already_restored(&dir, &other).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// `T-037-09`: a restore says what it fetched and what it could not, and nothing about what it
     /// held.
