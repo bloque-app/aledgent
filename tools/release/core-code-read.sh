@@ -25,7 +25,7 @@ trap 'chmod -R u+w "$raw"; rm -rf "$raw"' EXIT
 
 crane export "$ref" - | tar -x -C "$raw"
 rec="$raw/set.json"
-[ -f "$rec" ] && [ ! -L "$rec" ] || { echo "core-code-read: $ref has no set.json: it is not a core code set" >&2; exit 1; }
+if [ ! -f "$rec" ] || [ -L "$rec" ]; then echo "core-code-read: $ref has no set.json: it is not a core code set" >&2; exit 1; fi
 jq -e '.format == "aledgent/core-code-set/v1" and (.code | test("^[0-9a-f]{64}$")) and (.files | length == 3)
        and ([.files[].role] | sort == ["manifest", "package", "runtime"])' "$rec" >/dev/null \
   || { echo "core-code-read: $ref's set.json is not a core code set of this format" >&2; exit 1; }
