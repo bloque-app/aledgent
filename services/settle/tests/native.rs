@@ -1,6 +1,6 @@
 // Copyright (c) 2026 Pagos Cube LLC
 // SPDX-License-Identifier: Apache-2.0 OR MIT
-//! `F-044` end to end against the fake settlement layer: the lanes and the anchor key as **native
+//! `F-045` end to end against the fake settlement layer: the lanes and the anchor key as **native
 //! accounts** (Ed25519 keys, each acting as its own account), with no PASS account. A batch is a v4
 //! signed transaction from the lane's account; the layer confirms that form on its runtime under its
 //! own name before anything signed in it is broadcast; anchors go out the same way; and a key whose
@@ -39,12 +39,12 @@ async fn until(k: &mut Kit, p: &Party, op: &str, want: &str, n: usize) {
     assert_eq!(k.state(p, op).await, want, "{op}");
 }
 
-/// `F-044`: a withdrawal settles from a native account. The transaction is v4 signed, from the
+/// `F-045`: a withdrawal settles from a native account. The transaction is v4 signed, from the
 /// lane's own account (its Ed25519 public key), with no PASS credential; its signature verifies
 /// over the signed payload; the account's own nonce moves; and the layer's confirmation of the
 /// runtime is recorded under the native form's name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn f_044_a_withdrawal_settles_from_a_native_account() {
+async fn f_045_a_withdrawal_settles_from_a_native_account() {
     let mut k = serving_kit(native()).await;
     let lane = std::sync::Arc::clone(&k.lanes[0]);
     let Public::Ed25519(public) = lane.public() else {
@@ -88,9 +88,9 @@ async fn f_044_a_withdrawal_settles_from_a_native_account() {
     assert!(runtimes[0].key.ends_with("+native"), "{runtimes:?}");
 }
 
-/// `F-044`, `F-017`: anchors are published by the native anchor account, with its own nonces.
+/// `F-045`, `F-017`: anchors are published by the native anchor account, with its own nonces.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn f_044_anchors_are_published_by_the_native_anchor_account() {
+async fn f_045_anchors_are_published_by_the_native_anchor_account() {
     let mut k = serving_kit(KitOptions {
         anchoring: true,
         ..native()
@@ -156,11 +156,11 @@ impl Signer for Down {
     }
 }
 
-/// `F-044`: a key whose engine does not sign fails the signing with [`ChainError::Signer`], which is
+/// `F-045`: a key whose engine does not sign fails the signing with [`ChainError::Signer`], which is
 /// not the settlement layer's unavailability (the binary does not restart over it); nothing is
 /// signed, so nothing can be stored or broadcast.
 #[tokio::test]
-async fn f_044_a_signer_that_does_not_answer_fails_the_signing_not_the_layer() {
+async fn f_045_a_signer_that_does_not_answer_fails_the_signing_not_the_layer() {
     let k = Kit::start_with(native()).await;
     let down = Down(std::sync::Arc::clone(&k.lanes[0]));
     let fin = k.chain.finalized().await.unwrap();
@@ -195,11 +195,11 @@ async fn f_044_a_signer_that_does_not_answer_fails_the_signing_not_the_layer() {
     assert!(e.to_string().contains("Vault does not answer"), "{e}");
 }
 
-/// `F-044`, `REQ-SA-9`: a restarted adapter over the same store finds the runtime confirmed for the
+/// `F-045`, `REQ-SA-9`: a restarted adapter over the same store finds the runtime confirmed for the
 /// native form (the row it stored, under `+native`): it neither asks the layer again nor refuses, and
 /// the next withdrawal goes out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn f_044_a_restart_keeps_the_native_confirmation() {
+async fn f_045_a_restart_keeps_the_native_confirmation() {
     let mut k = serving_kit(native()).await;
     let alice = k.d.party("alice", 1_000).await;
     let first = k.withdrawal(&alice, 10, "before").await;

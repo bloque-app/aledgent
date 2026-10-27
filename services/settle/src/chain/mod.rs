@@ -695,7 +695,7 @@ pub enum ChainError {
     /// It answered with something the adapter cannot use (a value that does not decode, an asset
     /// that does not fit the runtime's type). Never guessed around.
     Invalid(String),
-    /// The key's signer did not sign (`F-044`): an engine that does not answer, such as Vault
+    /// The key's signer did not sign (`F-045`): an engine that does not answer, such as Vault
     /// Transit down, or a refusal. The layer itself may be fine: the step that asked fails, and the
     /// next one asks again; it is not the layer's unavailability, and does not restart the process.
     Signer(String),

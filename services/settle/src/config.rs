@@ -4,7 +4,7 @@
 //! `REQ-AU-8`): a key file, an environment variable's name, a key of the signer service, a key entry
 //! on a signature engine (`F-042`).
 //!
-//! **Two forms of lane** (`F-044`), one per file: `keys` and `anchor_key`, the device keys of
+//! **Two forms of lane** (`F-045`), one per file: `keys` and `anchor_key`, the device keys of
 //! community PASS accounts (`F-027`, secp256k1); or `accounts` and `anchor_account`, **native
 //! accounts**: each lane, and the anchor key, is an Ed25519 key's own account, which the contract
 //! lists, and which signs standard transactions. A native account's key may be on the sidecar or on
@@ -60,7 +60,7 @@ pub enum KeySource {
     },
     /// A key entry of the file's `keys` (`F-042`): `{ "engine": "<name>", "key": { … } }`, on an engine
     /// declared in `engines`. A PASS device key may use the sidecar only; a native account's key the
-    /// sidecar or Vault Transit (`F-044`, [`engine_key_need`]).
+    /// sidecar or Vault Transit (`F-045`, [`engine_key_need`]).
     Engine(String),
 }
 
@@ -95,7 +95,7 @@ pub struct AdapterConfig {
     /// [`AdapterConfig::accounts`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keys: Vec<PassKey>,
-    /// The lanes' keys as **native accounts** (`F-044`), one per lane: each an Ed25519 key whose own
+    /// The lanes' keys as **native accounts** (`F-045`), one per lane: each an Ed25519 key whose own
     /// account the contract lists as a key, and which signs standard transactions. Exactly one of
     /// this and [`AdapterConfig::keys`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -128,7 +128,7 @@ pub struct AdapterConfig {
     /// comparison.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor_key: Option<PassKey>,
-    /// The anchor key as a native account (`F-044`): with [`AdapterConfig::accounts`], in place of
+    /// The anchor key as a native account (`F-045`): with [`AdapterConfig::accounts`], in place of
     /// [`AdapterConfig::anchor_key`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor_account: Option<KeySource>,
@@ -196,7 +196,7 @@ impl AdapterConfig {
             .collect()
     }
 
-    /// Whether the lanes are native accounts (`F-044`), after checking that the file gives one form
+    /// Whether the lanes are native accounts (`F-045`), after checking that the file gives one form
     /// ([`AdapterConfig::keys`] and [`AdapterConfig::anchor_key`], or [`AdapterConfig::accounts`] and
     /// [`AdapterConfig::anchor_account`]) and at least one lane. Mixing the two is refused: a
     /// transaction format is confirmed on the layer for one form at a time.
@@ -469,7 +469,7 @@ pub fn default_contracts_pallet() -> String {
     "Contracts".into()
 }
 
-/// What the adapter needs of each key on an engine (`F-042`, `F-044`). `NFR-8` says settlement-layer key
+/// What the adapter needs of each key on an engine (`F-042`, `F-045`). `NFR-8` says settlement-layer key
 /// material is held in a boundary that is separate from the book and can be audited separately: the
 /// sidecar, or Vault Transit (whose audit log is Vault's), and never in the adapter's own process (an
 /// in-process key has no audit apart from the adapter's).
@@ -847,7 +847,7 @@ mod tests {
                 && e.contains("may use: sidecar"),
             "{e}"
         );
-        // Transit, for a PASS device key: Transit does not offer secp256k1 (F-044 opens Transit for
+        // Transit, for a PASS device key: Transit does not offer secp256k1 (F-045 opens Transit for
         // native accounts' Ed25519 keys only).
         c.engines = engines(serde_json::json!({ "vault_transit": {} }));
         let e = c.check_key_sources().unwrap_err();
@@ -877,7 +877,7 @@ mod tests {
         assert!(c.check_key_sources().unwrap_err().contains("one form"));
     }
 
-    /// A file whose lanes are native accounts (`F-044`) on Vault Transit, as the deployments' are.
+    /// A file whose lanes are native accounts (`F-045`) on Vault Transit, as the deployments' are.
     fn native_on_transit() -> ProcessConfig {
         let mut c: ProcessConfig =
             serde_json::from_str(include_str!("../../../deploy/templates/settle.json")).unwrap();
@@ -912,10 +912,10 @@ mod tests {
         c
     }
 
-    /// `F-044`: native accounts' keys are Ed25519, on Vault Transit or the sidecar; never in process,
+    /// `F-045`: native accounts' keys are Ed25519, on Vault Transit or the sidecar; never in process,
     /// never from the environment; a file in development only. One form per file.
     #[test]
-    fn f_044_native_accounts_keys_may_use_transit_or_the_sidecar() {
+    fn f_045_native_accounts_keys_may_use_transit_or_the_sidecar() {
         let c = native_on_transit();
         assert_eq!(c.adapter.native(), Ok(true));
         assert_eq!(c.check_key_sources(), Ok(false));

@@ -9,7 +9,7 @@
 //! - **Reorgs above the finality point** ([`FakeChain::reorg`]): the blocks above it are dropped
 //!   and their transactions go back to the pool, as a node's pool does.
 //! - **Transactions are Kreivo's own bytes**: v5 general transactions authorised by
-//!   `PassAuthenticate`, or a native account's v4 signed transactions (`F-044`), both
+//!   `PassAuthenticate`, or a native account's v4 signed transactions (`F-045`), both
 //!   ([`super::kreivo`]) built by [`Chain::sign_batch`] and decoded and checked here as the runtime
 //!   checks them. A native transaction's signature must verify over its signed payload against its
 //!   account, which the call then runs as; the rest of this item is the PASS form's. The era must contain the block (the birth block's
@@ -1084,7 +1084,7 @@ impl FakeChain {
         let birth_hash = s.blocks.get(usize::try_from(birth).ok()?)?.hash;
         let tx = match tx {
             kreivo::AnyTx::Pass(tx) => tx,
-            // F-044: a native account's signature over the signed payload, as
+            // F-045: a native account's signature over the signed payload, as
             // `UncheckedExtrinsic::check` verifies it; the call runs as that account.
             kreivo::AnyTx::Native(tx) => {
                 let p = TxParams {

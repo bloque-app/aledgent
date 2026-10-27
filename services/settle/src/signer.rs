@@ -3,11 +3,11 @@
 //! The signer boundary (`REQ-AR-3`, `NFR-8`, `REQ-SA-8`; guardrail 13).
 //!
 //! The adapter never needs a secret key, only something that signs a message as the chain's
-//! `MultiSignature` verifies it: [`Signer`]. Two schemes (`F-044`):
+//! `MultiSignature` verifies it: [`Signer`]. Two schemes (`F-045`):
 //!
 //! - **Ed25519** ([`Public::Ed25519`]): the key signs the message's bytes. Its account is its
 //!   public key (`MultiSigner::Ed25519`). The lanes and the anchor key of a deployment on **native
-//!   accounts** (`F-044`, the owner's ruling of 2026-10-25, bloque-ledgent#287), whose keys stay in
+//!   accounts** (`F-045`, the owner's ruling of 2026-10-25, bloque-ledgent#287), whose keys stay in
 //!   Vault Transit.
 //! - **ECDSA over secp256k1** ([`Public::Ecdsa`]): the key signs the blake2b-256 of the message, so
 //!   a 32-byte digest is all it sees (`F-016` plan, proposal "signer"). Its account is the
@@ -17,12 +17,12 @@
 //!
 //! - [`PassAccount`] (`F-027`): a secp256k1 key as the device key of the deployment's community PASS
 //!   account on Kreivo. The device signs; the PASS account acts. Kept while the zombienet suite runs
-//!   on PASS accounts; deployments move to native accounts (`F-044`).
+//!   on PASS accounts; deployments move to native accounts (`F-045`).
 //! - [`DevSigner`] (secp256k1) and [`DevEd25519`]: a key read from a file (or, secp256k1 only, an
 //!   environment variable), for development and tests. Neither has a `Debug` or `Display` that
 //!   shows the key, neither logs it, and their errors never carry it. The key is zeroised when the
 //!   signer is dropped.
-//! - [`ServiceSigner`] (`F-035`) and [`EngineEd25519`] (`F-042`, `F-044`): the production signers. A
+//! - [`ServiceSigner`] (`F-035`) and [`EngineEd25519`] (`F-042`, `F-045`): the production signers. A
 //!   key behind a signature engine: the signer service (`services/signer`), a process of its own,
 //!   reached on a Unix socket with peer credentials and a token; or Vault Transit, where an Ed25519
 //!   key is made and never leaves. The adapter holds the key's public half, nothing else.
@@ -143,7 +143,7 @@ pub trait Signer: Send + Sync {
     }
 
     /// The hashed user id of the PASS account this key is a device of, if it is one
-    /// (`F-027` T-027-03). `None`: the key's own account acts, a native account (`F-044`).
+    /// (`F-027` T-027-03). `None`: the key's own account acts, a native account (`F-045`).
     fn pass_user(&self) -> Option<[u8; 32]> {
         None
     }
@@ -280,7 +280,7 @@ impl Signer for DevSigner {
     }
 }
 
-/// An Ed25519 key read from a file, for development and tests (`F-044`). See the module
+/// An Ed25519 key read from a file, for development and tests (`F-045`). See the module
 /// documentation. There is no environment source: `NFR-8` (and `T-042-09`).
 pub struct DevEd25519 {
     key: ed25519_dalek::SigningKey,
@@ -405,7 +405,7 @@ impl Signer for ServiceSigner {
     }
 }
 
-/// An Ed25519 key behind a signature engine (`F-042`, `F-044`): Vault Transit, where the key is made
+/// An Ed25519 key behind a signature engine (`F-042`, `F-045`): Vault Transit, where the key is made
 /// and never leaves, or the signer service. A native account: its account is its public key. Each
 /// signature is checked against the public key before it is used ([`signer::client::RemoteEd25519`]).
 ///
@@ -500,10 +500,10 @@ mod tests {
         assert!(!Signature::Ecdsa(sig).verify(b"other", &s.account()));
     }
 
-    /// `F-044`: a native Ed25519 account is its public key, and its signature is over the message's
+    /// `F-045`: a native Ed25519 account is its public key, and its signature is over the message's
     /// bytes, as `MultiSignature::Ed25519` verifies it.
     #[tokio::test]
-    async fn f_044_an_ed25519_account_is_its_public_key_and_signs_the_bytes() {
+    async fn f_045_an_ed25519_account_is_its_public_key_and_signs_the_bytes() {
         let s = DevEd25519::from_secret(&SECRET);
         let Public::Ed25519(public) = s.public() else {
             panic!("an Ed25519 key");

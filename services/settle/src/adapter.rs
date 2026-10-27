@@ -375,7 +375,7 @@ struct Chosen {
     /// and [`Chosen::format_name`].
     key: String,
     /// The format's name as the confirmation records it: the format's own for PASS transactions,
-    /// [`kreivo::TxFormat::native_name`] for a native account's (`F-044`), so that a runtime confirmed
+    /// [`kreivo::TxFormat::native_name`] for a native account's (`F-045`), so that a runtime confirmed
     /// for one form is not taken as confirmed for the other.
     format_name: String,
     /// The block the runtime was read at ([`RuntimeInfo::at`]): what is signed for it is
@@ -736,7 +736,7 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
         })
     }
 
-    /// Whether the adapter signs as native accounts (`F-044`): its keys are no PASS account's
+    /// Whether the adapter signs as native accounts (`F-045`): its keys are no PASS account's
     /// devices. The configuration gives every lane and the anchor key one form, so the first lane
     /// says it for all.
     fn native(&self) -> bool {

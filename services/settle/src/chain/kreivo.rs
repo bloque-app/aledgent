@@ -27,7 +27,7 @@
 //!   key signs a challenge bound to the exact call and to every extension after
 //!   `PassAuthenticate`; the runtime then dispatches the call as the PASS account, whose ordinary
 //!   nonce it bumps.
-//! - **Or, for a native account** (`F-044`): a **v4 signed transaction**, from the lane's own
+//! - **Or, for a native account** (`F-045`): a **v4 signed transaction**, from the lane's own
 //!   account, its key's `MultiSignature` over the signed payload (below). `PassAuthenticate` carries
 //!   no credential, and a signed origin passes through it unchanged.
 //!
@@ -79,7 +79,7 @@
 //! the first transaction signed in it is broadcast ([`transaction_validity`]): an order flipped
 //! with no change of surface fails there.
 //!
-//! ## The native transaction (`F-044`)
+//! ## The native transaction (`F-045`)
 //!
 //! The same runtime type, in its v4 signed form:
 //!
@@ -1518,7 +1518,7 @@ impl TxFormat {
     }
 
     /// The name the layer's confirmation of a native transaction on a runtime of this format is
-    /// recorded under (`F-044`): `<name>+native`. A runtime confirmed for PASS transactions has not
+    /// recorded under (`F-045`): `<name>+native`. A runtime confirmed for PASS transactions has not
     /// confirmed native ones, nor the reverse.
     pub fn native_name(&self) -> String {
         format!("{}+native", self.name)
@@ -1746,7 +1746,7 @@ impl From<SignError> for super::ChainError {
 /// Sign `call` as `signer`'s account: as the PASS account behind it (its hashed user id, and its
 /// device key) with the challenge's context at block `context` (its number and hash), in `format`:
 /// the one the adapter chose for the runtime's surface (`T-027-12`), never one guessed from `p`;
-/// or, for a native account (`F-044`, no PASS user), as a v4 signed transaction ([`sign_native`]).
+/// or, for a native account (`F-045`, no PASS user), as a v4 signed transaction ([`sign_native`]).
 /// The key signs through [`Signer`] and is never seen here.
 pub async fn sign(
     signer: &dyn Signer,
@@ -1825,7 +1825,7 @@ pub fn native_extrinsic(
     out
 }
 
-/// Sign `call` as `signer`'s own account (`F-044`): a v4 signed transaction (module documentation).
+/// Sign `call` as `signer`'s own account (`F-045`): a v4 signed transaction (module documentation).
 /// The key's signature is checked against the account before the bytes are built.
 pub async fn sign_native(
     signer: &dyn Signer,
@@ -1916,7 +1916,7 @@ pub fn decode_native(bytes: &[u8]) -> Result<DecodedNative, String> {
 pub enum AnyTx {
     /// A PASS transaction.
     Pass(DecodedTx),
-    /// A native account's (`F-044`).
+    /// A native account's (`F-045`).
     Native(DecodedNative),
 }
 
@@ -2671,7 +2671,7 @@ mod tests {
         // The PASS account, not the device, is who the call runs as.
         assert_eq!(pass.account(), pass_account(&[0x51; 32]));
         assert_ne!(pass.account(), device.account());
-        // A plain key is no PASS account's device: it signs as its own account (F-044).
+        // A plain key is no PASS account's device: it signs as its own account (F-045).
         let plain = sign(device.as_ref(), &FORMAT_133, &call, &p, (9, [0xc0; 32]))
             .await
             .unwrap();
@@ -2694,11 +2694,11 @@ mod tests {
         }
     }
 
-    /// `F-044`: a native account's transaction is v4 signed, from its own account, with no PASS
+    /// `F-045`: a native account's transaction is v4 signed, from its own account, with no PASS
     /// credential; its Ed25519 signature is over the signed payload; and it round-trips. The payload
     /// is hashed only past 256 bytes, as `SignedPayload` does.
     #[tokio::test]
-    async fn f_044_a_native_transaction_round_trips_and_verifies_against_its_account() {
+    async fn f_045_a_native_transaction_round_trips_and_verifies_against_its_account() {
         let key = crate::signer::DevEd25519::from_secret(&[0x5e; 32]);
         let p = native_params();
         // A short call: the payload is signed as it is.
@@ -2745,12 +2745,12 @@ mod tests {
         assert!(AnyTx::decode(&[1, 2, 3]).is_err());
     }
 
-    /// `F-044`: the native vector (`services/settle/kreivo-pin/vectors-native.json`). `kreivo-pin`
+    /// `F-045`: the native vector (`services/settle/kreivo-pin/vectors-native.json`). `kreivo-pin`
     /// decodes the same bytes with Kreivo's own types (`sp-runtime` 48.0.0's `UncheckedExtrinsic`, its
     /// v4 signed preamble, `MultiAddress`, `MultiSignature`) and verifies the signature over the payload
     /// `UncheckedExtrinsic::check` builds, so this test and that crate pin the native transaction too.
     #[tokio::test]
-    async fn f_044_the_native_transaction_matches_the_pinned_vector() {
+    async fn f_045_the_native_transaction_matches_the_pinned_vector() {
         let key = crate::signer::DevEd25519::from_secret(&[0x5e; 32]);
         let p = native_params();
         let contract = [0xc0; 32];

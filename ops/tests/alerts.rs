@@ -372,7 +372,7 @@ fn nfr_11_each_signal_over_its_line_pages_the_test_route() {
                     .insert("runtime".into(), 1);
             },
         ),
-        // F-044: a signing key's engine (Vault Transit) not ready.
+        // F-045: a signing key's engine (Vault Transit) not ready.
         ("AledgentAdapterSignerNotReady", "settlement-adapter", |s| {
             s.adapter
                 .as_mut()

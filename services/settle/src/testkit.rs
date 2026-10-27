@@ -58,7 +58,7 @@ pub fn pass_lane(secret: &[u8; 32], user: [u8; 32]) -> Arc<dyn Signer> {
     Arc::new(PassAccount::new(device, user))
 }
 
-/// A test native account (`F-044`): the Ed25519 key of the test constant `secret`, acting as its own
+/// A test native account (`F-045`): the Ed25519 key of the test constant `secret`, acting as its own
 /// account.
 pub fn native_lane(secret: &[u8; 32]) -> Arc<dyn Signer> {
     Arc::new(DevEd25519::from_secret(secret))
@@ -91,7 +91,7 @@ pub struct KitOptions {
     /// A batch's gas margin over its dry run, in percent
     /// ([`AdapterConfig::batch_gas_margin_percent`]).
     pub batch_gas_margin_percent: u64,
-    /// Whether the lanes and the anchor key are native accounts (`F-044`, Ed25519 keys signing v4
+    /// Whether the lanes and the anchor key are native accounts (`F-045`, Ed25519 keys signing v4
     /// transactions) rather than PASS accounts' devices.
     pub native_accounts: bool,
 }

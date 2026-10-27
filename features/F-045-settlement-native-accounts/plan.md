@@ -3,7 +3,7 @@ Copyright (c) 2026 Pagos Cube LLC
 SPDX-License-Identifier: CC-BY-4.0
 -->
 
-# F-044 — The settlement adapter on native accounts, its keys in Vault Transit
+# F-045 — The settlement adapter on native accounts, its keys in Vault Transit
 
 | | |
 |---|---|
@@ -11,7 +11,7 @@ SPDX-License-Identifier: CC-BY-4.0
 | Track | B |
 | Home | `services/settle` (its signer boundary, the transaction, the fake layer, the configuration, the binary), `services/settle/kreivo-pin` (the native vector), `ops/prometheus` (the signer alert's rule) |
 | Depends on | `F-027` (the executor and its transaction), `F-042` (signature engines, the Vault Transit engine), `F-043` (the adapter it is built on) |
-| Unblocks | Turning settlement on again with keys that cannot leave Vault; removing the PASS form once the zombienet suite moves (`T-044-06`) |
+| Unblocks | Turning settlement on again with keys that cannot leave Vault; removing the PASS form once the zombienet suite moves (`T-045-06`) |
 | Realises | `NFR-8`, `REQ-SA-8`, `REQ-SA-9`, `REQ-AU-8` |
 | Status | **Built** (the pull request that carries this file). The owner's ruling of 2026-10-25 (bloque-ledgent#287): the lane and anchor keys move to Vault Transit, and so to Ed25519 accounts that sign standard transactions. No `SPEC.md` change: `NFR-8` is met more strictly (no key ever reaches a process), and `REQ-SA-9`'s confirmation applies to the new form unchanged |
 
@@ -58,7 +58,7 @@ PASS transactions is not taken as confirmed for native ones, nor the reverse.
 
 **One form per file.** `accounts` and `anchor_account` (native) or `keys` and `anchor_key` (PASS), never
 both: a configuration that mixes them does not start. The PASS form stays, unchanged, while the zombienet
-suite still provisions PASS accounts (`e2e/`, owned by other work); `T-044-06` removes it.
+suite still provisions PASS accounts (`e2e/`, owned by other work); `T-045-06` removes it.
 
 **Failure.** A key whose engine does not sign fails the step that needed the signature
 (`ChainError::Signer`): nothing is stored or broadcast, the calls wait, and the next step asks again. It is

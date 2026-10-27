@@ -10,7 +10,7 @@ executor of the call outbox (`F-027`, `DEC-18`): the one component of aledgent t
 settlement layer. It holds the signing keys, apart from the core; it reaches the core only through
 ingress, as the principal the settlement configuration names; it takes every external movement and
 anchor from the core's call outbox as an envelope, executes them in batches on the settlement
-contract (`F-026`) as its lanes' native accounts (`F-044`) or the deployment's community PASS
+contract (`F-026`) as its lanes' native accounts (`F-045`) or the deployment's community PASS
 account, and reports what the layer recorded as observations, never stating an outcome. `features/F-016-settlement-adapter/NOTES.md` and
 `features/F-027-settlement-extension/NOTES.md` say what was built and why.
 
@@ -186,7 +186,7 @@ account. Each key is a **device key of that PASS account** (`"user"`: the accoun
 id; the account itself is `blake2_256([0; 32] ‖ user)`, and it is what the contract lists as a
 key, what pays fees and whose nonce moves).
 
-**Or as native accounts** (`F-044`; how deployments run). Each lane, and the anchor key, is an
+**Or as native accounts** (`F-045`; how deployments run). Each lane, and the anchor key, is an
 Ed25519 key acting as its own account: the account is the public key, the contract lists it, it
 pays its fees, and its own nonce moves. A batch is then a **v4 signed transaction** from that
 account (`MultiAddress::Id`, `MultiSignature::Ed25519` over the signed payload), with
@@ -296,7 +296,7 @@ the adapter's ingress token.
 cargo test -p settle                                  # fake settlement layer; PostgreSQL in Docker
 cargo test -p conformance --test suite -- F-016       # the conformance cases
 # The PASS transaction against Kreivo's own crates, each format in a workspace of its own (and, in
-# kreivo-pin, a native account's v4 signed transaction, F-044):
+# kreivo-pin, a native account's v4 signed transaction, F-045):
 cargo test --locked --manifest-path services/settle/kreivo-pin/Cargo.toml       # spec 133, 4aef055
 cargo test --locked --manifest-path services/settle/kreivo-pin-132/Cargo.toml   # spec 132, 0.16.9
 ```

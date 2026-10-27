@@ -27,8 +27,8 @@
 //!   `ChargeAssetTxPayment { #[codec(compact)] tip, asset_id: Option<_> }`; and Kreivo's
 //!   `BlockHashChallenger`, copied below.
 //!
-//! **`F-044`: the native transaction** (`vectors-native.json`, pinned by
-//! `f_044_the_native_transaction_matches_the_pinned_vector` in `src/chain/kreivo.rs`): the same
+//! **`F-045`: the native transaction** (`vectors-native.json`, pinned by
+//! `f_045_the_native_transaction_matches_the_pinned_vector` in `src/chain/kreivo.rs`): the same
 //! `UncheckedExtrinsic`, in its v4 signed form, from a native account (`MultiAddress::Id`) with a
 //! `MultiSignature::Ed25519`, `PassAuthenticate` carrying `None`; and the signature checked over the
 //! payload `UncheckedExtrinsic::check` builds (`sp-runtime` 48.0.0: `call ‖ explicit ‖ implicit`,
@@ -195,12 +195,12 @@ mod tests {
         serde_json::from_str(include_str!("../vectors-native.json")).expect("vectors-native.json")
     }
 
-    /// `F-044`: a native account's transaction, as Kreivo's crates decode and check it, equals the
+    /// `F-045`: a native account's transaction, as Kreivo's crates decode and check it, equals the
     /// pinned vector: v4 signed, from the key's own account, `PassAuthenticate` with no credential,
     /// and an Ed25519 signature over `SignedPayload`'s bytes that `MultiSignature::verify` accepts
     /// for that account and for no other payload.
     #[test]
-    fn f_044_the_pinned_native_transaction_is_kreivos() {
+    fn f_045_the_pinned_native_transaction_is_kreivos() {
         let v = native_vector();
         let (i, o) = (&v["inputs"], &v["outputs"]);
         // The account is the key: `MultiSigner::Ed25519(public).into_account()`.

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 //! `F-035`: the adapter's lane key behind the signer service. The adapter holds the key's
 //! identifier and public half; each signature comes from the signer's process and recovers to
-//! the key, as the chain checks it. `F-044`: a native account's Ed25519 key, the same way.
+//! the key, as the chain checks it. `F-045`: a native account's Ed25519 key, the same way.
 
 use std::os::unix::fs::MetadataExt as _;
 use std::sync::Arc;
@@ -73,11 +73,11 @@ async fn nfr_8_a_lane_signs_through_the_signer_service() {
     );
 }
 
-/// `F-044`: a native account's Ed25519 key on the signer service, in the form written before
+/// `F-045`: a native account's Ed25519 key on the signer service, in the form written before
 /// `F-042` (`{ "signer": { "key": … } }`). Its account is its public key, and its signature over the
 /// message's own bytes verifies against that account.
 #[tokio::test(flavor = "multi_thread")]
-async fn f_044_a_native_lane_signs_through_the_signer_service() {
+async fn f_045_a_native_lane_signs_through_the_signer_service() {
     let dir = tempfile::tempdir().unwrap();
     let probe = dir.path().join(".uid");
     std::fs::write(&probe, b"").unwrap();

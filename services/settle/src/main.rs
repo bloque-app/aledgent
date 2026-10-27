@@ -9,7 +9,7 @@
 //! is news for it (`wake_poll`, `NFR-15`). Only one instance per
 //! set of keys acts at a time: the others wait for the lease.
 //!
-//! `aledgent-settle <config.json> keys` (`F-044`) opens the keys, prints each lane's and the anchor
+//! `aledgent-settle <config.json> keys` (`F-045`) opens the keys, prints each lane's and the anchor
 //! key's account and public key as JSON (public halves only), and exits: nothing is read from the
 //! settlement layer, the store or ingress. It is how an operator reads the accounts a contract's
 //! `set_keys` must list, and checks that the keys open (for a Vault Transit key, the AWS IAM login and
@@ -45,10 +45,10 @@ use settle::store::pg::PgStore;
 /// supervisor to start a new one.
 const BLIND_RESTART: Duration = Duration::from_secs(180);
 
-/// The alert a signing key's engine that is not ready raises (`F-044`): kind `signer` in the signals.
+/// The alert a signing key's engine that is not ready raises (`F-045`): kind `signer` in the signals.
 const SIGNER_ALERT: &str = "signer:engines";
 
-/// The lanes, in the file's form (`F-044`): native accounts, or PASS accounts.
+/// The lanes, in the file's form (`F-045`): native accounts, or PASS accounts.
 fn lanes(config: &ProcessConfig, keys: &Keys) -> Result<Vec<Arc<dyn Signer>>, String> {
     let mut out: Vec<Arc<dyn Signer>> = Vec::new();
     for k in &config.adapter.keys {
@@ -139,7 +139,7 @@ fn pass(k: &PassKey, keys: &Keys) -> Result<Arc<dyn Signer>, String> {
     Ok(Arc::new(PassAccount::new(signer(&k.device, keys)?, user)))
 }
 
-/// A native account (`F-044`): an Ed25519 key, acting as its own account. Its key is on an engine (the
+/// A native account (`F-045`): an Ed25519 key, acting as its own account. Its key is on an engine (the
 /// sidecar or Vault Transit), on the signer service, or, in development, in a file; never in the
 /// environment (the configuration's check refuses it first).
 fn native(k: &KeySource, keys: &Keys) -> Result<Arc<dyn Signer>, String> {
@@ -223,7 +223,7 @@ enum Command {
     Gap { from: u64, to: u64 },
     /// Reset the cursor and the accepted head with the book's re-founding, and exit.
     Refound,
-    /// Open the keys, print the accounts, and exit (`F-044`).
+    /// Open the keys, print the accounts, and exit (`F-045`).
     Keys,
 }
 
@@ -286,7 +286,7 @@ async fn run() -> Result<(), String> {
     let lanes = lanes(&config, &keys)?;
     let anchor = anchor(&config, &keys)?;
     if matches!(command, Command::Keys) {
-        // F-044: public halves only; nothing else is opened.
+        // F-045: public halves only; nothing else is opened.
         let show = |role: &str, s: &Arc<dyn Signer>| {
             serde_json::json!({
                 "role": role,
@@ -456,7 +456,7 @@ async fn run() -> Result<(), String> {
         if let Some(path) = &config.signals_file {
             write_signals(&adapter, path).await;
         }
-        // F-044: an engine that cannot sign (Vault Transit down for its window, or a key no longer
+        // F-045: an engine that cannot sign (Vault Transit down for its window, or a key no longer
         // what was pinned) raises the alert `signer:engines`, which the signals count by kind for the
         // exporter, and clears it when it comes back (the first step clears one a previous process
         // left). A step that needs a signature fails meanwhile (`ChainError::Signer`), and the next
