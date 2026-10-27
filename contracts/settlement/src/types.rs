@@ -79,14 +79,13 @@ pub const CALL_WEIGHT_LIMIT: Weight = Weight::new(25_000_000_000, 512 * 1024);
 /// itself between 49 and 61 KB of it (a reserve of 44 KiB left a batch short). 80 KiB covers that
 /// with room for the code to grow by 20 KB.
 pub const CALL_FRAME_COST: Weight = Weight::new(1_000_000_000, 80 * 1024);
-/// What recording one call as refused costs the batch: the chain's head read and rewritten
-/// (`seal_get_storage` and `seal_set_storage`, about 140 M ps and 254 B each), two BLAKE2 hashes
-/// of at most about 200 bytes, and its event with two topics (`seal_deposit_event`, about 265 M ps
-/// and 5 940 B), which now carries the call (amendment 0040). Raised from 0.6 G of ref time with
-/// the chain; a dry run of a batch of refusals on a fork of Kreivo spec 134 costs 0.13 G and
-/// 10.4 KB more per refusal than v2's did, to be checked against the zombienet measurement
-/// (`T-043-03`).
-pub const REFUSAL_RESERVE: Weight = Weight::new(700_000_000, 8 * 1024);
+/// What recording one call as refused costs the batch: the chain's head read and rewritten, two
+/// BLAKE2 hashes of at most about 200 bytes, and its event with two topics, which now carries the
+/// call (amendment 0040). v2 reserved 0.6 G and 8 KiB for an inbox entry and the event. Dry runs of
+/// batches of refused anchors on a fork of Kreivo spec 134 (the deployed test instance) charge each
+/// refusal 0.13 G and 10.4 KB more under this code than under v2, so both parts are raised by
+/// about that much. To be checked against the zombienet measurement (`T-043-03`).
+pub const REFUSAL_RESERVE: Weight = Weight::new(750_000_000, 20 * 1024);
 /// What the batch needs after its last call: storing the head and returning the outcomes.
 pub const BATCH_FINISH_RESERVE: Weight = Weight::new(400_000_000, 4 * 1024);
 

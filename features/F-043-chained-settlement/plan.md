@@ -52,21 +52,25 @@ and finalises.
 - Removed: `prune_inbox`, `inbox_entry`, the superseded-anchor removals, `InboxPruned`. The `inbox` and legacy
   `anchors` keys stay declared, and the legacy anchor migration stays as it was.
 - `bound[asset]` is kept across a reset (`REQ-AS-8`); its value is a position in the chain it was bound in.
-- `REFUSAL_RESERVE` ref time 0.6 G to 0.7 G: a refusal now reads and writes the cell and hashes twice.
+- `REFUSAL_RESERVE` from 0.6 G and 8 KiB to 0.75 G and 20 KiB: a dry-run refusal costs 0.13 G and 10.4 KB more
+  than under v2 (it reads and writes the cell and hashes twice). To be re-measured on zombienet (`T-043-03`).
 - `check_invariants` checks the cell against the head, that nothing is stored from `start` on, and that the
   events the contract emitted since its last reset fold to the cell (the mock records each event's emitter and
   block, as Kreivo does).
 
 #### The reset's weight and refund (measured)
 
-On a Chopsticks fork of Kreivo (spec 134, finalized #40,151,145) with this code installed on both instances,
-`set_anchor_head` dry-run as governance (`ContractsApi.call`, `gas_required`):
+On a Chopsticks fork of Kreivo (spec 134, finalized #40,151,145) with a local build of this code
+(before `MAX_RESET_CLEAR` went from 128 to 64 and `REFUSAL_RESERVE` was raised; the reset's path is otherwise the
+same) installed on both instances, `set_anchor_head`
+dry-run as governance (`ContractsApi.call`, `gas_required`), on the test instance with its stored entries
+rewritten in the fork's storage to each count:
 
 | Stored entries | Ref time | Proof size |
 |---|---|---|
 | 0 | 1.713 G | 185,728 B |
 | 13 (test) | 3.885 G | 320,148 B |
-| 17 (prod) | 4.552 G | 361,508 B |
+| 17 (prod's count) | 4.552 G | 361,508 B |
 | 128 | 23.089 G | 1,509,248 B |
 
 That is **0.167 G and 10,340 B per removed entry**, linear; at the bound of 64, about 12.4 G and 0.85 MB, a third
@@ -75,7 +79,9 @@ of the 2.45 MB a normal extrinsic may prove. The storage deposit released goes t
 `Communities.dispatch_as_account`, that is the community's account. Test: community 1200's account
 (`F3opxRaMqPWKwA5yvdbzVhug5ZTGkeU6id6SRBWB9c15Sy3`, already governance), 93,684,332,889 planck (0.0937 KSM). Prod:
 community 1201's account (`F3opxRaMqPWKwA5yvdsjXFVnaEejJkLqPZbzMsLdyUjMCLk`) once the admin names it,
-113,750,666,134 planck (0.1138 KSM).
+113,750,666,134 planck (0.1138 KSM), from a `DryRunApi` run on the prod instance. Only a referendum of the
+community moves funds out of its account. The referendum's route ran only as a `DryRunApi` call with the
+`Communities{1200}` origin; the fork's scheduler enacted nothing, so the enactment itself is `T-043-03`'s.
 
 ### 2. Settle (`services/settle`)
 

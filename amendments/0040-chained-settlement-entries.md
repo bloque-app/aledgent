@@ -75,9 +75,11 @@ There is no intermediate version: the contract that replaces v2 is the final one
   cell. `Head` keeps its encoding and `next_seq` runs from 0 in the new chain, so readers of `next_seq` read
   the chain's position with no change. The storage deposits it releases go to the origin of the call: the
   governance account (on Kreivo, the community account a referendum dispatches as). It removes at most 64
-  entries and refuses an instance that may hold more (`TooManyStoredEntries`), changing nothing. Measured on a
-  fork of Kreivo (spec 134): 1.71 G of ref time and 186 KB of proof with nothing to remove, plus 0.167 G and
-  10.3 KB per entry; 4.55 G and 362 KB for prod's 17.
+  entries and refuses an instance that may hold more (`TooManyStoredEntries`), changing nothing. It counts
+  positions, not what is left: a v2 instance past position 64 is refused even if it pruned most of them. Both
+  deployed instances are below it. Measured on a
+  fork of Kreivo (spec 134), on the test instance's cells: 1.71 G of ref time and 186 KB of proof with nothing
+  to remove, plus 0.167 G and 10.3 KB per entry; 4.55 G and 362 KB at prod's count of 17.
 - **Why `start`.** Between the upgrade and the reset an instance can still append (an anchor), which advances
   `next_seq` and stores nothing. `next_seq` then no longer marks the end of what v2 stored, and an instance
   that was reset once has nothing stored at all. `start` is that end.
