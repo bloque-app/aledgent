@@ -16,6 +16,8 @@ path = [
   # The core stream's test PKI (F-038): test values, never a deployment's.
   "services/ingress/tests/fixtures/stream/*.pem",
   "services/ingress/tests/fixtures/stream/*.key",
+  # The code-history gate's recorded book (T-037-12): bytes a test build wrote, never edited.
+  "crates/core-binding/tests/fixtures/code-history/*",
   "**/*.txt",
 ]
 precedence = "aggregate"

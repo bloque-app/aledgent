@@ -35,6 +35,10 @@
 //! (`T-037-17`), neither built; and the platform's execution under each range's replayer, which
 //! needs the real packages (the core release job's check).
 
+// The fixture is a book in the default construction (`DEC-25`); a build of another construction
+// (`smt-v1`) founds another book, and a deployment never mixes the two.
+#![cfg(not(feature = "smt-v1"))]
+
 mod common;
 use common::*;
 
