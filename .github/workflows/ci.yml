@@ -222,6 +222,9 @@ jobs:
       # AWS IAM login is never run against a real Vault here (dev mode cannot): a staging smoke test with a
       # real role is required before a deployment uses Transit in production.
       - run: cargo test -p signer --features test-vault-auth --test transit_e2e -- --nocapture
+      # F-044: the archive's seal, wrapped to a Transit rsa-4096 key's public half and opened by
+      # Vault's decrypt, per version, under a decrypt-only policy (it mounts Transit of its own).
+      - run: cargo test -p core-archive --test transit -- --nocapture
       - name: Vault's log
         if: failure()
         run: docker logs vault | tail -n 60
