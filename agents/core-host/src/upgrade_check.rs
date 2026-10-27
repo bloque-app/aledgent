@@ -163,7 +163,7 @@ struct Upgrading {
 }
 
 impl Upgrading {
-    fn install(&mut self, generation: u64) -> Result<(), String> {
+    fn switch_generation(&mut self, generation: u64) -> Result<(), String> {
         let package = self
             .packages
             .get(&generation)
@@ -209,7 +209,7 @@ impl AgentPort for Upgrading {
         if g == self.installed {
             return Ok(());
         }
-        self.install(g)
+        self.switch_generation(g)
     }
 }
 
@@ -332,7 +332,7 @@ pub fn check_upgrade(args: &[String]) -> Result<(), String> {
         if !WriterCode::of(&hot).due(e.seq) {
             continue;
         }
-        port.install(gn)?;
+        port.switch_generation(gn)?;
         port.pinned = true;
         roll_forward_agent(
             port,
