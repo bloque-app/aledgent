@@ -1220,7 +1220,7 @@ const phases = {
     for (const [title, list] of [['Scenarios', report.scenarios], ['Fault injection (T-027-06)', report.faults]]) {
       lines.push('', `### ${title}`, '', '| Case | Result | Detail |', '|---|---|---|');
       for (const c of list) {
-        const detail = (typeof c.detail === 'string' ? c.detail : JSON.stringify(c.detail ?? '')).replace(/\n/g, ' ').replace(/\|/g, '\\|').slice(0, 600);
+        const detail = (typeof c.detail === 'string' ? c.detail : JSON.stringify(c.detail ?? '', (_, v) => (typeof v === 'bigint' ? v.toString() : v))).replace(/\n/g, ' ').replace(/\|/g, '\\|').slice(0, 600);
         lines.push(`| ${c.name} | ${icon[c.status] ?? c.status} | ${detail} |`);
       }
     }
@@ -1534,7 +1534,10 @@ phases.upgrade = async (ctx) => {
     ok &= await runCase('scenarios', 'upgrade: set_anchor_head passes as governance only; the full reset removes v2\'s entries and refunds the origin', async () => {
       const c = drive.contractOf(api, ctx.abi);
       const governance = new Keyring({ type: 'sr25519' }).addFromUri(env('GOVERNANCE_SURI', '//Charlie'));
-      await drive.send(api.tx.balances.transferKeepAlive(governance.address, '100000000000000'), accounts.admin, 'fund governance');
+      // Governance pays its own fees; funded once (dev chains give //Charlie a balance already).
+      if (big((await api.query.system.account(governance.address)).data.free) < 1_000_000_000_000n) {
+        await drive.send(api.tx.balances.transferKeepAlive(governance.address, '10000000000000'), accounts.admin, 'fund governance');
+      }
       await drive.callContract(api, c, accounts.admin, 'setGovernance', [governance.address], 'set_governance');
       const head = (await drive.read(api, c, 'head')).toJSON();
       const book = u8aToHex(randomBytes(32));
