@@ -401,6 +401,16 @@ groups:
         annotations:
           summary: The settlement layer has not confirmed its runtime; nothing is broadcast on it.
           runbook: ops/runbooks/release/settlement-adapter-outage.md
+      # F-044: a signing key's engine is not ready (Vault Transit has not answered for its window,
+      # or a key is no longer what was pinned). Nothing is signed meanwhile: withdrawals and anchors
+      # wait, observation carries on. A Vault blip does not raise it (the engine's own 30 s window).
+      - alert: AledgentAdapterSignerNotReady
+        expr: aledgent_adapter_alerts{kind="signer"} > 0
+        for: 2m
+        labels: { severity: page, owner: settlement-operations, signal: settlement-adapter }
+        annotations:
+          summary: A settlement key's signer (Vault Transit) is not ready; nothing is signed.
+          runbook: ops/runbooks/release/settlement-adapter-outage.md
       # Blocks come and finality does not: Kreivo's finality follows Kusama's.
       - alert: AledgentFinalityStalled
         expr: aledgent_finality_lag_blocks > 20

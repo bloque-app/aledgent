@@ -194,3 +194,29 @@ async fn f_044_a_signer_that_does_not_answer_fails_the_signing_not_the_layer() {
     assert!(matches!(e, ChainError::Signer(_)), "{e:?}");
     assert!(e.to_string().contains("Vault does not answer"), "{e}");
 }
+
+/// `F-044`, `REQ-SA-9`: a restarted adapter over the same store finds the runtime confirmed for the
+/// native form (the row it stored, under `+native`): it neither asks the layer again nor refuses, and
+/// the next withdrawal goes out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f_044_a_restart_keeps_the_native_confirmation() {
+    let mut k = serving_kit(native()).await;
+    let alice = k.d.party("alice", 1_000).await;
+    let first = k.withdrawal(&alice, 10, "before").await;
+    until(&mut k, &alice, &first, "Settled", 6).await;
+    let asked = k.chain.validations();
+    assert!(asked >= 1, "the layer was asked once");
+    k.restart();
+    let r = k.step().await.unwrap();
+    assert!(r.serving, "{:?}", k.adapter.status());
+    let second = k.withdrawal(&alice, 5, "after").await;
+    until(&mut k, &alice, &second, "Settled", 6).await;
+    assert_eq!(
+        k.chain.validations(),
+        asked,
+        "not asked again after the restart"
+    );
+    let runtimes = k.store.runtimes().await.unwrap();
+    assert_eq!(runtimes.len(), 1, "{runtimes:?}");
+    assert!(runtimes[0].format.ends_with("+native"));
+}

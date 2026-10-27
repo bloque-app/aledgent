@@ -38,11 +38,15 @@ use settle::chain::rpc::{Names, RpcChain};
 use settle::config::{ChainSource, KeySource, PassKey, ProcessConfig};
 use settle::link::HttpTransport;
 use settle::signer::{DevEd25519, DevSigner, EngineEd25519, PassAccount, ServiceSigner, Signer};
+use settle::store::Store as _;
 use settle::store::pg::PgStore;
 
 /// How long every step may find the settlement layer unreachable before the process ends, for its
 /// supervisor to start a new one.
 const BLIND_RESTART: Duration = Duration::from_secs(180);
+
+/// The alert a signing key's engine that is not ready raises (`F-044`): kind `signer` in the signals.
+const SIGNER_ALERT: &str = "signer:engines";
 
 /// The lanes, in the file's form (`F-044`): native accounts, or PASS accounts.
 fn lanes(config: &ProcessConfig, keys: &Keys) -> Result<Vec<Arc<dyn Signer>>, String> {
@@ -434,7 +438,7 @@ async fn run() -> Result<(), String> {
     // smoldot did not always reconnect after its peers were cut for a minute and a half.
     let mut blind_since: Option<std::time::Instant> = None;
     let mut served = false;
-    let mut keys_ready = true;
+    let mut keys_ready: Option<bool> = None;
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -453,16 +457,41 @@ async fn run() -> Result<(), String> {
             write_signals(&adapter, path).await;
         }
         // F-044: an engine that cannot sign (Vault Transit down for its window, or a key no longer
-        // what was pinned) is said once when it goes and once when it comes back. A step that needs
-        // a signature fails meanwhile (`ChainError::Signer`), and the next one asks again; it does
-        // not count as the layer being unreachable.
-        let ready = keys.ready();
-        if ready.0 != keys_ready {
-            keys_ready = ready.0;
-            if ready.0 {
-                tracing::info!("the signing keys' engines are ready again");
+        // what was pinned) raises the alert `signer:engines`, which the signals count by kind for the
+        // exporter, and clears it when it comes back (the first step clears one a previous process
+        // left). A step that needs a signature fails meanwhile (`ChainError::Signer`), and the next
+        // one asks again; it does not count as the layer being unreachable.
+        let (ready, detail) = keys.ready();
+        if keys_ready != Some(ready) {
+            use ingress::clock::Clock as _;
+            let now = SystemClock.now();
+            let written = if ready {
+                adapter.store().clear(SIGNER_ALERT, now).await.map(|_| ())
             } else {
-                tracing::error!(detail = %ready.1, "a signing key's engine is not ready; nothing is signed until it is");
+                adapter
+                    .store()
+                    .raise(
+                        SIGNER_ALERT,
+                        &format!("a signing key's engine is not ready: {detail}; nothing is signed until it is"),
+                        now,
+                    )
+                    .await
+                    .map(|_| ())
+            };
+            match written {
+                Ok(()) => {
+                    if keys_ready.is_some() || !ready {
+                        if ready {
+                            tracing::info!("the signing keys' engines are ready again");
+                        } else {
+                            tracing::error!(detail = %detail, "a signing key's engine is not ready; nothing is signed until it is");
+                        }
+                    }
+                    keys_ready = Some(ready);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "the signer alert was not written; the next step tries again")
+                }
             }
         }
         // Blind: the layer does not answer; or, in a process that has never served, it answers

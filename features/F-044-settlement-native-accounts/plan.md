@@ -9,7 +9,7 @@ SPDX-License-Identifier: CC-BY-4.0
 |---|---|
 | Milestone | M-3 — Production V0 (no key material in any process: the adapter's keys never leave Vault) |
 | Track | B |
-| Home | `services/settle` (its signer boundary, the transaction, the fake layer, the configuration, the binary), `services/settle/kreivo-pin` (the native vector) |
+| Home | `services/settle` (its signer boundary, the transaction, the fake layer, the configuration, the binary), `services/settle/kreivo-pin` (the native vector), `ops/prometheus` (the signer alert's rule) |
 | Depends on | `F-027` (the executor and its transaction), `F-042` (signature engines, the Vault Transit engine), `F-043` (the adapter it is built on) |
 | Unblocks | Turning settlement on again with keys that cannot leave Vault; removing the PASS form once the zombienet suite moves (`T-044-06`) |
 | Realises | `NFR-8`, `REQ-SA-8`, `REQ-SA-9`, `REQ-AU-8` |
@@ -64,7 +64,9 @@ suite still provisions PASS accounts (`e2e/`, owned by other work); `T-044-06` r
 (`ChainError::Signer`): nothing is stored or broadcast, the calls wait, and the next step asks again. It is
 not the layer's unavailability, so it does not count toward the binary's restart after three minutes
 without the layer. The Transit engine's own readiness (Vault down past its window, a key no longer what was
-pinned) is logged when it changes; the binary has no readiness endpoint.
+pinned) raises the adapter's alert `signer:engines` and clears it when it comes back; the signals count it
+(kind `signer`) and `AledgentAdapterSignerNotReady` pages after two minutes. The binary has no readiness
+endpoint.
 
 **Operators.** `aledgent-settle <config> keys` opens the keys and prints each lane's and the anchor key's
 account and public key, and exits: no layer, store or ingress. It is the smoke test of the AWS IAM login to
@@ -72,8 +74,10 @@ Vault and of the keys' reads, and the source of the accounts `set_keys` lists.
 
 ## Trade-offs, stated plainly
 
-- Every signature is a round trip to Vault: Vault is in the path of settlement, and its outage stops
-  signing (not observing). Settlement's rate is low, and a stall only delays it.
+- Every signature is a round trip to Vault: Vault is in the path of settlement. While it is out, a step
+  still takes in the outbox and observes the layer (both come before signing), then stops at the first
+  signature it needs: withdrawals, and the anchor, bindings and position reports that follow them in the
+  step, wait. Settlement's rate is low, and a stall only delays it.
 - The adapter's own process, not only the sidecar, holds a Vault token that can sign with its keys. It could
   already ask the sidecar to sign anything; what changes is that the boundary that holds the key is Vault,
   whose audit log is the separate audit `NFR-8` asks for.

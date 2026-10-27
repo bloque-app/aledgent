@@ -372,6 +372,14 @@ fn nfr_11_each_signal_over_its_line_pages_the_test_route() {
                     .insert("runtime".into(), 1);
             },
         ),
+        // F-044: a signing key's engine (Vault Transit) not ready.
+        ("AledgentAdapterSignerNotReady", "settlement-adapter", |s| {
+            s.adapter
+                .as_mut()
+                .unwrap()
+                .alerts
+                .insert("signer".into(), 1);
+        }),
         ("AledgentFinalityStalled", "settlement-adapter", |s| {
             s.adapter.as_mut().unwrap().best = 141
         }),
@@ -668,7 +676,7 @@ fn t_018_10_release_alerts_link_their_runbooks_and_route_to_the_pager() {
             r.alert
         );
     }
-    assert_eq!(release, 17, "the release alerts");
+    assert_eq!(release, 18, "the release alerts");
     let routing = Routing::committed().unwrap();
     let mut labels = BTreeMap::new();
     labels.insert("severity".to_owned(), "page".to_owned());
