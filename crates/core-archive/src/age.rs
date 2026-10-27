@@ -327,17 +327,17 @@ fn polymod(values: &[u8]) -> u32 {
     chk
 }
 
-fn hrp_expand(hrp: &[u8]) -> Vec<u8> {
-    let mut v: Vec<u8> = hrp.iter().map(|c| c >> 5).collect();
+fn hrp_expand(hrp: &[u8]) -> Zeroizing<Vec<u8>> {
+    let mut v: Zeroizing<Vec<u8>> = Zeroizing::new(hrp.iter().map(|c| c >> 5).collect());
     v.push(0);
     v.extend(hrp.iter().map(|c| c & 31));
     v
 }
 
-fn convert_bits(data: &[u8], from: u32, to: u32, pad: bool) -> Option<Vec<u8>> {
+fn convert_bits(data: &[u8], from: u32, to: u32, pad: bool) -> Option<Zeroizing<Vec<u8>>> {
     let (mut acc, mut bits) = (0u32, 0u32);
     let maxv = (1u32 << to) - 1;
-    let mut out = Vec::new();
+    let mut out = Zeroizing::new(Vec::new());
     for &d in data {
         let d = u32::from(d);
         if d >> from != 0 {
@@ -360,18 +360,20 @@ fn convert_bits(data: &[u8], from: u32, to: u32, pad: bool) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Bech32 (BIP 173) of `data` under `hrp`, lower case.
-pub fn bech32_encode(hrp: &str, data: &[u8]) -> String {
+/// Bech32 (BIP 173) of `data` under `hrp`, lower case. Every buffer it uses is wiped (an
+/// identity's secret passes through it).
+pub fn bech32_encode(hrp: &str, data: &[u8]) -> Zeroizing<String> {
     let hrp = hrp.to_ascii_lowercase();
     let five = convert_bits(data, 8, 5, true).unwrap_or_default();
     let mut values = hrp_expand(hrp.as_bytes());
     values.extend_from_slice(&five);
     values.extend_from_slice(&[0; 6]);
     let pm = polymod(&values) ^ 1;
-    let mut s = hrp;
+    let mut s = Zeroizing::new(String::with_capacity(hrp.len() + 1 + five.len() + 6));
+    s.push_str(&hrp);
     s.push('1');
-    for v in five {
-        s.push(BECH32[v as usize] as char);
+    for v in five.iter() {
+        s.push(BECH32[*v as usize] as char);
     }
     for i in 0..6 {
         s.push(BECH32[((pm >> (5 * (5 - i))) & 31) as usize] as char);
@@ -379,21 +381,23 @@ pub fn bech32_encode(hrp: &str, data: &[u8]) -> String {
     s
 }
 
-/// Decode Bech32 (BIP 173): (the HRP in lower case, the data). One case throughout.
-pub fn bech32_decode(s: &str) -> Option<(String, Vec<u8>)> {
+/// Decode Bech32 (BIP 173): (the HRP in lower case, the data). One case throughout. Every buffer
+/// it uses is wiped.
+pub fn bech32_decode(s: &str) -> Option<(String, Zeroizing<Vec<u8>>)> {
     if s.chars().any(|c| c.is_ascii_lowercase()) && s.chars().any(|c| c.is_ascii_uppercase()) {
         return None;
     }
-    let s = s.to_ascii_lowercase();
+    let s = Zeroizing::new(s.to_ascii_lowercase());
     let pos = s.rfind('1')?;
     let (hrp, data) = (&s[..pos], &s[pos + 1..]);
     if hrp.is_empty() || data.len() < 6 {
         return None;
     }
-    let values: Vec<u8> = data
-        .bytes()
-        .map(|c| BECH32.iter().position(|b| *b == c).map(|p| p as u8))
-        .collect::<Option<_>>()?;
+    let values: Zeroizing<Vec<u8>> = Zeroizing::new(
+        data.bytes()
+            .map(|c| BECH32.iter().position(|b| *b == c).map(|p| p as u8))
+            .collect::<Option<_>>()?,
+    );
     let mut check = hrp_expand(hrp.as_bytes());
     check.extend_from_slice(&values);
     if polymod(&check) != 1 {
@@ -432,7 +436,7 @@ impl Recipient {
 
     /// Its `age1…` form.
     pub fn to_bech32(&self) -> String {
-        bech32_encode("age", &self.0)
+        bech32_encode("age", &self.0).to_string()
     }
 
     /// Wrap `file_key` to it: a fresh ephemeral share, as `age` does.
@@ -502,7 +506,8 @@ impl Identity {
 
     /// Its `AGE-SECRET-KEY-1…` form (upper case, as `age-keygen` writes it).
     pub fn to_bech32(&self) -> Zeroizing<String> {
-        Zeroizing::new(bech32_encode("age-secret-key-", &self.0.to_bytes()).to_ascii_uppercase())
+        let secret = Zeroizing::new(self.0.to_bytes());
+        Zeroizing::new(bech32_encode("age-secret-key-", secret.as_ref()).to_ascii_uppercase())
     }
 
     /// Its recipient.
@@ -529,9 +534,11 @@ impl Identity {
         salt.extend_from_slice(&share);
         salt.extend_from_slice(&self.recipient().0);
         let key = hkdf(&salt, shared.as_bytes(), X25519_INFO);
-        let pt = ChaCha20Poly1305::new(Key::from_slice(key.as_ref()))
-            .decrypt(Nonce::from_slice(&[0u8; 12]), stanza.body.as_slice())
-            .ok()?;
+        let pt = Zeroizing::new(
+            ChaCha20Poly1305::new(Key::from_slice(key.as_ref()))
+                .decrypt(Nonce::from_slice(&[0u8; 12]), stanza.body.as_slice())
+                .ok()?,
+        );
         let mut k = Zeroizing::new([0u8; 16]);
         k.copy_from_slice(pt.get(..16)?);
         Some(k)
@@ -557,7 +564,8 @@ mod tests {
         assert!(bech32_decode("a12uel5m").is_none());
         let data = [7u8; 32];
         let s = bech32_encode("age", &data);
-        assert_eq!(bech32_decode(&s), Some(("age".into(), data.to_vec())));
+        let (hrp, back) = bech32_decode(&s).unwrap();
+        assert_eq!((hrp.as_str(), back.as_slice()), ("age", data.as_slice()));
     }
 
     #[test]

@@ -29,6 +29,13 @@ struct Vault {
 
 impl Vault {
     fn from_env() -> Option<Vault> {
+        let given = |v: &str| std::env::var_os(v).is_some_and(|x| !x.is_empty());
+        // Half a Vault is a broken job, not a reason to skip.
+        assert_eq!(
+            given("ALEDGENT_TEST_VAULT"),
+            given("ALEDGENT_TEST_VAULT_TOKEN"),
+            "ALEDGENT_TEST_VAULT and ALEDGENT_TEST_VAULT_TOKEN go together"
+        );
         match (
             std::env::var("ALEDGENT_TEST_VAULT"),
             std::env::var("ALEDGENT_TEST_VAULT_TOKEN"),

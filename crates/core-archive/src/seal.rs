@@ -26,7 +26,10 @@
 //! **In clear** (`K`): a segment's or a checkpoint's record header (the book, the offsets and
 //! SHA-256 of its payloads, the restore point, its times), and the whole of a `verify-genesis`
 //! report; nothing of any other object. That is what the writer reads back after a restart, with
-//! no key: the core host never holds a key that opens the archive ([`ObjectStore::head`]).
+//! no key: the core host never holds a key that opens the archive ([`ObjectStore::head`]). For
+//! a keyless reader those bytes, and the seal line, are **not authenticated**: they are what the
+//! store returns, kept honest by its write-once and Object Lock. A reader with a key checks them
+//! (the MAC covers the seal line; the plaintext must match it and begin with the clear bytes).
 //! Payloads (the log's entries and replies), checkpoints' state and chainspecs are only in the age
 //! file.
 //!
@@ -332,21 +335,58 @@ impl core::fmt::Debug for VaultTransit {
     }
 }
 
-/// Whether `address` may carry a Vault token: HTTPS, or plain HTTP to this host (a dev Vault).
+/// Whether `address` may carry a Vault token: HTTPS to a host, or plain HTTP to this host (a dev
+/// Vault). The authority is parsed: no user information (`http://localhost@evil/`), no path tricks.
 fn check_vault_address(address: &str) -> Result<(), String> {
-    let loopback = ["http://127.0.0.1", "http://localhost", "http://[::1]"]
-        .iter()
-        .any(|p| {
-            address == *p
-                || address.starts_with(&format!("{p}:"))
-                || address.starts_with(&format!("{p}/"))
-        });
-    if address.starts_with("https://") || loopback {
+    let refuse = || {
+        Err(format!(
+            "vault={address:?}: https://<host>[:port], or http:// to 127.0.0.1, localhost or [::1] only"
+        ))
+    };
+    let (https, rest) = match (
+        address.strip_prefix("https://"),
+        address.strip_prefix("http://"),
+    ) {
+        (Some(r), _) => (true, r),
+        (None, Some(r)) => (false, r),
+        _ => return refuse(),
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty()
+        || authority.contains(['@', '\\', '%'])
+        || authority
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control())
+    {
+        return refuse();
+    }
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(v6) => match v6.split_once(']') {
+            Some((h, p)) => (format!("[{h}]"), p),
+            None => return refuse(),
+        },
+        None => match authority.split_once(':') {
+            Some((h, p)) => (h.to_owned(), &authority[h.len()..][..1 + p.len()]),
+            None => (authority.to_owned(), ""),
+        },
+    };
+    let port_ok = match port.strip_prefix(':') {
+        None => port.is_empty(),
+        Some(p) => !p.is_empty() && p.len() <= 5 && p.bytes().all(|b| b.is_ascii_digit()),
+    };
+    let host_ok = !host.is_empty()
+        && (host.starts_with('[')
+            || host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.'));
+    let loopback = matches!(
+        host.to_ascii_lowercase().as_str(),
+        "127.0.0.1" | "localhost" | "[::1]"
+    );
+    if port_ok && host_ok && (https || loopback) {
         Ok(())
     } else {
-        Err(format!(
-            "vault={address:?}: https://, or http:// to this host only"
-        ))
+        refuse()
     }
 }
 
@@ -372,7 +412,7 @@ impl VaultTransit {
         })
     }
 
-    fn call(&self, key: &str, body: &str) -> Result<(u16, String), StoreError> {
+    fn call(&self, key: &str, body: &str) -> Result<(u16, Zeroizing<String>), StoreError> {
         let token = self.token.token()?;
         let url = format!("{}/v1/{}/decrypt/{key}", self.address, self.mount);
         let mut resp = self
@@ -383,12 +423,14 @@ impl VaultTransit {
             .send(body)
             .map_err(|e| StoreError::Unavailable(format!("Vault Transit decrypt: {e}")))?;
         let status = resp.status().as_u16();
-        let text = resp
-            .body_mut()
-            .with_config()
-            .limit(64 * 1024)
-            .read_to_string()
-            .map_err(|e| StoreError::Unavailable(format!("Vault Transit decrypt: {e}")))?;
+        // It holds the file key, in base64, when Vault answers: wiped when dropped.
+        let text = Zeroizing::new(
+            resp.body_mut()
+                .with_config()
+                .limit(64 * 1024)
+                .read_to_string()
+                .map_err(|e| StoreError::Unavailable(format!("Vault Transit decrypt: {e}")))?,
+        );
         Ok((status, text))
     }
 }
@@ -427,7 +469,7 @@ impl TransitUnwrap for VaultTransit {
                     struct Resp {
                         data: Data,
                     }
-                    let r: Resp = serde_json::from_str(&text).map_err(|_| {
+                    let r: Resp = serde_json::from_str(text.as_str()).map_err(|_| {
                         StoreError::Unavailable(format!(
                             "Vault Transit decrypt {what}: not an answer"
                         ))
@@ -779,7 +821,9 @@ impl Sealed {
         }
     }
 
-    /// Open the envelope `raw` read as `name`, refusing a plaintext over `max` bytes.
+    /// Open the envelope `raw` read as `name`, refusing a plaintext over `max` bytes: always by
+    /// decrypting it, with a file key this layer holds (one it sealed with, or opened before) or
+    /// one its [`Keys`] unwrap. Nothing in clear is taken on trust here.
     pub fn open(&self, name: &str, raw: &[u8], max: u64) -> Result<Vec<u8>, StoreError> {
         let env = parse_envelope(name, raw)?;
         if env.line.name != name {
@@ -787,15 +831,6 @@ impl Sealed {
         }
         if env.line.bytes > max {
             return Err(StoreError::TooLarge(name.to_owned()));
-        }
-        // Wholly in clear (a verify-genesis report), and no key to check the rest: what is in
-        // clear is the object, as the seal line's digest says.
-        if env.line.clear == env.line.bytes && self.keys.is_empty() {
-            return if sha256_hex(env.clear) == env.line.sha256 {
-                Ok(env.clear.to_vec())
-            } else {
-                Err(corrupt(name, "its clear bytes are not the seal line's"))
-            };
         }
         let (header, at) = age::parse_header(env.age).map_err(|e| corrupt(name, &e.to_string()))?;
         let seal_line_digest = sha256_hex(env.line_bytes);
@@ -857,6 +892,23 @@ impl ObjectStore for Sealed {
             return Ok(None);
         };
         if is_sealed(&raw) {
+            // Wholly in clear (a verify-genesis report) and no key given: the clear bytes, if they
+            // are what the seal line's digest says. That catches corruption, not a forgery: the
+            // seal line is not authenticated for a reader with no key (the store's write-once and
+            // Object Lock are what keep it). A reader with a key decrypts.
+            if self.keys.is_empty() {
+                let env = parse_envelope(name, &raw)?;
+                if env.line.name == name && env.line.clear == env.line.bytes {
+                    if env.line.bytes > max {
+                        return Err(StoreError::TooLarge(name.to_owned()));
+                    }
+                    return if sha256_hex(env.clear) == env.line.sha256 {
+                        Ok(Some(env.clear.to_vec()))
+                    } else {
+                        Err(corrupt(name, "its clear bytes are not the seal line's"))
+                    };
+                }
+            }
             return self.open(name, &raw, max).map(Some);
         }
         if self.unsealed == Unsealed::Refuse {
@@ -923,15 +975,25 @@ impl ObjectStore for Sealed {
 /// What [`copy`] did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Copied {
-    /// Objects sealed and published.
+    /// Objects sealed and published by this run, each decrypted back and found the same.
     pub created: u64,
-    /// Objects already there, the same.
+    /// Objects already there, by their seal line the same, and decrypted back with the target's
+    /// reader keys and found the same.
     pub present: u64,
+    /// Objects already there, by their seal line the same, that this run could not decrypt (the
+    /// target has no reader key): **not verified**. The old archive retires only when a run with
+    /// a reader key leaves this empty.
+    pub unverified: Vec<String>,
 }
 
-/// Copy every object under `prefixes` of `from` (the old archive, read as it is) to `to` (a
-/// sealing writer), under the same names, each read back from `to` and checked byte for byte
-/// against what was read. Resumable: what is already there, the same, is counted and left.
+/// Copy every object under `prefixes` of `from` (the old archive, as it is) to `to` (a sealing
+/// writer), under the same names. Each object this run seals is decrypted back (with the file key
+/// it sealed under) and compared byte for byte; each one already there is decrypted with `to`'s
+/// reader keys if it has any, and otherwise listed in [`Copied::unverified`]. Any failure to read
+/// back is an error, never a count. Resumable.
+///
+/// `from` must give plaintext: an object that is already sealed is refused (read a sealed source
+/// through a [`Sealed`] reader), so nothing is sealed twice.
 pub fn copy(
     from: &dyn ObjectStore,
     to: &Sealed,
@@ -949,24 +1011,32 @@ pub fn copy(
             let bytes = from
                 .get(&name, max)?
                 .ok_or_else(|| StoreError::Unavailable(format!("{name} vanished while copied")))?;
-            if to.put_once(&name, &bytes)?.created {
-                out.created += 1;
-            } else {
-                out.present += 1;
+            if is_sealed(&bytes) {
+                return Err(corrupt(
+                    &name,
+                    "the source holds it sealed already: read the source through a Sealed reader",
+                ));
             }
-            match to.inner.get(&name, sealed_bound(max))? {
-                Some(raw) if is_sealed(&raw) && Sealed::same(&name, &raw, &bytes) => {
-                    // Opened with this epoch's key when this run sealed it.
-                    if let Ok(back) = to.open(&name, &raw, max)
-                        && back != bytes
-                    {
-                        return Err(corrupt(
-                            &name,
-                            "the copy does not read back as the original",
-                        ));
-                    }
-                }
+            let created = to.put_once(&name, &bytes)?.created;
+            let raw = match to.inner.get(&name, sealed_bound(max))? {
+                Some(raw) if is_sealed(&raw) && Sealed::same(&name, &raw, &bytes) => raw,
                 _ => return Err(corrupt(&name, "the copy is not sealed as the original")),
+            };
+            if created || !to.keys.is_empty() {
+                // Sealed by this run (its file key is held), or a reader key is given: decrypt.
+                if to.open(&name, &raw, max)? != bytes {
+                    return Err(corrupt(
+                        &name,
+                        "the copy does not read back as the original",
+                    ));
+                }
+                if created {
+                    out.created += 1;
+                } else {
+                    out.present += 1;
+                }
+            } else {
+                out.unverified.push(name);
             }
         }
     }

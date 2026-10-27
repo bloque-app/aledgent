@@ -76,7 +76,7 @@ segment's age part, cut with the recipe below, with the recovery identity (2026-
 - **Nonce:** age's per-file payload nonce; the stanza nonces are age's.
 - **AEAD:** ChaCha20-Poly1305 (payload, X25519 wrap); RSA-OAEP for the Transit wrap; HMAC-SHA-256 over the
   header.
-- **Read:** the seal line's name must be the name asked for; the header must bind the seal line; the MAC must
+- **Read** (with a key): the seal line's name must be the name asked for; the header must bind the seal line; the MAC must
   verify; the plaintext must have the seal line's length and SHA-256 and begin with the clear bytes.
 - **Recovery with stock tools** (no aledgent binary): `n=$(head -2 obj | wc -c); k=$(sed -n 2p obj | jq .clear);
   tail -c +$((n+k+1)) obj | age -d -i recovery.txt > record`.
@@ -86,8 +86,7 @@ segment's age part, cut with the recipe below, with the recovery identity (2026-
 The writer (the core host) reads its archive back in three places: the archiver's resume after a restart (the
 last segment's header and digest, and the last checkpoint's header), the write-once comparison after a refused
 put, and `verify-genesis --archive` (the report kept beside the chainspec). It holds no key that opens the
-archive (D2), so what it reads back is kept **in clear**, authenticated by the seal line's SHA-256 for a keyless
-reader and by the MAC for a reader with a key:
+archive (D2), so what it reads back is kept **in clear**:
 
 | Object | In clear | Sealed only |
 |---|---|---|
@@ -95,6 +94,25 @@ reader and by the MAC for a reader with a key:
 | checkpoint | its record header (the same kind of fields) | the Agent's state |
 | `chainspec/<digest>.verified.json` | all of it: verified, the digest, chunk and record counts, the roots, a duration | — |
 | `chainspec/<digest>.bin` and anything else | nothing | all of it |
+
+**What a keyless reader can trust of it.** For a reader with a key, the clear bytes are authenticated: the header's
+MAC covers the seal line, and the decrypted plaintext must have the seal line's SHA-256 and begin with the clear
+bytes. **For the keyless writer they are not.** A segment's or checkpoint's clear header is taken as the store
+returns it, and so is the seal line beside it (`Sealed::head` checks only its name and bounds); anyone who can
+write an object could write any seal line and any header. The whole of a `verify-genesis` report is in clear,
+and a keyless read checks it against the seal line's SHA-256, which catches corruption but not a forgery, since
+that seal line is no more authenticated. What keeps these bytes honest for the writer is the store: write-once
+(`If-None-Match`), Object Lock, and a writer role that is the only one allowed to put.
+
+What the archiver's resume does catch, with no key: the clear header's book must be this host's; the bytes of
+`archive.bin` and `replies.jsonl` at the header's offsets must have the header's SHA-256 (else "not this host's
+history" and the archiver stops writing); and the local logs must not be shorter than the header's ends. What it
+does not catch: a header that matches the local logs but carries another digest (the seal line's SHA-256, taken
+as the segment's) or another restore point. The archiver then continues the chain from the wrong digest; nothing
+is lost on the node, and `fetch` (which decrypts) refuses the chain at that segment at the next restore or
+drill, so the damage shows there, not at write time. Closing that gap cheaply: the writer keeps the last
+segment's number and digest in a local file and compares it on resume (not built; a fresh node after a restore
+has no such file, so `restore` would lay it out).
 
 > **Trade-off, stated plainly.** A reader of the bucket learns the archive's volume and rhythm (inputs and
 > entries per segment, when each was written, byte counts) and the roots, which anchoring publishes anyway.
@@ -199,8 +217,11 @@ statement (D9).
 
 They stay readable as they are (the layer passes unsealed objects through). The move to the new bucket copies
 them **resealed**, under the same names: `core_archive::seal::copy` reads each object of the old archive (with a
-role that has `kms:Decrypt`), seals it, publishes it, and checks it reads back byte for byte; run again, it skips
-what is there. The new bucket then holds no unsealed object, and the old bucket and its KMS key are retired only
+role that has `kms:Decrypt`), seals it, publishes it, and decrypts it back and compares it byte for byte; any
+read-back that fails is an error. Run again, it skips what is there: with a reader key (Transit or the recovery
+identity) it decrypts and checks each such object too; without one it lists them as **unverified**. A source
+that already holds sealed objects is refused (read it through a `Sealed` reader), so nothing is sealed twice.
+**Retiring the old bucket requires a run with a reader key that leaves no object unverified**, then the drill. The new bucket then holds no unsealed object, and the old bucket and its KMS key are retired only
 after the copy has been fetched and checked with each key on its own (D7). The CLI around it (`opsctl archive
 copy`) is a follow-up in `ops/`.
 

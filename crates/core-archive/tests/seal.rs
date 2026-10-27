@@ -402,8 +402,9 @@ fn f_044_unsealed_objects_are_read_unless_refused() {
     ));
 }
 
-/// The copy of an old archive into a sealed one: every object under the same name, sealed, read
-/// back the same; run again, nothing is written twice.
+/// The copy of an old archive into a sealed one: every object under the same name, sealed, and
+/// decrypted back. Run again with no reader key, nothing is written and nothing claims to be
+/// verified; with the recovery key, every object is verified.
 #[test]
 fn f_044_an_old_archive_copies_into_a_sealed_one() {
     let tmp = tempfile::tempdir().unwrap();
@@ -424,14 +425,27 @@ fn f_044_an_old_archive_copies_into_a_sealed_one() {
     )
     .unwrap();
     assert_eq!((copied.created, copied.present), (4, 0));
-    let again = seal::copy(
+    assert!(copied.unverified.is_empty());
+    let keyless = seal::copy(
         &o,
         &sealed(&new, 1, &recovery, Keys::none()),
         &prefixes,
         1 << 20,
     )
     .unwrap();
-    assert_eq!((again.created, again.present), (0, 4));
+    assert_eq!((keyless.created, keyless.present), (0, 0));
+    assert_eq!(keyless.unverified.len(), 4, "no key: none claimed verified");
+    let keyed = seal::copy(
+        &o,
+        &sealed(&new, 1, &recovery, with_recovery(&recovery)),
+        &prefixes,
+        1 << 20,
+    )
+    .unwrap();
+    assert_eq!(
+        (keyed.created, keyed.present, keyed.unverified.len()),
+        (0, 4, 0)
+    );
     let r = reader(&new, with_recovery(&recovery));
     for name in o.list("segments/").unwrap() {
         assert_eq!(
@@ -444,6 +458,85 @@ fn f_044_an_old_archive_copies_into_a_sealed_one() {
                 .starts_with(MAGIC_LINE)
         );
     }
+
+    // A copy damaged after it was written (its seal line intact): the verifying run fails.
+    let victim = new.join("chainspec/aa.bin");
+    let mut raw = std::fs::read(&victim).unwrap();
+    let last = raw.len() - 1;
+    raw[last] ^= 1;
+    std::fs::remove_file(&victim).unwrap();
+    std::fs::write(&victim, &raw).unwrap();
+    assert!(matches!(
+        seal::copy(
+            &o,
+            &sealed(&new, 1, &recovery, with_recovery(&recovery)),
+            &prefixes,
+            1 << 20
+        ),
+        Err(StoreError::Corrupt(_))
+    ));
+
+    // A sealed source is refused, not sealed twice; read through a reader, it copies.
+    let again = tmp.path().join("again");
+    assert!(matches!(
+        seal::copy(
+            &FsStore::open(&new).unwrap(),
+            &sealed(&again, 1, &recovery, Keys::none()),
+            &["segments/"],
+            1 << 20
+        ),
+        Err(StoreError::Corrupt(m)) if m.contains("sealed already")
+    ));
+    let through = seal::copy(
+        &reader(&new, with_recovery(&recovery)),
+        &sealed(&again, 1, &recovery, Keys::none()),
+        &["segments/"],
+        1 << 20,
+    )
+    .unwrap();
+    assert_eq!(through.created, 3);
+}
+
+/// A store that hands back what it holds with its last byte flipped.
+struct Damaging(FsStore);
+
+impl ObjectStore for Damaging {
+    fn put_once(&self, name: &str, bytes: &[u8]) -> Result<Put, StoreError> {
+        self.0.put_once(name, bytes)
+    }
+    fn get(&self, name: &str, max: u64) -> Result<Option<Vec<u8>>, StoreError> {
+        Ok(self.0.get(name, max)?.map(|mut b| {
+            if let Some(x) = b.last_mut() {
+                *x ^= 1;
+            }
+            b
+        }))
+    }
+    fn list(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+        self.0.list(prefix)
+    }
+    fn describe(&self) -> String {
+        self.0.describe()
+    }
+}
+
+/// A copy whose read-back does not decrypt is an error in the run that sealed it, never a count.
+#[test]
+fn f_044_a_copy_that_does_not_read_back_fails_the_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let o = FsStore::open(tmp.path().join("old")).unwrap();
+    o.put_once("segments/a.seg", b"record").unwrap();
+    let recovery = Identity::generate();
+    let to = Sealed::new(
+        Box::new(Damaging(FsStore::open(tmp.path().join("new")).unwrap())),
+        Some(recipients(1, &recovery)),
+        Keys::none(),
+        Unsealed::Accept,
+    );
+    assert!(matches!(
+        seal::copy(&o, &to, &["segments/"], 1 << 20),
+        Err(StoreError::Corrupt(_))
+    ));
 }
 
 /// The spec: `seal=` makes a writer seal (a reader ignores it), the seal file is checked, and the
@@ -582,4 +675,41 @@ fn f_044_stock_age_opens_the_seal_and_the_seal_opens_stock_age() {
         rec,
         "the seal's age code opens rage's file"
     );
+}
+
+/// A Vault address carries a token: HTTPS to a host, or HTTP to this host only, with its authority
+/// parsed (no user information to smuggle another host past a prefix check).
+#[test]
+fn f_044_a_vault_address_is_parsed_not_prefix_matched() {
+    let new = |a: &str| {
+        core_archive::seal::VaultTransit::new(
+            a,
+            "transit",
+            core_archive::seal::TokenSource::Fixed(Default::default()),
+        )
+    };
+    for ok in [
+        "https://vault.example",
+        "https://vault.example:8200",
+        "https://vault.example/",
+        "http://127.0.0.1:8200",
+        "http://localhost",
+        "http://[::1]:8200",
+    ] {
+        assert!(new(ok).is_ok(), "{ok}");
+    }
+    for bad in [
+        "http://vault.example",
+        "http://localhost:80@evil.example/",
+        "http://localhost@evil.example",
+        "https://user@vault.example",
+        "http://127.0.0.1.evil.example",
+        "http://localhost:80x",
+        "https://",
+        "ftp://vault.example",
+        "http://[::1",
+        "https://vault.example:99999999",
+    ] {
+        assert!(new(bad).is_err(), "{bad}");
+    }
 }

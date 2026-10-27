@@ -106,9 +106,10 @@ fn t_005_15_the_s3_sink_writes_once_encrypted_and_locked() {
     assert!(core_archive::open(&read_spec, Access::Write).is_err());
 }
 
-/// `F-044` over S3: a sealed writer's exact retry goes through S3's refusal (412) and the seal
-/// line, different bytes conflict, every object is locked and sealed, and the recovery key reads
-/// it back.
+/// `F-044` over S3, with no KMS key (the new bucket's writer): a sealed writer starts without
+/// `kms-key-id`, its exact retry goes through S3's refusal (412) and the seal line, different bytes
+/// conflict, every object is locked and sealed and not under KMS, and the recovery key reads it
+/// back.
 #[test]
 fn f_044_the_sealed_s3_sink_writes_once_locked_and_sealed() {
     let Some(spec) = spec() else {
@@ -123,6 +124,11 @@ fn f_044_the_sealed_s3_sink_writes_once_locked_and_sealed() {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis()
+    );
+    config.kms_key_id = None;
+    assert!(
+        config.check_writer(false).is_err(),
+        "neither the seal nor KMS"
     );
     config.check_writer(true).unwrap();
     let recovery = Identity::generate();
@@ -150,6 +156,11 @@ fn f_044_the_sealed_s3_sink_writes_once_locked_and_sealed() {
     assert!(raw.starts_with(MAGIC_LINE) && raw.windows(8).all(|x| x != b"a record"));
     let p = store().protection("segments/a.seg").unwrap().unwrap();
     assert!(p.lock_mode.is_some() && p.retain_until.is_some(), "{p:?}");
+    assert_ne!(
+        p.encryption.as_deref(),
+        Some("aws:kms"),
+        "no KMS asked: {p:?}"
+    );
     let r = Sealed::new(
         store(),
         None,
