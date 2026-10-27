@@ -1,0 +1,109 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+name: Code history
+
+# The code-history gate (T-037-12; REQ-RT-3, REQ-RT-17, REQ-RT-19; amendment 0023 (f), amendment 0033
+# (d) and D18; bloque-app/bloque-ledgent#286).
+#
+# A book keeps every input it ever took, and a restore must be able to replay all of them, each range
+# under the code that ran it. This build must therefore still decide every recorded input exactly as
+# the build that recorded it did, under that input's code generation (the frozen host spec, ruling
+# a0023-q6). The gate replays a recorded history (crates/core-binding/tests/fixtures/code-history)
+# from genesis, natively, under its code map, and requires every archived root and log hash; and it
+# decides every way-out input at an upgrade's input under the generation in force and the next one,
+# and requires the same writer state (D18). The recorded part of the history may only grow: a change
+# that rewrote it would pass by re-recording what it breaks.
+#
+# It runs on every change to the core's guest, its host, the kernel, the library or the call format,
+# and it is a reusable workflow: the core release job (core-release.yml) calls it before a code
+# version is built, so no code version is published from a tree that fails it.
+#
+# Not here yet: a construction migration (T-037-10) and a continuation (T-037-17), neither built;
+# the platform's execution of each range under its replayer, with the real packages; and the read-only
+# replay of a deployment's archive, which needs read access to the archive.
+
+on:
+  pull_request:
+    paths:
+      - "agents/core/**"
+      - "agents/core-host/**"
+      - "crates/core-binding/**"
+      - "crates/ledger-core/**"
+      - "crates/ledger-kernel/**"
+      - "crates/compact-smt/**"
+      - "crates/leaf-store/**"
+      - "Cargo.lock"
+      - "agents/Cargo.lock"
+      - "tools/ci/check-code-history-fixture.sh"
+      - ".github/workflows/code-history.yml"
+  push:
+    branches: [develop, main]
+    paths:
+      - "agents/core/**"
+      - "agents/core-host/**"
+      - "crates/core-binding/**"
+      - "crates/ledger-core/**"
+      - "crates/ledger-kernel/**"
+      - "crates/compact-smt/**"
+      - "crates/leaf-store/**"
+      - "Cargo.lock"
+      - "agents/Cargo.lock"
+      - "tools/ci/check-code-history-fixture.sh"
+      - ".github/workflows/code-history.yml"
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  code-history:
+    name: code history (T-037-12)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The base the recorded history is compared with must be in the clone.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: The recorded history only grew
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            pull_request) base="$PR_BASE" ;;
+            push) base="$BEFORE" ;;
+            # A release, or a run by hand: against the newest release tag.
+            *) base=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true) ;;
+          esac
+          if [ -z "$base" ] || [ "$base" = 0000000000000000000000000000000000000000 ]; then
+            echo "No base to compare the recorded history with: skipped." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          tools/ci/check-code-history-fixture.sh "$base" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: code-history
+
+      - name: This build replays the recorded history, and decides each way out the same by either generation
+        run: cargo test -p core-binding --features ingress --test code_history
+
+      - name: Restore and replay across upgrades (AC-K7.3, AC-K7.18), and the code map
+        run: |
+          cargo test -p core-binding --features ingress --lib code_map
+          cargo test -p core-binding --features ingress --test roll_forward --test switch_driver --test fence
+          cargo test -p conformance -- AC-K7
