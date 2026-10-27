@@ -104,6 +104,8 @@ pub mod selector {
     /// `chain_head()` (amendment 0040): the head of the chain of entries. It replaces
     /// `inbox_entry(seq)` (`0x0000_0302`), which the contract no longer answers.
     pub const CHAIN_HEAD: [u8; 4] = [0, 0, 0x03, 0x0A];
+    /// `anchor_epoch()` (amendment 0039): the anchor sequence governance started last.
+    pub const ANCHOR_EPOCH: [u8; 4] = [0, 0, 0x03, 0x08];
     /// `latest_anchor()`: the only anchor the contract keeps, overwritten by each new one
     /// (owner's ruling of 2026-10-11). It replaces `anchor_record(number)` (`0x0000_0303`).
     pub const LATEST_ANCHOR: [u8; 4] = [0, 0, 0x03, 0x07];
@@ -461,6 +463,32 @@ pub struct ChainHeadCell {
     pub digest: [u8; 32],
     /// The position the chain started at, from the zero digest.
     pub start: u64,
+}
+
+/// `anchor_epoch()`'s answer, as stored (`AnchorEpoch`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct AnchorEpochCell {
+    /// The sequence's number.
+    pub epoch: u32,
+    /// The number it starts after.
+    pub base: u64,
+    /// The position of its first entry.
+    pub from_seq: u64,
+    /// The block it started at.
+    pub at: u32,
+    /// The book it anchors.
+    pub book: [u8; 32],
+    /// The latest anchor before it.
+    pub previous: Option<LatestAnchor>,
+}
+
+/// `anchor_epoch()`'s answer in the adapter's terms.
+pub fn chain_epoch(cell: &AnchorEpochCell) -> super::ChainEpoch {
+    super::ChainEpoch {
+        epoch: cell.epoch,
+        from_seq: cell.from_seq,
+        at: u64::from(cell.at),
+    }
 }
 
 /// `chain_head()`'s answer in the adapter's terms.

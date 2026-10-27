@@ -205,7 +205,8 @@ async fn t_043_04_an_idle_sync_is_one_read() {
         Some(AcceptedHead {
             position: 3,
             digest: h.digest,
-            block: fin.number
+            block: fin.number,
+            epoch: 0,
         })
     );
     assert_eq!(k.store.cursor(INSTANCE).await.unwrap(), 3);
@@ -222,12 +223,12 @@ async fn t_043_04_an_idle_sync_is_one_read() {
             (1, 0)
         );
     }
-    // The accepted block follows the finalized head while idle, so the next entry's sync reads
+    // The verified block follows the finalized head while idle, so the next entry's sync reads
     // only the blocks since.
     let fin = k.chain.finalized().await.unwrap();
     assert_eq!(
         k.store
-            .accepted_head(INSTANCE)
+            .verified_head(INSTANCE)
             .await
             .unwrap()
             .unwrap()
@@ -540,4 +541,292 @@ async fn t_043_05_nothing_re_reads_a_range_on_a_timer() {
         .filter(|r| r.kind == "rescan")
         .count();
     assert_eq!(rescans, 0);
+}
+
+// ------------------------------------------------------------------------------ a slow core
+
+/// A transport to ingress that can be cut: the core unreachable.
+#[derive(Clone)]
+struct Cuttable {
+    inner: settle::link::RouterTransport,
+    down: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl settle::link::Transport for Cuttable {
+    fn call<'a>(
+        &'a self,
+        method: &'a str,
+        path: &'a str,
+        client_key: Option<&'a str>,
+        body: Option<Value>,
+    ) -> settle::signer::BoxFuture<'a, Result<(u16, Value), settle::link::LinkError>> {
+        if self.down.load(std::sync::atomic::Ordering::SeqCst) {
+            return Box::pin(async { Err(settle::link::LinkError("ingress is down".into())) });
+        }
+        self.inner.call(method, path, client_key, body)
+    }
+}
+
+/// An adapter over the kit's chain and store whose transport is `transport`.
+fn adapter_over<T: settle::link::Transport>(
+    k: &Kit,
+    transport: T,
+) -> settle::Adapter<settle::chain::fake::FakeChain, settle::store::mem::MemStore, T> {
+    settle::Adapter::new(
+        k.adapter.config().clone(),
+        k.chain.clone(),
+        k.store.clone(),
+        transport,
+        k.lanes.clone(),
+        std::sync::Arc::new(k.d.clock.clone()),
+    )
+}
+
+/// `T-043-04` (review of #79): a core that refuses what the adapter reports for longer than the
+/// node keeps events (more than 256 blocks) does not make the range unreadable. What the fold
+/// verified is kept, entries and head, and later syncs fold only the blocks after it; once the core
+/// takes reports in again, the kept entries reach it and the head is accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_043_04_a_core_that_refuses_for_long_leaves_nothing_unreadable() {
+    let mut k = serving_kit().await;
+    deposits(&k, 1);
+    k.chain.finalize_all();
+    k.step().await.unwrap();
+    // The core refuses the adapter (its token no longer opens anything); two more deposits.
+    let mut refused = adapter_over(
+        &k,
+        settle::link::RouterTransport::new(k.d.router.clone(), "not-the-adapter"),
+    );
+    deposits(&k, 2);
+    for _ in 0..300 {
+        k.chain.advance(1);
+        let _ = refused.step().await;
+    }
+    let fin = k.chain.finalized().await.unwrap();
+    let verified = k.store.verified_head(INSTANCE).await.unwrap().unwrap();
+    assert_eq!((verified.position, verified.block), (3, fin.number));
+    assert_eq!(
+        k.store
+            .accepted_head(INSTANCE)
+            .await
+            .unwrap()
+            .unwrap()
+            .position,
+        1
+    );
+    assert_eq!(core_seqs(&k), vec![0]);
+    // The core takes them in again.
+    k.restart();
+    let before = k.chain.reads();
+    let r = k.step().await.unwrap();
+    assert_eq!(r.observed, 2);
+    assert_eq!(k.chain.reads().blocks - before.blocks, 0, "nothing re-read");
+    assert!(open_alerts(&k, "unreadable:").await.is_empty());
+    assert_eq!(core_seqs(&k), vec![0, 1, 2]);
+    let h = head(&k).await;
+    let accepted = k.store.accepted_head(INSTANCE).await.unwrap().unwrap();
+    assert_eq!((accepted.position, accepted.digest), (h.position, h.digest));
+    assert!(
+        k.store
+            .chain_entries(INSTANCE, 0, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// `T-043-04` (review of #79): the same with the core unreachable, every step failing: each still
+/// verifies and keeps the chain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_043_04_a_core_unreachable_for_long_leaves_nothing_unreadable() {
+    let k = serving_kit().await;
+    let down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut a = adapter_over(
+        &k,
+        Cuttable {
+            inner: settle::link::RouterTransport::new(
+                k.d.router.clone(),
+                settle::testkit::ADAPTER_TOKEN,
+            ),
+            down: down.clone(),
+        },
+    );
+    deposits(&k, 1);
+    k.chain.finalize_all();
+    a.step().await.unwrap();
+    down.store(true, std::sync::atomic::Ordering::SeqCst);
+    deposits(&k, 2);
+    for _ in 0..300 {
+        k.chain.advance(1);
+        assert!(a.step().await.is_err());
+    }
+    down.store(false, std::sync::atomic::Ordering::SeqCst);
+    let r = a.step().await.unwrap();
+    assert_eq!(r.observed, 2);
+    assert!(open_alerts(&k, "unreadable:").await.is_empty());
+    assert_eq!(core_seqs(&k), vec![0, 1, 2]);
+    assert_eq!(
+        k.store
+            .accepted_head(INSTANCE)
+            .await
+            .unwrap()
+            .unwrap()
+            .position,
+        3
+    );
+}
+
+// ------------------------------------------------------------------------------ first starts
+
+/// `T-043-04` (review of #79): a first start never moves a cursor that is not a chain's before
+/// the instance's reset. Past the start of a chain never reset: an alert, the cursor kept, nothing
+/// reported. Behind the start of an upgraded instance (positions the earlier code wrote and nobody
+/// read): an alert, the cursor not moved forward, until the operator records the gap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_043_04_a_first_start_moves_only_a_cursor_from_before_a_reset() {
+    // Past the start, never reset.
+    let mut k = Kit::start_with(KitOptions::default()).await;
+    deposits(&k, 2);
+    k.chain.finalize_all();
+    k.store.advance_cursor(INSTANCE, 13).await.unwrap();
+    let r = k.step().await.unwrap();
+    assert_eq!(r.observed, 0);
+    assert_eq!(k.store.cursor(INSTANCE).await.unwrap(), 13);
+    assert_eq!(
+        open_alerts(&k, &format!("{CHAIN_ALERT}:{INSTANCE}:0"))
+            .await
+            .len(),
+        1
+    );
+    assert!(core_seqs(&k).is_empty());
+
+    // Behind the start of an instance upgraded at position 13 and not reset.
+    let mut k = Kit::start_with(KitOptions::default()).await;
+    k.chain.upgraded_at(INSTANCE, 13);
+    deposits(&k, 2);
+    k.chain.finalize_all();
+    k.store.advance_cursor(INSTANCE, 4).await.unwrap();
+    let r = k.step().await.unwrap();
+    assert_eq!(r.observed, 0);
+    assert_eq!(k.store.cursor(INSTANCE).await.unwrap(), 4);
+    let alerts = open_alerts(&k, &format!("unreadable:{INSTANCE}:4")).await;
+    assert_eq!(alerts.len(), 1, "{:?}", k.store.alerts().await.unwrap());
+    assert!(matches!(
+        k.adapter.record_operator_gap(13, 15).await,
+        Err(AdapterError::Refused(_))
+    ));
+    k.adapter.record_operator_gap(4, 15).await.unwrap();
+    assert_eq!(k.store.cursor(INSTANCE).await.unwrap(), 15);
+    deposits(&k, 1);
+    k.chain.finalize_all();
+    assert_eq!(k.step().await.unwrap().observed, 1);
+    assert_eq!(core_seqs(&k), vec![15]);
+
+    // A first start this chain's own reports advanced: the head is verified before any report, so
+    // a crash in between leaves a verified head, and the cursor is never moved back.
+    let mut k = Kit::start_with(KitOptions::default()).await;
+    deposits(&k, 3);
+    k.chain.finalize_all();
+    k.adapter.crash_at(CrashPoint::AfterVerdict);
+    assert!(k.step().await.is_err());
+    assert_eq!(
+        k.store
+            .verified_head(INSTANCE)
+            .await
+            .unwrap()
+            .map(|v| v.position),
+        Some(3)
+    );
+    k.restart();
+    assert_eq!(k.step().await.unwrap().observed, 3);
+    assert_eq!(k.store.cursor(INSTANCE).await.unwrap(), 3);
+}
+
+// ------------------------------------------------------------------------------ resets, again
+
+/// The reports of `kind` the adapter sent.
+async fn sent(k: &Kit, kind: &str) -> usize {
+    k.store
+        .reports()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.kind == kind)
+        .count()
+}
+
+/// `T-043-04` (review of #79): while a reset under the adapter is open, nothing goes to the book
+/// it serves: no observation, no head, no position cut, no anchor; `refound` resumes on the new
+/// chain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_043_04_while_a_reset_is_open_nothing_reaches_the_old_book() {
+    let mut k = Kit::start_with(KitOptions {
+        anchoring: true,
+        ..KitOptions::default()
+    })
+    .await;
+    assert!(k.step().await.unwrap().serving);
+    deposits(&k, 2);
+    k.chain.finalize_all();
+    k.step().await.unwrap();
+    assert!(sent(&k, "positions").await > 0);
+    k.chain.reset(INSTANCE, 0);
+    k.chain.produce();
+    deposits(&k, 1);
+    k.chain.finalize_all();
+    k.step().await.unwrap();
+    assert_eq!(open_alerts(&k, &format!("reset:{INSTANCE}")).await.len(), 1);
+    let (heads, positions, observed) = (
+        sent(&k, "head").await,
+        sent(&k, "positions").await,
+        sent(&k, "observe").await,
+    );
+    for _ in 0..5 {
+        k.chain.advance(1);
+        let r = k.step().await.unwrap();
+        assert_eq!(r.observed, 0);
+    }
+    assert_eq!(sent(&k, "head").await, heads);
+    assert_eq!(sent(&k, "positions").await, positions);
+    assert_eq!(sent(&k, "observe").await, observed);
+    k.adapter.refound().await.unwrap();
+    k.step().await.unwrap();
+    assert!(sent(&k, "head").await > heads);
+    assert!(open_alerts(&k, "reset:").await.is_empty());
+}
+
+/// `T-043-04` (review of #79): a reset of a chain with no entry yet, whose head reads `(0, zeros)`
+/// before and after, is told by the instance's anchor sequence, read only while the chain has no
+/// entry; a chain with entries is idle on one read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_043_04_a_reset_of_an_empty_chain_is_seen() {
+    let mut k = serving_kit().await;
+    k.chain.advance(1);
+    let before = k.chain.reads();
+    k.step().await.unwrap();
+    assert_eq!(k.chain.reads().epochs - before.epochs, 1);
+    k.chain.reset(INSTANCE, 0);
+    k.chain.advance(1);
+    for _ in 0..3 {
+        k.chain.advance(1);
+        k.step().await.unwrap();
+    }
+    assert_eq!(open_alerts(&k, &format!("reset:{INSTANCE}")).await.len(), 1);
+    deposits(&k, 1);
+    k.chain.finalize_all();
+    assert_eq!(k.step().await.unwrap().observed, 0);
+    assert!(core_seqs(&k).is_empty());
+    // With entries, an idle sync reads the head alone.
+    let mut k = serving_kit().await;
+    deposits(&k, 1);
+    k.chain.finalize_all();
+    k.step().await.unwrap();
+    k.chain.advance(1);
+    let before = k.chain.reads();
+    k.step().await.unwrap();
+    let after = k.chain.reads();
+    assert_eq!(
+        (after.heads - before.heads, after.epochs - before.epochs),
+        (1, 0)
+    );
 }

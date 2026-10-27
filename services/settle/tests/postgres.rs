@@ -147,9 +147,22 @@ async fn req_sa_5_the_postgres_store_keeps_its_rules() {
         position: 5,
         digest: [0xD5; 32],
         block: 40,
+        epoch: 1,
     };
+    // Verified with its entries, before the core took them in; accepted, and the entries below
+    // the accepted head are gone.
+    s.verify_head(1, &head, &[(3, vec![3, 3]), (4, vec![4])])
+        .await
+        .unwrap();
+    assert_eq!(s.verified_head(1).await.unwrap(), Some(head));
+    assert_eq!(s.accepted_head(1).await.unwrap(), None);
+    assert_eq!(
+        s.chain_entries(1, 0, 5).await.unwrap(),
+        vec![(3, vec![3, 3]), (4, vec![4])]
+    );
     s.accept_head(1, &head).await.unwrap();
     assert_eq!(s.accepted_head(1).await.unwrap(), Some(head));
+    assert!(s.chain_entries(1, 0, 5).await.unwrap().is_empty());
     assert_eq!(s.cursor(1).await.unwrap(), 5);
     s.reset_chain(1, 0).await.unwrap();
     assert_eq!(

@@ -282,6 +282,19 @@ pub struct ChainHead {
     pub start: u64,
 }
 
+/// The anchor sequence an instance runs (`anchor_epoch()`, amendment 0039): governance's last
+/// reset, if any. Each reset starts a new one, so it tells a chain from the one before when their
+/// heads alike read `(0, zeros)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChainEpoch {
+    /// The sequence's number: 1 for the first reset, one more for each later one.
+    pub epoch: u32,
+    /// The position its first entry took: 0 for a reset by the contract's current code.
+    pub from_seq: u64,
+    /// The block of the reset.
+    pub at: u64,
+}
+
 /// What one of a block's events says of an instance's chain, in the order the block emitted them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChainEvent {
@@ -726,6 +739,19 @@ pub trait Chain: Send + Sync + 'static {
         at: &BlockRef,
         instance: u32,
     ) -> impl Future<Output = ChainResult<Option<ChainHead>>> + Send;
+
+    /// The anchor sequence `instance` runs at `at` (`anchor_epoch()`): `None` if it was never
+    /// reset. Read on a first start, and while the chain has no entry, where the head alone cannot
+    /// tell a reset.
+    fn chain_epoch(
+        &self,
+        at: &BlockRef,
+        instance: u32,
+    ) -> impl Future<Output = ChainResult<Option<ChainEpoch>>> + Send;
+
+    /// An entry's SCALE bytes, as the adapter verified and kept them, decoded and mapped into the
+    /// adapter's terms with this layer's deployments ([`kreivo::inbox_entry`]).
+    fn entry(&self, raw: Vec<u8>) -> ChainResult<InboxEntry>;
 
     /// The events of `block` about `instance`'s chain, and its parent's hash. Through the
     /// adapter's own client: a full node keeps about 256 blocks of events, so an older block may

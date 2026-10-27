@@ -130,11 +130,15 @@ review), never move value.
 amendment 0040). The contract stores no entry: it keeps one head, `(position, digest, start)`, in
 which each entry's digest covers the one before it, and emits each entry as an event. At each step
 the adapter reads that head at the finalized block (`chain_head()`). If it is the head the adapter
-last accepted, that is all: **an idle sync is one read**. Otherwise it reads the events of the
+last verified, that is all: **an idle sync is one read** (two while the chain has no entry yet: the
+instance's anchor sequence too, since an empty chain reads `(0, zeros)` before a reset and after). Otherwise it reads the events of the
 blocks since the one it accepted the head at, walking back by parent hash, rebuilds each entry from
 its event and its block's number, and folds them from the accepted digest. If they lead exactly to
-the head, it reports them in order and accepts the head once the core has taken in every one
-(`settle_cursors`, `migrations/0006_chain.sql`). If not, it reads them once more; still not, it
+the head, it keeps them, with the head as **verified**, before reporting anything; it then reports
+them in order and **accepts** the head once the core has taken in every one (`settle_cursors` and
+`settle_chain_entries`, `migrations/0006_chain.sql`). However long the core refuses them or cannot
+be reached (a step that loses the core still verifies), the next sync folds only the blocks after
+the verified head, and the kept entries reach the core when it is back. If not, it reads them once more; still not, it
 raises `chain:<instance>:<position>` (kind `chain`, which pages) and reports nothing past that first
 new position, while submitting and anchoring go on. A full node keeps about 256 blocks of events, so
 routine settlement needs no archive node. An adapter further behind reads the older blocks from a
@@ -159,8 +163,10 @@ each runs once and exits.
 
 A reset of the instance (governance's `set_anchor_head`) comes only with its book's re-founding. The
 first start on a reset instance folds from the reset, and a cursor kept from the chain before it is
-reset to the chain's start. A reset under a running adapter raises `reset:<instance>` and stops
-observation; once the adapter is pointed at the re-founded book, `aledgent-settle settle.json
+reset to the chain's start. No other cursor is moved: one past the start of a chain never reset
+raises `chain:`, and one behind it (positions the contract's earlier code wrote and nobody read)
+raises `unreadable:` until the operator records them as a gap. A reset under a running adapter raises `reset:<instance>`, and from then on nothing reaches the book
+it serves: no observation, head, anchor or position cut; once the adapter is pointed at the re-founded book, `aledgent-settle settle.json
 refound` resets its cursor and accepted head, and the next run starts on the new chain.
 
 **There is no periodic re-scan** (`T-043-05`): nothing re-reads a range on a timer.

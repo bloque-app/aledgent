@@ -23,6 +23,8 @@ struct Inner {
     reports: BTreeMap<String, ReportRow>,
     cursors: BTreeMap<u32, u64>,
     heads: BTreeMap<u32, super::AcceptedHead>,
+    verified: BTreeMap<u32, super::AcceptedHead>,
+    entries: BTreeMap<(u32, u64), Vec<u8>>,
     gaps: BTreeMap<(u32, u64), GapRow>,
     alerts: BTreeMap<String, AlertRow>,
     anchors: BTreeMap<u64, AnchorRow>,
@@ -297,8 +299,46 @@ impl Store for MemStore {
         Ok(self.lock().heads.get(&instance).copied())
     }
 
+    async fn verified_head(&self, instance: u32) -> StoreResult<Option<super::AcceptedHead>> {
+        Ok(self.lock().verified.get(&instance).copied())
+    }
+
+    async fn verify_head(
+        &self,
+        instance: u32,
+        head: &super::AcceptedHead,
+        entries: &[(u64, Vec<u8>)],
+    ) -> StoreResult<()> {
+        let mut s = self.lock();
+        for (seq, raw) in entries {
+            s.entries.insert((instance, *seq), raw.clone());
+        }
+        s.verified.insert(instance, *head);
+        Ok(())
+    }
+
+    async fn chain_entries(
+        &self,
+        instance: u32,
+        from: u64,
+        to: u64,
+    ) -> StoreResult<Vec<(u64, Vec<u8>)>> {
+        if to <= from {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .lock()
+            .entries
+            .range((instance, from)..(instance, to))
+            .map(|((_, seq), raw)| (*seq, raw.clone()))
+            .collect())
+    }
+
     async fn accept_head(&self, instance: u32, head: &super::AcceptedHead) -> StoreResult<()> {
-        self.lock().heads.insert(instance, *head);
+        let mut s = self.lock();
+        s.heads.insert(instance, *head);
+        s.entries
+            .retain(|(i, seq), _| *i != instance || *seq >= head.position);
         Ok(())
     }
 
@@ -306,6 +346,8 @@ impl Store for MemStore {
         let mut s = self.lock();
         s.cursors.insert(instance, start);
         s.heads.remove(&instance);
+        s.verified.remove(&instance);
+        s.entries.retain(|(i, _), _| *i != instance);
         Ok(())
     }
 

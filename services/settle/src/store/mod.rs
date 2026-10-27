@@ -6,8 +6,9 @@
 //! ([`InstructionRow`]), **what the network did** ([`ObservationRow`], [`ExtrinsicRow`] with its
 //! inclusion) and **what it told the core** ([`ReportRow`], with the core's verdict). Besides
 //! those: the signed bytes of every extrinsic, stored before they are broadcast (`REQ-SA-6`); the
-//! nonce lanes; the cursor, and the head of the instance's chain of entries the adapter last
-//! accepted ([`AcceptedHead`], amendment 0040); explicit gaps (`REQ-SA-7`); alerts; and the
+//! nonce lanes; the cursor, and the heads of the instance's chain of entries the adapter verified
+//! and the core accepted ([`AcceptedHead`], amendment 0040), with the entries verified and not yet
+//! accepted; explicit gaps (`REQ-SA-7`); alerts; and the
 //! single-active lease.
 //!
 //! Its rules hold whatever the adapter above does:
@@ -343,18 +344,39 @@ pub struct ReportRow {
     pub answered_at: Option<Time>,
 }
 
-/// The head of an instance's chain of entries the adapter accepted (amendment 0040): the chain's
-/// position and digest, and the finalized block it read them at. It is accepted only once the core
-/// has taken in every entry below `position`; the next sync folds the entries of the blocks after
-/// `block`, from `digest`.
+/// A head of an instance's chain of entries (amendment 0040) as the adapter holds it: the chain's
+/// position and digest, the finalized block it read them at, and the anchor sequence (`epoch`, 0
+/// for none) the instance ran then. Two are kept: the **verified** head, which the adapter's fold of
+/// the layer's events reached (the next sync folds only the blocks after its `block`), and the
+/// **accepted** head, below which the core has taken in every entry. The accepted head never passes
+/// the verified one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcceptedHead {
     /// The position the next entry takes.
     pub position: u64,
     /// The chain digest after the entry at `position - 1`.
+    #[serde(with = "hex32")]
     pub digest: [u8; 32],
     /// The finalized block the head was read at.
     pub block: u64,
+    /// The instance's anchor sequence then: 0 if it was never reset.
+    #[serde(default)]
+    pub epoch: u32,
+}
+
+mod hex32 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(b: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&hex::encode(b))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+        hex::decode(String::deserialize(d)?)
+            .ok()
+            .and_then(|v| v.try_into().ok())
+            .ok_or_else(|| serde::de::Error::custom("32 bytes of hex"))
+    }
 }
 
 /// A range the adapter was forced to skip (`REQ-SA-7`, `AC-D2.2`).
@@ -528,14 +550,39 @@ pub trait Store: Clone + Send + Sync + 'static {
         to: u64,
     ) -> impl Future<Output = StoreResult<()>> + Send;
 
-    /// The head of `instance`'s chain the adapter last accepted; `None` if it never accepted one
-    /// on this chain (a new store, a cursor written before amendment 0040, or one reset since).
+    /// The head of `instance`'s chain the core last accepted; `None` if none on this chain (a new
+    /// store, a cursor written before amendment 0040, or one reset since).
     fn accepted_head(
         &self,
         instance: u32,
     ) -> impl Future<Output = StoreResult<Option<AcceptedHead>>> + Send;
 
-    /// Accept `head` for `instance`. The cursor is not moved: it is at `head.position` already.
+    /// The head of `instance`'s chain the adapter's fold last reached; `None` as for
+    /// [`Store::accepted_head`].
+    fn verified_head(
+        &self,
+        instance: u32,
+    ) -> impl Future<Output = StoreResult<Option<AcceptedHead>>> + Send;
+
+    /// Record that the fold reached `head`, with the `entries` (position, SCALE bytes) it verified
+    /// since the last verified head: the entries first, then the head.
+    fn verify_head(
+        &self,
+        instance: u32,
+        head: &AcceptedHead,
+        entries: &[(u64, Vec<u8>)],
+    ) -> impl Future<Output = StoreResult<()>> + Send;
+
+    /// The verified entries of `instance` not yet accepted, at positions `[from, to)`, in order.
+    fn chain_entries(
+        &self,
+        instance: u32,
+        from: u64,
+        to: u64,
+    ) -> impl Future<Output = StoreResult<Vec<(u64, Vec<u8>)>>> + Send;
+
+    /// Accept `head` for `instance`: the core took in every entry below it. The entries below it
+    /// are removed. The cursor is not moved: it is at `head.position` already.
     fn accept_head(
         &self,
         instance: u32,
@@ -543,9 +590,9 @@ pub trait Store: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = StoreResult<()>> + Send;
 
     /// Start `instance` on a chain from position `start` (amendment 0040): the cursor set to it,
-    /// back if need be, and no head accepted. The only way the cursor goes back: when the adapter
-    /// starts on a chain whose head it never accepted, as after the instance's reset with its
-    /// book's re-founding.
+    /// back if need be, no head verified or accepted, no entry kept. The only way the cursor goes
+    /// back: when the adapter starts on a chain it never verified, after the instance's reset with
+    /// its book's re-founding.
     fn reset_chain(
         &self,
         instance: u32,

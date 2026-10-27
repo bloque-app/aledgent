@@ -57,9 +57,9 @@ use parity_scale_codec::{Decode, Encode};
 
 use super::kreivo::{self, CallLimits, TxParams};
 use super::{
-    AccountId32, BatchCall, BlockEvents, BlockRef, Chain, ChainAsset, ChainError, ChainHead,
-    ChainResult, DryRun, Included, InstanceView, Mortality, RuntimeInfo, RuntimeVersion,
-    SignedExtrinsic, Validity,
+    AccountId32, BatchCall, BlockEvents, BlockRef, Chain, ChainAsset, ChainEpoch, ChainError,
+    ChainHead, ChainResult, DryRun, InboxEntry, Included, InstanceView, Mortality, RuntimeInfo,
+    RuntimeVersion, SignedExtrinsic, Validity,
 };
 use crate::signer::Signer;
 
@@ -675,6 +675,17 @@ impl Chain for RpcChain {
             .read(at, instance, kreivo::selector::CHAIN_HEAD.to_vec())
             .await?;
         Ok(Some(kreivo::chain_head(&cell)))
+    }
+
+    async fn chain_epoch(&self, at: &BlockRef, instance: u32) -> ChainResult<Option<ChainEpoch>> {
+        let cell: Option<kreivo::AnchorEpochCell> = self
+            .read(at, instance, kreivo::selector::ANCHOR_EPOCH.to_vec())
+            .await?;
+        Ok(cell.as_ref().map(kreivo::chain_epoch))
+    }
+
+    fn entry(&self, raw: Vec<u8>) -> ChainResult<InboxEntry> {
+        kreivo::inbox_entry(raw, |c| self.names.instance_of(c)).map_err(invalid)
     }
 
     async fn block_events(&self, block: &BlockRef, instance: u32) -> ChainResult<BlockEvents> {
