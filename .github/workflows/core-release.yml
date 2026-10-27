@@ -15,7 +15,12 @@ name: Core release
 #      keeping the Cargo.lock the build resolved), keeps the runtime of the code in force byte for byte, and has the host the node runs
 #      write the code manifest (digests, lengths, build profiles; amendment 0033);
 #   2. refuses unless the result is what an in-place upgrade can take: generation + 1, the same
-#      runtime, the platform the host drives, a manifest the host's own restart check accepts;
+#      runtime, the platform the host drives, a manifest the host's own restart check accepts; and
+#      unless it passes the code-history gate (code-history.yml) and the real-package check
+#      (`check-upgrade`, run inside the build: the gate's recorded book through the predecessor's
+#      package and then the new one, installed in place over that state, every input at its archived
+#      log hash, and every way out at an upgrade's input decided alike by both packages, D18; owner
+#      ruling of 2026-10-27, bloque-ledgent#286);
 #   3. publishes the three files, each named by its blake2b-256 digest (the layout of the core host's
 #      `fs` code source), as ONE image by digest, ghcr.io/bloque-app/aledgent-core-code@sha256:..., with a
 #      build provenance attestation signed through GitHub's OIDC (`gh attestation verify`), and records
@@ -289,8 +294,9 @@ jobs:
             echo "::error::the host image does not accept these bytes as code $CODE"; exit 1
           fi
           cp "$W/io/pred-report.json" "$W/pred-report.json"
-          # The package alone, as the build's named context (the runtime is not built).
-          cp "$W/pred/core.vos" "$W/pred-pkg/core.vos"
+          # The code in force, as the build's named context: the package the new one claims, and the
+          # runtime check-upgrade runs both under (the runtime is not built).
+          cp "$W/pred/core.vos" "$W/pred/agent_runtime.pvm" "$W/pred-pkg/"
           # The platform this tree's host drives, from the Dockerfile's pin; it must be the code in force's.
           vos_rev=$(sed -n 's/^ARG VOS_REV=\([0-9a-f]\{40\}\)$/\1/p' deploy/docker/core.Dockerfile | sort -u)
           [[ $vos_rev =~ ^[0-9a-f]{40}$ ]] \
@@ -375,6 +381,10 @@ jobs:
         run: |
           set -euo pipefail
           test -s "$W/upgrade/core.vos"
+          # The build ran check-upgrade and gives nothing out unless it passed; its report.
+          test -s "$W/upgrade/upgrade-check.json"
+          { echo '### The real-package check (check-upgrade)'; echo '```json'; cat "$W/upgrade/upgrade-check.json"; echo '```'; } >>"$GITHUB_STEP_SUMMARY"
+          cp "$W/upgrade/upgrade-check.json" "$W/upgrade-check.json"
           cp "$W/upgrade/core.vos" "$W/new/core.vos"
           # The runtime of the code in force, byte for byte: a new runtime cannot go in place (#288).
           cp "$W/pred/agent_runtime.pvm" "$W/new/agent_runtime.pvm"
@@ -428,6 +438,7 @@ jobs:
             ${{ steps.in.outputs.w }}/set
             ${{ steps.in.outputs.w }}/set.json
             ${{ steps.in.outputs.w }}/report.json
+            ${{ steps.in.outputs.w }}/upgrade-check.json
             ${{ steps.in.outputs.w }}/new/profile
           if-no-files-found: error
 

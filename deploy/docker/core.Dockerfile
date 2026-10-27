@@ -239,7 +239,7 @@ CMD ["serve", "--config", "/etc/aledgent/ingress.json", \
 #
 #   docker buildx build -f deploy/docker/core.Dockerfile --target core-upgrade \
 #     --build-arg ROOTS=<the book's roots> \
-#     --build-context previous-code=<dir with core.vos, the package the book runs now> \
+#     --build-context previous-code=<dir with core.vos and agent_runtime.pvm, the code the book runs now> \
 #     --output type=local,dest=<dir> .
 #
 # What differs from step 5 of `build`: the package claims the state of the previous package's program
@@ -252,6 +252,15 @@ CMD ["serve", "--config", "/etc/aledgent/ingress.json", \
 # from the code in force. `GENERATION` is the source's (`agents/core/src/lib.rs`): bumping it is a
 # change to the source, reviewed with the change that needs the upgrade, and the workflow refuses
 # a package whose generation is not the predecessor's plus one.
+#
+# Nothing comes out of this target unless the new package passes `check-upgrade` (T-037-12,
+# T-037-19's precondition, owner ruling of 2026-10-27): the recorded book of the code-history gate
+# is run through the real packages under the code in force's runtime, the predecessor's package
+# deciding its generation's inputs, the new one installed in place over that state at the recorded
+# upgrade and deciding the rest, every input at its archived log hash; and every way out at an
+# upgrade's input is decided by the new package as the predecessor decided it (D18). So the
+# `previous-code` context holds the runtime too (`agent_runtime.pvm`), and the report is
+# `upgrade-check.json`.
 FROM scratch AS previous-code
 
 FROM host AS upgrade
@@ -270,10 +279,22 @@ RUN --mount=type=bind,from=previous-code,target=/previous \
  && if [ -z "$elf" ]; then elf=/w/target/core/riscv64em-vos/release/aledgent_core; fi \
  && /out/bin/aledgent-core-host package "$elf" /out/share/core.vos --previous /previous/core.vos \
  && cp /w/aledgent/agents/core/Cargo.lock /out/share/core.Cargo.lock \
- && ls -l /out/share/core.vos /out/share/core.Cargo.lock
+ && ls -l /out/share/core.vos /out/share/core.Cargo.lock \
+ && if [ ! -s /previous/agent_runtime.pvm ]; then \
+      echo "core-upgrade: the runtime of the code in force is required beside its package, for check-upgrade" >&2; \
+      exit 1; \
+    fi \
+ && if [ "$ROOTS" != v2 ]; then \
+      echo "core-upgrade: the recorded history (T-037-12) is a book in roots v2; there is none in roots $ROOTS to check the upgrade against" >&2; \
+      exit 1; \
+    fi \
+ && /out/bin/aledgent-core-host check-upgrade --runtime /previous/agent_runtime.pvm \
+      --previous /previous/core.vos --package /out/share/core.vos \
+      --history /w/aledgent/crates/core-binding/tests/fixtures/code-history \
+      --out /out/share/upgrade-check.json
 
 FROM scratch AS core-upgrade
-COPY --from=upgrade /out/share/core.vos /out/share/core.Cargo.lock /
+COPY --from=upgrade /out/share/core.vos /out/share/core.Cargo.lock /out/share/upgrade-check.json /
 
 # The default target: the core built from source.
 FROM ${RUNTIME_IMAGE} AS core

@@ -134,4 +134,14 @@ grep -qE '^ *crane append -f "\$layer" -t "\$ref" >&2$' "$pub" || fail "core-cod
   || fail "the workflow reaches an environment"
 ! grep -qE 'repository_dispatch|dispatches|gh workflow run|--method POST' "$wf" || fail "the workflow starts something elsewhere"
 grep -qE '^permissions: \{\}$' "$wf" || fail "the workflow's default permissions are not empty"
+# T-037-12, owner ruling of 2026-10-27: no core build before the code-history gate, and nothing out of
+# the build unless the new package passes the real-package check.
+grep -qE '^    needs: \[scripts, code-history\]$' "$wf" || fail "the core build does not wait for the code-history gate"
+grep -qE '^    uses: \./\.github/workflows/code-history\.yml$' "$wf" || fail "the code-history gate is not called"
+df="$repo/deploy/docker/core.Dockerfile"
+awk '/^FROM host AS upgrade$/,/^FROM scratch AS core-upgrade$/' "$df" | grep -q 'aledgent-core-host check-upgrade' \
+  || fail "the upgrade stage does not run check-upgrade"
+grep -qE '^COPY --from=upgrade .*/out/share/upgrade-check\.json /$' "$df" || fail "core-upgrade gives no check report"
+# shellcheck disable=SC2016  # the workflow's text, not ours
+grep -qF 'test -s "$W/upgrade/upgrade-check.json"' "$wf" || fail "the workflow does not require the check's report"
 echo "ok: core release scripts"
