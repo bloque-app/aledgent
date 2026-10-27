@@ -885,12 +885,20 @@ fn fetch_chainspec(args: &[String]) -> Result<(), String> {
 pub const RESTORED_FILE: &str = "restore.done.json";
 
 /// `restore --config <file> --runtime <runtime.pvm> --actor <actor.vos> --state <dir>
-/// [--budget <bytes>]` (`T-005-16`): finish a restore `opsctl restore core --from` laid out in
-/// `<dir>`. The Agent starts from the checkpoint's runtime state when the layout has one, or is
-/// founded afresh, and every archived input after it is re-sent and checked against its archived
-/// entry ([`roll_forward_agent`]). The Agent must end at the plan's point: its input number, log
-/// head and roots. Then the plan becomes `restore.done.json`, and `serve` starts on the directory.
-/// Nothing is answered from a restore that did not end there.
+/// [--budget <bytes>] [--code-config <file>]` (`T-005-16`): finish a restore `opsctl restore core
+/// --from` laid out in `<dir>`. The Agent starts from the checkpoint's runtime state when the
+/// layout has one, or is founded afresh, and every archived input after it is re-sent and checked
+/// against its archived entry ([`roll_forward_agent`]). The Agent must end at the plan's point:
+/// its input number, log head and roots. Then the plan becomes `restore.done.json`, and `serve`
+/// starts on the directory. Nothing is answered from a restore that did not end there.
+///
+/// **Across upgrades** (`T-037-09`): the archive is re-sent range by range, each range under the
+/// code version that ran it, switched as the live upgrade switched it. Every version the archive
+/// names beyond the genesis package is fetched through `--code-config`'s sources (the cache
+/// first) and checked as staging checks it, held to the generation the code map gives it, before
+/// any input is re-sent; a checkpoint taken after a switch is attached from the same cache. A
+/// version that cannot be had refuses the restore up front, naming its inputs. The code map the
+/// restore used is recorded in `restore.done.json`.
 pub fn restore(args: &[String]) -> Result<(), String> {
     // F-036: a chainspec book's restore needs its chainspec: `--chainspec`, the state directory's
     // copy, or the archive's (`--archive <spec>`), by the digest genesis commits.
@@ -917,17 +925,36 @@ pub fn restore(args: &[String]) -> Result<(), String> {
         ));
     }
     let started = std::time::Instant::now();
-    let port = open_port(&runtime, &actor, &keys, &dir, genesis_code, None).map_err(|e| {
-        if e.starts_with(crate::restart::NOT_FOUND) {
+    // T-037-09: where the versions an archive across upgrades names are fetched from.
+    let code_source = crate::code_source::from_args(args, &dir)?;
+    let mut port = open_port(
+        &runtime,
+        &actor,
+        &keys,
+        &dir,
+        genesis_code,
+        code_source.as_deref(),
+    )
+    .map_err(|e| {
+        if code_source.is_none() && e.starts_with(crate::restart::NOT_FOUND) {
             format!(
-                "{e}. A restore across an upgrade is not supported yet (T-037-09): restore from a \
-                 checkpoint taken before the switch"
+                "{e}. The checkpoint was taken after a switch: give --code-config naming a source \
+                 that holds the version it runs (T-037-09)"
             )
         } else {
             e
         }
     })?;
     let entries = FileLog::open(&dir)?.entries()?;
+    // T-037-09: every version the archive names, staged before anything is re-sent. The roll
+    // forward refuses up front if one is missing, and holds every entry to the map it derives.
+    let claimed = core_binding::core::claimed_code_map(&mut port, &founding, &entries)?;
+    if let Some(source) = code_source.as_deref() {
+        let staged = core_binding::staging::stage_versions(&mut port, source, &claimed.versions());
+        for line in describe_staged(&staged) {
+            eprintln!("aledgent-core-host: restore: {line}");
+        }
+    }
     let stores = ReplicaStores::Disk {
         dir: dir.join("replica"),
         cache_bytes: REPLICA_CACHE_BYTES,
@@ -957,6 +984,7 @@ pub fn restore(args: &[String]) -> Result<(), String> {
             "service_root": hex::encode(rolled.roots.service),
             "audit": hex::encode(rolled.roots.audit),
             "log_head": hex::encode(rolled.log_head),
+            "code_map": rolled.code_map,
         },
         "elapsed_ms": started.elapsed().as_millis() as u64,
     });
@@ -978,9 +1006,49 @@ pub fn restore(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// What staging an archive's versions did, one line each for a version that was fetched or could
+/// not be (`T-037-09`); a version already held says nothing.
+fn describe_staged(report: &[core_binding::staging::Restaged]) -> Vec<String> {
+    use core_binding::staging::Restaged;
+    report
+        .iter()
+        .filter_map(|r| match r {
+            Restaged::Held(_) => None,
+            Restaged::Staged(code) => Some(format!(
+                "code version {} staged from the code sources",
+                core_binding::switch::short(code)
+            )),
+            Restaged::Refused(code, why) => Some(format!(
+                "code version {} cannot be staged ({why}): the inputs it ran cannot be re-sent \
+                 by this host. Put its manifest and files in a source of --code-config, or re-send \
+                 its range under its replayer",
+                core_binding::switch::short(code)
+            )),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `T-037-09`: a restore says what it fetched and what it could not, and nothing about what it
+    /// held.
+    #[test]
+    fn t037_09_a_restore_names_the_versions_it_staged_and_refused() {
+        use core_binding::staging::{Restaged, StageRefusal};
+        let lines = describe_staged(&[
+            Restaged::Held([1; 32]),
+            Restaged::Staged([2; 32]),
+            Restaged::Refused([3; 32], StageRefusal::NotRetrievable("the manifest".into())),
+        ]);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].contains("staged from the code sources"),
+            "{lines:?}"
+        );
+        assert!(lines[1].contains("cannot be staged"), "{lines:?}");
+    }
 
     /// `F-035`: the core host refuses to start with key material in its environment.
     #[test]
