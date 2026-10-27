@@ -12,7 +12,7 @@ SPDX-License-Identifier: CC-BY-4.0
 | Home | `crates/core-archive` (the seal, its age code, the spec, the archiver's read-back), `.github/workflows/ci.yml` (one line in the `vault transit (F-042)` job). Follow-ups in `ops/` (runbooks, `opsctl archive copy`, the restore's Vault login) and the infrastructure repository (bucket, Transit key, copy) |
 | Depends on | `F-005` (`T-005-15`–`T-005-18`, the archive), `F-042` (Vault Transit on test and prod), infrastructure#26 (archive decoupled from the node) |
 | Realises | `NFR-4`, `NFR-10`, `NFR-22`, `NFR-21` (c), `REQ-AU-8` |
-| Status | **Proposed, and built in the pull request that carries this file.** The decisions D1–D9 at the end are proposals for the owner; the code follows the recommended option of each and changes if a ruling differs. Owner rulings already made and followed: object lock 180 days for now, retention forever (David, 2026-10-25). No `SPEC.md` change: the spec has no requirement on how backups are encrypted, and `NFR-8` / `REQ-AR-3` concern settlement-layer key material, which this does not touch. It is an amendment to the plan: `F-005`'s "S3 with Object Lock and KMS" becomes "S3 with Object Lock, sealed by aledgent, KMS optional" (a row for `F-044` in `PLAN.md` is left to the merge, see T-044-09) |
+| Status | **Ruled 2026-10-27 and built in the pull request that carries this file.** The owner accepted the recommended option of every decision D1–D9 and the file-key epoch as built (rulings at the end); the code follows them. Recovery keys exist, one per deployment (§"The recovery recipients"). Owner rulings also followed: object lock 180 days for now, retention forever (David, 2026-10-25). No `SPEC.md` change: the spec has no requirement on how backups are encrypted, and `NFR-8` / `REQ-AR-3` concern settlement-layer key material, which this does not touch. It is an amendment to the plan: `F-005`'s "S3 with Object Lock and KMS" becomes "S3 with Object Lock, sealed by aledgent, KMS optional" (a row for `F-044` in `PLAN.md` is left to the merge, see T-044-09) |
 
 ## Why
 
@@ -254,9 +254,12 @@ copy`) is a follow-up in `ops/`.
 5. **Single-flight unwraps:** concurrent reads that miss the same epoch each ask Vault (up to `fetch`'s 32 at the
    first segment of an epoch). Harmless; a single-flight map would make it one.
 
-## Decisions for the owner
+## Decisions, ruled 2026-10-27
 
-| | Question | Options | Recommended (built) |
+The owner (Pablo) accepted the recommended set on 2026-10-27: the right-hand column of every row below, and the
+file-key epoch as built. D3's ruling was "go ahead"; how it was carried out is in the next section.
+
+| | Question | Options | Ruled (as recommended; built) |
 |---|---|---|---|
 | D1 | How Transit is used | (a) public-key wrap, Vault only decrypts; (b) `datakey` on the core host; (c) `encrypt` of each object | **(a)**: no Vault on the core host or its write path; (c) cannot carry 64 MiB segments |
 | D2 | How the keyless writer reads back | (a) record headers and the verify report in clear; (b) a local write-ahead file of the last heads, laid out by restore; (c) the core host decrypts through Vault (a role and a token on it) | **(a)**: no new state on the node; the metadata it shows is in the table above |
@@ -268,6 +271,24 @@ copy`) is a follow-up in `ops/`.
 | D8 | The restore's Vault login | (a) token file from Vault Agent (built); (b) `F-042`'s AWS IAM session in `opsctl` and `restore` | (a) now, (b) as a follow-up |
 | D9 | Keep SSE-KMS on the new bucket? | (a) no: SSE-S3 (AES-256) as the bucket default; (b) yes, as an outer layer | **(a)**: the point is not to depend on it; (b) costs a key and grants and buys little over the seal |
 
-Also for the owner: **the file key epoch** (4096 objects or one hour). Shorter makes a restore call Vault more;
+**The file key epoch** (4096 objects or one hour), ruled with the set. Shorter makes a restore call Vault more;
 longer widens what one file key opens. And the core host's process holds each epoch's file key in memory; it
 holds the plaintext book already, so this adds nothing a compromised host does not have.
+
+## The recovery recipients
+
+One age X25519 recovery key per deployment, generated on 2026-10-27 by the coordinating agent under Pablo's
+"go ahead" on D3. These are the public halves, and they are what a deployment's seal file names under
+`recovery`:
+
+| Deployment | Recovery recipient |
+|---|---|
+| test | `age1umcu6mry0mna5ln0wg3lrk5rvt3pujf2drk09ky75mvnvmkwvp5sjnfdjf` |
+| prod | `age1mjl99xfd8q3ylzm88cummy2tq0wrgu9wlyqmulexekaqv5ff8veqvfmfws` |
+
+**Custody, stated plainly.** The private halves (`AGE-SECRET-KEY-1…`) are held only in Pablo's macOS Keychain
+(`kenv` group `archive`). That is one copy on one machine: **the offline copies are still to be made by Pablo**
+(the recommendation stands: two printed copies in two places). Until they exist, losing that Keychain leaves
+Vault Transit as the archive's only way in. The keys were not generated on an offline machine, which D3
+recommended. Each identity is kept as long as the archive, which is forever, and is opened at every restore drill
+with Vault off for that drill.
