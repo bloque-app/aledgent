@@ -5,6 +5,7 @@
 // same route, and every call refused as any other origin.
 //
 //   node rehearse.mjs <port> <test|prod>
+import { startOf } from '../chain-head.mjs';
 import { blake2AsU8a, bnToU8a, connect, ContractPromise, abiOf, bundle, communityAccount, decodeAddress, encodeAddress, hexToU8a, j, PROD, save, TEST, u8aConcat, u8aToHex } from './common.mjs';
 
 const port = Number(process.argv[2]);
@@ -199,7 +200,7 @@ try {
   out.afterUpgrade.head = (await query(abiNew, C, 'head')).output.ok;
   out.afterUpgrade.chainHead = (await query(abiNew, C, 'chainHead')).output.ok;
   const ch = out.afterUpgrade.chainHead;
-  out.afterUpgrade.chainHeadIsNZerosN = Number(ch.position) === n && ch.digest === zeros && Number(ch.start) === n;
+  out.afterUpgrade.chainHeadIsNZerosN = Number(ch.position) === n && ch.digest === zeros && startOf(ch) === BigInt(n);
   out.afterUpgrade.inboxEntrySelectorGone = (await api.call.contractsApi.call(C, C, 0, null, null, '0x00000302' + u64le(0))).result.toHuman();
   say('after upgrade', { codeHash: out.afterUpgrade.codeHash, cellsDiffer: diff, chainHead: ch, ok: out.afterUpgrade.chainHeadIsNZerosN });
 
@@ -278,7 +279,7 @@ try {
   const e0 = blake2AsU8a(entry, 256);
   const d0 = blake2AsU8a(u8aConcat(new TextEncoder().encode('aledgent/settlement-entry/v1'), new Uint8Array(32), bnToU8a(0n, { bitLength: 64, isLe: false }), e0), 256);
   const chAfter = (await query(abiNew, C, 'chainHead')).output.ok;
-  out.fold = { block: ex.block, outcome: qe.output, eventSeq: Number(Buffer.from(anchored.data.slice(0, 8)).readBigUInt64LE()), entry: u8aToHex(entry), e0: u8aToHex(e0), d0: u8aToHex(d0), chainHead: chAfter, equal: chAfter.digest === u8aToHex(d0) && Number(chAfter.position) === 1 && Number(chAfter.start) === 0 };
+  out.fold = { block: ex.block, outcome: qe.output, eventSeq: Number(Buffer.from(anchored.data.slice(0, 8)).readBigUInt64LE()), entry: u8aToHex(entry), e0: u8aToHex(e0), d0: u8aToHex(d0), chainHead: chAfter, equal: chAfter.digest === u8aToHex(d0) && Number(chAfter.position) === 1 && startOf(chAfter) === 0n };
   say('fold after reset', { d0: out.fold.d0, chainHead: chAfter, equal: out.fold.equal });
 } catch (e) {
   out.error = e.stack ?? String(e);

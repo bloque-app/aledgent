@@ -8,8 +8,9 @@
     "node": ">=20"
   },
   "scripts": {
-    "check": "node --check chain.mjs && node --check drive.mjs && node --check e2e.mjs",
-    "drive": "node drive.mjs"
+    "check": "node --check chain-head.mjs && node --check chain.mjs && node --check drive.mjs && node --check e2e.mjs",
+    "drive": "node drive.mjs",
+    "test": "node --test test/chain.test.mjs"
   },
   "dependencies": {
     "@polkadot/api": "^16.0.0",

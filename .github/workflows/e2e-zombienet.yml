@@ -63,7 +63,11 @@ on:
         type: string
         default: ""
       upgrade_from:
-        description: "Rehearse the upgrade from the contract at this commit (T-043-03): deployed, given entries, upgraded to this code, reset. 210ca4b is v2's source: its build has the ABI, storage layout and code size of the code both mainnet instances run (0x268de8fb..., built on Linux). Empty: skipped"
+        description: "Rehearse the upgrade from the contract at this commit (T-043-03): deployed, given entries, upgraded to this code, reset. 210ca4b is v2's source, the code both mainnet instances run (0x268de8fb...). Empty: skipped"
+        type: string
+        default: ""
+      upgrade_from_code_hash:
+        description: "With upgrade_from: the code hash its build must have, or the step fails. Empty: v2's (0x268de8fb...) when upgrade_from is 210ca4b; any other commit is not checked"
         type: string
         default: ""
   # The release gate: a release tag runs the full suite with the script driver and requires the
@@ -120,6 +124,7 @@ jobs:
       ALEDGENT_CONNECTION: ${{ inputs.aledgent_connection || 'light-client' }}
       MAINNET_PARITY: ${{ inputs.mainnet_parity || 'require' }}
       UPGRADE_FROM: ${{ inputs.upgrade_from || '' }}
+      UPGRADE_FROM_CODE_HASH: ${{ inputs.upgrade_from_code_hash || '' }}
       # The deployment, as on mainnet: the operator's own community publishes,
       # licenses and instantiates. On a fresh network it does not exist, so the suite registers it
       # first. //Alice administers it and is the contract's admin; //Bob is the contract's key;
@@ -412,7 +417,24 @@ jobs:
         if: ${{ !cancelled() && steps.deploy.outcome == 'success' && env.UPGRADE_FROM != '' }}
         timeout-minutes: 30
         working-directory: contracts/settlement/scripts
-        run: V2_BUNDLE="$WORK/dist/v2/aledgent_settlement_contract.contract" node e2e.mjs upgrade
+        run: |
+          set -euo pipefail
+          bundle="$WORK/dist/v2/aledgent_settlement_contract.contract"
+          # The code the rehearsal upgrades from must be the code mainnet runs, byte for byte: the
+          # build of 210ca4b here (Linux x86-64, Rust 1.91, cargo-contract 5.0.3, as v2 was built)
+          # must have v2's hash. A build on another host (aarch64 macOS) has the same ABI, storage
+          # layout and code size but other bytes, so this is checked here only.
+          expected="$UPGRADE_FROM_CODE_HASH"
+          if [ -z "$expected" ] && [ "$(git rev-parse "$UPGRADE_FROM^{commit}")" = 210ca4bb13713780586882c2a6512ab6b39ed256 ]; then
+            expected=0x268de8fba38af3a9e3257dc8e11cad7e2f782631dce13a4cca39189904b758d5
+          fi
+          built="$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).source.hash)' "$bundle")"
+          echo "code to upgrade from: $built (expected ${expected:-not checked})"
+          if [ -n "$expected" ] && [ "$built" != "$expected" ]; then
+            echo "::error::the build of $UPGRADE_FROM has code hash $built, not $expected: the rehearsal would not start from the code mainnet runs"
+            exit 1
+          fi
+          V2_BUNDLE="$bundle" node e2e.mjs upgrade
 
       # Before the artifacts are uploaded: the adapter's last log is kept, its test keys are not.
       - name: Stop the aledgent driver

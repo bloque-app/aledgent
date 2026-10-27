@@ -1472,7 +1472,7 @@ phases.upgrade = async (ctx) => {
       if (after.codeHash !== ctx.bundle.source.hash) fail(`code ${after.codeHash}, expected ${ctx.bundle.source.hash}`);
       const changed = [...new Set([...Object.keys(before.cells), ...Object.keys(after.cells)])].filter((k) => before.cells[k] !== after.cells[k]);
       if (changed.length) fail(`cells changed by the upgrade: ${changed.join(', ')}`);
-      const chain = await drive.startFold(api, ctx.abi, address, upgradedAt);
+      const chain = await drive.startFold(api, ctx.abi, address, upgradedAt, { upgrade: true });
       if (chain.position !== BigInt(n) || (startOf(chain) !== null && startOf(chain) !== BigInt(n)) || chain.digest !== u8aToHex(new Uint8Array(32))) fail(`chain head ${JSON.stringify(chain, drive.big)}, expected (${n}, zeros, ${n})`);
       out.upgrade = { block: upgradedAt, codeHashBefore: before.codeHash, codeHashAfter: after.codeHash, cells: Object.keys(after.cells).length, chain: { position: Number(chain.position), start: startOf(chain) === null ? null : Number(startOf(chain)), digest: chain.digest } };
       return out.upgrade;

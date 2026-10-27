@@ -51,7 +51,7 @@ import { Abi, ContractPromise } from '@polkadot/api-contract';
 import { bnToU8a, compactToU8a, hexToU8a, stringToU8a, u8aConcat, u8aEq, u8aToHex } from '@polkadot/util';
 import { blake2AsU8a, cryptoWaitReady, decodeAddress, encodeAddress } from '@polkadot/util-crypto';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { advance, decodeChainHead, expectFoldEquals, foldFromJson, foldToJson, locateStart, newFold, startOf } from './chain.mjs';
+import { ENTRY_EVENTS, advance, contractEventsOf, decodeChainHead, expectFoldEquals, foldFromJson, foldToJson, locateStart, newFold, startOf } from './chain.mjs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -376,7 +376,9 @@ async function foldAt(api, abi, address, fin) {
     fold = await locateStart(api, abi, address, fin.number, at.chain, Number(env('BLOCKS', '256')), positionAfter);
     log(`fold of ${address}: ${keep ? 'no fold kept' : `#${fin.number} is before the fold kept`}; the chain starts after #${fold.number}`);
   }
-  await advance(api, abi, address, fold, fin.number, plainEntry);
+  // A reset ends a chain: the fold up to the block before it is checked against the head there.
+  const headAt = async (n) => (await chainHeadAt(api, abi, address, await api.rpc.chain.getBlockHash(n))).chain;
+  await advance(api, abi, address, fold, fin.number, plainEntry, headAt);
   expectFoldEquals(fold, at.chain, `${address} at #${fin.number}`);
   if (keep) {
     state.folds[address] = foldToJson(fold);
@@ -385,15 +387,28 @@ async function foldAt(api, abi, address, fin) {
   return { ...at, fold };
 }
 
-/// Start the fold of `address` at block `number`, at the chain's head there (`instantiate`, and an
-/// upgrade from code that kept no chain: its events before are of another shape).
-async function startFold(api, abi, address, number) {
+/// Start the fold of `address` in block `number`, and fold that block: at its instantiation (a
+/// chain from `(0, zeros)`), or, with `upgrade`, at an upgrade from code that kept no chain (a chain
+/// from the head's `start`, after the `ContractCodeUpdated` event; the earlier code's events before
+/// it in that block are of other shapes and not this chain's). Entries in that block after the
+/// start are folded and checked against the head at the block. Returns that head.
+async function startFold(api, abi, address, number, { upgrade = false } = {}) {
   const hash = await api.rpc.chain.getBlockHash(number);
   const { chain } = await chainHeadAt(api, abi, address, hash);
+  let fold;
+  if (upgrade) {
+    const events = contractEventsOf(abi, address, await (await api.at(hash)).query.system.events());
+    if (!events.some((e) => e.kind === 'ContractCodeUpdated')) fail(`#${number} does not change the code of ${address}`);
+    const after = BigInt(events.filter((e) => e.kind in ENTRY_EVENTS).length);
+    const start = startOf(chain) ?? chain.position - after;
+    fold = newFold({ number: number - 1, position: start, skip: { block: number, until: 'ContractCodeUpdated' } });
+  } else {
+    fold = newFold({ number: number - 1, position: 0n });
+  }
+  await advance(api, abi, address, fold, number, plainEntry);
+  expectFoldEquals(fold, chain, `${address} at #${number}, where its chain starts`);
   state.folds ??= {};
-  // The fold starts here, so its chain starts here too: at instantiation (0) or at an upgrade
-  // from code that kept no chain (the head's next position, with the zero digest).
-  state.folds[address] = foldToJson(newFold({ number, position: chain.position, digest: chain.digest }));
+  state.folds[address] = foldToJson(fold);
   save();
   return chain;
 }

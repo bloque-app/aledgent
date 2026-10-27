@@ -20,9 +20,12 @@
 import { bnToU8a, stringToU8a, u8aConcat, u8aEq, u8aToHex } from '@polkadot/util';
 import { blake2AsU8a } from '@polkadot/util-crypto';
 
+import { ZERO_HEX, decodeChainHead, startOf } from './chain-head.mjs';
+
+export { ZERO_HEX, decodeChainHead, startOf };
+
 export const CHAIN_LABEL = stringToU8a('aledgent/settlement-entry/v1');
 export const ZERO_DIGEST = new Uint8Array(32);
-const ZERO_HEX = u8aToHex(ZERO_DIGEST);
 
 /// The events that carry an entry, by the index of their `InboxEvent` variant (`src/types.rs`).
 export const ENTRY_EVENTS = { Deposited: 0, Withdrawn: 1, Anchored: 2, Refused: 3, Bound: 4 };
@@ -40,22 +43,6 @@ const u64le = (bytes, offset) => {
   return n;
 };
 
-/// **The one decoding of the head cell** (`ChainHead`): `position` (u64), `digest` ([u8; 32]),
-/// `start` (u64), in that order, SCALE. `bytes` is the cell as stored, or the value of the
-/// `chain_head` message (the same layout). Absent (`null`), the cell reads as the contract reads it:
-/// `{ position: next_seq, digest: zeros, start: next_seq }`, with `nextSeq` the head's.
-///
-/// The head's third field, `start`, is not yet ruled by the owner: dropping it changes this
-/// function, and nothing else here reads the cell.
-export function decodeChainHead(bytes, nextSeq) {
-  if (bytes === null || bytes === undefined) {
-    if (nextSeq === undefined) fail('decodeChainHead: no cell and no next_seq to read it from');
-    return { position: BigInt(nextSeq), digest: ZERO_HEX, start: BigInt(nextSeq) };
-  }
-  if (bytes.length !== 48) fail(`decodeChainHead: ${bytes.length} bytes, a ChainHead is 48`);
-  return { position: u64le(bytes, 0), digest: u8aToHex(bytes.subarray(8, 40)), start: u64le(bytes, 40) };
-}
-
 /// `e_n` of the entry an event carries: `blake2b-256(at as u32 LE ‖ variant ‖ data[8..])`.
 export function entryDigest(at, kind, data) {
   const variant = ENTRY_EVENTS[kind] ?? fail(`not an entry event: ${kind}`);
@@ -68,27 +55,37 @@ export function chainDigest(previous, n, entry) {
   return blake2AsU8a(u8aConcat(CHAIN_LABEL, previous, bnToU8a(n, { bitLength: 64, isLe: false }), entry), 256);
 }
 
-/// The contract's events in one block's records, in order: entries (`{ kind, seq, data, args,
-/// names }`) and the starts of a new chain (`{ kind: 'AnchorHeadSet' }`). `abi` decodes them.
+/// The contract's events in one block's records, in order: entries (`{ kind, seq, data, args }`),
+/// the starts of a new chain (`{ kind: 'AnchorHeadSet' }`) and the change of its code
+/// (`{ kind: 'ContractCodeUpdated' }`). `abi` decodes them. In a block that changes the contract's
+/// code, its events before the change are the earlier code's, of other shapes: they are returned as
+/// `{ kind: 'EarlierCode' }`, not decoded.
 export function contractEventsOf(abi, address, records) {
+  const ours = (event) => event.section === 'contracts' && event.data[0].toString() === address;
+  const updated = records.findIndex(({ event }) => ours(event) && event.method === 'ContractCodeUpdated');
   const out = [];
-  for (const record of records) {
+  records.forEach((record, i) => {
     const { event } = record;
-    if (event.section === 'contracts' && event.method === 'ContractCodeUpdated' && event.data[0].toString() === address) {
+    if (!ours(event)) return;
+    if (event.method === 'ContractCodeUpdated') {
       out.push({ kind: 'ContractCodeUpdated' });
-      continue;
+      return;
     }
-    if (event.section !== 'contracts' || event.method !== 'ContractEmitted' || event.data[0].toString() !== address) continue;
+    if (event.method !== 'ContractEmitted') return;
+    if (updated >= 0 && i < updated) {
+      out.push({ kind: 'EarlierCode' });
+      return;
+    }
     const decoded = abi.decodeEvent(record);
     const kind = decoded.event.identifier.split('::').pop();
     const data = event.data[1].toU8a(true);
     const args = {};
-    decoded.event.args.forEach((a, i) => {
-      args[a.name] = decoded.args[i];
+    decoded.event.args.forEach((a, j) => {
+      args[a.name] = decoded.args[j];
     });
     if (kind in ENTRY_EVENTS) out.push({ kind, seq: u64le(data, 0), data, args });
     else if (kind === 'AnchorHeadSet') out.push({ kind, args });
-  }
+  });
   return out;
 }
 
@@ -96,24 +93,55 @@ export function contractEventsOf(abi, address, records) {
 /// and digest after it, where the chain started, and every entry of the current chain (`{ seq, at,
 /// kind, args }`). A new chain (`AnchorHeadSet`) starts it again from `(0, zeros)`.
 ///
-/// `fold` is what `newFold` returns, or the same object saved as JSON.
-export function newFold({ number, position = 0n, digest = ZERO_HEX, start = position }) {
-  return { number, position: BigInt(position), digest, start: BigInt(start), entries: [], resets: 0 };
+/// `fold` is what `newFold` returns, or the same object saved as JSON. With `skip` (`{ block,
+/// until }`), the chain starts within block `block`, after its `until` event (`ContractCodeUpdated`:
+/// an upgrade from code that kept no chain; `AnchorHeadSet`: a reset); what comes before it in that
+/// block is not this chain's.
+export function newFold({ number, position = 0n, digest = ZERO_HEX, start = position, skip = null }) {
+  return { number, position: BigInt(position), digest, start: BigInt(start), entries: [], resets: 0, skip };
 }
 
 /// Fold every finalized block after `fold.number` up to `toNumber`, in place. Fails if an entry's
-/// position is not the next one (an entry skipped, repeated or out of order), or if the
-/// contract's code changes mid-way (a chain from before an upgrade is folded from the upgrade's
-/// block, `newFold` at the head it left). `plain(seq, at, kind, args)` turns an entry into what is
-/// kept in `fold.entries`.
-export async function advance(api, abi, address, fold, toNumber, plain) {
+/// position is not the next one (an entry skipped, repeated or out of order). `plain(seq, at, kind,
+/// args)` turns an entry into what is kept in `fold.entries`.
+///
+/// **A reset** (`AnchorHeadSet`) starts a new chain from `(0, zeros)`. The chain it ends is checked
+/// first: the fold up to the block before the reset must equal the head at that block, which
+/// `headAt(n)` reads (a decoded head, `decodeChainHead`'s). With no `headAt`, a fold that spans a
+/// reset fails rather than drop a chain it never compared. An entry of the old chain in the reset's
+/// own block, before the reset, is unsupported (no head is readable between two extrinsics of one
+/// block) and fails with that reason.
+///
+/// **A change of the contract's code** is folded only where the fold starts (`skip`): a chain from
+/// before an upgrade is folded from the upgrade's block, at the head it left. Anywhere else it fails.
+export async function advance(api, abi, address, fold, toNumber, plain, headAt = null) {
   let position = BigInt(fold.position);
   let digest = typeof fold.digest === 'string' ? hexBytes(fold.digest) : fold.digest;
   for (let n = Number(fold.number) + 1; n <= toNumber; n++) {
     const hash = await api.rpc.chain.getBlockHash(n);
     const records = await (await api.at(hash)).query.system.events();
-    for (const e of contractEventsOf(abi, address, records)) {
-      if (e.kind === 'ContractCodeUpdated') fail(`the contract's code changed at #${n}: fold from that block, at the head it left`);
+    let events = contractEventsOf(abi, address, records);
+    if (fold.skip && Number(fold.skip.block) === n) {
+      const at = events.map((e) => e.kind).lastIndexOf(fold.skip.until);
+      if (at < 0) fail(`#${n}: the fold starts after its ${fold.skip.until}, and it has none`);
+      events = events.slice(at + 1);
+      fold.skip = null;
+    }
+    const resets = events.flatMap((e, i) => (e.kind === 'AnchorHeadSet' ? [i] : []));
+    const reset = resets.length ? resets[0] : -1;
+    for (let k = 1; k < resets.length; k++) {
+      if (events.slice(resets[k - 1], resets[k]).some((e) => e.kind in ENTRY_EVENTS)) fail(`#${n}: entries between two resets in one block: unsupported, no head is readable between them`);
+    }
+    if (reset >= 0) {
+      if (events.slice(0, reset).some((e) => e.kind in ENTRY_EVENTS)) {
+        fail(`#${n}: entries of the old chain in the block that resets it, before the reset: unsupported, no head is readable between them and the reset`);
+      }
+      if (!headAt) fail(`#${n}: the fold spans a reset, and no head before it was given to check the chain it ends`);
+      const before = await headAt(n - 1);
+      expectFoldEquals({ ...fold, position, digest: u8aToHex(digest) }, before, `the chain the reset at #${n} ends, at #${n - 1}`);
+    }
+    for (const e of events) {
+      if (e.kind === 'ContractCodeUpdated' || e.kind === 'EarlierCode') fail(`the contract's code changed at #${n}: fold from that block, at the head it left`);
       if (e.kind === 'AnchorHeadSet') {
         position = 0n;
         digest = ZERO_DIGEST;
@@ -136,10 +164,6 @@ export async function advance(api, abi, address, fold, toNumber, plain) {
   return fold;
 }
 
-/// Where a decoded head says its chain started, or `null` if the head carries no `start` (the
-/// field is not yet ruled: readers outside this module ask here, never `head.start`).
-export const startOf = (head) => (head.start === undefined ? null : head.start);
-
 /// Whether the fold equals a head (`decodeChainHead`'s): position and digest, and where the chain
 /// started if the head says.
 export function foldMatches(fold, head) {
@@ -156,19 +180,23 @@ export function expectFoldEquals(fold, head, label) {
 
 /// Walk back from block `toNumber` to where the current chain started, for a reader that kept no
 /// fold. Returns a fold positioned just before the chain's first entry, ready for `advance`. Stops
-/// at the block of the newest `AnchorHeadSet` (a new chain from 0), or, with the head's `start`, at
-/// the block holding the entry at `start`, or, without it, at the block the contract's code changed
-/// (the chain then starts at `positionAfter(n)`, the head's next position at that block); fails
-/// after `maxBlocks`.
+/// at the block of the newest `AnchorHeadSet` (a new chain from 0, after it), at the block the
+/// contract's code changed (the chain starts after the change, at the head's `start`, or without
+/// it at `positionAfter(n)` less the entries after the change in that block), or, with `start`, at
+/// the block holding the entry at `start`; fails after `maxBlocks`.
 export async function locateStart(api, abi, address, toNumber, head, maxBlocks, positionAfter) {
   const start = startOf(head);
   if (start !== null && head.position === start) return newFold({ number: toNumber, position: start });
   for (let n = toNumber, i = 0; n > 0 && i < maxBlocks; n--, i++) {
     const hash = await api.rpc.chain.getBlockHash(n);
     const events = contractEventsOf(abi, address, await (await api.at(hash)).query.system.events());
-    if (events.some((e) => e.kind === 'AnchorHeadSet')) return newFold({ number: n - 1, position: 0n });
+    if (events.some((e) => e.kind === 'AnchorHeadSet')) return newFold({ number: n - 1, position: 0n, skip: { block: n, until: 'AnchorHeadSet' } });
+    if (events.some((e) => e.kind === 'ContractCodeUpdated')) {
+      const after = events.filter((e) => e.kind in ENTRY_EVENTS).length;
+      const position = start ?? (await positionAfter(n)) - BigInt(after);
+      return newFold({ number: n - 1, position, skip: { block: n, until: 'ContractCodeUpdated' } });
+    }
     if (start !== null && events.some((e) => e.seq === start)) return newFold({ number: n - 1, position: start });
-    if (start === null && events.some((e) => e.kind === 'ContractCodeUpdated')) return newFold({ number: n, position: await positionAfter(n) });
   }
   return fail(`the chain's start is not within ${maxBlocks} blocks of #${toNumber}`);
 }
