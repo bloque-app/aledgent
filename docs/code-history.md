@@ -45,10 +45,21 @@ Two builds of the same source with different settings are two code versions.
 
   Changing the mode is an input of its own, authorised under the mode in force at that moment. It cancels
   pending proposals, and the next anchor binds the new mode.
-- **The code map** (which inputs ran under which version) is read off the book itself: every archived entry
-  names its code version.
+- **The code map** (which inputs ran under which version, and of which generation) is read off the book
+  itself, from its `Upgrade`, `RescheduleUpgrade` and `CancelUpgrade` inputs as the book decided them.
+  Every archived entry also names its code version; a replay holds that to the map and refuses an entry that
+  names another.
 - **Replay and restore** fetch each range's code and run each range under it, checking every entry against
-  its archived log hash.
+  its archived log hash. `aledgent-core-host restore --code-config <file>` stages every version the archive
+  names before it re-sends anything, refuses up front a version it cannot have (naming its inputs), and
+  records the map it used in `restore.done.json`.
+- **The `code-history` gate** (`.github/workflows/code-history.yml`) replays a small recorded history under
+  every change to the core, the kernel or the library, and the core release job runs it before it builds a
+  code version. A build must still decide every recorded input exactly as before, under that input's
+  generation: a change in how a transition decides comes in under a new generation and leaves the earlier
+  ones as they were. The recorded history only grows. A release that adds a code generation extends it by
+  one range: `ALEDGENT_CODE_HISTORY_EXTEND=1 cargo test -p core-binding --features ingress --test
+  code_history -- --ignored extend`.
 - **Checkpoints and anchors** name the code version and the construction of the state commitment, so a
   verifier holding an anchor knows what produced the anchored state and how it is committed. A change of
   construction is itself an input (a migration), and its checkpoint binds both roots.
