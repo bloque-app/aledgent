@@ -38,8 +38,9 @@ pub type AttestationKey = [u8; 32];
 /// The most keys a deployment can have.
 pub const MAX_KEYS: usize = 16;
 /// The most calls one batch can carry: a generous bound, not the one that keeps a batch inside an
-/// extrinsic. Proof size does that, and it depends on the calls: 32 withdrawals to accounts (61 KB
-/// each) dry-run at 2.05 MB, while a withdrawal to another deployment in its own frame takes 235 KB.
+/// extrinsic. Proof size does that, and it depends on the calls: under amendment 0040, 32
+/// withdrawals to accounts dry-run at 2.41 MB on zombienet (over what an extrinsic leaves), while a
+/// withdrawal to another deployment in its own frame takes 235 KB.
 /// The adapter sizes every batch by its dry run's proof size (`F-027`, T-027-09); a batch too large
 /// for an extrinsic is refused by the pool and changes nothing. See F-026 NOTES, decision 23,
 /// "The price".
@@ -81,11 +82,12 @@ pub const CALL_WEIGHT_LIMIT: Weight = Weight::new(25_000_000_000, 512 * 1024);
 pub const CALL_FRAME_COST: Weight = Weight::new(1_000_000_000, 80 * 1024);
 /// What recording one call as refused costs the batch: the chain's head read and rewritten, two
 /// BLAKE2 hashes of at most about 200 bytes, and its event with two topics, which now carries the
-/// call (amendment 0040). v2 reserved 0.6 G and 8 KiB for an inbox entry and the event. Dry runs of
-/// batches of refused anchors on a fork of Kreivo spec 134 (the deployed test instance) charge each
-/// refusal 0.13 G and 10.4 KB more under this code than under v2, so both parts are raised by
-/// about that much. To be checked against the zombienet measurement (`T-043-03`).
-pub const REFUSAL_RESERVE: Weight = Weight::new(750_000_000, 20 * 1024);
+/// call (amendment 0040). v2 reserved 0.6 G and 8 KiB, below its own 16.2 KB refusal. Measured on
+/// zombienet (`T-043-03`): a refusal alone costs 0.581 G and 26 563 B, 0.13 G and 10 359 B more
+/// than under v2. At 20 KiB some gas limits reverted a starved batch whole instead of recording
+/// each refusal; at 28 KiB a sweep at 1 KB steps (2 and 5 calls) and 5 KB steps (3 and 8 calls)
+/// recorded every refusal.
+pub const REFUSAL_RESERVE: Weight = Weight::new(750_000_000, 28 * 1024);
 /// What the batch needs after its last call: storing the head and returning the outcomes.
 pub const BATCH_FINISH_RESERVE: Weight = Weight::new(400_000_000, 4 * 1024);
 
