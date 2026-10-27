@@ -24,8 +24,10 @@
 //   deposit      DEPOSITOR deposits to an account reference; the contract pulls it through Kreivo's
 //                assets API, with no approval.
 //   execute      KEY submits a batch: a withdrawal to PAYEE, one the bound refuses, and an anchor.
-//   read         read the head and every inbox entry, by contract query and by raw child-trie
-//                storage at the finalized block (the adapter's path), and check they agree.
+//   read         read the head and the chain's head (`chain_head`, amendment 0040) by contract
+//                query and by raw child-trie storage at the finalized block (the adapter's path),
+//                check they agree, and fold the contract's events from the chain's start to that
+//                block: the fold must equal the chain's head. The contract stores no entry.
 //   events       print the contract's events in the latest finalized blocks.
 //   all          every step above, in order.
 //
@@ -41,12 +43,15 @@
 //   ASSET            the asset, as Kreivo's FungibleAssetLocation JSON (default {"Here":1})
 //   BUNDLE           the `.contract` bundle `cargo contract build` wrote
 //   STATE            where ids and the contract address are kept between steps (default .state.json)
+//   BLOCKS           `events`: how many blocks back to print; `read`, with no fold kept for the
+//                    contract: how far back to look for the chain's start (default 20 and 256)
 
 import { ApiPromise, Keyring, WsProvider } from '@polkadot/api';
 import { Abi, ContractPromise } from '@polkadot/api-contract';
 import { bnToU8a, compactToU8a, hexToU8a, stringToU8a, u8aConcat, u8aEq, u8aToHex } from '@polkadot/util';
 import { blake2AsU8a, cryptoWaitReady, decodeAddress, encodeAddress } from '@polkadot/util-crypto';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { advance, decodeChainHead, expectFoldEquals, foldFromJson, foldToJson, locateStart, newFold } from './chain.mjs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -65,8 +70,10 @@ const ASSETS_PALLET = 13;
 const ASSETS_CALLS = { transfer: 8 };
 // The contract's storage root keys (`src/lib.rs`, `ManualKey`).
 // `anchors` (3) is the legacy map of every anchor by number, removed by the migration of the code
-// of 2026-10-11; `latestAnchor` (8) is the only anchor that code keeps.
-const ROOT_KEYS = { registration: 1, head: 2, anchors: 3, inbox: 4, positions: 5, bounds: 6, bound: 7, latestAnchor: 8, anchorMigration: 9 };
+// of 2026-10-11; `latestAnchor` (8) is the only anchor that code keeps. `inbox` (4) is where v2
+// stored each entry: this code stores none, and its reset removes what v2 left. `chain` (12) is the
+// head of the chain of entries (amendment 0040), decoded only by `chain.mjs`.
+const ROOT_KEYS = { registration: 1, head: 2, anchors: 3, inbox: 4, positions: 5, bounds: 6, bound: 7, latestAnchor: 8, anchorMigration: 9, anchorEpoch: 10, governance: 11, chain: 12 };
 
 // Kreivo's transaction extensions (`runtime/kreivo/src/lib.rs`). `PassAuthenticate` comes first;
 // its explicit part is `Option<AuthenticateParams>`, always `None` here (0x00), so the inner type
@@ -270,6 +277,120 @@ async function callContract(api, contract, signer, message, args, label) {
   return { ...(await send(tx, signer, label)), output: query.output, query };
 }
 
+/// The contract's child trie at block `hash`: `raw(key)` reads one cell by its unhashed key.
+async function childTrie(api, address, hash) {
+  const info = (await (await api.at(hash)).query.contracts.contractInfoOf(address)).unwrap();
+  const child = u8aToHex(u8aConcat(stringToU8a(':child_storage:default:'), info.trieId));
+  return {
+    info,
+    async raw(key) {
+      const v = await api.rpc.childstate.getStorage(child, u8aToHex(key), hash);
+      return v.isSome ? v.unwrap().toU8a(true) : null;
+    },
+  };
+}
+
+/// Run a read-only message at block `hash` (not the best block), and return its value's bytes:
+/// the `Result<T, LangError>` it returns, less its `Ok` byte.
+async function messageAt(api, abi, address, hash, message, args = []) {
+  const data = abi.findMessage(message).toU8a(args);
+  const r = await (await api.at(hash)).call.contractsApi.call(address, address, 0, null, null, data);
+  if (r.result.isErr) fail(`${message} at ${hash.toHex?.() ?? hash}: ${r.result.asErr.toString()}`);
+  const out = r.result.asOk.data.toU8a(true);
+  if (r.result.asOk.flags.isRevert || out[0] !== 0) fail(`${message} at ${hash.toHex?.() ?? hash}: reverted (${u8aToHex(out)})`);
+  return out.subarray(1);
+}
+
+/// `Head` (three u64s: last anchor, next position, pruned watermark) from its cell or its
+/// message's value.
+function decodeHead(bytes) {
+  if (!bytes) return { lastAnchor: 0n, nextSeq: 0n, prunedTo: 0n };
+  const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  return { lastAnchor: v.getBigUint64(0, true), nextSeq: v.getBigUint64(8, true), prunedTo: v.getBigUint64(16, true) };
+}
+
+/// The head and the chain's head at block `hash`, each read twice: by raw child-trie key (the
+/// adapter's path) and by its message run at that block. Fails if the two disagree.
+async function chainHeadAt(api, abi, address, hash) {
+  const trie = await childTrie(api, address, hash);
+  const headCell = await trie.raw(contractKey(ROOT_KEYS.head));
+  const head = decodeHead(headCell);
+  const viaHeadMessage = decodeHead(await messageAt(api, abi, address, hash, 'head'));
+  if (JSON.stringify(viaHeadMessage, big) !== JSON.stringify(head, big)) fail(`head: storage ${JSON.stringify(head, big)}, query ${JSON.stringify(viaHeadMessage, big)}`);
+  const cell = await trie.raw(contractKey(ROOT_KEYS.chain));
+  const chain = decodeChainHead(cell, head.nextSeq);
+  const viaQuery = decodeChainHead(await messageAt(api, abi, address, hash, 'chainHead'));
+  if (JSON.stringify(viaQuery, big) !== JSON.stringify(chain, big)) fail(`chain head: storage ${JSON.stringify(chain, big)}, query ${JSON.stringify(viaQuery, big)}`);
+  if (chain.position !== head.nextSeq) fail(`the chain's head is at ${chain.position}, the head's next position is ${head.nextSeq}`);
+  return { head, chain, cellPresent: cell !== null, codeHash: trie.info.codeHash.toHex() };
+}
+
+const big = (_, v) => (typeof v === 'bigint' ? v.toString() : v);
+
+/// An entry of the fold as plain values, from its event's decoded fields: `{ seq, at, kind,
+/// operationRef, accountRef, from, to, asset, amount, reason, call, number, commitment }`.
+function plainEntry(seq, at, kind, args) {
+  const out = { seq, at, kind };
+  const put = (name, f) => {
+    const v = args[name];
+    if (v !== undefined && v !== null) out[name] = f(v);
+  };
+  put('operationRef', (v) => v.toHex());
+  put('accountRef', (v) => v.toHex());
+  put('from', (v) => u8aToHex(v.toU8a()));
+  put('to', (v) => (v.type === 'Account' ? v.value.toHex() : JSON.stringify(v.toJSON())));
+  put('asset', (v) => JSON.stringify(v.toJSON()));
+  put('amount', (v) => v.toString());
+  put('reason', (v) => renderEnum(v));
+  put('call', (v) => JSON.stringify(v.toJSON()));
+  put('number', (v) => Number(v.toString()));
+  put('commitment', (v) => v.toHex());
+  return out;
+}
+
+/// `Refusal` (and nested enums) as `BoundExceeded` or `Kreivo(Assets(CannotTransfer))`.
+function renderEnum(codec) {
+  const isEnum = (c) => c && typeof c.type === 'string' && 'isBasic' in c;
+  if (!isEnum(codec)) return codec?.toString();
+  if (codec.isBasic) return codec.type;
+  const inner = codec.value;
+  // Not `isEmpty`: an enum whose own value is a unit variant reports itself empty too.
+  if (isEnum(inner)) return `${codec.type}(${renderEnum(inner)})`;
+  if (!inner || inner.toRawType?.() === 'Null') return codec.type;
+  return `${codec.type}(${inner.toString()})`;
+}
+
+/// The fold of `address`'s entries up to finalized block `fin` (`{ hash, number }`), checked
+/// against the chain's head there: `{ head, chain, fold }`. The fold is kept in the state between
+/// steps (`state.folds[address]`), so each call folds only the blocks after the last; `instantiate`
+/// starts it, and an upgrade or a caller with no fold kept starts it where the chain did
+/// (`chain.mjs` `locateStart`).
+async function foldAt(api, abi, address, fin) {
+  const at = await chainHeadAt(api, abi, address, fin.hash);
+  state.folds ??= {};
+  let fold = state.folds[address] ? foldFromJson(state.folds[address]) : null;
+  if (!fold || fold.number > fin.number) {
+    fold = await locateStart(api, abi, address, fin.number, at.chain, Number(env('BLOCKS', '256')));
+    log(`fold of ${address}: no fold kept; the chain starts after #${fold.number}`);
+  }
+  await advance(api, abi, address, fold, fin.number, plainEntry);
+  expectFoldEquals(fold, at.chain, `${address} at #${fin.number}`);
+  state.folds[address] = foldToJson(fold);
+  save();
+  return { ...at, fold };
+}
+
+/// Start the fold of `address` at block `number`, at the chain's head there (`instantiate`, and an
+/// upgrade from code that kept no chain: its events before are of another shape).
+async function startFold(api, abi, address, number) {
+  const hash = await api.rpc.chain.getBlockHash(number);
+  const { chain } = await chainHeadAt(api, abi, address, hash);
+  state.folds ??= {};
+  state.folds[address] = foldToJson(newFold({ number, position: chain.position, digest: chain.digest, start: chain.start }));
+  save();
+  return chain;
+}
+
 async function read(api, contract, message, args = []) {
   const gasLimit = api.registry.createType('WeightV2', api.consts.system.blockWeights.maxBlock);
   const query = await contract.query[message](contract.address, { gasLimit, storageDepositLimit: null }, ...args);
@@ -352,11 +473,14 @@ const steps = {
     const data = abi.findConstructor('new').toU8a([accounts.admin.address, [accounts.key.address], null]);
     const salt = u8aToHex(stringToU8a(`aledgent-${Date.now()}`));
     const tx = api.tx.contractsStore.instantiate(appId, licenseId, 0, data, salt);
-    await send(tx, accounts.admin, 'contractsStore.instantiate');
+    const { blockHash } = await send(tx, accounts.admin, 'contractsStore.instantiate');
     const address = (await api.query.contractsStore.contractAccount([appId, licenseId])).unwrap().toString();
     state.contract = address;
     save();
-    log(`contract ${address}`);
+    // The chain starts empty at instantiation, `(0, zeros, 0)`: the fold starts at its block.
+    const number = (await api.rpc.chain.getHeader(blockHash)).number.toNumber();
+    if (abi.messages.some((m) => m.method === 'chainHead')) await startFold(api, abi, address, number);
+    log(`contract ${address}, instantiated at #${number}`);
   },
 
   async bound({ api, accounts, abi }) {
@@ -391,23 +515,14 @@ const steps = {
 
   async read({ api, abi }) {
     const contract = contractOf(api, abi);
-    const finalized = await api.rpc.chain.getFinalizedHead();
-    const at = await api.at(finalized);
-    const head = (await read(api, contract, 'head')).toJSON();
-    log(`head ${JSON.stringify(head)} (finalized ${finalized.toHex()})`);
-    // The adapter's path: the contract's child trie, read by key at a finalized block.
-    const info = (await at.query.contracts.contractInfoOf(contract.address)).unwrap();
-    const childKey = u8aToHex(u8aConcat(stringToU8a(':child_storage:default:'), info.trieId));
-    for (let seq = Number(head.prunedTo); seq < Number(head.nextSeq); seq++) {
-      const key = contractKey(ROOT_KEYS.inbox, bnToU8a(seq, { bitLength: 64, isLe: true }));
-      const raw = await api.rpc.childstate.getStorage(childKey, u8aToHex(key), finalized);
-      const queried = await read(api, contract, 'inboxEntry', [seq]);
-      const viaQuery = queried.isSome ? queried.unwrap().toU8a() : null;
-      const viaStorage = raw.isSome ? raw.unwrap().toU8a(true) : null;
-      const agree = viaQuery && viaStorage && u8aEq(viaQuery, viaStorage);
-      log(`inbox[${seq}] ${JSON.stringify(queried.toHuman())} storage ${agree ? 'agrees' : 'DIFFERS'}`);
-      if (!agree) fail(`inbox[${seq}]: storage ${viaStorage && u8aToHex(viaStorage)} vs query ${viaQuery && u8aToHex(viaQuery)}`);
-    }
+    const hash = await api.rpc.chain.getFinalizedHead();
+    const number = (await api.rpc.chain.getHeader(hash)).number.toNumber();
+    // The adapter's path: the head and the chain's head by raw child-trie key at a finalized
+    // block, each against its message run at that block; then the events folded to it.
+    const { head, chain, cellPresent, fold } = await foldAt(api, abi, contract.address.toString(), { hash, number });
+    log(`head ${JSON.stringify(head, big)}; chain head ${JSON.stringify(chain, big)} (${cellPresent ? 'stored' : 'no cell: read as (next_seq, zeros, next_seq)'}); storage and query agree (finalized #${number} ${hash.toHex()})`);
+    for (const e of fold.entries.slice(-Number(env('ENTRIES', '8')))) log(`entry[${e.seq}] #${e.at} ${JSON.stringify(e)}`);
+    log(`the events fold to the chain's head: ${fold.entries.length} entries since the chain started at ${fold.start}, ${fold.resets} reset(s) folded`);
   },
 
   async events({ api, abi }) {
@@ -441,7 +556,16 @@ export {
   ASSET,
   EXECUTE_MARGIN,
   ROOT_KEYS,
+  big,
   callContract,
+  chainHeadAt,
+  childTrie,
+  decodeHead,
+  foldAt,
+  messageAt,
+  plainEntry,
+  renderEnum,
+  startFold,
   communityAccount,
   connect,
   contractKey,

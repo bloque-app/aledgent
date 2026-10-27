@@ -8,7 +8,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "check": "node --check drive.mjs && node --check e2e.mjs",
+    "check": "node --check chain.mjs && node --check drive.mjs && node --check e2e.mjs",
     "drive": "node drive.mjs"
   },
   "dependencies": {
