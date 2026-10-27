@@ -57,8 +57,8 @@ on:
       - ".github/workflows/core-release.yml"
       - "deploy/docker/core.Dockerfile"
       - "tools/release/core-*"
+      - "tools/release/test-core-*"
       - "tools/release/pack-code-layer.py"
-      - "tools/release/test-core-release.sh"
   workflow_dispatch:
     inputs:
       host_image:
@@ -106,9 +106,17 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: shellcheck
-        run: shellcheck tools/release/core-code-set.sh tools/release/core-profile.sh tools/release/test-core-release.sh
+        run: shellcheck tools/release/core-*.sh tools/release/test-core-*.sh
       - name: The set's layout, the layer, the profile and this workflow's promises
         run: tools/release/test-core-release.sh
+      - name: Publishing and reading a set, against a registry on the runner
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 5 -o /tmp/crane.tar.gz \
+            "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz"
+          echo "${CRANE_SHA256}  /tmp/crane.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin" && tar -xzf /tmp/crane.tar.gz -C "$RUNNER_TEMP/bin" crane
+          PATH="$RUNNER_TEMP/bin:$PATH" tools/release/test-core-code-registry.sh
 
   core-code:
     name: core code (${{ matrix.case }})
@@ -220,20 +228,13 @@ jobs:
           git cat-file -e "$rev^{commit}" || { echo "::error::the host image's commit $rev is not in this repository's history"; exit 1; }
 
           if [ -n "$PRED_SET" ]; then
-            # A previous release's set: its record says which file is which, and the manifest is the file named by H.
-            mkdir "$W/set-in"
-            crane export "$PRED_SET" - | tar -x -C "$W/set-in"
-            jq -e '.format == "aledgent/core-code-set/v1"' "$W/set-in/set.json" >/dev/null \
-              || { echo "::error::$PRED_SET is not a code set of this workflow"; exit 1; }
-            from_set=$(jq -r .code "$W/set-in/set.json")
+            # A previous release's set, read back and checked as it was written (core-code-read.sh).
+            from_set=$(tools/release/core-code-read.sh "$PRED_SET" "$W/set-in")
             if [ -n "$CODE" ] && [ "$CODE" != "$from_set" ]; then
               echo "::error::predecessor_code $CODE is not the code of $PRED_SET ($from_set)"; exit 1
             fi
             CODE=$from_set
-            file() { jq -er --arg r "$1" '.files[] | select(.role == $r) | .digest' "$W/set-in/set.json"; }
-            cp "$W/set-in/code/$(file manifest)" "$W/pred/manifest.bin"
-            cp "$W/set-in/code/$(file package)" "$W/pred/core.vos"
-            cp "$W/set-in/code/$(file runtime)" "$W/pred/agent_runtime.pvm"
+            cp "$W/set-in/manifest.bin" "$W/set-in/core.vos" "$W/set-in/agent_runtime.pvm" "$W/pred/"
           else
             id=$(docker create --platform linux/amd64 "$HOST")
             docker cp "$id:/usr/share/aledgent/core.vos" "$W/pred/core.vos"
@@ -426,19 +427,8 @@ jobs:
         run: |
           set -euo pipefail
           crane auth login ghcr.io -u "$GITHUB_ACTOR" --password-stdin <<<"$GH_TOKEN"
-          ref="$CODE_REPO:code-$H"
-          if existing=$(crane digest "$ref" 2>/dev/null); then
-            # Code version H is a function of its bytes: the same tag must hold the same files.
-            mkdir "$W/existing"
-            crane export "$CODE_REPO@$existing" - | tar -x -C "$W/existing"
-            diff -r "$W/set" "$W/existing/code" \
-              || { echo "::error::$ref holds a different set than this run built: a code version's files never change"; exit 1; }
-            echo "::notice::$ref exists and holds exactly these files; nothing pushed"
-            digest=$existing
-          else
-            crane append -f "$W/layer.tar" -t "$ref" >/dev/null
-            digest=$(crane digest "$ref")
-          fi
+          # Pushes the set, or finds exactly these files already there under H; anything else is refused.
+          digest=$(tools/release/core-code-publish.sh "$CODE_REPO" "$H" "$W/set" "$W/layer.tar")
           [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]]
           # Anonymous pull, as release.yml checks for every image: the node and the delivery pull with no credential.
           name="${CODE_REPO#ghcr.io/}"
