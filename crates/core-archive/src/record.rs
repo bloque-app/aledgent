@@ -199,6 +199,44 @@ fn unframe<'a, H: for<'de> Deserialize<'de>>(
     Ok((header, payload))
 }
 
+/// The length of a segment's or a checkpoint's frame before its payloads (magic, length and
+/// header), or `None` if `bytes` does not start with one.
+pub fn header_len(bytes: &[u8]) -> Option<usize> {
+    let magic = bytes.get(..8)?;
+    if magic != SEGMENT_MAGIC.as_slice() && magic != CHECKPOINT_MAGIC.as_slice() {
+        return None;
+    }
+    let len = u32::from_be_bytes(bytes.get(8..12)?.try_into().ok()?) as usize;
+    let end = 12usize.checked_add(len)?;
+    (end <= bytes.len()).then_some(end)
+}
+
+/// A segment's header from the first bytes of its record (at least [`header_len`] of them), with
+/// its format checked. The payloads are not: whoever has the whole record uses
+/// [`decode_segment`].
+pub fn decode_segment_header(prefix: &[u8]) -> Result<SegmentHeader, Malformed> {
+    let (header, _): (SegmentHeader, _) = unframe(SEGMENT_MAGIC, prefix)?;
+    if header.format != FORMAT {
+        return Err(Malformed(format!(
+            "format {} is not {FORMAT}",
+            header.format
+        )));
+    }
+    Ok(header)
+}
+
+/// A checkpoint's header from the first bytes of its record, with its format checked.
+pub fn decode_checkpoint_header(prefix: &[u8]) -> Result<CheckpointHeader, Malformed> {
+    let (header, _): (CheckpointHeader, _) = unframe(CHECKPOINT_MAGIC, prefix)?;
+    if header.format != FORMAT {
+        return Err(Malformed(format!(
+            "format {} is not {FORMAT}",
+            header.format
+        )));
+    }
+    Ok(header)
+}
+
 /// A segment, read back and checked: its header, and its two payloads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Segment {

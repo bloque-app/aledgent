@@ -10,7 +10,8 @@
 //! ([`crate::fetch()`]).
 //!
 //! Two backends: [`FsStore`], a directory (tests, the drill, a mounted volume), and
-//! [`crate::s3::S3Store`], S3 with Object Lock and KMS encryption (the deployment's).
+//! [`crate::s3::S3Store`], S3 with Object Lock (the deployment's). [`crate::seal::Sealed`] is a
+//! layer over either that seals what it publishes and opens what it reads (`F-044`).
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read as _, Write as _};
@@ -30,6 +31,9 @@ pub enum StoreError {
     Corrupt(String),
     /// The backend did not answer, or refused; nothing is implied about the object. Retried.
     Unavailable(String),
+    /// The object is sealed and no key given opens it, or a key's service answered that it does
+    /// not (`F-044`). Not retried.
+    Sealed(String),
 }
 
 impl core::fmt::Display for StoreError {
@@ -40,6 +44,7 @@ impl core::fmt::Display for StoreError {
             StoreError::TooLarge(n) => write!(f, "{n}: larger than its bound"),
             StoreError::Corrupt(s) => write!(f, "corrupt: {s}"),
             StoreError::Unavailable(s) => write!(f, "unavailable: {s}"),
+            StoreError::Sealed(s) => write!(f, "sealed: {s}"),
         }
     }
 }
@@ -51,12 +56,46 @@ pub struct Put {
     pub created: bool,
 }
 
+/// What a reader with no key can know of an object: its length and SHA-256, and its leading
+/// bytes. Of an unsealed object, all of it; of a sealed one, what its seal keeps in clear
+/// ([`crate::seal::clear_len`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Head {
+    /// The object's length.
+    pub bytes: u64,
+    /// Its SHA-256, hex.
+    pub sha256: String,
+    /// Its first bytes.
+    pub clear: Vec<u8>,
+}
+
+impl Head {
+    /// The head of an object read whole.
+    pub fn of(bytes: Vec<u8>) -> Head {
+        Head {
+            bytes: bytes.len() as u64,
+            sha256: crate::record::sha256_hex(&bytes),
+            clear: bytes,
+        }
+    }
+
+    /// Whether it holds the whole object.
+    pub fn is_whole(&self) -> bool {
+        self.clear.len() as u64 == self.bytes
+    }
+}
+
 /// A write-once object store (module documentation).
 pub trait ObjectStore: Send + Sync {
     /// Publish `bytes` under `name`, once.
     fn put_once(&self, name: &str, bytes: &[u8]) -> Result<Put, StoreError>;
     /// The bytes published under `name`, refusing more than `max` bytes.
     fn get(&self, name: &str, max: u64) -> Result<Option<Vec<u8>>, StoreError>;
+    /// The [`Head`] of `name`, refusing an object of more than `max` bytes. A store that holds
+    /// objects as they are reads the whole object.
+    fn head(&self, name: &str, max: u64) -> Result<Option<Head>, StoreError> {
+        Ok(self.get(name, max)?.map(Head::of))
+    }
     /// Every name under `prefix` (which ends in `/`), sorted.
     fn list(&self, prefix: &str) -> Result<Vec<String>, StoreError>;
     /// Where it is, for logs and the status file: never a credential.

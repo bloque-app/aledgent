@@ -13,13 +13,15 @@
 //!   delete or overwrite a segment within it (compliance mode); the bucket must have Object Lock
 //!   enabled, and S3 refuses the PUT otherwise. Each PUT carries its SHA-256 checksum and MD5, as
 //!   S3 requires of a locked upload, and S3 checks them.
-//! - **KMS.** Every PUT asks for server-side encryption under the deployment's KMS key
-//!   (`aws:kms`). Reads decrypt transparently for a role allowed to use the key.
+//! - **KMS, optional.** With `kms-key-id`, every PUT asks for server-side encryption under the
+//!   deployment's KMS key (`aws:kms`); reads decrypt transparently for a role allowed to use the
+//!   key. Since `F-044` aledgent seals every object itself ([`crate::seal`]), so the archive
+//!   depends on no KMS key; KMS may be kept as a second layer.
 //!
-//! A writer refuses to start without both ([`S3Config::check_writer`]): the archive holds every
-//! decision the core committed. The lock defaults to compliance mode for 400 days, the owner's
-//! ruling of 2026-10-05 (`crate::archive::DEFAULT_RETAIN_DAYS`). Reads need neither, so a restore can read a bucket with a
-//! read-only role.
+//! A writer refuses to start without Object Lock, or without either encryption
+//! ([`S3Config::check_writer`]): the archive holds every decision the core committed. The lock
+//! defaults to compliance mode for [`crate::archive::DEFAULT_RETAIN_DAYS`] days. Reads need
+//! neither, so a restore can read a bucket with a read-only role.
 //!
 //! **Credentials** come, in order, from the file named by `ALEDGENT_ARCHIVE_CREDENTIALS_FILE`
 //! (short-lived credentials in the instance metadata service's JSON shape, `AccessKeyId`,
@@ -82,10 +84,11 @@ pub struct S3Config {
 }
 
 impl S3Config {
-    /// A writer must encrypt under KMS and lock what it writes (module documentation).
-    pub fn check_writer(&self) -> Result<(), String> {
-        if self.kms_key_id.as_deref().is_none_or(str::is_empty) {
-            return Err("the archive's S3 sink needs kms-key-id: every object is encrypted under the deployment's KMS key".into());
+    /// A writer must lock what it writes, and encrypt it: sealed by aledgent (`sealed`, `F-044`),
+    /// under KMS, or both (module documentation).
+    pub fn check_writer(&self, sealed: bool) -> Result<(), String> {
+        if !sealed && self.kms_key_id.as_deref().is_none_or(str::is_empty) {
+            return Err("the archive's S3 sink needs seal= (aledgent seals every object) or kms-key-id (S3 encrypts it under the deployment's KMS key)".into());
         }
         match self.lock {
             Some((_, days)) if days > 0 => Ok(()),
@@ -934,13 +937,17 @@ mod tests {
             kms_key_id: None,
             lock: None,
         };
-        assert!(c.check_writer().is_err());
+        assert!(c.check_writer(false).is_err());
+        assert!(c.check_writer(true).is_err(), "sealed, but not locked");
         c.kms_key_id = Some("alias/aledgent-archive".into());
-        assert!(c.check_writer().is_err());
+        assert!(c.check_writer(false).is_err());
         c.lock = Some((LockMode::Compliance, 0));
-        assert!(c.check_writer().is_err());
-        c.lock = Some((LockMode::Compliance, 400));
-        assert!(c.check_writer().is_ok());
+        assert!(c.check_writer(false).is_err());
+        c.lock = Some((LockMode::Compliance, 180));
+        assert!(c.check_writer(false).is_ok());
+        c.kms_key_id = None;
+        assert!(c.check_writer(false).is_err());
+        assert!(c.check_writer(true).is_ok());
         assert_eq!(
             c.host_and_base(),
             (

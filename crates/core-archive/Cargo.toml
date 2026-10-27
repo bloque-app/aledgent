@@ -3,7 +3,7 @@
 [package]
 name = "core-archive"
 version.workspace = true
-description = "The core Agent's off-node archive (F-005, T-005-15 to T-005-18): every committed decision of the core host streamed to an object store (S3 with Object Lock and KMS, or a directory), checkpoints of the Agent's runtime state, and the verified read-back a restore lays out on a fresh node."
+description = "The core Agent's off-node archive (F-005, T-005-15 to T-005-18; F-044): every committed decision of the core host streamed to an object store (S3 with Object Lock, or a directory), each object sealed by aledgent to a Vault Transit key and an offline recovery key, checkpoints of the Agent's runtime state, and the verified read-back a restore lays out on a fresh node."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -25,9 +25,20 @@ base64 = "0.22"
 md-5 = "0.10"
 # S3 over HTTPS, blocking: the archiver is a thread of its own, never the core's async runtime.
 ureq = { version = "3", default-features = false, features = ["rustls"] }
+# F-044, the seal: age v1 (X25519 and ChaCha20-Poly1305 with HKDF-SHA-256) and the file key wrapped
+# to a Vault Transit RSA key with OAEP. Pure Rust, RustCrypto: the core host's build links no C crypto.
+# `rsa` only encrypts in production (to a public key); decryption is Vault's.
+chacha20poly1305 = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+hkdf = "0.12"
+rsa = { version = "0.9", default-features = false, features = ["std", "pem"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+zeroize = "1"
 
 [dev-dependencies]
 tempfile = "3"
+# F-044: the seal's age part is checked against the reference Rust implementation (rage), both ways.
+age = { version = "0.11", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [lints]

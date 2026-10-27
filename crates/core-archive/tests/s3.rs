@@ -6,8 +6,12 @@
 //! `ALEDGENT_TEST_S3` names a bucket (an `s3://` spec with `kms-key-id`, `lock-mode` and
 //! `retain-days`), with credentials in the environment.
 
+mod common;
+
+use core_archive::age::Identity;
 use core_archive::archive::{ArchiveSink as _, ArchiveSource as _, parse_s3};
 use core_archive::s3::{CredentialSource, S3Store};
+use core_archive::seal::{Keys, MAGIC_LINE, Sealed, Unsealed};
 use core_archive::store::{ObjectStore as _, Put, StoreError};
 use core_archive::{Access, Archive};
 
@@ -33,7 +37,7 @@ fn t_005_15_the_s3_sink_writes_once_encrypted_and_locked() {
     let rest = spec.strip_prefix("s3://").expect("an s3:// spec");
     let mut config = parse_s3(rest).unwrap();
     config
-        .check_writer()
+        .check_writer(false)
         .expect("the test bucket is written as production is");
     // A fresh prefix per run: the objects are locked and stay.
     let run = format!(
@@ -94,10 +98,66 @@ fn t_005_15_the_s3_sink_writes_once_encrypted_and_locked() {
     // A reader needs no protections of its own; a writer without them is refused.
     let mut bare = config.clone();
     bare.kms_key_id = None;
-    assert!(bare.check_writer().is_err());
+    assert!(bare.check_writer(false).is_err());
     let read_spec = format!(
         "s3://{}/{}?region={}",
         config.bucket, config.prefix, config.region
     );
     assert!(core_archive::open(&read_spec, Access::Write).is_err());
+}
+
+/// `F-044` over S3: a sealed writer's exact retry goes through S3's refusal (412) and the seal
+/// line, different bytes conflict, every object is locked and sealed, and the recovery key reads
+/// it back.
+#[test]
+fn f_044_the_sealed_s3_sink_writes_once_locked_and_sealed() {
+    let Some(spec) = spec() else {
+        return;
+    };
+    let mut config = parse_s3(spec.strip_prefix("s3://").unwrap()).unwrap();
+    config.prefix = format!(
+        "{}sealed-{}-{}/",
+        config.prefix,
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    );
+    config.check_writer(true).unwrap();
+    let recovery = Identity::generate();
+    let store = || Box::new(S3Store::new(config.clone(), CredentialSource::Default));
+    let w = Sealed::new(
+        store(),
+        Some(common::recipients(1, &recovery)),
+        Keys::none(),
+        Unsealed::Refuse,
+    );
+    let rec = b"a record".to_vec();
+    assert_eq!(
+        w.put_once("segments/a.seg", &rec),
+        Ok(Put { created: true })
+    );
+    assert_eq!(
+        w.put_once("segments/a.seg", &rec),
+        Ok(Put { created: false })
+    );
+    assert_eq!(
+        w.put_once("segments/a.seg", b"another"),
+        Err(StoreError::Conflict("segments/a.seg".into()))
+    );
+    let raw = store().get("segments/a.seg", 1 << 20).unwrap().unwrap();
+    assert!(raw.starts_with(MAGIC_LINE) && raw.windows(8).all(|x| x != b"a record"));
+    let p = store().protection("segments/a.seg").unwrap().unwrap();
+    assert!(p.lock_mode.is_some() && p.retain_until.is_some(), "{p:?}");
+    let r = Sealed::new(
+        store(),
+        None,
+        Keys {
+            transit: None,
+            recovery: vec![Identity::parse(&recovery.to_bech32()).unwrap()],
+        },
+        Unsealed::Refuse,
+    );
+    assert_eq!(r.get("segments/a.seg", 1 << 20).unwrap(), Some(rec));
 }

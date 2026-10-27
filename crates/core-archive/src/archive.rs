@@ -12,10 +12,15 @@
 //! Uploading is maintenance: nothing the core commits, acknowledges or answers ever waits on a
 //! sink call ([`crate::archiver`]).
 
+use std::path::PathBuf;
+
 use crate::record::{
-    CHECKPOINTS, MAX_RECORD_BYTES, SEGMENTS, checkpoint_name, number_of, segment_name,
+    CHECKPOINTS, CheckpointHeader, MAX_RECORD_BYTES, SEGMENTS, SegmentHeader, checkpoint_name,
+    decode_checkpoint, decode_checkpoint_header, decode_segment, decode_segment_header, number_of,
+    segment_name,
 };
 use crate::s3::{CredentialSource, LockMode, S3Config, S3Store};
+use crate::seal::{Keys, Recipients, Sealed, Unsealed};
 use crate::store::{FsStore, ObjectStore, Put, StoreError};
 
 /// Publication side.
@@ -64,6 +69,43 @@ impl Archive {
     /// Where it is (no credential).
     pub fn describe(&self) -> String {
         self.0.describe()
+    }
+
+    /// The store it is over.
+    pub fn store(&self) -> &dyn ObjectStore {
+        self.0.as_ref()
+    }
+
+    /// Segment `n`'s header and digest, read with no key (`F-044`): from the record when the
+    /// store holds it as it is (and then checked whole), from what its seal keeps in clear when it
+    /// is sealed. What the archiver reads back when it resumes.
+    pub fn segment_head(&self, n: u64) -> Result<Option<(SegmentHeader, String)>, StoreError> {
+        let Some(h) = self.0.head(&segment_name(n), MAX_RECORD_BYTES)? else {
+            return Ok(None);
+        };
+        let bad = |e: crate::record::Malformed| StoreError::Corrupt(format!("segment {n}: {e}"));
+        if h.is_whole() {
+            let s = decode_segment(&h.clear).map_err(bad)?;
+            return Ok(Some((s.header, s.digest)));
+        }
+        Ok(Some((
+            decode_segment_header(&h.clear).map_err(bad)?,
+            h.sha256,
+        )))
+    }
+
+    /// The checkpoint at segment `n`'s header, read with no key, as [`Archive::segment_head`].
+    pub fn checkpoint_head(&self, n: u64) -> Result<Option<CheckpointHeader>, StoreError> {
+        let Some(h) = self.0.head(&checkpoint_name(n), MAX_RECORD_BYTES)? else {
+            return Ok(None);
+        };
+        let bad = |e: crate::record::Malformed| StoreError::Corrupt(format!("checkpoint {n}: {e}"));
+        if h.is_whole() {
+            return decode_checkpoint(&h.clear)
+                .map(|c| Some(c.header))
+                .map_err(bad);
+        }
+        decode_checkpoint_header(&h.clear).map(Some).map_err(bad)
     }
 
     fn numbers(&self, prefix: &str) -> Result<Vec<u64>, StoreError> {
@@ -143,10 +185,13 @@ impl ArchiveSource for Archive {
     }
 }
 
-/// The Object Lock retention every archived object carries unless the spec says otherwise: 400 days
-/// in compliance mode (the owner, 2026-10-05, `ab-q01`). The bucket has no lifecycle rule that
-/// deletes current versions, so an object outlives its lock.
-pub const DEFAULT_RETAIN_DAYS: u32 = 400;
+/// The Object Lock retention every archived object carries unless the spec says otherwise: 180 days
+/// in compliance mode (David, 2026-10-25, relaxing the owner's 400 days of 2026-10-05, `ab-q01`).
+/// Retention itself is forever (`NFR-22`): the bucket has no lifecycle rule that deletes current
+/// versions, so an object outlives its lock. If the archive enters PCI DSS scope the lock becomes
+/// 365 days (requirement 10.5.1 keeps audit history for twelve months); Colombia's ten years come
+/// later. Both are a `retain-days` in the deployment's spec, not a change here.
+pub const DEFAULT_RETAIN_DAYS: u32 = 180;
 
 /// What the archive is for: a writer (the core host) must have S3's protections; a reader (a
 /// restore) need not.
@@ -158,43 +203,124 @@ pub enum Access {
     Read,
 }
 
+/// The seal's part of a spec (`F-044`): options of every kind of store.
+#[derive(Debug, Default)]
+struct SealOptions {
+    seal: Option<PathBuf>,
+    vault: Option<String>,
+    transit_mount: Option<String>,
+    refuse_unsealed: bool,
+}
+
+/// Split the seal's options off `query`, giving back the others.
+fn seal_options(query: &str) -> Result<(SealOptions, String), String> {
+    let mut o = SealOptions::default();
+    let mut rest = Vec::new();
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        let (k, v) = pair
+            .split_once('=')
+            .ok_or_else(|| format!("archive option {pair:?} has no value"))?;
+        match k {
+            "seal" => o.seal = Some(PathBuf::from(v)),
+            "vault" => o.vault = Some(v.to_owned()),
+            "transit-mount" => o.transit_mount = Some(v.to_owned()),
+            "unsealed" => {
+                o.refuse_unsealed = match v {
+                    "accept" => false,
+                    "refuse" => true,
+                    _ => return Err(format!("unsealed={v:?}: accept or refuse")),
+                }
+            }
+            _ => rest.push(pair),
+        }
+    }
+    if o.vault.is_some() != o.transit_mount.is_some() {
+        return Err("vault= and transit-mount= go together".into());
+    }
+    Ok((o, rest.join("&")))
+}
+
 /// Open the archive a deployment names (`--archive`, `--from`):
 ///
 /// ```text
-/// fs:<directory>
-/// s3://<bucket>[/<prefix>]?region=<region>&kms-key-id=<key>[&lock-mode=compliance|governance
-///      &retain-days=<days>][&endpoint=<scheme://host:port>&path-style=true]
+/// fs:<directory>[?<seal options>]
+/// s3://<bucket>[/<prefix>]?region=<region>[&kms-key-id=<key>][&lock-mode=compliance|governance
+///      &retain-days=<days>][&endpoint=<scheme://host:port>&path-style=true][&<seal options>]
+///
+/// seal options (F-044): seal=<seal file>                      a writer seals to its keys
+///                       vault=<https://…>&transit-mount=<m>   a reader opens with Vault Transit
+///                       unsealed=accept|refuse                objects written before the seal
 /// ```
 ///
-/// Object Lock defaults to the owner's ruling (2026-10-05, `ab-q01`): compliance mode for
-/// [`DEFAULT_RETAIN_DAYS`] days. `lock-mode` and `retain-days` override it, together; nothing turns
-/// it off. A writer over S3 needs `kms-key-id` (`S3Config::check_writer`).
-/// Credentials never appear here: the environment or the instance role supplies them.
+/// Object Lock defaults to compliance mode for [`DEFAULT_RETAIN_DAYS`] days. `lock-mode` and
+/// `retain-days` override it, together; nothing turns it off. A writer over S3 needs the seal
+/// (`seal=`) or KMS (`kms-key-id`), and may have both (`S3Config::check_writer`).
+///
+/// Credentials and keys never appear here: S3's come from the environment, a file or the instance
+/// role ([`crate::s3`]); a reader's Vault token and recovery identity from the files the
+/// environment names ([`Keys::from_env`]). The seal file holds public keys only.
 pub fn open(spec: &str, access: Access) -> Result<Archive, String> {
-    if let Some(path) = spec.strip_prefix("fs:") {
-        if path.is_empty() {
-            return Err("fs: needs a directory".into());
-        }
-        return FsStore::open(path)
-            .map(|s| Archive::new(Box::new(s)))
-            .map_err(|e| e.to_string());
+    let (_, query) = split_spec(spec)?;
+    let (options, _) = seal_options(query)?;
+    let vault = options
+        .vault
+        .as_deref()
+        .zip(options.transit_mount.as_deref());
+    open_with(spec, access, Keys::from_env(vault)?)
+}
+
+fn split_spec(spec: &str) -> Result<(&str, &str), String> {
+    if let Some(rest) = spec.strip_prefix("fs:") {
+        return Ok(rest.split_once('?').unwrap_or((rest, "")));
     }
     let Some(rest) = spec.strip_prefix("s3://") else {
         return Err(format!(
             "{spec:?}: an archive is fs:<dir> or s3://<bucket>/<prefix>?…"
         ));
     };
-    let config = parse_s3(rest)?;
-    if access == Access::Write {
-        config.check_writer()?;
-    }
-    Ok(Archive::new(Box::new(S3Store::new(
-        config,
-        CredentialSource::Default,
+    Ok(rest.split_once('?').unwrap_or((rest, "")))
+}
+
+/// [`open`], with the reader's keys given rather than taken from the environment.
+pub fn open_with(spec: &str, access: Access, keys: Keys) -> Result<Archive, String> {
+    let (path, query) = split_spec(spec)?;
+    let (options, others) = seal_options(query)?;
+    let recipients = match (&options.seal, access) {
+        (Some(p), Access::Write) => Some(Recipients::load(p)?),
+        // A reader opens; the seal file is a writer's.
+        (Some(_), Access::Read) | (None, _) => None,
+    };
+    let inner: Box<dyn ObjectStore> = if spec.starts_with("fs:") {
+        if path.is_empty() {
+            return Err("fs: needs a directory".into());
+        }
+        if !others.is_empty() {
+            return Err(format!("fs: takes the seal's options only, not {others:?}"));
+        }
+        Box::new(FsStore::open(path).map_err(|e| e.to_string())?)
+    } else {
+        let config = parse_s3(&if others.is_empty() {
+            path.to_owned()
+        } else {
+            format!("{path}?{others}")
+        })?;
+        if access == Access::Write {
+            config.check_writer(recipients.is_some())?;
+        }
+        Box::new(S3Store::new(config, CredentialSource::Default))
+    };
+    let unsealed = if options.refuse_unsealed {
+        Unsealed::Refuse
+    } else {
+        Unsealed::Accept
+    };
+    Ok(Archive::new(Box::new(Sealed::new(
+        inner, recipients, keys, unsealed,
     ))))
 }
 
-/// Parse `bucket[/prefix]?k=v&…` (the part of an `s3://` spec after the scheme).
+/// Parse `bucket[/prefix]?k=v&…` (the part of an `s3://` spec after the scheme, without the seal's
+/// options).
 pub fn parse_s3(rest: &str) -> Result<S3Config, String> {
     let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
     let (bucket, prefix) = path.split_once('/').unwrap_or((path, ""));
@@ -270,14 +396,18 @@ mod tests {
             ("aledgent-archive", "prod/core/", "us-east-2")
         );
         assert_eq!(c.lock, Some((LockMode::Compliance, 400)));
-        assert!(c.check_writer().is_ok());
+        assert!(c.check_writer(false).is_ok());
         assert!(
             open("s3://b/p?region=us-east-2", Access::Write).is_err(),
-            "no KMS key"
+            "neither the seal nor a KMS key"
         );
         let d = parse_s3("b/p?region=us-east-2&kms-key-id=alias/k").unwrap();
         assert_eq!(d.lock, Some((LockMode::Compliance, DEFAULT_RETAIN_DAYS)));
-        assert!(d.check_writer().is_ok());
+        assert_eq!(DEFAULT_RETAIN_DAYS, 180, "David, 2026-10-25");
+        assert!(d.check_writer(false).is_ok());
+        let e = parse_s3("b/p?region=us-east-2").unwrap();
+        assert!(e.check_writer(true).is_ok(), "the seal, no KMS");
+        assert!(e.check_writer(false).is_err());
         assert!(open("s3://b/p?region=us-east-2", Access::Read).is_ok());
         assert!(
             open(
