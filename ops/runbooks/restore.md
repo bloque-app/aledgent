@@ -29,6 +29,28 @@ A restored book whose report was never archived takes no command (`ERR-InitialSt
 installed again: `aledgent-core-host install-verified --config <file> --state <dir> --report <the window's
 report>`. Reads are answered meanwhile.
 
+**A book that has upgraded** (`T-037-09`; `REQ-RT-17`, `REQ-RT-3`, `AC-K7.3`): its archive is re-sent range by
+range, each range under the code version that ran it, so `aledgent-core-host restore` needs a source for every
+version the archive names. Pass `--code-config <file>` to `opsctl restore core --from`, which hands it on: the
+same code configuration the core unit's `serve` takes (a cache and its sources). Every version from the archive's
+latest checkpoint on (from genesis with `--from-genesis`), the one the checkpoint runs included, must be in the
+cache or a source; the genesis package comes from `--actor` and is never fetched. A version the host cannot have is
+refused before anything is re-sent, naming its inputs.
+
+- **How to tell that a book has upgraded:** you cannot, beforehand. `restore.done.json` exists only after a
+  restore has finished, and `opsctl` prints no summary of the archive's code versions. The signal is the
+  refusal: without `--code-config` the core host refuses an archive that needs a version other than the genesis
+  package, and a checkpoint taken after a switch. So pass `--code-config` whenever the core unit's `serve` has it,
+  which is for any book that may have upgraded (a `serve` without it refuses every upgrade). A version the host
+  already holds is not fetched, so the flag costs a book that never upgraded nothing but a valid file.
+- **The flags go together.** `--core-host` also needs `--runtime` and `--actor`, and the command needs `--config`
+  and `--state`; the complete command is in `release/total-loss-recovery.md`, step 1. `opsctl` lays the archive
+  out in `--state` before it reads `--runtime` and `--actor`, so a missing flag fails with the layout already
+  written, and so does a refusal from the core host. A retry into that directory is refused (a restore writes
+  only into an empty directory): start again from a new, empty `--state` directory.
+- **Afterwards,** check `rolled.code_map` in `restore.done.json` (in `--state`): each range's code version and
+  its rules version (`generation`), from Agent input 1 to the plan's last (`point.entries`).
+
 ## Before you start
 
 1. **Isolate.** A drill runs on a host with no network path to production. A restore runs on the
