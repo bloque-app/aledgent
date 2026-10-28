@@ -1069,3 +1069,8 @@ removed. What else changed that a transaction's metadata does not show, read off
   transaction from an unregistered device is `Invalid(BadSigner)` all three ways: it decodes and
   reaches authentication, which is all a device the runtime does not know can show. The message
   order rests on `kreivo-pin-136` and the zombienet gate on `0.18.1`.
+- **Mainnet over the light client** (`surface_probe --light` with the image's chain specs, at
+  #40 203 093): the same surface and the same six answers, so smoldot runs 136's validation (decision
+  53's failure does not occur); and with `--contract` set to the test deployment, the registration,
+  `chain_head()` and the extrinsic limit read through `ContractsApi_call`, and the next anchor's dry
+  run as the deployment's anchor key applies (`failure: None`).

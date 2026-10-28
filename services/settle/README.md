@@ -259,7 +259,9 @@ nothing else is: Kreivo `0.18.1` (spec 136, live on mainnet from 2026-10-27) mov
 `CommunitiesManager` calls it removed, and kept every extension, type and the PASS message order, so
 `kreivo-133` lists 14 since its transactions were pinned against that release's crates
 (`kreivo-pin-136`) and validated on mainnet (`fixtures/surface-136.json`). `examples/surface_probe.rs`
-prints a live runtime's surface and the format chosen for it, saves its metadata for a fixture, and
+prints a live runtime's surface and the format chosen for it (over a node's RPC or, `--light`, the
+adapter's own light client), saves its metadata for a fixture, reads a deployment's contract and
+dry-runs its next anchor (`--contract`), and
 has the runtime validate a transaction signed in that format by throwaway, unfunded keys, broadcasting
 nothing: the first thing to run when Kreivo announces an upgrade. **The `spec_version` decides nothing.** A surface the adapter
 has no format for is refused (`unknown_surface`), and so is a new Kreivo format until it is added

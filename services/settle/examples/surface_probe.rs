@@ -4,11 +4,13 @@
 //! adapter reads from a live runtime, the format it would sign in, and the runtime's own verdict
 //! on a transaction signed in it by **throwaway, unfunded keys**. Nothing is broadcast.
 //!
-//!   surface_probe <rpc-url> [metadata-out]
+//!   surface_probe (<rpc-url> | --light <kreivo-spec> <relay-spec>) [--contract <hex>] [--metadata <out>]
 //!
-//! It prints, for the runtime at the best head (`Chain::runtime`): its `spec_version`, its surface
+//! It connects as the adapter does: to a node's RPC, or (`--light`) through its own light client
+//! (`RpcChain::light`) with the chain specs the image bakes in (`deploy/templates/chain-specs/`),
+//! which is how a deployment validates by default. It prints, for the runtime at the best head (`Chain::runtime`): its `spec_version`, its surface
 //! (`transaction_version`, extensions in order, the types digest) and the surface's fingerprint,
-//! and the format `TxFormat::by_surface` chooses. With `metadata-out`, it also saves
+//! and the format `TxFormat::by_surface` chooses. With `--metadata`, it also saves
 //! `Metadata_metadata_at_version(15)`'s answer at that block, which `t_027_12_write_surface_fixtures`
 //! (`src/chain/surface.rs`) reduces to `fixtures/surface-<spec>.json`.
 //!
@@ -25,28 +27,62 @@
 //! - **a signature byte flipped**: native `BadProof`;
 //! - **signed with `transaction_version` − 1**: native `BadProof`, so the check sees the version.
 //!
+//! With `--contract` (a deployment's contract account, as instance 1), it also reads what a step
+//! reads through `ContractsApi_call` at the finalized head (the registration, the chain's head,
+//! the block's extrinsic limit) and dry-runs the deployment's next anchor as its last key, as a
+//! batch's sizing does: read only, nothing signed.
+//!
 //! Not part of the adapter.
 
 use std::sync::Arc;
 
 use settle::chain::kreivo::{self, AssetId, Call, CallLimits, Destination, Envelope, Weight};
 use settle::chain::rpc::{Names, RpcChain};
-use settle::chain::{Chain, Mortality, SignedExtrinsic, blake2_256};
+use settle::chain::{
+    AccountId32, BatchCall, BatchCallKind, Chain, Mortality, SignedExtrinsic, blake2_256,
+};
 use settle::signer::{DevEd25519, DevSigner, PassAccount, Signer};
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
-    let mut args = std::env::args().skip(1);
-    let url = args
-        .next()
-        .ok_or("usage: surface_probe <rpc-url> [metadata-out]")?;
-    let metadata_out = args.next();
+    const USAGE: &str = "usage: surface_probe (<rpc-url> | --light <kreivo-spec> <relay-spec>) \
+                         [--contract <hex>] [--metadata <out>]";
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let flag = |name: &str| {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1).cloned())
+    };
+    let metadata_out = flag("--metadata");
+    let contract: Option<AccountId32> = match flag("--contract") {
+        Some(h) => Some(
+            hex::decode(h.trim_start_matches("0x"))
+                .map_err(d)?
+                .try_into()
+                .map_err(|_| "a contract account is 32 bytes")?,
+        ),
+        None => None,
+    };
     let names = Names {
         contracts: "Contracts".into(),
         assets: "Assets".into(),
-        deployments: Vec::new(),
+        deployments: contract.map(|c| vec![(1, c)]).unwrap_or_default(),
     };
-    let chain = RpcChain::connect(&url, names, &[]).await.map_err(d)?;
+    let chain = if args.first().map(String::as_str) == Some("--light") {
+        let read = |i: usize| -> Result<String, String> {
+            std::fs::read_to_string(args.get(i).ok_or(USAGE)?).map_err(d)
+        };
+        let (kreivo_spec, relay_spec) = (read(1)?, read(2)?);
+        let chain = RpcChain::light(&kreivo_spec, Some(&relay_spec), names, &[])
+            .await
+            .map_err(d)?;
+        println!("connection      light client");
+        chain
+    } else {
+        let url = args.first().ok_or(USAGE)?;
+        println!("connection      {url}");
+        RpcChain::connect(url, names, &[]).await.map_err(d)?
+    };
     let runtime = chain.runtime().await.map_err(d)?;
     let s = &runtime.surface;
     println!(
@@ -78,6 +114,9 @@ async fn main() -> Result<(), String> {
             .map_err(d)?;
         std::fs::write(&out, bytes).map_err(d)?;
         println!("metadata        {out}");
+    }
+    if contract.is_some() {
+        read_deployment(&chain).await?;
     }
     let Some(format) = format else {
         return Ok(());
@@ -159,6 +198,43 @@ async fn main() -> Result<(), String> {
             println!("{name:<7} {case:<28} {v:?}");
         }
     }
+    Ok(())
+}
+
+/// What a step reads of instance 1's contract at the finalized head, and a dry run of its next
+/// anchor as its last key: `ContractsApi_call` on this runtime, read only.
+async fn read_deployment(chain: &RpcChain) -> Result<(), String> {
+    let fin = chain.finalized().await.map_err(d)?;
+    let instance = chain.instance(&fin, 1).await.map_err(d)?;
+    println!("\nfinalized       #{}", fin.number);
+    println!("instance 1      {instance:?}");
+    println!(
+        "chain_head      {:?}",
+        chain.chain_head(&fin, 1).await.map_err(d)?
+    );
+    println!(
+        "extrinsic_limit {:?}",
+        chain.extrinsic_limit(&fin).await.map_err(d)?
+    );
+    let Some(view) = instance else {
+        return Ok(());
+    };
+    let Some(key) = view.keys.last() else {
+        return Ok(());
+    };
+    let anchor = BatchCall {
+        reference: blake2_256(b"surface_probe/anchor"),
+        kind: BatchCallKind::Anchor {
+            number: view.last_anchor + 1,
+            commitment: [0; 32],
+        },
+    };
+    let dry = chain.dry_run(&fin, 1, &[anchor], key).await.map_err(d)?;
+    println!(
+        "dry run         anchor {} as {}: {dry:?}",
+        view.last_anchor + 1,
+        hex::encode(key)
+    );
     Ok(())
 }
 
