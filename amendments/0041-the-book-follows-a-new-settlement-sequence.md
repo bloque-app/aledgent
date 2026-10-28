@@ -5,10 +5,10 @@ SPDX-License-Identifier: CC-BY-4.0
 
 # Amendment 0041 — The book follows a new settlement sequence without a re-founding
 
-**Status:** **draft**, a proposal for the owner's ruling (asked for on 2026-10-28). Nothing here is applied to
-`SPEC.md`; the plan and the code cite it as `[PENDING AMENDMENT 0041]`. The implementation is built on top
-(`T-043-14` to `T-043-17`) so that it can merge once the owner rules; each decision below names what the build
-assumed.
+**Status:** **draft**, ruled by the owner on 2026-10-28 (form q28) except decision 2, which is still open.
+Decisions 1 and 3 to 8 are ruled as built, but for decision 6, ruled the other way (the start clears the gap
+end), and the build follows the ruling. Nothing here is applied to `SPEC.md` yet; the plan and the code cite it
+as `[PENDING AMENDMENT 0041]`. The implementation is built on top (`T-043-14` to `T-043-17`).
 **Target:** `SPEC.md` v0.4.29 as on `develop` (at `9c12b11`); amendments 0039 and 0040; `F-043`.
 **Date:** 2026-10-28
 **Number:** 0040 is the last on `develop`; no open PR or remote branch claims 0041.
@@ -123,8 +123,9 @@ were decided.
    and 1). A record in the reset's own block cannot be placed by block alone, so it counts as earlier
    (decision 5).
 5. **Otherwise the start is taken.** The sequence is recorded, and the head becomes
-   `{ height: at, next_seq: from_seq }`. If the core already holds a head at a later block than `at`, that head
-   is already the new chain's and is kept. Later heads compare against it as before, so they are compared within
+   `{ height: at, next_seq: from_seq }`, and the gap end is cleared (decision 6): every position below it was
+   the earlier sequence's. If the core already holds a head at a later block than `at`, that head is already
+   the new chain's and is kept, and so is the gap end, since a gap recorded since may be the new chain's. Later heads compare against it as before, so they are compared within
    the sequence. The head moves back only here, and only to a strictly later sequence; the store enforces both
    (`REQ-AR-4`).
 
@@ -135,8 +136,6 @@ A refusal changes no state but the audit trail. It is one audit record, a settle
 **Left as they are:**
 - **The positions' tally.** It only passes final positions, and step 4 leaves none of an earlier sequence at or
   above `from_seq`.
-- **The gap end.** A gap of an earlier sequence keeps the new sequence's positions below its end unprovable, so
-  the proof refuses rather than releases (decision 6).
 - **The index by position.** Nothing from generation 1 on reads it.
 
 ### The guard (a follow-up, `T-043-17`)
@@ -174,7 +173,8 @@ sequence (`REQ-SL-1`); one book's record MAY run over several sequences".
 > report an entry of the new sequence until aledgent has taken the start in. Before it reports the start, the
 > adapter MUST have shown the earlier sequence complete up to the start (`REQ-SA-7`); otherwise it MUST raise an
 > alert and report neither. aledgent MUST take the start as its finalised point and compare every later point
-> within the new sequence. aledgent MUST refuse the start, as an incident (`REQ-AT-1`), if it names another
+> within the new sequence; a gap of an earlier sequence MUST NOT make a position of the new one unprovable.
+> aledgent MUST refuse the start, as an incident (`REQ-AT-1`), if it names another
 > book, while any external leg it instructed is not yet decided, or while it holds a final record of an earlier
 > sequence at a position the new sequence reuses. A refused start MUST change nothing else, and the adapter MUST
 > raise an alert an operator sees. *Amendment 0041.*
@@ -233,29 +233,33 @@ sequence (`REQ-SL-1`); one book's record MAY run over several sequences".
 
 ## Decisions for the owner
 
-1. **The generation.** *Built:* `SETTLEMENT_EPOCHS = CHAINED_SETTLEMENT = 1`, so test needs one core upgrade,
+1. **The generation.** *Ruled as built (q28).* `SETTLEMENT_EPOCHS = CHAINED_SETTLEMENT = 1`, so test needs one core upgrade,
    0 to 1, the same one `T-043-06` to `T-043-08` need. *Alternative:* a new generation 2, which costs a second
    in-place upgrade (1 to 2) on each book. Generation 1 is safe only because no book has decided an input at
    generation 1 yet (fact 8). Once one has, the rule needs 2. So no generation-1 package may be built or
    applied before `T-043-14` and `T-043-17` are both on `develop`.
-2. **Instructions in flight at a start.** *Built:* the start is refused while any instruction is not yet
+2. **Instructions in flight at a start.** **Open** (q28 did not settle it). *Built:* the start is refused while any instruction is not yet
    decided. Such an instruction then cannot be decided by proof, so the operator resolves it through review
    with evidence (`REQ-RC-5`) before the start can be taken. *Alternative:* take the start and move each such
    operation to `Needs-Review`, with a mark that keeps `proof` from reading the new sequence for it. That needs
    a per-instruction leaf and a bound on how many move at once. None is in flight on either deployment today.
-3. **A book that has settled in the earlier sequence.** *Built:* refused (the trade-off above). *Alternative:*
+3. **A book that has settled in the earlier sequence.** *Ruled as built (q28):* refused (the trade-off above). *Alternative:*
    key positions by sequence (rejected alternatives), so that any start can be taken.
-4. **The book's name.** *Built:* the start's `book` must equal the book's chainspec digest. This rules amendment
+4. **The book's name.** *Ruled as built (q28):* the start's `book` must equal the book's chainspec digest. This rules amendment
    0039's q1 for the chainspec digest; a book founded without a chainspec is always refused. *Alternative:*
    the genesis roots, which would change what governance passes to `set_anchor_head`.
-5. **A final record in the reset's own block.** *Built:* counted as the earlier sequence's (refused).
+5. **A final record in the reset's own block.** *Ruled as built (q28):* counted as the earlier sequence's (refused).
    *Alternative:* the adapter tells the core which entries of that block follow the reset event. That needs one
    more field in the input.
-6. **The gap end across a start.** *Built:* kept. This is cautious: a withdrawal whose range starts below an
-   earlier sequence's gap goes to review, not to release. *Alternative:* the start clears it.
-7. **The guard's error.** *Built:* `ERR-SettlementLayerUnavailable`, with its meaning extended. *Alternative:*
+6. **The gap end across a start.** *Ruled (q28): the start clears it*, rather than keeping it (the proposal's
+   cautious option, under which a withdrawal whose range starts below an earlier sequence's gap went to review).
+   Read as: a start that restarts the head clears the gap end; one that keeps a head at a later block keeps it,
+   because that head, and a gap recorded since, may be the new sequence's. Clearing is safe because a start is
+   refused while any instruction is live (decision 2), so `proof` has nothing of the earlier sequence left to
+   decide.
+7. **The guard's error.** *Ruled as built (q28):* `ERR-SettlementLayerUnavailable`, with its meaning extended. *Alternative:*
    a new error condition.
-8. **Who reads the head route.** *Built:* the operator's principals, read-only, with no justification, like
+8. **Who reads the head route.** *Ruled as built (q28):* the operator's principals, read-only, with no justification, like
    `GET /v1/ops/anchors`. *Alternative:* the ops token only.
 
 ## Plan and code
