@@ -273,6 +273,10 @@ pub struct Ledger<S: LeafStore, V: VaultBackend> {
     /// The code generation in force before the current input, and whether its calls are decided
     /// by the next one ([`Ledger::set_generation`]). Not service state.
     generation: (u64, bool),
+    /// Whether the current input, unless it is a way out, switches the writer to
+    /// [`crate::settlement::CHAINED_SETTLEMENT`]: the book's incidents and gaps then move to the
+    /// audit trail at its end ([`Ledger::switch_settlement`], `T-043-08`). Not service state.
+    switching: bool,
 }
 
 fn policy_used(p: &Principal) -> AuthorityUsed {
@@ -397,6 +401,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             calls_in_input: (0, 0),
             writer: crate::code::authority::Position::default(),
             generation: (0, false),
+            switching: false,
         };
         if let Some(sp) = spec {
             ledger.build_genesis_state(&founded, &sp)?;
@@ -451,6 +456,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             calls_in_input: (0, 0),
             writer: crate::code::authority::Position::default(),
             generation: (0, false),
+            switching: false,
         }
     }
 
@@ -489,6 +495,8 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
     /// replay from the code map. A ledger never told decides as generation 0.
     pub fn set_generation(&mut self, in_force: u64, next: bool) {
         self.generation = (in_force, next);
+        let c = crate::settlement::CHAINED_SETTLEMENT;
+        self.switching = next && in_force < c && c <= in_force.saturating_add(1);
     }
 
     /// The code generation that decides the commands that follow ([`Ledger::set_generation`]).

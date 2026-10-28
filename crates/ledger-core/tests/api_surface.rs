@@ -238,6 +238,14 @@ const SURFACE: &[(&str, &str)] = &[
         "set_generation",
         "sets the code generation that decides the commands that follow (T-043-06)",
     ),
+    // F-043, T-043-08: the move of a running book's incidents and gaps to the audit trail, at the
+    // end of the input that switches the writer to the chained generation. Not a command: the
+    // writer calls it once per input (the Agent, the replica, a replay), and it moves nothing at
+    // any other input.
+    (
+        "switch_settlement",
+        "moves the book's incidents and gaps to the audit trail at the switch (T-043-08)",
+    ),
     (
         "take_way_out",
         "takes the way out of a scheduled upgrade the last commands took (T-037-15)",

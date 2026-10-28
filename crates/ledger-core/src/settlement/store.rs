@@ -139,6 +139,12 @@ pub enum SettlementWrite {
     Head(FinalisedHead),
     /// Record a skipped range.
     Gap(Gap),
+    /// Empty the gaps leaf (`T-043-08`): the gaps moved to the gap end and the audit trail in the
+    /// same batch, at the switch to [`super::CHAINED_SETTLEMENT`].
+    DropGaps,
+    /// Take the first this many incidents out of the incidents leaf (`T-043-08`): moved to the
+    /// audit trail in the same batch. Refused if the leaf holds fewer.
+    DropIncidents(u32),
     /// Raise the end of the highest gap to at least this position (`T-043-07`): the one number
     /// the book keeps for gaps from [`super::CHAINED_SETTLEMENT`] on, each gap itself going to
     /// the audit trail. It never goes down.
@@ -226,6 +232,8 @@ pub(crate) enum SettlementUndo {
     Head(Option<FinalisedHead>),
     PopGap,
     GapEnd(u64),
+    Gaps(Vec<Gap>),
+    Incidents(Vec<Incident>),
     PopIncident,
     PopRescanned((u8, Coordinate)),
     Status(Option<AdapterStatus>),
@@ -393,6 +401,12 @@ impl SettlementStore {
             }
             SettlementUndo::GapEnd(before) => {
                 self.gap_end.set(before);
+            }
+            SettlementUndo::Gaps(gaps) => {
+                self.gaps.set(gaps);
+            }
+            SettlementUndo::Incidents(incidents) => {
+                self.incidents.set(incidents);
             }
             SettlementUndo::PopIncident => {
                 self.incidents.get_mut().pop();
@@ -626,6 +640,15 @@ impl SettlementStore {
                 }
                 self.gaps.get_mut().push(*g);
                 Ok(SettlementUndo::PopGap)
+            }
+            SettlementWrite::DropGaps => Ok(SettlementUndo::Gaps(self.gaps.set(Vec::new()))),
+            SettlementWrite::DropIncidents(n) => {
+                let n = *n as usize;
+                if n > self.incidents.get().len() {
+                    return Err(SettlementRefusal::Missing);
+                }
+                let rest = self.incidents.get()[n..].to_vec();
+                Ok(SettlementUndo::Incidents(self.incidents.set(rest)))
             }
             SettlementWrite::GapEnd(to) => {
                 let before = *self.gap_end.get();

@@ -327,7 +327,7 @@ fn t043_06_the_chained_generation_refuses_a_rescan() {
         1,
         "generation 0 indexes an ingested record by position"
     );
-    let incidents = fx.replica.state().settlement().incidents().len();
+    let incidents = recorded_incidents(&fx);
 
     assert_eq!(upgrade(&mut fx), CHAINED_SETTLEMENT);
     let committed_before = fx.archive.len();
@@ -344,7 +344,7 @@ fn t043_06_the_chained_generation_refuses_a_rescan() {
     // The input is the Agent's too: committed, its call refused there as here.
     assert_eq!(fx.archive.len(), committed_before + 1);
     assert_eq!(
-        fx.replica.state().settlement().incidents().len(),
+        recorded_incidents(&fx),
         incidents,
         "a refused re-scan records nothing"
     );
@@ -508,4 +508,142 @@ fn t043_07_generation_0_reads_no_leaf_the_code_before_did_not_know() {
         !seen.contains(&ledger_core::leaves::kind::GAP_END),
         "a generation-0 input read the gap end"
     );
+}
+
+/// The writer state an input leaves, as the code-history gate compares it (D18).
+fn decided(port: &mut NativePort) -> (u64, [u8; 32], core_binding::envelope::Roots, [u8; 32], u64) {
+    let h = port.hot().unwrap().expect("founded");
+    (h.inputs, h.log_head, h.roots(), h.code, h.generation)
+}
+
+/// `T-043-08`, `NFR-22`, `REQ-RT-17`, amendment 0040 a40b-existing-books: a book that recorded
+/// incidents and gaps in the old layout (the inputs of the generation-0 fixture, an `Unusable`,
+/// an `Unassociated`, three re-scan differences and a gap) upgrades in place to the chained
+/// generation. At the switch input each incident is an audit record, in the order the book
+/// held them, carrying the justification that says it was moved; the gap end is the gap's; and
+/// the gaps and incidents leaves are gone from the book's state. The Agent and the replica agree,
+/// and the whole history replays from genesis.
+#[test]
+fn t043_08_a_book_with_incidents_and_gaps_upgrades_in_place() {
+    use ledger_core::audit::{AuditAction, AuditClass};
+    let mut fx = Fx::native();
+    let who = settlement(&mut fx);
+    settlement_inputs(&mut fx, who);
+    let held: Vec<ledger_core::settlement::Incident> =
+        fx.replica.state().settlement().incidents().to_vec();
+    assert_eq!(held.len(), 6, "{held:?}");
+    assert_eq!(fx.replica.state().settlement().gaps().len(), 1);
+    let emitted = fx.replica.state().audit().emitted();
+    assert_eq!(upgrade(&mut fx), CHAINED_SETTLEMENT);
+    let state = fx.replica.state();
+    assert!(state.settlement().incidents().is_empty());
+    assert!(state.settlement().gaps().is_empty());
+    assert_eq!(state.settlement().gap_end(), 9);
+    let moved: Vec<_> = state
+        .audit()
+        .outbox()
+        .filter(|r| r.audit_seq >= emitted && r.class == AuditClass::SettlementIncident)
+        .collect();
+    assert_eq!(
+        moved
+            .iter()
+            .map(|r| match r.action {
+                AuditAction::Incident(i) => i,
+                other => panic!("{other:?}"),
+            })
+            .collect::<Vec<_>>(),
+        held
+    );
+    for r in &moved {
+        assert_eq!(
+            r.justification.as_ref().map(|j| j.as_bytes()),
+            Some(ledger_core::audit::MOVED_TO_AUDIT)
+        );
+    }
+    // The upgrade's own record and the switch input's come before; nothing else moved.
+    let map = claimed_code_map(&mut NativePort::new(), &founding_of(&fx), &fx.archive).unwrap();
+    assert_eq!(map.ranges.len(), 2);
+    let mut port = NativePort::new();
+    port.code_map = map.versions();
+    let (_, rolled) =
+        roll_forward_agent(port, &founding_of(&fx), &fx.archive, &ReplicaStores::Memory)
+            .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(rolled.log_head, fx.archive.last().unwrap().log_hash());
+    // After the switch, a gap is the audit trail's and raises the gap end.
+    adapter(
+        &mut fx,
+        who,
+        AdapterInput::Gap(Gap {
+            from: 9,
+            to: 12,
+            reason: GapReason::Unreadable,
+        }),
+    )
+    .unwrap();
+    assert_eq!(fx.replica.state().settlement().gap_end(), 12);
+    assert!(fx.replica.state().settlement().gaps().is_empty());
+}
+
+/// `T-043-08`, D18: a way out at the switch input decides the same under either generation and
+/// moves nothing, even in a book that holds incidents and gaps; the writer stays at generation
+/// 0, and the move happens at the ordinary input the upgrade is rescheduled to.
+#[test]
+fn t043_08_a_way_out_at_the_switch_moves_nothing() {
+    let mut fx = Fx::native();
+    let who = settlement(&mut fx);
+    settlement_inputs(&mut fx, who);
+    let source = HeldCode::default();
+    let h = source.version(1);
+    let checked = core_binding::staging::fetch(&source, &h, 0).unwrap();
+    fx.driver.port_mut().stage_code(checked).unwrap();
+    let n = fx.driver.seq() + 2;
+    let c = fx.ctx(fx.operator());
+    fx.replica.upgrade(&c, h, n, b"f043: scheduled").unwrap();
+    fx.synced();
+    // Input n: a reschedule to n + 2, a way out.
+    let c = fx.ctx(fx.operator());
+    fx.replica
+        .reschedule_upgrade(&c, n + 2, b"f043: later")
+        .unwrap();
+    fx.synced();
+    assert_eq!(fx.archive.last().unwrap().seq, n);
+    assert_eq!(fx.driver.writer().generation, 0);
+    assert_eq!(fx.replica.state().settlement().incidents().len(), 6);
+    // D18: input n decided by generation 0 and by generation 1 leaves the same writer.
+    let f = founding_of(&fx);
+    let i = (n - 1) as usize;
+    let map = claimed_code_map(&mut NativePort::new(), &f, &fx.archive).unwrap();
+    let holding = || {
+        let mut p = NativePort::new();
+        p.code_map = map.versions();
+        p
+    };
+    let (mut old, _) =
+        roll_forward_agent(holding(), &f, &fx.archive[..=i], &ReplicaStores::Memory).unwrap();
+    let (mut before, _) =
+        roll_forward_agent(holding(), &f, &fx.archive[..i], &ReplicaStores::Memory).unwrap();
+    before.code_map.clear();
+    before.generation = 1;
+    let (mut new, _) =
+        roll_forward_agent(before, &f, &fx.archive[..=i], &ReplicaStores::Memory).unwrap();
+    assert_eq!(decided(&mut old), decided(&mut new));
+    // n + 1 under generation 0; n + 2, ordinary, takes the switch and the move.
+    let _ = fx.person();
+    assert_eq!(fx.replica.state().settlement().incidents().len(), 6);
+    let _ = fx.person();
+    assert_eq!(fx.driver.writer().generation, CHAINED_SETTLEMENT);
+    assert!(fx.replica.state().settlement().incidents().is_empty());
+    assert_eq!(fx.replica.state().settlement().gap_end(), 9);
+}
+
+/// How many settlement incidents the book has recorded: in its incidents leaf, and on the audit
+/// trail (from the chained generation on, and those the switch moved there, `T-043-08`).
+fn recorded_incidents<P: core_binding::host::AgentPort>(fx: &Fx<P>) -> usize {
+    let state = fx.replica.state();
+    state.settlement().incidents().len()
+        + state
+            .audit()
+            .outbox()
+            .filter(|r| r.class == ledger_core::audit::AuditClass::SettlementIncident)
+            .count()
 }

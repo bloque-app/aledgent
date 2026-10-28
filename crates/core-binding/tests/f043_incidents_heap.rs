@@ -128,14 +128,27 @@ fn incidents(n: u64, chained: bool) -> Vec<usize> {
     let _one = ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut fx = Fx::new(
+    let mut fx = modelled();
+    let (adapter, source) = configure(&mut fx);
+    if chained {
+        upgrade(&mut fx);
+    }
+    record_incidents(&mut fx, adapter, source, n, chained)
+}
+
+/// A book on the modelled port.
+fn modelled() -> Fx<Modelled> {
+    Fx::new(
         Modelled {
             inner: NativePort::new(),
             arenas: Vec::new(),
         },
         Limits::DEFAULT,
-    );
-    // The adapter, its configuration and support.
+    )
+}
+
+/// The adapter, its configuration and its support.
+fn configure(fx: &mut Fx<Modelled>) -> (Caller, SourceId) {
     let ctx = fx.ctx(fx.operator());
     let o = fx
         .replica
@@ -175,10 +188,12 @@ fn incidents(n: u64, chained: bool) -> Vec<usize> {
         )
         .unwrap();
     fx.synced();
-    // The upgrade, in place, to the chained generation.
-    if !chained {
-        return record_incidents(&mut fx, adapter, source, n, false);
-    }
+    (adapter, source)
+}
+
+/// The upgrade, in place, to the chained generation: scheduled two inputs on, taken at the input
+/// after (the switch input, the last invocation).
+fn upgrade(fx: &mut Fx<Modelled>) {
     let held = HeldCode::default();
     let h = held.version(1);
     let checked = core_binding::staging::fetch(&held, &h, 0).unwrap();
@@ -191,7 +206,6 @@ fn incidents(n: u64, chained: bool) -> Vec<usize> {
     fx.synced();
     let _ = fx.person();
     assert_eq!(fx.driver.writer().generation, CHAINED_SETTLEMENT);
-    record_incidents(&mut fx, adapter, source, n, true)
 }
 
 fn record_incidents(
@@ -265,4 +279,73 @@ fn record_incidents(
         assert_eq!(store.incidents().len() as u64, n);
     }
     arenas
+}
+
+/// `T-043-08`, `REQ-RT-1`: a book that holds `ALEDGENT_SWITCH_INCIDENTS` incidents in the old
+/// layout (default 450: near the most an old book held before the guest could no longer record
+/// the next, the 528 at which a canary halted) moves them to the audit trail
+/// [`MOVE_PER_INPUT`] at a time, from the switch input and then at each adapter input, every
+/// one of those inputs within the guest's arena; until the leaf is empty, and then reading it
+/// costs an adapter input nothing more.
+#[test]
+fn t043_08_the_move_fits_the_arena_input_by_input() {
+    let n = env("ALEDGENT_SWITCH_INCIDENTS", 450);
+    let _one = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut fx = modelled();
+    let (adapter, source) = configure(&mut fx);
+    record_incidents(&mut fx, adapter, source, n, false);
+    assert_eq!(fx.replica.state().settlement().incidents().len() as u64, n);
+    let before_move = *fx.driver.port().arenas.last().unwrap();
+    let emitted = fx.replica.state().audit().emitted();
+    upgrade(&mut fx);
+    let mut arenas = vec![*fx.driver.port().arenas.last().unwrap()];
+    let mut inputs = 0;
+    while !fx.replica.state().settlement().incidents().is_empty() {
+        let ctx = fx.ctx(adapter);
+        fx.replica
+            .adapter(
+                &ctx,
+                AdapterInput::Head {
+                    head: ledger_core::settlement::FinalisedHead {
+                        height: 1,
+                        next_seq: 0,
+                    },
+                    nonces: Vec::new(),
+                },
+            )
+            .unwrap();
+        fx.synced();
+        arenas.push(*fx.driver.port().arenas.last().unwrap());
+        inputs += 1;
+        assert!(inputs <= n, "the move does not end");
+    }
+    let per = ledger_core::ledger::settlement::MOVE_PER_INPUT as u64;
+    assert_eq!(inputs, n.saturating_sub(per).div_ceil(per));
+    let moved = fx
+        .replica
+        .state()
+        .audit()
+        .outbox()
+        .filter(|r| r.audit_seq >= emitted && r.class == AuditClass::SettlementIncident)
+        .count() as u64;
+    assert_eq!(moved, n, "every incident on the audit trail");
+    let peak = *arenas.iter().max().unwrap();
+    println!(
+        "moving {n} incidents, {per} an input: the switch input {} B, then {inputs} adapter \
+         inputs, the largest {peak} B (the last old-layout incident took {before_move} B)",
+        arenas[0]
+    );
+    assert!(
+        peak <= GUEST_HEAP - RUNTIME_MARGIN,
+        "an input of the move takes {peak} B of the guest's arena"
+    );
+    // No input of the move costs more than recording one more incident in the old layout did:
+    // a book that could still take an input before the upgrade can take each of these.
+    assert!(
+        peak < before_move,
+        "an input of the move ({peak} B) costs more than the book's last old-layout incident \
+         ({before_move} B)"
+    );
 }

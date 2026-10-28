@@ -48,7 +48,7 @@ use crate::state::Command;
 pub mod emit;
 pub mod trail;
 
-pub use emit::{AuditLog, AuditNote, IncidentNote};
+pub use emit::{AuditLog, AuditNote, IncidentNote, MOVED_TO_AUDIT};
 pub use trail::{AuditQuery, AuditSink, AuditTrail, SinkError, TrailError};
 
 /// Domain of the record hash.

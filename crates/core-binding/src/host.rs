@@ -1622,6 +1622,17 @@ impl<P: AgentPort> Driver<P> {
         deliveries: Vec<([u8; 32], Time)>,
     ) -> Result<Option<u64>, DriveError> {
         let recorded: Vec<Recorded> = replica.take_calls();
+        // The switch to the chained generation moves the book's incidents and gaps to the audit
+        // trail at the end of the input that takes it, as the Agent does (`T-043-08`): before the
+        // input's keys and leaves are taken, so its witness holds what the move reads.
+        if !(recorded.is_empty() && deliveries.is_empty())
+            && !crate::fence::way_out_input(recorded.iter().map(|r| &r.call), deliveries.len())
+                .unwrap_or(false)
+        {
+            replica.switch_settlement().map_err(|e| {
+                DriveError::Replica(format!("the switch's move to the audit trail: {e:?}"))
+            })?;
+        }
         let keys = replica.book().store().take_keys();
         let before = replica.book().vault_backend_take();
         let touched = Touches::take(replica, &deliveries);
@@ -2303,6 +2314,16 @@ fn replay_with(
         let _ = replica.take_calls();
         // An archived input was taken whole: a way-out input is one call and no delivery.
         let way_out = crate::fence::way_out_input(&e.calls, e.deliveries.len()).unwrap_or(false);
+        // The switch to the chained generation, at the end of the input that takes it
+        // (`T-043-08`, [`Driver::stage`]).
+        if !way_out {
+            replica.switch_settlement().map_err(|why| {
+                DriveError::Diverged(format!(
+                    "replay: input {}: the switch's move: {why:?}",
+                    e.seq
+                ))
+            })?;
+        }
         let (taken, scheduled) = (replica.take_way_out(), replica.take_upgrade());
         crate::fence::decide(&mut writer, e.seq, way_out, taken, scheduled);
         let touched = Touches::take(&replica, &e.deliveries);
