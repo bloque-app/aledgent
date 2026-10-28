@@ -5,9 +5,9 @@ SPDX-License-Identifier: CC-BY-4.0
 
 # Amendment 0041 — The book follows a new settlement sequence without a re-founding
 
-**Status:** **draft**, ruled by the owner on 2026-10-28 (form q28) except decision 2, which is still open.
-Decisions 1 and 3 to 8 are ruled as built, but for decision 6, ruled the other way (the start clears the gap
-end), and the build follows the ruling. Nothing here is applied to `SPEC.md` yet; the plan and the code cite it
+**Status:** **draft**, ruled by the owner on 2026-10-28 (form q28, and decision 2 the same day). Every
+decision is ruled as built but decision 6, ruled the other way (the start clears the gap end), and the build
+follows the ruling. Nothing here is applied to `SPEC.md` yet; the plan and the code cite it
 as `[PENDING AMENDMENT 0041]`. The implementation is built on top (`T-043-14` to `T-043-17`).
 **Target:** `SPEC.md` v0.4.29 as on `develop` (at `9c12b11`); amendments 0039 and 0040; `F-043`.
 **Date:** 2026-10-28
@@ -18,7 +18,9 @@ Amendment 0040's rule "a reset comes only with a book re-founding" is withdrawn.
 `SPEC.md` changes, and no error condition is added.
 **Rationale in one line:** the settlement layer can start a new sequence of its record under a book that keeps
 running, and today the book keeps the old sequence's head and silently drops every head of the new one, so
-withdrawals created meanwhile are born expired.
+withdrawals created meanwhile are born expired. A contract reset belongs to a re-founding and its maintenance
+window, never to routine maintenance: if one finds anything in flight, the core refuses it and pages (`epoch:`),
+and that is the signal that a re-founding window is needed.
 
 ---
 
@@ -238,7 +240,7 @@ sequence (`REQ-SL-1`); one book's record MAY run over several sequences".
    in-place upgrade (1 to 2) on each book. Generation 1 is safe only because no book has decided an input at
    generation 1 yet (fact 8). Once one has, the rule needs 2. So no generation-1 package may be built or
    applied before `T-043-14` and `T-043-17` are both on `develop`.
-2. **Instructions in flight at a start.** **Open** (q28 did not settle it). *Built:* the start is refused while any instruction is not yet
+2. **Instructions in flight at a start.** *Ruled as built (Pablo, 28 Oct):* the start is refused while any instruction is not yet
    decided. Such an instruction then cannot be decided by proof, so the operator resolves it through review
    with evidence (`REQ-RC-5`) before the start can be taken. *Alternative:* take the start and move each such
    operation to `Needs-Review`, with a mark that keeps `proof` from reading the new sequence for it. That needs
