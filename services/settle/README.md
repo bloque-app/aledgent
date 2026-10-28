@@ -174,7 +174,10 @@ the new chain is reported, the start being asked again every ten minutes; or it 
 (`epoch-unsupported:`, a core before the amendment's generation). A reset for another book, or one with
 entries of the chain before it left unreported, raises `reset:<instance>`, and from then on nothing reaches
 the book it serves; once the adapter is pointed at the re-founded book, `aledgent-settle settle.json
-refound` resets its cursor and accepted head, and the next run starts on the new chain.
+refound` resets its cursor and accepted head, and the next run starts on the new chain. Reporting a reset is behind `adapter.report_resets`, **off by default**: turn it on only once the
+core runs a build with `T-043-14` at `SETTLEMENT_EPOCHS`. A core host built before it cannot decode the
+input and refuses the whole feed it arrives in, so the book's inputs would wait behind it. Off, a reset
+behaves as before amendment 0041.
 
 **There is no periodic re-scan** (`T-043-05`): nothing re-reads a range on a timer.
 `adapter.rescan_every` and `adapter.rescan_window`, in a file that still sets them, are accepted

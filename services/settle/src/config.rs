@@ -156,6 +156,14 @@ pub struct AdapterConfig {
     /// unsigned before it ends as never signed. 0 is taken as 1.
     #[serde(default = "default_not_now_alert_after")]
     pub not_now_alert_after: u32,
+    /// Whether the adapter reports a reset of its instance (a new settlement sequence) to the core
+    /// (amendment 0041, `T-043-15`). **Off by default**, and turned on only once the core runs a
+    /// build that knows the input (`T-043-14`) at `SETTLEMENT_EPOCHS`: a core host built before it
+    /// cannot decode the input, refuses the whole feed it arrives in, and the book's inputs wait
+    /// behind it. Off, a reset behaves as before amendment 0041 (`reset:` until `refound`; a first
+    /// start moves to the new chain without telling the core).
+    #[serde(default)]
+    pub report_resets: bool,
 }
 
 /// [`ProcessConfig::wake_poll`]'s default, in milliseconds.

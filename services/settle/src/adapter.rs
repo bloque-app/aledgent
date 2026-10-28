@@ -3079,7 +3079,9 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
         let now = self.now();
         if self.refounding().await? {
             // A reset the core may still follow (amendment 0041): reported again when due.
-            self.retry_epoch(fin).await?;
+            if self.config.report_resets {
+                self.retry_epoch(fin).await?;
+            }
             return Ok(None);
         }
         let Some(head) = self.chain.chain_head(fin, instance).await? else {
@@ -3125,7 +3127,7 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             Err(Stop::Reset(block, dropped)) => {
                 // Amendment 0041: a reset with nothing of the chain before it left unreported is
                 // reported to the core, and followed once the core holds it.
-                if dropped == 0 && self.follow_reset(fin).await? {
+                if dropped == 0 && self.config.report_resets && self.follow_reset(fin).await? {
                     return Ok(None);
                 }
                 self.stopped(from, &head, Stop::Reset(block, dropped))
@@ -3150,7 +3152,7 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             return Ok((0, 0, false));
         };
         // Amendment 0041: nothing of a new chain goes to a core that refused to follow it.
-        if !self.epoch_followed(fin).await? {
+        if self.config.report_resets && !self.epoch_followed(fin).await? {
             return Ok((0, 0, false));
         }
         let verified = self.store.verified_head(instance).await?;

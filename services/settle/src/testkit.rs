@@ -100,6 +100,8 @@ pub struct KitOptions {
     /// Whether the book is founded on a chainspec (an empty seed), so it has a genesis digest a
     /// settlement sequence can name ([`Kit::book`]); otherwise it has none.
     pub named_book: bool,
+    /// [`AdapterConfig::report_resets`].
+    pub report_resets: bool,
 }
 
 impl Default for KitOptions {
@@ -119,6 +121,7 @@ impl Default for KitOptions {
             native_accounts: false,
             core_generation: 0,
             named_book: false,
+            report_resets: false,
         }
     }
 }
@@ -172,6 +175,7 @@ pub fn adapter_config(genesis: [u8; 32]) -> AdapterConfig {
         batch_gas_cap: None,
         batch_gas_margin_percent: crate::config::default_batch_gas_margin_percent(),
         not_now_alert_after: crate::config::default_not_now_alert_after(),
+        report_resets: false,
     }
 }
 
@@ -245,6 +249,7 @@ impl Kit {
         let mut config = adapter_config(FakeConfig::default().genesis);
         config.batch_gas_cap = options.batch_gas_cap;
         config.batch_gas_margin_percent = options.batch_gas_margin_percent;
+        config.report_resets = options.report_resets;
         let store = MemStore::new();
         let mut adapter = Adapter::new(
             config.clone(),

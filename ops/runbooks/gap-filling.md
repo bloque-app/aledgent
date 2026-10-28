@@ -84,7 +84,8 @@ Incidents and gaps are written to the audit trail (`NFR-6`, `REQ-AT-1`), not to 
 ## After a reset
 
 A reset of the instance starts a new sequence of its record (`anchor_epoch()`: its number, the block, and
-the book it names). The adapter reports it to the core (amendment 0041): live, when it reads the reset
+the book it names). With `adapter.report_resets` on (off by default; on only once the core runs a build
+that knows the input, see the settle README), the adapter reports it to the core (amendment 0041): live, when it reads the reset
 past the head it verified and nothing of the chain before it was left unreported; and once per sequence,
 when it moved to the new chain on its own at a first start. The core's answer is kept in the adapter's
 store (`settle/epoch/<instance>`):
@@ -121,6 +122,9 @@ store (`settle/epoch/<instance>`):
   start the adapter goes on, and the core's head stays where it was, so its withdrawals are refused or born
   expired: upgrade the core (the release order is the core first, then the adapter). On a live reset the
   adapter also stops (`reset:`) until the upgrade; it then goes on by itself.
+
+With `report_resets` off, every reset under a running adapter is `reset:<instance>`, as before: follow
+"Another book's reset" above.
 
 A reset the owner did not announce is not re-founded: the adapter stays stopped for the book, and the
 case goes to security ([divergence](release/divergence.md)).

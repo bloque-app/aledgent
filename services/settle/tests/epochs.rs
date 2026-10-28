@@ -17,6 +17,7 @@ async fn kit(generation: u64) -> Kit {
     let mut k = Kit::start_with(KitOptions {
         named_book: true,
         core_generation: generation,
+        report_resets: true,
         ..KitOptions::default()
     })
     .await;
@@ -207,6 +208,32 @@ async fn t043_15_a_core_upgraded_later_follows_the_reset() {
     assert_eq!(core_amounts(&k), vec![3]);
 }
 
+/// `report_resets` off (the default, until the core runs a build that knows the input): nothing
+/// is reported, and a live reset stops the adapter as before amendment 0041, even for a core that
+/// would follow it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t043_15_off_by_default_nothing_is_reported() {
+    let mut k = Kit::start_with(KitOptions {
+        named_book: true,
+        core_generation: SETTLEMENT_EPOCHS,
+        ..KitOptions::default()
+    })
+    .await;
+    assert!(!k.adapter.config().report_resets);
+    assert!(k.step().await.unwrap().serving);
+    k.chain.advance(1);
+    k.step().await.unwrap();
+    k.chain.reset_for(INSTANCE, 0, k.book());
+    k.chain.advance(1);
+    k.step().await.unwrap();
+    k.d.clock.advance(EPOCH_RETRY);
+    k.chain.advance(1);
+    k.step().await.unwrap();
+    assert_eq!(sent(&k, "epoch").await, 0);
+    assert_eq!(open(&k, &format!("reset:{INSTANCE}")).await, 1);
+    assert_eq!(k.core_settlement(|s| s.epoch()).unwrap(), None);
+}
+
 /// A reset that names another book: the core refuses it, and the adapter stops until `refound`
 /// (the book was re-founded), with no `epoch:` alert.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -258,6 +285,7 @@ async fn t043_15_a_first_start_reports_the_sequence_once() {
     let mut k = Kit::start_with(KitOptions {
         named_book: true,
         anchoring: true,
+        report_resets: true,
         ..KitOptions::default()
     })
     .await;
