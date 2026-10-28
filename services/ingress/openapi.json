@@ -5085,8 +5085,7 @@
         ]
       },
       "SettlementHeadBody": {
-        "additionalProperties": false,
-        "description": "Where the book stands on the settlement layer's record (amendment 0041, `T-043-16`):\n`GET /v1/ops/settlement/head`.",
+        "description": "Where the book stands on the settlement layer's record (amendment 0041, `T-043-16`):\n`GET /v1/ops/settlement/head`. Unknown fields are not refused: a field a later core adds (as\n`reported`, `T-043-17`) still reads where ingress is older than the core.",
         "properties": {
           "epoch": {
             "anyOf": [

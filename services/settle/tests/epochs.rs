@@ -857,4 +857,28 @@ async fn t043_16_the_head_route_shows_the_sequence() {
     let (status, v) = read(&k, settle::testkit::ADAPTER_TOKEN).await;
     assert!(!status.is_success(), "{status} {v}");
     assert_eq!(v["error"], "ERR-NotAuthorised");
+    // A customer is refused; a principal holding the anchoring authority reads it (decision 8, as
+    // `GET /v1/ops/anchors`).
+    let alice = k.d.party("alice", 0).await;
+    let (status, v) = read(&k, &alice.token).await;
+    assert_eq!(status.as_u16(), 403, "{v}");
+    assert_eq!(v["error"], "ERR-NotAuthorised");
+    let auditor = k.d.party("auditor", 0).await;
+    let (status, v) =
+        k.d.call(
+            "POST",
+            "/v1/ops/operator-grants",
+            Some(&op),
+            &[("client-key", "t043-16-auditor")],
+            Some(serde_json::json!({
+                "principal": auditor.identity,
+                "kinds": ["anchor_checkpoint"],
+                "justification": "the auditor anchors on request",
+            })),
+        )
+        .await;
+    assert!(status.is_success(), "{status} {v}");
+    let (status, v) = read(&k, &auditor.token).await;
+    assert!(status.is_success(), "{status} {v}");
+    assert_eq!(v["epoch"]["epoch"], 1);
 }

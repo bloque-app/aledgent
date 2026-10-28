@@ -598,9 +598,9 @@ pub struct EpochBody {
 }
 
 /// Where the book stands on the settlement layer's record (amendment 0041, `T-043-16`):
-/// `GET /v1/ops/settlement/head`.
+/// `GET /v1/ops/settlement/head`. Unknown fields are not refused: a field a later core adds (as
+/// `reported`, `T-043-17`) still reads where ingress is older than the core.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct SettlementHeadBody {
     /// The instance the book settles on, once configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
