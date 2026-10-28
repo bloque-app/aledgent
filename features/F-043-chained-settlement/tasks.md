@@ -7,8 +7,8 @@ SPDX-License-Identifier: CC-BY-4.0
 
 **In progress** (amendment 0040; the owner ruled the design on 2026-10-26, in two rounds). `T-043-02` is built. Traces: `REQ-IN-5`, `REQ-SL-9`,
 `REQ-SL-10`, `REQ-SA-7`, `REQ-AT-1`, `AC-D2.1` (as amendment 0040 restates them), `REQ-SL-5`, `REQ-PR-9`, `NFR-6`, `NFR-22`.
-`T-043-13` to `T-043-18` serve amendment 0041 (a running book follows a new settlement sequence), a proposal not yet
-ruled: they also trace `REQ-SA-10` and `REQ-SL-4` as it would amend them.
+`T-043-13` to `T-043-18` serve amendment 0041 (a running book follows a new settlement sequence), ruled by the owner
+on 2026-10-28 and not yet applied to `SPEC.md`: they also trace `REQ-SA-10` and `REQ-SL-4` as it amends them.
 
 | ID | Task | Traces | Done when |
 |---|---|---|---|

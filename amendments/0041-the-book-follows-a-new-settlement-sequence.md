@@ -18,9 +18,7 @@ Amendment 0040's rule "a reset comes only with a book re-founding" is withdrawn.
 `SPEC.md` changes, and no error condition is added.
 **Rationale in one line:** the settlement layer can start a new sequence of its record under a book that keeps
 running, and today the book keeps the old sequence's head and silently drops every head of the new one, so
-withdrawals created meanwhile are born expired. A contract reset belongs to a re-founding and its maintenance
-window, never to routine maintenance: if one finds anything in flight, the core refuses it and pages (`epoch:`),
-and that is the signal that a re-founding window is needed.
+withdrawals created meanwhile are born expired.
 
 ---
 
@@ -37,6 +35,10 @@ the new book starts with no head at all. Neither deployment follows that assumpt
 The core keeps the highest head it has seen and drops any lower one. So after the reset it drops every head of
 the new chain until that chain passes position 13. A withdrawal created meanwhile takes its expiry and its first
 position from the stale head, and is born expired.
+
+A contract reset belongs to a re-founding and its maintenance window, never to routine maintenance. If one finds
+anything in flight, the core refuses it and pages (`epoch:`), and that is the signal that a re-founding window is
+needed (decision 2).
 
 ## Verified facts (on `develop` at `9c12b11`, and read-only on test, 28 Oct)
 
@@ -175,8 +177,8 @@ sequence (`REQ-SL-1`); one book's record MAY run over several sequences".
 > report an entry of the new sequence until aledgent has taken the start in. Before it reports the start, the
 > adapter MUST have shown the earlier sequence complete up to the start (`REQ-SA-7`); otherwise it MUST raise an
 > alert and report neither. aledgent MUST take the start as its finalised point and compare every later point
-> within the new sequence; a gap of an earlier sequence MUST NOT make a position of the new one unprovable.
-> aledgent MUST refuse the start, as an incident (`REQ-AT-1`), if it names another
+> within the new sequence. When aledgent restarts its finalised point at the start, it MUST clear what it holds
+> of an earlier sequence's gaps. aledgent MUST refuse the start, as an incident (`REQ-AT-1`), if it names another
 > book, while any external leg it instructed is not yet decided, or while it holds a final record of an earlier
 > sequence at a position the new sequence reuses. A refused start MUST change nothing else, and the adapter MUST
 > raise an alert an operator sees. *Amendment 0041.*
@@ -256,7 +258,9 @@ sequence (`REQ-SL-1`); one book's record MAY run over several sequences".
 6. **The gap end across a start.** *Ruled (q28): the start clears it*, rather than keeping it (the proposal's
    cautious option, under which a withdrawal whose range starts below an earlier sequence's gap went to review).
    Read as: a start that restarts the head clears the gap end; one that keeps a head at a later block keeps it,
-   because that head, and a gap recorded since, may be the new sequence's. Clearing is safe because a start is
+   because that head, and a gap recorded since, may be the new sequence's. Keeping it there is harmless: the
+   kept head already passed the earlier sequence's position, so every new withdrawal's `from_seq` is at or above
+   any gap end of the earlier sequence. Clearing is safe because a start is
    refused while any instruction is live (decision 2), so `proof` has nothing of the earlier sequence left to
    decide.
 7. **The guard's error.** *Ruled as built (q28):* `ERR-SettlementLayerUnavailable`, with its meaning extended. *Alternative:*
