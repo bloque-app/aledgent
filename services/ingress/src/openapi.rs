@@ -287,6 +287,7 @@ fn operation(route: &crate::surface::Route) -> Value {
                     false,
                 ),
                 QueryRoute::Anchoring => (None, "AnchoringBody", false),
+                QueryRoute::SettlementHead => (None, "SettlementHeadBody", false),
                 QueryRoute::Signals => (None, "SignalsBody", false),
                 QueryRoute::IntegratingParties => (None, "IntegratingPartiesBody", false),
                 QueryRoute::Alias => (
@@ -497,6 +498,7 @@ fn schemas() -> Map<String, Value> {
     add::<crate::settlement::PositionsBody>(&mut g);
     add::<crate::settlement::AttestationBody>(&mut g);
     add::<crate::settlement::EpochBody>(&mut g);
+    add::<crate::settlement::SettlementHeadBody>(&mut g);
     add::<crate::settlement::AnchorReadBody>(&mut g);
     add::<crate::anchoring::DisclosureBody>(&mut g);
     add::<crate::anchoring::AnchoringJustifiedBody>(&mut g);

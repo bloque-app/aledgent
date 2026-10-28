@@ -597,6 +597,44 @@ pub struct EpochBody {
     pub previous: Option<PreviousAnchorBody>,
 }
 
+/// Where the book stands on the settlement layer's record (amendment 0041, `T-043-16`):
+/// `GET /v1/ops/settlement/head`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SettlementHeadBody {
+    /// The instance the book settles on, once configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<u32>,
+    /// The finalised head the book holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<FinalisedHeadBody>,
+    /// The last sequence of the layer's record whose start the book took; absent while it follows
+    /// the sequence the instance began with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<EpochBody>,
+}
+
+/// The settlement head on the wire (amendment 0041).
+pub fn settlement_head_body(v: &ledger_core::settlement::SettlementHeadView) -> SettlementHeadBody {
+    SettlementHeadBody {
+        instance: v.instance,
+        head: v.head.as_ref().map(finalised_head_body),
+        epoch: v.epoch.as_ref().map(epoch_body),
+    }
+}
+
+/// `GET /v1/ops/settlement/head` (amendment 0041): the operator's read.
+pub fn settlement_head<S: LeafStore, V: VaultBackend>(
+    l: &Ledger<S, V>,
+    caller: &Caller,
+    now: ledger_core::account::Time,
+) -> QueryReply {
+    match l.settlement_head_view(caller, now) {
+        Ok(v) => QueryReply::SettlementHead(settlement_head_body(&v)),
+        Err(error) => QueryReply::Refused { error },
+    }
+}
+
 /// What the core made of a new sequence (amendment 0041).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

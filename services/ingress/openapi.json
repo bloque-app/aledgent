@@ -5084,6 +5084,44 @@
           }
         ]
       },
+      "SettlementHeadBody": {
+        "additionalProperties": false,
+        "description": "Where the book stands on the settlement layer's record (amendment 0041, `T-043-16`):\n`GET /v1/ops/settlement/head`.",
+        "properties": {
+          "epoch": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EpochBody"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The last sequence of the layer's record whose start the book took; absent while it follows\nthe sequence the instance began with."
+          },
+          "head": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FinalisedHeadBody"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The finalised head the book holds."
+          },
+          "instance": {
+            "description": "The instance the book settles on, once configured.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "SettlementResultBody": {
         "additionalProperties": false,
         "description": "What a settlement command produced.",
@@ -10272,6 +10310,49 @@
           }
         },
         "summary": "Operator: compare the book with the settlement layer's positions at the latest cut (F-017)."
+      }
+    },
+    "/v1/ops/settlement/head": {
+      "get": {
+        "operationId": "settlement_head",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SettlementHeadBody"
+                }
+              }
+            },
+            "description": "The answer, from one consistent view (REQ-QR-2)."
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Refusal"
+                }
+              }
+            },
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Refusal"
+                }
+              }
+            },
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
+          }
+        },
+        "summary": "Operator: the book's finalised settlement head and the sequence of the settlement layer's record it follows (amendment 0041). Read-only."
       }
     },
     "/v1/ops/signals": {

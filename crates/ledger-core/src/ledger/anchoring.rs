@@ -347,6 +347,23 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
         Ok(self.state.anchoring())
     }
 
+    /// The book's settlement head and the sequence it follows (amendment 0041, `T-043-16`): for
+    /// the operator, or a principal holding an anchoring or comparison authority, as
+    /// [`Ledger::anchoring_view`]. Read-only.
+    pub fn settlement_head_view(
+        &self,
+        caller: &Caller,
+        now: Time,
+    ) -> Result<crate::settlement::SettlementHeadView, Refusal> {
+        self.anchoring_view(caller, now)?;
+        let store = self.state.settlement();
+        Ok(crate::settlement::SettlementHeadView {
+            instance: store.config().map(|c| c.instance),
+            head: store.head(),
+            epoch: store.epoch(),
+        })
+    }
+
     // ------------------------------------------------------------------ the comparison
 
     /// Every posting sequence number `op` wrote ([`crate::state::State::posting_seqs_of`]).

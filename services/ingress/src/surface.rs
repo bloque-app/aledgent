@@ -705,6 +705,12 @@ pub const ROUTES: &[Route] = &[
         "anchoring",
         "Operator: every checkpoint, the recorded settlement comparisons, and anchoring's incidents (F-017).",
     ),
+    query(
+        "/v1/ops/settlement/head",
+        QueryRoute::SettlementHead,
+        "settlement_head",
+        "Operator: the book's finalised settlement head and the sequence of the settlement layer's record it follows (amendment 0041). Read-only.",
+    ),
     command(
         "/v1/ops/settlement/comparisons",
         CommandRoute::Anchoring(AnchoringRoute::CompareSettlement),
@@ -2217,6 +2223,7 @@ fn query_response(reply: QueryReply) -> Response {
         QueryReply::Anchor(a) => json(serde_json::to_value(a)),
         QueryReply::Verified(v) => json(serde_json::to_value(v)),
         QueryReply::Anchoring(a) => json(serde_json::to_value(a)),
+        QueryReply::SettlementHead(h) => json(serde_json::to_value(h)),
         QueryReply::Signals(s) => json(serde_json::to_value(s)),
         QueryReply::IntegratingParties(p) => json(serde_json::to_value(p)),
         QueryReply::Alias(a) => json(serde_json::to_value(a)),
@@ -2261,6 +2268,8 @@ pub enum QueryRoute {
     VerifyDisclosure,
     /// `GET /v1/ops/anchors` (`F-017`).
     Anchoring,
+    /// `GET /v1/ops/settlement/head` (amendment 0041).
+    SettlementHead,
     /// `GET /v1/ops/signals` (`F-018`).
     Signals,
     /// `GET /v1/ops/integrating-parties` (`REQ-ID-7`).
@@ -2367,6 +2376,10 @@ fn query_unchecked(
         QueryRoute::Anchoring => {
             let _: AssetParams = params(raw)?;
             Query::Anchoring
+        }
+        QueryRoute::SettlementHead => {
+            let _: AssetParams = params(raw)?;
+            Query::SettlementHead
         }
         QueryRoute::VerifyDisclosure => {
             let p: crate::anchoring::VerifyParams = params(raw)?;
