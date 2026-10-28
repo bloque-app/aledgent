@@ -98,6 +98,7 @@ the adapter keeps stepping but declares to the core that it does not serve (`ale
 `ERR-SettlementLayerUnavailable`: this is not an adapter outage. It lifts when a start is taken (every
 `epoch` alert of the instance clears) or with `refound`.
 
+By the core's answer:
 
 - **It follows it** (`started`, or `recorded`): the core's finalised head restarts at the reset's block
   and position 0, and the new chain's entries and heads reach it. Nothing to do. Check it with
