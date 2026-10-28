@@ -304,11 +304,14 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
     /// state to the audit trail, in their order, each with the justification that it was moved
     /// (`T-043-08`). Only from the chained generation on, which is when anything reads the leaf
     /// for it: the switch input, and each settlement adapter input after it until the leaf is
-    /// empty. With the leaf empty it writes nothing.
+    /// empty. At most once an input ([`Ledger::set_input`] starts one), however many adapter
+    /// calls it holds, so one input never moves more than one chunk. With the leaf empty it
+    /// writes nothing.
     pub(crate) fn move_incidents(&mut self, at: Time) -> Result<(), Refusal> {
-        if !self.chained() {
+        if !self.chained() || self.moved_in_input {
             return Ok(());
         }
+        self.moved_in_input = true;
         let store = self.state.settlement();
         let incidents = store.incidents();
         if incidents.is_empty() {

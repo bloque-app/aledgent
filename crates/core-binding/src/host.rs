@@ -1622,10 +1622,17 @@ impl<P: AgentPort> Driver<P> {
         deliveries: Vec<([u8; 32], Time)>,
     ) -> Result<Option<u64>, DriveError> {
         let recorded: Vec<Recorded> = replica.take_calls();
+        let unsupported = recorded
+            .iter()
+            .find(|r| matches!(r.call, Call::Unsupported { .. }))
+            .map(|r| r.call.method().to_string());
         // The switch to the chained generation moves the book's incidents and gaps to the audit
         // trail at the end of the input that takes it, as the Agent does (`T-043-08`): before the
-        // input's keys and leaves are taken, so its witness holds what the move reads.
-        if !(recorded.is_empty() && deliveries.is_empty())
+        // input's keys and leaves are taken, so its witness holds what the move reads. Not for an
+        // input this driver refuses to send (an unsupported call): the switch is one-shot, and the
+        // input that takes it must be the one the Agent commits.
+        if unsupported.is_none()
+            && !(recorded.is_empty() && deliveries.is_empty())
             && !crate::fence::way_out_input(recorded.iter().map(|r| &r.call), deliveries.len())
                 .unwrap_or(false)
         {
@@ -1639,11 +1646,8 @@ impl<P: AgentPort> Driver<P> {
         if recorded.is_empty() && deliveries.is_empty() {
             return Ok(None);
         }
-        if let Some(r) = recorded
-            .iter()
-            .find(|r| matches!(r.call, Call::Unsupported { .. }))
-        {
-            return Err(DriveError::Unsupported(r.call.method().to_string()));
+        if let Some(method) = unsupported {
+            return Err(DriveError::Unsupported(method));
         }
         // Whether it is a way-out input, and the way out it took, the replica's: what the input
         // does to the writer's code (`T-037-15`). An input that mixes a way out with anything else
