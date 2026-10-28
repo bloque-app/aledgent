@@ -601,7 +601,7 @@ fn ac_e4_4__service(_: &mut dyn Harness) -> Outcome {
         let mut k = serving(KitOptions::default()).await?;
         k.chain.upgrade(|c| {
             c.spec_version = 134;
-            c.transaction_version = 14;
+            c.transaction_version = 15;
         });
         let r = k.step().await.map_err(|e| e.to_string())?;
         check(!r.serving, || "the adapter served a changed surface".into())?;

@@ -11,6 +11,11 @@
 //!   runtime since whose surface is the same: Kreivo release `0.17.1` (spec 134), enacted on
 //!   mainnet on 2026-10-14, is one (it adds asset calls to the contracts' chain extension; its
 //!   transaction extensions, their types, `transaction_version` and PASS crates are spec 133's).
+//!   So is Kreivo release `0.18.1` (spec 136, `transaction_version` 14, `5cd5003`): it bumped
+//!   `transaction_version` because it removed two `CommunitiesManager` calls, none of which a
+//!   transaction here carries; its transaction extensions and their types are 133's, and its PASS
+//!   crates (`fc-traits-authn` 3.0.0-pre.2, `pass-authenticators-substrate-keys` 2.0.0-pre.1)
+//!   sign and verify the same message in the same order (`services/settle/kreivo-pin-136`).
 //!
 //! What it speaks:
 //!
@@ -34,7 +39,8 @@
 //! Everything here is plain SCALE, written from Kreivo's source at the pinned revisions, with no
 //! runtime metadata: [`crate::chain::fake`] builds and checks transactions with it, and
 //! `crate::chain::rpc` sends them. `services/settle/kreivo-pin` proves the spec 133 bytes against
-//! Kreivo's own crates at the versions `4aef055` locks, and `services/settle/kreivo-pin-132` the
+//! Kreivo's own crates at the versions `4aef055` locks, `services/settle/kreivo-pin-136` the spec
+//! 136 bytes against the versions release `0.18.1` locks, and `services/settle/kreivo-pin-132` the
 //! spec 132 bytes against the versions release `0.16.9` locks.
 //!
 //! ## The transaction, as Kreivo decodes it
@@ -1375,12 +1381,15 @@ pub enum MessageOrder {
 pub struct TxFormat {
     /// Its name, as an operator names it in the configuration's `formats`.
     pub name: &'static str,
-    /// The Kreivo revision the format is pinned against.
+    /// The Kreivo revisions the format is pinned against.
     pub kreivo: &'static str,
     /// The order of the message the device signs.
     pub order: MessageOrder,
-    /// The runtime's `transaction_version` the format applies to.
-    pub transaction_version: u32,
+    /// The runtime `transaction_version`s the format applies to: the one it was first pinned
+    /// against, then each later one whose surface is otherwise this one's and whose transactions
+    /// were pinned again against that runtime's own crates (a `transaction_version` can change
+    /// for a call nothing here carries, as 14 did). A version not listed matches nothing.
+    pub transaction_versions: &'static [u32],
     /// The runtime's transaction extensions, as its metadata names them for extension version 0,
     /// in order.
     pub extensions: &'static [&'static str],
@@ -1404,10 +1413,10 @@ pub struct Surface {
 }
 
 impl Surface {
-    /// The surface of `format`, as a runtime that matches it describes it.
+    /// The surface of `format`, as the first runtime it was pinned against describes it.
     pub fn of(format: &TxFormat) -> Surface {
         Surface {
-            transaction_version: format.transaction_version,
+            transaction_version: format.transaction_versions[0],
             extensions: format.extensions.iter().map(|e| (*e).to_owned()).collect(),
             types: Some(format.types),
         }
@@ -1471,19 +1480,22 @@ pub const FORMAT_132: TxFormat = TxFormat {
     name: "kreivo-132",
     kreivo: "0.16.9 (db3d8af)",
     order: MessageOrder::AuthorityFirst,
-    transaction_version: 12,
+    transaction_versions: &[12],
     extensions: EXTENSIONS_132,
     types: TYPES_132,
 };
 
 /// Kreivo `4aef055`'s format (spec 133, `transaction_version` 13), and every runtime since whose
 /// surface is the same: Kreivo `0.17.1` (spec 134, enacted on mainnet on 2026-10-14) is one
-/// (`fixtures/surface-134.json`). Pinned by `services/settle/kreivo-pin`.
+/// (`fixtures/surface-134.json`), and so is Kreivo `0.18.1` (spec 136, `transaction_version` 14,
+/// `fixtures/surface-136.json`), whose only change to the surface is its `transaction_version`.
+/// Pinned by `services/settle/kreivo-pin` (spec 133) and `services/settle/kreivo-pin-136`
+/// (spec 136).
 pub const FORMAT_133: TxFormat = TxFormat {
     name: "kreivo-133",
-    kreivo: "4aef055",
+    kreivo: "4aef055; 0.18.1 (5cd5003)",
     order: MessageOrder::ChallengeFirst,
-    transaction_version: 13,
+    transaction_versions: &[13, 14],
     extensions: EXTENSIONS_133,
     types: TYPES_133,
 };
@@ -1495,8 +1507,9 @@ pub const TYPES_132: [u8; 32] = [
     0xcd, 0x08, 0xe5, 0x6e, 0x52, 0xa9, 0x93, 0xd0, 0xc3, 0x64, 0x5f, 0x12, 0xba, 0x99, 0x9b, 0xb9,
 ];
 
-/// The digest of spec 133's types (`fixtures/surface-133.json`), and spec 134's
-/// (`fixtures/surface-134.json`): `2da44f419d560b7bff6d56438e512190d93e6079703f584c67bbd8061ef34064`.
+/// The digest of spec 133's types (`fixtures/surface-133.json`), and specs 134's and 136's
+/// (`fixtures/surface-134.json`, `fixtures/surface-136.json`):
+/// `2da44f419d560b7bff6d56438e512190d93e6079703f584c67bbd8061ef34064`.
 pub const TYPES_133: [u8; 32] = [
     0x2d, 0xa4, 0x4f, 0x41, 0x9d, 0x56, 0x0b, 0x7b, 0xff, 0x6d, 0x56, 0x43, 0x8e, 0x51, 0x21, 0x90,
     0xd9, 0x3e, 0x60, 0x79, 0x70, 0x3f, 0x58, 0x4c, 0x67, 0xbb, 0xd8, 0x06, 0x1e, 0xf3, 0x40, 0x64,
@@ -1524,10 +1537,11 @@ impl TxFormat {
         format!("{}+native", self.name)
     }
 
-    /// Whether `surface` is this format's: the same `transaction_version`, the same extensions in
-    /// the same order, and the same types.
+    /// Whether `surface` is this format's: one of its `transaction_version`s, the same extensions
+    /// in the same order, and the same types.
     pub fn matches(&self, surface: &Surface) -> bool {
-        surface.transaction_version == self.transaction_version
+        self.transaction_versions
+            .contains(&surface.transaction_version)
             && surface
                 .extensions
                 .iter()
@@ -2524,6 +2538,15 @@ mod tests {
         check_pinned_vector(&FORMAT_132, 132, 12, "kreivo-pin-132/vectors.json").await;
     }
 
+    /// The spec 136 vector (`services/settle/kreivo-pin-136/vectors.json`): Kreivo release
+    /// `0.18.1`, `transaction_version` 14, signed in `kreivo-133`. `kreivo-pin-136` rebuilds it
+    /// with the crates that release locks (`fc-traits-authn` 3.0.0-pre.2 and
+    /// `pass-authenticators-substrate-keys` 2.0.0-pre.1, by git revision).
+    #[tokio::test]
+    async fn the_spec_136_transaction_matches_its_pinned_vector() {
+        check_pinned_vector(&FORMAT_133, 136, 14, "kreivo-pin-136/vectors.json").await;
+    }
+
     /// `T-027-07`, `T-027-12`: each known surface has one format, chosen by the surface alone, and
     /// no other surface is guessed at.
     #[test]
@@ -2534,21 +2557,34 @@ mod tests {
         // The same nine extensions; 133 appends DynamicMaxBlockWeight, which encodes nothing.
         assert_eq!(f132.extensions, &f133.extensions[..9]);
         assert_eq!(f133.extensions[9..], ["DynamicMaxBlockWeight"]);
-        // The one real format change came with a transaction_version bump.
+        // The one real format change came with a transaction_version bump (12 to 13); 14 (Kreivo
+        // 0.18.1, spec 136) changed a call nothing here carries, and is pinned to 133's format.
         assert_eq!(
-            (f132.transaction_version, f133.transaction_version),
-            (12, 13)
+            (f132.transaction_versions, f133.transaction_versions),
+            (&[12][..], &[13, 14][..])
         );
         assert_eq!(TxFormat::by_surface(&Surface::of(&f132)), Some(f132));
         assert_eq!(TxFormat::by_surface(&Surface::of(&f133)), Some(f133));
+        let s136 = Surface {
+            transaction_version: 14,
+            ..Surface::of(&f133)
+        };
+        assert_eq!(TxFormat::by_surface(&s136), Some(f133));
+        assert_ne!(s136.fingerprint(), Surface::of(&f133).fingerprint());
         assert_eq!(TxFormat::named("kreivo-132"), Some(f132));
         assert_eq!(TxFormat::named("kreivo-133"), Some(f133));
         assert_eq!(TxFormat::named("kreivo-134"), None);
-        // Any part of the surface changed: no format.
+        assert_eq!(TxFormat::named("kreivo-136"), None);
+        // Any part of the surface changed: no format. A transaction_version no format lists is a
+        // change, however unchanged the rest is.
         let changed = [
             Surface {
-                transaction_version: 14,
+                transaction_version: 15,
                 ..Surface::of(&f133)
+            },
+            Surface {
+                transaction_version: 14,
+                ..Surface::of(&f132)
             },
             Surface {
                 extensions: f133.extensions[..9]
@@ -2751,8 +2787,26 @@ mod tests {
     /// `UncheckedExtrinsic::check` builds, so this test and that crate pin the native transaction too.
     #[tokio::test]
     async fn f_045_the_native_transaction_matches_the_pinned_vector() {
+        check_native_vector(native_params(), "kreivo-pin/vectors-native.json").await;
+    }
+
+    /// `F-045`: the native vector on Kreivo `0.18.1` (spec 136, `transaction_version` 14,
+    /// `services/settle/kreivo-pin-136/vectors-native.json`), which `kreivo-pin-136` decodes and
+    /// verifies with that release's crates.
+    #[tokio::test]
+    async fn f_045_the_spec_136_native_transaction_matches_its_pinned_vector() {
+        let p = TxParams {
+            spec_version: 136,
+            transaction_version: 14,
+            ..native_params()
+        };
+        check_native_vector(p, "kreivo-pin-136/vectors-native.json").await;
+    }
+
+    /// The native transaction for `p`, built as [`sign_native`] builds it, against the vector at
+    /// `path` (relative to `services/settle`).
+    async fn check_native_vector(p: TxParams, path: &str) {
         let key = crate::signer::DevEd25519::from_secret(&[0x5e; 32]);
-        let p = native_params();
         let contract = [0xc0; 32];
         let envelopes = vec![Envelope {
             operation_ref: [1; 32],
@@ -2805,7 +2859,6 @@ mod tests {
                 "extrinsic_hash": h(signed.hash),
             },
         });
-        let path = "kreivo-pin/vectors-native.json";
         let full = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
         if std::env::var_os("UPDATE_KREIVO_VECTORS").is_some() {
             let text = serde_json::to_string_pretty(&got).unwrap() + "\n";

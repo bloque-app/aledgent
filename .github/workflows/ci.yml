@@ -477,18 +477,18 @@ jobs:
             exit 1
           fi
 
-  # F-027 (T-027-03, T-027-07): the settlement executor's Kreivo PASS transactions, rebuilt with
-  # Kreivo's own crates in both formats it signs: spec 133 (Kreivo 4aef055, kreivo-pin) and spec 132
-  # (release 0.16.9, live on mainnet, kreivo-pin-132). Each is a workspace of its own, built from
-  # its committed lock file; services/settle's own tests check its encoder against the same
-  # vectors.json.
+  # F-027 (T-027-03, T-027-07, REQ-SA-9): the settlement executor's Kreivo transactions, rebuilt with
+  # Kreivo's own crates for each runtime they are pinned to: spec 133 (Kreivo 4aef055, kreivo-pin),
+  # spec 136 (release 0.18.1, live on mainnet from 2026-10-27, kreivo-pin-136; same format as 133)
+  # and spec 132 (release 0.16.9, kreivo-pin-132). Each is a workspace of its own, built from its
+  # committed lock file; services/settle's own tests check its encoder against the same vectors.
   kreivo-pin:
     name: kreivo pin (${{ matrix.crate }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        crate: [kreivo-pin, kreivo-pin-132]
+        crate: [kreivo-pin, kreivo-pin-136, kreivo-pin-132]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

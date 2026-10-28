@@ -1009,3 +1009,63 @@ that ran and failed.
   `runtime` alert, and a healthy deployment (`runtime` at zero) pages no one.
 - Decision 53 changes no code, so it has no test of its own; decision 51's tests of
   `rpc::call_failure` stand.
+
+## Kreivo 0.18.1, spec 136 and `transaction_version` 14 (`REQ-SA-9`, 2026-10-28)
+
+Kreivo mainnet moved to release `0.18.1` (`5cd5003`, spec 136; release `0.18.0`, spec 135, is where
+`transaction_version` went to 14). Read from mainnet's own metadata
+(`Metadata_metadata_at_version(15)` at #40 202 760, read only, `examples/surface_probe.rs`):
+`transaction_version` 14, the same ten transaction extensions in the same order, and the same types
+digest as specs 133 and 134 (`2da44f41…`, `fixtures/surface-136.json`). An adapter without this
+change refuses 136 (`unknown_surface`), as decision 44 designed: a `transaction_version` no format
+lists is a changed surface.
+
+Why 14: Kreivo's release cut (kreivo#519) bumped it because two `CommunitiesManager` calls were
+removed. What else changed that a transaction's metadata does not show, read off Kreivo's source:
+
+- **The PASS crates**: `fc-traits-authn`/`fc-pallet-pass` 3.0.0-pre.2 (frame-contrib `4d16b1e`) and
+  `pass-authenticators-substrate-keys` 2.0.0-pre.1 (`86674b2`), by git revision. The message the
+  device signs is still `context ‖ challenge ‖ authority`; the challenger (`BlockHashChallenger`, 30
+  minutes) and the extrinsic context `PassAuthenticate` hashes are unchanged.
+- **Device filters**: `fc-pallet-pass` 3.x refuses a device with no call filter
+  (`InvalidTransaction::Call`, which the confirmation reads as a refusal). `0.18.0`'s
+  `MigrateV0ToV1` gave `Admin` (every call allowed) to every device; on mainnet at #40 202 760 the
+  multi-block migration cursor is empty and all 5 484 `Pass::Devices` entries have a
+  `Pass::DeviceFilters` entry.
+- **The fee step** is `SkipCheckIfFeeless<ChargeUsageSubscription<ChargeAssetTxPayment>>`, which
+  encodes, and is named, as `ChargeAssetTxPayment` (Kreivo's own test of it).
+
+### Decisions
+
+54. **A format lists the `transaction_version`s it is pinned for.** `TxFormat::transaction_versions`
+    replaces `transaction_version`: `kreivo-132` is `[12]`, `kreivo-133` is `[13, 14]`. A version is
+    added to a format only after its runtime's metadata gives the format's extensions and types
+    (a fixture), its own crates rebuild the format's bytes (a pin crate) and mainnet validates a
+    transaction signed in it. The name stays `kreivo-133`, so a runtime confirmed under an
+    operator's `"formats": { "136": "kreivo-133" }` and one confirmed by the surface are recorded
+    under the same name. A new format (`kreivo-136`) was the alternative; nothing it signs differs,
+    and it would have made an interim operator mapping and the release disagree on the name.
+    Trade-off, stated plainly: the next `transaction_version` bump stops every deployment again
+    until a release lists it, which is decision 44's choice of a false stop over a false start.
+55. **`kreivo-pin-136`** is `kreivo-pin` with the crates `0.18.1` locks (the Polkadot SDK crates are
+    the same versions), its lock seeded from Kreivo `0.18.1`'s, and its vectors (`vectors.json`,
+    `vectors-native.json`) written by `services/settle`'s encoder at spec 136 and
+    `transaction_version` 14.
+
+### Tests
+
+- `chain::surface`: `t_027_12_the_pinned_surfaces_are_kreivos_own` reads `surface-136.json`: 14,
+  and 134's extensions and types, chosen as `kreivo-133`.
+- `chain::kreivo`: `t_027_12_each_known_surface_has_one_format_and_no_other_is_guessed` (14 is
+  `kreivo-133`'s, 15 is no format's, 14 with 132's surface neither);
+  `the_spec_136_transaction_matches_its_pinned_vector`,
+  `f_045_the_spec_136_native_transaction_matches_its_pinned_vector`.
+- `tests/contract.rs`: `ac_e4_3_kreivo_0_18_1_spec_136_transaction_version_14_keeps_serving`;
+  `tests/native.rs`: `f_045_a_native_withdrawal_settles_on_spec_136`. The tests that used 14 as an
+  unknown `transaction_version` (`tests/flow.rs`, conformance `AC-E4.4`) use 15.
+- **Mainnet, read only** (`examples/surface_probe.rs` at #40 202 760, throwaway unfunded keys, nothing
+  broadcast): a native transaction signed with 14 is `Invalid(Payment)` (the format accepted); with a
+  signature byte flipped, `Invalid(BadProof)`; signed with 13, `Invalid(BadProof)`. A PASS
+  transaction from an unregistered device is `Invalid(BadSigner)` all three ways: it decodes and
+  reaches authentication, which is all a device the runtime does not know can show. The message
+  order rests on `kreivo-pin-136` and the zombienet gate on `0.18.1`.

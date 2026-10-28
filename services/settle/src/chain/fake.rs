@@ -121,7 +121,7 @@ impl FakeConfig {
 
     /// This runtime with `format`'s surface and authenticator.
     pub fn with_format(mut self, format: &kreivo::TxFormat) -> FakeConfig {
-        self.transaction_version = format.transaction_version;
+        self.transaction_version = format.transaction_versions[0];
         self.extensions = format.extensions.iter().map(|e| (*e).to_owned()).collect();
         self.types = Some(format.types);
         self.order = format.order;
@@ -138,7 +138,7 @@ impl Default for FakeConfig {
             spec_version: 133,
             pallet: true,
             block_hash_count: 256,
-            transaction_version: f.transaction_version,
+            transaction_version: f.transaction_versions[0],
             challenge_window: 300,
             extensions: f.extensions.iter().map(|e| (*e).to_owned()).collect(),
             types: Some(f.types),

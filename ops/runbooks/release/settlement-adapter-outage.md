@@ -54,7 +54,12 @@ settlement-operations.
      If the change is known not to touch what the adapter signs (an asset location type that gained a
      variant, for instance), the operator can instead name a known format for that `spec_version` in
      `adapter.formats` (`{ "<spec_version>": "kreivo-133" }`) and restart: the layer still has to
-     confirm it before anything is broadcast. Record either as a finding.
+     confirm it before anything is broadcast. Record either as a finding. To see what changed, run
+     `cargo run -p settle --example surface_probe -- <kreivo-rpc-url>` (read only): it prints the live
+     surface and the format chosen for it, and has the runtime validate a transaction signed in that
+     format by throwaway, unfunded keys, broadcasting nothing (`Invalid(Payment)` for the native form
+     means the format is accepted). Kreivo `0.18.1` (spec 136) was this case: only the
+     `transaction_version` moved, to 14, and the release that lists 14 for `kreivo-133` serves it.
    - **`unconfirmed`** (with a `runtime:<spec_version>` alert): the surface matched a format, but the
      runtime refused a transaction signed in it (`BadProof`, `BadSigner`, `UnknownOrigin`, an
      extension's `Custom` error, bytes it cannot decode). The format changed in a way the metadata
