@@ -273,6 +273,14 @@ pub struct Ledger<S: LeafStore, V: VaultBackend> {
     /// The code generation in force before the current input, and whether its calls are decided
     /// by the next one ([`Ledger::set_generation`]). Not service state.
     generation: (u64, bool),
+    /// Whether the current input, unless it is a way out, switches the writer to
+    /// [`crate::settlement::CHAINED_SETTLEMENT`]: the book's incidents and gaps then move to the
+    /// audit trail at its end ([`Ledger::switch_settlement`], `T-043-08`). Not service state.
+    switching: bool,
+    /// Whether the current input has moved its chunk of the incidents an earlier generation kept
+    /// in the book's state (`Ledger::move_incidents`, `T-043-08`): at most one chunk an input,
+    /// however many adapter calls it holds. Not service state.
+    moved_in_input: bool,
 }
 
 fn policy_used(p: &Principal) -> AuthorityUsed {
@@ -397,6 +405,8 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             calls_in_input: (0, 0),
             writer: crate::code::authority::Position::default(),
             generation: (0, false),
+            switching: false,
+            moved_in_input: false,
         };
         if let Some(sp) = spec {
             ledger.build_genesis_state(&founded, &sp)?;
@@ -451,6 +461,8 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             calls_in_input: (0, 0),
             writer: crate::code::authority::Position::default(),
             generation: (0, false),
+            switching: false,
+            moved_in_input: false,
         }
     }
 
@@ -472,6 +484,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
     /// that has the hot row gives the scheduled change first ([`Ledger::set_authority_next`]).
     pub fn set_input(&mut self, input: u64) {
         self.input = input;
+        self.moved_in_input = false;
         self.calls_in_input.1 = 0;
         self.writer.begin(&mut self.code.1, input);
     }
@@ -489,6 +502,14 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
     /// replay from the code map. A ledger never told decides as generation 0.
     pub fn set_generation(&mut self, in_force: u64, next: bool) {
         self.generation = (in_force, next);
+        let c = crate::settlement::CHAINED_SETTLEMENT;
+        self.switching = next && in_force < c && c <= in_force.saturating_add(1);
+    }
+
+    /// Whether the current input, unless it is a way out, switches the writer to the chained
+    /// generation (`T-043-08`).
+    pub(crate) fn switching_input(&self) -> bool {
+        self.switching
     }
 
     /// The code generation that decides the commands that follow ([`Ledger::set_generation`]).

@@ -221,6 +221,13 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             let p = resolve_adapter(&self.state, &ctx.caller)?;
             let source = SourceId::of_identity(&p.identity);
             let now = ctx.now;
+            // A running book's incidents still in its state move to the audit trail, a bounded
+            // number per adapter input, from the chained generation on (`T-043-08`). Not at the
+            // switch input itself: its end moves the first chunk (`Ledger::switch_settlement`),
+            // and two chunks in one invocation could take more than the guest's arena.
+            if !self.switching_input() {
+                self.move_incidents(now)?;
+            }
             Ok(match input {
                 AdapterInput::Declare {
                     serving,

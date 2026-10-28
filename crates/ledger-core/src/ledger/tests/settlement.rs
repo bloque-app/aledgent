@@ -1403,3 +1403,238 @@ fn t043_07_a_generation_0_head_reads_no_gap_end() {
         );
     }
 }
+
+/// A withdrawal of 40 from a new account, submitted, whose instruction the layer drops; then a
+/// gap `[gap_from, gap_to)` recorded at generation 0 and, if `switch`, the switch to the chained
+/// generation (the gap list moved to the gap end); then a finalised head past the expiry. The
+/// operation's path.
+fn decided_after_a_gap(gap_from: u64, gap_to: u64, head_before: u64, switch: bool) -> Vec<OpState> {
+    let mut lx = Lx::new();
+    let (alice, a) = funded(&mut lx.fx, 100);
+    lx.fx
+        .ledger
+        .observe_head(
+            ADAPTER,
+            FinalisedHead {
+                height: 1,
+                next_seq: head_before,
+            },
+            &[],
+            10,
+        )
+        .unwrap();
+    let ctx = lx.withdraw(alice, a, 40, 500);
+    let i = lx.fx.ledger.submit_outbound(&ctx, TO).unwrap().value;
+    assert_eq!(
+        lx.fx
+            .ledger
+            .state()
+            .settlement()
+            .instruction(&ctx.op)
+            .unwrap()
+            .from_seq,
+        head_before
+    );
+    lx.fx
+        .ledger
+        .record_gap(
+            ADAPTER,
+            crate::settlement::Gap {
+                from: gap_from,
+                to: gap_to,
+                reason: crate::settlement::GapReason::Unreadable,
+            },
+            10,
+        )
+        .unwrap();
+    if switch {
+        lx.fx.ledger.set_generation(0, true);
+        lx.fx.ledger.switch_settlement().unwrap();
+        lx.fx
+            .ledger
+            .set_generation(crate::settlement::CHAINED_SETTLEMENT, false);
+        let s = lx.fx.ledger.state().settlement();
+        assert!(s.gaps().is_empty() && s.incidents().is_empty());
+        assert_eq!(s.gap_end(), gap_to);
+    }
+    lx.fx
+        .ledger
+        .observe_head(
+            ADAPTER,
+            FinalisedHead {
+                height: i.expiry() + 1,
+                next_seq: gap_to.max(head_before),
+            },
+            &[],
+            10,
+        )
+        .unwrap();
+    // The head has passed the gap, and no position outside it is unread: the inbox proves
+    // non-inclusion unless the gap covers the instruction's range.
+    lx.path(&ctx.op)
+}
+
+/// `T-043-08`: `proof` answers the same for a book whose gaps moved to the gap end at the
+/// switch as it did over the list: a gap after the instruction makes non-inclusion unprovable,
+/// one wholly before it changes nothing.
+#[test]
+fn t043_08_proof_answers_the_same_after_the_move() {
+    let mut released = 0;
+    for (from, to, head) in [
+        (0, 4, 0),
+        (2, 6, 2),
+        (3, 6, 2),
+        (1, 5, 3),
+        (0, 2, 2),
+        (0, 1, 3),
+    ] {
+        assert_eq!(
+            decided_after_a_gap(from, to, head, false),
+            decided_after_a_gap(from, to, head, true),
+            "gap [{from}, {to}), instruction from {head}"
+        );
+        released += usize::from(
+            decided_after_a_gap(from, to, head, true).last() == Some(&OpState::Released),
+        );
+    }
+    assert_eq!(
+        released, 2,
+        "the two gaps wholly before the instruction release it"
+    );
+}
+
+/// `T-043-08`: the move at the switch writes one audit record per incident, with the
+/// justification that it was moved, and empties both leaves; a book with neither writes
+/// nothing, and no input but the switching one moves anything.
+#[test]
+fn t043_08_the_move_at_the_switch() {
+    let mut lx = Lx::new();
+    let before = lx.fx.ledger.state().audit().emitted();
+    lx.fx.ledger.set_generation(0, true);
+    lx.fx.ledger.switch_settlement().unwrap();
+    assert_eq!(
+        lx.fx.ledger.state().audit().emitted(),
+        before,
+        "nothing to move"
+    );
+
+    let mut lx = Lx::new();
+    let g = crate::settlement::Gap {
+        from: 2,
+        to: 5,
+        reason: crate::settlement::GapReason::Unreadable,
+    };
+    lx.fx.ledger.record_gap(ADAPTER, g, 10).unwrap();
+    assert_eq!(lx.incidents(), vec![Incident::Gap(g)]);
+    // Not the switching input: nothing moves.
+    lx.fx.ledger.set_generation(0, false);
+    lx.fx.ledger.switch_settlement().unwrap();
+    assert_eq!(lx.fx.ledger.state().settlement().gaps().len(), 1);
+    let before = lx.fx.ledger.state().audit().emitted();
+    lx.fx.ledger.set_generation(0, true);
+    lx.fx.ledger.switch_settlement().unwrap();
+    // Once only.
+    lx.fx.ledger.switch_settlement().unwrap();
+    let state = lx.fx.ledger.state();
+    assert_eq!(state.audit().emitted(), before + 1);
+    let r = state.audit().outbox().last().unwrap();
+    assert_eq!(
+        r.action,
+        crate::audit::AuditAction::Incident(Incident::Gap(g))
+    );
+    assert_eq!(
+        r.justification.as_ref().map(|j| j.as_bytes()),
+        Some(crate::audit::MOVED_TO_AUDIT)
+    );
+    assert_eq!(state.settlement().gap_end(), 5);
+    assert!(state.settlement().gaps().is_empty() && state.settlement().incidents().is_empty());
+}
+
+/// An observation of nothing the book knows, at position `seq`: an `Unassociated` incident.
+fn unassociated(seq: u64) -> Observation {
+    Observation {
+        source: ADAPTER,
+        coordinate: Coordinate {
+            instance: 1,
+            seq,
+            digest: [seq as u8; 32],
+        },
+        at: 1,
+        kind: EventKind::Withdrawn,
+        payload: Payload::default(),
+        observed_finality: ObservedFinality::Provisional,
+        operation_ref: None,
+        account_ref: None,
+        movement: None,
+        anchor: None,
+    }
+}
+
+/// `T-043-08`: a gap the book's gaps leaf holds with no `Gap` incident of its own (none should
+/// exist; the earlier generations wrote both) still reaches the audit trail at the switch, and
+/// raises the gap end; a gap with its incident is recorded once, from the incident.
+#[test]
+fn t043_08_a_gap_without_its_incident_is_recorded_at_the_switch() {
+    let mut lx = Lx::new();
+    let lone = crate::settlement::Gap {
+        from: 7,
+        to: 11,
+        reason: crate::settlement::GapReason::Pruned,
+    };
+    let paired = crate::settlement::Gap {
+        from: 2,
+        to: 5,
+        reason: crate::settlement::GapReason::Unreadable,
+    };
+    lx.fx.ledger.record_gap(ADAPTER, paired, 10).unwrap();
+    lx.fx
+        .ledger
+        .state
+        .commit(&[crate::state::Write::Settlement(
+            crate::settlement::store::SettlementWrite::Gap(lone),
+        )])
+        .unwrap();
+    assert_eq!(lx.fx.ledger.state().settlement().gaps().len(), 2);
+    assert_eq!(lx.incidents(), vec![Incident::Gap(paired)]);
+    let before = lx.fx.ledger.state().audit().emitted();
+    lx.fx.ledger.set_generation(0, true);
+    lx.fx.ledger.switch_settlement().unwrap();
+    let state = lx.fx.ledger.state();
+    let moved: Vec<Incident> = state
+        .audit()
+        .outbox()
+        .filter(|r| r.audit_seq >= before)
+        .map(|r| match r.action {
+            crate::audit::AuditAction::Incident(i) => i,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(moved, vec![Incident::Gap(lone), Incident::Gap(paired)]);
+    assert_eq!(state.settlement().gap_end(), 11);
+    assert!(state.settlement().gaps().is_empty() && state.settlement().incidents().is_empty());
+}
+
+/// `T-043-08`: one input moves at most one chunk of the incidents an earlier generation kept,
+/// however many adapter calls it holds; the next input moves the next.
+#[test]
+fn t043_08_one_chunk_an_input() {
+    let mut lx = Lx::new();
+    let n = crate::ledger::settlement::MOVE_PER_INPUT as u64 + 8;
+    for seq in 0..n {
+        let _ = lx.fx.ledger.record_observation(unassociated(seq), 10);
+    }
+    assert_eq!(
+        lx.fx.ledger.state().settlement().incidents().len() as u64,
+        n
+    );
+    lx.fx
+        .ledger
+        .set_generation(crate::settlement::CHAINED_SETTLEMENT, false);
+    lx.fx.ledger.set_input(100);
+    lx.fx.ledger.move_incidents(10).unwrap();
+    lx.fx.ledger.move_incidents(10).unwrap();
+    assert_eq!(lx.fx.ledger.state().settlement().incidents().len(), 8);
+    lx.fx.ledger.set_input(101);
+    lx.fx.ledger.move_incidents(10).unwrap();
+    assert!(lx.fx.ledger.state().settlement().incidents().is_empty());
+}

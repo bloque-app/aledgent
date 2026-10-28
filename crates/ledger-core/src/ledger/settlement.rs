@@ -234,9 +234,99 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                 incident: i,
                 source,
                 at: now,
+                moved: false,
             }),
             None => Write::Settlement(SettlementWrite::Incident(i)),
         }
+    }
+
+    /// The end of an input that is not a way out (`T-043-08`, amendment 0040 a40b-existing-books,
+    /// `NFR-22`): if it is the input at which the writer switches to
+    /// [`crate::settlement::CHAINED_SETTLEMENT`] ([`Ledger::set_generation`]), begin moving the
+    /// book's settlement incidents and gaps, which the earlier generations kept in its state, to
+    /// the audit trail. In one batch:
+    ///
+    /// - the gaps leaf is emptied, the end of its highest gap becomes the gap end `proof` reads,
+    ///   and a gap the incidents leaf has no record of (none should exist) gets its audit record;
+    /// - the first [`MOVE_PER_INPUT`] incidents become audit records (`Ledger::move_incidents`).
+    ///
+    /// The rest move [`MOVE_PER_INPUT`] at a time, at the start of each settlement adapter input
+    /// that follows: moving them all at once could take more than the guest's arena (about 2.4 KB
+    /// an incident in one invocation). Nothing reads the incidents leaf to decide anything, so
+    /// what is still in it changes no answer while it drains.
+    ///
+    /// A book with neither writes nothing, so the switch of a book that never recorded one leaves
+    /// every root as the code before it would. The writer calls it once per input, whatever the
+    /// input holds, after its calls (the calls decide alike before or after: `proof` reads the
+    /// list or the gap end). An input that is a way out never switches the writer, and moves
+    /// nothing (D18): the writer does not call it then.
+    ///
+    /// The indexes only a re-scan read (`INGESTED_AT`, `RESCAN_RECORDED`) are left as they are:
+    /// nothing reads them from this generation on.
+    pub fn switch_settlement(&mut self) -> Result<(), Refusal> {
+        if !core::mem::take(&mut self.switching) {
+            return Ok(());
+        }
+        let recording = self.calls.is_some();
+        self.state.record_leaves(recording);
+        let at = self.state.operations().clock().unwrap_or(0);
+        let r = self.move_gaps(at).and_then(|()| self.move_incidents(at));
+        if recording {
+            self.state.record_leaves(false);
+        }
+        r
+    }
+
+    /// The gaps' part of the switch ([`Ledger::switch_settlement`]).
+    fn move_gaps(&mut self, at: Time) -> Result<(), Refusal> {
+        let store = self.state.settlement();
+        let gaps = store.gaps().to_vec();
+        if gaps.is_empty() {
+            return Ok(());
+        }
+        let Some(source) = store.config().map(|c| c.authoritative) else {
+            return Err(Refusal::Internal);
+        };
+        let incidents = store.incidents();
+        let mut writes: Vec<Write> = gaps
+            .iter()
+            .filter(|g| !incidents.contains(&Incident::Gap(**g)))
+            .map(|g| moved(Incident::Gap(*g), source, at))
+            .collect();
+        if let Some(end) = gaps.iter().map(|g| g.to).max() {
+            writes.push(Write::Settlement(SettlementWrite::GapEnd(end)));
+        }
+        writes.push(Write::Settlement(SettlementWrite::DropGaps));
+        self.commit(&writes)
+    }
+
+    /// Move the first [`MOVE_PER_INPUT`] incidents the earlier generations kept in the book's
+    /// state to the audit trail, in their order, each with the justification that it was moved
+    /// (`T-043-08`). Only from the chained generation on, which is when anything reads the leaf
+    /// for it: the switch input, and each settlement adapter input after it until the leaf is
+    /// empty. At most once an input ([`Ledger::set_input`] starts one), however many adapter
+    /// calls it holds, so one input never moves more than one chunk. With the leaf empty it
+    /// writes nothing.
+    pub(crate) fn move_incidents(&mut self, at: Time) -> Result<(), Refusal> {
+        if !self.chained() || self.moved_in_input {
+            return Ok(());
+        }
+        self.moved_in_input = true;
+        let store = self.state.settlement();
+        let incidents = store.incidents();
+        if incidents.is_empty() {
+            return Ok(());
+        }
+        let Some(source) = store.config().map(|c| c.authoritative) else {
+            return Err(Refusal::Internal);
+        };
+        let n = incidents.len().min(MOVE_PER_INPUT);
+        let mut writes: Vec<Write> = incidents[..n]
+            .iter()
+            .map(|i| moved(*i, source, at))
+            .collect();
+        writes.push(Write::Settlement(SettlementWrite::DropIncidents(n as u32)));
+        self.commit(&writes)
     }
 
     /// Mark `op` for review, alone in its own batch (`INV-23`).
@@ -1983,6 +2073,21 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
         self.leave(top, || crate::call::Summary::of(&r));
         r
     }
+}
+
+/// How many of the incidents the earlier generations kept in the book's state one input moves to
+/// the audit trail (`T-043-08`): sized so the input stays well inside the guest's arena
+/// (`tests/f043_incidents_heap.rs`).
+pub const MOVE_PER_INPUT: usize = 32;
+
+/// The audit record of an incident moved from the book's state (`T-043-08`).
+fn moved(incident: Incident, source: SourceId, at: Time) -> Write {
+    Write::Incident(crate::audit::IncidentNote {
+        incident,
+        source,
+        at,
+        moved: true,
+    })
 }
 
 /// The ingest write of `obs`, associated with `op`. `by_position`: the record is also indexed by

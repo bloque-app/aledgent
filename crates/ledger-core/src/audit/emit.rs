@@ -73,7 +73,14 @@ pub struct IncidentNote {
     pub source: crate::settlement::SourceId,
     /// The time input of the transition.
     pub at: Time,
+    /// Moved from the book's state at the switch to the chained generation (`T-043-08`): the
+    /// record carries the justification that says so, and its time is the book's clock then.
+    pub moved: bool,
 }
+
+/// The justification of a record [`IncidentNote::moved`].
+pub const MOVED_TO_AUDIT: &[u8] =
+    b"moved from the book's state to the audit trail at the switch to the chained generation (F-043)";
 
 impl IncidentNote {
     /// The operation the incident is of, if it names one.
@@ -121,7 +128,7 @@ impl IncidentNote {
             subject,
             op,
             at: self.at,
-            justification: None,
+            justification: self.moved.then(|| Justification(MOVED_TO_AUDIT.to_vec())),
             outcome: AuditOutcome::Accepted,
         }
     }

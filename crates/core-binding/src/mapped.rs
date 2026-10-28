@@ -461,6 +461,16 @@ fn input(
         }
         summaries.push(s);
     }
+    // The switch to the chained generation moves the book's incidents and gaps to the audit
+    // trail, at the end of the input that takes it (`T-043-08`); a way out never takes it.
+    if !way_out {
+        if let Err(e) = ledger.switch_settlement() {
+            return Err(AgentRefusal::Fault(alloc::format!("{e:?}")));
+        }
+        if ledger.state().missed() {
+            return Err(AgentRefusal::UnprovenRead);
+        }
+    }
     // What the input did to the writer's code (`T-037-15`), decided the same by either generation.
     let taken = ledger.take_way_out();
     crate::fence::decide(&mut code, i.seq, way_out, taken, ledger.take_upgrade());

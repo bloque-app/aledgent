@@ -1622,17 +1622,32 @@ impl<P: AgentPort> Driver<P> {
         deliveries: Vec<([u8; 32], Time)>,
     ) -> Result<Option<u64>, DriveError> {
         let recorded: Vec<Recorded> = replica.take_calls();
+        let unsupported = recorded
+            .iter()
+            .find(|r| matches!(r.call, Call::Unsupported { .. }))
+            .map(|r| r.call.method().to_string());
+        // The switch to the chained generation moves the book's incidents and gaps to the audit
+        // trail at the end of the input that takes it, as the Agent does (`T-043-08`): before the
+        // input's keys and leaves are taken, so its witness holds what the move reads. Not for an
+        // input this driver refuses to send (an unsupported call): the switch is one-shot, and the
+        // input that takes it must be the one the Agent commits.
+        if unsupported.is_none()
+            && !(recorded.is_empty() && deliveries.is_empty())
+            && !crate::fence::way_out_input(recorded.iter().map(|r| &r.call), deliveries.len())
+                .unwrap_or(false)
+        {
+            replica.switch_settlement().map_err(|e| {
+                DriveError::Replica(format!("the switch's move to the audit trail: {e:?}"))
+            })?;
+        }
         let keys = replica.book().store().take_keys();
         let before = replica.book().vault_backend_take();
         let touched = Touches::take(replica, &deliveries);
         if recorded.is_empty() && deliveries.is_empty() {
             return Ok(None);
         }
-        if let Some(r) = recorded
-            .iter()
-            .find(|r| matches!(r.call, Call::Unsupported { .. }))
-        {
-            return Err(DriveError::Unsupported(r.call.method().to_string()));
+        if let Some(method) = unsupported {
+            return Err(DriveError::Unsupported(method));
         }
         // Whether it is a way-out input, and the way out it took, the replica's: what the input
         // does to the writer's code (`T-037-15`). An input that mixes a way out with anything else
@@ -2303,6 +2318,16 @@ fn replay_with(
         let _ = replica.take_calls();
         // An archived input was taken whole: a way-out input is one call and no delivery.
         let way_out = crate::fence::way_out_input(&e.calls, e.deliveries.len()).unwrap_or(false);
+        // The switch to the chained generation, at the end of the input that takes it
+        // (`T-043-08`, [`Driver::stage`]).
+        if !way_out {
+            replica.switch_settlement().map_err(|why| {
+                DriveError::Diverged(format!(
+                    "replay: input {}: the switch's move: {why:?}",
+                    e.seq
+                ))
+            })?;
+        }
         let (taken, scheduled) = (replica.take_way_out(), replica.take_upgrade());
         crate::fence::decide(&mut writer, e.seq, way_out, taken, scheduled);
         let touched = Touches::take(&replica, &e.deliveries);

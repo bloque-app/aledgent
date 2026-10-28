@@ -128,14 +128,27 @@ fn incidents(n: u64, chained: bool) -> Vec<usize> {
     let _one = ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut fx = Fx::new(
+    let mut fx = modelled();
+    let (adapter, source) = configure(&mut fx);
+    if chained {
+        upgrade(&mut fx);
+    }
+    record_incidents(&mut fx, adapter, source, n, chained)
+}
+
+/// A book on the modelled port.
+fn modelled() -> Fx<Modelled> {
+    Fx::new(
         Modelled {
             inner: NativePort::new(),
             arenas: Vec::new(),
         },
         Limits::DEFAULT,
-    );
-    // The adapter, its configuration and support.
+    )
+}
+
+/// The adapter, its configuration and its support.
+fn configure(fx: &mut Fx<Modelled>) -> (Caller, SourceId) {
     let ctx = fx.ctx(fx.operator());
     let o = fx
         .replica
@@ -175,10 +188,12 @@ fn incidents(n: u64, chained: bool) -> Vec<usize> {
         )
         .unwrap();
     fx.synced();
-    // The upgrade, in place, to the chained generation.
-    if !chained {
-        return record_incidents(&mut fx, adapter, source, n, false);
-    }
+    (adapter, source)
+}
+
+/// The upgrade, in place, to the chained generation: scheduled two inputs on, taken at the input
+/// after (the switch input, the last invocation).
+fn upgrade(fx: &mut Fx<Modelled>) {
     let held = HeldCode::default();
     let h = held.version(1);
     let checked = core_binding::staging::fetch(&held, &h, 0).unwrap();
@@ -191,7 +206,6 @@ fn incidents(n: u64, chained: bool) -> Vec<usize> {
     fx.synced();
     let _ = fx.person();
     assert_eq!(fx.driver.writer().generation, CHAINED_SETTLEMENT);
-    record_incidents(&mut fx, adapter, source, n, true)
 }
 
 fn record_incidents(
@@ -262,7 +276,147 @@ fn record_incidents(
             ))
         ));
     } else {
-        assert_eq!(store.incidents().len() as u64, n);
+        assert!(store.incidents().len() as u64 >= n);
     }
     arenas
+}
+
+/// A finalised head the adapter reports, changing nothing: an ordinary adapter input.
+fn head() -> AdapterInput {
+    AdapterInput::Head {
+        head: ledger_core::settlement::FinalisedHead {
+            height: 1,
+            next_seq: 0,
+        },
+        nonces: Vec::new(),
+    }
+}
+
+/// Fill a generation-0 book's settlement leaves with `n` incidents of mixed kinds, as the old
+/// layout held them: 16 gaps (each in the gaps leaf and an incident), re-scan differences
+/// (`Missing`, a position and a digest, 30 a re-scan) for about a third, and `Unassociated`
+/// records for the rest.
+fn record_mixed(fx: &mut Fx<Modelled>, adapter: Caller, source: SourceId, n: u64) {
+    let gaps = 16u64.min(n);
+    for g in 0..gaps {
+        let ctx = fx.ctx(adapter);
+        fx.replica
+            .adapter(
+                &ctx,
+                AdapterInput::Gap(ledger_core::settlement::Gap {
+                    from: 2_000_000 + g * 10,
+                    to: 2_000_000 + g * 10 + 5,
+                    reason: ledger_core::settlement::GapReason::Unreadable,
+                }),
+            )
+            .unwrap();
+        fx.synced();
+    }
+    let missing = (n - gaps) / 3;
+    let mut done = 0;
+    while done < missing {
+        let k = 30.min(missing - done);
+        let from = 1_000_000 + done;
+        let layer = (from..from + k)
+            .map(|seq| {
+                let mut d = [0xC3; 32];
+                d[..8].copy_from_slice(&seq.to_be_bytes());
+                (seq, d)
+            })
+            .collect();
+        let ctx = fx.ctx(adapter);
+        fx.replica
+            .adapter(
+                &ctx,
+                AdapterInput::Rescan {
+                    from,
+                    to: from + k,
+                    layer,
+                },
+            )
+            .unwrap();
+        fx.synced();
+        done += k;
+    }
+    record_incidents(fx, adapter, source, n - gaps - missing, false);
+    let store = fx.replica.state().settlement();
+    assert_eq!(store.incidents().len() as u64, n);
+    assert_eq!(store.gaps().len() as u64, gaps);
+}
+
+/// `T-043-08`, `REQ-RT-1`: a book that holds `ALEDGENT_SWITCH_INCIDENTS` incidents in the old
+/// layout (default 520, of mixed kinds and with gaps; the canary that halted held 528) moves them
+/// to the audit trail [`MOVE_PER_INPUT`] at a time. The switch input is an adapter input, as in
+/// production, and moves one chunk (the adapter's own move waits for the next input); every
+/// input of the move fits the guest's arena, and none costs more than the book's last
+/// old-layout input did.
+#[test]
+fn t043_08_the_move_fits_the_arena_input_by_input() {
+    let n = env("ALEDGENT_SWITCH_INCIDENTS", 520);
+    let _one = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut fx = modelled();
+    let (adapter, source) = configure(&mut fx);
+    record_mixed(&mut fx, adapter, source, n);
+    let before_move = *fx.driver.port().arenas.last().unwrap();
+    let emitted = fx.replica.state().audit().emitted();
+    // The upgrade, taken at an adapter input.
+    let held = HeldCode::default();
+    let h = held.version(1);
+    let checked = core_binding::staging::fetch(&held, &h, 0).unwrap();
+    fx.driver.port_mut().stage_code(checked).unwrap();
+    let at = fx.driver.seq() + 2;
+    let c = fx.ctx(fx.operator());
+    fx.replica
+        .upgrade(&c, h, at, b"f043: the chained generation")
+        .unwrap();
+    fx.synced();
+    assert_eq!(fx.driver.seq() + 1, at);
+    let ctx = fx.ctx(adapter);
+    fx.replica.adapter(&ctx, head()).unwrap();
+    fx.synced();
+    assert_eq!(fx.driver.writer().generation, CHAINED_SETTLEMENT);
+    let per = ledger_core::ledger::settlement::MOVE_PER_INPUT as u64;
+    assert_eq!(
+        fx.replica.state().settlement().incidents().len() as u64,
+        n - per,
+        "the switch input moves one chunk, an adapter input or not"
+    );
+    assert!(fx.replica.state().settlement().gaps().is_empty());
+    let mut arenas = vec![*fx.driver.port().arenas.last().unwrap()];
+    let mut inputs = 0;
+    while !fx.replica.state().settlement().incidents().is_empty() {
+        let ctx = fx.ctx(adapter);
+        fx.replica.adapter(&ctx, head()).unwrap();
+        fx.synced();
+        arenas.push(*fx.driver.port().arenas.last().unwrap());
+        inputs += 1;
+        assert!(inputs <= n, "the move does not end");
+    }
+    assert_eq!(inputs, n.saturating_sub(per).div_ceil(per));
+    let moved = fx
+        .replica
+        .state()
+        .audit()
+        .outbox()
+        .filter(|r| r.audit_seq >= emitted && r.class == AuditClass::SettlementIncident)
+        .count() as u64;
+    assert_eq!(moved, n, "every incident on the audit trail");
+    let peak = *arenas.iter().max().unwrap();
+    println!(
+        "moving {n} incidents, {per} an input: the switch input (an adapter input) {} B, then \
+         {inputs} adapter inputs, the largest {peak} B (the last old-layout input took \
+         {before_move} B)",
+        arenas[0]
+    );
+    assert!(
+        peak <= GUEST_HEAP - RUNTIME_MARGIN,
+        "an input of the move takes {peak} B of the guest's arena"
+    );
+    assert!(
+        peak < before_move,
+        "an input of the move ({peak} B) costs more than the book's last old-layout input \
+         ({before_move} B)"
+    );
 }
