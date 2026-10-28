@@ -44,11 +44,26 @@ d2=$("$here/core-code-publish.sh" "$repo" "$version" "$work/set" "$work/layer.ta
 [ "$d1" = "$d2" ] || fail "publishing the same set again changed the digest"
 grep -q "nothing pushed" "$work/p2.log" || fail "the second publish pushed"
 
+# The image is the layer, once, labelled with its source.
+crane config "$repo@$d1" | jq -e --arg d "sha256:$(sha256sum "$work/layer.tar" | cut -d' ' -f1)" \
+  '.rootfs.diff_ids == [$d] and .config.Labels["org.opencontainers.image.source"] == "https://github.com/bloque-app/aledgent"' >/dev/null \
+  || fail "the published image is not the layer with its source label"
+[ "$(crane manifest "$repo@$d1" | jq '.layers | length')" = 1 ] || fail "the published image is not one layer"
+
+# The same files under the tag, but not the image this script publishes: no label, or a second layer.
+crane append -f "$work/layer.tar" -t "$repo-nolabel:code-$version" >/dev/null
+if "$here/core-code-publish.sh" "$repo-nolabel" "$version" "$work/set" "$work/layer.tar" >/dev/null 2>"$work/p4.log"; then fail "an unlabelled image was accepted"; fi
+grep -q "with the label" "$work/p4.log" || fail "unlabelled image refused for another reason: $(cat "$work/p4.log")"
+printf 'y' >"$work/extra"; tar -C "$work" -cf "$work/extra.tar" extra
+crane append -b "$repo@$d1" -f "$work/extra.tar" -t "$repo-twolayers:code-$version" >/dev/null
+if "$here/core-code-publish.sh" "$repo-twolayers" "$version" "$work/set" "$work/layer.tar" >/dev/null 2>"$work/p5.log"; then fail "a two-layer image was accepted"; fi
+grep -q "not one layer" "$work/p5.log" || fail "two-layer image refused for another reason: $(cat "$work/p5.log")"
+
 # A different set under the same code version is refused (a code version's files never change).
 mkdir "$work/other"; head -c 1500 /dev/urandom >"$work/other/$(head -c 32 /dev/urandom | xxd -p -c 64)"
 python3 -I "$here/pack-code-layer.py" "$work/other" "$work/other.tar"
 if "$here/core-code-publish.sh" "$repo" "$version" "$work/other" "$work/other.tar" >/dev/null 2>"$work/p3.log"; then fail "a different set was accepted"; fi
-grep -q "never change" "$work/p3.log" || fail "refused for another reason: $(cat "$work/p3.log")"
+grep -qE "never change" "$work/p3.log" || fail "refused for another reason: $(cat "$work/p3.log")"
 
 # Read it back, as the workflow reads a predecessor.
 got=$("$here/core-code-read.sh" "$repo@$d1" "$work/read")
