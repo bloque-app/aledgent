@@ -18,6 +18,8 @@ path = [
   "services/ingress/tests/fixtures/stream/*.key",
   # The code-history gate's recorded book (T-037-12): bytes a test build wrote, never edited.
   "crates/core-binding/tests/fixtures/code-history/*",
+  # F-043's generation-0 settlement book (T-043-06): bytes develop's build wrote, never edited.
+  "crates/core-binding/tests/fixtures/f043-generation-0/*",
   "**/*.txt",
 ]
 precedence = "aggregate"
