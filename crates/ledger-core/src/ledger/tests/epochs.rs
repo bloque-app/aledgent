@@ -432,7 +432,10 @@ fn t043_14_an_earlier_sequence_is_refused() {
 /// An instruction acknowledged and submitted, taken to `state` by the heads and the clock: the
 /// start is refused while it is live, whatever its state short of a terminal one (decision 2).
 fn in_flight_refuses(to_review: bool) {
-    let (mut fx, adapter) = as_on_test();
+    // Built on the chain before the reset, as on test before it (a later dropped head would arm
+    // the guard of `T-043-17` first).
+    let (mut fx, adapter) = book(SETTLEMENT_EPOCHS);
+    head(&mut fx, adapter, 142, 13);
     let (alice, acct) = funded(&mut fx, 100);
     declare(&mut fx, adapter, true, 10).unwrap();
     let ctx = fx.ctx(alice);
@@ -460,6 +463,8 @@ fn in_flight_refuses(to_review: bool) {
     } else {
         crate::lifecycle::State::Expired
     };
+    // The new chain's head, dropped.
+    head(&mut fx, adapter, 207, 2);
     assert_eq!(fx.ledger.operation(&ctx.op).unwrap().state(), expected);
     assert_eq!(
         start(&mut fx, adapter, sequence(2, RESET, BOOK)),
