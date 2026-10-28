@@ -248,7 +248,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
     ///
     /// - the gaps leaf is emptied, the end of its highest gap becomes the gap end `proof` reads,
     ///   and a gap the incidents leaf has no record of (none should exist) gets its audit record;
-    /// - the first [`MOVE_PER_INPUT`] incidents become audit records ([`Ledger::move_incidents`]).
+    /// - the first [`MOVE_PER_INPUT`] incidents become audit records (`Ledger::move_incidents`).
     ///
     /// The rest move [`MOVE_PER_INPUT`] at a time, at the start of each settlement adapter input
     /// that follows: moving them all at once could take more than the guest's arena (about 2.4 KB

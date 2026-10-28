@@ -278,7 +278,7 @@ pub struct Ledger<S: LeafStore, V: VaultBackend> {
     /// audit trail at its end ([`Ledger::switch_settlement`], `T-043-08`). Not service state.
     switching: bool,
     /// Whether the current input has moved its chunk of the incidents an earlier generation kept
-    /// in the book's state ([`Ledger::move_incidents`], `T-043-08`): at most one chunk an input,
+    /// in the book's state (`Ledger::move_incidents`, `T-043-08`): at most one chunk an input,
     /// however many adapter calls it holds. Not service state.
     moved_in_input: bool,
 }
