@@ -1,0 +1,32 @@
+<!--
+Copyright (c) 2026 Pagos Cube LLC
+SPDX-License-Identifier: CC-BY-4.0
+-->
+
+# F-043 — tasks
+
+**In progress** (amendment 0040; the owner ruled the design on 2026-10-26, in two rounds). `T-043-02` is built. Traces: `REQ-IN-5`, `REQ-SL-9`,
+`REQ-SL-10`, `REQ-SA-7`, `REQ-AT-1`, `AC-D2.1` (as amendment 0040 restates them), `REQ-SL-5`, `REQ-PR-9`, `NFR-6`, `NFR-22`.
+
+| ID | Task | Traces | Done when |
+|---|---|---|---|
+| T-043-01 | **The design.** Amendment 0040, this plan, these tasks and the `PLAN.md` row. Docs only | `REQ-IN-5`, `REQ-SL-9` | The files are in `amendments/` and `features/F-043-chained-settlement/`, the row is in `PLAN.md`, and `cargo xtask spec-ids --check` passes |
+| T-043-02 | **The contract, one release.** The head cell `(position, digest, start)` at `0x0000_000C` and its read `chain_head`; the labelled fold in `append`; the full reset in `set_anchor_head` (v2's stored entries removed, at most 64; `Head` to `{ base, 0, 0 }`; the cell cleared); `from` on `Deposited` and `call` on `Refused`; `prune_inbox` and `inbox_entry` removed; bindings kept across a reset; `check_invariants` | `REQ-SL-9`, `REQ-SL-10`, `REQ-SL-5`, `REQ-AS-8` | **Done.** The contract unit tests of the plan pass: every entry kind rebuilt from its event folds to the head; a failed frame drops its chain write; the live test and prod cells upgrade byte for byte and reset in full; no entry is stored. The reset's weight per entry and its refund account are measured on a fork. The build's code hash is recorded from CI |
+| T-043-03 | **The upgrade, rehearsed, and the gate's scripts.** `drive.mjs read` and `e2e.mjs` fold the events and compare with `chain_head`, in place of the stored entries. zombienet: v2 to this code with entries before and after, a failing frame, a reset, and the per-refusal weight against `REFUSAL_RESERVE`. Chopsticks: `publish_upgrade`, `upgrade` and `set_anchor_head` on forks of the test and prod instances | `REQ-SL-9` | The fold of the events equals the head at every step. A failed frame's events are gone with it. Each call passes as the required origin and fails as any other. The release gate passes against this code |
+| T-043-04 | **Settle verifies at sync.** Head read and events read (rpc, light client, `fake`); an optional history endpoint for catch-up; the accepted head and block in `settle_cursors`; `observe` folds only new entries and accepts a head after the core took in every entry; a mismatch is re-read once, then alerts and stops; the entries read from events, not `inbox_entry` (gone); readers of `next_seq` unchanged (it is the chain position after the reset); the cursor of an instance reset with its re-founding; the operator's gap through the adapter's source, after which the adapter accepts the layer's head; the adapter's own `Pruned` gap removed; first start just after the reset, or at instantiation if never reset | `REQ-IN-5`, `REQ-SA-7`, `REQ-IN-3`, `REQ-IN-4` | An idle sync is one read (counted in a test). Hidden, extra and altered entries each stop the adapter at the first new position with an alert. Behind more than 256 blocks: unreadable without a history endpoint, caught up with one |
+| T-043-05 | **Settle's re-scan removed.** `Adapter::rescan`, its timer, `rescan_every` and `rescan_window` (ignored with a warning for one release, then refused), `settle.json`; `ops`' restore step | `REQ-IN-5` | No code path re-reads a range on a timer. The restore resumes from the accepted head (`ops/tests/restore.rs`) |
+| T-043-06 | **The core's re-scan path removed.** `Ledger::rescan`, the ingress route, `Incident::Missing` and `Incident::Unknown`, the indexes `RESCAN_RECORDED` and `INGESTED_AT`. `Call::Rescan` stays decodable and is refused | `REQ-IN-5`, `NFR-22` | An old input log with re-scans replays under its own code. The new code refuses `Rescan` |
+| T-043-07 | **Incidents and gaps to the audit trail.** A new audit class; each settlement incident and each gap is an audit record in the batch that would have written its leaf; the `gaps` and `incidents` leaves go; the gap end (one `u64`) replaces `gap_within` in `proof`; export records updated | `REQ-IN-5`, `NFR-6`, `REQ-AT-1`, `REQ-SA-7` | Recording an incident or a gap writes no leaf that grows. `proof` gives the same answers as with the list over the existing tests. The heap test stays flat over 10,000 incidents |
+| T-043-08 | **Running books upgrade in place.** The stateful migration for `T-037-19`: existing incidents and gaps written as audit records, the gap end set, the leaves dropped | `NFR-22`, `REQ-RT-17` | Depends on `T-037-19` and its replay gate. A book with incidents and gaps in the old layout upgrades in place with each one on the audit trail and the same `proof` answers |
+| T-043-09 | **Readers and runbooks.** `crates/verify` reads a same-block superseded anchor after the upgrade from its `Anchored` event, and assigns a carried anchor to its sequence by `Some(p) != this.previous`, not by position (`rpc.rs:540`); the alert becomes `AledgentSettlementChainMismatch`; every runbook naming the re-scan, and `F-018`'s restore step, rewritten | `REQ-PR-4`, `NFR-9` | `ops/tests/runbooks.rs` and `ops/tests/alerts.rs` pass. The verifier's reset tests pass on this code |
+| T-043-10 | **Rollout on test.** The upgrade by the licence owner, then the full reset by governance, before the next settlement on test; then settle and the core with `F-043` | `REQ-IN-5` | Two idle syncs of one read each, and one sync with new entries folded, on test |
+| T-043-11 | **Rollout on prod.** The upgrade by the licence-owning community's referendum, governance named by the admin, then the full reset as governance, then settle and the core | `REQ-IN-5` | As `T-043-10`, on prod |
+| T-043-12 | **Withdrawn** (26 Oct evening ruling): there is no later contract version; `T-043-02` removes `prune_inbox` and the stored entries in one release | `REQ-SL-10` | — |
+
+## Order
+
+`T-043-01`. Then `T-043-02` and `T-043-06` side by side. `T-043-03` and `T-043-04` follow `T-043-02`, and
+`T-043-05` goes with `T-043-04`. `T-043-07` follows `T-043-06`. `T-043-08` follows `T-043-07` and `T-037-19`.
+`T-043-09` runs beside them. Then `T-043-10` and `T-043-11`. The adapter (`T-043-04`, `T-043-05`) can ship before the core's cleanup
+(`T-043-06` to `T-043-08`): it stops calling the re-scan, and the core keeps its leaves until `T-037-19` moves
+them.

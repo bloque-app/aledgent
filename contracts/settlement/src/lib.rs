@@ -24,26 +24,29 @@
 //!   divergence (amendment 0011, `REQ-AS-8`).
 //! - **Withdrawals are bounded per asset per window** (`NFR-8`). No bound, no withdrawal.
 //! - **Anchors by sequence**, from one, with no gaps. Only the latest is kept, overwritten in place
-//!   by the next (owner's ruling of 2026-10-11): anchoring adds no storage item but its inbox
-//!   entry, which the admin can prune once it is no longer the latest. An identical replay of the
-//!   latest is a no-op; an older number is refused. A deployment that ran the earlier code, which
-//!   kept every anchor by number, is migrated by its next state-changing messages
-//!   ([`AnchorMigration`](types::AnchorMigration)).
-//! - **An ordered inbox**: every movement, anchor, binding and refusal is one entry, numbered from
-//!   zero with no gaps, readable by position (`REQ-SL-9`).
-//! - **Keys and an admin.** The admin rotates keys, sets bounds and prunes the inbox.
-//! - **Governance, and anchor sequences** (amendment 0039, `[PENDING AMENDMENT 0039]`). A
-//!   deployment's governance (an account the admin names once, then only governance replaces:
-//!   on Kreivo, the licence-owning community's account, reached by a referendum) can start a new
-//!   anchor sequence for a re-founded book, as a relay chain's governance sets a parachain's head
+//!   by the next (owner's ruling of 2026-10-11): anchoring adds no storage item. An identical
+//!   replay of the latest is a no-op; an older number is refused. A deployment that ran the
+//!   earlier code, which kept every anchor by number, is migrated by its next state-changing
+//!   messages ([`AnchorMigration`](types::AnchorMigration)).
+//! - **A chain of entries** (amendment 0040, `[PENDING AMENDMENT 0040]`): every movement, anchor,
+//!   binding and refusal is one entry, numbered from zero with no gaps (`REQ-SL-9`). The contract
+//!   stores none of them. It keeps one [`ChainHead`](types::ChainHead), the position and digest
+//!   after the last entry, where each entry's digest covers the one before it; each entry is in an
+//!   event that carries all of it. A reader folds the events since the head it last accepted and
+//!   compares the result with the head.
+//! - **Keys and an admin.** The admin rotates keys and sets bounds.
+//! - **Governance, and anchor sequences** (amendments 0039 and 0040). A deployment's governance
+//!   (an account the admin names once, then only governance replaces: on Kreivo, the
+//!   licence-owning community's account, reached by a referendum) can start a new anchor sequence
+//!   for a re-founded book, as a relay chain's governance sets a parachain's head
 //!   ([`set_anchor_head`](settlement::Settlement::set_anchor_head)). It sets the next anchor
-//!   number and names the book; it moves no value and touches no position, bound, binding, key or
-//!   inbox entry, and the inbox's numbering runs on. The previous sequence's latest anchor stays in
-//!   current state; earlier ones stay where they were.
+//!   number, names the book, and starts a new chain of entries at position 0 with the zero digest,
+//!   removing every entry the earlier code stored. It moves no value and touches no position,
+//!   bound, binding or key. The previous sequence's latest anchor stays in current state.
 //!
 //! Nothing is keyed by an account reference, an operation reference or anything a holder supplies
-//! (`REQ-SL-5`, `REQ-SL-10`). Storage is keyed by inbox sequence and asset only (and, until a
-//! deployment of the earlier code is migrated, by anchor number).
+//! (`REQ-SL-5`, `REQ-SL-10`). Storage is keyed by asset only (and, until a deployment of the
+//! earlier code is migrated or reset, by anchor number and inbox position).
 //!
 //! Value moves through Kreivo's own contract API, its chain extension: `deposit` pulls from the
 //! caller, `transfer` pays out, `balance` reads the contract's holding. The one exception is a
@@ -84,20 +87,24 @@ pub mod settlement {
     pub struct Settlement {
         /// The deployment's identity: admin, keys, attestation key.
         registration: Lazy<Registration, ManualKey<0x0000_0001>>,
-        /// Where the anchors and the inbox have reached.
+        /// Where the anchors and the chain of entries have reached.
         head: Lazy<Head, ManualKey<0x0000_0002>>,
         /// **Legacy.** Every anchor by number, as the code before 2026-10-11 kept it. Never written
         /// now: the migration reads the highest to seed `latest_anchor` and removes them all
         /// ([`migrate_anchors`](Self::migrate_anchors)). Declared so that its key stays reserved.
         anchors: Mapping<AnchorNumber, AnchorRecord, ManualKey<0x0000_0003>>,
-        /// The ordered record of every movement, anchor and refusal.
+        /// **Legacy.** Every entry by position, as the code before amendment 0040 stored it. Never
+        /// written or read now: `set_anchor_head` removes what is left ([`ChainHead::start`]).
+        /// Declared so that its key stays reserved.
         inbox: Mapping<InboxSeq, InboxEntry, ManualKey<0x0000_0004>>,
         /// The deployment's position per asset, as the inbox accounts for it.
         positions: Mapping<AssetId, Balance, ManualKey<0x0000_0005>>,
         /// The withdrawal bound per asset, with its current window.
         bounds: Mapping<AssetId, WithdrawalWindow, ManualKey<0x0000_0006>>,
-        /// The inbox position of each bound asset's `Bound` entry (`Call::Bind`). Written once per
-        /// asset, never removed; its entry is never pruned.
+        /// Each bound asset's mark (`Call::Bind`): the position of its `Bound` entry in the chain
+        /// it was bound in. Written once per asset and never removed, a reset included: an asset
+        /// is bound once, ever (`REQ-AS-8`). After a reset the position names an entry of an
+        /// earlier chain; its `Bound` event, in the block that recorded it, tells which.
         bound: Mapping<AssetId, InboxSeq, ManualKey<0x0000_0007>>,
         /// The latest anchor, overwritten in place by each new one. Absent until the first anchor,
         /// or, on a deployment of the earlier code, until the migration seeds it.
@@ -111,6 +118,9 @@ pub mod settlement {
         /// The deployment's governance: the only caller of `set_anchor_head`. Absent until the
         /// admin names it; from then on only governance replaces it.
         governance: Lazy<AccountId, ManualKey<0x0000_000B>>,
+        /// The head of the chain of entries (amendment 0040), overwritten by each entry. Absent
+        /// until the first entry under this code, and after each reset.
+        chain: Lazy<ChainHead, ManualKey<0x0000_000C>>,
     }
 
     /// The root key of `latest_anchor`.
@@ -122,6 +132,8 @@ pub mod settlement {
     /// The root key of `governance` (read by the tests that pin the layout).
     #[cfg(test)]
     pub(crate) const GOVERNANCE_KEY: u32 = 0x0000_000B;
+    /// The root key of `chain`.
+    pub(crate) const CHAIN_KEY: u32 = 0x0000_000C;
 
     /// The deployment registered: the contract was instantiated.
     #[ink(event)]
@@ -145,12 +157,16 @@ pub mod settlement {
         pub attestation_key: Option<AttestationKey>,
     }
 
-    /// Value arrived at the position, recorded at inbox position `seq`.
+    /// Value arrived at the position, recorded at position `seq` of the chain. With its block's
+    /// number, it carries all of its entry (`InboxEvent::Deposited`), as every entry's event does.
     #[ink(event)]
     #[derive(Debug, PartialEq, Eq)]
     pub struct Deposited {
-        /// The inbox position.
+        /// The position.
         pub seq: InboxSeq,
+        /// Who sent it: a plain account, or the sending deployment's contract account (amendment
+        /// 0040).
+        pub from: AccountId,
         /// The opaque account reference it was addressed to.
         pub account_ref: AccountRef,
         /// The asset.
@@ -159,11 +175,11 @@ pub mod settlement {
         pub amount: Balance,
     }
 
-    /// Value left the position, recorded at inbox position `seq`.
+    /// Value left the position, recorded at position `seq` of the chain.
     #[ink(event)]
     #[derive(Debug, PartialEq, Eq)]
     pub struct Withdrawn {
-        /// The inbox position.
+        /// The position.
         pub seq: InboxSeq,
         /// The deployment's operation reference. Also the event's topic.
         #[ink(topic)]
@@ -176,11 +192,11 @@ pub mod settlement {
         pub amount: Balance,
     }
 
-    /// An anchor was stored, recorded at inbox position `seq`.
+    /// An anchor was stored, recorded at position `seq` of the chain.
     #[ink(event)]
     #[derive(Debug, PartialEq, Eq)]
     pub struct Anchored {
-        /// The inbox position.
+        /// The position.
         pub seq: InboxSeq,
         /// The deployment's operation reference. Also the event's topic.
         #[ink(topic)]
@@ -191,12 +207,12 @@ pub mod settlement {
         pub commitment: Commitment,
     }
 
-    /// A book-only asset was bound at zero divergence, recorded at inbox position `seq`: the
+    /// A book-only asset was bound at zero divergence, recorded at position `seq` of the chain: the
     /// deployment's holding of it is now its position (`REQ-AS-8`).
     #[ink(event)]
     #[derive(Debug, PartialEq, Eq)]
     pub struct Bound {
-        /// The inbox position.
+        /// The position.
         pub seq: InboxSeq,
         /// The deployment's operation reference. Also the event's topic.
         #[ink(topic)]
@@ -207,15 +223,17 @@ pub mod settlement {
         pub amount: Balance,
     }
 
-    /// A call was refused and moved nothing, recorded at inbox position `seq`.
+    /// A call was refused and moved nothing, recorded at position `seq` of the chain.
     #[ink(event)]
     #[derive(Debug, PartialEq, Eq)]
     pub struct Refused {
-        /// The inbox position.
+        /// The position.
         pub seq: InboxSeq,
         /// The deployment's operation reference. Also the event's topic.
         #[ink(topic)]
         pub operation_ref: OperationRef,
+        /// The call, as submitted (amendment 0040).
+        pub call: Call,
         /// Why.
         pub reason: Refusal,
     }
@@ -248,9 +266,10 @@ pub mod settlement {
         pub governance: AccountId,
     }
 
-    /// Governance started a new anchor sequence: the next anchor is `base + 1`, and inbox entries
-    /// from `from_seq` on belong to it. Nothing else changed. A verifier reads this event (or
-    /// `anchor_epoch()`) to tell one book's anchors from another's on the same instance.
+    /// Governance started a new anchor sequence: the next anchor is `base + 1`, and a new chain of
+    /// entries starts at position `from_seq` (0) with the zero digest. A verifier reads this event
+    /// (or `anchor_epoch()`) to tell one book's anchors and entries from another's on the same
+    /// instance.
     #[ink(event)]
     #[derive(Debug, PartialEq, Eq)]
     pub struct AnchorHeadSet {
@@ -259,7 +278,7 @@ pub mod settlement {
         pub epoch: u32,
         /// The number the new sequence starts after.
         pub base: AnchorNumber,
-        /// The inbox position of the new sequence's first entry.
+        /// The position of the new sequence's first entry: 0.
         pub from_seq: InboxSeq,
         /// The opaque name of the book the new sequence anchors.
         pub book: Commitment,
@@ -267,23 +286,10 @@ pub mod settlement {
         pub previous: Option<LatestAnchor>,
     }
 
-    /// Movement, refusal and superseded anchor entries in `[from, to)` were pruned; `removed` of
-    /// them existed.
-    #[ink(event)]
-    #[derive(Debug, PartialEq, Eq)]
-    pub struct InboxPruned {
-        /// The first position covered.
-        pub from: InboxSeq,
-        /// One past the last position covered.
-        pub to: InboxSeq,
-        /// How many entries were removed.
-        pub removed: u64,
-    }
-
     impl Settlement {
         /// Register the deployment. Called once, when the contracts store instantiates the contract.
         ///
-        /// `admin` rotates keys, sets withdrawal bounds and prunes the inbox; `keys` submit calls.
+        /// `admin` rotates keys and sets withdrawal bounds; `keys` submit calls.
         /// At most [`MAX_KEYS`] keys, no duplicates. An empty set is allowed: nothing can be withdrawn
         /// or anchored until the admin sets keys.
         #[ink(constructor, selector = 0x0000_0001)]
@@ -300,7 +306,7 @@ pub mod settlement {
                 attestation_key,
             });
             this.head.set(&Head::default());
-            this.env().emit_event(Registered {
+            this.emit(Registered {
                 admin,
                 keys,
                 attestation_key,
@@ -310,7 +316,7 @@ pub mod settlement {
 
         /// Execute a batch of calls. Key only.
         ///
-        /// Each call gets exactly one outcome, returned in order and recorded in the inbox: applied,
+        /// Each call gets exactly one outcome, returned in order and recorded in the chain: applied,
         /// or refused with a reason. A refused call moves nothing and does not undo the calls before
         /// or after it. The message itself fails, and records nothing, only when the batch as a whole
         /// is at fault: the caller is not a key, it is empty, or it has more than [`MAX_CALLS`] calls.
@@ -357,8 +363,9 @@ pub mod settlement {
         /// else's**: `execute` calls it on the contract itself; any other caller is refused
         /// (`NotKey`) and nothing happens.
         ///
-        /// Takes the inbox's head as the batch has it and returns it as the call leaves it, with the
-        /// call's outcome. The head itself is stored by the batch, once, at its end. A refusal the
+        /// Takes the head as the batch has it and returns it as the call leaves it, with the call's
+        /// outcome. The head itself is stored by the batch, once, at its end; the chain's head is
+        /// stored by each entry, in this frame, so a frame that fails takes its write with it. A refusal the
         /// call earns (a bound, a position, Kreivo's reason) is recorded here like any other. If
         /// this frame fails instead, everything it did is rolled back and the batch records the
         /// call as [`Refusal::CallFailed`].
@@ -378,7 +385,7 @@ pub mod settlement {
         /// API (`deposit`) and records the arrival. The call itself, with the amount in its
         /// arguments, is the depositor's consent: no approval is needed and none is left behind.
         /// Only the caller's own funds can be pulled: the API takes them from whoever called this
-        /// contract, the same account recorded as `from`. Returns the inbox position.
+        /// contract, the same account recorded as `from`. Returns the entry's position.
         ///
         /// Kreivo keeps the depositor's asset account alive: a deposit that would leave it below
         /// the asset's minimum balance is refused (`DepositRefused`), and records nothing.
@@ -411,7 +418,7 @@ pub mod settlement {
 
         /// Record value another deployment has just moved to this one. Only a deployment running
         /// this contract's code can call it, and it does so only right after moving `amount` of
-        /// `asset` here, in the same call. Returns the inbox position.
+        /// `asset` here, in the same call. Returns the entry's position.
         #[ink(message, selector = 0x0000_0102)]
         pub fn credit(
             &mut self,
@@ -450,7 +457,7 @@ pub mod settlement {
             registration.keys = keys.clone();
             registration.attestation_key = attestation_key;
             self.registration.set(&registration);
-            self.env().emit_event(KeysSet {
+            self.emit(KeysSet {
                 keys,
                 attestation_key,
             });
@@ -487,50 +494,8 @@ pub mod settlement {
                 }
                 None => self.bounds.remove(asset),
             }
-            self.env().emit_event(WithdrawalBoundSet { asset, bound });
+            self.emit(WithdrawalBoundSet { asset, bound });
             Ok(())
-        }
-
-        /// Remove the entries of the inbox in `[pruned_to, up_to)`: movements, refusals and
-        /// anchors other than the latest. Admin only.
-        ///
-        /// Bind entries stay, and so does the latest anchor's entry (owner's ruling of 2026-10-11;
-        /// before it, every anchor entry stayed). At most [`MAX_PRUNE`] positions per call. Returns
-        /// how many entries were removed. Each removed entry's storage deposit is released to the
-        /// signer of the call (`pallet-contracts`: a refund goes to the call's origin).
-        #[ink(message, selector = 0x0000_0202)]
-        pub fn prune_inbox(&mut self, up_to: InboxSeq) -> Result<u64, Error> {
-            self.ensure_admin()?;
-            let mut head = self.load_head();
-            let from = head.pruned_to;
-            if up_to <= from || up_to > head.next_seq {
-                return Err(Error::InvalidPruneRange);
-            }
-            if up_to.saturating_sub(from) > MAX_PRUNE {
-                return Err(Error::TooManyToPrune);
-            }
-            self.migrate_anchors(&head);
-            let latest = self.load_latest_anchor(&head).map(|a| a.seq);
-            let mut removed = 0u64;
-            for seq in from..up_to {
-                if Some(seq) == latest {
-                    continue;
-                }
-                if let Some(entry) = self.inbox.get(seq) {
-                    if !entry.event.is_kept() {
-                        self.inbox.remove(seq);
-                        removed = removed.saturating_add(1);
-                    }
-                }
-            }
-            head.pruned_to = up_to;
-            self.head.set(&head);
-            self.env().emit_event(InboxPruned {
-                from,
-                to: up_to,
-                removed,
-            });
-            Ok(removed)
         }
 
         /// Name or replace the deployment's governance (amendment 0039). While none is set, the
@@ -555,26 +520,29 @@ pub mod settlement {
             }
             self.migrate_anchors(&self.load_head());
             self.governance.set(&governance);
-            self.env().emit_event(GovernanceSet { governance });
+            self.emit(GovernanceSet { governance });
             Ok(())
         }
 
-        /// Start a new anchor sequence for a re-founded book: the next anchor is `base + 1`.
-        /// Governance only (amendment 0039; `OQ-68`).
+        /// Start a new anchor sequence for a re-founded book: the next anchor is `base + 1`, and a
+        /// new chain of entries starts at position 0 with the zero digest. Governance only
+        /// (amendments 0039 and 0040; `OQ-68`).
         ///
         /// `expected_last` must be the head's `last_anchor` as it stands (`HeadMoved` otherwise),
         /// so a reset decided days before it is enacted cannot land after an anchor it did not
         /// know of. `book` is an opaque 32-byte name of the book the new sequence anchors (its
         /// genesis or seed digest).
         ///
-        /// It writes the head's `last_anchor` (to `base`), the sequence's record and nothing else
-        /// of the contract's state: no position, bound, binding, key, attestation key or
-        /// governance changes, no value moves, the inbox's `next_seq` and `pruned_to` stay, and no
-        /// inbox entry is written or rewritten. The previous sequence's latest anchor moves from
-        /// `latest_anchor` into the sequence's record (`previous`), so it stays in current state;
-        /// its inbox entry, which `prune_inbox` kept while it was the latest, is removed if a prune
-        /// has already passed it (nothing else would reach it), and is prunable otherwise. Earlier
-        /// anchors are where they were: in their entries until pruned, their events and the
+        /// **A full reset** (amendment 0040, the owner's ruling of 2026-10-26): it sets the head to
+        /// `{ last_anchor: base, next_seq: 0, pruned_to: 0 }`, clears the chain's head (which then
+        /// reads as `(0, zeros, 0)`), and removes every entry the earlier code stored: positions
+        /// `[0, start)` of the chain's head ([`ChainHead::start`]), at most [`MAX_RESET_CLEAR`]
+        /// (`TooManyStoredEntries` otherwise). Each removed entry's storage deposit is released to
+        /// the origin of the call (`pallet-contracts` refunds to the origin of the outermost call;
+        /// on Kreivo, the community account a referendum dispatches as). The previous sequence's
+        /// latest anchor moves from `latest_anchor` into the sequence's record (`previous`), so it
+        /// stays in current state. No position, bound, binding, key, attestation key or governance
+        /// changes, and no value moves. Earlier anchors and entries are in their events and the
         /// layer's finalized history.
         ///
         /// Refused while the earlier code's anchor records are unmigrated (`MigrationPending`).
@@ -588,7 +556,7 @@ pub mod settlement {
             if self.governance.get() != Some(self.env().caller()) {
                 return Err(Error::NotGovernance);
             }
-            let mut head = self.load_head();
+            let head = self.load_head();
             if head.last_anchor != expected_last {
                 return Err(Error::HeadMoved);
             }
@@ -603,6 +571,10 @@ pub mod settlement {
             {
                 return Err(Error::MigrationPending);
             }
+            let stored = self.load_chain(&head).start;
+            if stored > MAX_RESET_CLEAR {
+                return Err(Error::TooManyStoredEntries);
+            }
             let epoch = current
                 .map_or(0, |e| e.epoch)
                 .checked_add(1)
@@ -613,13 +585,16 @@ pub mod settlement {
             let previous = self
                 .load_latest_anchor(&head)
                 .or_else(|| current.and_then(|e| e.previous));
-            if let Some(old) = previous {
-                if old.seq < head.pruned_to {
-                    self.inbox.remove(old.seq);
-                }
+            for seq in 0..stored {
+                self.inbox.remove(seq);
             }
+            ink::env::clear_contract_storage(&CHAIN_KEY);
             ink::env::clear_contract_storage(&LATEST_ANCHOR_KEY);
-            head.last_anchor = base;
+            let head = Head {
+                last_anchor: base,
+                next_seq: 0,
+                pruned_to: 0,
+            };
             self.head.set(&head);
             let record = AnchorEpoch {
                 epoch,
@@ -630,7 +605,7 @@ pub mod settlement {
                 previous,
             };
             self.anchor_epoch.set(&record);
-            self.env().emit_event(AnchorHeadSet {
+            self.emit(AnchorHeadSet {
                 epoch,
                 base,
                 from_seq: record.from_seq,
@@ -659,21 +634,25 @@ pub mod settlement {
             self.load_registration()
         }
 
-        /// Where the anchors and the inbox have reached.
+        /// Where the anchors and the chain of entries have reached.
         #[ink(message, selector = 0x0000_0301)]
         pub fn head(&self) -> Head {
             self.load_head()
         }
 
-        /// The inbox entry at `seq`, if it exists and has not been pruned.
-        #[ink(message, selector = 0x0000_0302)]
-        pub fn inbox_entry(&self, seq: InboxSeq) -> Option<InboxEntry> {
-            self.inbox.get(seq)
+        /// The head of the chain of entries (amendment 0040): the next position, the digest after
+        /// the last entry, and where the chain started. A new selector. `inbox_entry(seq)`
+        /// (`0x0000_0302`) is gone with the stored entries, so a caller that still sends it fails
+        /// to dispatch rather than reading "absent"; neither it nor `prune_inbox`'s
+        /// (`0x0000_0202`) is ever reused.
+        #[ink(message, selector = 0x0000_030A)]
+        pub fn chain_head(&self) -> ChainHead {
+            self.load_chain(&self.load_head())
         }
 
         /// The latest anchor, if any: the only one the contract keeps (owner's ruling of
-        /// 2026-10-11). An earlier anchor is read from its `Anchored` inbox entry while it is not
-        /// pruned, from its `Anchored` event, or from this read at a block before the next anchor.
+        /// 2026-10-11). An earlier anchor is read from its `Anchored` event, or from this read at
+        /// a block before the next anchor.
         /// On a deployment of the earlier code not yet migrated, it is read from the legacy record.
         ///
         /// A new selector: `anchor_record(number)` (`0x0000_0303`) is gone, so a caller that still
@@ -695,7 +674,8 @@ pub mod settlement {
             self.bounds.get(asset)
         }
 
-        /// The inbox position of the asset's `Bound` entry, if it was bound (`REQ-AS-8`).
+        /// The position of the asset's `Bound` entry in the chain it was bound in, if it was bound
+        /// (`REQ-AS-8`). A reset leaves it: an asset is bound once, ever.
         #[ink(message, selector = 0x0000_0306)]
         pub fn bound(&self, asset: AssetId) -> Option<InboxSeq> {
             self.bound.get(asset)
@@ -717,7 +697,25 @@ pub mod settlement {
                 anchor_migration: Lazy::new(),
                 anchor_epoch: Lazy::new(),
                 governance: Lazy::new(),
+                chain: Lazy::new(),
             }
+        }
+
+        /// Emit `event`. In tests, also note which contract emitted it and at which block, as
+        /// Kreivo records each contract event (`Contracts::ContractEmitted`, in its block).
+        fn emit<E: ink::env::Event>(&self, event: E) {
+            self.env().emit_event(event);
+            #[cfg(test)]
+            crate::mock::emitted(self.env().account_id(), self.env().block_number());
+        }
+
+        /// The chain's head: the cell, or, absent, a chain with no entry yet starting at `head`.
+        fn load_chain(&self, head: &Head) -> ChainHead {
+            self.chain.get().unwrap_or(ChainHead {
+                position: head.next_seq,
+                digest: [0; 32],
+                start: head.next_seq,
+            })
         }
 
         fn load_registration(&self) -> Registration {
@@ -758,7 +756,7 @@ pub mod settlement {
         /// Migrate a deployment of the code before 2026-10-11, which kept every anchor by number
         /// (`anchors[n]`), one bounded step at a time. Runs at the start of every state-changing
         /// message a key or the admin signs (`execute`, `execute_with_limits`, `set_keys`,
-        /// `set_withdrawal_bound`, `prune_inbox`), after its caller is checked; never in
+        /// `set_withdrawal_bound`, `set_governance`), after its caller is checked; never in
         /// `deposit` or `credit`, whose signers are strangers to the deployment and would
         /// receive the released deposits.
         ///
@@ -814,7 +812,7 @@ pub mod settlement {
             migration.next = last.saturating_add(1);
             if migration.next > migration.end {
                 ink::env::clear_contract_storage(&ANCHOR_MIGRATION_KEY);
-                self.env().emit_event(AnchorsMigrated {
+                self.emit(AnchorsMigrated {
                     through: migration.end,
                 });
             } else {
@@ -830,17 +828,24 @@ pub mod settlement {
             Ok(registration)
         }
 
-        /// Write the next inbox entry. The caller stores `head` afterwards.
+        /// Fold the next entry into the chain (amendment 0040) and store the chain's head; store
+        /// nothing else for it. The caller emits the entry's event and stores `head` afterwards.
         fn append(&mut self, head: &mut Head, event: InboxEvent) -> Result<InboxSeq, Error> {
             let seq = head.next_seq;
-            head.next_seq = seq.checked_add(1).ok_or(Error::SequenceOverflow)?;
-            self.inbox.insert(
-                seq,
-                &InboxEntry {
-                    at: self.env().block_number(),
-                    event,
-                },
+            let mut chain = self.load_chain(head);
+            // The cell and the head advance together, in the same frame.
+            assert!(
+                chain.position == seq,
+                "the chain's head is not at the head's next position"
             );
+            head.next_seq = seq.checked_add(1).ok_or(Error::SequenceOverflow)?;
+            let entry = InboxEntry {
+                at: self.env().block_number(),
+                event,
+            };
+            chain.digest = chain_digest(&chain.digest, seq, &entry_digest(&entry));
+            chain.position = head.next_seq;
+            self.chain.set(&chain);
             Ok(seq)
         }
 
@@ -969,7 +974,7 @@ pub mod settlement {
                                     amount,
                                 },
                             )?;
-                            self.env().emit_event(Withdrawn {
+                            self.emit(Withdrawn {
                                 seq,
                                 operation_ref,
                                 to,
@@ -993,15 +998,6 @@ pub mod settlement {
                                     commitment,
                                 },
                             )?;
-                            // The superseded anchor's entry, if a prune has already passed it
-                            // (it kept it while it was the latest): nothing else would reach it.
-                            if head.pruned_to > 0 {
-                                if let Some(old) = self.load_latest_anchor(head) {
-                                    if old.seq < head.pruned_to {
-                                        self.inbox.remove(old.seq);
-                                    }
-                                }
-                            }
                             // Overwritten in place: the same cell, the same size, no new deposit.
                             self.latest_anchor.set(&LatestAnchor {
                                 number,
@@ -1010,7 +1006,7 @@ pub mod settlement {
                                 seq,
                             });
                             head.last_anchor = number;
-                            self.env().emit_event(Anchored {
+                            self.emit(Anchored {
                                 seq,
                                 operation_ref,
                                 number,
@@ -1037,7 +1033,7 @@ pub mod settlement {
                             self.positions.insert(asset, &position);
                         }
                         self.bound.insert(asset, &seq);
-                        self.env().emit_event(Bound {
+                        self.emit(Bound {
                             seq,
                             operation_ref,
                             asset,
@@ -1066,9 +1062,10 @@ pub mod settlement {
                     reason,
                 },
             )?;
-            self.env().emit_event(Refused {
+            self.emit(Refused {
                 seq,
                 operation_ref,
+                call,
                 reason,
             });
             Ok(Outcome::Refused { seq, reason })
@@ -1104,8 +1101,9 @@ pub mod settlement {
                 },
             )?;
             self.head.set(head);
-            self.env().emit_event(Deposited {
+            self.emit(Deposited {
                 seq,
+                from,
                 account_ref,
                 asset,
                 amount,
@@ -1468,6 +1466,27 @@ pub mod settlement {
         )
     }
 
+    /// `e_n`: the digest of one entry, `blake2b-256(SCALE(entry))` (amendment 0040).
+    pub fn entry_digest(entry: &InboxEntry) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        ink::env::hash_encoded::<ink::env::hash::Blake2x256, _>(entry, &mut out);
+        out
+    }
+
+    /// `d_n = blake2b-256(CHAIN_LABEL ‖ d_(n-1) ‖ n ‖ e_n)`, `n` as 8 bytes big-endian (amendment
+    /// 0040). `previous` is the 32 zero bytes for a chain's first entry.
+    pub fn chain_digest(previous: &[u8; 32], n: InboxSeq, entry: &[u8; 32]) -> [u8; 32] {
+        // The label (28 bytes), the previous digest, the position and the entry's digest.
+        let mut input = Vec::with_capacity(100);
+        input.extend_from_slice(CHAIN_LABEL);
+        input.extend_from_slice(previous);
+        input.extend_from_slice(&n.to_be_bytes());
+        input.extend_from_slice(entry);
+        let mut out = [0u8; 32];
+        ink::env::hash_bytes::<ink::env::hash::Blake2x256>(&input, &mut out);
+        out
+    }
+
     /// At most [`MAX_KEYS`] keys, no duplicates.
     fn check_keys(keys: &[AccountId]) -> Result<(), Error> {
         if keys.len() > MAX_KEYS {
@@ -1488,25 +1507,19 @@ pub mod settlement {
     #[derive(Clone, Debug)]
     pub(crate) struct Cells {
         head: Option<Head>,
-        inbox: (InboxSeq, Option<InboxEntry>),
+        chain: Option<ChainHead>,
         latest_anchor: Option<Option<LatestAnchor>>,
         asset: Option<(AssetId, Option<Balance>, Option<WithdrawalWindow>)>,
     }
 
     #[cfg(test)]
     impl Settlement {
-        /// The cells a frame at this contract can write: its head, the inbox entry at its next
-        /// position (`next_seq`), the latest anchor if it anchors, and the position and bound of
-        /// `asset`.
-        pub(crate) fn cells(
-            &self,
-            next_seq: InboxSeq,
-            anchors: bool,
-            asset: Option<AssetId>,
-        ) -> Cells {
+        /// The cells a frame at this contract can write: its head, the chain's head, the latest
+        /// anchor if it anchors, and the position and bound of `asset`.
+        pub(crate) fn cells(&self, anchors: bool, asset: Option<AssetId>) -> Cells {
             Cells {
                 head: self.head.get(),
-                inbox: (next_seq, self.inbox.get(next_seq)),
+                chain: self.chain.get(),
                 latest_anchor: anchors.then(|| self.latest_anchor.get()),
                 asset: asset.map(|a| (a, self.positions.get(a), self.bounds.get(a))),
             }
@@ -1518,14 +1531,12 @@ pub mod settlement {
                 Some(head) => self.head.set(&head),
                 None => self.head.set(&Head::default()),
             }
-            let (seq, entry) = cells.inbox;
-            match entry {
-                Some(entry) => self.inbox.insert(seq, &entry),
+            match cells.chain {
+                Some(chain) => self.chain.set(&chain),
                 None => {
-                    self.inbox.remove(seq);
-                    None
+                    ink::env::clear_contract_storage(&CHAIN_KEY);
                 }
-            };
+            }
             if let Some(latest) = cells.latest_anchor {
                 match latest {
                     Some(latest) => self.latest_anchor.set(&latest),
@@ -1555,32 +1566,58 @@ pub mod settlement {
 
     #[cfg(test)]
     impl Settlement {
-        /// Move the inbox's head, to reach the sequence's end without writing 2^64 entries. Everything
-        /// below it counts as pruned.
+        /// Move the head, to reach the position's end without writing 2^64 entries: a chain with no
+        /// entry yet starts there.
         pub(crate) fn force_next_seq(&mut self, next_seq: InboxSeq) {
             let mut head = self.load_head();
             head.next_seq = next_seq;
-            head.pruned_to = next_seq;
             self.head.set(&head);
+            self.chain.set(&ChainHead {
+                position: next_seq,
+                digest: [0; 32],
+                start: next_seq,
+            });
+        }
+
+        /// The legacy inbox entry at `seq`, as the earlier code stored it (tests only).
+        pub(crate) fn stored_entry(&self, seq: InboxSeq) -> Option<InboxEntry> {
+            self.inbox.get(seq)
         }
 
         /// The contract's invariants over the storage it can enumerate:
         ///
-        /// - with anchors, the latest is stored in place with `last_anchor`'s number, and its
-        ///   inbox entry is the matching `Anchored` entry; with none, nothing is;
+        /// - the chain's head is at the head's next position, and started at or below it; the
+        ///   events this contract emitted since its last reset, from the chain's start, fold to it
+        ///   (`crate::mock::fold`: what a reader rebuilds from events alone);
+        /// - no entry is stored at or above the chain's start;
+        /// - with anchors, the latest is stored in place with `last_anchor`'s number, at a position
+        ///   of the chain below its head; with none, nothing is;
         /// - legacy records (`anchors[n]`) remain only while a migration runs, and then only in
         ///   its range `next..=end`; none past `last_anchor`;
-        /// - `pruned_to <= next_seq`; from `pruned_to` up every inbox position is filled; below it
-        ///   only bind entries, the latest anchor's entry and, while a migration runs, the entries
-        ///   of the anchors it has still to remove remain;
-        /// - every `Bound` entry is the one its asset's `bound` points at, so an asset is bound
-        ///   at most once.
+        /// - `pruned_to <= next_seq`.
         pub(crate) fn check_invariants(&self) {
             let head = self.load_head();
             assert!(
                 head.pruned_to <= head.next_seq,
-                "pruned past the inbox's end"
+                "pruned past the head's end"
             );
+            let chain = self.load_chain(&head);
+            assert_eq!(
+                chain.position, head.next_seq,
+                "the chain is not at the head"
+            );
+            assert!(
+                chain.start <= chain.position,
+                "a chain starts past its head"
+            );
+            assert_eq!(
+                crate::mock::fold(self.env().account_id(), chain.start),
+                (chain.position, chain.digest),
+                "the events do not fold to the chain's head"
+            );
+            for seq in chain.start..=head.next_seq {
+                assert!(self.inbox.get(seq).is_none(), "an entry is stored at {seq}");
+            }
             let migration = self.anchor_migration.get();
             let latest = self.latest_anchor.get();
             match latest {
@@ -1593,22 +1630,10 @@ pub mod settlement {
                         latest.number, head.last_anchor,
                         "the latest is not the last"
                     );
-                    let entry = self
-                        .inbox
-                        .get(latest.seq)
-                        .expect("the latest anchor's entry is never pruned");
-                    match entry.event {
-                        InboxEvent::Anchored {
-                            number, commitment, ..
-                        } => {
-                            assert_eq!(number, latest.number, "anchor entry for another number");
-                            assert_eq!(
-                                commitment, latest.commitment,
-                                "anchor entry and anchor differ"
-                            );
-                        }
-                        other => panic!("the latest anchor points at {other:?}"),
-                    }
+                    assert!(
+                        latest.seq < head.next_seq,
+                        "the latest anchor is past the chain's head"
+                    );
                 }
             }
             // In the instance's first sequence only: a later one starts only once the legacy
@@ -1638,52 +1663,14 @@ pub mod settlement {
                     .is_none(),
                 "an anchor is stored past the last one"
             );
-            for seq in head.pruned_to..head.next_seq {
-                assert!(
-                    self.inbox.get(seq).is_some(),
-                    "gap in the unpruned inbox at {seq}"
-                );
-            }
-            let latest_seq = latest.map(|a| a.seq);
-            for seq in 0..head.pruned_to {
-                if let Some(entry) = self.inbox.get(seq) {
-                    // While a migration runs, the entries of the anchors whose records it has
-                    // still to take.
-                    let migrating = matches!(
-                        (migration, entry.event),
-                        (Some(m), InboxEvent::Anchored { number, .. }) if number >= m.next
-                    );
-                    assert!(
-                        entry.event.is_kept() || Some(seq) == latest_seq || migrating,
-                        "a pruned entry remains at {seq}"
-                    );
-                }
-            }
-            for seq in 0..head.next_seq {
-                if let Some(InboxEntry {
-                    event: InboxEvent::Bound { asset, .. },
-                    ..
-                }) = self.inbox.get(seq)
-                {
-                    assert_eq!(
-                        self.bound.get(asset),
-                        Some(seq),
-                        "a Bound entry its asset does not point at"
-                    );
-                }
-            }
-            assert!(
-                self.inbox.get(head.next_seq).is_none(),
-                "an entry past next_seq"
-            );
-            // A sequence governance started (amendment 0039): it starts within the inbox, its
-            // anchors are numbered from its base and written from its first position, no legacy
-            // migration runs in it, and the previous sequence's latest is not the current one.
+            // A sequence governance started: it starts within the chain, its anchors are numbered
+            // from its base, no legacy migration runs in it, and the previous sequence's latest
+            // is not the current one.
             if let Some(e) = self.anchor_epoch.get() {
                 assert!(e.epoch > 0, "sequence 0 is never stored");
                 assert!(
                     e.from_seq <= head.next_seq,
-                    "a sequence starts past the inbox"
+                    "a sequence starts past the chain"
                 );
                 assert!(
                     e.base <= head.last_anchor,
@@ -1701,18 +1688,6 @@ pub mod settlement {
                     Some(latest) => {
                         assert!(latest.number > e.base, "the latest is not of this sequence");
                         assert!(latest.seq >= e.from_seq, "the latest predates its sequence");
-                    }
-                }
-                for seq in e.from_seq..head.next_seq {
-                    if let Some(InboxEntry {
-                        event: InboxEvent::Anchored { number, .. },
-                        ..
-                    }) = self.inbox.get(seq)
-                    {
-                        assert!(
-                            number > e.base,
-                            "anchor {number} at {seq} is below the base"
-                        );
                     }
                 }
             }

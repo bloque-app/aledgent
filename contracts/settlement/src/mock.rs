@@ -32,10 +32,12 @@
 //!   recording and finishing cost the batch nothing here.
 
 use crate::kreivo::{KreivoEnvironment as Env, EXTENSION_ID, FN_BALANCE, FN_DEPOSIT, FN_TRANSFER};
-use crate::settlement::Settlement;
+use crate::settlement::{
+    AnchorHeadSet, Anchored, Bound, Deposited, Refused, Settlement, Withdrawn,
+};
 use crate::types::{
-    AccountId, AccountRef, AssetId, Balance, Call, Destination, Envelope, Head, OperationRef,
-    Outcome, Weight,
+    AccountId, AccountRef, AssetId, Balance, BlockNumber, Call, Destination, Envelope, Head,
+    InboxEntry, InboxEvent, InboxSeq, OperationRef, Outcome, Weight, CHAIN_LABEL,
 };
 use kreivo_apis::apis::{AssetsApiError, KreivoApisError, KreivoApisErrorCode};
 use scale::{Compact, Decode, Encode};
@@ -251,6 +253,154 @@ pub fn live_events() -> Vec<ink::env::test::EmittedEvent> {
         .collect()
 }
 
+thread_local! {
+    /// For each event ink!'s engine recorded, in order: the contract that emitted it and the block
+    /// it was emitted in, as Kreivo records a contract's event (`Contracts::ContractEmitted`, in a
+    /// block). Every event the contract emits goes through `Settlement::emit`, which notes it.
+    static EMITTERS: RefCell<Vec<(AccountId, BlockNumber)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Note that `contract` emitted the event ink!'s engine recorded last, at block `at`.
+pub fn emitted(contract: AccountId, at: BlockNumber) {
+    EMITTERS.with(|e| e.borrow_mut().push((contract, at)));
+}
+
+/// What a reader sees of one contract's events, in order: each entry rebuilt from its event and
+/// its block's number, and each reset (`AnchorHeadSet`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)] // a test model, read in order: size does not matter
+pub enum Seen {
+    /// An entry, at its position.
+    Entry(InboxSeq, InboxEntry),
+    /// A new sequence and chain started.
+    Reset,
+}
+
+fn is<E: ink::env::Event>(event: &ink::env::test::EmittedEvent) -> bool {
+    event.topics.first().map(Vec::as_slice) == E::SIGNATURE_TOPIC.as_ref().map(|t| &t[..])
+}
+
+fn decode<E: Decode>(event: &ink::env::test::EmittedEvent) -> E {
+    E::decode(&mut &event.data[..]).expect("the event decodes as its type")
+}
+
+/// Every event `contract` emitted that stands, read as a reader of the layer reads them: from
+/// the event's fields and its block's number alone, never from the contract's storage.
+pub fn seen(contract: AccountId) -> Vec<Seen> {
+    let emitters = EMITTERS.with(|e| e.borrow().clone());
+    let rolled_back = CHAIN.with(|chain| chain.borrow().rolled_back_events.clone());
+    let recorded: Vec<_> = ink::env::test::recorded_events().collect();
+    assert_eq!(
+        recorded.len(),
+        emitters.len(),
+        "an event was emitted other than through Settlement::emit"
+    );
+    let mut out = Vec::new();
+    for (i, (event, (by, at))) in recorded.iter().zip(emitters).enumerate() {
+        if by != contract || rolled_back.iter().any(|r| r.contains(&i)) {
+            continue;
+        }
+        let entry = |event| InboxEntry { at, event };
+        out.push(if is::<Deposited>(event) {
+            let e: Deposited = decode(event);
+            Seen::Entry(
+                e.seq,
+                entry(InboxEvent::Deposited {
+                    from: e.from,
+                    account_ref: e.account_ref,
+                    asset: e.asset,
+                    amount: e.amount,
+                }),
+            )
+        } else if is::<Withdrawn>(event) {
+            let e: Withdrawn = decode(event);
+            Seen::Entry(
+                e.seq,
+                entry(InboxEvent::Withdrawn {
+                    operation_ref: e.operation_ref,
+                    to: e.to,
+                    asset: e.asset,
+                    amount: e.amount,
+                }),
+            )
+        } else if is::<Anchored>(event) {
+            let e: Anchored = decode(event);
+            Seen::Entry(
+                e.seq,
+                entry(InboxEvent::Anchored {
+                    operation_ref: e.operation_ref,
+                    number: e.number,
+                    commitment: e.commitment,
+                }),
+            )
+        } else if is::<Bound>(event) {
+            let e: Bound = decode(event);
+            Seen::Entry(
+                e.seq,
+                entry(InboxEvent::Bound {
+                    operation_ref: e.operation_ref,
+                    asset: e.asset,
+                    amount: e.amount,
+                }),
+            )
+        } else if is::<Refused>(event) {
+            let e: Refused = decode(event);
+            Seen::Entry(
+                e.seq,
+                entry(InboxEvent::Refused {
+                    operation_ref: e.operation_ref,
+                    call: e.call,
+                    reason: e.reason,
+                }),
+            )
+        } else if is::<AnchorHeadSet>(event) {
+            Seen::Reset
+        } else {
+            continue;
+        });
+    }
+    out
+}
+
+/// The entries of `contract`'s current chain, rebuilt from its events: those since its last
+/// reset, in the order they were emitted.
+pub fn chain_entries(contract: AccountId) -> Vec<(InboxSeq, InboxEntry)> {
+    let seen = seen(contract);
+    let since = seen
+        .iter()
+        .rposition(|s| *s == Seen::Reset)
+        .map_or(0, |i| i + 1);
+    seen[since..]
+        .iter()
+        .map(|s| match s {
+            Seen::Entry(seq, entry) => (*seq, *entry),
+            Seen::Reset => unreachable!(),
+        })
+        .collect()
+}
+
+/// Fold `contract`'s current chain from its events, from position `start` with the zero digest,
+/// as a reader does: `d_n = blake2b-256(label ‖ d_(n-1) ‖ n (8 bytes, big-endian) ‖
+/// blake2b-256(SCALE(entry)))`. Written here apart from the contract's own helper. Returns the next
+/// position and the digest; panics if the positions are not `start, start + 1, ...`.
+pub fn fold(contract: AccountId, start: InboxSeq) -> (InboxSeq, [u8; 32]) {
+    use ink::env::hash::{Blake2x256, CryptoHash};
+    let mut position = start;
+    let mut digest = [0u8; 32];
+    for (seq, entry) in chain_entries(contract)
+        .into_iter()
+        .filter(|(seq, _)| *seq >= start)
+    {
+        assert_eq!(seq, position, "the events skip or repeat a position");
+        let mut e = [0u8; 32];
+        Blake2x256::hash(&entry.encode(), &mut e);
+        let input = [CHAIN_LABEL, &digest[..], &seq.to_be_bytes(), &e[..]].concat();
+        Blake2x256::hash(&input, &mut digest);
+        position += 1;
+    }
+    (position, digest)
+}
+
 /// Leave the batch `left` of weight.
 pub fn set_gas_left(left: Weight) {
     GAS.with(|gas| gas.borrow_mut().left = left);
@@ -316,13 +466,8 @@ pub fn apply(
         Call::Bind { .. } => panic!("a bind runs inline, never in a frame of its own"),
     };
     let chain = CHAIN.with(|chain| chain.borrow().clone());
-    let ours = Settlement::handle().cells(head.next_seq, anchor, asset);
-    let theirs = receiver.map(|r| {
-        on(r, contract, || {
-            let settlement = Settlement::handle();
-            settlement.cells(settlement.head().next_seq, false, asset)
-        })
-    });
+    let ours = Settlement::handle().cells(anchor, asset);
+    let theirs = receiver.map(|r| on(r, contract, || Settlement::handle().cells(false, asset)));
     let events = ink::env::test::recorded_events().count();
 
     CHAIN.with(|c| c.borrow_mut().running = Some(envelope.operation_ref));

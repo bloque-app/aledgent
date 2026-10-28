@@ -38,14 +38,24 @@ pub type AttestationKey = [u8; 32];
 /// The most keys a deployment can have.
 pub const MAX_KEYS: usize = 16;
 /// The most calls one batch can carry: a generous bound, not the one that keeps a batch inside an
-/// extrinsic. Proof size does that, and it depends on the calls: 32 withdrawals to accounts (61 KB
-/// each) dry-run at 2.05 MB, while a withdrawal to another deployment in its own frame takes 235 KB.
+/// extrinsic. Proof size does that, and it depends on the calls: under amendment 0040, 32
+/// withdrawals to accounts dry-run at 2.41 MB on zombienet (over what an extrinsic leaves), while a
+/// withdrawal to another deployment in its own frame takes 235 KB.
 /// The adapter sizes every batch by its dry run's proof size (`F-027`, T-027-09); a batch too large
 /// for an extrinsic is refused by the pool and changes nothing. See F-026 NOTES, decision 23,
 /// "The price".
 pub const MAX_CALLS: usize = 32;
-/// The most inbox positions one `prune_inbox` can cover.
-pub const MAX_PRUNE: u64 = 128;
+/// The most entries the earlier code stored that one reset removes (`set_anchor_head`, amendment
+/// 0040). Measured on a Chopsticks fork of Kreivo (spec 134) with the deployed test instance's
+/// cells: a reset costs 1.71 G of ref time and 186 KB of proof size with nothing to remove, and
+/// 0.167 G and 10.3 KB more per entry it removes (one `seal_clear_storage` of a 77-byte entry in
+/// the contract's child trie). At 64 that is about 12.4 G and 0.85 MB, a third of the 2.45 MB an
+/// extrinsic may prove. The deployed instances hold 13 (test) and 17 (prod). An instance that may
+/// hold more is refused (`TooManyStoredEntries`) and nothing changes.
+pub const MAX_RESET_CLEAR: u64 = 64;
+/// The fixed label in front of every chain digest (amendment 0040, ruling a40c-domain-tag): its
+/// ASCII bytes, with no length prefix. A digest of anything else cannot be taken for one of these.
+pub const CHAIN_LABEL: &[u8] = b"aledgent/settlement-entry/v1";
 /// The most legacy anchor records one message removes while it migrates a deployment that ran the
 /// code before 2026-10-11 (one `anchors[n]` per number; see [`AnchorMigration`]). Each removal is
 /// one `seal_take_storage` of 44 bytes, and at most one `seal_clear_storage` of the anchor's inbox
@@ -70,10 +80,14 @@ pub const CALL_WEIGHT_LIMIT: Weight = Weight::new(25_000_000_000, 512 * 1024);
 /// itself between 49 and 61 KB of it (a reserve of 44 KiB left a batch short). 80 KiB covers that
 /// with room for the code to grow by 20 KB.
 pub const CALL_FRAME_COST: Weight = Weight::new(1_000_000_000, 80 * 1024);
-/// What recording one call as refused costs the batch: its inbox entry (`seal_set_storage`,
-/// about 140 M ps and 254 B) and its event with two topics (`seal_deposit_event`, about 265 M ps
-/// and 5 940 B).
-pub const REFUSAL_RESERVE: Weight = Weight::new(600_000_000, 8 * 1024);
+/// What recording one call as refused costs the batch: the chain's head read and rewritten, two
+/// BLAKE2 hashes of at most about 200 bytes, and its event with two topics, which now carries the
+/// call (amendment 0040). v2 reserved 0.6 G and 8 KiB, below its own 16.2 KB refusal. Measured on
+/// zombienet (`T-043-03`): a refusal alone costs 0.581 G and 26 563 B, 0.13 G and 10 359 B more
+/// than under v2. At 20 KiB some gas limits reverted a starved batch whole instead of recording
+/// each refusal; at 28 KiB a sweep at 1 KB steps (2 and 5 calls) and 5 KB steps (3 and 8 calls)
+/// recorded every refusal.
+pub const REFUSAL_RESERVE: Weight = Weight::new(750_000_000, 28 * 1024);
 /// What the batch needs after its last call: storing the head and returning the outcomes.
 pub const BATCH_FINISH_RESERVE: Weight = Weight::new(400_000_000, 4 * 1024);
 
@@ -131,8 +145,8 @@ pub enum AssetId {
 #[ink::scale_derive(Encode, Decode, TypeInfo)]
 #[cfg_attr(feature = "std", derive(ink::storage::traits::StorageLayout))]
 pub struct Registration {
-    /// Rotates keys, sets withdrawal bounds and prunes the inbox. It cannot submit calls unless it
-    /// is also a key.
+    /// Rotates keys, sets withdrawal bounds and names governance first. It cannot submit calls
+    /// unless it is also a key.
     pub admin: AccountId,
     /// The accounts that may submit calls. At most [`MAX_KEYS`], no duplicates.
     pub keys: Vec<AccountId>,
@@ -148,17 +162,47 @@ pub struct Registration {
 pub struct Head {
     /// The number of the last anchor stored. Zero means none yet.
     pub last_anchor: AnchorNumber,
-    /// The sequence the next inbox entry will take. Also the count of entries ever written.
+    /// The position the next entry will take in the current chain ([`ChainHead::position`]).
+    /// A reset (`set_anchor_head`) sets it back to zero (amendment 0040).
     pub next_seq: InboxSeq,
-    /// Movement and refusal entries below this sequence may have been pruned. Anchor and bind
-    /// entries never are.
+    /// Written by the earlier code, which stored each entry and let the admin prune them: entries
+    /// below it may have been pruned. This code stores no entry and prunes nothing; a reset sets
+    /// it to zero with `next_seq`.
     pub pruned_to: InboxSeq,
+}
+
+/// The head of the chain of entries (amendment 0040), at `ManualKey<0x0000_000C>`: the one value
+/// the contract keeps about its entries, overwritten by each one.
+///
+/// Entry `n` is `e_n = blake2b-256(SCALE(InboxEntry { at, event }))`, and the chain digest after
+/// it is `d_n = blake2b-256(CHAIN_LABEL ‖ d_(n-1) ‖ n ‖ e_n)`, with `n` as 8 bytes big-endian and
+/// `d_(start-1)` the 32 zero bytes. Every entry is in an event (`Deposited`, `Withdrawn`,
+/// `Anchored`, `Bound`, `Refused`) that carries its position and every field of its entry; with
+/// the block number of that event's block, a reader rebuilds `e_n` and folds the chain.
+///
+/// An absent cell reads as `{ position: next_seq, digest: zeros, start: next_seq }`: a chain with
+/// no entry yet, starting where the head is. That is `(0, zeros, 0)` on an instance this code
+/// instantiated or reset.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[ink::scale_derive(Encode, Decode, TypeInfo)]
+#[cfg_attr(feature = "std", derive(ink::storage::traits::StorageLayout))]
+pub struct ChainHead {
+    /// The position the next entry will take: always `Head::next_seq`.
+    pub position: InboxSeq,
+    /// The chain digest after the entry at `position - 1`; the 32 zero bytes if the chain has no
+    /// entry yet.
+    pub digest: [u8; 32],
+    /// The position at which the chain started, from the zero digest. Zero on an instance this code
+    /// instantiated or reset. On an instance upgraded from the earlier code and not reset since, the
+    /// `next_seq` it had then: the earlier code may have stored entries below it, and the reset
+    /// removes them.
+    pub start: InboxSeq,
 }
 
 /// The latest anchor, the only one the contract keeps: each new anchor overwrites it in place, so
 /// anchoring adds no storage item (owner's ruling of 2026-10-11). Earlier anchors are in their
-/// `Anchored` inbox entries until the admin prunes them, in their `Anchored` events, and in the
-/// layer's finalized history: this record, read at the block that stored each one.
+/// `Anchored` events and in the layer's finalized history: this record, read at the block that
+/// stored each one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[ink::scale_derive(Encode, Decode, TypeInfo)]
 #[cfg_attr(feature = "std", derive(ink::storage::traits::StorageLayout))]
@@ -169,7 +213,7 @@ pub struct LatestAnchor {
     pub commitment: Commitment,
     /// The block in which it was stored.
     pub at: BlockNumber,
-    /// The inbox position of its `Anchored` entry, which `prune_inbox` keeps while it is the latest.
+    /// The position of its `Anchored` entry in the chain it was stored in.
     pub seq: InboxSeq,
 }
 
@@ -192,9 +236,9 @@ pub struct AnchorMigration {
 /// one the instance began with (base 0, from inbox position 0, no book named), so a deployment of
 /// the earlier code needs nothing written to read it.
 ///
-/// A start never moves value and never touches the inbox: the inbox's numbering runs on across
-/// sequences, so every coordinate `(instance, seq)` names one entry for good. What it changes is
-/// which anchor number comes next: `base + 1`.
+/// A start never moves value. Since amendment 0040 it also starts a new chain of entries at
+/// position 0 ([`ChainHead`]), and removes every entry the earlier code stored: a coordinate is
+/// `(instance, sequence, position)`. It also changes which anchor number comes next: `base + 1`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[ink::scale_derive(Encode, Decode, TypeInfo)]
 #[cfg_attr(feature = "std", derive(ink::storage::traits::StorageLayout))]
@@ -204,8 +248,9 @@ pub struct AnchorEpoch {
     pub epoch: u32,
     /// The number the sequence starts after: its first anchor is `base + 1`.
     pub base: AnchorNumber,
-    /// The inbox position of the sequence's first entry: `next_seq` when it started. Every
-    /// entry from here on was written in this sequence; every entry below it, in an earlier one.
+    /// The position of the sequence's first entry. Zero for a sequence this code started, whose
+    /// chain starts at position 0 (amendment 0040). For one the earlier code started (amendment
+    /// 0039), `next_seq` when it started: its positions ran on from the sequence before.
     pub from_seq: InboxSeq,
     /// The block at which it started.
     pub at: BlockNumber,
@@ -455,7 +500,8 @@ impl Weight {
     }
 }
 
-/// What happened to one call of a batch. Every call gets exactly one.
+/// What happened to one call of a batch. Every call gets exactly one. Positions are in the
+/// current chain ([`ChainHead`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[ink::scale_derive(Encode, Decode, TypeInfo)]
 pub enum Outcome {
@@ -526,7 +572,7 @@ pub enum InboxEvent {
         reason: Refusal,
     },
     /// A book-only asset was bound: the deployment's holding of it became its position, at zero
-    /// divergence (amendment 0011, `REQ-AS-8`). Never pruned.
+    /// divergence (amendment 0011, `REQ-AS-8`).
     #[codec(index = 4)]
     Bound {
         /// The deployment's operation reference.
@@ -543,17 +589,11 @@ impl InboxEvent {
     pub fn is_anchor(&self) -> bool {
         matches!(self, InboxEvent::Anchored { .. })
     }
-
-    /// Whether the entry is always kept when the inbox is pruned: bind entries, which each bound
-    /// asset points at. `prune_inbox` also keeps the latest anchor's entry, which
-    /// [`LatestAnchor::seq`] points at; every other anchor entry is pruned like a movement
-    /// (owner's ruling of 2026-10-11; before it, every anchor entry was kept).
-    pub fn is_kept(&self) -> bool {
-        matches!(self, InboxEvent::Bound { .. })
-    }
 }
 
-/// One position of the inbox.
+/// One entry: what the chain digests at each position ([`ChainHead`]). The earlier code stored it
+/// at its position (`ManualKey<0x0000_0004>`); this code stores none, and its encoding never
+/// changes, since `e_n` is the hash of it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[ink::scale_derive(Encode, Decode, TypeInfo)]
 #[cfg_attr(feature = "std", derive(ink::storage::traits::StorageLayout))]
@@ -608,9 +648,11 @@ pub enum Error {
     ZeroAmount,
     /// A withdrawal bound must have a window of at least one block.
     InvalidBound,
-    /// The range to prune is empty, already pruned, or reaches past the inbox's end.
+    /// No longer returned: `prune_inbox` is gone (amendment 0040). Kept so that every later
+    /// variant keeps its index.
     InvalidPruneRange,
-    /// The range to prune covers more than [`MAX_PRUNE`] positions.
+    /// No longer returned: `prune_inbox` is gone (amendment 0040). Kept so that every later
+    /// variant keeps its index.
     TooManyToPrune,
     /// Kreivo's assets API refused to move the deposit from the caller, with its reason: not
     /// enough of the asset, an amount that would take the caller below the asset's minimum balance,
@@ -620,7 +662,7 @@ pub enum Error {
     NotADeployment,
     /// The position would overflow.
     PositionOverflow,
-    /// The inbox's sequence cannot advance.
+    /// The chain's position cannot advance.
     SequenceOverflow,
     /// Kreivo reported moving an amount other than the one asked for. The message reverts, so
     /// nothing moved.
@@ -640,4 +682,7 @@ pub enum Error {
     MigrationPending,
     /// No further anchor sequence can be started.
     EpochOverflow,
+    /// The earlier code may have stored more entries than one reset removes
+    /// ([`MAX_RESET_CLEAR`]). Nothing changed.
+    TooManyStoredEntries,
 }

@@ -10,8 +10,8 @@
 use crate::kreivo::{AssetsCall, KreivoEnvironment as Env, MultiAddress, RuntimeCall};
 use crate::mock;
 use crate::settlement::{
-    Anchored, AnchorsMigrated, Bound, Deposited, InboxPruned, KeysSet, Refused, Registered,
-    Settlement, WithdrawalBoundSet, Withdrawn,
+    chain_digest, entry_digest, Anchored, AnchorsMigrated, Bound, Deposited, KeysSet, Refused,
+    Registered, Settlement, WithdrawalBoundSet, Withdrawn,
 };
 use crate::types::*;
 use crate::CREDIT_SELECTOR;
@@ -184,6 +184,19 @@ fn last_topics() -> Vec<Vec<u8>> {
     events().pop().expect("an event").topics
 }
 
+/// The entry at `seq` of `who`'s current chain, as a reader rebuilds it from the events alone
+/// (amendment 0040): the contract stores none.
+fn entry_of(who: AccountId, seq: InboxSeq) -> Option<InboxEntry> {
+    mock::chain_entries(who)
+        .into_iter()
+        .rev()
+        .find(|(s, _)| *s == seq)
+        .map(|(_, e)| e)
+}
+fn entry(seq: InboxSeq) -> Option<InboxEntry> {
+    entry_of(me(), seq)
+}
+
 /// What a refusal must leave untouched.
 #[derive(Debug, PartialEq, Eq)]
 struct Snapshot {
@@ -215,7 +228,7 @@ fn assert_refused(contract: &mut Settlement, call: Call, reason: Refusal) {
     let outcome = execute_one(contract, 0x77, call);
     assert_eq!(outcome, Outcome::Refused { seq, reason });
     assert_eq!(
-        contract.inbox_entry(seq).expect("refusal recorded").event,
+        entry(seq).expect("refusal recorded").event,
         InboxEvent::Refused {
             operation_ref: reference(0x77),
             call,
@@ -227,6 +240,7 @@ fn assert_refused(contract: &mut Settlement, call: Call, reason: Refusal) {
         Refused {
             seq,
             operation_ref: reference(0x77),
+            call,
             reason
         }
     );
@@ -540,7 +554,7 @@ fn t_026_03_deposit_lands_with_its_account_reference_in_the_inbox() {
         fund_and_deposit(&mut contract, depositor(), reference(0xA1), DUSD, 250).expect("deposit");
     assert_eq!(seq, 0);
     assert_eq!(
-        contract.inbox_entry(0),
+        entry(0),
         Some(InboxEntry {
             at: 1,
             event: InboxEvent::Deposited {
@@ -555,6 +569,7 @@ fn t_026_03_deposit_lands_with_its_account_reference_in_the_inbox() {
         last_event::<Deposited>(),
         Deposited {
             seq: 0,
+            from: depositor(),
             account_ref: reference(0xA1),
             asset: DUSD,
             amount: 250
@@ -652,7 +667,7 @@ fn deposit_pulls_only_from_its_caller() {
     assert_eq!(mock::balance(DUSD, stranger()), 100);
     assert_eq!(mock::balance(DUSD, depositor()), 1_000);
     assert!(matches!(
-        contract.inbox_entry(seq).unwrap().event,
+        entry(seq).unwrap().event,
         InboxEvent::Deposited { from, .. } if from == stranger()
     ));
 }
@@ -769,7 +784,7 @@ fn t_026_02_a_batch_with_one_refused_call_applies_the_rest() {
     );
     // One entry per call, in order, each under its reference.
     assert_eq!(
-        contract.inbox_entry(1).unwrap().event,
+        entry(1).unwrap().event,
         InboxEvent::Withdrawn {
             operation_ref: reference(0x01),
             to: Destination::Account(payee()),
@@ -778,7 +793,7 @@ fn t_026_02_a_batch_with_one_refused_call_applies_the_rest() {
         }
     );
     assert_eq!(
-        contract.inbox_entry(2).unwrap().event,
+        entry(2).unwrap().event,
         InboxEvent::Refused {
             operation_ref: reference(0x02),
             call: calls[1].call,
@@ -786,7 +801,7 @@ fn t_026_02_a_batch_with_one_refused_call_applies_the_rest() {
         }
     );
     assert_eq!(
-        contract.inbox_entry(3).unwrap().event,
+        entry(3).unwrap().event,
         InboxEvent::Anchored {
             operation_ref: reference(0x03),
             number: 1,
@@ -794,7 +809,7 @@ fn t_026_02_a_batch_with_one_refused_call_applies_the_rest() {
         }
     );
     assert_eq!(
-        contract.inbox_entry(4).unwrap().event,
+        entry(4).unwrap().event,
         InboxEvent::Withdrawn {
             operation_ref: reference(0x04),
             to: Destination::Account(payee()),
@@ -838,6 +853,7 @@ fn batch_emits_one_event_per_call_with_the_reference_as_topic() {
         Refused {
             seq: 2,
             operation_ref: reference(0x12),
+            call: to_payee(0),
             reason: Refusal::ZeroAmount
         }
     );
@@ -904,7 +920,7 @@ fn req_sl_8_withdrawal_to_an_account_is_recorded_under_its_operation_reference()
     let outcome = execute_one(&mut contract, 0x42, to_payee(400));
     assert_eq!(outcome, Outcome::Applied { seq: 1 });
     assert_eq!(
-        contract.inbox_entry(1),
+        entry(1),
         Some(InboxEntry {
             at: 3,
             event: InboxEvent::Withdrawn {
@@ -992,7 +1008,7 @@ fn req_sl_6_withdrawal_to_another_deployment_writes_both_inboxes() {
     assert_eq!(outcome, Outcome::Applied { seq: 1 });
     // Sender: `Withdrawn` under the operation reference.
     assert_eq!(
-        contract.inbox_entry(1).unwrap().event,
+        entry(1).unwrap().event,
         InboxEvent::Withdrawn {
             operation_ref: reference(0x51),
             to,
@@ -1006,7 +1022,7 @@ fn req_sl_6_withdrawal_to_another_deployment_writes_both_inboxes() {
     on_peer(|| {
         let receiver = Settlement::handle();
         assert_eq!(
-            receiver.inbox_entry(0),
+            entry_of(peer(), 0),
             Some(InboxEntry {
                 at: 4,
                 event: InboxEvent::Deposited {
@@ -1246,7 +1262,7 @@ fn credit_from_a_deployment_records_a_deposit() {
     caller(peer());
     assert_eq!(contract.credit(reference(0xB2), DUSD, 70), Ok(0));
     assert_eq!(
-        contract.inbox_entry(0).unwrap().event,
+        entry(0).unwrap().event,
         InboxEvent::Deposited {
             from: peer(),
             account_ref: reference(0xB2),
@@ -1329,7 +1345,7 @@ fn inv_19_the_stored_commitment_is_the_submitted_one() {
     );
     assert_eq!(contract.latest_anchor().unwrap().commitment, commitment);
     assert_eq!(
-        contract.inbox_entry(0).unwrap().event,
+        entry(0).unwrap().event,
         InboxEvent::Anchored {
             operation_ref: reference(1),
             number: 1,
@@ -1418,7 +1434,7 @@ fn consecutive_anchors_in_one_batch() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Pruning
+// The chain of entries (amendment 0040, T-043-02; REQ-SL-9)
 // ---------------------------------------------------------------------------------------------
 
 /// Entries: 0 deposit, 1 anchor, 2 withdrawal, 3 refusal, 4 anchor, 5 deposit.
@@ -1439,74 +1455,239 @@ fn with_history() -> Settlement {
     contract
 }
 
-#[ink::test]
-fn prune_inbox_is_admin_only() {
-    let mut contract = with_history();
-    for who in [key(), stranger()] {
-        caller(who);
-        assert_eq!(contract.prune_inbox(3), Err(Error::NotAdmin));
+/// 32 bytes from 64 hex digits.
+fn h32(hex: &str) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).expect("hex");
     }
-    assert_eq!(contract.head().pruned_to, 0);
+    out
 }
 
+/// The chain's digest, pinned to values computed outside this crate (Python's `hashlib.blake2b`,
+/// `digest_size=32`), so that every reader (settle, the verifier) has a fixed target:
+/// `e_0 = blake2b-256(SCALE(entry))` and `d_0 = blake2b-256("aledgent/settlement-entry/v1" ‖
+/// 32 zero bytes ‖ 0u64 big-endian ‖ e_0)`, then `d_1` over the next entry.
 #[ink::test]
-fn prune_inbox_keeps_only_the_latest_anchors_entry() {
-    let mut contract = with_history();
-    caller(admin());
-    // Anchor 1's entry (1) is superseded by anchor 2's (4): pruned like a movement.
-    assert_eq!(contract.prune_inbox(4), Ok(4));
+fn t_043_02_the_chain_digest_is_labelled_and_pinned() {
+    assert_eq!(CHAIN_LABEL, b"aledgent/settlement-entry/v1");
+    // Anchor 1, operation reference [1; 32], commitment [0xA1; 32], at block 1.
+    let first = InboxEntry {
+        at: 1,
+        event: InboxEvent::Anchored {
+            operation_ref: [1; 32],
+            number: 1,
+            commitment: [0xA1; 32],
+        },
+    };
+    let mut bytes = vec![1, 0, 0, 0, 2];
+    bytes.extend([1u8; 32]);
+    bytes.extend(1u64.to_le_bytes());
+    bytes.extend([0xA1u8; 32]);
+    assert_eq!(first.encode(), bytes, "the entry encodes as v2 stored it");
+    let e0 = h32("01306698c3faca4813e818fafd0fe09f2977d886b76582e0e1c5fd527195500a");
+    let d0 = h32("8cdf807deac993ffabca639a554c713011a2edb44f3ed1fca81602403b631c15");
+    let d1 = h32("c1315c819fdcc8a0130ff4dba03b16ceb5e9d374bc6cab6bf11a8ae9d97f9e72");
+    assert_eq!(entry_digest(&first), e0);
+    assert_eq!(chain_digest(&[0; 32], 0, &e0), d0);
+
+    // The contract gives exactly these heads: a fresh chain starts at (0, zeros, 0).
+    let mut contract = setup();
     assert_eq!(
-        last_event::<InboxPruned>(),
-        InboxPruned {
-            from: 0,
-            to: 4,
-            removed: 4
+        contract.chain_head(),
+        ChainHead {
+            position: 0,
+            digest: [0; 32],
+            start: 0
         }
     );
-    assert_eq!(contract.head().pruned_to, 4);
-    for seq in [0, 1, 2, 3] {
-        assert_eq!(contract.inbox_entry(seq), None, "entry {seq} pruned");
-    }
-    assert!(contract.inbox_entry(4).is_some());
-    assert!(contract.inbox_entry(5).is_some());
-    assert_eq!(contract.latest_anchor().unwrap().seq, 4);
-    contract.check_invariants();
-
-    // Pruning continues from the watermark; the latest anchor's entry stays; the sequence
-    // carries on.
-    assert_eq!(contract.prune_inbox(6), Ok(1));
-    assert!(contract.inbox_entry(4).unwrap().event.is_anchor());
     assert_eq!(
-        fund_and_deposit(&mut contract, depositor(), reference(6), DUSD, 20),
-        Ok(6)
+        raw(&0x0Cu32),
+        None,
+        "an absent cell reads as the chain's start"
     );
+    execute_one(&mut contract, 1, anchor(1, 0xA1));
+    assert_eq!(
+        contract.chain_head(),
+        ChainHead {
+            position: 1,
+            digest: d0,
+            start: 0
+        }
+    );
+    // The cell: position, digest, start; 48 bytes at `0C000000`.
+    assert_eq!(raw(&0x0Cu32), Some((1u64, d0, 0u64).encode()));
+    test::set_block_number::<Env>(2);
+    execute_one(&mut contract, 2, anchor(2, 0xA2));
+    assert_eq!(contract.chain_head().digest, d1);
+    assert_eq!(contract.chain_head().position, contract.head().next_seq);
     contract.check_invariants();
 }
 
+/// Every kind of entry, over several blocks, in batches, with a failing frame and a credit from
+/// another deployment: a reader that rebuilds each entry from its event and its block's number
+/// alone folds to the head the contract holds. Nothing is stored per entry.
 #[ink::test]
-fn prune_inbox_refuses_an_invalid_range() {
-    let mut contract = with_history();
-    caller(admin());
-    assert_eq!(contract.prune_inbox(0), Err(Error::InvalidPruneRange));
-    assert_eq!(contract.prune_inbox(7), Err(Error::InvalidPruneRange));
-    contract.prune_inbox(3).expect("prunes");
-    assert_eq!(contract.prune_inbox(3), Err(Error::InvalidPruneRange));
-    assert_eq!(contract.prune_inbox(2), Err(Error::InvalidPruneRange));
+fn t_043_02_a_fold_of_the_events_alone_gives_the_head() {
+    // Block 1: 0 a deposit.
+    let mut contract = funded(1_000, 1_000);
+    register_peer();
+    // Block 2: 1 an anchor, 2 a withdrawal to an account, 3 a refusal, 4 a withdrawal to the
+    // peer, in its own frame.
+    test::set_block_number::<Env>(2);
+    execute(
+        &mut contract,
+        vec![
+            envelope(1, anchor(1, 0xA1)),
+            envelope(2, to_payee(10)),
+            envelope(3, to_payee(0)),
+            envelope(4, to_peer(20, 0xB1)),
+        ],
+    )
+    .expect("batch accepted");
+    // Block 3: 5 a bind.
+    test::set_block_number::<Env>(3);
+    fund_contract(COPM, 30);
+    assert_eq!(
+        execute_one(&mut contract, 5, bind(COPM, 30)),
+        Outcome::Applied { seq: 5 }
+    );
+    // Block 4: 6 a withdrawal to the peer whose frame runs out after the peer recorded it: the
+    // frame is rolled back, the peer's entry with it, and the call is recorded as refused.
+    test::set_block_number::<Env>(4);
+    mock::run_out_after_credit(reference(6));
+    assert_eq!(
+        execute_one(&mut contract, 6, to_peer(5, 0xB2)),
+        Outcome::Refused {
+            seq: 6,
+            reason: Refusal::CallFailed(CallFailure::OutOfGas)
+        }
+    );
+    // Block 5: 7 a credit from the peer (which has just moved the value here), 8 a deposit.
+    test::set_block_number::<Env>(5);
+    mock::mint(DUSD, me(), 7);
+    caller(peer());
+    assert_eq!(contract.credit(reference(7), DUSD, 7), Ok(7));
+    fund_and_deposit(&mut contract, depositor(), reference(8), DUSD, 8).expect("deposit");
+
+    let entries = mock::chain_entries(me());
+    let kinds: Vec<_> = entries
+        .iter()
+        .map(|(seq, e)| {
+            let kind = match e.event {
+                InboxEvent::Deposited { from, .. } if from == peer() => "credit",
+                InboxEvent::Deposited { .. } => "deposit",
+                InboxEvent::Withdrawn {
+                    to: Destination::Deployment { .. },
+                    ..
+                } => "to-deployment",
+                InboxEvent::Withdrawn { .. } => "withdrawal",
+                InboxEvent::Anchored { .. } => "anchor",
+                InboxEvent::Bound { .. } => "bind",
+                InboxEvent::Refused { .. } => "refusal",
+            };
+            (*seq, e.at, kind)
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            (0, 1, "deposit"),
+            (1, 2, "anchor"),
+            (2, 2, "withdrawal"),
+            (3, 2, "refusal"),
+            (4, 2, "to-deployment"),
+            (5, 3, "bind"),
+            (6, 4, "refusal"),
+            (7, 5, "credit"),
+            (8, 5, "deposit"),
+        ]
+    );
+    // The fold, with the contract's own helpers (pinned above), from the zero digest.
+    let mut digest = [0u8; 32];
+    for (seq, e) in &entries {
+        digest = chain_digest(&digest, *seq, &entry_digest(e));
+    }
+    let head = ChainHead {
+        position: 9,
+        digest,
+        start: 0,
+    };
+    assert_eq!(contract.chain_head(), head);
+    assert_eq!(mock::fold(me(), 0), (9, digest));
+    assert_eq!(contract.head().next_seq, 9);
+    // Nothing is stored per entry.
+    for seq in 0..=9u64 {
+        assert_eq!(raw(&(4u32, seq)), None, "entry {seq}");
+    }
+    // The peer's chain holds the one credit that stands.
+    assert_eq!(mock::chain_entries(peer()).len(), 1);
+    on_peer(|| {
+        let receiver = Settlement::handle();
+        assert_eq!(receiver.chain_head().position, 1);
+        receiver.check_invariants();
+    });
+    contract.check_invariants();
 }
 
+/// A call's frame writes the chain's head in storage, so when the frame fails, its write goes
+/// with everything else it did, at the sender and at the receiving deployment. The head then folds
+/// exactly what stands: the refusal in the failed call's place.
 #[ink::test]
-fn prune_inbox_refuses_more_than_the_limit() {
-    let mut contract = setup();
-    for i in 0..=MAX_PRUNE {
-        fund_and_deposit(&mut contract, depositor(), reference(i as u8), DUSD, MIN)
-            .expect("deposit");
+fn t_043_02_a_failed_frame_takes_its_chain_write_with_it() {
+    let mut contract = funded(1_000, 1_000);
+    register_peer();
+    let before = contract.chain_head();
+    assert_eq!(before.position, 1);
+    mock::run_out_after_credit(reference(0x33));
+    let failing = to_peer(50, 0xE3);
+    let outcomes = execute(
+        &mut contract,
+        vec![
+            envelope(0x31, anchor(1, 1)),
+            envelope(0x33, failing),
+            envelope(0x34, to_payee(20)),
+        ],
+    )
+    .expect("batch accepted");
+    let reason = Refusal::CallFailed(CallFailure::OutOfGas);
+    assert_eq!(outcomes[1], Outcome::Refused { seq: 2, reason });
+    // The receiver had folded the credit into its chain inside the frame: gone with the frame.
+    assert_peer_untouched(0);
+    // The sender's head folds the anchor, the refusal and the withdrawal, and nothing else.
+    let mut digest = before.digest;
+    for (n, event) in [
+        InboxEvent::Anchored {
+            operation_ref: reference(0x31),
+            number: 1,
+            commitment: [1; 32],
+        },
+        InboxEvent::Refused {
+            operation_ref: reference(0x33),
+            call: failing,
+            reason,
+        },
+        InboxEvent::Withdrawn {
+            operation_ref: reference(0x34),
+            to: Destination::Account(payee()),
+            asset: DUSD,
+            amount: 20,
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let n = before.position + n as u64;
+        digest = chain_digest(&digest, n, &entry_digest(&InboxEntry { at: 1, event }));
     }
-    caller(admin());
     assert_eq!(
-        contract.prune_inbox(MAX_PRUNE + 1),
-        Err(Error::TooManyToPrune)
+        contract.chain_head(),
+        ChainHead {
+            position: 4,
+            digest,
+            start: 0
+        }
     );
-    assert_eq!(contract.prune_inbox(MAX_PRUNE), Ok(MAX_PRUNE));
     contract.check_invariants();
 }
 
@@ -1536,7 +1717,7 @@ fn req_as_8_bind_at_zero_divergence_records_the_holding_as_the_position() {
     assert_eq!(contract.bound(DUSD), Some(0));
     assert_eq!(contract.bound(COPM), None);
     assert_eq!(
-        contract.inbox_entry(0).expect("recorded").event,
+        entry(0).expect("recorded").event,
         InboxEvent::Bound {
             operation_ref: reference(0xB1),
             asset: DUSD,
@@ -1703,30 +1884,6 @@ fn req_as_8_a_bind_runs_inline_in_its_batch() {
     contract.check_invariants();
 }
 
-#[ink::test]
-fn req_as_8_bound_entries_survive_pruning() {
-    // Entries 0 to 5 as `with_history`; 6 binds COPM; 7 a deposit.
-    let mut contract = with_history();
-    fund_contract(COPM, 50);
-    assert_eq!(
-        execute_one(&mut contract, 0xB7, bind(COPM, 50)),
-        Outcome::Applied { seq: 6 }
-    );
-    fund_and_deposit(&mut contract, depositor(), reference(8), DUSD, 20).expect("deposit");
-    caller(admin());
-    assert_eq!(contract.prune_inbox(8), Ok(6));
-    for seq in [0, 1, 2, 3, 5, 7] {
-        assert_eq!(contract.inbox_entry(seq), None, "entry {seq} pruned");
-    }
-    assert!(contract.inbox_entry(4).unwrap().event.is_anchor());
-    let kept = contract
-        .inbox_entry(6)
-        .expect("a Bound entry is never pruned");
-    assert!(kept.event.is_kept() && !kept.event.is_anchor());
-    assert_eq!(contract.bound(COPM), Some(6));
-    contract.check_invariants();
-}
-
 // ---------------------------------------------------------------------------------------------
 // Reads
 // ---------------------------------------------------------------------------------------------
@@ -1743,7 +1900,7 @@ fn reads_return_what_is_stored() {
             pruned_to: 0
         }
     );
-    assert_eq!(contract.inbox_entry(6), None);
+    assert_eq!(entry(6), None);
     assert_eq!(
         contract.latest_anchor().map(|a| (a.number, a.seq)),
         Some((2, 4))
@@ -1777,13 +1934,14 @@ impl Lcg {
     }
 }
 
-/// Count the storage cells the contract should use: the registration and the head, one for the
-/// latest anchor if any (however many anchors there were), one per unpruned inbox entry, one per
-/// asset with a position, one per withdrawal bound, one per bound asset.
+/// Count the storage cells the contract should use: its fixed cells that are set (registration,
+/// head, latest anchor, sequence record, governance, the chain's head), however many anchors and
+/// entries there were, and one per asset with a position, one per withdrawal bound, one per bound
+/// asset. No cell per entry.
 fn expected_cells(contract: &Settlement) -> usize {
-    let head = contract.head();
-    let entries = (0..head.next_seq)
-        .filter(|seq| contract.inbox_entry(*seq).is_some())
+    let fixed = [1u32, 2, 8, 9, 0x0A, 0x0B, 0x0C]
+        .iter()
+        .filter(|key| ink::env::contains_contract_storage(*key).is_some())
         .count();
     let positions = [DUSD, COPM]
         .iter()
@@ -1797,13 +1955,15 @@ fn expected_cells(contract: &Settlement) -> usize {
         .iter()
         .filter(|asset| contract.bound(**asset).is_some())
         .count();
-    2 + usize::from(head.last_anchor > 0) + entries + positions + bounds + bound
+    fixed + positions + bounds + bound
 }
 
 #[ink::test]
 fn req_sl_9_req_sl_5_invariants_hold_over_a_long_run() {
     let mut contract = setup();
     register_peer();
+    name_governance(&mut contract);
+    let mut resets = 0u32;
     let mut rng = Lcg(0x5EED_F026);
     let mut peer_received: Balance = 0;
     let (mut applied, mut refused) = (0u32, 0u32);
@@ -1816,6 +1976,7 @@ fn req_sl_9_req_sl_5_invariants_hold_over_a_long_run() {
         let asset = assets[index];
         let before = contract.head();
         let mut expected_entries: u64 = 0;
+        let mut reset = false;
         match rng.below(9) {
             // A deposit, with a fresh account reference each time.
             0 | 1 => {
@@ -1870,7 +2031,7 @@ fn req_sl_9_req_sl_5_invariants_hold_over_a_long_run() {
                     match outcome {
                         Outcome::Applied { seq } => {
                             applied += 1;
-                            let event = contract.inbox_entry(*seq).expect("recorded").event;
+                            let event = entry(*seq).expect("recorded").event;
                             match (envelope.call, event) {
                                 (
                                     Call::Anchor { number, commitment },
@@ -1914,7 +2075,7 @@ fn req_sl_9_req_sl_5_invariants_hold_over_a_long_run() {
                         Outcome::Refused { seq, reason } => {
                             refused += 1;
                             assert_eq!(
-                                contract.inbox_entry(*seq).expect("recorded").event,
+                                entry(*seq).expect("recorded").event,
                                 InboxEvent::Refused {
                                     operation_ref: envelope.operation_ref,
                                     call: envelope.call,
@@ -1963,7 +2124,7 @@ fn req_sl_9_req_sl_5_invariants_hold_over_a_long_run() {
                         assert!(!was_bound && !off, "step {step}");
                         assert_eq!(contract.bound(asset), Some(seq));
                         assert_eq!(
-                            contract.inbox_entry(seq).expect("recorded").event,
+                            entry(seq).expect("recorded").event,
                             InboxEvent::Bound {
                                 operation_ref,
                                 asset,
@@ -1986,25 +2147,30 @@ fn req_sl_9_req_sl_5_invariants_hold_over_a_long_run() {
                 }
                 expected_entries = 1;
             }
-            // The admin prunes a little.
+            // Now and then, governance starts a new sequence: a new chain from position 0.
             _ => {
-                let head = contract.head();
-                if head.next_seq > head.pruned_to {
-                    let up_to = head.pruned_to
-                        + 1
-                        + rng.below((head.next_seq - head.pruned_to).min(MAX_PRUNE));
-                    caller(admin());
-                    contract.prune_inbox(up_to).expect("prunes");
+                if rng.below(4) == 0 {
+                    let last = contract.head().last_anchor;
+                    let base = if rng.below(2) == 0 { 0 } else { last };
+                    reset_head(&mut contract, last, base, rng.below(256) as u8).expect("reset");
+                    assert_eq!(
+                        contract.chain_head(),
+                        ChainHead {
+                            position: 0,
+                            digest: [0; 32],
+                            start: 0
+                        }
+                    );
+                    reset = true;
+                    resets += 1;
                 }
             }
         }
 
         // Every value movement and every call outcome has exactly one entry; nothing else writes.
-        assert_eq!(
-            contract.head().next_seq,
-            before.next_seq + expected_entries,
-            "step {step}"
-        );
+        // A reset starts the chain again at 0.
+        let expected = if reset { 0 } else { before.next_seq } + expected_entries;
+        assert_eq!(contract.head().next_seq, expected, "step {step}");
         contract.check_invariants();
         // The position is exactly what the inbox accounts for: no value moved unrecorded, and
         // what an issuer placed outside the inbox is all that a binding has yet to record.
@@ -2014,12 +2180,15 @@ fn req_sl_9_req_sl_5_invariants_hold_over_a_long_run() {
                 mock::balance(asset, me()),
                 "step {step}"
             );
+            // A binding names its entry's position in the chain it was bound in, which may be an
+            // earlier one: its `Bound` event is there.
             if let Some(seq) = contract.bound(asset) {
                 assert!(
-                    matches!(
-                        contract.inbox_entry(seq).map(|e| e.event),
-                        Some(InboxEvent::Bound { asset: a, .. }) if a == asset
-                    ),
+                    mock::seen(me()).iter().any(|s| matches!(
+                        s,
+                        mock::Seen::Entry(p, InboxEntry { event: InboxEvent::Bound { asset: a, .. }, .. })
+                            if *p == seq && *a == asset
+                    )),
                     "step {step}"
                 );
             }
@@ -2036,6 +2205,7 @@ fn req_sl_9_req_sl_5_invariants_hold_over_a_long_run() {
         applied > 50 && refused > 50,
         "the run exercises both: {applied} applied, {refused} refused"
     );
+    assert!(resets > 3, "the run resets the chain: {resets}");
     assert!(
         assets.iter().all(|asset| contract.bound(*asset).is_some()),
         "the run binds every asset"
@@ -2307,7 +2477,7 @@ fn assert_isolated(contract: &mut Settlement, failing: Call, failure: CallFailur
         ]
     );
     assert_eq!(
-        contract.inbox_entry(seq + 2).expect("recorded").event,
+        entry(seq + 2).expect("recorded").event,
         InboxEvent::Refused {
             operation_ref: reference(0x33),
             call: failing,
@@ -2322,6 +2492,7 @@ fn assert_isolated(contract: &mut Settlement, failing: Call, failure: CallFailur
         Refused {
             seq: seq + 2,
             operation_ref: reference(0x33),
+            call: failing,
             reason
         }
     );
@@ -2346,12 +2517,17 @@ fn assert_isolated(contract: &mut Settlement, failing: Call, failure: CallFailur
 }
 
 /// The receiving deployment, as it must be after a failed call to it: nothing recorded, nothing
-/// held.
+/// held, its chain where it was.
 fn assert_peer_untouched(next_seq: InboxSeq) {
     on_peer(|| {
         let receiver = Settlement::handle();
         assert_eq!(receiver.head().next_seq, next_seq);
+        assert_eq!(receiver.chain_head().position, next_seq);
+        if next_seq == 0 {
+            assert_eq!(raw(&0x0Cu32), None, "the receiver's chain is not written");
+        }
         assert_eq!(receiver.position(DUSD), 0);
+        receiver.check_invariants();
     });
     assert_eq!(mock::balance(DUSD, peer()), 0);
 }
@@ -2397,7 +2573,7 @@ fn t_026_08_a_call_that_runs_out_after_the_receiver_recorded_it_rolls_back_the_r
     mock::run_out_after_credit(reference(0x33));
     assert_isolated(&mut contract, to_peer(50, 0xE3), CallFailure::OutOfGas);
     assert_peer_untouched(0);
-    on_peer(|| assert_eq!(Settlement::handle().inbox_entry(0), None));
+    assert_eq!(entry_of(peer(), 0), None);
 }
 
 #[ink::test]
@@ -2488,7 +2664,7 @@ fn t_026_08_a_batch_short_of_weight_applies_what_fits_and_refuses_the_rest() {
             }
         );
         assert_eq!(
-            contract.inbox_entry(at).unwrap().event,
+            entry(at).unwrap().event,
             InboxEvent::Refused {
                 operation_ref: calls[i].operation_ref,
                 call: calls[i].call,
@@ -2597,7 +2773,7 @@ fn t_026_08_a_call_given_less_than_it_needs_runs_out_alone() {
         ]
     );
     assert_eq!(
-        contract.inbox_entry(seq + 1).unwrap().event,
+        entry(seq + 1).unwrap().event,
         InboxEvent::Refused {
             operation_ref: reference(0x62),
             call: to_peer(20, 0xEA),
@@ -2825,6 +3001,7 @@ fn footprint(numbers: u64, seqs: u64) -> (u128, u128) {
     add(size(&|| ink::env::contains_contract_storage(&2u32)));
     add(size(&|| ink::env::contains_contract_storage(&8u32)));
     add(size(&|| ink::env::contains_contract_storage(&9u32)));
+    add(size(&|| ink::env::contains_contract_storage(&0x0Cu32)));
     for n in 1..=numbers {
         add(size(&|| ink::env::contains_contract_storage(&(3u32, n))));
     }
@@ -2896,52 +3073,38 @@ fn the_root_keys_of_the_new_cells_are_fixed() {
     assert_eq!(ink::env::contains_contract_storage(&9u32), None);
 }
 
-/// The ruling's point: an anchor adds one storage item, its inbox entry, which `prune_inbox`
-/// removes once a later anchor supersedes it. The latest is overwritten in place.
+/// The rulings' point: anchoring adds no storage item. The first anchor writes the latest-anchor
+/// cell and the chain's head; every later one overwrites both in place (amendment 0040: before it,
+/// each anchor added its 77-byte inbox entry).
 #[ink::test]
-fn anchoring_adds_no_storage_item_but_its_prunable_entry() {
+fn anchoring_adds_no_storage_item() {
     let mut contract = setup();
     let base = test::count_used_storage_cells::<Env>(&me()).expect("cells");
     execute_one(&mut contract, 1, anchor(1, 1));
-    // The first anchor writes its entry and the latest-anchor cell.
     let first = footprint(0, 1);
     assert_eq!(
         test::count_used_storage_cells::<Env>(&me()).expect("cells"),
         base + 2
     );
     for number in 2..=20u64 {
-        let cells = test::count_used_storage_cells::<Env>(&me()).expect("cells");
-        let before = footprint(0, number);
         execute_one(&mut contract, number as u8, anchor(number, number as u8));
-        let after = footprint(0, number);
-        // One item more (the entry, 77 bytes); the latest cell is rewritten at the same size.
         assert_eq!(
             test::count_used_storage_cells::<Env>(&me()).expect("cells"),
-            cells + 1
-        );
-        assert_eq!(
-            (after.0 - before.0, after.1 - before.1),
-            (1, 77),
+            base + 2,
             "anchor {number}"
         );
+        assert_eq!(footprint(0, number + 1), first, "anchor {number}");
         assert_eq!(ink::env::contains_contract_storage(&8u32), Some(52));
+        assert_eq!(ink::env::contains_contract_storage(&0x0Cu32), Some(48));
         assert_eq!(ink::env::contains_contract_storage(&(3u32, number)), None);
     }
-    // Pruning everything leaves the latest anchor's entry only: whatever the number of anchors,
-    // they hold two items (the latest cell and its entry).
-    caller(admin());
-    assert_eq!(contract.prune_inbox(20), Ok(19));
-    assert_eq!(
-        test::count_used_storage_cells::<Env>(&me()).expect("cells"),
-        base + 2
-    );
-    assert_eq!(footprint(0, 20), first);
     contract.check_invariants();
 }
 
 /// Before and after, per anchor, as `pallet-contracts` charges Kreivo's prices (printed with
-/// `--nocapture`). Before: two items held for good (the record, 44 B, and the entry, 77 B, which
-/// pruning kept). After: the entry alone, released by pruning once superseded.
+/// `--nocapture`). Before 2026-10-11: two items held for good per anchor (the record, 44 B, and the
+/// entry, 77 B). Since amendment 0040: none per anchor; the latest cell (52 B) and the chain's head
+/// (48 B), once.
 #[ink::test]
 fn storage_deposit_per_anchor_before_and_after() {
     // Before: the earlier layout, ten anchors, pruned through.
@@ -2957,26 +3120,22 @@ fn storage_deposit_per_anchor_before_and_after() {
         ink::env::clear_contract_storage(&(4u32, number - 1));
     }
 
-    // After: ten anchors with the new code, pruned through.
+    // After: ten anchors with the new code.
     let mut contract = setup();
     let regs = footprint(0, 0); // registration and head
     for number in 1..=10u64 {
         execute_one(&mut contract, number as u8, anchor(number, number as u8));
     }
-    caller(admin());
-    contract.prune_inbox(10).expect("prunes");
     let after = footprint(10, 10);
-    // What is left of ten anchors: the latest cell (52 B) and its entry (77 B).
-    assert_eq!((after.0 - regs.0, after.1 - regs.1), (2, 52 + 77));
+    assert_eq!((after.0 - regs.0, after.1 - regs.1), (2, 52 + 48));
     let held_before = deposit_of((per_anchor_before, bytes_before));
-    let entry = deposit_of((1, 77));
     std::println!(
-        "per anchor, before: 2 items, 121 B, {held_before} held for good; \
-         after: 1 item, 77 B, {entry} until pruned, plus once {} for the latest cell",
-        deposit_of((1, 52))
+        "per anchor, before: 2 items, 121 B, {held_before} held for good; after: nothing, plus \
+         once {} for the latest cell and {} for the chain's head",
+        deposit_of((1, 52)),
+        deposit_of((1, 48))
     );
     assert_eq!(held_before, 13_373_666_613);
-    assert_eq!(entry, 6_692_333_301);
 }
 
 #[ink::test]
@@ -2992,7 +3151,7 @@ fn the_earlier_layout_reads_unchanged_under_the_new_code() {
         }
     );
     assert_eq!(
-        contract.inbox_entry(1),
+        contract.stored_entry(1),
         Some(InboxEntry {
             at: 102,
             event: InboxEvent::Anchored {
@@ -3022,6 +3181,15 @@ fn the_earlier_layout_reads_unchanged_under_the_new_code() {
     );
     assert_eq!(ink::env::contains_contract_storage(&8u32), None);
     assert_eq!(legacy_left(3), 3);
+    // The chain's head is absent and reads as a chain starting where the head is.
+    assert_eq!(
+        contract.chain_head(),
+        ChainHead {
+            position: 3,
+            digest: [0; 32],
+            start: 3
+        }
+    );
 }
 
 /// A deployment of the earlier code with more anchors than one step removes: each state-changing
@@ -3057,7 +3225,7 @@ fn the_migration_runs_in_bounded_steps_and_then_never_again() {
     assert_eq!(ink::env::contains_contract_storage(&8u32), Some(52));
     assert_eq!(legacy_left(n), (n - MIGRATION_STEP) as usize);
     for seq in 0..MIGRATION_STEP {
-        assert_eq!(contract.inbox_entry(seq), None, "entry {seq}");
+        assert_eq!(contract.stored_entry(seq), None, "entry {seq}");
     }
     assert!(migrated_events().is_empty());
     contract.check_invariants();
@@ -3070,9 +3238,9 @@ fn the_migration_runs_in_bounded_steps_and_then_never_again() {
     assert_eq!(legacy_left(n), (n - 2 * MIGRATION_STEP) as usize);
     // Entries below the watermark (anchors up to 40) are gone; above it they stay, prunable.
     for seq in 0..40 {
-        assert_eq!(contract.inbox_entry(seq), None, "entry {seq}");
+        assert_eq!(contract.stored_entry(seq), None, "entry {seq}");
     }
-    assert!(contract.inbox_entry(40).is_some());
+    assert!(contract.stored_entry(40).is_some());
     assert!(migrated_events().is_empty());
     contract.check_invariants();
 
@@ -3092,12 +3260,15 @@ fn the_migration_runs_in_bounded_steps_and_then_never_again() {
         Some((n + 1, [0xEE; 32], seq))
     );
     contract.check_invariants();
-    // Registration, head, the latest cell, and the entries from the watermark up.
+    // Registration, head, the latest cell, the earlier code's entries from the watermark up
+    // (`40..n`), and the chain's head: the new anchor stored no entry.
     let after = cells(&contract);
-    assert_eq!(after, 3 + (seq + 1 - 40) as usize);
+    assert_eq!(after, 3 + (n - 40) as usize + 1);
+    assert_eq!(contract.stored_entry(seq), None);
+    assert_eq!(contract.chain_head().start, n);
 
     // 4. From now on: a no-op. Every trigger runs again; nothing more is removed or emitted,
-    //    and an anchor adds its entry only.
+    //    and an anchor adds no cell.
     caller(admin());
     contract
         .set_keys(vec![key()], None)
@@ -3111,14 +3282,13 @@ fn the_migration_runs_in_bounded_steps_and_then_never_again() {
             }),
         )
         .expect("bound");
-    contract.prune_inbox(41).expect("prunes");
     assert_eq!(
         execute_one(&mut contract, 3, anchor(n + 2, 0xEF)),
         Outcome::Applied { seq: seq + 1 }
     );
     assert_eq!(migrated_events().len(), 1);
-    // One entry pruned (40), one bound and one entry added.
-    assert_eq!(cells(&contract), after - 1 + 1 + 1);
+    // One bound added.
+    assert_eq!(cells(&contract), after + 1);
     contract.check_invariants();
 }
 
@@ -3180,35 +3350,14 @@ fn a_deployment_with_no_anchors_has_nothing_to_migrate() {
     contract
         .set_keys(vec![key()], None)
         .expect("admin sets keys");
+    // The withdrawal overwrites the chain's head (written by the deposit) and adds no cell.
     execute_one(&mut contract, 1, to_payee(10));
     assert_eq!(
         test::count_used_storage_cells::<Env>(&me()).expect("cells"),
-        cells + 1
+        cells
     );
     assert!(migrated_events().is_empty());
     assert_eq!(ink::env::contains_contract_storage(&9u32), None);
-}
-
-/// An anchor entry a prune passed while it was the latest (so kept) goes when the next anchor
-/// supersedes it: `prune_inbox` never goes back below its watermark, so nothing else would.
-#[ink::test]
-fn a_superseded_anchor_entry_below_the_watermark_goes_with_the_next_anchor() {
-    let mut contract = setup();
-    execute_one(&mut contract, 1, anchor(1, 1));
-    caller(admin());
-    assert_eq!(contract.prune_inbox(1), Ok(0));
-    assert!(
-        contract.inbox_entry(0).is_some(),
-        "the latest's entry is kept"
-    );
-    contract.check_invariants();
-    assert_eq!(
-        execute_one(&mut contract, 2, anchor(2, 2)),
-        Outcome::Applied { seq: 1 }
-    );
-    assert_eq!(contract.inbox_entry(0), None);
-    assert_eq!(contract.latest_anchor().map(|a| a.seq), Some(1));
-    contract.check_invariants();
 }
 
 /// The earlier code kept the latest anchor's entry when a prune passed it; the migration removes
@@ -3220,10 +3369,10 @@ fn the_migration_keeps_the_latests_entry_below_the_watermark() {
     contract
         .set_keys(vec![key()], None)
         .expect("admin sets keys");
-    assert_eq!(contract.inbox_entry(0), None);
-    assert_eq!(contract.inbox_entry(1), None);
+    assert_eq!(contract.stored_entry(0), None);
+    assert_eq!(contract.stored_entry(1), None);
     assert!(
-        contract.inbox_entry(2).is_some(),
+        contract.stored_entry(2).is_some(),
         "the latest's entry stays"
     );
     assert_eq!(contract.latest_anchor().map(|a| a.seq), Some(2));
@@ -3231,7 +3380,8 @@ fn the_migration_keeps_the_latests_entry_below_the_watermark() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Governance and anchor sequences (amendment 0039, T-026-10; OQ-68)
+// Governance and anchor sequences (amendment 0039, T-026-10; OQ-68), and the full reset
+// (amendment 0040, T-043-02)
 // ---------------------------------------------------------------------------------------------
 
 /// The deployment's governance: on Kreivo, the licence-owning community's account, which a
@@ -3297,9 +3447,8 @@ fn raw<K: Encode>(key: &K) -> Option<Vec<u8>> {
 }
 
 /// Everything a reset must leave byte for byte as it was: the value the contract holds, its
-/// registration (admin, keys, attestation key: the grants), governance, each asset's position,
-/// withdrawal window and binding, every inbox entry but the superseded latest anchor's, and the
-/// inbox's numbering.
+/// registration (admin, keys, attestation key: the grants), governance, and each asset's position,
+/// withdrawal window and binding.
 #[derive(Debug, PartialEq, Eq)]
 struct Untouched {
     held: Vec<Balance>,
@@ -3307,13 +3456,9 @@ struct Untouched {
     governance: Option<Vec<u8>>,
     /// Per asset: its position, withdrawal window and binding cells.
     assets: Vec<AssetCells>,
-    inbox: Vec<Option<Vec<u8>>>,
-    next_seq: InboxSeq,
-    pruned_to: InboxSeq,
 }
 
-fn untouched(contract: &Settlement, skip: Option<InboxSeq>) -> Untouched {
-    let head = contract.head();
+fn untouched(_contract: &Settlement) -> Untouched {
     Untouched {
         held: [DUSD, COPM]
             .iter()
@@ -3325,12 +3470,6 @@ fn untouched(contract: &Settlement, skip: Option<InboxSeq>) -> Untouched {
             .iter()
             .map(|a| (raw(&(5u32, *a)), raw(&(6u32, *a)), raw(&(7u32, *a))))
             .collect(),
-        inbox: (0..head.next_seq + 1)
-            .filter(|seq| Some(*seq) != skip)
-            .map(|seq| raw(&(4u32, seq)))
-            .collect(),
-        next_seq: head.next_seq,
-        pruned_to: head.pruned_to,
     }
 }
 
@@ -3345,8 +3484,7 @@ fn head_set_events() -> Vec<crate::settlement::AnchorHeadSet> {
 }
 
 /// A deployment with value in it and every kind of state a reset must not touch: a DUSD position
-/// from a deposit with a bound and a withdrawal against it, a COPM binding, three anchors and a
-/// pruned prefix.
+/// from a deposit with a bound and a withdrawal against it, a COPM binding, and three anchors.
 fn busy() -> Settlement {
     let mut contract = funded(1_000, 500);
     // 0: Deposited (by `funded`). 1: Withdrawn.
@@ -3368,10 +3506,6 @@ fn busy() -> Settlement {
             anchor(number, 0xA0 + number as u8),
         );
     }
-    caller(admin());
-    contract
-        .prune_inbox(2)
-        .expect("prunes the deposit and the withdrawal");
     contract.check_invariants();
     contract
 }
@@ -3426,7 +3560,7 @@ fn t_026_10_only_governance_resets_the_anchor_head() {
         );
     }
     name_governance(&mut contract);
-    let before = untouched(&contract, None);
+    let before = untouched(&contract);
     let events_before = event_count();
     // Named: still not the admin, a key or a stranger.
     for who in [admin(), key(), stranger()] {
@@ -3436,7 +3570,7 @@ fn t_026_10_only_governance_resets_the_anchor_head() {
             Err(Error::NotGovernance)
         );
     }
-    assert_eq!(untouched(&contract, None), before);
+    assert_eq!(untouched(&contract), before);
     assert_eq!(contract.head().last_anchor, 3);
     assert_eq!(contract.anchor_epoch(), None);
     assert_eq!(event_count(), events_before);
@@ -3446,22 +3580,22 @@ fn t_026_10_only_governance_resets_the_anchor_head() {
     contract.check_invariants();
 }
 
-/// The reset moves no value and changes no position, window, binding, grant or inbox entry: the
-/// cells are byte-identical before and after. Only the head's `last_anchor`, the latest anchor
-/// (moved into the sequence's record) and the sequence's record change.
+/// The reset moves no value and changes no position, window, binding or grant: the cells are
+/// byte-identical before and after. The head, the chain's head, the latest anchor (moved into the
+/// sequence's record) and the sequence's record change; the chain starts again at position 0.
 #[ink::test]
 fn t_026_10_a_reset_leaves_funds_binds_positions_windows_and_grants_byte_identical() {
     let mut contract = busy();
     name_governance(&mut contract);
     let old_latest = contract.latest_anchor().expect("anchor 3");
     assert_eq!(old_latest.seq, 5);
-    let before = untouched(&contract, None);
+    let before = untouched(&contract);
     let window = contract.withdrawal_window(DUSD);
     test::set_block_number::<Env>(50);
 
     assert_eq!(reset_head(&mut contract, 3, 0, 0xB0), Ok(()));
 
-    assert_eq!(untouched(&contract, None), before, "nothing else changed");
+    assert_eq!(untouched(&contract), before, "nothing else changed");
     assert_eq!(contract.withdrawal_window(DUSD), window);
     assert_eq!(contract.position(DUSD), 900);
     assert_eq!(contract.position(COPM), 70);
@@ -3470,16 +3604,25 @@ fn t_026_10_a_reset_leaves_funds_binds_positions_windows_and_grants_byte_identic
         contract.head(),
         Head {
             last_anchor: 0,
-            next_seq: 6,
-            pruned_to: 2
+            next_seq: 0,
+            pruned_to: 0
         }
     );
+    assert_eq!(
+        contract.chain_head(),
+        ChainHead {
+            position: 0,
+            digest: [0; 32],
+            start: 0
+        }
+    );
+    assert_eq!(raw(&0x0Cu32), None);
     assert_eq!(contract.latest_anchor(), None);
     assert_eq!(ink::env::contains_contract_storage(&8u32), None);
     let record = AnchorEpoch {
         epoch: 1,
         base: 0,
-        from_seq: 6,
+        from_seq: 0,
         at: 50,
         book: [0xB0; 32],
         previous: Some(old_latest),
@@ -3490,7 +3633,7 @@ fn t_026_10_a_reset_leaves_funds_binds_positions_windows_and_grants_byte_identic
         vec![crate::settlement::AnchorHeadSet {
             epoch: 1,
             base: 0,
-            from_seq: 6,
+            from_seq: 0,
             book: [0xB0; 32],
             previous: Some(old_latest),
         }]
@@ -3501,13 +3644,16 @@ fn t_026_10_a_reset_leaves_funds_binds_positions_windows_and_grants_byte_identic
     assert_eq!(last_topics()[1], topic);
     contract.check_invariants();
 
-    // The deployment works as before: a withdrawal within the same window, a deposit.
+    // The deployment works as before, in the new chain: a withdrawal within the same window, a
+    // deposit. COPM stays bound, once ever (REQ-AS-8).
     assert_eq!(
         execute_one(&mut contract, 0x12, to_payee(50)),
-        Outcome::Applied { seq: 6 }
+        Outcome::Applied { seq: 0 }
     );
     fund_and_deposit(&mut contract, depositor(), reference(0xA1), DUSD, 5).expect("deposit");
     assert_eq!(contract.position(DUSD), 855);
+    assert_refused(&mut contract, bind(COPM, 0), Refusal::AlreadyBound);
+    assert_eq!(contract.bound(COPM), Some(2));
     contract.check_invariants();
 }
 
@@ -3571,98 +3717,63 @@ fn t_026_10_the_sequence_continues_from_the_new_base() {
     contract.check_invariants();
 }
 
-/// The old sequence's anchors stay readable where they were: their entries (until pruned), their
-/// events, and the previous sequence's latest in current state, in the sequence's record.
+/// The old sequence's anchors and entries stay readable where they were: in their events and the
+/// layer's finalized history, and the previous sequence's latest in current state, in the
+/// sequence's record. The events tell the chains apart: entries before an `AnchorHeadSet` belong
+/// to the chain before it.
 #[ink::test]
 fn t_026_10_old_anchors_remain_verifiable_after_a_reset() {
     let mut contract = busy();
     name_governance(&mut contract);
-    let entries: Vec<_> = (3..6).map(|seq| contract.inbox_entry(seq)).collect();
-    let anchored_before: Vec<_> = events()
-        .into_iter()
-        .filter(|e| {
-            e.topics.first().map(Vec::as_slice)
-                == Some(&<Anchored as ink::env::Event>::SIGNATURE_TOPIC.expect("topic")[..])
-        })
-        .map(|e| e.data)
-        .collect();
-    assert_eq!(anchored_before.len(), 3);
+    let old_chain = mock::chain_entries(me());
+    assert_eq!(old_chain.len(), 6);
+    let old_head = contract.chain_head();
+    assert_eq!(mock::fold(me(), 0), (old_head.position, old_head.digest));
     reset_head(&mut contract, 3, 0, 0xB0).expect("reset");
     execute_one(&mut contract, 0x21, anchor(1, 0xC1));
 
-    // The entries of anchors 1 to 3 are unchanged, numbers and commitments included.
+    // Everything the reader saw before the reset still stands, in order, before the reset.
+    let seen = mock::seen(me());
+    let at = seen
+        .iter()
+        .position(|s| *s == mock::Seen::Reset)
+        .expect("the reset is seen");
+    let before: Vec<_> = seen[..at]
+        .iter()
+        .map(|s| match s {
+            mock::Seen::Entry(seq, e) => (*seq, *e),
+            mock::Seen::Reset => unreachable!(),
+        })
+        .collect();
+    assert_eq!(before, old_chain);
     for (i, seq) in (3..6).enumerate() {
-        assert_eq!(contract.inbox_entry(seq), entries[i]);
-        match contract.inbox_entry(seq).expect("kept").event {
+        match old_chain[seq].1.event {
             InboxEvent::Anchored {
                 number, commitment, ..
             } => assert_eq!((number, commitment), (i as u64 + 1, [0xA1 + i as u8; 32])),
             other => panic!("{other:?}"),
         }
     }
-    // Their events stand.
-    let anchored_after: Vec<_> = events()
-        .into_iter()
-        .filter(|e| {
-            e.topics.first().map(Vec::as_slice)
-                == Some(&<Anchored as ink::env::Event>::SIGNATURE_TOPIC.expect("topic")[..])
-        })
-        .map(|e| e.data)
-        .collect();
-    assert_eq!(&anchored_after[..3], &anchored_before[..]);
-    // The old latest is in current state, in the record; the new latest is the new sequence's.
+    // The old latest is in current state, in the record; the new latest is the new sequence's,
+    // at position 0 of the new chain.
     let record = contract.anchor_epoch().expect("record");
     assert_eq!(
         record.previous.map(|a| (a.number, a.commitment, a.seq)),
         Some((3, [0xA3; 32], 5))
     );
-    assert_eq!(contract.latest_anchor().map(|a| a.number), Some(1));
-    // An entry from the new sequence is told from the old one's by its position.
-    assert!(contract.latest_anchor().expect("latest").seq >= record.from_seq);
-    // Old anchor entries are now prunable like any superseded anchor; the record keeps the last.
-    caller(admin());
-    contract.prune_inbox(6).expect("prune to the reset");
-    assert_eq!(contract.inbox_entry(5), None);
-    assert_eq!(contract.anchor_epoch(), Some(record));
-    contract.check_invariants();
-}
-
-/// An old latest anchor's entry that a prune passed while it was the latest (so kept) goes with
-/// the reset: nothing else would reach it, and the sequence's record keeps the anchor.
-#[ink::test]
-fn t_026_10_a_reset_releases_the_old_latests_entry_below_the_watermark() {
-    let mut contract = busy();
-    caller(admin());
-    contract.prune_inbox(6).expect("prune everything");
-    assert!(
-        contract.inbox_entry(5).is_some(),
-        "the latest's entry is kept"
-    );
-    assert!(
-        contract.inbox_entry(2).is_some(),
-        "the bind's entry is kept"
-    );
-    name_governance(&mut contract);
-    let before = untouched(&contract, Some(5));
-    reset_head(&mut contract, 3, 0, 0xB0).expect("reset");
-    assert_eq!(contract.inbox_entry(5), None);
-    assert_eq!(untouched(&contract, Some(5)), before);
     assert_eq!(
-        contract
-            .anchor_epoch()
-            .and_then(|r| r.previous)
-            .map(|a| a.seq),
-        Some(5)
+        contract.latest_anchor().map(|a| (a.number, a.seq)),
+        Some((1, 0))
     );
+    assert_eq!(mock::chain_entries(me()).len(), 1);
     contract.check_invariants();
 }
 
-/// A reset cannot be used to replay what already happened. The inbox's numbering never goes
-/// back, so the entry that recorded a settled withdrawal, and the anchor that followed it, keep
-/// their coordinates for good: no later entry can take them, and nothing re-executes the
-/// withdrawal. An anchor of the old sequence submitted again after a reset is a new anchor of
-/// the new sequence, at a new position, never `Applied` at the old one's; and at a base equal to
-/// the old latest number, it is refused instead of replaying.
+/// A reset cannot be used to replay what already happened. Nothing re-executes a settled
+/// withdrawal, and its event stands in the chain before the reset: a coordinate is `(sequence,
+/// position)`. An anchor of the old sequence submitted again after a reset is a new anchor of the
+/// new sequence, at a position of the new chain, never `Applied` at the old one's; and at a base
+/// equal to the old latest number, it is refused instead of replaying.
 #[ink::test]
 fn t_026_10_a_reset_cannot_replay_an_anchor_or_a_settled_withdrawal() {
     let mut contract = funded(1_000, 500);
@@ -3676,40 +3787,34 @@ fn t_026_10_a_reset_cannot_replay_an_anchor_or_a_settled_withdrawal() {
         execute_one(&mut contract, 0x11, anchor(1, 0xA1)),
         Outcome::Applied { seq: 2 }
     );
-    let withdrawal = raw(&(4u32, 1u64)).expect("withdrawal entry");
-    let anchored = raw(&(4u32, 2u64)).expect("anchor entry");
+    let withdrawal = entry(1).expect("withdrawal entry");
     let paid = mock::balance(DUSD, payee());
     let held = mock::balance(DUSD, me());
 
     // A reset to the old latest number: the old anchor does not replay as `Applied { seq: 2 }`.
     reset_head(&mut contract, 1, 1, 0xB0).expect("reset at 1");
     assert_refused(&mut contract, anchor(1, 0xA1), Refusal::AnchorOutOfOrder);
-    // A reset to zero: the same anchor again is a new anchor, at a new position.
+    // A reset to zero: the same anchor again is a new anchor, at position 0 of a new chain.
     let last = contract.head().last_anchor;
     reset_head(&mut contract, last, 0, 0xB1).expect("reset to 0");
-    let seq = contract.head().next_seq;
-    assert!(seq > 2);
     assert_eq!(
         execute_one(&mut contract, 0x11, anchor(1, 0xA1)),
-        Outcome::Applied { seq }
+        Outcome::Applied { seq: 0 }
     );
-    // The withdrawal's and the old anchor's entries are byte-identical, at the same coordinates;
-    // no value moved again and no second `Withdrawn` exists.
-    assert_eq!(raw(&(4u32, 1u64)), Some(withdrawal));
-    assert_eq!(raw(&(4u32, 2u64)), Some(anchored));
+    // No value moved again, and the one `Withdrawn` stands, in the first chain.
     assert_eq!(mock::balance(DUSD, payee()), paid);
     assert_eq!(mock::balance(DUSD, me()), held);
-    let withdrawn = (0..contract.head().next_seq)
-        .filter(|s| {
-            matches!(
-                contract.inbox_entry(*s).map(|e| e.event),
-                Some(InboxEvent::Withdrawn { .. })
-            )
+    let withdrawn: Vec<_> = mock::seen(me())
+        .into_iter()
+        .filter_map(|s| match s {
+            mock::Seen::Entry(seq, e) if matches!(e.event, InboxEvent::Withdrawn { .. }) => {
+                Some((seq, e))
+            }
+            _ => None,
         })
-        .count();
-    assert_eq!(withdrawn, 1);
-    // Every coordinate is written once: next_seq only grew.
-    assert_eq!(contract.head().next_seq, seq + 1);
+        .collect();
+    assert_eq!(withdrawn, vec![(1, withdrawal)]);
+    assert_eq!(contract.head().next_seq, 1);
     contract.check_invariants();
 }
 
@@ -3719,10 +3824,10 @@ fn t_026_10_a_reset_cannot_replay_an_anchor_or_a_settled_withdrawal() {
 fn t_026_10_a_stale_reset_and_an_old_books_next_anchor_are_refused() {
     let mut contract = busy();
     name_governance(&mut contract);
-    let before = untouched(&contract, None);
+    let before = untouched(&contract);
     assert_eq!(reset_head(&mut contract, 2, 0, 0xB0), Err(Error::HeadMoved));
     assert_eq!(reset_head(&mut contract, 4, 0, 0xB0), Err(Error::HeadMoved));
-    assert_eq!(untouched(&contract, None), before);
+    assert_eq!(untouched(&contract), before);
     assert_eq!(contract.head().last_anchor, 3);
     assert_eq!(contract.anchor_epoch(), None);
     assert!(head_set_events().is_empty());
@@ -3755,7 +3860,8 @@ fn t_026_10_a_base_with_no_next_number_is_refused() {
 /// sequence never starts their migration.
 #[ink::test]
 fn t_026_10_a_reset_waits_for_the_legacy_migration() {
-    let n = 2 * MIGRATION_STEP + 5;
+    // Within what one reset clears of the entries the earlier code stored.
+    let n = MIGRATION_STEP + 5;
     let mut contract = upgraded(n, 0);
     // Naming governance is an admin message: it takes the first migration step.
     name_governance(&mut contract);
@@ -3767,7 +3873,6 @@ fn t_026_10_a_reset_waits_for_the_legacy_migration() {
     // The admin's next messages finish it.
     caller(admin());
     contract.set_keys(vec![key()], None).expect("step 2");
-    contract.set_keys(vec![key()], None).expect("step 3");
     assert_eq!(legacy_left(n), 0);
     assert_eq!(reset_head(&mut contract, n, 0, 0xB0), Ok(()));
     assert_eq!(
@@ -3832,8 +3937,9 @@ fn t_026_10_the_root_keys_of_the_sequence_cells_are_fixed() {
         .expect("stored");
     assert_eq!(
         raw_record,
-        (1, 0, 1, 7, [0xB0; 32], Some((1, [0xA1; 32], 1, 0)))
+        (1, 0, 0, 7, [0xB0; 32], Some((1, [0xA1; 32], 1, 0)))
     );
+    assert_eq!(crate::settlement::CHAIN_KEY, 0x0000_000C);
 }
 
 /// The prod instance runs the code of 2026-10-11 (`0xa43bfd98…`, T-026-09): the latest anchor in
@@ -3920,12 +4026,16 @@ fn t_026_10_the_deployed_layout_upgrades_with_nothing_to_migrate() {
     }
     assert_eq!(raw(&0x0Bu32), Some(governance().encode()));
 
-    // Governance resets, as p2 needs: its first checkpoint is 1.
+    // Governance resets, as p2 needs: its first checkpoint is 1, at position 0 of a new chain,
+    // and the 17 stored entries are gone.
     let held = mock::balance(DUSD, me());
     reset_head(&mut contract, 17, 0, 0xB2).expect("reset");
+    for seq in 0..=17u64 {
+        assert_eq!(raw(&(4u32, seq)), None, "entry {seq}");
+    }
     assert_eq!(
         execute_one(&mut contract, 0x31, anchor(1, 0xC1)),
-        Outcome::Applied { seq: 17 }
+        Outcome::Applied { seq: 0 }
     );
     assert_eq!(mock::balance(DUSD, me()), held);
     assert_eq!(contract.position(DUSD), 25);
@@ -3968,3 +4078,284 @@ fn t_026_10_a_second_reset_before_any_anchor_keeps_the_previous_latest() {
     );
     contract.check_invariants();
 }
+
+// ---------------------------------------------------------------------------------------------
+// The upgrade from v2 and the full reset, on the deployed instances' own cells (amendment 0040,
+// T-043-02)
+// ---------------------------------------------------------------------------------------------
+
+fn unhex(hex: &str) -> Vec<u8> {
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex"))
+        .collect()
+}
+
+/// Write `cells` by raw key and raw value, as `ContractsStore.upgrade` leaves them: the code
+/// changes, the child trie does not.
+fn write_cells(cells: &[(&str, &str)]) {
+    for (key, value) in cells {
+        ink::env::set_contract_storage(&Raw(unhex(key)), &Raw(unhex(value)));
+    }
+}
+
+/// Every cell of `cells` as stored now, by its key.
+fn read_cells(cells: &[(&str, &str)]) -> Vec<(String, Option<Vec<u8>>)> {
+    cells
+        .iter()
+        .map(|(key, _)| (key.to_string(), raw(&Raw(unhex(key)))))
+        .collect()
+}
+
+/// The upgrade, then the full reset, on one instance's cells as v2 stored them (`n` entries, all
+/// `Anchored`, nothing pruned).
+fn upgrade_then_reset(cells: &[(&str, &str)], n: u64, last_anchor: AnchorNumber) {
+    let mut contract = setup();
+    // The constructor wrote a registration and a head for `setup`; the instance's own replace them.
+    write_cells(cells);
+    let stored = read_cells(cells);
+    assert!(stored.iter().all(|(_, v)| v.is_some()));
+    let registration = contract.registration();
+    let key = registration.keys[0];
+
+    // 1. It reads unchanged under the new code: no code runs at the upgrade.
+    assert_eq!(
+        contract.head(),
+        Head {
+            last_anchor,
+            next_seq: n,
+            pruned_to: 0
+        }
+    );
+    assert_eq!(
+        contract.latest_anchor().map(|a| a.number),
+        Some(last_anchor)
+    );
+    assert_eq!(
+        contract.chain_head(),
+        ChainHead {
+            position: n,
+            digest: [0; 32],
+            start: n
+        }
+    );
+    for seq in 0..n {
+        assert!(
+            matches!(
+                contract.stored_entry(seq).map(|e| e.event),
+                Some(InboxEvent::Anchored { .. })
+            ),
+            "entry {seq}"
+        );
+    }
+    contract.check_invariants();
+
+    // 2. A message that appends nothing leaves every cell byte for byte: naming governance where
+    //    none is (prod), or the admin setting the keys it has (both).
+    caller(registration.admin);
+    if contract.governance().is_none() {
+        contract
+            .set_governance(governance())
+            .expect("the admin names governance");
+    }
+    contract
+        .set_keys(registration.keys.clone(), registration.attestation_key)
+        .expect("the admin sets the same keys");
+    let governance = contract.governance().expect("governance");
+    assert_eq!(
+        read_cells(cells),
+        stored,
+        "every existing cell, byte for byte"
+    );
+    assert_eq!(raw(&0x0Cu32), None, "no chain cell before the first entry");
+
+    // 3. An entry before the reset (a refusal: an anchor out of order) changes the head and the
+    //    chain's head only, and stores nothing; the chain starts at `n` with the zero digest.
+    caller(key);
+    let outcome = contract
+        .execute(vec![envelope(0x51, anchor(last_anchor + 5, 0x51))])
+        .expect("batch accepted")[0];
+    assert_eq!(
+        outcome,
+        Outcome::Refused {
+            seq: n,
+            reason: Refusal::AnchorOutOfOrder
+        }
+    );
+    for (key, before) in read_cells(cells) {
+        if key != "02000000" {
+            assert_eq!(raw(&Raw(unhex(&key))), before, "cell {key}");
+        }
+    }
+    assert_eq!(raw(&(4u32, n)), None, "nothing stored for the new entry");
+    let chain = contract.chain_head();
+    assert_eq!((chain.position, chain.start), (n + 1, n));
+    assert_eq!(mock::fold(me(), n), (n + 1, chain.digest));
+    contract.check_invariants();
+
+    // 4. The full reset: every stored entry gone, the head at `{ base, 0, 0 }`, the chain's head
+    //    cleared, the latest anchor moved into the sequence's record. Registration, governance
+    //    and the root cell are byte for byte.
+    test::set_block_number::<Env>(77);
+    caller(governance);
+    contract
+        .set_anchor_head(last_anchor, 0, [0xB4; 32])
+        .expect("reset");
+    for seq in 0..=n + 1 {
+        assert_eq!(raw(&(4u32, seq)), None, "entry {seq}");
+    }
+    assert_eq!(
+        contract.head(),
+        Head {
+            last_anchor: 0,
+            next_seq: 0,
+            pruned_to: 0
+        }
+    );
+    assert_eq!(raw(&0x0Cu32), None);
+    assert_eq!(raw(&8u32), None);
+    assert_eq!(
+        contract.chain_head(),
+        ChainHead {
+            position: 0,
+            digest: [0; 32],
+            start: 0
+        }
+    );
+    for key in ["00000000", "01000000"] {
+        let before = stored
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone());
+        assert_eq!(raw(&Raw(unhex(key))), before.flatten(), "cell {key}");
+    }
+    let record = contract.anchor_epoch().expect("record");
+    assert_eq!((record.from_seq, record.base), (0, 0));
+    assert_eq!(
+        record.previous.map(|a| (a.number, a.seq)),
+        Some((last_anchor, n - 1))
+    );
+    contract.check_invariants();
+
+    // 5. The new book's first anchor is entry 0 of the new chain: d_0 over the zero digest.
+    caller(key);
+    assert_eq!(
+        contract.execute(vec![envelope(0x61, anchor(1, 0x61))]),
+        Ok(vec![Outcome::Applied { seq: 0 }])
+    );
+    let e0 = entry_digest(&InboxEntry {
+        at: 77,
+        event: InboxEvent::Anchored {
+            operation_ref: reference(0x61),
+            number: 1,
+            commitment: [0x61; 32],
+        },
+    });
+    assert_eq!(
+        contract.chain_head(),
+        ChainHead {
+            position: 1,
+            digest: chain_digest(&[0; 32], 0, &e0),
+            start: 0
+        }
+    );
+    assert_eq!(raw(&(4u32, 0u64)), None);
+    contract.check_invariants();
+}
+
+/// The test instance as v2 left it on 2026-10-26: 13 entries, a sequence governance started on
+/// 2026-10-23 (`from_seq` 12), governance community 1200's account.
+#[ink::test]
+fn t_043_02_the_test_instance_upgrades_byte_for_byte_and_resets_in_full() {
+    upgrade_then_reset(TEST_CELLS, 13, 1);
+}
+
+/// The prod instance as v2 left it on 2026-10-26: 17 entries, no governance named, no sequence.
+#[ink::test]
+fn t_043_02_the_prod_instance_upgrades_byte_for_byte_and_resets_in_full() {
+    upgrade_then_reset(PROD_CELLS, 17, 17);
+}
+
+/// The reset removes at most `MAX_RESET_CLEAR` stored entries. An instance whose earlier code may
+/// have stored more is refused, and nothing changes.
+#[ink::test]
+fn t_043_02_a_reset_refuses_more_stored_entries_than_it_clears() {
+    let mut contract = setup();
+    name_governance(&mut contract);
+    for seq in 0..=MAX_RESET_CLEAR {
+        ink::env::set_contract_storage(&(4u32, seq), &(1u32, 3u8, [0u8; 32], 1u8, 0u8));
+    }
+    // Head { last_anchor 0, next_seq MAX + 1, pruned_to 0 }, as v2 would leave it.
+    ink::env::set_contract_storage(&2u32, &(0u64, MAX_RESET_CLEAR + 1, 0u64));
+    let before = raw(&2u32);
+    assert_eq!(
+        reset_head(&mut contract, 0, 0, 0xB0),
+        Err(Error::TooManyStoredEntries)
+    );
+    assert_eq!(raw(&2u32), before);
+    assert!(raw(&(4u32, 0u64)).is_some());
+    // At the bound, it clears them all.
+    ink::env::set_contract_storage(&2u32, &(0u64, MAX_RESET_CLEAR, 0u64));
+    ink::env::clear_contract_storage(&(4u32, MAX_RESET_CLEAR));
+    assert_eq!(reset_head(&mut contract, 0, 0, 0xB0), Ok(()));
+    for seq in 0..=MAX_RESET_CLEAR {
+        assert_eq!(raw(&(4u32, seq)), None, "entry {seq}");
+    }
+    // A later reset has nothing to clear, however long the chain has grown: the chain started at
+    // 0, and nothing is stored from there on.
+    for i in 0..3 {
+        fund_and_deposit(&mut contract, depositor(), reference(i), DUSD, 20).expect("deposit");
+    }
+    assert_eq!(contract.chain_head().start, 0);
+    assert_eq!(reset_head(&mut contract, 0, 0, 0xB1), Ok(()));
+    contract.check_invariants();
+}
+
+/// The test instance's child trie, read-only at finalized #40151145 (0x715637f1d4a0c1cc…):
+/// every cell, raw key and raw value, as v2 (`0x268de8fba38af3a9…`) stored it.
+const TEST_CELLS: &[(&str, &str)] = &[
+    ("00000000", ""),
+    ("01000000", "d8a59ad5a5513b7d8f1c38dbb41d9a619791cc321da34387d0b57a2cd2140e6908acf77b897a66f5364a45de2cabc257a09eeac30ff143927e91fee9c51ca8b5e4d8f8da90fcb2077c4e29a074242589fc26e05f3f30878553931d0e5b404a3da601fabe0ea0c8923d7185b7414df565a9a45d4f789e6156d3531358fc3681dc470a"),
+    ("02000000", "01000000000000000d000000000000000000000000000000"),
+    ("040000000000000000000000", "ef965a0202b8e60e21c27f4278ae7c735c9ed8f5db80e2d83b1ae9859fcc6554d37d8800cd0100000000000000b585dcbe6ddf6cad6798bdeb39d8b2cd422880dece34353bbff0b4efce9bfed4"),
+    ("040000000100000000000000", "8b9d5a020267cbe5551a792b956c839d0d47a9db513119c413cda71b68315c90202766915302000000000000001721447b082dcd43067a274618fe2c4ff37cafd515b68d415f4abf9175d0c3fa"),
+    ("040000000200000000000000", "f80c5b02025d8473dfb7d325732f28ac45da98eca510fc6996c5023c756fd6c3eaf6884ffa030000000000000070a37990deecd4df240b404764e0531fd9ab3eb68368663333d7a96b56af931f"),
+    ("040000000300000000000000", "0c8c5b0202e4048e91cad2214f889c1bcee6cefa102d0994fafe95091a65a9044ee4c135b004000000000000001c859f13e62e0b9c1a26219ea6a2e52a1d980b05e5983b0d5b782abfb7310be0"),
+    ("040000000400000000000000", "da925b0202bca81a102ee1cf597c308d79bb9c2824c7ad22bd154bef237a3a2a02cdaf4913050000000000000077f2a8f5669edd8e899999949d9d0e487d2d8469283185b3f17f4360b2e062ef"),
+    ("040000000500000000000000", "a8945b0202358755bea6d1b7cf33510f07b21cf512fff5907ae208d14e41ff7e7861a9a29e0600000000000000317c8927a28d1419526e1b0aaea21f21982d1d82b3a0540002017161b6cbb88a"),
+    ("040000000600000000000000", "569b5b02023bbeaf54e656a64894204eeb2a306d777c756a5afa31ee53570ddd1879d58a950700000000000000584693809e7778e1d5b377aa08764f4fa692107a39cfecddefd5b41b5c6394d9"),
+    ("040000000700000000000000", "2c4c5c0202436e0e327523527cf8780a8e94be075d18ef02137f5f327f9f123d9e6a4d74f00800000000000000af4eb88c3149e86bc5be7cccd10cdf88994aa37426eaf7b687f4fd68c66bd9f5"),
+    ("040000000800000000000000", "dd525c02023fa5a036b9b9d364906b339cbb91a78298449a1330efb221ccd1eb4feaa10ecb0900000000000000c3029619adf4a0cbbbf0c6fcb47b69e45c576baefa432124b97dcb1737ad25e6"),
+    ("040000000900000000000000", "2d6e5d0202a1c18dbb05909a8ebd1de799377ee14ee2a6c7902dc7157622172f535485c08f0a000000000000006793aa0f77ebd85b697f68b939b734187891ce7cc55ffd15f8def064c733fd88"),
+    ("040000000a00000000000000", "e1745d02022ce725c26ea2c1c52364fef045ea5e907c044b52b7f5ff435f4a3b67e3120ae20b0000000000000015ae07dfdf7565e59a95264e15d4fa3fe424876808cf0d5f4aadee6446d73b25"),
+    ("040000000b00000000000000", "5a895d0202bbec4a4c6a8c3e9277790a2d02f5a6b4f9b1c689aea27a7eb9f6e614ce7883110c00000000000000e85611087d34ae81322ac0162ec0f0ef2b71c629ae605e316f14d862fa7cd432"),
+    ("040000000c00000000000000", "35b2620202b8e60e21c27f4278ae7c735c9ed8f5db80e2d83b1ae9859fcc6554d37d8800cd010000000000000050e0a222ed8e61d8958b02b150d88a5b3a7f9f0c5bcb04ecbe3bb8985dada97b"),
+    ("08000000", "010000000000000050e0a222ed8e61d8958b02b150d88a5b3a7f9f0c5bcb04ecbe3bb8985dada97b35b262020c00000000000000"),
+    ("0a000000", "0100000000000000000000000c00000000000000af7462020d5d75063b3de53b668ae07ff31169b9a8df6b49685ed9d5f689f451600a22d4010c00000000000000e85611087d34ae81322ac0162ec0f0ef2b71c629ae605e316f14d862fa7cd4325a895d020b00000000000000"),
+    ("0b000000", "6d6f646c6b762f636d747973b004000000000000000000000000000000000000"),
+];
+/// The prod instance's child trie, read-only at finalized #40151145 (0x715637f1d4a0c1cc…):
+/// every cell, raw key and raw value, as v2 (`0x268de8fba38af3a9…`) stored it.
+const PROD_CELLS: &[(&str, &str)] = &[
+    ("00000000", ""),
+    ("01000000", "d8dba69752ffb04fa563b126a31b037c8bebeb73e3c66cacd7c8efab46bd342308683d4c52e25c628e3b0e354073d4b526fbed986dd5c21a365e7f0255564c94eefdd7a0de51ba258ef9d9212916993bf63cfcac96c6185cc27d33929050f6ff040112dc3006db0268c96deddf9fea1a47781d51b60d659523fe4dd20f1efdaf0e69"),
+    ("02000000", "110000000000000011000000000000000000000000000000"),
+    ("040000000000000000000000", "3b9c5b0202b8e60e21c27f4278ae7c735c9ed8f5db80e2d83b1ae9859fcc6554d37d8800cd0100000000000000dd2ac52a919af4b94b40a162b69fe96b7a58189de2ee9c95e64be2d148bff5bb"),
+    ("040000000100000000000000", "e8825d020267cbe5551a792b956c839d0d47a9db513119c413cda71b68315c90202766915302000000000000001334731ce68ee62341155f05fde31cb6a045f44894b356c1a04ee31fc363634b"),
+    ("040000000200000000000000", "1e306002025d8473dfb7d325732f28ac45da98eca510fc6996c5023c756fd6c3eaf6884ffa03000000000000003b848e448b29e5cf2507d60dbf6438ef598fb2cf75c8cc3fd385f467a4203211"),
+    ("040000000300000000000000", "f536600202e4048e91cad2214f889c1bcee6cefa102d0994fafe95091a65a9044ee4c135b00400000000000000320fca1e52179b4adb5c21eb03a1a4f26c0b015aff3ecefba1951abe3eeed88d"),
+    ("040000000400000000000000", "af3d600202bca81a102ee1cf597c308d79bb9c2824c7ad22bd154bef237a3a2a02cdaf491305000000000000007d4b65b741a5def399c237901466961655998e3ddcee5595f6b604b78dc80ed6"),
+    ("040000000500000000000000", "0e58600202358755bea6d1b7cf33510f07b21cf512fff5907ae208d14e41ff7e7861a9a29e0600000000000000a026756461413322a295e797628d31555d5e65f19478465b2a447519d0b04112"),
+    ("040000000600000000000000", "d75e6002023bbeaf54e656a64894204eeb2a306d777c756a5afa31ee53570ddd1879d58a950700000000000000f485cd9930f96b642a261e27da5c333bc1293a2d08a556fe1c8db8ea947ea01a"),
+    ("040000000700000000000000", "f497600202436e0e327523527cf8780a8e94be075d18ef02137f5f327f9f123d9e6a4d74f008000000000000008c56e4ed33fe10c8539ea38c54b76b3e54436a7bc8263f1d2a78b068d0b818bf"),
+    ("040000000800000000000000", "5fc66002023fa5a036b9b9d364906b339cbb91a78298449a1330efb221ccd1eb4feaa10ecb090000000000000043ae77b9bea84873d8a0bb78fb894c52cc178de022eb91da470168ed2451404a"),
+    ("040000000900000000000000", "3bcd600202a1c18dbb05909a8ebd1de799377ee14ee2a6c7902dc7157622172f535485c08f0a0000000000000067e3677f2447f9d2653215ad70412903a239a53c05358be1624d8c020c45a201"),
+    ("040000000a00000000000000", "f2e16002022ce725c26ea2c1c52364fef045ea5e907c044b52b7f5ff435f4a3b67e3120ae20b00000000000000a9d3b7a248006f7ed92b5d7869e30f7e4b15b2e7eced3301de4581794a3cdd7f"),
+    ("040000000b00000000000000", "9634610202bbec4a4c6a8c3e9277790a2d02f5a6b4f9b1c689aea27a7eb9f6e614ce7883110c00000000000000398c7bfb84d9509783e7a56b3c3ad487da8eed056024af90574c576a5a795947"),
+    ("040000000c00000000000000", "653b6102021a55d635458682618b41a1643971a7dfe1f637d42fab15285bdc86dce885cfeb0d000000000000007742a6cb24f56d61f179dbe2dd73084a0fca4d25b22677bfd3612b7f6b76acd0"),
+    ("040000000d00000000000000", "0443610202627668ef0749e16fd84f9be2e19cd9ebed65cd7ac6514e375ee39b92db8a8c3a0e000000000000001ebee028dc67b006b55af1a97e5746782dabab05a48292856e11dcaa06bb98b8"),
+    ("040000000e00000000000000", "35776102025e8123d23d26a100c6d64c039cc6dc380b01aae4248e5da97a6bdbbd7afa620d0f00000000000000d5ac8e3373f0cc482508fec1cd45e0906406cfacd2a5d25834681eb6912cbbbc"),
+    ("040000000f00000000000000", "147e610202a92ed04d6dfe0d0586f519d40d21519cfca0c6ec3256b6eed6db24c5fd2ea7cb1000000000000000d1f81188ee1184d538f54fc1e1c53e14de30904a880e75cb85cebb4bba1ae4fe"),
+    ("040000001000000000000000", "d4846102026069e4f571c4ea4c6e384ab87c23c644f182484fea1e25121e0d81724c8710bd11000000000000008245af2b6d2daacbb31d621c459d0f54b0f1ee9f6fad4cc45e6a84efc6cb4b44"),
+    ("08000000", "11000000000000008245af2b6d2daacbb31d621c459d0f54b0f1ee9f6fad4cc45e6a84efc6cb4b44d48461021000000000000000"),
+];
