@@ -7,6 +7,8 @@ SPDX-License-Identifier: CC-BY-4.0
 
 **In progress** (amendment 0040; the owner ruled the design on 2026-10-26, in two rounds). `T-043-02` is built. Traces: `REQ-IN-5`, `REQ-SL-9`,
 `REQ-SL-10`, `REQ-SA-7`, `REQ-AT-1`, `AC-D2.1` (as amendment 0040 restates them), `REQ-SL-5`, `REQ-PR-9`, `NFR-6`, `NFR-22`.
+`T-043-13` to `T-043-18` serve amendment 0041 (a running book follows a new settlement sequence), a proposal not yet
+ruled: they also trace `REQ-SA-10` and `REQ-SL-4` as it would amend them.
 
 | ID | Task | Traces | Done when |
 |---|---|---|---|
@@ -21,12 +23,20 @@ SPDX-License-Identifier: CC-BY-4.0
 | T-043-09 | **Readers and runbooks.** `crates/verify` reads a same-block superseded anchor after the upgrade from its `Anchored` event, and assigns a carried anchor to its sequence by `Some(p) != this.previous`, not by position (`rpc.rs:540`); the alert becomes `AledgentSettlementChainMismatch`; every runbook naming the re-scan, and `F-018`'s restore step, rewritten | `REQ-PR-4`, `NFR-9` | `ops/tests/runbooks.rs` and `ops/tests/alerts.rs` pass. The verifier's reset tests pass on this code |
 | T-043-10 | **Rollout on test.** The upgrade by the licence owner, then the full reset by governance, before the next settlement on test; then settle and the core with `F-043` | `REQ-IN-5` | Two idle syncs of one read each, and one sync with new entries folded, on test |
 | T-043-11 | **Rollout on prod.** The upgrade by the licence-owning community's referendum, governance named by the admin, then the full reset as governance, then settle and the core | `REQ-IN-5` | As `T-043-10`, on prod |
+| T-043-13 | **The design for a new sequence under a running book.** Amendment 0041, section 7 of the plan, these tasks. Docs only | `REQ-SL-1`, `REQ-SL-9`, `REQ-SA-10` | The amendment is in `amendments/`, the plan and tasks name it, and `cargo xtask spec-ids --check` passes |
+| T-043-14 | **The core takes a new sequence** (`[PENDING AMENDMENT 0041]`). `AdapterInput::Epoch` and `AdapterReply::Epoch`; from `SETTLEMENT_EPOCHS` the start is refused for another book, an earlier or conflicting sequence, an instruction in flight, or an earlier chain's final record at or above `from_seq`, each refusal one audit record; otherwise the sequence is recorded and the head restarts at `{ at, from_seq }`, the store refusing a sequence that is not strictly later. Ingress: the `epoch` body and reply | `REQ-SA-10`, `REQ-SL-4`, `REQ-AT-1`, `NFR-22` | Test's case as it stands (head 13, new-chain finals at 0 and 1, then the start) takes the next heads and a withdrawal right after gets its first position at the head and a live expiry; each refusal changes nothing but the audit trail; generation 0 refuses the input and the generation-0 fixture and the `code-history` gate replay unchanged |
+| T-043-15 | **The adapter reports a new sequence.** `ChainEpoch` with base, book and previous; a live reset with no dropped entry is reported and the cursor moves only once the core has taken it; a first-start sequence the core has not confirmed is reported once; refusals raise `epoch:` (pages) and are retried every ten minutes; another book is `reset:` as today; `refound` stays. Runbooks `gap-filling.md` and `release/settlement-adapter-outage.md`, the alert, the settle README | `REQ-SA-10`, `REQ-SA-7`, `REQ-IN-5` | A live reset in the fake chain is reported, then the new chain is reported from 0; a refusal stops it with one alert; a dropped entry raises `reset:`; `ops/tests/runbooks.rs` and `ops/tests/alerts.rs` pass |
+| T-043-16 | **A read of the core's head.** `GET /v1/ops/settlement/head` for the operator's principals: per instance, the finalised head, the sequence held, and the head reported and not taken | `REQ-SA-10`, `NFR-6` | The route answers the head and sequence after a start, and refuses the adapter and an unauthorised caller |
+| T-043-17 | **The guard.** From `SETTLEMENT_EPOCHS`, a head dropped for a lower position at a later block is recorded as reported and not taken; a later head or a start clears it; while it is set, `withdraw` and `submit_outbound` are refused with `ERR-SettlementLayerUnavailable` | `REQ-SL-4` (amendment 0041) | A withdrawal is refused while the head is stale and accepted after the start; generation 0 records nothing |
+| T-043-18 | **On test: the core follows epoch 2.** The core's in-place upgrade to the package built as generation 1 (with `T-043-06` to `T-043-08`), then the adapter release | `REQ-SA-10` | `GET /v1/ops/settlement/head` shows epoch 2 and a head at `next_seq` 2 or later; a withdrawal created then has a live expiry |
 | T-043-12 | **Withdrawn** (26 Oct evening ruling): there is no later contract version; `T-043-02` removes `prune_inbox` and the stored entries in one release | `REQ-SL-10` | — |
 
 ## Order
 
 `T-043-01`. Then `T-043-02` and `T-043-06` side by side. `T-043-03` and `T-043-04` follow `T-043-02`, and
 `T-043-05` goes with `T-043-04`. `T-043-07` follows `T-043-06`. `T-043-08` follows `T-043-07` and `T-037-19`.
-`T-043-09` runs beside them. Then `T-043-10` and `T-043-11`. The adapter (`T-043-04`, `T-043-05`) can ship before the core's cleanup
+`T-043-09` runs beside them. Then `T-043-10` and `T-043-11`. `T-043-13` (amendment 0041) comes before
+`T-043-14`, then `T-043-15`, `T-043-16` and `T-043-17` in that order; `T-043-18` needs `T-043-14` and `T-043-15`
+released, the core first. The adapter (`T-043-04`, `T-043-05`) can ship before the core's cleanup
 (`T-043-06` to `T-043-08`): it stops calling the re-scan, and the core keeps its leaves until `T-037-19` moves
 them.
