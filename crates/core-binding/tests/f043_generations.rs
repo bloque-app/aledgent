@@ -708,9 +708,10 @@ fn held<P: core_binding::host::AgentPort>(fx: &Fx<P>) -> Option<FinalisedHead> {
 /// replica alike. Test's case on 28 Oct, scaled: the core's head is 13 from the chain before the
 /// reset, and the new chain's anchors at 0 and 1 are final. Under generation 0 the start of
 /// sequence 2 is refused, `ERR-MalformedCommand`, and writes nothing. After the in-place upgrade to
-/// [`SETTLEMENT_EPOCHS`], a start naming another book is refused (one audit record), and one
-/// naming this book is taken: the head restarts at the reset's block and position 0, and the next
-/// head of the new chain is taken at once. The whole history replays from genesis under its code
+/// [`SETTLEMENT_EPOCHS`] and a gap of the chain before, a start naming another book is refused (one
+/// audit record), and one naming this book is taken: the head restarts at the reset's block and
+/// position 0, the gap end is cleared (ruling q28), and the next head of the new chain is taken at
+/// once. The whole history replays from genesis under its code
 /// map.
 #[test]
 fn t043_14_the_book_follows_a_new_sequence_from_its_generation() {
@@ -753,6 +754,18 @@ fn t043_14_the_book_follows_a_new_sequence_from_its_generation() {
     assert_eq!(fx.replica.state().settlement().epoch(), None);
 
     assert_eq!(upgrade(&mut fx), SETTLEMENT_EPOCHS);
+    // A gap of the chain before: the gap end, which a restart clears (ruling q28).
+    adapter(
+        &mut fx,
+        who,
+        AdapterInput::Gap(Gap {
+            from: 5,
+            to: 9,
+            reason: GapReason::Unreadable,
+        }),
+    )
+    .unwrap();
+    assert_eq!(fx.replica.state().settlement().gap_end(), 9);
     // Another book's start: refused, one audit record, the head unchanged.
     let roots = fx.archive.last().unwrap().roots;
     assert!(matches!(
@@ -773,6 +786,7 @@ fn t043_14_the_book_follows_a_new_sequence_from_its_generation() {
         })))
     ));
     assert_eq!(fx.replica.state().settlement().epoch(), Some(start(book)));
+    assert_eq!(fx.replica.state().settlement().gap_end(), 0, "cleared");
     adapter(&mut fx, who, head(210, 2)).unwrap();
     assert_eq!(
         held(&fx),

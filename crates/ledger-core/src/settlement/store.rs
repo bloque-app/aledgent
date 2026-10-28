@@ -23,6 +23,9 @@
 //!   sequence of the layer's record moves it back, to that sequence's start (amendment 0041,
 //!   [`SettlementWrite::Epoch`]); the store refuses any other head that goes back, and a sequence
 //!   that is not later than the one it holds.
+//! - **The gap end is cleared only by a restart** (amendment 0041, ruling q28): the start of a
+//!   strictly later sequence that moves the head back to its start also sets the gap end to 0,
+//!   since every position below it belonged to the chain before. Otherwise it only rises.
 //! - **Gaps and incidents are appended, never removed.** A re-scan's difference (`Missing`,
 //!   `Unknown`) is one incident however many re-scans find it: the store indexes the ones
 //!   recorded by key, so a re-scan that finds nothing new reads that index, never the incidents.
@@ -143,7 +146,10 @@ pub enum SettlementWrite {
     Head(FinalisedHead),
     /// Record the start of a new sequence of the layer's record (amendment 0041): refused unless
     /// its number is strictly later than the one the store holds. With `head`, the finalised head
-    /// becomes it, even below the one held: the one write that moves the head back.
+    /// becomes it, even below the one held: the one write that moves the head back; and the gap
+    /// end is cleared (ruling q28), the positions below it being the chain before's. Without
+    /// `head`, the gap end stays: the head held is the new sequence's already, and a gap recorded
+    /// since may be the new sequence's too.
     Epoch {
         /// The sequence.
         epoch: SettlementEpoch,
@@ -161,7 +167,7 @@ pub enum SettlementWrite {
     DropIncidents(u32),
     /// Raise the end of the highest gap to at least this position (`T-043-07`): the one number
     /// the book keeps for gaps from [`super::CHAINED_SETTLEMENT`] on, each gap itself going to
-    /// the audit trail. It never goes down.
+    /// the audit trail. It never goes down but at a restart ([`SettlementWrite::Epoch`]).
     GapEnd(u64),
     /// Raise an incident.
     Incident(Incident),
@@ -246,7 +252,8 @@ pub(crate) enum SettlementUndo {
     Unsign(OperationId),
     Undecide(OperationId),
     Head(Option<FinalisedHead>),
-    Epoch(Option<SettlementEpoch>, Option<FinalisedHead>),
+    /// The sequence, the head, and the gap end a restart cleared, before a start.
+    Epoch(Option<SettlementEpoch>, Option<FinalisedHead>, Option<u64>),
     PopGap,
     GapEnd(u64),
     Gaps(Vec<Gap>),
@@ -416,9 +423,12 @@ impl SettlementStore {
             SettlementUndo::Head(h) => {
                 self.head.set(h);
             }
-            SettlementUndo::Epoch(e, h) => {
+            SettlementUndo::Epoch(e, h, gap_end) => {
                 self.epoch.set(e);
                 self.head.set(h);
+                if let Some(g) = gap_end {
+                    self.gap_end.set(g);
+                }
             }
             SettlementUndo::PopGap => {
                 self.gaps.get_mut().pop();
@@ -667,11 +677,15 @@ impl SettlementStore {
                     return Err(SettlementRefusal::EpochNotLater);
                 }
                 let before = *self.head.get();
+                let mut gap_end = None;
                 if let Some(h) = head {
                     self.head.set(Some(*h));
+                    // Ruling q28: a restart clears the gap end (kind 37, which the generation
+                    // that takes a start already reads).
+                    gap_end = Some(self.gap_end.set(0));
                 }
                 let held = self.epoch.set(Some(*epoch));
-                Ok(SettlementUndo::Epoch(held, before))
+                Ok(SettlementUndo::Epoch(held, before, gap_end))
             }
             SettlementWrite::Gap(g) => {
                 if g.to <= g.from {

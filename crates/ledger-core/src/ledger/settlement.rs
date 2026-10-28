@@ -1975,8 +1975,10 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
     ///    the new sequence's, and stays. Later heads compare against it as before.
     ///
     /// A refusal writes one audit record ([`Incident::EpochRefused`]) and nothing in the book's
-    /// state. The positions' tally, the gap end and the index by position are left as they are
-    /// (amendment 0041). This reads the instructions in flight and the instance's final
+    /// state. A restart of the head also clears the gap end (ruling q28): every position below it
+    /// was the chain before's; a start that keeps a later head keeps it, as that head, and a gap
+    /// recorded since, may be the new sequence's. The positions' tally and the index by position
+    /// are left as they are (amendment 0041). This reads the instructions in flight and the instance's final
     /// positions from `from_seq` whole: it comes once per reset.
     pub(super) fn start_epoch(
         &mut self,

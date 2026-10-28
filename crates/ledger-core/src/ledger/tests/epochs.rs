@@ -18,9 +18,9 @@ use crate::ledger::settle_adapter::{AdapterInput, AdapterReply};
 use crate::ledger::settlement::Withdrawal;
 use crate::settlement::store::{SettlementRefusal, SettlementStore, SettlementWrite};
 use crate::settlement::{
-    Coordinate, Destination, EpochOutcome, EpochRefusal, EventKind, FinalisedHead, Incident,
-    Observation, ObservedFinality, Payload, PreviousAnchor, SETTLEMENT_EPOCHS, SettlementEpoch,
-    SourceId,
+    Coordinate, Destination, EpochOutcome, EpochRefusal, EventKind, FinalisedHead, Gap, GapReason,
+    Incident, Observation, ObservedFinality, Payload, PreviousAnchor, SETTLEMENT_EPOCHS,
+    SettlementEpoch, SourceId,
 };
 use crate::state::Write;
 
@@ -245,6 +245,71 @@ fn t043_14_the_book_follows_test_s_reset() {
     assert!(refusals(&fx).is_empty());
 }
 
+/// A gap of `[from, to)`, reported by the adapter.
+fn gap(fx: &mut Fx, adapter: Caller, from: u64, to: u64) {
+    input(
+        fx,
+        adapter,
+        AdapterInput::Gap(Gap {
+            from,
+            to,
+            reason: GapReason::Pruned,
+        }),
+    )
+    .unwrap();
+}
+
+/// Ruling q28 (amendment 0041, decision 6): a start that restarts the head clears the gap end. In
+/// test's case a gap of the chain before (positions 5 to 8) would otherwise keep every withdrawal
+/// of the new chain, whose first positions are far below it, from being proven not executed:
+/// `proof` reads the gap end (`gap_starts_below`) and sends the range to review. A refused start
+/// clears nothing.
+#[test]
+fn t043_14_a_restart_clears_the_gap_end() {
+    let (mut fx, adapter) = as_on_test();
+    gap(&mut fx, adapter, 5, 9);
+    let store = |fx: &Fx| {
+        (
+            fx.ledger.state().settlement().gap_end(),
+            fx.ledger.state().settlement().gap_starts_below(2),
+        )
+    };
+    assert_eq!(store(&fx), (9, true));
+    // Refused (another book): the gap end stays.
+    assert!(matches!(
+        start(&mut fx, adapter, sequence(2, RESET, [0xC1; 32])),
+        Ok(EpochOutcome::Refused(EpochRefusal::OtherBook))
+    ));
+    assert_eq!(store(&fx), (9, true));
+    // Taken: the head restarts and the gap end is cleared.
+    assert_eq!(
+        start(&mut fx, adapter, sequence(2, RESET, BOOK)),
+        Ok(EpochOutcome::Started(FinalisedHead {
+            height: RESET,
+            next_seq: 0
+        }))
+    );
+    assert_eq!(store(&fx), (0, false));
+    // A gap of the new sequence is recorded as before.
+    gap(&mut fx, adapter, 3, 4);
+    assert_eq!(store(&fx), (4, true));
+}
+
+/// Ruling q28, read narrowly: a start that keeps a head at a later block (already the new
+/// sequence's) keeps the gap end, since a gap recorded since may be the new sequence's.
+#[test]
+fn t043_14_a_kept_head_keeps_the_gap_end() {
+    let (mut fx, adapter) = book(SETTLEMENT_EPOCHS);
+    head(&mut fx, adapter, 142, 2);
+    gap(&mut fx, adapter, 0, 2);
+    head(&mut fx, adapter, 250, 3);
+    assert!(matches!(
+        start(&mut fx, adapter, sequence(2, RESET, BOOK)),
+        Ok(EpochOutcome::Started(h)) if h.height == 250
+    ));
+    assert_eq!(fx.ledger.state().settlement().gap_end(), 2);
+}
+
 /// Amendment 0041, step 5: a book that already holds a head at a later block than the reset's
 /// holds the new chain's head (it passed the old position by itself), and keeps it.
 #[test]
@@ -448,4 +513,36 @@ fn t043_14_the_store_takes_only_a_later_sequence() {
         );
     }
     assert_eq!(s.head(), Some(h(RESET, 0)));
+}
+
+/// The store rule for the gap end (ruling q28): a start with a head clears it and its undo puts
+/// it back; a start without one leaves it, and its undo does not touch it.
+#[test]
+fn t043_14_the_store_clears_the_gap_end_only_at_a_restart() {
+    let h = |height, next_seq| FinalisedHead { height, next_seq };
+    let mut s = SettlementStore::new();
+    s.apply(&SettlementWrite::Head(h(142, 13))).unwrap();
+    s.apply(&SettlementWrite::GapEnd(9)).unwrap();
+    let u = s
+        .apply(&SettlementWrite::Epoch {
+            epoch: sequence(2, RESET, BOOK),
+            head: Some(h(RESET, 0)),
+        })
+        .unwrap();
+    assert_eq!(s.gap_end(), 0);
+    s.undo(u);
+    assert_eq!(
+        (s.gap_end(), s.head(), s.epoch()),
+        (9, Some(h(142, 13)), None)
+    );
+    let u = s
+        .apply(&SettlementWrite::Epoch {
+            epoch: sequence(2, RESET, BOOK),
+            head: None,
+        })
+        .unwrap();
+    assert_eq!(s.gap_end(), 9);
+    s.apply(&SettlementWrite::GapEnd(12)).unwrap();
+    s.undo(u);
+    assert_eq!((s.gap_end(), s.epoch()), (12, None));
 }
