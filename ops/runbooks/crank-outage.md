@@ -23,7 +23,8 @@ deadlines keep running: operations move to `Needs-Review`, never to a refund.
 2. Crank: submit the chain's own block-production trigger from the crank account (the chain team's
    procedure; its key is not the adapter's).
 3. Verify the height moves, then that the adapter's cursor catches up (`aledgent_observation_cursor_lag`
-   back to zero) and the re-scan finds no difference (`gap-filling.md` if it does).
+   back to zero) and it accepts the layer's head with no chain mismatch (`gap-filling.md` if it raises
+   one). A stall longer than a full node keeps events (about 256 blocks) needs a node that keeps history.
 4. Operations that reached `Needs-Review` while stalled are resolved with the layer's records as evidence
    through `CTR-OPS` (`resolve_operation`), one by one. None is released without evidence.
 

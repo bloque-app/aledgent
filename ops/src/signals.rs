@@ -5,7 +5,7 @@
 //! | Signal | Metric | Source |
 //! |---|---|---|
 //! | Age of the oldest non-terminal operation (`REQ-OP-8`) | `aledgent_oldest_non_terminal_age_ms`; `aledgent_oldest_undecided_row_age_ms` (`REQ-CS-7`) | core; ingress's received-log |
-//! | Observation completeness (`REQ-SA-7`, `REQ-IN-5`) | `aledgent_observation_cursor_lag`, `aledgent_observation_gaps_total`, `aledgent_observation_rescan_differences` | adapter |
+//! | Observation completeness (`REQ-SA-7`, `REQ-IN-5`) | `aledgent_observation_cursor_lag`, `aledgent_observation_gaps_total`, `aledgent_observation_chain_mismatches`, `aledgent_observation_stopped` | adapter |
 //! | Undelivered notifications, count and age (`REQ-EV-6`) | `aledgent_undelivered_notifications`, `aledgent_oldest_undelivered_age_ms` | core's outbox |
 //! | Anchor lag | `aledgent_anchor_lag_ms`, `aledgent_anchor_in_flight_age_ms` | core (`F-017`'s anchor store) |
 //! | Reconciliation outcome per axis (`NFR-9`) | `aledgent_reconciliation_differences`, `aledgent_reconciliation_last_run_age_ms` | reconciliation records |
@@ -51,7 +51,8 @@ pub const SIGNALS: &[(&str, &[&str])] = &[
         &[
             "aledgent_observation_cursor_lag",
             "aledgent_observation_gaps_total",
-            "aledgent_observation_rescan_differences",
+            "aledgent_observation_chain_mismatches",
+            "aledgent_observation_stopped",
         ],
     ),
     (
@@ -106,7 +107,16 @@ pub const SIGNALS: &[(&str, &[&str])] = &[
 
 /// The kinds of the adapter's alerts (`F-016`), each exported even at zero.
 pub const ADAPTER_ALERTS: &[&str] = &[
-    "digest", "fees", "gap", "incident", "lane", "position", "refusing", "rescan", "runtime",
+    "chain",
+    "digest",
+    "fees",
+    "gap",
+    "lane",
+    "position",
+    "refusing",
+    "reset",
+    "runtime",
+    "unreadable",
 ];
 
 /// Anchoring's signals beyond the anchor lag (`F-017`), and the `Suspense` report (`REQ-LA-2`).
@@ -781,10 +791,16 @@ fn adapter(e: &mut Exposition, a: &AdapterSignals, now: u64) {
     e.sample("aledgent_observation_gaps_total", &[], a.gaps);
     let open = |k: &str| a.alerts.get(k).copied().unwrap_or(0);
     e.gauge(
-        "aledgent_observation_rescan_differences",
-        "Open incidents a re-scan raised: records never ingested or no longer shown (REQ-IN-5).",
+        "aledgent_observation_chain_mismatches",
+        "Open chain mismatches (alert kind `chain`): entries the adapter read that do not lead to the head the layer holds, after a second read (REQ-IN-5).",
         &[],
-        open("rescan") + open("incident"),
+        open("chain"),
+    );
+    e.gauge(
+        "aledgent_observation_stopped",
+        "Open stops of observation that wait for an operator: a range no reader can serve (`unreadable`), or the layer reset under a running adapter (`reset`, until `refound`) (REQ-IN-5).",
+        &[],
+        open("unreadable") + open("reset"),
     );
     for kind in ["position", "fees"] {
         e.gauge(

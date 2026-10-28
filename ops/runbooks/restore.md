@@ -81,10 +81,12 @@ report>`. Reads are answered meanwhile.
 4. **Serve.** Point `core_journal` in ingress's configuration at the rebuilt journal and start
    `aledgent-ingress serve`. The core replays the journal; the forwarder decides every row the log holds
    undecided.
-5. **The adapter.** Start `aledgent-settle` on the restored adapter database. It reads the settlement
-   layer from its cursor — the layer is the truth for settlement — and its re-scan compares the inbox with
-   what it stored and what the core ingested (`REQ-IN-5`). Any difference is an incident: see
-   `gap-filling.md`.
+5. **The adapter.** Start `aledgent-settle` on the restored adapter database. It resumes from the head it
+   last accepted for each instance — the layer is the truth for settlement — reads the events since, and
+   folds them to check them against the head the layer holds (`REQ-IN-5`). If the backup is further behind
+   than a full node keeps events (about 256 blocks), it catches up from the history endpoint; without one
+   the range is unreadable and it alerts without advancing. No range is re-read on a timer. A difference
+   raises `AledgentSettlementChainMismatch`: see `gap-filling.md`.
 6. **Take a fresh core backup** and a fresh audit backup at once. The restored core's audit trail
    continues from the export's head with the import's own record.
 

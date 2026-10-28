@@ -8,7 +8,7 @@ SPDX-License-Identifier: CC-BY-4.0
 | ID | Task | Traces | Done when |
 |---|---|---|---|
 | T-018-01 | Backup jobs: `F-014` export on a cadence, PostgreSQL base backups and WAL archives for ingress and the adapter, VOS space backup in a stop window once qualified | `NFR-4`, `NFR-10`, `REQ-RC-3`, `DEC-10` | Every durable store in the plan's table has a scheduled backup with a verified checksum. The key stores are excluded |
-| T-018-02 | `opsctl restore`: core restore, ingress restore, ordered replay of inputs after the backup point, leaf-store rebuild, adapter re-scan | `NFR-4`, `REQ-RT-3`, `INV-6`, `AC-K5.1` | A restore to an older backup plus replay yields the pre-failure composite root |
+| T-018-02 | `opsctl restore`: core restore, ingress restore, ordered replay of inputs after the backup point, leaf-store rebuild, adapter resume from its accepted head (amendment 0040; was a re-scan) | `NFR-4`, `REQ-RT-3`, `INV-6`, `AC-K5.1` | A restore to an older backup plus replay yields the pre-failure composite root |
 | T-018-03 | Restore drill on an isolated host, with the five checks and a recorded result | `NFR-10`, `INV-5`, `INV-6`, `INV-19`, `AC-K5.1` | The drill runs in CI at small size and in staging at production-like size, and writes its result |
 | T-018-04 | Signal exporter and the core's signal queries through ingress under an operator principal | `NFR-11`, `REQ-OP-8`, `REQ-EV-6`, `REQ-SA-7`, `REQ-SN-2`, `REQ-PV-5`, `AC-C4.2` | All six signals and the three extras are scraped. The queries return no ledger fact |
 | T-018-05 | Alert rules, paging routes and dashboards, including the `Needs-Review` queue | `NFR-9`, `NFR-11`, `REQ-OP-6`, `AC-C4.1`, `RISK-7` | Each signal pushed over its line in staging pages the test route |

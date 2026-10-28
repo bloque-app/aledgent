@@ -3,43 +3,104 @@ Copyright (c) 2026 Pagos Cube LLC
 SPDX-License-Identifier: CC-BY-4.0
 -->
 
-# Runbook: an observation gap, and filling it from an archive
+# Runbook: a chain mismatch, an unreadable range, a reset, and a gap
 
-`F-018` T-018-08 · `REQ-IN-5`, `REQ-SA-7`, `AC-D2.2`, `NFR-9`
+`F-018` T-018-08, `F-043` T-043-09 · `REQ-IN-5`, `REQ-SA-7`, `REQ-SL-9`, `AC-D2.2`, `NFR-9`
 
-**Pages that lead here:** `AledgentObservationGap`, `AledgentRescanDifference`, `AledgentObservationLag`.
-**Owner:** settlement-operations. **Rule that does not bend:** nothing here writes the book or a store by
-hand. What the settlement layer recorded reaches the book only as the adapter's observations through the
-core's surface; an operation that cannot settle is resolved with evidence through `CTR-OPS`
-(`resolve_operation`), never by an edit (`REQ-AT-3`, `INV-11`).
+**Pages that lead here:** `AledgentSettlementChainMismatch`, `AledgentObservationStopped`,
+`AledgentObservationGap`, `AledgentObservationLag`. **Owner:** settlement-operations. **Rule that does not bend:** nothing here
+writes the book or a store by hand. What the settlement layer recorded reaches the book only as the
+adapter's observations through the core's surface; an operation that cannot settle is resolved with
+evidence through `CTR-OPS` (`resolve_operation`), never by an edit (`REQ-AT-3`, `INV-11`).
 
-## What a gap is
+## What the adapter checks
 
-The adapter reads the settlement layer's inbox in order. When a range below the finalized head is pruned
-by the node it reads, it records the range as a gap, raises `gap:<instance>:<from>`, reports it to the
-core, and only then moves past it (`F-016` decision 16). A re-scan compares the whole inbox with what the
-adapter stored and what the core ingested; each difference raises `rescan:` or `incident:` alerts.
+The settlement contract keeps one value for its entries: the position and the digest of the latest one,
+where each entry's digest covers the one before it (`REQ-SL-9`, amendment 0040). It stores no entry.
+The adapter keeps the last head it accepted for each instance, with the block it read it at, and at each
+sync:
 
-## Procedure
+1. reads the head at the finalized block. If it has not moved, that is all: one read;
+2. otherwise reads the events of the blocks since, **folds** the new entries from the accepted digest,
+   and compares the result with the head. On a match it reports the entries to the core in order, and
+   accepts the head once the core has taken in every entry up to it;
+3. on a difference, reads once more. If the result still differs, it raises
+   `AledgentSettlementChainMismatch` and does **not pass the first new position**. It keeps submitting and
+   anchoring (`REQ-PR-9`): only observation past that position waits. No timer re-reads old ranges.
 
-1. **Establish the range.** Read the adapter's open alerts and gaps (its store: `gaps`, `alerts`, or the
-   `aledgent_adapter_alerts` panel). Note the instance and each `[from, to)`.
-2. **Read the range from an archive node.** Run a second adapter process — same configuration, a
-   different `holder` name so it never takes the signing lease — against an archive node that holds the
-   range, and run its re-scan over it. It reads only; it signs nothing. The re-scan lists every position
-   the layer holds that the core never ingested (`incident:missing:*`).
-3. **Ingest.** `TODO(F-016)`: reporting a skipped range's records to the core from an archive is not
-   built (`F-016` Deferred: "Filling a gap from an archive is not built"). Until it is:
+A full node keeps about 256 blocks of events, so routine settlement needs no archive node. An adapter
+further behind catches up from a node that keeps history. If none can serve a block, the position is
+unreadable: the adapter raises `unreadable:<instance>:<position>` and does not advance, until a reader
+serves it or the operator records a gap (below). A reset of the instance under a running adapter raises
+`reset:<instance>`: from then on nothing reaches the book it serves, until the operator re-founds it
+(below). A chain mismatch pages as `AledgentSettlementChainMismatch` (alert kind `chain:<instance>:<position>`;
+also a first-start cursor past the chain's start). `unreadable` and `reset` page as
+`AledgentObservationStopped`: all three need an operator.
+
+Incidents and gaps are written to the audit trail (`NFR-6`, `REQ-AT-1`), not to the book's state.
+
+## What the operator does
+
+1. **Establish what stopped.** Read the adapter's open alerts (`aledgent_adapter_alerts`, or its store's
+   `alerts`) and the audit trail's latest incident for the instance. Note the instance, the position the
+   adapter accepted, the head the layer holds, and the first position it did not pass.
+   `aledgent_observation_cursor_lag` says how far behind observation is.
+2. **Let it re-read.** A difference the node caused (one that is behind the finalized head it reported,
+   say) clears at the next sync with no action: the alert closes itself when the fold
+   matches. Do not clear it by hand. If it persists across two syncs, it is real or the node is wrong.
+3. **Check against a second node.** Run a second adapter process with the same configuration, a different
+   `holder` name so it never takes the signing lease, against another node (an archive node for an old
+   range). It reads only; it signs nothing. If it folds to the layer's head, the first node was wrong:
+   point the primary at the second, or replace the first (`release/replace-node.md`). If it also differs,
+   treat it as a divergence of the layer's record: page security and follow
+   [divergence](release/divergence.md). Do not accept the head.
+4. **A reset by governance** (`AnchorHeadSet`) starts a new chain at position 0, and comes only with its
+   book's re-founding. A running adapter that sees one raises `reset:<instance>` and stops reporting
+   anything to the book it serves (no observation, head, anchor or position cut). Follow
+   "After a reset" below. If nobody announced the reset, do not re-found: treat it as step 3's second
+   case and page security.
+5. **If no node can serve the range**, choose, and write the choice on the incident:
+   - **Wait**, for a node that keeps the range. The rest of the book goes on.
+   - **Record a gap.** Have the adapter record the range as a gap through its own authoritative source
+     (the core refuses a gap from any other, `REQ-AT-3`): stop the running adapter (the command takes its
+     lease), then run once `aledgent-settle <config> gap <from> <to>` with the range the alert names, and
+     start the adapter again. Use the range the command reports: it prints what it recorded, and if it
+     refuses the range it says which range it can record. The adapter then accepts the layer's head as it
+     stands, **unverified for that range**, and the gap is on the audit trail. The book keeps only the end of its highest gap, so `proof` answers
+     `Unprovable` for any range that starts below that end, not only for positions inside the gap
+     (`REQ-SA-7`).
+6. **Ingest what the gap hid.** `TODO(F-016)`: reporting a skipped range's records to the core from an
+   archive is not built (`F-016` Deferred: "Filling a gap from an archive is not built"). Until it is:
    - a missing **withdrawal** record leaves its operation in `Submitted` until its deadline, then in
      `Needs-Review` (`REQ-OP-6`); resolve it with the archive's record as evidence:
      `POST /v1/ops/operations/{reference}/resolve` with a justification;
    - a missing **deposit** has no operation yet: escalate to the owner; do not issue by hand.
-4. **Verify.** Re-run the re-scan against the primary node. Every `incident:missing:*` for the range is
-   accounted for. Clear nothing by hand: the adapter clears what its next reads resolve.
+7. **Verify.** At the next sync the adapter accepts the head: the `chain` or `unreadable` alert closes,
+   `aledgent_observation_cursor_lag` returns to about 0, and the instance's accepted position equals the
+   layer's. After an operator's gap, the `gap:` alert it raised (`AledgentObservationGap`) closes once the
+   adapter has accepted the head past the range. If it stays open after that, it is the adapter's
+   defect, not the operator's to clear: raise it with settlement-operations. Clear nothing by hand.
+
+## After a reset
+
+Only with the owner's announcement of the book's re-founding (`F-043`, amendment 0040):
+
+1. The book has been re-founded and the adapter's configuration points at it. Stop the running adapter.
+2. Run once `aledgent-settle <config> refound`. It takes the lease, resets the instance's cursor and
+   accepted head, and exits.
+3. Start the adapter. It starts on the new chain at position 0 (a cursor kept from before the reset is
+   never read on it), and nothing of the old chain is reported.
+4. Verify that `reset:` closes and `AledgentObservationStopped` clears, then that
+   `aledgent_observation_cursor_lag` is about 0 and the next anchor goes final.
+
+A reset the owner did not announce is not re-founded: the adapter stays stopped for the book, and the
+case goes to security ([divergence](release/divergence.md)).
 
 ## Exercised
 
-In CI: `services/settle/tests/flow.rs` (a pruned range recorded as a gap, reported, passed; the re-scan's
-differences raised), `ops/tests/restore.rs` (the restored adapter's re-scan reconciles), and
-`ops/tests/alerts.rs` (a gap, a re-scan difference and a lag each page). The archive-node step needs a
-live archive node and runs in staging: deferred.
+In CI: `services/settle/tests` (`F-043`'s test plan: an idle sync is one read; an entry hidden, added or
+altered by a reader stub stops the adapter at the first new position, with an alert; behind more than 256
+blocks is unreadable without a history endpoint and caught up with one; a gap recorded for the named range
+lets it accept the head; a reset under a running adapter stops its reports until `refound`), `ops/tests/restore.rs` (a
+restored adapter resumes from its accepted head), and `ops/tests/alerts.rs` (a gap, a chain mismatch, a stopped
+observation of either kind and a lag each page). The second-node step needs a live node and runs in staging: deferred.

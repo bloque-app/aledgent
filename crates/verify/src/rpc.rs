@@ -19,7 +19,10 @@
 //! - `latest_anchor`: `k = 08000000` → `{ number: u64, commitment, at: u32, seq: u64 }`, the only
 //!   anchor the contract keeps, overwritten by each new one (owner's ruling of 2026-10-11);
 //! - `inbox[seq]`: `k = 04000000 ‖ seq (u64 LE)` → `{ at: u32, event }`, an `Anchored` event
-//!   being `02 ‖ operation_ref ‖ number (u64 LE) ‖ commitment`;
+//!   being `02 ‖ operation_ref ‖ number (u64 LE) ‖ commitment`. **Only the code before amendment
+//!   0040 wrote it**: the code of 0040 stores no entry (its chain is one head, `0x0C`, and the
+//!   entries are in the contract's events), so a block after the upgrade holds none and this
+//!   reader takes the anchors of a block from its `Anchored` events instead ([`ContractReader::chain_events_at`]);
 //! - `anchors[number]` (**legacy**): `k = 03000000 ‖ number (u64 LE)` → `{ commitment, at: u32,
 //!   seq: u64 }`, every anchor by number, as the code before 2026-10-11 kept them; present on a
 //!   deployment of that code until its migration removes them;
@@ -36,10 +39,11 @@
 //! latest at the blocks between its own and the next anchor's, all final, and the read finds it
 //! there: [`find_contract_anchor`] searches the finalized blocks for the first at which the
 //! contract holds that number or a later one, and reads it at that block, from `latest_anchor`
-//! (or the legacy record), or from its `Anchored` inbox entry when a later anchor was stored in
-//! the same block. That reads state below the finalized head: it needs a node that keeps it (an
-//! archive node). A node that has discarded it answers with an error, reported as unreadable,
-//! never as a missing anchor.
+//! (or the legacy record), or, when a later anchor was stored in the same block, from its own
+//! `Anchored` inbox entry (the code before amendment 0040) or its `Anchored` event (from then on).
+//! That reads state below the finalized head: it needs a node that keeps it (an archive node); a
+//! block's events are kept for about as long as its state. A node that has discarded it answers
+//! with an error, reported as unreadable, never as a missing anchor.
 //!
 //! **After a reset** (amendment 0039) anchor numbers start again above a base, so "the first block
 //! that holds this number or a later one" no longer names one anchor: two books can each hold an
@@ -62,8 +66,10 @@
 
 use alloc::format;
 use alloc::string::{String, ToString};
+use alloc::vec;
 use alloc::vec::Vec;
 
+use scale_info::PortableRegistry;
 use serde_json::{Value, json};
 use twox_hash::XxHash64;
 
@@ -186,7 +192,9 @@ pub struct ContractAnchorEpoch {
     pub epoch: u32,
     /// The number it starts after.
     pub base: u64,
-    /// The inbox position of its first entry: every entry from here on was written in it.
+    /// The position of its first entry: every entry from here on was written in it. Always 0 for
+    /// a reset by the code of amendment 0040, whose chain restarts; for one by the code of 0039,
+    /// the `next_seq` it started at. Not comparable across sequences: do not order by it.
     pub from_seq: u64,
     /// The block that started it.
     pub at: u64,
@@ -230,11 +238,89 @@ pub fn decode_contract_anchored_entry(bytes: &[u8]) -> Option<(u64, [u8; 32], u6
     Some((number, c, at))
 }
 
-/// A read of one settlement contract's child trie at any block up to the finalized head.
+/// The signature topic of the contract's `Anchored` event (ink! 5.1.1), the first topic of each.
+///
+/// Pinned from the contract: `<Anchored as ink::env::Event>::SIGNATURE_TOPIC` in
+/// `contracts/settlement`, which a change to the event's name or field types changes. A test
+/// recomputes it from the contract's source, so such a change fails there.
+pub const ANCHORED_TOPIC: [u8; 32] =
+    hex32(b"1978d6331d5625c5147056235631ac680e9e1b4bb1294d7aa28780f804555682");
+
+/// The signature topic of the contract's `AnchorHeadSet` event (the reset), pinned as
+/// [`ANCHORED_TOPIC`] is.
+pub const ANCHOR_HEAD_SET_TOPIC: [u8; 32] =
+    hex32(b"7769b2a1fed276d4fb3e485627b9af8e0258c24ad57cf8beb248f5d349ac9a49");
+
+const fn hex32(s: &[u8; 64]) -> [u8; 32] {
+    const fn nibble(c: u8) -> u8 {
+        match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            _ => panic!("not lower-case hex"),
+        }
+    }
+    let mut out = [0u8; 32];
+    let mut i = 0;
+    while i < 32 {
+        out[i] = nibble(s[2 * i]) << 4 | nibble(s[2 * i + 1]);
+        i += 1;
+    }
+    out
+}
+
+/// What a block's events say about the contract's chain of entries, as far as this reader needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChainEvent {
+    /// An anchor was stored, as entry `seq` of the current chain (`Anchored`).
+    Anchored {
+        /// The entry's position.
+        seq: u64,
+        /// The anchor's number.
+        number: u64,
+        /// The commitment.
+        commitment: [u8; 32],
+    },
+    /// Governance reset the instance (`AnchorHeadSet`): the chain restarts at position 0.
+    Reset,
+}
+
+/// Read a contract event as a [`ChainEvent`], from its topics and its data. `None` for any other
+/// event, and for one that does not have the shape the contract gives these.
+///
+/// After the upgrade of amendment 0040 an `Anchored` event is `seq (u64 LE) ‖ operation_ref ‖
+/// number (u64 LE) ‖ commitment`, 80 bytes, with the signature topic and `operation_ref` as its
+/// two topics (ink! 5 keeps topic fields in the data too). It has the shape the stored entry's
+/// `Anchored` had, less the block, which the event's block gives.
+pub fn decode_chain_event(topics: &[[u8; 32]], data: &[u8]) -> Option<ChainEvent> {
+    match topics.first()? {
+        t if *t == ANCHOR_HEAD_SET_TOPIC => Some(ChainEvent::Reset),
+        t if *t == ANCHORED_TOPIC => {
+            if topics.len() != 2 || data.len() != 8 + 32 + 8 + 32 || topics[1] != data[8..40] {
+                return None;
+            }
+            let mut commitment = [0u8; 32];
+            commitment.copy_from_slice(&data[48..80]);
+            Some(ChainEvent::Anchored {
+                seq: u64::from_le_bytes(data[..8].try_into().ok()?),
+                number: u64::from_le_bytes(data[40..48].try_into().ok()?),
+                commitment,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// A read of one settlement contract at any block up to the finalized head.
 pub trait ContractReader {
     /// The item `key` of the contract's child trie at block `block`; `None` if the contract or the
     /// item is not stored there.
     fn item_at(&self, block: u64, key: &[u8]) -> Result<Option<Vec<u8>>, String>;
+
+    /// The contract's `Anchored` and `AnchorHeadSet` events in block `block`, in the order they
+    /// were emitted (amendment 0040: after the upgrade the entries are in the events, not in the
+    /// contract's state). An error if the node cannot serve that block's events: a full node keeps
+    /// about 256 blocks of them; an archive node, all.
+    fn chain_events_at(&self, block: u64) -> Result<Vec<ChainEvent>, String>;
 }
 
 /// What the contract holds about one anchor number at one block.
@@ -244,8 +330,8 @@ enum AtBlock {
     Anchor([u8; 32], u64),
     /// No anchor of that number or later.
     NotYet,
-    /// A later anchor is the latest, at this inbox position, and no record of this one is kept.
-    Superseded { latest_seq: u64 },
+    /// A later anchor is the latest, and no record of this one is kept.
+    Superseded { latest: ContractLatestAnchor },
 }
 
 /// What the contract holds about anchor `number` at `block`. `legacy`: whether the records the code
@@ -283,9 +369,7 @@ fn contract_at_block<R: ContractReader + ?Sized>(
     } else {
         match legacy()? {
             Some((c, at)) => AtBlock::Anchor(c, at),
-            None => AtBlock::Superseded {
-                latest_seq: latest.seq,
-            },
+            None => AtBlock::Superseded { latest },
         }
     })
 }
@@ -296,8 +380,9 @@ fn contract_at_block<R: ContractReader + ?Sized>(
 /// Read at `finalized` first. An anchor older than the latest is found at the first finalized
 /// block at which the contract holds that number or a later one (a binary search: once stored, an
 /// anchor never leaves that condition), read there from `latest_anchor` or the legacy record, or,
-/// when a later anchor was stored in the same block, from its own `Anchored` inbox entry, found by
-/// walking down from the later one's entry through the entries written in that block.
+/// when a later anchor was stored in the same block, from its own `Anchored` inbox entry (found by
+/// walking down from the later one's entry through the entries written in that block) or, for a
+/// block written by the code of amendment 0040, which stores none, from that block's events.
 pub fn find_contract_anchor<R: ContractReader + ?Sized>(
     r: &R,
     finalized: u64,
@@ -324,20 +409,29 @@ pub fn find_contract_anchor<R: ContractReader + ?Sized>(
         AtBlock::NotYet => Err(format!(
             "anchor {number}: no block holds it, yet a later one does"
         )),
-        AtBlock::Superseded { latest_seq } => in_block_inbox(r, hi, latest_seq, number).map(Some),
+        AtBlock::Superseded { latest } => in_block_inbox(r, hi, &latest, number).map(Some),
     }
 }
 
-/// Anchor `number`'s `Anchored` entry among those written in `block` below inbox position
-/// `above`: several extrinsics of that block (other batches, deposits) may lie between it and the
-/// anchor that superseded it in the same block.
+/// Anchor `number`, superseded in `block` by `latest` (the anchor the contract held after it):
+/// its commitment and `block`. Several extrinsics of that block (other batches, deposits) may lie
+/// between the two.
+///
+/// Two places keep it, by the code that wrote `block`:
+///
+/// - **The code before amendment 0040** stored every entry: `Anchored` entries written in `block`
+///   and below `latest`'s position. Read first, since it costs one read where it holds nothing.
+/// - **The code from then on stores none**: the block's `Anchored` events say, as read by
+///   [`ContractReader::chain_events_at`]. Positions restart at 0 at a reset, and a reset can share
+///   the block, so the chain is cut at each `AnchorHeadSet` and the one that holds `latest` is
+///   searched, before `latest`.
 fn in_block_inbox<R: ContractReader + ?Sized>(
     r: &R,
     block: u64,
-    above: u64,
+    latest: &ContractLatestAnchor,
     number: u64,
 ) -> Result<([u8; 32], u64), String> {
-    let mut seq = above;
+    let mut seq = latest.seq;
     while let Some(below) = seq.checked_sub(1) {
         seq = below;
         let Some(raw) = r.item_at(block, &contract_inbox_key(seq))? else {
@@ -356,8 +450,40 @@ fn in_block_inbox<R: ContractReader + ?Sized>(
             }
         }
     }
+    let events = r.chain_events_at(block).map_err(|why| {
+        format!(
+            "anchor {number}: superseded in block {block}, whose stored inbox does not hold its \
+             entry, and that block's events cannot be read (it needs a node that keeps them): {why}"
+        )
+    })?;
+    // The chains the block's events touch, each as the anchors it stored, in order.
+    let mut chains: Vec<Vec<(u64, u64, [u8; 32])>> = vec![Vec::new()];
+    for event in events {
+        match event {
+            ChainEvent::Reset => chains.push(Vec::new()),
+            ChainEvent::Anchored {
+                seq,
+                number,
+                commitment,
+            } => {
+                if let Some(chain) = chains.last_mut() {
+                    chain.push((seq, number, commitment));
+                }
+            }
+        }
+    }
+    let superseding = (latest.seq, latest.number, latest.commitment);
+    for anchors in &chains {
+        let Some(at) = anchors.iter().position(|a| *a == superseding) else {
+            continue;
+        };
+        if let Some((_, _, c)) = anchors[..at].iter().rev().find(|(_, n, _)| *n == number) {
+            return Ok((*c, block));
+        }
+    }
     Err(format!(
-        "anchor {number}: superseded in block {block}, and its entry is not in that block's inbox"
+        "anchor {number}: superseded in block {block}, and its entry is neither in that block's \
+         stored inbox nor among its events"
     ))
 }
 
@@ -390,7 +516,7 @@ fn find_in_sequence<R: ContractReader + ?Sized>(
     };
     let end = last.at.min(to);
     if from > end || past(end)? == AtBlock::NotYet {
-        return in_block_inbox(r, last.at, last.seq, number);
+        return in_block_inbox(r, last.at, last, number);
     }
     let (mut lo, mut hi) = (from, end);
     while lo < hi {
@@ -406,7 +532,7 @@ fn find_in_sequence<R: ContractReader + ?Sized>(
         AtBlock::NotYet => Err(format!(
             "anchor {number}: no block holds it, yet a later one does"
         )),
-        AtBlock::Superseded { latest_seq } => in_block_inbox(r, hi, latest_seq, number),
+        AtBlock::Superseded { latest } => in_block_inbox(r, hi, &latest, number),
     }
 }
 
@@ -537,7 +663,13 @@ pub fn find_contract_anchors<R: ContractReader + ?Sized>(
                 }
             }
         };
-        let last = next.previous.filter(|p| p.seq >= this.from_seq);
+        // `next.previous` is the latest anchor before `next` started. It is this sequence's own
+        // unless this sequence stored none and the anchor is the one it carried itself (it equals
+        // `this.previous`). Not decided by position: a full reset (amendment 0040) restarts
+        // positions at 0, so `from_seq` is 0 in every sequence it starts and a carried anchor's
+        // position (in its own chain) is not comparable with it. It holds for 0039's sequences
+        // too, and needs no block comparison, which a reset and an anchor in one block confuse.
+        let last = next.previous.filter(|p| Some(*p) != this.previous);
         search(
             Sequence {
                 epoch,
@@ -776,16 +908,197 @@ struct RpcContract<'a> {
     account: [u8; 32],
 }
 
-impl ContractReader for RpcContract<'_> {
-    fn item_at(&self, block: u64, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
-        let hash = self
+impl RpcContract<'_> {
+    fn hash_of(&self, block: u64) -> Result<String, String> {
+        Ok(self
             .rpc
             .call("chain_getBlockHash", json!([block]))?
             .as_str()
             .ok_or_else(|| format!("chain_getBlockHash({block}): no such block"))?
-            .to_string();
+            .to_string())
+    }
+}
+
+impl ContractReader for RpcContract<'_> {
+    fn item_at(&self, block: u64, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
+        let hash = self.hash_of(block)?;
         self.rpc.contract_item(&self.account, key, &hash)
     }
+
+    fn chain_events_at(&self, block: u64) -> Result<Vec<ChainEvent>, String> {
+        let hash = self.hash_of(block)?;
+        // The runtime's own metadata at that block says how `System::Events` is laid out; without
+        // it the records cannot be told apart, and a contract's bytes could pass for another's.
+        let metadata = match self.rpc.call("state_getMetadata", json!([hash]))? {
+            Value::String(s) => bytes_of(&s).ok_or("state_getMetadata: not hex")?,
+            _ => return Err("state_getMetadata: unexpected reply".to_string()),
+        };
+        let events = self
+            .rpc
+            .storage(&prefix("System", "Events"), &hash)?
+            .ok_or_else(|| format!("block {block}: no events are stored"))?;
+        let (types, events_type) = events_type(&metadata)?;
+        contract_chain_events(&types, events_type, &events, &self.account)
+    }
+}
+
+/// The type registry of a runtime's metadata and the type of `System::Events` in it. Metadata
+/// versions 14 to 16, which share the shape this reads.
+fn events_type(metadata: &[u8]) -> Result<(PortableRegistry, u32), String> {
+    use frame_metadata::{RuntimeMetadata, RuntimeMetadataPrefixed, v14, v16};
+    use parity_scale_codec::Decode;
+
+    fn plain<T: scale_info::form::Form>(
+        entries: &[v14::StorageEntryMetadata<T>],
+    ) -> Option<&T::Type> {
+        entries.iter().find_map(|e| match &e.ty {
+            v14::StorageEntryType::Plain(ty) if e.name.as_ref() == "Events" => Some(ty),
+            _ => None,
+        })
+    }
+    let prefixed = RuntimeMetadataPrefixed::decode(&mut &metadata[..])
+        .map_err(|e| format!("the runtime's metadata does not decode: {e}"))?;
+    let (types, id) = match prefixed.1 {
+        RuntimeMetadata::V14(m) => {
+            let storage = m
+                .pallets
+                .iter()
+                .find(|p| p.name == "System")
+                .and_then(|p| p.storage.as_ref());
+            let id = storage.and_then(|s| plain(&s.entries)).map(|t| t.id);
+            (m.types, id)
+        }
+        RuntimeMetadata::V15(m) => {
+            let storage = m
+                .pallets
+                .iter()
+                .find(|p| p.name == "System")
+                .and_then(|p| p.storage.as_ref());
+            let id = storage.and_then(|s| plain(&s.entries)).map(|t| t.id);
+            (m.types, id)
+        }
+        RuntimeMetadata::V16(m) => {
+            let storage = m
+                .pallets
+                .iter()
+                .find(|p| p.name == "System")
+                .and_then(|p| p.storage.as_ref());
+            let id = storage.and_then(|s| {
+                s.entries.iter().find_map(|e| match &e.ty {
+                    v16::StorageEntryType::Plain(ty) if e.name == "Events" => Some(ty.id),
+                    _ => None,
+                })
+            });
+            (m.types, id)
+        }
+        other => {
+            return Err(format!(
+                "the runtime's metadata is version {}, which this reader does not read",
+                other.version()
+            ));
+        }
+    };
+    let id = id.ok_or("the runtime's metadata names no `System::Events`")?;
+    Ok((types, id))
+}
+
+/// The `Anchored` and `AnchorHeadSet` events of `contract` among a block's events (`System::Events`
+/// of type `events_type`, SCALE-encoded as `events`), in order. Records are decoded whole against
+/// the metadata's types and only `Contracts::ContractEmitted` records whose `contract` is this one
+/// are read: no byte pattern in another record can pass for one.
+fn contract_chain_events(
+    types: &PortableRegistry,
+    events_type: u32,
+    events: &[u8],
+    contract: &[u8; 32],
+) -> Result<Vec<ChainEvent>, String> {
+    use scale_value::{Composite, Value, ValueDef};
+
+    fn values(v: &Value<u32>) -> Option<Vec<&Value<u32>>> {
+        match &v.value {
+            ValueDef::Composite(Composite::Unnamed(vs)) => Some(vs.iter().collect()),
+            ValueDef::Composite(Composite::Named(vs)) => Some(vs.iter().map(|(_, v)| v).collect()),
+            _ => None,
+        }
+    }
+    /// The field `name` of a struct or of a variant with named fields.
+    fn named<'a>(v: &'a Value<u32>, name: &str) -> Option<&'a Value<u32>> {
+        let fields = match &v.value {
+            ValueDef::Composite(c) => c,
+            ValueDef::Variant(var) => &var.values,
+            _ => return None,
+        };
+        match fields {
+            Composite::Named(vs) => vs.iter().find(|(n, _)| n == name).map(|(_, v)| v),
+            Composite::Unnamed(_) => None,
+        }
+    }
+    /// A run of bytes: a sequence or array of `u8`, however many newtypes wrap it.
+    fn bytes(v: &Value<u32>) -> Option<Vec<u8>> {
+        let inner = values(v)?;
+        if let [only] = inner[..] {
+            if let Some(b) = bytes(only) {
+                return Some(b);
+            }
+        }
+        inner
+            .into_iter()
+            .map(|b| b.as_u128().and_then(|n| u8::try_from(n).ok()))
+            .collect()
+    }
+    fn variant(v: &Value<u32>) -> Option<(&str, &Value<u32>)> {
+        match &v.value {
+            ValueDef::Variant(var) => Some((var.name.as_str(), v)),
+            _ => None,
+        }
+    }
+    fn payload(v: &Value<u32>) -> Option<&Value<u32>> {
+        match &v.value {
+            ValueDef::Variant(var) => match &var.values {
+                Composite::Unnamed(vs) if vs.len() == 1 => vs.first(),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    let decoded = scale_value::scale::decode_as_type(&mut &events[..], events_type, types)
+        .map_err(|e| format!("the block's events do not decode against its metadata: {e}"))?;
+    let records = values(&decoded).ok_or("the block's events are not a list")?;
+    let mut out = Vec::new();
+    for record in records {
+        let Some(event) = named(record, "event") else {
+            return Err("an event record has no `event`".to_string());
+        };
+        // `RuntimeEvent::Contracts(pallet_contracts::Event::ContractEmitted { contract, data })`.
+        let Some(("Contracts", pallet)) = variant(event) else {
+            continue;
+        };
+        let Some(inner) = payload(pallet) else {
+            continue;
+        };
+        let Some(("ContractEmitted", emitted)) = variant(inner) else {
+            continue;
+        };
+        let from = named(emitted, "contract").and_then(bytes);
+        if from.as_deref() != Some(&contract[..]) {
+            continue;
+        }
+        let data = named(emitted, "data").and_then(bytes);
+        let topics: Option<Vec<[u8; 32]>> =
+            named(record, "topics").and_then(values).and_then(|ts| {
+                ts.into_iter()
+                    .map(|t| bytes(t).and_then(|b| <[u8; 32]>::try_from(b).ok()))
+                    .collect()
+            });
+        let (Some(data), Some(topics)) = (data, topics) else {
+            return Err("a `ContractEmitted` record does not read as bytes and topics".to_string());
+        };
+        if let Some(event) = decode_chain_event(&topics, &data) {
+            out.push(event);
+        }
+    }
+    Ok(out)
 }
 
 impl AnchorSource for RpcAnchors {
@@ -936,6 +1249,11 @@ mod tests {
         changes: Vec<(u64, Vec<u8>, Option<Vec<u8>>)>,
         /// Blocks below this one have had their state discarded.
         pruned_below: u64,
+        /// The contract's `Anchored` and `AnchorHeadSet` events by block, in emission order.
+        events: Vec<(u64, ChainEvent)>,
+        /// Blocks below this one have had their events discarded (a node keeps state, and the
+        /// events with it, for about as long as each other; this lets a test tell them apart).
+        events_pruned_below: u64,
     }
 
     impl ContractReader for History {
@@ -948,6 +1266,18 @@ mod tests {
                 .iter()
                 .rfind(|(b, k, _)| *b <= block && k == key)
                 .and_then(|(_, _, v)| v.clone()))
+        }
+
+        fn chain_events_at(&self, block: u64) -> Result<Vec<ChainEvent>, String> {
+            if block < self.pruned_below.max(self.events_pruned_below) {
+                return Err(std::format!("State already discarded for block {block}"));
+            }
+            Ok(self
+                .events
+                .iter()
+                .filter(|(b, _)| *b == block)
+                .map(|(_, e)| *e)
+                .collect())
         }
     }
 
@@ -999,6 +1329,8 @@ mod tests {
         History {
             changes,
             pruned_below,
+            events: vec![],
+            events_pruned_below: 0,
         }
     }
 
@@ -1046,6 +1378,8 @@ mod tests {
                 (10, contract_anchor_key(3), None),
             ],
             pruned_below: 10,
+            events: vec![],
+            events_pruned_below: 0,
         };
         assert_eq!(find_contract_anchor(&h, 10, 2), Ok(Some(([2; 32], 5))));
         assert_eq!(find_contract_anchor(&h, 10, 3), Ok(Some(([3; 32], 8))));
@@ -1067,6 +1401,8 @@ mod tests {
         let h = History {
             changes,
             pruned_below: 0,
+            events: vec![],
+            events_pruned_below: 0,
         };
         assert_eq!(find_contract_anchor(&h, 20, 4), Ok(Some(([4; 32], 12))));
     }
@@ -1194,6 +1530,8 @@ mod tests {
         History {
             changes,
             pruned_below,
+            events: vec![],
+            events_pruned_below: 0,
         }
     }
 
@@ -1510,6 +1848,529 @@ mod tests {
             find_contract_anchors(&h, 22, 4).unwrap().found,
             vec![first(4, 12, 22)]
         );
+    }
+
+    // ---- T-043-09: a full reset restarts positions at 0 (amendment 0040) ----
+
+    /// Every reset of the contract after F-043 records `from_seq` 0: the chain restarts, and the
+    /// anchor it carries over (`previous`) keeps the position it had in its own chain.
+    ///
+    /// The first book as `reset_history` has it (anchors 1 to 5, inbox 0 to 4), then governance
+    /// resets at block 20, again at block 23 before any anchor of the second sequence (a wrong
+    /// book name, say), each naming `book` and recording `from_seq` 0. Anchor 5 is carried
+    /// across both.
+    fn full_reset_twice() -> History {
+        let mut h = reset_history(0, false, 0);
+        let p5 = latest(5, 15, 4);
+        h.changes
+            .retain(|(b, k, _)| !(*b == 20 && *k == contract_anchor_epoch_key()));
+        h.changes.push((
+            20,
+            contract_anchor_epoch_key(),
+            Some(epoch_record(1, 0, 0, 20, BOOK, Some(p5.clone()))),
+        ));
+        h.changes.push((
+            23,
+            contract_anchor_epoch_key(),
+            Some(epoch_record(2, 0, 0, 23, [0xB3; 32], Some(p5))),
+        ));
+        h
+    }
+
+    /// `T-043-09`: `from_seq` is 0 after every reset, so a carried anchor cannot be told from the
+    /// sequence's own by its position. The anchor the second reset carried (5) belongs to the
+    /// first sequence alone: the one in between never stored one. Read by position
+    /// (`p.seq >= from_seq`), it was also attributed to sequence 1.
+    #[test]
+    fn t_043_09_a_carried_anchor_is_the_sequence_that_wrote_it_when_every_reset_starts_at_0() {
+        let h = full_reset_twice();
+        let read = find_contract_anchors(&h, 24, 5).unwrap();
+        assert_eq!(read.current_epoch, 2);
+        assert_eq!(read.found, vec![first(5, 15, 24)]);
+        assert!(read.unread.is_empty(), "{:?}", read.unread);
+        // And so the check names the one book that anchored it.
+        assert!(
+            read.single().is_err(),
+            "the current book has none of its own"
+        );
+        for n in [1, 2, 3, 4] {
+            assert_eq!(
+                find_contract_anchors(&h, 24, n).unwrap().found,
+                vec![first(n, [5, 8, 12, 12][n as usize - 1], 24)],
+                "anchor {n}"
+            );
+        }
+        // No past state: sequence 1's record cannot be read, nothing is attributed to it.
+        let mut head_only = full_reset_twice();
+        head_only.pruned_below = 24;
+        let read = find_contract_anchors(&head_only, 24, 5).unwrap();
+        assert!(read.found.is_empty());
+        assert!(matches!(
+            read.unread.as_slice(),
+            [Unread::Before {
+                epoch: 2,
+                last_anchor: Some(5),
+                ..
+            }]
+        ));
+    }
+
+    /// `T-043-09`: a sequence that did anchor keeps its own last anchor, and the one before it
+    /// still goes to the sequence before, as when the resets recorded `from_seq` by position.
+    #[test]
+    fn t_043_09_each_sequence_keeps_its_own_last_anchor() {
+        let mut h = full_reset_twice();
+        // The second sequence anchors 1 (block 21, inbox 0) and 2 (block 22, inbox 1); the
+        // second reset then carries 2, not 5.
+        let set = |b: u64, k: Vec<u8>, v: Vec<u8>| (b, k, Some(v));
+        h.changes
+            .retain(|(b, k, _)| !(*b == 23 && *k == contract_anchor_epoch_key()));
+        h.changes.extend([
+            set(21, contract_inbox_key(0), anchored_with(1, p2c(1), 21)),
+            set(
+                21,
+                contract_latest_anchor_key(),
+                latest_with(1, p2c(1), 21, 0),
+            ),
+            set(22, contract_inbox_key(1), anchored_with(2, p2c(2), 22)),
+            set(
+                22,
+                contract_latest_anchor_key(),
+                latest_with(2, p2c(2), 22, 1),
+            ),
+            set(
+                23,
+                contract_anchor_epoch_key(),
+                epoch_record(2, 0, 0, 23, [0xB3; 32], Some(latest_with(2, p2c(2), 22, 1))),
+            ),
+            (23, contract_latest_anchor_key(), None),
+        ]);
+        let in_1 = |n: u64, at: u64| {
+            (
+                Sequence {
+                    epoch: 1,
+                    base: 0,
+                    book: Some(BOOK),
+                },
+                PublicAnchor {
+                    commitment: p2c(n),
+                    stored_at: at,
+                    read_at: 24,
+                },
+            )
+        };
+        assert_eq!(
+            find_contract_anchors(&h, 24, 2).unwrap().found,
+            vec![in_1(2, 22), first(2, 8, 24)]
+        );
+        assert_eq!(
+            find_contract_anchors(&h, 24, 1).unwrap().found,
+            vec![in_1(1, 21), first(1, 5, 24)]
+        );
+        // Anchor 5 is the first sequence's, and sequence 1 never had it.
+        assert_eq!(
+            find_contract_anchors(&h, 24, 5).unwrap().found,
+            vec![first(5, 15, 24)]
+        );
+    }
+
+    // ---- T-043-09: entries from the events (amendment 0040) ----
+
+    fn anchored_event(seq: u64, n: u64, c: [u8; 32]) -> ChainEvent {
+        ChainEvent::Anchored {
+            seq,
+            number: n,
+            commitment: c,
+        }
+    }
+
+    /// The data of an `Anchored` event: `seq ‖ operation_ref ‖ number ‖ commitment`.
+    fn anchored_data(seq: u64, operation_ref: [u8; 32], n: u64, c: [u8; 32]) -> Vec<u8> {
+        let mut v = seq.to_le_bytes().to_vec();
+        v.extend_from_slice(&operation_ref);
+        v.extend_from_slice(&n.to_le_bytes());
+        v.extend_from_slice(&c);
+        v
+    }
+
+    /// `T-043-09`: the pinned signature topics are the contract's, recomputed here from its source.
+    /// ink! 5.1.1 sets an event's signature topic to `blake2b-256("Name(type1,type2,...)")`, the
+    /// field types as written, spaces removed (`ink_macro::event::signature_topic`). The verifier
+    /// depends on no contract crate, so the check reads `contracts/settlement/src/lib.rs`: a change
+    /// to either event's fields fails here, rather than making the reader report "unreadable".
+    #[test]
+    fn t_043_09_the_pinned_topics_are_the_contracts_event_signatures() {
+        use blake2::Digest;
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../contracts/settlement/src/lib.rs");
+        let source =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let signature = |event: &str| {
+            let start = source
+                .find(&std::format!("pub struct {event} {{"))
+                .unwrap_or_else(|| panic!("the contract has no event {event}"));
+            let body = &source[start..];
+            let body = &body[..body.find("\n    }").expect("the struct ends")];
+            let types: Vec<String> = body
+                .lines()
+                .filter_map(|l| l.trim().strip_prefix("pub "))
+                .filter(|l| !l.starts_with("struct"))
+                .filter_map(|l| l.split_once(':'))
+                .map(|(_, ty)| ty.trim().trim_end_matches(',').replace(' ', ""))
+                .collect();
+            std::format!("{event}({})", types.join(","))
+        };
+        let topic = |event: &str| -> [u8; 32] {
+            blake2::Blake2b::<blake2::digest::consts::U32>::digest(signature(event).as_bytes())
+                .into()
+        };
+        assert_eq!(
+            signature("Anchored"),
+            "Anchored(InboxSeq,OperationRef,AnchorNumber,Commitment)"
+        );
+        assert_eq!(
+            topic("Anchored"),
+            ANCHORED_TOPIC,
+            "{}",
+            signature("Anchored")
+        );
+        assert_eq!(
+            topic("AnchorHeadSet"),
+            ANCHOR_HEAD_SET_TOPIC,
+            "{}",
+            signature("AnchorHeadSet")
+        );
+    }
+
+    #[test]
+    fn t_043_09_the_contracts_events_read_as_chain_events() {
+        let r = [0xAA; 32];
+        let data = anchored_data(7, r, 4, [4; 32]);
+        assert_eq!(
+            decode_chain_event(&[ANCHORED_TOPIC, r], &data),
+            Some(anchored_event(7, 4, [4; 32]))
+        );
+        // The reset, with whatever else it carries.
+        assert_eq!(
+            decode_chain_event(&[ANCHOR_HEAD_SET_TOPIC, [1; 32]], &[1, 2, 3]),
+            Some(ChainEvent::Reset)
+        );
+        // Not the contract's shape: another signature, no operation reference among the topics, one
+        // that is not the data's, or data of another length.
+        assert_eq!(decode_chain_event(&[[9; 32], r], &data), None);
+        assert_eq!(decode_chain_event(&[ANCHORED_TOPIC], &data), None);
+        assert_eq!(
+            decode_chain_event(&[ANCHORED_TOPIC, [0xBB; 32]], &data),
+            None
+        );
+        assert_eq!(decode_chain_event(&[ANCHORED_TOPIC, r], &data[..79]), None);
+        assert_eq!(decode_chain_event(&[], &data), None);
+        // The pinned signatures are ink!'s: 32 bytes, distinct, read from the hex given.
+        assert_ne!(ANCHORED_TOPIC, ANCHOR_HEAD_SET_TOPIC);
+        assert_eq!(ANCHORED_TOPIC[..4], [0x19, 0x78, 0xd6, 0x33]);
+        assert_eq!(ANCHOR_HEAD_SET_TOPIC[31], 0x49);
+    }
+
+    /// `T-043-09`: after the upgrade nothing is stored per entry; an anchor superseded in the same
+    /// block is in that block's events, past other entries (deposits, here, which are not read).
+    #[test]
+    fn t_043_09_a_same_block_anchor_is_found_in_the_blocks_events() {
+        let mut h = History {
+            changes: vec![
+                (12, contract_latest_anchor_key(), Some(latest(5, 12, 14))),
+                (9, contract_latest_anchor_key(), Some(latest(3, 9, 9))),
+            ],
+            pruned_below: 0,
+            events: vec![],
+            events_pruned_below: 0,
+        };
+        h.changes.sort_by_key(|(b, _, _)| *b);
+        h.events = vec![
+            (9, anchored_event(9, 3, [3; 32])),
+            (12, anchored_event(10, 4, [4; 32])),
+            (12, anchored_event(14, 5, [5; 32])),
+        ];
+        assert_eq!(find_contract_anchor(&h, 20, 5), Ok(Some(([5; 32], 12))));
+        assert_eq!(find_contract_anchor(&h, 20, 4), Ok(Some(([4; 32], 12))));
+        assert_eq!(find_contract_anchor(&h, 20, 3), Ok(Some(([3; 32], 9))));
+        // A node that no longer serves that block's events: unreadable, never missing or another's.
+        h.events_pruned_below = 15;
+        let err = find_contract_anchor(&h, 20, 4).unwrap_err();
+        assert!(err.contains("cannot be read"), "{err}");
+        assert!(find_contract_anchors(&h, 20, 4).is_err());
+    }
+
+    /// `T-043-09`: a block's events that do not hold it say so, and the reader never stops at an
+    /// anchor of another number.
+    #[test]
+    fn t_043_09_an_anchor_the_blocks_events_do_not_hold_is_an_error() {
+        let h = History {
+            changes: vec![(12, contract_latest_anchor_key(), Some(latest(5, 12, 14)))],
+            pruned_below: 0,
+            events: vec![(12, anchored_event(14, 5, [5; 32]))],
+            events_pruned_below: 0,
+        };
+        let err = find_contract_anchor(&h, 20, 4).unwrap_err();
+        assert!(err.contains("neither in that block's"), "{err}");
+    }
+
+    /// `T-043-09`, the reset's own block, with no stored entry (the mirror of
+    /// `t_026_11_anchors_in_the_resets_own_block`): the old book stores 6 and 7, governance resets
+    /// to base 5, and the new book anchors 6 in the same block. Number 6 is in the block twice; each
+    /// book gets its own, because a reset cuts the block's chain and positions restart at 0.
+    #[test]
+    fn t_043_09_anchors_in_the_resets_own_block_come_from_the_events() {
+        let mut h = reset_history(0, false, 0);
+        h.changes.retain(|(b, _, _)| *b < 20);
+        // The first book's entries are not stored (the upgrade has run), only its latest anchor
+        // and what the block 20 left.
+        h.changes
+            .retain(|(_, k, _)| !(0..5).any(|seq| *k == contract_inbox_key(seq)));
+        let set = |b: u64, k: Vec<u8>, v: Vec<u8>| (b, k, Some(v));
+        h.changes.extend([
+            set(
+                20,
+                contract_latest_anchor_key(),
+                latest_with(6, p2c(6), 20, 0),
+            ),
+            set(
+                20,
+                contract_anchor_epoch_key(),
+                epoch_record(1, 5, 0, 20, BOOK, Some(latest(7, 20, 6))),
+            ),
+        ]);
+        h.events = vec![
+            (20, anchored_event(5, 6, [6; 32])),
+            (20, anchored_event(6, 7, [7; 32])),
+            (20, ChainEvent::Reset),
+            (20, anchored_event(0, 6, p2c(6))),
+        ];
+        let sequence = |epoch, base, book| Sequence { epoch, base, book };
+        let book_2 = |n: u64, at, read_at| {
+            (
+                sequence(1, 5, Some(BOOK)),
+                PublicAnchor {
+                    commitment: p2c(n),
+                    stored_at: at,
+                    read_at,
+                },
+            )
+        };
+        // 7: the old book's last, from the sequence record, not the events.
+        assert_eq!(
+            find_contract_anchors(&h, 22, 7).unwrap().found,
+            vec![first(7, 20, 22)]
+        );
+        // 6: the new book's in place, and the old book's, read from the events of the block it
+        // shares: not the other's commitment.
+        assert_eq!(
+            find_contract_anchors(&h, 22, 6).unwrap().found,
+            vec![book_2(6, 20, 22), first(6, 20, 22)]
+        );
+        // 4 was stored and superseded before the block.
+        assert_eq!(
+            find_contract_anchors(&h, 22, 4).unwrap().found,
+            vec![first(4, 12, 22)]
+        );
+    }
+
+    /// A stand-in runtime: the types of a block's events as a node's metadata describes them, to
+    /// show the records are read whole and nothing else is taken for one.
+    mod runtime {
+        use alloc::vec;
+        use alloc::vec::Vec;
+        use parity_scale_codec::Encode;
+        use scale_info::{TypeInfo, meta_type};
+
+        #[derive(Encode, TypeInfo)]
+        pub struct AccountId32(pub [u8; 32]);
+        #[derive(Encode, TypeInfo)]
+        pub struct H256(pub [u8; 32]);
+        #[derive(Encode, TypeInfo)]
+        pub enum Phase {
+            ApplyExtrinsic(u32),
+            Finalization,
+            Initialization,
+        }
+        #[derive(Encode, TypeInfo)]
+        pub enum SystemEvent {
+            ExtrinsicSuccess { weight: u64 },
+        }
+        #[derive(Encode, TypeInfo)]
+        pub enum ContractsEvent {
+            #[codec(index = 0)]
+            Instantiated {
+                deployer: AccountId32,
+                contract: AccountId32,
+            },
+            #[codec(index = 3)]
+            ContractEmitted {
+                contract: AccountId32,
+                data: Vec<u8>,
+            },
+        }
+        #[derive(Encode, TypeInfo)]
+        pub enum BalancesEvent {
+            Note { who: AccountId32, memo: Vec<u8> },
+        }
+        #[derive(Encode, TypeInfo)]
+        pub enum RuntimeEvent {
+            #[codec(index = 0)]
+            System(SystemEvent),
+            #[codec(index = 7)]
+            Contracts(ContractsEvent),
+            #[codec(index = 10)]
+            Balances(BalancesEvent),
+        }
+        #[derive(Encode, TypeInfo)]
+        pub struct EventRecord {
+            pub phase: Phase,
+            pub event: RuntimeEvent,
+            pub topics: Vec<H256>,
+        }
+
+        pub fn emitted(contract: [u8; 32], data: Vec<u8>, topics: &[[u8; 32]]) -> EventRecord {
+            EventRecord {
+                phase: Phase::ApplyExtrinsic(1),
+                event: RuntimeEvent::Contracts(ContractsEvent::ContractEmitted {
+                    contract: AccountId32(contract),
+                    data,
+                }),
+                topics: topics.iter().map(|t| H256(*t)).collect(),
+            }
+        }
+
+        /// A version 14 metadata whose `System::Events` is a list of [`EventRecord`].
+        pub fn metadata() -> Vec<u8> {
+            use frame_metadata::RuntimeMetadataPrefixed;
+            use frame_metadata::v14::{
+                ExtrinsicMetadata, PalletMetadata, PalletStorageMetadata, RuntimeMetadataV14,
+                StorageEntryMetadata, StorageEntryModifier, StorageEntryType,
+            };
+            let pallet = |name: &'static str, index: u8, entries| PalletMetadata {
+                name,
+                storage: Some(PalletStorageMetadata {
+                    prefix: name,
+                    entries,
+                }),
+                calls: None,
+                event: None,
+                constants: vec![],
+                error: None,
+                index,
+            };
+            let events = StorageEntryMetadata {
+                name: "Events",
+                modifier: StorageEntryModifier::Default,
+                ty: StorageEntryType::Plain(meta_type::<Vec<EventRecord>>()),
+                default: vec![0],
+                docs: vec![],
+            };
+            let number = StorageEntryMetadata {
+                name: "Number",
+                modifier: StorageEntryModifier::Default,
+                ty: StorageEntryType::Plain(meta_type::<u32>()),
+                default: vec![0; 4],
+                docs: vec![],
+            };
+            let v14 = RuntimeMetadataV14::new(
+                vec![
+                    pallet("Balances", 10, vec![number]),
+                    pallet("System", 0, vec![events]),
+                ],
+                ExtrinsicMetadata {
+                    ty: meta_type::<u8>(),
+                    version: 4,
+                    signed_extensions: vec![],
+                },
+                meta_type::<RuntimeEvent>(),
+            );
+            RuntimeMetadataPrefixed::from(v14).encode()
+        }
+    }
+
+    #[test]
+    fn t_043_09_the_blocks_events_are_decoded_against_its_metadata() {
+        use parity_scale_codec::Encode;
+        use runtime::*;
+        let me = [0x5E; 32];
+        let other = [0x07; 32];
+        let r = [0xAA; 32];
+        // A blob another contract emits that is, byte for byte, an `Anchored` record of this one:
+        // the forgery a scan of the raw events would take for a real entry.
+        let forged_data = anchored_data(3, r, 9, [0xEE; 32]);
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&[0, 1, 0, 0, 0]); // Phase::ApplyExtrinsic(1)
+        raw.extend_from_slice(&[7, 3]); // Contracts, ContractEmitted
+        raw.extend_from_slice(&me);
+        raw.extend_from_slice(&parity_scale_codec::Compact(80u32).encode());
+        raw.extend_from_slice(&anchored_data(3, r, 9, [0xEE; 32]));
+        raw.extend_from_slice(&[0x08]);
+        raw.extend_from_slice(&ANCHORED_TOPIC);
+        raw.extend_from_slice(&r);
+        let mut blob = raw.clone();
+        blob.extend_from_slice(&[0; 4]);
+        let records = std::vec![
+            EventRecord {
+                phase: Phase::Initialization,
+                event: RuntimeEvent::System(SystemEvent::ExtrinsicSuccess { weight: 5 }),
+                topics: vec![],
+            },
+            EventRecord {
+                phase: Phase::Finalization,
+                event: RuntimeEvent::Contracts(ContractsEvent::Instantiated {
+                    deployer: AccountId32(other),
+                    contract: AccountId32(me),
+                }),
+                topics: vec![H256(me)],
+            },
+            // This contract's anchor 4 at position 10.
+            emitted(me, anchored_data(10, r, 4, [4; 32]), &[ANCHORED_TOPIC, r]),
+            // Another contract's event with the same signature and shape: not this one's.
+            emitted(
+                other,
+                anchored_data(11, r, 5, [5; 32]),
+                &[ANCHORED_TOPIC, r]
+            ),
+            // Another contract whose data holds a whole record of this one's, as raw bytes.
+            emitted(other, blob, &[]),
+            // An event of another pallet that names this contract's account.
+            EventRecord {
+                phase: Phase::ApplyExtrinsic(2),
+                event: RuntimeEvent::Balances(BalancesEvent::Note {
+                    who: AccountId32(me),
+                    memo: forged_data.clone(),
+                }),
+                topics: vec![],
+            },
+            // This contract's reset, then its anchor 1 at position 0; and an event of this contract
+            // that is not one of the two.
+            emitted(me, std::vec![1, 2, 3], &[ANCHOR_HEAD_SET_TOPIC]),
+            emitted(me, anchored_data(0, r, 1, [1; 32]), &[ANCHORED_TOPIC, r]),
+            emitted(me, std::vec![9; 12], &[[0x42; 32]]),
+        ];
+        let events = records.encode();
+        let metadata = runtime::metadata();
+        let (types, ty) = events_type(&metadata).unwrap();
+        assert_eq!(
+            contract_chain_events(&types, ty, &events, &me),
+            Ok(std::vec![
+                anchored_event(10, 4, [4; 32]),
+                ChainEvent::Reset,
+                anchored_event(0, 1, [1; 32]),
+            ])
+        );
+        assert_eq!(
+            contract_chain_events(&types, ty, &events, &other),
+            Ok(std::vec![anchored_event(11, 5, [5; 32])])
+        );
+        assert_eq!(
+            contract_chain_events(&types, ty, &events, &[0x11; 32]),
+            Ok(std::vec![])
+        );
+        // Bytes that are not the metadata's events are an error, never a partial read.
+        assert!(contract_chain_events(&types, ty, &events[..events.len() - 3], &me).is_err());
+        assert!(events_type(&metadata[..metadata.len() / 2]).is_err());
     }
 
     #[test]

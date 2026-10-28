@@ -8,7 +8,7 @@ SPDX-License-Identifier: CC-BY-4.0
 `REQ-SA-5`, `REQ-SA-6`, `REQ-SA-7`, `REQ-OP-6`, `REQ-OP-9`, `INV-10`, `INV-11` · `F-016`, `F-027` ·
 **Pages:** `AledgentAdapterNotServing` (not serving for 5 minutes), `AledgentAdapterRuntimeUnconfirmed`
 (a `runtime:<spec_version>` alert open), `AledgentAdapterSignalsStale`,
-`AledgentSignalsDown`, `AledgentObservationLag`,
+`AledgentSignalsDown`, `AledgentObservationLag`, `AledgentObservationStopped`,
 `AledgentAnchorLag`, `AledgentLaneUnderFeeFloor`, the platform's task-not-running alarm · **Owner:**
 settlement-operations.
 
@@ -98,7 +98,7 @@ settlement-operations.
      ends released when its expiry passes; nothing can hold it past that (`REQ-SL-4`). Payers can
      retry once the runtime is confirmed.
 6. **Database.** If the adapter cannot reach `aledgent_settle`, follow the database server's own failover.
-   The adapter resumes from its cursor.
+   The adapter resumes from the head it last accepted.
 7. **Keys.** If signing fails, read the signer's log: a signer that cannot log in to Vault or read its
    secret does not start (check its Vault role's binding to the task's identity); for a lane opted into
    KMS, check KMS reachability and the task role's `kms:Sign` grant. Do not fall back to a key in the
@@ -106,14 +106,26 @@ settlement-operations.
 8. **Liquidity.** A lane or anchor key under its fee floor parks instructions. Treasury tops up
    ([crank-outage](../crank-outage.md), "Liquidity or fees short").
 
+9. **Running, but observation is stopped** (`AledgentObservationStopped`). The adapter serves and signs,
+   and waits for an operator on one instance:
+   - `unreadable:<instance>:<position>`: no reader serves that range. Give the adapter a history endpoint,
+     or stop it, run once `aledgent-settle <config> gap <from> <to>` with the range the alert names (use the
+     range the command reports if it refuses), and start it again;
+   - `reset:<instance>`: governance reset the layer's instance under it, and nothing reaches the book it
+     serves. Once the book is re-founded and the configuration points at it, stop the adapter, run once
+     `aledgent-settle <config> refound`, and start it again.
+   Both commands take the adapter's lease, so the running adapter is stopped first; each runs once and
+   exits. The steps and their checks are in [gap-filling](../gap-filling.md).
+
 **To pause on purpose:** scale the service to zero (nothing is signed). If the keys are in doubt, the
 contract's admin clears a bound or empties the key set.
 
 ## Verification
 
 - [ ] `aledgent_adapter_serving == 1`, and the signals are fresh.
-- [ ] `aledgent_observation_cursor_lag` returns to about 0. The re-scan finds no difference; if it does,
-  follow [gap-filling](../gap-filling.md).
+- [ ] `aledgent_observation_cursor_lag` returns to about 0 and the adapter accepts the layer's head. If it
+  raises `AledgentSettlementChainMismatch` or `AledgentObservationStopped`, or cannot read the range it missed, follow
+  [gap-filling](../gap-filling.md).
 - [ ] Parked withdrawals resume by themselves; nothing is resubmitted by hand. The oldest non-terminal
   age falls.
 - [ ] Anchors resume, and the anchor lag falls under the interval.
