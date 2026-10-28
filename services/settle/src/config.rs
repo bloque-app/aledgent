@@ -160,8 +160,9 @@ pub struct AdapterConfig {
     /// (amendment 0041, `T-043-15`). **Off by default**, and turned on only once the core runs a
     /// build that knows the input (`T-043-14`) at `SETTLEMENT_EPOCHS`: a core host built before it
     /// cannot decode the input, refuses the whole feed it arrives in, and the book's inputs wait
-    /// behind it. Off, a reset behaves as before amendment 0041 (`reset:` until `refound`; a first
-    /// start moves to the new chain without telling the core).
+    /// behind it. Off, a reset stops the adapter as before amendment 0041 (`reset:` until
+    /// `refound`; a first start moves to the new chain without telling the core), and the adapter
+    /// is held while `reset:` is open: it declares that it does not serve.
     #[serde(default)]
     pub report_resets: bool,
 }
