@@ -8,7 +8,7 @@
 //!                     [--code-config <file>]
 //!                                    the core Agent behind ingress's boundary::Core, streaming every
 //!                                    decision to the off-node archive (serve.rs)
-//! aledgent-core-host restore --config <file> --runtime <runtime.pvm> --actor <actor.vos> --state <dir> [--budget <bytes>]
+//! aledgent-core-host restore --config <file> --runtime <runtime.pvm> --actor <actor.vos> --state <dir> [--budget <bytes>] [--code-config <file>]
 //!                                    finish a restore `opsctl restore core --from` laid out: the Agent
 //!                                    re-sent every archived input after its checkpoint (T-005-16)
 //! aledgent-core-host measure <runtime.pvm> <actor.vos> <out.csv> [--n N] [--warmup W] [--mix reserve|mixed|card|transfers|tick|open|custody|head|positions] [--batch N] [--mapped]
@@ -73,6 +73,7 @@ mod sharded;
 #[cfg(test)]
 mod stateful_fixture;
 mod switch;
+mod upgrade_check;
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
@@ -94,6 +95,7 @@ fn usage() -> ! {
     eprintln!(
         "usage:\n  aledgent-core-host serve --config <file> --runtime <runtime.pvm> --actor <actor.vos> --state <dir> [--chainspec <file> [--genesis-manifest <file>] [--unnamed-code] [--unverified-genesis]] [--budget <bytes>] [--batch N] [--archive <spec> [--archive-interval-ms MS] [--checkpoint-every N] [--checkpoint-every-secs S]] [--code-config <file>]\n  \
          aledgent-core-host restore --config <file> --runtime <runtime.pvm> --actor <actor.vos> --state <dir> [--budget <bytes>]\n  \
+         aledgent-core-host check-upgrade --runtime <pvm> --previous <vos> --package <vos> --history <dir> [--out <file>]\n  \
          aledgent-core-host code-manifest --actor <vos> --runtime <pvm> --profile <json> --out <file>\n  \
          aledgent-core-host check-code --actor <vos> --runtime <pvm> (--chainspec <file> | --manifest <file>) [--code <hex>] [--write-manifest <file>] [--out <file>]\n  \
          aledgent-core-host build-spec --config <file> --chainspec <file> --actor <vos> --runtime <pvm> --out <dir> [--unnamed-code] [--max-memory <bytes>]\n  \
@@ -273,6 +275,12 @@ fn main() {
         Some("serve") => {
             if let Err(e) = serve::serve(&args) {
                 eprintln!("aledgent-core-host: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some("check-upgrade") => {
+            if let Err(e) = upgrade_check::check_upgrade(&args) {
+                eprintln!("aledgent-core-host: check-upgrade refused: {e}");
                 std::process::exit(1);
             }
         }

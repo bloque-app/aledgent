@@ -71,7 +71,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # The base the recorded history is compared with must be in the clone.
           fetch-depth: 0
@@ -84,16 +84,20 @@ jobs:
           BEFORE: ${{ github.event.before }}
         run: |
           set -euo pipefail
+          zero=0000000000000000000000000000000000000000
           case "$EVENT" in
             pull_request) base="$PR_BASE" ;;
-            push) base="$BEFORE" ;;
+            # A push that creates the branch has no "before": its parent is the base.
+            push) base="$BEFORE"; [ "$base" != "$zero" ] || base=$(git rev-parse HEAD^) ;;
             # A release, or a run by hand: against the newest release tag before this commit (a tagged
             # commit is never compared with its own tag).
             *) base=$(git describe --tags --abbrev=0 --match 'v*' "$(git rev-parse HEAD)^" 2>/dev/null || true) ;;
           esac
-          if [ -z "$base" ] || [ "$base" = 0000000000000000000000000000000000000000 ]; then
-            echo "No base to compare the recorded history with: skipped." | tee -a "$GITHUB_STEP_SUMMARY"
-            exit 0
+          # Fail closed: no base, nothing proven to have only grown. The very first recording is the
+          # script's own case (a base that holds no fixture), never a missing base.
+          if [ -z "$base" ] || [ "$base" = "$zero" ]; then
+            echo "::error::no base to compare the recorded history with (event $EVENT): refusing rather than skipping"
+            exit 1
           fi
           # The base's copy of the check, not this change's: a change cannot loosen the rule it is
           # held to. Only where the base has none yet (the change that adds it) is this one used.
@@ -106,8 +110,8 @@ jobs:
           fi
           bash "$RUNNER_TEMP/check-code-history-fixture.sh" "$base" | tee -a "$GITHUB_STEP_SUMMARY"
 
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: code-history
 

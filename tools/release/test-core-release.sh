@@ -126,12 +126,37 @@ if [ -n "$writes" ] && grep -vF -e '"$ref"' -e CODE_REPO <<<"$writes" >/dev/null
 fi
 # The publish script writes to the one repository it is given, never to a tag of anything else.
 pub="$here/core-code-publish.sh"
-[ "$(grep -cE '^ *crane (append|copy|cp|tag|push|mutate|delete)' "$pub")" = 1 ] || fail "core-code-publish.sh writes in more than one place"
+[ "$(grep -cE '^ *crane (append|copy|cp|tag|push|mutate|delete)' "$pub")" = 2 ] || fail "core-code-publish.sh writes in other places than its append and its label"
 # shellcheck disable=SC2016  # the script's text, not ours
 grep -qE '^ *crane append -f "\$layer" -t "\$ref" >&2$' "$pub" || fail "core-code-publish.sh does not append to its own tag"
+# shellcheck disable=SC2016  # the script's text, not ours
+grep -qE '^ *crane mutate "\$ref" --label "org\.opencontainers\.image\.source=\$source" -t "\$ref" >&2$' "$pub" \
+  || fail "core-code-publish.sh labels something else than its own tag"
 ! grep -qE 'ghcr\.io/bloque-app/aledgent-core:' "$wf" || fail "the workflow names a tag of the core image"
 ! grep -qE '^[^#]*(aws-actions|configure-aws-credentials|role-to-assume|ssm send-command|aws )' "$wf" \
   || fail "the workflow reaches an environment"
 ! grep -qE 'repository_dispatch|dispatches|gh workflow run|--method POST' "$wf" || fail "the workflow starts something elsewhere"
 grep -qE '^permissions: \{\}$' "$wf" || fail "the workflow's default permissions are not empty"
+# T-037-12, owner ruling of 2026-10-27: no core build before the code-history gate, and nothing out of
+# the build unless the new package passes the real-package check.
+grep -qE '^    needs: \[scripts, code-history\]$' "$wf" || fail "the core build does not wait for the code-history gate"
+grep -qE '^    uses: \./\.github/workflows/code-history\.yml$' "$wf" || fail "the code-history gate is not called"
+df="$repo/deploy/docker/core.Dockerfile"
+awk '/^FROM host AS upgrade$/,/^FROM scratch AS core-upgrade$/' "$df" | grep -q 'aledgent-core-host check-upgrade' \
+  || fail "the upgrade stage does not run check-upgrade"
+grep -qE '^COPY --from=upgrade .*/out/share/upgrade-check\.json /out/share/upgrade-check\.log /$' "$df" || fail "core-upgrade gives no check report"
+grep -qE '^ARG CHECK_MUST_PASS=1$' "$df" || fail "check-upgrade does not fail the build by default"
+# Only the publish job may write a package or sign; the check job reads, and no job-wide token.
+awk '/^  core-code:$/,/^  publish:$/' "$wf" | grep -qE 'packages: write|id-token: write|attestations: write' \
+  && fail "the check job can write a package or sign"
+awk '/^  publish:$/,0' "$wf" | grep -qE '^      packages: write' || fail "the publish job cannot write the code set"
+if ! awk '/^  publish:$/,/^    runs-on:/' "$wf" | grep -q "github.event_name == 'workflow_dispatch' && inputs.publish"; then
+  fail "the publish job runs on something else than a dispatch that asked to publish"
+fi
+! grep -qE '^      GH_TOKEN:' "$wf" || fail "a job-wide GH_TOKEN"
+# shellcheck disable=SC2016  # the workflow's text, not ours
+grep -q -- '--signer-workflow "$REPO/.github/workflows/core-release.yml" --source-ref "$src"' "$wf" \
+  || fail "predecessor_set is used without its provenance"
+# shellcheck disable=SC2016  # the workflow's text, not ours
+grep -qF 'test -s "$W/upgrade/upgrade-check.json"' "$wf" || fail "the workflow does not require the check's report"
 echo "ok: core release scripts"
