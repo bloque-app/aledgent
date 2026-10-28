@@ -26,6 +26,7 @@ impl SettlementStore {
             head,
             gaps,
             incidents,
+            gap_end,
             status,
             attestations,
             binds,
@@ -35,7 +36,7 @@ impl SettlementStore {
             counted: _,
             rescanned: _,
         } = self;
-        alloc::vec![
+        let mut out = alloc::vec![
             canon::to_bytes(config),
             canon::to_bytes(support),
             canon::to_bytes(ingested),
@@ -60,11 +61,24 @@ impl SettlementStore {
             // starts from. The operations it counts are derived again from its cursor, and its
             // sums checked against them (`crate::state::State`'s import).
             canon::to_bytes(tally),
-        ]
+        ];
+        // T-043-07: the end of the highest gap, from the chained generation on, as a 17th record,
+        // and only once it is set. A book that has none (every book before the chained
+        // generation) exports exactly the 16 records it did before, so its section, and every
+        // digest and root over it, is unchanged, and an export written before still imports.
+        if *gap_end.get() != 0 {
+            out.push(canon::to_bytes(gap_end));
+        }
+        out
     }
 
-    /// The store from its records.
+    /// The store from its records: [`SettlementStore::to_records`]'s, or those of an export
+    /// written before `T-043-07`, which has no gap end.
     pub(crate) fn from_records(r: &[&[u8]]) -> Result<SettlementStore, DecodeError> {
+        let (r, gap_end): (&[&[u8]], Option<&[u8]>) = match r.split_last() {
+            Some((last, rest)) if r.len() == 17 => (rest, Some(*last)),
+            _ => (r, None),
+        };
         let [
             config,
             support,
@@ -101,6 +115,10 @@ impl SettlementStore {
             head: canon::from_bytes(head)?,
             gaps: canon::from_bytes(gaps)?,
             incidents: canon::from_bytes(incidents)?,
+            gap_end: match gap_end {
+                Some(b) => canon::from_bytes(b)?,
+                None => Default::default(),
+            },
             status: canon::from_bytes(status)?,
             attestations: canon::from_bytes(attestations)?,
             binds: canon::from_bytes(binds)?,
@@ -110,5 +128,38 @@ impl SettlementStore {
             counted: Default::default(),
             rescanned: Default::default(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settlement::store::SettlementWrite;
+
+    /// `T-043-07`: a store with no gap end exports the 16 records it did before `F-043`, and
+    /// those 16 import (an export written before reads as it did); with a gap end, a 17th record
+    /// carries it and reads back.
+    #[test]
+    fn t043_07_the_gap_end_is_a_17th_record_only_once_set() {
+        let s = SettlementStore::new();
+        let records = s.to_records();
+        assert_eq!(
+            records.len(),
+            16,
+            "a book with no gap end exports as before"
+        );
+        let refs: Vec<&[u8]> = records.iter().map(Vec::as_slice).collect();
+        let back = SettlementStore::from_records(&refs).unwrap();
+        assert_eq!(back.gap_end(), 0);
+        assert_eq!(back.to_records(), records);
+
+        let mut s = SettlementStore::new();
+        s.apply(&SettlementWrite::GapEnd(9)).unwrap();
+        let records = s.to_records();
+        assert_eq!(records.len(), 17);
+        let refs: Vec<&[u8]> = records.iter().map(Vec::as_slice).collect();
+        let back = SettlementStore::from_records(&refs).unwrap();
+        assert_eq!(back.gap_end(), 9);
+        assert_eq!(back.to_records(), records);
     }
 }

@@ -284,6 +284,9 @@ pub enum Write {
     Settlement(SettlementWrite),
     /// Add to the batch's audit record, or record one of its own (`F-013`).
     Audit(AuditNote),
+    /// Record a settlement incident or a gap on the audit trail, and nothing in the book's state
+    /// (`T-043-07`, from [`crate::settlement::CHAINED_SETTLEMENT`] on).
+    Incident(crate::audit::IncidentNote),
     /// Change the operator records (`F-013`).
     Ops(OpsWrite),
     /// Record a posting the kernel step applies, in plaintext (`F-011`).
@@ -1041,7 +1044,7 @@ impl State {
                 .map(Undo::Anchor)
                 .map_err(StoreRefusal::Anchor),
             // Read by the batch's audit emission, after every write has applied.
-            Write::Audit(_) => Ok(Undo::Nothing),
+            Write::Audit(_) | Write::Incident(_) => Ok(Undo::Nothing),
             Write::Ops(w) => {
                 let identities = &self.identities;
                 let grants = &self.grants;

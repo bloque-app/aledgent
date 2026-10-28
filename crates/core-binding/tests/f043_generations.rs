@@ -378,3 +378,134 @@ fn t043_06_the_chained_generation_refuses_a_rescan() {
 fn founding_of(_fx: &Fx<NativePort>) -> Founding {
     founding(&(genesis(), op(0), 1, ROOT))
 }
+
+/// `T-043-07`, `REQ-AT-1` as amended, `NFR-6`: at the chained generation, in the Agent and the
+/// replica alike, every settlement incident and every gap is an audit record of the batch that
+/// raises it, and the book's state keeps no list of either: the incidents and gaps leaves stay
+/// absent, and the gap end is the one number kept. The whole history replays from genesis.
+#[test]
+fn t043_07_incidents_and_gaps_go_to_the_audit_trail() {
+    use ledger_core::audit::{AuditAction, AuditClass};
+    use ledger_core::settlement::Incident;
+    let mut fx = Fx::native();
+    let who = settlement(&mut fx);
+    let source = SourceId::of_identity(&who.principal);
+    assert_eq!(upgrade(&mut fx), CHAINED_SETTLEMENT);
+    let emitted = fx.replica.state().audit().emitted();
+    let roots = fx.archive.last().unwrap().roots;
+    let _ = adapter(
+        &mut fx,
+        who,
+        AdapterInput::Observe(record(source, 0, EventKind::Deposited)),
+    );
+    let _ = adapter(
+        &mut fx,
+        who,
+        AdapterInput::Observe(record(source, 1, EventKind::Withdrawn)),
+    );
+    let gap = Gap {
+        from: 2,
+        to: 5,
+        reason: GapReason::Unreadable,
+    };
+    adapter(&mut fx, who, AdapterInput::Gap(gap)).unwrap();
+    let state = fx.replica.state();
+    assert!(state.settlement().incidents().is_empty());
+    assert!(state.settlement().gaps().is_empty());
+    assert_eq!(state.settlement().gap_end(), 5);
+    let recorded: Vec<Incident> = state
+        .audit()
+        .outbox()
+        .filter(|r| r.audit_seq >= emitted)
+        .map(|r| {
+            assert_eq!(r.class, AuditClass::SettlementIncident);
+            match r.action {
+                AuditAction::Incident(i) => i,
+                other => panic!("{other:?}"),
+            }
+        })
+        .collect();
+    assert_eq!(
+        recorded,
+        vec![
+            Incident::Unusable {
+                coordinate: record(source, 0, EventKind::Deposited).coordinate
+            },
+            Incident::Unassociated {
+                coordinate: record(source, 1, EventKind::Withdrawn).coordinate
+            },
+            Incident::Gap(gap),
+        ]
+    );
+    // The Agent committed the same: its roots, the audit chain's included, are the replica's.
+    assert_ne!(fx.archive.last().unwrap().roots.audit, roots.audit);
+    let map = claimed_code_map(&mut NativePort::new(), &founding_of(&fx), &fx.archive).unwrap();
+    let mut port = NativePort::new();
+    port.code_map = map.versions();
+    let (_, rolled) =
+        roll_forward_agent(port, &founding_of(&fx), &fx.archive, &ReplicaStores::Memory)
+            .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(rolled.log_head, fx.archive.last().unwrap().log_hash());
+}
+
+/// The native port, keeping the leaf kinds of every input's service witness.
+struct Kinds {
+    inner: NativePort,
+    seen: std::collections::BTreeSet<u8>,
+}
+
+impl core_binding::host::AgentPort for Kinds {
+    fn invoke(
+        &mut self,
+        message: Vec<u8>,
+        blobs: Vec<Vec<u8>>,
+    ) -> Result<Vec<u8>, core_binding::host::PortError> {
+        use core_binding::envelope::Envelope;
+        if let Ok(Envelope::Input(i)) = decode::<Envelope>(&message) {
+            let blob = blobs
+                .iter()
+                .find(|b| self.inner.blob_key(b) == i.service)
+                .expect("the service witness");
+            let w: core_binding::service::ServiceWitness = decode(blob).unwrap();
+            self.seen.extend(w.leaves.iter().map(|(k, _, _)| *k));
+            self.seen.extend(w.whole.iter().copied());
+        }
+        self.inner.invoke(message, blobs)
+    }
+    fn blob_key(&self, bytes: &[u8]) -> core_binding::envelope::BlobKey {
+        self.inner.blob_key(bytes)
+    }
+    fn hot(&mut self) -> Result<Option<core_binding::hot::Hot>, core_binding::host::PortError> {
+        self.inner.hot()
+    }
+    fn entry(&mut self, seq: u64) -> Result<Option<RingEntry>, core_binding::host::PortError> {
+        self.inner.entry(seq)
+    }
+}
+
+/// The generation rule, at the witness: this build's host decides a generation-0 input for the
+/// code of generation 0, which refuses a witness holding a leaf kind it does not know
+/// (`State::load_leaves`). So no generation-0 input may read the leaf `F-043` adds (the gap end,
+/// kind 37): the settlement inputs of the fixture witness none of it. (`ledger-core`'s
+/// `t043_07_a_generation_0_head_reads_no_gap_end` holds a head's proof to it.)
+#[test]
+fn t043_07_generation_0_reads_no_leaf_the_code_before_did_not_know() {
+    let mut fx = Fx::new(
+        Kinds {
+            inner: NativePort::new(),
+            seen: Default::default(),
+        },
+        Limits::DEFAULT,
+    );
+    let who = settlement(&mut fx);
+    settlement_inputs(&mut fx, who);
+    let seen = &fx.driver.port().seen;
+    assert!(
+        seen.contains(&ledger_core::leaves::kind::FINALISED_HEAD),
+        "the witnesses were read: {seen:?}"
+    );
+    assert!(
+        !seen.contains(&ledger_core::leaves::kind::GAP_END),
+        "a generation-0 input read the gap end"
+    );
+}

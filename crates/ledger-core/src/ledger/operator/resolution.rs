@@ -405,7 +405,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             }
             Some(PostingKind::Redeem | PostingKind::Issue) => {
                 let (u, incident) = settling.ok_or(Refusal::EvidenceInsufficient)?;
-                writes.extend(incident.map(|i| Write::Settlement(SettlementWrite::Incident(i))));
+                writes.extend(incident.map(|i| self.incident(i, ctx.now)));
                 // The settled leg rests on the cited record (`INV-11`, `INV-12`).
                 writes.extend(bind.map(|c| {
                     Write::Settlement(SettlementWrite::Bind {
