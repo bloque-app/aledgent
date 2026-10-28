@@ -16,11 +16,12 @@
 //!    covers the account), then the delegated grant with the narrowest effective scope, then an
 //!    operator grant, which counts only while the account's custody is delegated (`REQ-AU-5`,
 //!    `REQ-AU-6`). None left is `ERR-NotAuthorised`; only revoked ones left is
-//!    `ERR-AuthorityRevoked`. From code generation [`ASSET_CANDIDATES`] on, the choice is made
-//!    first among the candidates whose effective assets include the operation's asset, in that
-//!    same order; only when none does is the first of them all chosen, whose asset bound then
-//!    refuses (`T-003-11`, `AC-G1.2`). Before it, the first of them all is chosen whatever its
-//!    assets, as the code of those generations decided;
+//!    `ERR-AuthorityRevoked`. From code generation [`ASSET_CANDIDATES`] on, a candidate whose
+//!    effective assets exclude the operation's asset is not preferred: the first, in that same
+//!    order, that includes it is chosen; only when none does is the first of them all chosen,
+//!    whose asset bound then refuses (`T-003-11`, `AC-G1.2`). The other bounds are looked at only
+//!    in step 6, so they still shadow (F-003 plan §7). Before that generation, the first of them
+//!    all is chosen whatever its assets, as the code of those generations decided;
 //! 6. the bounds of the one candidate chosen: `ERR-BoundExceeded` (`REQ-AG-2`).
 //!
 //! Anything that cannot be evaluated — a missing record, a broken chain — counts as no authority
@@ -59,11 +60,12 @@ use crate::state::State;
 /// rule, amendment 0033): the code map gives every input its generation, and [`Ledger::generation`]
 /// hands it here.
 ///
-/// It is the generation of `F-043`'s chained settlement: no book has decided an input at it yet,
-/// so one in-place upgrade takes both. Once a book has, a change here needs a new generation.
+/// It is [`crate::settlement::CHAINED_SETTLEMENT`]: no book has decided an input at that
+/// generation yet, so one in-place upgrade takes both. Once a book has, a change here needs a new
+/// generation.
 ///
 /// [`Ledger::generation`]: crate::ledger::Ledger::generation
-pub const ASSET_CANDIDATES: u64 = 1;
+pub const ASSET_CANDIDATES: u64 = crate::settlement::CHAINED_SETTLEMENT;
 
 /// One operation to authorise on one account.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

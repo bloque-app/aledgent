@@ -1637,13 +1637,29 @@ fn req_pv_5_every_query_is_attributed() {
 }
 
 /// One grant to `to` over `acct`, made by `by`: `kind`, transfers only, `per_op` per operation and
-/// per 1 000-unit window, over `assets` (all, for `None`).
+/// `per_op * 10` per 1 000-unit window, over `assets` (all, for `None`).
 fn transfer_grant(
     q: &mut Q<MemStore>,
     by: Caller,
     to: &Caller,
     kind: GrantKind,
     acct: AccountId,
+    per_op: u64,
+    assets: Option<AssetId>,
+) -> crate::id::GrantId {
+    let ops = [OperationKind::Transfer];
+    grant_for(q, by, to, kind, acct, &ops, per_op, assets)
+}
+
+/// [`transfer_grant`] for the operation kinds `ops`.
+#[allow(clippy::too_many_arguments)]
+fn grant_for(
+    q: &mut Q<MemStore>,
+    by: Caller,
+    to: &Caller,
+    kind: GrantKind,
+    acct: AccountId,
+    ops: &[OperationKind],
     per_op: u64,
     assets: Option<AssetId>,
 ) -> crate::id::GrantId {
@@ -1655,7 +1671,7 @@ fn transfer_grant(
                 kind,
                 principal: to.principal,
                 subject: Subject::Account(acct),
-                ops: NonEmptySet::one(OperationKind::Transfer),
+                ops: NonEmptySet::new(ops.iter().copied().collect()).unwrap(),
                 per_operation: Some(nz(per_op)),
                 per_window: Some(Window {
                     length: core::num::NonZeroU64::new(1_000).unwrap(),
@@ -1777,11 +1793,117 @@ fn per_asset_grants_over_one_account_each_decide_their_own_asset() {
         view.can_spend(&bob, &acct, &usd(), m(1_001)),
         Err(Refusal::BoundExceeded)
     );
-    // And the command: the movement records the USD grant.
+    // And the command: each movement records its own asset's grant.
     let carol = q.person();
     let to = q.account(&carol, Custody::Owned);
-    q.transfer(bob, acct, to, usd(), 500).unwrap();
-    q.transfer(bob, acct, to, eur(), 100).unwrap();
+    for (a, n, g) in [(usd(), 500, g_usd), (eur(), 100, g_eur)] {
+        let ctx = q.ctx(bob);
+        let done = q
+            .ledger
+            .transfer(&ctx, &Transfer::single(acct, to, a, m(n)))
+            .unwrap();
+        assert_eq!(done.record.authorities[0].grant, Some(g));
+    }
+}
+
+/// `T-003-11`: a multi-leg transfer out of one account, one USD leg and one EUR leg, at
+/// [`crate::eval::ASSET_CANDIDATES`]: each leg is authorised under its own asset's grant, and the
+/// legs' bounds are checked per grant and asset (`bounds_together`).
+#[test]
+fn a_multi_leg_transfer_takes_each_legs_own_asset_grant() {
+    let (mut q, bob, acct, g_usd, g_eur) = per_asset_grants(crate::eval::ASSET_CANDIDATES);
+    let carol = q.person();
+    let to = q.account(&carol, Custody::Owned);
+    let leg = |a, n| crate::ledger::transfers::Leg {
+        from: acct,
+        to,
+        asset: a,
+        amount: m(n),
+    };
+    let ctx = q.ctx(bob);
+    let done = q
+        .ledger
+        .transfer(&ctx, &Transfer::unit(vec![leg(usd(), 600), leg(eur(), 60)]))
+        .unwrap();
+    let grants: StdSet<_> = done.record.authorities.iter().map(|a| a.grant).collect();
+    assert_eq!(grants, StdSet::from([Some(g_usd), Some(g_eur)]));
+    // Two EUR legs drawing 60 each on the EUR grant exceed its 100 together.
+    let ctx = q.ctx(bob);
+    assert_eq!(
+        q.ledger
+            .transfer(&ctx, &Transfer::unit(vec![leg(eur(), 60), leg(eur(), 60)]))
+            .map(|_| ()),
+        Err(Refusal::BoundExceeded)
+    );
+}
+
+/// `T-003-11`: in-flight transitions across the switch. A reservation accepted under generation 0
+/// is captured, or released, under the generation after it by the same grant, with no window
+/// charged again; and at [`crate::eval::ASSET_CANDIDATES`] a USD reservation and its capture are
+/// decided under the USD grant, which a narrower EUR grant would have shadowed before.
+#[test]
+fn reservations_keep_their_asset_grant_across_the_switch() {
+    let ops = [
+        OperationKind::Reserve,
+        OperationKind::Capture,
+        OperationKind::Release,
+    ];
+    let book = |generation| {
+        let mut q = Q::new();
+        q.ledger.set_generation(generation, false);
+        let alice = q.person();
+        let bob = q.person();
+        let acct = q.account(&alice, Custody::Owned);
+        let carol = q.person();
+        let to = q.account(&carol, Custody::Owned);
+        q.issue(acct, usd(), 10_000);
+        q.issue(acct, eur(), 10_000);
+        let k = GrantKind::Delegated;
+        let g_usd = grant_for(&mut q, alice, &bob, k, acct, &ops, 1_000, Some(usd()));
+        let g_eur = grant_for(&mut q, alice, &bob, k, acct, &ops, 100, Some(eur()));
+        (q, bob, acct, to, g_usd, g_eur)
+    };
+    let used = |q: &Q<MemStore>, grant, asset| {
+        q.ledger.state().used(&crate::authority::WindowKey {
+            grant,
+            window: 0,
+            asset,
+        })
+    };
+
+    // Accepted under generation 0, under the EUR grant (the narrowest, and it admits EUR).
+    let (mut q, bob, acct, to, _g_usd, g_eur) = book(0);
+    let captured = q.reserve(bob, acct, eur(), 50).unwrap();
+    let released = q.reserve(bob, acct, eur(), 30).unwrap();
+    assert_eq!(used(&q, g_eur, eur()), Minor::new(80));
+    // The input switched by a scheduled upgrade, then the generation after it.
+    q.ledger.set_generation(0, true);
+    let ctx = q.on_op(bob, captured);
+    let done = q.ledger.capture(&ctx, to, m(50)).unwrap();
+    assert_eq!(done.record.authorities[0].grant, Some(g_eur));
+    q.ledger
+        .set_generation(crate::eval::ASSET_CANDIDATES, false);
+    let ctx = q.on_op(bob, released);
+    let done = q.ledger.release(&ctx).unwrap();
+    assert_eq!(done.record.authorities[0].grant, Some(g_eur));
+    // Neither charged the window again. (A release restores nothing in V0: `REQ-AG-3` serves
+    // `US-G4`, beyond it, F-003 plan.)
+    assert_eq!(used(&q, g_eur, eur()), Minor::new(80));
+
+    // From the new generation on, a USD reservation and its capture take the USD grant.
+    let (mut q, bob, acct, to, g_usd, _g_eur) = book(crate::eval::ASSET_CANDIDATES);
+    let op = q.reserve(bob, acct, usd(), 500).unwrap();
+    assert_eq!(used(&q, g_usd, usd()), Minor::new(500));
+    let ctx = q.on_op(bob, op);
+    let done = q.ledger.capture(&ctx, to, m(500)).unwrap();
+    assert_eq!(done.record.authorities[0].grant, Some(g_usd));
+    assert_eq!(used(&q, g_usd, usd()), Minor::new(500));
+    // Before it, the EUR grant decided the USD reservation, and refused it.
+    let (mut q, bob, acct, _to, _g_usd, _g_eur) = book(0);
+    assert_eq!(
+        q.reserve(bob, acct, usd(), 500),
+        Err(Refusal::BoundExceeded)
+    );
 }
 
 /// `T-003-11`: an asset no grant lists is refused, under the first candidate as before, with
