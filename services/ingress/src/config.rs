@@ -390,6 +390,13 @@ pub struct DeploymentConfig {
     /// `--batch`). Absent: [`crate::service::DEFAULT_CORE_BATCH`]. 1 is one input at a time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub core_batch: Option<usize>,
+    /// Whether ingress takes the settlement adapter's report of a new settlement sequence
+    /// (`POST /v1/settlement/epochs`, amendment 0041). **Off by default**: a core host built before
+    /// `T-043-14` cannot decode the input and refuses the whole feed it arrives in, so the book's
+    /// inputs would wait behind it. Turned on only once the core runs a build that knows it; off,
+    /// the route is refused `ERR-MalformedCommand` and nothing is logged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub settlement_epochs: bool,
     /// How long ingress reuses what the core answered for an API key's credential, milliseconds
     /// (`T-031-13`, [`crate::credentials::VerifierCache`]). A revoked key stops authenticating
     /// within it. Absent: 500; 0 reads the core on every request; above 1 000 (`NFR-20`'s bound)
@@ -1395,6 +1402,7 @@ impl DeploymentConfig {
                 .max(1),
             // T-036-25: a chainspec book takes commands only once its core says so.
             genesis_gate: self.genesis.chainspec.is_some(),
+            settlement_epochs: self.settlement_epochs,
             link: self.forward_link(),
             ..Config::default()
         }

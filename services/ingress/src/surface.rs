@@ -1361,6 +1361,13 @@ async fn handle_command<S: Store, C: Core>(
     if !crate::service::takes_commands(&shared).await {
         return logged(refusal(Refusal::InitialStateNotSealed), Some(&who), name);
     }
+    // Amendment 0041: a new settlement sequence is taken only once the deployment says its core
+    // knows the input; a core host built before it would refuse the whole feed it arrives in.
+    // Nothing of a refused one is logged.
+    if route == CommandRoute::Settlement(SettlementRoute::Epoch) && !shared.config.settlement_epochs
+    {
+        return logged(refusal(Refusal::MalformedCommand), Some(&who), name);
+    }
     let arrival = Arrival {
         at: started,
         clock: arrived_at,
