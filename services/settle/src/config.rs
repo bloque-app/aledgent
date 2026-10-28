@@ -100,10 +100,14 @@ pub struct AdapterConfig {
     /// of its blocks old, so no era is signed to outlive it. Default 256.
     #[serde(default = "default_challenge_window")]
     pub challenge_window: u64,
-    /// Every how many steps the re-scan runs; 0 never.
-    pub rescan_every: u64,
-    /// How many positions behind the cursor a periodic re-scan reads.
-    pub rescan_window: u64,
+    /// **Retired** (`T-043-05`, amendment 0040): the periodic re-scan is gone, since the adapter
+    /// checks the chain's head at every sync. A file that still sets it is accepted, with a
+    /// warning ([`AdapterConfig::retired`]), for this release; the next refuses it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rescan_every: Option<u64>,
+    /// **Retired** with [`AdapterConfig::rescan_every`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rescan_window: Option<u64>,
     /// The key that publishes anchors (`F-017`), one of the instance's keys, used for nothing
     /// else. Without one, the adapter neither anchors nor reports positions for the settlement
     /// comparison.
@@ -171,6 +175,19 @@ impl AdapterConfig {
             .filter(|name| crate::chain::kreivo::TxFormat::named(name).is_none())
             .cloned()
             .collect()
+    }
+
+    /// The retired fields the file still sets (`T-043-05`): accepted with a warning for one
+    /// release, then refused.
+    pub fn retired(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.rescan_every.is_some() {
+            out.push("rescan_every");
+        }
+        if self.rescan_window.is_some() {
+            out.push("rescan_window");
+        }
+        out
     }
 
     /// The binding of the book's `asset`.
@@ -313,6 +330,14 @@ pub struct ProcessConfig {
     /// decides anything stays on `connection`. Absent: dry runs go through `connection` too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dry_run_endpoint: Option<String>,
+    /// A node's RPC that keeps every block's events (an archive node), `ws://…` or `wss://…`, used
+    /// only to catch up (`T-043-04`, amendment 0040): a full node, and so the light client's peers,
+    /// keep about 256 blocks of events, and an adapter further behind reads the older blocks'
+    /// events here. Nothing it serves is trusted: its entries are folded against the head read
+    /// through `connection`. Absent: an adapter behind the node's history stops with an alert until
+    /// one is configured or the operator records a gap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_endpoint: Option<String>,
     /// Ingress's base URL.
     pub ingress: String,
     /// The file holding the adapter's ingress token. Exactly one of this and

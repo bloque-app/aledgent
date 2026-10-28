@@ -310,7 +310,7 @@ async fn restore_core(args: &[String]) -> Result<(), Error> {
         },
         replay,
         rebuild,
-        rescan: None,
+        resume: None,
         size,
         checks,
     };
@@ -573,7 +573,7 @@ fn restore_core_from(args: &[String]) -> Result<(), Error> {
             ..ops::restore::ReplayReport::default()
         },
         rebuild: verified.rebuild.clone(),
-        rescan: None,
+        resume: None,
         size: ops::drill::Size {
             postings: verified.postings,
             kernel_accounts: 0,

@@ -26,6 +26,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
     (3, include_str!("../../migrations/0003_batches.sql")),
     (4, include_str!("../../migrations/0004_binds.sql")),
     (5, include_str!("../../migrations/0005_runtimes.sql")),
+    (6, include_str!("../../migrations/0006_chain.sql")),
 ];
 
 /// The adapter's store in PostgreSQL. Clones share the pool.
@@ -138,6 +139,29 @@ async fn fenced(tx: &tokio_postgres::Transaction<'_>, epoch: u64) -> StoreResult
     match row {
         Some(r) if u64_of(r.try_get("epoch").map_err(err)?)? == epoch => Ok(()),
         _ => Err(StoreError::Fenced),
+    }
+}
+
+impl PgStore {
+    /// One of the chain heads kept beside the cursor (`verified`, `accepted`), if set.
+    async fn chain_head_column(
+        &self,
+        instance: u32,
+        column: &str,
+    ) -> StoreResult<Option<super::AcceptedHead>> {
+        let c = self.client().await?;
+        let Some(r) = c
+            .query_opt(
+                &format!("SELECT {column} FROM settle_cursors WHERE instance = $1"),
+                &[&i64::from(instance)],
+            )
+            .await
+            .map_err(err)?
+        else {
+            return Ok(None);
+        };
+        let body: Option<String> = r.try_get(0).map_err(err)?;
+        body.as_deref().map(from_json).transpose()
     }
 }
 
@@ -593,6 +617,107 @@ impl Store for PgStore {
         .await
         .map_err(err)?;
         Ok(())
+    }
+
+    async fn accepted_head(&self, instance: u32) -> StoreResult<Option<super::AcceptedHead>> {
+        self.chain_head_column(instance, "accepted").await
+    }
+
+    async fn verified_head(&self, instance: u32) -> StoreResult<Option<super::AcceptedHead>> {
+        self.chain_head_column(instance, "verified").await
+    }
+
+    async fn verify_head(
+        &self,
+        instance: u32,
+        head: &super::AcceptedHead,
+        entries: &[(u64, Vec<u8>)],
+    ) -> StoreResult<()> {
+        let mut c = self.client().await?;
+        let tx = c.transaction().await.map_err(err)?;
+        for (seq, raw) in entries {
+            tx.execute(
+                "INSERT INTO settle_chain_entries (instance, seq, raw) VALUES ($1, $2, $3) \
+                 ON CONFLICT (instance, seq) DO UPDATE SET raw = EXCLUDED.raw",
+                &[&i64::from(instance), &i64_of(*seq)?, &hex::encode(raw)],
+            )
+            .await
+            .map_err(err)?;
+        }
+        tx.execute(
+            "INSERT INTO settle_cursors (instance, next_seq, verified) VALUES ($1, 0, $2) \
+             ON CONFLICT (instance) DO UPDATE SET verified = EXCLUDED.verified",
+            &[&i64::from(instance), &to_json(head)?],
+        )
+        .await
+        .map_err(err)?;
+        tx.commit().await.map_err(err)
+    }
+
+    async fn chain_entries(
+        &self,
+        instance: u32,
+        from: u64,
+        to: u64,
+    ) -> StoreResult<Vec<(u64, Vec<u8>)>> {
+        let c = self.client().await?;
+        c.query(
+            "SELECT seq, raw FROM settle_chain_entries \
+             WHERE instance = $1 AND seq >= $2 AND seq < $3 ORDER BY seq",
+            &[&i64::from(instance), &i64_of(from)?, &i64_of(to)?],
+        )
+        .await
+        .map_err(err)?
+        .into_iter()
+        .map(|r| {
+            let seq = u64_of(r.try_get("seq").map_err(err)?)?;
+            let raw: &str = r.try_get("raw").map_err(err)?;
+            Ok((seq, hex::decode(raw).map_err(err)?))
+        })
+        .collect()
+    }
+
+    async fn accept_head(&self, instance: u32, head: &super::AcceptedHead) -> StoreResult<()> {
+        let mut c = self.client().await?;
+        let tx = c.transaction().await.map_err(err)?;
+        tx.execute(
+            "INSERT INTO settle_cursors (instance, next_seq, accepted) VALUES ($1, $2, $3) \
+             ON CONFLICT (instance) DO UPDATE SET accepted = EXCLUDED.accepted",
+            &[
+                &i64::from(instance),
+                &i64_of(head.position)?,
+                &to_json(head)?,
+            ],
+        )
+        .await
+        .map_err(err)?;
+        tx.execute(
+            "DELETE FROM settle_chain_entries WHERE instance = $1 AND seq < $2",
+            &[&i64::from(instance), &i64_of(head.position)?],
+        )
+        .await
+        .map_err(err)?;
+        tx.commit().await.map_err(err)
+    }
+
+    async fn reset_chain(&self, instance: u32, start: u64) -> StoreResult<()> {
+        let mut c = self.client().await?;
+        let tx = c.transaction().await.map_err(err)?;
+        tx.execute(
+            "INSERT INTO settle_cursors (instance, next_seq) VALUES ($1, $2) \
+             ON CONFLICT (instance) DO UPDATE \
+             SET next_seq = EXCLUDED.next_seq, verified = NULL, accepted = NULL",
+            &[&i64::from(instance), &i64_of(start)?],
+        )
+        .await
+        .map_err(err)?;
+        tx.execute(
+            "DELETE FROM settle_chain_entries WHERE instance = $1",
+            &[&i64::from(instance)],
+        )
+        .await
+        .map_err(err)?;
+        tx.commit().await.map_err(err)
     }
 
     async fn insert_gap(&self, row: &GapRow) -> StoreResult<()> {

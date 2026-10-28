@@ -20,7 +20,7 @@ use std::sync::Arc;
 use ingress::settlement::{
     AcknowledgementBody, AdapterDeclarationBody, AnchorAcknowledgementBody, AnchorFailureBody,
     AnchorReadBody, AttestationBody, CallBody, CheckBody, GapBody, HeadBody, InstructionBody,
-    ObservationBody, PositionsBody, RescanBody, SettlementResultBody, SigningBody,
+    ObservationBody, PositionsBody, SettlementResultBody, SigningBody,
 };
 use ingress::wire::{AdapterLegBody, CommandResult};
 use serde::Serialize;
@@ -355,11 +355,6 @@ impl<T: Transport> CoreLink<T> {
     /// `record_observation`: a gap.
     pub async fn gap(&self, key: &str, body: &GapBody) -> Result<Answer, LinkError> {
         self.post("/v1/settlement/gaps", key, json(body)).await
-    }
-
-    /// `record_observation`: a re-scan.
-    pub async fn rescan(&self, key: &str, body: &RescanBody) -> Result<Answer, LinkError> {
-        self.post("/v1/settlement/rescans", key, json(body)).await
     }
 
     /// The checkpoint in flight and whether a comparison is due (`F-017`).

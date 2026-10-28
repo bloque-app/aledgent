@@ -50,9 +50,10 @@ use crate::restore::{RebuildReport, decided_inputs, rebuild_leaf_store};
 /// state its reply showed.
 ///
 /// A reply to one of the settlement adapter's inputs (a declaration, an observation, a check, a
-/// head, a gap, a re-scan, an anchor, a position cut, an attestation) names the reference ingress
-/// minted for that input, and no operation: the core keeps what the adapter reported in its
-/// settlement store, at coordinates, and the re-scan checks it (`REQ-IN-5`). No operation is
+/// head, a gap, a re-scan of the earlier code, an anchor, a position cut, an attestation) names the
+/// reference ingress minted for that input, and no operation: the core keeps what the adapter
+/// reported in its settlement store, at coordinates, and the adapter's sync shows them complete
+/// (`REQ-IN-5`). No operation is
 /// behind that reference, so it cannot be lost as one, and holding it to
 /// [`ledger_core::export::rederive::check_acknowledged`] refused every restore of a book that has
 /// an adapter (the 2026-10-15 restore drill: 63,947 of 70,761 replies). The archive's entries carry

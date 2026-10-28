@@ -9,11 +9,16 @@
 //! answered "not implemented", and `chainHead_v1_storage` with a `childTrie` "not supported yet"
 //! (`smoldot-light` 0.17.2, `json_rpc_service/background.rs`); the reads were built around that and
 //! are unchanged on smoldot-light 2.1. A runtime call is served, and
-//! smoldot proves every storage read it makes, child tries included. So the contract's inbox,
+//! smoldot proves every storage read it makes, child tries included. So the contract's chain head,
 //! head, registration and positions are read with **`ContractsApi_call`**, a dry run of the
-//! contract's read messages (`inbox_entry(seq)`, `head()`, `registration()`, `position(asset)`)
-//! at the finalized block (`state_call` with that block's hash). The messages return the stored
-//! values as stored: an inbox entry's bytes, and so its digest, are the storage's.
+//! contract's read messages (`chain_head()`, `head()`, `registration()`, `position(asset)`) at the
+//! finalized block (`state_call` with that block's hash).
+//!
+//! **The entries are read from the contract's events** (amendment 0040): each block's
+//! `Contracts::ContractEmitted` events, block by block back from a head by parent hash, decoded by
+//! their signature topics, and each entry rebuilt from its event and its block's number; the
+//! adapter folds them against `chain_head()`. A full node keeps about 256 blocks of events; older
+//! blocks are read from the history endpoint when one is configured ([`RpcChain::with_history_over`]).
 //!
 //! **Chain state is read through the live metadata** (`F-016` plan; Kreivo's runtime): nonces
 //! and native balances (`System::Account`), what the contract account holds (`Assets::Account`),
@@ -52,9 +57,9 @@ use parity_scale_codec::{Decode, Encode};
 
 use super::kreivo::{self, CallLimits, TxParams};
 use super::{
-    AccountId32, BatchCall, BlockRef, Chain, ChainAsset, ChainError, ChainResult, DryRun,
-    InboxRead, Included, InstanceView, Mortality, RuntimeInfo, RuntimeVersion, SignedExtrinsic,
-    Validity,
+    AccountId32, BatchCall, BlockEvents, BlockRef, Chain, ChainAsset, ChainEpoch, ChainError,
+    ChainHead, ChainResult, DryRun, InboxEntry, Included, InstanceView, Mortality, RuntimeInfo,
+    RuntimeVersion, SignedExtrinsic, Validity,
 };
 use crate::signer::Signer;
 
@@ -94,6 +99,8 @@ pub struct RpcChain {
     assets: Vec<(ChainAsset, Value<()>)>,
     /// A node's RPC for dry runs only ([`RpcChain::with_dry_runs_over`]).
     dry_runs: Option<DryRunNode>,
+    /// The history endpoint, for catching up only ([`RpcChain::with_history_over`]).
+    history: Option<OnlineClient<PolkadotConfig>>,
     /// Every transaction submitted and still watched, by hash: see [`Chain::submit`].
     watching: std::sync::Mutex<std::collections::HashMap<[u8; 32], tokio::task::JoinHandle<()>>>,
     /// The last extrinsic limit read, and the block it was read at ([`Chain::extrinsic_limit`]).
@@ -328,6 +335,7 @@ impl RpcChain {
             names,
             assets,
             dry_runs: None,
+            history: None,
             watching: std::sync::Mutex::default(),
             limit_at: std::sync::Mutex::default(),
         })
@@ -345,6 +353,23 @@ impl RpcChain {
             url: url.to_owned(),
             rpc: std::sync::Mutex::new(rpc),
         });
+        Ok(self)
+    }
+
+    /// Read the events of blocks this client cannot serve from the node's RPC at `url`, one that
+    /// keeps every block's events (`T-043-04`, amendment 0040): only to catch up, and only events.
+    /// Nothing it serves is trusted: the entries are folded against the head this client reads.
+    /// Its events are decoded with the metadata it reports when it connects; a block of an older
+    /// runtime whose events no longer decode with it is unreadable there too.
+    pub async fn with_history_over(mut self, url: &str) -> ChainResult<RpcChain> {
+        let rpc = RpcClient::from_insecure_url(url)
+            .await
+            .map_err(unavailable)?;
+        self.history = Some(
+            OnlineClient::<PolkadotConfig>::from_rpc_client(rpc)
+                .await
+                .map_err(unavailable)?,
+        );
         Ok(self)
     }
 
@@ -481,6 +506,49 @@ impl RpcChain {
     }
 }
 
+/// `block`'s events about the contract `contract`'s chain of entries (amendment 0040), and its
+/// parent's hash, through `client`: its `Contracts::ContractEmitted` events, the contract's own
+/// only (a credit from another deployment is emitted by the receiver), each decoded by its
+/// signature topic ([`kreivo::contract_event`]). The block is named by its hash: nothing is looked
+/// up by number. Its events are state at that block, which a full node keeps for about 256 blocks.
+async fn events_of(
+    client: &OnlineClient<PolkadotConfig>,
+    block: &BlockRef,
+    contract: &AccountId32,
+    instance_of: impl Fn(&AccountId32) -> Option<u32>,
+) -> ChainResult<BlockEvents> {
+    let b = client
+        .blocks()
+        .at(H256(block.hash))
+        .await
+        .map_err(unavailable)?;
+    let parent = b.header().parent_hash.0;
+    let events = b.events().await.map_err(unavailable)?;
+    let mut out = Vec::new();
+    for ev in events.iter() {
+        let ev = ev.map_err(invalid)?;
+        if ev.pallet_name() != "Contracts" || ev.variant_name() != "ContractEmitted" {
+            continue;
+        }
+        let (emitter, data) = <(AccountId32, Vec<u8>)>::decode(&mut ev.field_bytes())
+            .map_err(|e| invalid(format!("a ContractEmitted event: {e}")))?;
+        if emitter != *contract {
+            continue;
+        }
+        let topics: Vec<[u8; 32]> = ev.topics().iter().map(|t| t.0).collect();
+        if let Some(e) =
+            kreivo::contract_event(&topics, &data, block.number, &instance_of).map_err(invalid)?
+        {
+            out.push(e);
+        }
+    }
+    Ok(BlockEvents {
+        block: *block,
+        parent,
+        events: out,
+    })
+}
+
 impl Chain for RpcChain {
     async fn runtime(&self) -> ChainResult<RuntimeInfo> {
         // The runtime at the best head, which is what a transaction signed now is checked
@@ -598,38 +666,48 @@ impl Chain for RpcChain {
         }))
     }
 
-    async fn inbox(
+    /// One `ContractsApi_call` and nothing else, so that an idle sync is one read. Whether the
+    /// contract is instantiated is not asked first: the step's assertions read the instance
+    /// (`Chain::instance`) before observation runs, and a contract that is not there fails the
+    /// call ([`ChainError::Invalid`]) rather than answer a head.
+    async fn chain_head(&self, at: &BlockRef, instance: u32) -> ChainResult<Option<ChainHead>> {
+        let cell: kreivo::ChainHeadCell = self
+            .read(at, instance, kreivo::selector::CHAIN_HEAD.to_vec())
+            .await?;
+        Ok(Some(kreivo::chain_head(&cell)))
+    }
+
+    async fn chain_epoch(&self, at: &BlockRef, instance: u32) -> ChainResult<Option<ChainEpoch>> {
+        let cell: Option<kreivo::AnchorEpochCell> = self
+            .read(at, instance, kreivo::selector::ANCHOR_EPOCH.to_vec())
+            .await?;
+        Ok(cell.as_ref().map(kreivo::chain_epoch))
+    }
+
+    fn entry(&self, raw: Vec<u8>) -> ChainResult<InboxEntry> {
+        kreivo::inbox_entry(raw, |c| self.names.instance_of(c)).map_err(invalid)
+    }
+
+    async fn block_events(&self, block: &BlockRef, instance: u32) -> ChainResult<BlockEvents> {
+        let contract = self.contract(instance)?;
+        events_of(&self.client, block, &contract, |c| {
+            self.names.instance_of(c)
+        })
+        .await
+    }
+
+    async fn history_events(
         &self,
-        at: &BlockRef,
+        block: &BlockRef,
         instance: u32,
-        from: u64,
-        count: u32,
-    ) -> ChainResult<Vec<(u64, InboxRead)>> {
-        let Some(view) = self.instance(at, instance).await? else {
-            return Ok(Vec::new());
+    ) -> ChainResult<Option<BlockEvents>> {
+        let Some(history) = &self.history else {
+            return Ok(None);
         };
-        let to = from.saturating_add(u64::from(count)).min(view.next_seq);
-        let mut out = Vec::new();
-        for seq in from..to {
-            let entry: Option<kreivo::InboxEntry> = self
-                .read(
-                    at,
-                    instance,
-                    kreivo::message(kreivo::selector::INBOX_ENTRY, &seq),
-                )
-                .await?;
-            let read = match entry {
-                // The message returns the stored value: its encoding is the stored bytes.
-                Some(e) => InboxRead::Entry(
-                    kreivo::inbox_entry(e.encode(), |c| self.names.instance_of(c))
-                        .map_err(invalid)?,
-                ),
-                None if seq < view.pruned_to => InboxRead::Pruned,
-                None => InboxRead::Absent,
-            };
-            out.push((seq, read));
-        }
-        Ok(out)
+        let contract = self.contract(instance)?;
+        events_of(history, block, &contract, |c| self.names.instance_of(c))
+            .await
+            .map(Some)
     }
 
     async fn asset_metadata(
