@@ -992,6 +992,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                     counterparty: None,
                 },
                 ctx.now,
+                self.generation(),
             )?;
             let acct = self
                 .state
@@ -1402,7 +1403,13 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
     /// Evaluate authority for one operation, with no effect: the evaluator every value-moving
     /// command calls (`F-004`, `F-008`). Window charges are returned, not made.
     pub fn authorise(&self, ctx: &Ctx, request: &Request) -> Result<Decision, Refusal> {
-        eval::authorise(&self.state, &ctx.caller, request, ctx.now)
+        eval::authorise(
+            &self.state,
+            &ctx.caller,
+            request,
+            ctx.now,
+            self.generation(),
+        )
     }
 }
 

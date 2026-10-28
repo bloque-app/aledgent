@@ -150,7 +150,12 @@ runs in a fixed order:
 4. Asset → `ERR-UnknownAsset` or `ERR-AssetDeprecated`.
 5. Candidates. **Proposal:** prefer owner (credential in scope), then the delegated grant with the
    narrowest effective scope, then operator. None left → `ERR-NotAuthorised`. Only revoked ones
-   left → `ERR-AuthorityRevoked`.
+   left → `ERR-AuthorityRevoked`. From code generation 1 (`T-003-11`), a grant whose effective
+   assets exclude the operation's asset does not cover it (`REQ-AU-1`, `AC-G1.2`): the choice, in
+   the same order, is made among the grants that include it, and only when none does is the first
+   of them all chosen, whose asset bound refuses at step 6. Generation 0 chose by narrowness alone,
+   so one principal's per-asset grants over one account shadowed each other; its inputs are still
+   decided that way (the generation rule, amendment 0033).
 6. Bounds → `ERR-BoundExceeded`.
 
 Any internal error counts as "no authority" (fail closed). The result, `AuthorityUsed { kind,

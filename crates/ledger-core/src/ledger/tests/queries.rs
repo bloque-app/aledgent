@@ -1636,56 +1636,265 @@ fn req_pv_5_every_query_is_attributed() {
     assert_eq!(got[0].query, crate::query::QueryKind::Balances);
 }
 
-/// Two per-asset grants over one account to one principal (the service key caps rollout,
-/// 2026-10-28): each asset's operations must be decided under that asset's grant. Today the
-/// candidate is chosen by narrowness alone (ops, then per-operation bound, then id), before the
-/// asset is looked at, so the EUR grant (the smaller per-operation bound) is chosen for a USD
-/// transfer and refuses it with `ERR-BoundExceeded`.
-#[test]
-fn per_asset_grants_over_one_account_each_decide_their_own_asset() {
+/// One grant to `to` over `acct`, made by `by`: `kind`, transfers only, `per_op` per operation and
+/// per 1 000-unit window, over `assets` (all, for `None`).
+fn transfer_grant(
+    q: &mut Q<MemStore>,
+    by: Caller,
+    to: &Caller,
+    kind: GrantKind,
+    acct: AccountId,
+    per_op: u64,
+    assets: Option<AssetId>,
+) -> crate::id::GrantId {
+    let ctx = q.ctx(by);
+    q.ledger
+        .grant_authority(
+            &ctx,
+            GrantRequest {
+                kind,
+                principal: to.principal,
+                subject: Subject::Account(acct),
+                ops: NonEmptySet::one(OperationKind::Transfer),
+                per_operation: Some(nz(per_op)),
+                per_window: Some(Window {
+                    length: core::num::NonZeroU64::new(1_000).unwrap(),
+                    limit: nz(per_op * 10),
+                }),
+                assets: assets.map(NonEmptySet::one),
+                counterparties: None,
+                parent: None,
+                expires: None,
+            },
+        )
+        .unwrap()
+        .value
+}
+
+/// What `who` may do with a transfer of `n` of `a` out of `acct`: the grant chosen, or the
+/// refusal. The window charges are checked to be the chosen grant's.
+fn chosen(
+    q: &mut Q<MemStore>,
+    who: Caller,
+    acct: AccountId,
+    a: AssetId,
+    n: u64,
+) -> Result<crate::id::GrantId, Refusal> {
+    let ctx = q.ctx(who);
+    let d = q.ledger.authorise(
+        &ctx,
+        &crate::eval::Request {
+            kind: OperationKind::Transfer,
+            account: acct,
+            asset: Some(a),
+            amount: Some(nz(n)),
+            counterparty: None,
+        },
+    )?;
+    let grant = d.used.grant.unwrap();
+    assert!(!d.charges.is_empty());
+    assert!(
+        d.charges
+            .iter()
+            .all(|c| c.key.grant == grant && c.key.asset == a)
+    );
+    Ok(grant)
+}
+
+/// Bob holds two per-asset grants over Alice's account (the service key caps rollout,
+/// 2026-10-28): USD, 1 000 per operation, and EUR, 100. At code generation `generation`.
+fn per_asset_grants(
+    generation: u64,
+) -> (
+    Q<MemStore>,
+    Caller,
+    AccountId,
+    crate::id::GrantId,
+    crate::id::GrantId,
+) {
     let mut q = Q::new();
+    q.ledger.set_generation(generation, false);
     let alice = q.person();
     let bob = q.person();
     let acct = q.account(&alice, Custody::Owned);
     q.issue(acct, usd(), 10_000);
     q.issue(acct, eur(), 10_000);
-    for (a, per_op) in [(usd(), 1_000), (eur(), 100)] {
-        let ctx = q.ctx(alice);
-        q.ledger
-            .grant_authority(
-                &ctx,
-                GrantRequest {
-                    kind: GrantKind::Delegated,
-                    principal: bob.principal,
-                    subject: Subject::Account(acct),
-                    ops: NonEmptySet::one(OperationKind::Transfer),
-                    per_operation: Some(nz(per_op)),
-                    per_window: None,
-                    assets: Some(NonEmptySet::one(a)),
-                    counterparties: None,
-                    parent: None,
-                    expires: None,
-                },
-            )
-            .unwrap();
+    let g_usd = transfer_grant(
+        &mut q,
+        alice,
+        &bob,
+        GrantKind::Delegated,
+        acct,
+        1_000,
+        Some(usd()),
+    );
+    let g_eur = transfer_grant(
+        &mut q,
+        alice,
+        &bob,
+        GrantKind::Delegated,
+        acct,
+        100,
+        Some(eur()),
+    );
+    (q, bob, acct, g_usd, g_eur)
+}
+
+/// `T-003-11` (`AC-G1.2`, `AC-G1.3`, `REQ-AU-1`, `REQ-AG-2`), from code generation
+/// [`crate::eval::ASSET_CANDIDATES`] on: each asset's operations are decided under the grant that
+/// lists that asset, within that grant's own bounds, and charge that grant's window.
+#[test]
+fn per_asset_grants_over_one_account_each_decide_their_own_asset() {
+    let (mut q, bob, acct, g_usd, g_eur) = per_asset_grants(crate::eval::ASSET_CANDIDATES);
+    assert_eq!(
+        chosen(&mut q, bob, acct, eur(), 100),
+        Ok(g_eur),
+        "EUR under the EUR grant"
+    );
+    assert_eq!(
+        chosen(&mut q, bob, acct, usd(), 500),
+        Ok(g_usd),
+        "USD under the USD grant"
+    );
+    assert_eq!(
+        chosen(&mut q, bob, acct, usd(), 1_000),
+        Ok(g_usd),
+        "USD at its own bound"
+    );
+    // Each over its own grant's bound is refused.
+    assert_eq!(
+        chosen(&mut q, bob, acct, eur(), 101),
+        Err(Refusal::BoundExceeded)
+    );
+    assert_eq!(
+        chosen(&mut q, bob, acct, usd(), 1_001),
+        Err(Refusal::BoundExceeded)
+    );
+    // The read that answers the same question, as the caps rollout verifies with it.
+    let view = q.ledger.view(q.now).unwrap();
+    assert_eq!(view.can_spend(&bob, &acct, &usd(), m(500)), Ok(()));
+    assert_eq!(
+        view.can_spend(&bob, &acct, &usd(), m(1_001)),
+        Err(Refusal::BoundExceeded)
+    );
+    // And the command: the movement records the USD grant.
+    let carol = q.person();
+    let to = q.account(&carol, Custody::Owned);
+    q.transfer(bob, acct, to, usd(), 500).unwrap();
+    q.transfer(bob, acct, to, eur(), 100).unwrap();
+}
+
+/// `T-003-11`: an asset no grant lists is refused, under the first candidate as before, with
+/// `ERR-BoundExceeded` (`REQ-AG-2`: the asset is a bound), at either generation.
+#[test]
+fn an_asset_no_grant_lists_is_refused_at_either_generation() {
+    for generation in [0, crate::eval::ASSET_CANDIDATES] {
+        let mut q = Q::new();
+        q.ledger.set_generation(generation, false);
+        let alice = q.person();
+        let bob = q.person();
+        let acct = q.account(&alice, Custody::Owned);
+        q.issue(acct, eur(), 10_000);
+        // Two grants over the account, neither listing EUR.
+        let narrow = transfer_grant(
+            &mut q,
+            alice,
+            &bob,
+            GrantKind::Delegated,
+            acct,
+            100,
+            Some(usd()),
+        );
+        let wide = transfer_grant(
+            &mut q,
+            alice,
+            &bob,
+            GrantKind::Delegated,
+            acct,
+            1_000,
+            Some(usd()),
+        );
+        assert!(narrow != wide);
+        assert_eq!(
+            chosen(&mut q, bob, acct, eur(), 1),
+            Err(Refusal::BoundExceeded),
+            "generation {generation}"
+        );
     }
-    let ask = |q: &mut Q<MemStore>, a: AssetId, n: u64| {
-        let ctx = q.ctx(bob);
-        q.ledger
-            .authorise(
-                &ctx,
-                &crate::eval::Request {
-                    kind: OperationKind::Transfer,
-                    account: acct,
-                    asset: Some(a),
-                    amount: Some(nz(n)),
-                    counterparty: None,
-                },
-            )
-            .map(|_| ())
-    };
-    assert_eq!(ask(&mut q, eur(), 100), Ok(()), "EUR under the EUR grant");
-    assert_eq!(ask(&mut q, usd(), 500), Ok(()), "USD under the USD grant");
+}
+
+/// `T-003-11`: the preference is across the candidate lists. A delegated grant that does not list
+/// the asset no longer shadows an operator grant that does (delegated custody, `REQ-AU-5`).
+#[test]
+fn an_operator_grant_listing_the_asset_is_chosen_over_a_delegated_one_that_does_not() {
+    for generation in [0, crate::eval::ASSET_CANDIDATES] {
+        let mut q = Q::new();
+        q.ledger.set_generation(generation, false);
+        let alice = q.person();
+        let bob = q.person();
+        let acct = q.account(&alice, Custody::Delegated);
+        q.issue(acct, usd(), 10_000);
+        let op = q.operator();
+        let delegated = transfer_grant(
+            &mut q,
+            alice,
+            &bob,
+            GrantKind::Delegated,
+            acct,
+            100,
+            Some(eur()),
+        );
+        let operator = transfer_grant(
+            &mut q,
+            op,
+            &bob,
+            GrantKind::Operator,
+            acct,
+            1_000,
+            Some(usd()),
+        );
+        assert!(delegated != operator);
+        let got = chosen(&mut q, bob, acct, usd(), 500);
+        if generation >= crate::eval::ASSET_CANDIDATES {
+            assert_eq!(got, Ok(operator));
+        } else {
+            // Before it, the delegated grant came first whatever its assets.
+            assert_eq!(got, Err(Refusal::BoundExceeded));
+        }
+    }
+}
+
+/// The generation rule (amendment 0033): an input of a generation before
+/// [`crate::eval::ASSET_CANDIDATES`] is decided as that code decided it. The narrowest grant (EUR,
+/// the smaller per-operation bound) is the one chosen for every asset, and its asset bound
+/// refuses a USD transfer; EUR goes on under it.
+#[test]
+fn before_asset_candidates_the_narrowest_grant_decides_every_asset() {
+    let (mut q, bob, acct, _g_usd, g_eur) = per_asset_grants(crate::eval::ASSET_CANDIDATES - 1);
+    assert_eq!(chosen(&mut q, bob, acct, eur(), 100), Ok(g_eur));
+    assert_eq!(
+        chosen(&mut q, bob, acct, usd(), 500),
+        Err(Refusal::BoundExceeded)
+    );
+    assert_eq!(
+        chosen(&mut q, bob, acct, usd(), 1),
+        Err(Refusal::BoundExceeded)
+    );
+    let view = q.ledger.view(q.now).unwrap();
+    assert_eq!(
+        view.can_spend(&bob, &acct, &usd(), m(500)),
+        Err(Refusal::BoundExceeded)
+    );
+    let carol = q.person();
+    let to = q.account(&carol, Custody::Owned);
+    assert_eq!(
+        q.transfer(bob, acct, to, usd(), 500),
+        Err(Refusal::BoundExceeded)
+    );
+    // An input switched to the next generation by a scheduled upgrade is decided by it.
+    q.ledger
+        .set_generation(crate::eval::ASSET_CANDIDATES - 1, true);
+    assert!(chosen(&mut q, bob, acct, usd(), 500).is_ok());
 }
 
 /// Prints the seeded grant ids of a book (`GENESIS_OP` = the 32 hex digits of its genesis op).

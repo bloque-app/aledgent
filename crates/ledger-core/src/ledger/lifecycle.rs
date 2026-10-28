@@ -1554,6 +1554,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                                 counterparty: None,
                             },
                             ctx.now,
+                            self.generation(),
                         ) {
                             Ok(d) => d,
                             Err(e) => return Err(self.refused(ctx, &p, command, subjects, e)),
