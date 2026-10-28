@@ -2,7 +2,7 @@
 # CI regenerates this file and fails on any difference (F-015 §1).
 # 25 invariants (§9), 42 errors (§10), 195 V0 acceptance criteria (§6, §15).
 
-spec_version = "0.4.29"
+spec_version = "0.4.30"
 
 [[invariant]]
 id = "INV-1"
@@ -1256,7 +1256,7 @@ text = "Given a mode change that is not authorised under the mode in force, or t
 id = "AC-K7.9"
 story = "US-K7"
 epic = "K"
-text = "Given an upgrade naming code version *H* from input *n*, When input *n* reaches a writer whose code is not of *H*'s code generation, Then it is refused, nothing changes, its number is not taken, and once the code is switched the same input runs under *H* (`REQ-RT-20`)."
+text = "Given an upgrade naming code version *H* from input *n*, When input *n* reaches a writer whose code is not of *H*'s rules version, Then it is refused, nothing changes, its number is not taken, and once the code is switched the same input runs under *H* (`REQ-RT-20`)."
 
 [[acceptance]]
 id = "AC-K7.10"
@@ -1280,7 +1280,7 @@ text = "Given a writer fenced at input *n*, When an input that moves the upgrade
 id = "AC-K7.13"
 story = "US-K7"
 epic = "K"
-text = "Given an upgrade made to change only the runtime that executes a writer's code, Then the new code version still raises the code generation and carries it in its code's bytes, a writer whose switch was missed refuses input *n*, and an execution node whose runtime is not the one the current range's code version names refuses to drive the writer (`REQ-RT-20`)."
+text = "Given an upgrade made to change only the runtime that executes a writer's code, Then the new code version still raises the rules version and carries it in its code's bytes, a writer whose switch was missed refuses input *n*, and an execution node whose runtime is not the one the current range's code version names refuses to drive the writer (`REQ-RT-20`)."
 
 [[acceptance]]
 id = "AC-K7.14"
@@ -1298,19 +1298,19 @@ text = "Given a range whose replayer the code archive holds, When the platform's
 id = "AC-K7.16"
 story = "US-K7"
 epic = "K"
-text = "Given a writer whose generation in force is *g* + 1 after an upgrade, When code of generation *g* is installed again and an input reaches it, Then the input is refused and nothing changes; and Given an upgrade whose code version names a generation other than the writer's plus one, Then it is refused and nothing changes (`REQ-RT-20`)."
+text = "Given a writer whose rules version in force is *g* + 1 after an upgrade, When code of rules version *g* is installed again and an input reaches it, Then the input is refused and nothing changes; and Given an upgrade whose code version names a rules version other than the writer's plus one, Then it is refused and nothing changes (`REQ-RT-20`)."
 
 [[acceptance]]
 id = "AC-K7.17"
 story = "US-K7"
 epic = "K"
-text = "Given an upgrade scheduled from input *n*, When an input that moves or cancels it is not authorised under the mode in force, before *n* or at or after it, Then it is refused, the refusal is recorded and takes its input number, the upgrade stays scheduled, and code of either generation decides it the same; and When an input moves or cancels it together with anything else, Then the whole input is refused as malformed and nothing of it applies (`REQ-RT-20`, `REQ-RT-18`). *Amendment 0035.*"
+text = "Given an upgrade scheduled from input *n*, When an input that moves or cancels it is not authorised under the mode in force, before *n* or at or after it, Then it is refused, the refusal is recorded and takes its input number, the upgrade stays scheduled, and code of either rules version decides it the same; and When an input moves or cancels it together with anything else, Then the whole input is refused as malformed and nothing of it applies (`REQ-RT-20`, `REQ-RT-18`). *Amendment 0035.*"
 
 [[acceptance]]
 id = "AC-K7.18"
 story = "US-K7"
 epic = "K"
-text = "Given an upgrade scheduled from input *n* and an input that moves or cancels it, authorised or not, arriving as input *n*, When it is decided by the old code, and When it is decided by the new code because the switch was already made, Then both commit the same outcome: the upgrade does not take effect at *n* and the generation stays the old one; and a replay assigns every input the generation the code map, read from the inputs alone, names (`REQ-RT-20`, `REQ-RT-17`)."
+text = "Given an upgrade scheduled from input *n* and an input that moves or cancels it, authorised or not, arriving as input *n*, When it is decided by the old code, and When it is decided by the new code because the switch was already made, Then both commit the same outcome: the upgrade does not take effect at *n* and the rules version stays the old one; and a replay assigns every input the rules version the code map, read from the inputs alone, names (`REQ-RT-20`, `REQ-RT-17`)."
 
 [[acceptance]]
 id = "AC-K7.19"

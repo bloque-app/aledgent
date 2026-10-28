@@ -136,7 +136,7 @@ community moves funds out of its account. The referendum's route ran only as a `
   as audit records, sets the gap end from the gaps, and drops the leaves.
 - The leaf kinds are keys in the actor's one map of rows (`agents/core/src/lib.rs:68-73`), so the runtime's
   state-layout check passes (`agents/core-host/src/switch.rs:373-375`).
-- It needs the release gate that replays the previous generation's state under the new core, which
+- It needs the release gate that replays the previous rules version's state under the new core, which
   `T-037-19` names as still to be ruled.
 
 ### 5. Readers and operations

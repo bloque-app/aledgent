@@ -112,7 +112,7 @@ are protected alike (one approving review, code owners, the required checks, sig
   (ingress, settle, ops, signer, core, sidecar) as `sha-<commit>` and `v<version>` (`+` becomes `_`
   in an image tag), and attaches `images.json`, each image by digest (`.github/workflows/release.yml`).
 - **Core releases.** A change to the core (`core.vos`) can ship without a new image and without
-  restarting the host: `.github/workflows/core-release.yml` builds it as the next generation of the
+  restarting the host: `.github/workflows/core-release.yml` builds it as the next rules version of the
   code a book already runs, has the node's host write the code manifest, and publishes the three
   files, each named by its blake2b-256 digest, as `ghcr.io/bloque-app/aledgent-core-code@sha256:…`
   with a provenance attestation. It prints the code version the operator submits as
