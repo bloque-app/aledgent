@@ -288,7 +288,13 @@ pub fn check_upgrade(args: &[String]) -> Result<(), String> {
     .into_iter()
     .collect();
     let plan = plan(&history.map, gp)?;
-    let entries = &history.entries[..plan.inputs.min(history.entries.len())];
+    let entries = history.entries.get(..plan.inputs).ok_or_else(|| {
+        format!(
+            "the recorded code map names {} inputs and entries.bin holds {}: the book is cut",
+            plan.inputs,
+            history.entries.len()
+        )
+    })?;
     let started = std::time::Instant::now();
 
     // 1. P's state, carried by N: the whole of both generations' recorded inputs.
@@ -296,6 +302,12 @@ pub fn check_upgrade(args: &[String]) -> Result<(), String> {
     let (port, rolled) =
         roll_forward_agent(port, &history.founding, entries, &ReplicaStores::Memory)
             .map_err(|e| format!("the recorded book does not replay through the packages: {e}"))?;
+    if usize::try_from(rolled.to).ok() != Some(plan.inputs) {
+        return Err(format!(
+            "the replay ended at input {}, not at the {} inputs the plan re-sends",
+            rolled.to, plan.inputs
+        ));
+    }
     if port.installs != [gn] {
         return Err(format!(
             "the switches taken were to generations {:?}, not one to generation {gn}",
@@ -311,8 +323,18 @@ pub fn check_upgrade(args: &[String]) -> Result<(), String> {
     // 2. D18: every way out at an upgrade's input in P's generation, decided by N too.
     let mut way_outs = Vec::new();
     for (i, e) in entries.iter().enumerate() {
-        if way_out_input(&e.calls, e.deliveries.len()) != Ok(true) {
-            continue;
+        match way_out_input(&e.calls, e.deliveries.len()) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            // A recorded input that mixes a way out with anything else: the book never commits one
+            // (it is refused whole), so a history that holds one is not a history to check against.
+            Err(why) => {
+                return Err(format!(
+                    "recorded input {} is a malformed way out ({why:?}): the recorded book is not one \
+                     a writer committed",
+                    e.seq
+                ));
+            }
         }
         if history.map.range_of(e.seq).map(|r| r.generation) != Some(gp) {
             continue;
