@@ -90,8 +90,10 @@ sequence's number, its base, its first position, its block, the book it names, a
 
 - **When it finds the reset live.** The sync meets `AnchorHeadSet` past the verified head, or sees the
   sequence change on an empty chain. The adapter first checks that the chain before the reset ended at the head
-  it verified, so that no entry of it was left unreported (fact 4). Then it reports the start, and only then
-  moves its cursor to the new chain's start and goes on. It reports no entry of the new chain before the core
+  it verified, so that no entry of it was left unreported (fact 4), and reports to the core every entry it
+  verified before the reset and had not reported yet (after a core outage, a refused observation, or a crash
+  between the two). If any is still unreported, it does not follow the reset. Then it reports the start, and
+  only then moves its cursor to the new chain's start and goes on. It reports no entry of the new chain before the core
   has taken the start in.
 - **Once per sequence, from state.** While the head it verified carries a sequence the core has not confirmed,
   it reads `anchor_epoch()` and reports it. That is test's case: the adapter already moved itself to the new
@@ -103,8 +105,19 @@ On the core's answer:
 |---|---|
 | started the sequence, or already holds it | goes on; the confirmation is kept, so the sequence is not reported again |
 | refused it: the sequence names another book | raises `reset:<instance>`, as today, and reports nothing more until `refound` (the book was re-founded) |
-| refused it for any other reason | raises `epoch:<instance>:<epoch>` (pages), reports nothing of the new chain, and reports the start again every ten minutes |
-| cannot take the input (a core before the generation of this amendment) | in a live reset, raises `reset:` as today; otherwise a non-paging `epoch:` alert, and goes on |
+| refused it for any other reason, or refused the command with any code but `ERR-MalformedCommand` | raises `epoch:<instance>:<epoch>` (pages), reports nothing of the new chain, and reports the start again every ten minutes |
+| cannot take the input: `ERR-MalformedCommand` (a core before the generation of this amendment, or ingress's route closed) | in a live reset, raises `reset:` as today; otherwise raises `epoch-unsupported:<instance>:<epoch>` (a warning, not a page), and goes on |
+
+A start the core takes clears every `epoch:` and `epoch-unsupported:` alert of the instance, whatever sequence
+raised it.
+
+**While held, the adapter declares itself not serving.** While `reset:<instance>` or any `epoch:` or
+`epoch-unsupported:` alert of the instance is open, the adapter declares to the core that it does not serve
+(`REQ-SA-2`), and declares again as soon as that changes. It keeps running: it retries the start and lifts the
+hold once the core takes it. So `withdraw` and `submit_outbound` are refused with
+`ERR-SettlementLayerUnavailable` at any generation, and no instruction is built from a head the adapter stopped
+sending. The settlement comparison is refused too while held. This is what covers a reset when both switches are
+off (prod's planned reset), and a start the core refused or cannot take.
 
 `refound` stays, for a book that was re-founded.
 
@@ -115,7 +128,8 @@ generation it refuses the input with `ERR-MalformedCommand` and writes nothing, 
 were decided.
 
 1. **The same sequence again** (equal in every field) is `Recorded`, and nothing changes. **An earlier or equal
-   sequence number with other fields** is refused.
+   sequence number with other fields** is refused, after step 2: a start naming another book is refused as such,
+   whatever its number.
 2. **Another book.** The start is refused if its `book` is not the book's own genesis digest. A book founded
    without a chainspec (genesis digest zero) can never match, so its starts are always refused (decision 4).
 3. **Instructions in flight.** The start is refused while any outbound instruction is not yet decided (the
@@ -130,12 +144,13 @@ were decided.
    `{ height: at, next_seq: from_seq }`, and the gap end is cleared (decision 6): every position below it was
    the earlier sequence's. If the core already holds a head at a later block than `at`, that head is already
    the new chain's and is kept, and so is the gap end, since a gap recorded since may be the new chain's. Later heads compare against it as before, so they are compared within
-   the sequence. The head moves back only here, and only to a strictly later sequence; the store enforces both
+   the sequence. The head moves back only here, only to a strictly later sequence, and only to its start; the store enforces all three
    (`REQ-AR-4`).
 
-A refusal changes no state but the audit trail. It is one audit record, a settlement incident
+A refusal changes nothing of its own but the audit trail. It is one audit record, a settlement incident
 (`Incident::EpochRefused`, amendment 0040's class), and its reason is in the adapter's reply. A second start
-(sequence + 1) goes through the same steps.
+(sequence + 1) goes through the same steps. (Like every adapter input, a refused start during `T-043-08`'s move
+of a running book's incidents also moves the next ones to the audit trail.)
 
 **Left as they are:**
 - **The positions' tally.** It only passes final positions, and step 4 leaves none of an earlier sequence at or
@@ -146,9 +161,12 @@ A refusal changes no state but the audit trail. It is one audit record, a settle
 
 From the same generation, when the core drops a head because its position is lower but its block is later, it
 records that head as **reported and not taken**. Taking a later head, or a start, clears it. While one is
-recorded, `withdraw` and `submit_outbound` are refused with `ERR-SettlementLayerUnavailable`. No instruction is
-then built from a stale head, whatever the cause. This is the case of a reset the adapter has not reported yet,
-or one the core refused.
+recorded, `withdraw` and `submit_outbound` are refused with `ERR-SettlementLayerUnavailable`. It arms only when
+the adapter goes on sending heads of the new chain: a first start on it before the core took the start (test's
+case), from a core at `SETTLEMENT_EPOCHS`. When the adapter stops instead (`reset:`, or a start refused or not
+taken), it sends no head, and its declaration covers it ("While held", above). Two cases are covered by neither:
+an adapter built before this amendment, on a live reset; and a first start with both switches off and a core at
+generation 0 (test today, harmless only because every test asset is `book_only`).
 
 ### A read of the head (a follow-up, `T-043-16`)
 
@@ -176,12 +194,16 @@ sequence (`REQ-SL-1`); one book's record MAY run over several sequences".
 > adapter serves, the adapter MUST report the start to aledgent, with the book the sequence names, and MUST NOT
 > report an entry of the new sequence until aledgent has taken the start in. Before it reports the start, the
 > adapter MUST have shown the earlier sequence complete up to the start (`REQ-SA-7`); otherwise it MUST raise an
-> alert and report neither. aledgent MUST take the start as its finalised point and compare every later point
-> within the new sequence. When aledgent restarts its finalised point at the start, it MUST clear what it holds
-> of an earlier sequence's gaps. aledgent MUST refuse the start, as an incident (`REQ-AT-1`), if it names another
-> book, while any external leg it instructed is not yet decided, or while it holds a final record of an earlier
-> sequence at a position the new sequence reuses. A refused start MUST change nothing else, and the adapter MUST
-> raise an alert an operator sees. *Amendment 0041.*
+> alert and report neither. aledgent MUST take the start as its finalised point, unless it holds a finalised
+> point at a later block, which it keeps, and MUST compare every later point within the new sequence. When it
+> takes the start as its finalised point, it MUST clear the end of the gaps it holds; when it keeps a later
+> point, it keeps that end. The same start again changes nothing. aledgent MUST refuse the start, as an incident
+> (`REQ-AT-1`), if it names another book, if its sequence is not later than the one aledgent took (or is that
+> sequence with other values), while any external leg it instructed is not yet decided, or while it holds a
+> final record of an earlier sequence at a position the new sequence reuses. A refused start MUST change
+> nothing else, and the adapter MUST raise an alert an operator sees. While a start is refused or not taken, or
+> the adapter stops at a reset, the adapter MUST declare that it does not serve (`REQ-SA-2`). *Amendment
+> 0041.*
 
 **`ERR-SettlementLayerUnavailable`:** "The settlement adapter cannot be reached, or refuses to serve
 (`REQ-SA-2`)" gains ", or aledgent's finalised point is behind one the adapter reported (`REQ-SL-4`)".
@@ -198,20 +220,24 @@ sequence (`REQ-SL-1`); one book's record MAY run over several sequences".
   - A core host built before this amendment cannot decode the new input. It refuses the whole feed the input
     arrives in, so the book's inputs would wait behind it. Merge order alone cannot prevent this: test's
     ingress and settle follow every `develop` merge, while its core runs a pinned image.
-  - So the adapter reports a start only when its configuration says `report_resets` (off by default). It is
-    turned on in a deployment template once that deployment's core runs a build with `T-043-14` at
-    `SETTLEMENT_EPOCHS`.
-  - A core of such a build still at generation 0 refuses the input cleanly (`ERR-MalformedCommand`). The
-    adapter then raises a non-paging alert.
-  - A core at `SETTLEMENT_EPOCHS` with the switch off is never told. The guard then refuses withdrawals while
-    the head is stale, as it should.
+  - So ingress takes the input only when its configuration says `settlement_epochs`, and the adapter reports
+    a start only when its own says `report_resets` (both off by default). They are turned on in a deployment
+    template once that deployment's core runs a build with `T-043-14` at `SETTLEMENT_EPOCHS`.
+  - A core host or Agent package built before this amendment refuses the whole feed, as above (test's `r10`
+    runs its genesis package). A core host and package built with it, still at generation 0, refuse the input
+    cleanly (`ERR-MalformedCommand`); so does ingress with its route closed. The adapter then raises
+    `epoch-unsupported:` (a warning) and declares itself not serving.
+  - A core at `SETTLEMENT_EPOCHS` with the switches off is never told. On a live reset the adapter stops
+    (`reset:`) and declares itself not serving; after a first start on the new chain, the guard refuses
+    withdrawals while the head is stale.
   - The core changes of `T-043-14` and `T-043-17` both decide generation-1 inputs. No generation-1 core
     package may be built or applied before both are on `develop` (decision 1).
 - **Test.**
   1. The core's in-place upgrade to the package built as generation 1 (`T-037-19`'s path, the same upgrade that
      takes `T-043-06` to `T-043-08`).
-  2. Then `report_resets: true` in test's settle template (bloque-ledgent). The adapter reports epoch 2
-     once.
+  2. Then `settlement_epochs: true` in test's ingress template and `report_resets: true` in its settle template
+     (bloque-ledgent). The adapter reports epoch 2 once. Before turning them on, read `r10`'s chainspec digest
+     and check that `anchor_epoch().book` names it, and that the book holds no gap of the new chain.
 
   The core takes it: no instruction is in flight, and its only finals are positions 0 and 1, both after the
   reset's block. Its head becomes `{ 40,195,735, 0 }`, and the adapter's next head (`next_seq` 2) is taken at
@@ -223,7 +249,10 @@ sequence (`REQ-SL-1`); one book's record MAY run over several sequences".
   takes it. Prod would not hit the stale head anyway, since its core has none; the start mainly records
   the sequence there.
 - **Rollback.** A core built before this amendment refuses the input and keeps its head. The adapter's
-  confirmation table is a cache of the core's answers and can be emptied.
+  confirmation is a cache of the core's answers; today only `refound` empties it (a step of its own is an open
+  item).
+- **A reset is a re-founding's.** Run it in a re-founding's maintenance window with nothing in flight: no
+  instruction, no provisional inbound observation, and no anchor checkpoint not yet final.
 
 ## Rejected alternatives
 
@@ -258,9 +287,11 @@ sequence (`REQ-SL-1`); one book's record MAY run over several sequences".
 6. **The gap end across a start.** *Ruled (q28): the start clears it*, rather than keeping it (the proposal's
    cautious option, under which a withdrawal whose range starts below an earlier sequence's gap went to review).
    Read as: a start that restarts the head clears the gap end; one that keeps a head at a later block keeps it,
-   because that head, and a gap recorded since, may be the new sequence's. Keeping it there is harmless: the
-   kept head already passed the earlier sequence's position, so every new withdrawal's `from_seq` is at or above
-   any gap end of the earlier sequence. Clearing is safe because a start is
+   because that head, and a gap recorded since, may be the new sequence's. Keeping it is the conservative side:
+   a gap end kept from the earlier sequence can only send a withdrawal to review, never prove it unexecuted
+   (a few new withdrawals could go to review when the earlier sequence's gap lies past the kept head). The
+   restart also clears a gap of the new sequence reported before it; a withdrawal over such a gap then waits
+   for its deadline and goes to review, rather than at once. Clearing is safe because a start is
    refused while any instruction is live (decision 2), so `proof` has nothing of the earlier sequence left to
    decide.
 7. **The guard's error.** *Ruled as built (q28):* `ERR-SettlementLayerUnavailable`, with its meaning extended. *Alternative:*

@@ -184,11 +184,11 @@ before the reset). Amendment 0041 has the adapter report the reset, and the core
   - otherwise one store write, `SettlementWrite::Epoch { epoch, head }`: the sequence (leaf kind 36, absent until
     set), and the head `{ at, from_seq }` unless the core holds a head at a later block. The store refuses a
     sequence that is not strictly later, and only this write moves the head back;
-  - with a head, the same write clears the gap end (ruling q28, decision 6), and its undo restores it; a start
+  - with a head, which the store requires to be the sequence's start, the same write clears the gap end (ruling q28, decision 6), and its undo restores it; a start
     that keeps a later head keeps it;
   - the tally and the index by position are left as they are (amendment 0041, "left as they are").
-  - The input reads the `live` index and the final positions whole. It comes once per reset, and its witness is
-    bounded by what is in flight and by the final positions of the new chain.
+  - The input reads the `live` index and the final positions whole: its witness holds the whole `finals` map,
+    as `proof`'s does. It comes once per reset.
 - **Ingress:** the adapter's route `POST /v1/settlement/epochs` (one route per adapter input, as today), its body
   and OpenAPI schema, and the reply's `epoch` result.
 - **Settle:**
