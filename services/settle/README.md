@@ -252,9 +252,18 @@ of the message the device signs. On every step the adapter reads, from the runti
 what a transaction must carry: its `transaction_version`, its transaction extensions in order, and a
 digest of their explicit and implicit types and of `Contracts::call`'s
 (`src/chain/surface.rs`). It signs each batch in the format whose surface that is (`kreivo-132`:
-`transaction_version` 12; `kreivo-133`: 13), so a runtime upgrade that changes the surface switches
+`transaction_version` 12; `kreivo-133`: 13 and 14), so a runtime upgrade that changes the surface switches
 the next batch, and one that changes nothing a transaction carries (spec 133 to 134, Kreivo `0.17.1`)
-needs no release and no configuration. **The `spec_version` decides nothing.** A surface the adapter
+needs no release and no configuration. A new `transaction_version` is a changed surface even when
+nothing else is: Kreivo `0.18.1` (spec 136, live on mainnet from 2026-10-27) moved it to 14 for two
+`CommunitiesManager` calls it removed, and kept every extension, type and the PASS message order, so
+`kreivo-133` lists 14 since its transactions were pinned against that release's crates
+(`kreivo-pin-136`) and validated on mainnet (`fixtures/surface-136.json`). `examples/surface_probe.rs`
+prints a live runtime's surface and the format chosen for it (over a node's RPC or, `--light`, the
+adapter's own light client), saves its metadata for a fixture, reads a deployment's contract and
+dry-runs its next anchor (`--contract`), and
+has the runtime validate a transaction signed in that format by throwaway, unfunded keys, broadcasting
+nothing: the first thing to run when Kreivo announces an upgrade. **The `spec_version` decides nothing.** A surface the adapter
 has no format for is refused (`unknown_surface`), and so is a new Kreivo format until it is added
 and pinned (`services/settle/kreivo-pin*`).
 

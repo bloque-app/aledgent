@@ -266,7 +266,7 @@ async fn ac_e4_4_a_runtime_with_an_unknown_transaction_version_stops_service() {
     let options = KitOptions {
         fake: FakeConfig {
             spec_version: 135,
-            transaction_version: 14,
+            transaction_version: 15,
             ..FakeConfig::default()
         },
         ..KitOptions::default()
@@ -277,7 +277,7 @@ async fn ac_e4_4_a_runtime_with_an_unknown_transaction_version_stops_service() {
         why,
         vec![Refusing::UnknownSurface {
             spec_version: 135,
-            transaction_version: 14,
+            transaction_version: 15,
             extensions: f.extensions.iter().map(|e| (*e).to_owned()).collect(),
             types: hex::encode(f.types),
         }]
@@ -640,7 +640,7 @@ async fn ac_e4_4_an_upgrade_to_an_unknown_surface_stops_submission_and_signing()
     let op = v["operation_reference"].as_str().unwrap().to_owned();
     k.chain.upgrade(|c| {
         c.spec_version = 200;
-        c.transaction_version = 14;
+        c.transaction_version = 15;
     });
     let r = k.step().await.unwrap();
     assert!(!r.serving);

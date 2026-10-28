@@ -748,6 +748,47 @@ async fn ac_e4_3_t_027_12_an_upgrade_that_changes_nothing_a_transaction_carries_
     assert_eq!(k.chain.balance_of(&PAYEE, &chain_usd()), 60);
 }
 
+/// `AC-E4.3`, `REQ-SA-9`: Kreivo 134 to 136 (release `0.18.1`, 2026-10-27) changed the
+/// `spec_version` and the `transaction_version` (13 to 14, for two `CommunitiesManager` calls it
+/// removed), and nothing else a transaction carries. `kreivo-133` is pinned for 14 too
+/// (`kreivo-pin-136`, `fixtures/surface-136.json`), so the adapter keeps serving with no
+/// configuration: the next batch is signed with 14 in its implicit data, confirmed by the layer
+/// on 136, broadcast and settled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ac_e4_3_kreivo_0_18_1_spec_136_transaction_version_14_keeps_serving() {
+    let mut k = serving_kit(KitOptions::default()).await;
+    let alice = k.d.party("alice", 1_000).await;
+    k.chain.set_spec_version(134);
+    k.chain.advance(1);
+    let first = k.withdrawal(&alice, 10, "on-134").await;
+    until_all(&mut k, &alice, std::slice::from_ref(&first), "Settled", 5).await;
+    assert!(k.adapter.config().formats.is_empty());
+    k.chain.upgrade(|c| {
+        c.spec_version = 136;
+        c.transaction_version = 14;
+    });
+    k.chain.advance(1);
+    assert!(k.step().await.unwrap().serving, "{:?}", k.adapter.status());
+    let second = k.withdrawal(&alice, 20, "on-136").await;
+    let r = k.step().await.unwrap();
+    assert_eq!((r.signed, r.broadcast), (1, 1));
+    assert_eq!(
+        k.chain.validations(),
+        2,
+        "confirmed on 136 before it went out"
+    );
+    until_all(&mut k, &alice, std::slice::from_ref(&second), "Settled", 5).await;
+    assert_eq!(signed_in(&extrinsic(&k, &second).await), vec!["kreivo-133"]);
+    assert_eq!(
+        served(&k).await,
+        vec![
+            (134, "kreivo-133".to_owned()),
+            (136, "kreivo-133".to_owned())
+        ]
+    );
+    assert_eq!(k.chain.balance_of(&PAYEE, &chain_usd()), 30);
+}
+
 /// `AC-E4.4`, `T-027-12`, `REQ-SA-9`: on a runtime whose surface is unchanged, a transaction the
 /// layer finds invalid for what it carries (here `BadProof`) is never stored or broadcast; the
 /// adapter refuses to serve on that runtime, raises an alert naming it, and signs nothing more.

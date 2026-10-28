@@ -329,3 +329,32 @@ async fn f_045_the_signer_alert_is_written_only_under_the_lease() {
     );
     assert!(!signer_alert_open(&k).await);
 }
+
+/// `F-045`, `AC-E4.3`, `REQ-SA-9`: on Kreivo 0.18.1 (spec 136, `transaction_version` 14, the same
+/// surface as 134 otherwise) a native account's withdrawal is signed with 14 in its payload's
+/// implicit data, confirmed by the layer under `kreivo-133+native` on 136, and settles, with no
+/// configuration naming the runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f_045_a_native_withdrawal_settles_on_spec_136() {
+    let mut k = serving_kit(native()).await;
+    assert!(k.adapter.config().formats.is_empty());
+    k.chain.upgrade(|c| {
+        c.spec_version = 136;
+        c.transaction_version = 14;
+    });
+    k.chain.advance(1);
+    assert!(k.step().await.unwrap().serving, "{:?}", k.adapter.status());
+    let alice = k.d.party("alice", 1_000).await;
+    let op = k.withdrawal(&alice, 10, "on-136").await;
+    until(&mut k, &alice, &op, "Settled", 6).await;
+    assert_eq!(k.chain.balance_of(&PAYEE, &chain_usd()), 10);
+    let runtimes = k.store.runtimes().await.unwrap();
+    assert_eq!(
+        runtimes
+            .iter()
+            .map(|r| (r.spec_version, r.format.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(136, "kreivo-133+native")],
+        "{runtimes:?}"
+    );
+}

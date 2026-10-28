@@ -32,9 +32,9 @@ on:
   workflow_dispatch:
     inputs:
       kreivo_release:
-        description: "Kreivo release tag of virto-network/kreivo. Default 0.17.0 (3e0a5c3, spec 133), the runtime mainnet runs from 2026-09-30; 0.16.9 (spec 132) stays selectable, with psdk_release polkadot-stable2603-4"
+        description: "Kreivo release tag of virto-network/kreivo. Default 0.18.1 (5cd5003, spec 136, transaction_version 14), the runtime mainnet runs from 2026-10-27; 0.17.0 (spec 133) and 0.16.9 (spec 132, with psdk_release polkadot-stable2603-4) stay selectable"
         type: string
-        default: "0.17.0"
+        default: "0.18.1"
       kreivo_ref:
         description: "Or build Kreivo's runtime from this branch, tag or commit instead of a release (about 20 minutes more)"
         type: string
@@ -42,7 +42,7 @@ on:
       psdk_release:
         description: "polkadot-sdk release for polkadot and polkadot-parachain (Kreivo 0.17 needs stable2606: the default; 0.16.9 needs stable2603 or newer, e.g. polkadot-stable2603-4)"
         type: string
-        default: polkadot-stable2606-2
+        default: polkadot-stable2606-3
       driver:
         description: "Who drives steps 3 and 4: the script (contracts/settlement/scripts) or aledgent (ingress and the core, and the adapter as its own process with PostgreSQL, over the light client)"
         type: choice
@@ -78,13 +78,13 @@ on:
     inputs:
       kreivo_release:
         type: string
-        default: "0.17.0"
+        default: "0.18.1"
       kreivo_ref:
         type: string
         default: ""
       psdk_release:
         type: string
-        default: polkadot-stable2606-2
+        default: polkadot-stable2606-3
       driver:
         type: string
         default: script
@@ -116,10 +116,10 @@ jobs:
       IMAGE: rust:1-bookworm
       # The aledgent driver's containers (the adapter, its namespace, PostgreSQL) and network.
       ALEDGENT_TAG: ${{ github.run_id }}-${{ github.run_attempt }}
-      # A release tag has no inputs: it gates on the defaults, Kreivo 0.17.0 on stable2606-2.
-      KREIVO_RELEASE: ${{ inputs.kreivo_release || '0.17.0' }}
+      # A release tag has no inputs: it gates on the defaults, Kreivo 0.18.1 on stable2606-3.
+      KREIVO_RELEASE: ${{ inputs.kreivo_release || '0.18.1' }}
       KREIVO_REF: ${{ inputs.kreivo_ref || '' }}
-      PSDK_RELEASE: ${{ inputs.psdk_release || 'polkadot-stable2606-2' }}
+      PSDK_RELEASE: ${{ inputs.psdk_release || 'polkadot-stable2606-3' }}
       DRIVER: ${{ inputs.driver || 'script' }}
       ALEDGENT_CONNECTION: ${{ inputs.aledgent_connection || 'light-client' }}
       MAINNET_PARITY: ${{ inputs.mainnet_parity || 'require' }}
