@@ -91,13 +91,18 @@ impl IncidentNote {
             | I::LateEvidence { op, .. }
             | I::FinalFailure { op, .. }
             | I::SettlementRefused { op, .. }
-            | I::IncludedWithoutRecord { op, .. } => Some(op),
+            | I::IncludedWithoutRecord { op, .. }
+            | I::EpochRefused {
+                refusal: crate::settlement::EpochRefusal::InFlight { op },
+                ..
+            } => Some(op),
             I::Unassociated { .. }
             | I::Unusable { .. }
             | I::Gap(_)
             | I::Missing { .. }
             | I::Unknown { .. }
-            | I::BindRefused { .. } => None,
+            | I::BindRefused { .. }
+            | I::EpochRefused { .. } => None,
         }
     }
 

@@ -647,3 +647,182 @@ fn recorded_incidents<P: core_binding::host::AgentPort>(fx: &Fx<P>) -> usize {
             .filter(|r| r.class == ledger_core::audit::AuditClass::SettlementIncident)
             .count()
 }
+
+// ------------------------------------------------------------------ amendment 0041
+
+/// A book named by a seed: its genesis committed a chainspec, so it has a genesis digest a new
+/// settlement sequence can name (amendment 0041). The founding and the fixture over it.
+fn named() -> (Founding, Fx<NativePort>, [u8; 32]) {
+    use core_binding::hot::MAX_BUDGET;
+    let spec = spec_of(
+        op(0),
+        1,
+        genesis().assets,
+        4,
+        ledger_core::chainspec::ChunkLimits::DEFAULT,
+    );
+    let digest = spec.commitment().digest;
+    let mut g = genesis();
+    g.chainspec = Some(spec.commitment());
+    g.spec = Some(std::sync::Arc::new(spec));
+    let limits = Limits {
+        budget: MAX_BUDGET,
+        ..Limits::DEFAULT
+    };
+    let fx = Fx::with_genesis(NativePort::new(), limits, g.clone());
+    let f = Founding {
+        genesis: g,
+        op: op(0),
+        at: 1,
+        keys: keys(),
+        limits,
+        genesis_roots: None,
+    };
+    (f, fx, digest)
+}
+
+/// An anchor record at `seq` observed at block `at`, reported and shown final.
+fn final_anchor<P: core_binding::host::AgentPort>(fx: &mut Fx<P>, who: Caller, seq: u64, at: u64) {
+    let source = SourceId::of_identity(&who.principal);
+    let mut o = record(source, seq, EventKind::Anchored);
+    o.at = at;
+    o.coordinate.digest[8..16].copy_from_slice(&at.to_be_bytes());
+    adapter(fx, who, AdapterInput::Observe(o.clone())).unwrap();
+    adapter(
+        fx,
+        who,
+        AdapterInput::Check {
+            coordinate: o.coordinate,
+            finalised_through: at + 1,
+            still_matches: true,
+        },
+    )
+    .unwrap();
+}
+
+fn held<P: core_binding::host::AgentPort>(fx: &Fx<P>) -> Option<FinalisedHead> {
+    fx.replica.state().settlement().head()
+}
+
+/// `T-043-14`, amendment 0041 (`REQ-SA-10` as proposed), the generation rule, in the Agent and the
+/// replica alike. Test's case on 28 Oct, scaled: the core's head is 13 from the chain before the
+/// reset, and the new chain's anchors at 0 and 1 are final. Under generation 0 the start of
+/// sequence 2 is refused, `ERR-MalformedCommand`, and writes nothing. After the in-place upgrade to
+/// [`SETTLEMENT_EPOCHS`], a start naming another book is refused (one audit record), and one
+/// naming this book is taken: the head restarts at the reset's block and position 0, and the next
+/// head of the new chain is taken at once. The whole history replays from genesis under its code
+/// map.
+#[test]
+fn t043_14_the_book_follows_a_new_sequence_from_its_generation() {
+    use ledger_core::settlement::{
+        EpochOutcome, EpochRefusal, PreviousAnchor, SETTLEMENT_EPOCHS, SettlementEpoch,
+    };
+    let (f, mut fx, book) = named();
+    let who = settlement(&mut fx);
+    let head = |height, next_seq| AdapterInput::Head {
+        head: FinalisedHead { height, next_seq },
+        nonces: Vec::new(),
+    };
+    adapter(&mut fx, who, head(142, 13)).unwrap();
+    final_anchor(&mut fx, who, 0, 205);
+    final_anchor(&mut fx, who, 1, 206);
+    adapter(&mut fx, who, head(207, 2)).unwrap();
+    assert_eq!(
+        held(&fx).map(|h| h.next_seq),
+        Some(13),
+        "dropped, as before"
+    );
+    let start = |book| SettlementEpoch {
+        epoch: 2,
+        base: 0,
+        from_seq: 0,
+        at: 195,
+        book,
+        previous: Some(PreviousAnchor {
+            number: 1,
+            commitment: [0x91; 32],
+        }),
+    };
+    // Generation 0: refused, and nothing written; the input is the Agent's too.
+    let committed = fx.archive.len();
+    assert_eq!(
+        adapter(&mut fx, who, AdapterInput::Epoch(start(book))).unwrap_err(),
+        Refusal::MalformedCommand
+    );
+    assert_eq!(fx.archive.len(), committed + 1);
+    assert_eq!(fx.replica.state().settlement().epoch(), None);
+
+    assert_eq!(upgrade(&mut fx), SETTLEMENT_EPOCHS);
+    // Another book's start: refused, one audit record, the head unchanged.
+    let roots = fx.archive.last().unwrap().roots;
+    assert!(matches!(
+        adapter(&mut fx, who, AdapterInput::Epoch(start([0xB1; 32]))),
+        Ok(AdapterReply::Epoch(EpochOutcome::Refused(
+            EpochRefusal::OtherBook
+        )))
+    ));
+    assert_ne!(fx.archive.last().unwrap().roots.audit, roots.audit);
+    assert_eq!(fx.archive.last().unwrap().roots.service, roots.service);
+    assert_eq!(held(&fx).map(|h| h.next_seq), Some(13));
+    // This book's: taken.
+    assert!(matches!(
+        adapter(&mut fx, who, AdapterInput::Epoch(start(book))),
+        Ok(AdapterReply::Epoch(EpochOutcome::Started(FinalisedHead {
+            height: 195,
+            next_seq: 0
+        })))
+    ));
+    assert_eq!(fx.replica.state().settlement().epoch(), Some(start(book)));
+    adapter(&mut fx, who, head(210, 2)).unwrap();
+    assert_eq!(
+        held(&fx),
+        Some(FinalisedHead {
+            height: 210,
+            next_seq: 2
+        })
+    );
+    let map = claimed_code_map(&mut NativePort::new(), &f, &fx.archive).unwrap();
+    assert_eq!(map.ranges.len(), 2);
+    let mut port = NativePort::new();
+    port.code_map = map.versions();
+    let (_, rolled) = roll_forward_agent(port, &f, &fx.archive, &ReplicaStores::Memory)
+        .unwrap_or_else(|e| panic!("{e}"));
+    let last = fx.archive.last().unwrap();
+    assert_eq!(
+        (rolled.log_head, rolled.roots),
+        (last.log_hash(), last.roots)
+    );
+}
+
+/// The generation rule, at the witness: a generation-0 input never reads the leaf amendment 0041
+/// adds (the sequence, kind 36), whatever the adapter sends.
+#[test]
+fn t043_14_generation_0_reads_no_sequence() {
+    let mut fx = Fx::new(
+        Kinds {
+            inner: NativePort::new(),
+            seen: Default::default(),
+        },
+        Limits::DEFAULT,
+    );
+    let who = settlement(&mut fx);
+    settlement_inputs(&mut fx, who);
+    let _ = adapter(
+        &mut fx,
+        who,
+        AdapterInput::Epoch(ledger_core::settlement::SettlementEpoch {
+            epoch: 2,
+            base: 0,
+            from_seq: 0,
+            at: 195,
+            book: [0xB0; 32],
+            previous: None,
+        }),
+    );
+    let seen = &fx.driver.port().seen;
+    assert!(seen.contains(&ledger_core::leaves::kind::FINALISED_HEAD));
+    assert!(
+        !seen.contains(&ledger_core::leaves::kind::SETTLEMENT_EPOCH),
+        "a generation-0 input read the sequence"
+    );
+}

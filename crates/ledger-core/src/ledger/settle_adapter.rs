@@ -51,9 +51,9 @@ use crate::refusal::Refusal;
 use crate::settlement::assets::{AssetAttestation, AttestationVerdict, Attested, admit};
 use crate::settlement::store::SettlementWrite;
 use crate::settlement::{
-    AdapterStatus, CallEnvelope, CanonicalCheck, Coordinate, FinalisedHead, Gap, HeadReport,
-    KeyNonce, MAX_ADAPTER_LEASE, Observation, OutboundInstruction, OutboxCall, RescanReport,
-    SigningRecord, SourceId, SupportDeclaration, Verdict, Verified,
+    AdapterStatus, CallEnvelope, CanonicalCheck, Coordinate, EpochOutcome, FinalisedHead, Gap,
+    HeadReport, KeyNonce, MAX_ADAPTER_LEASE, Observation, OutboundInstruction, OutboxCall,
+    RescanReport, SettlementEpoch, SigningRecord, SourceId, SupportDeclaration, Verdict, Verified,
 };
 use crate::state::Write;
 
@@ -152,6 +152,12 @@ pub enum AdapterInput {
     /// at a finalised height (`DEC-20`). A binding reads it; after the binding it is ignored
     /// (`REQ-AS-9`).
     Attest(AssetAttestation),
+    /// A new sequence of the settlement layer's record started under the book (amendment 0041,
+    /// `[PENDING AMENDMENT 0041]`): the core restarts its finalised head at its start, or refuses
+    /// it ([`Ledger::start_epoch`](crate::ledger::Ledger)). Refused with `ERR-MalformedCommand`,
+    /// writing nothing, before [`crate::settlement::SETTLEMENT_EPOCHS`]. Appended last, so every
+    /// recorded input decodes as before.
+    Epoch(SettlementEpoch),
 }
 
 /// What the core derived from an adapter input (`REQ-SI-5`): never more than a verdict, a state
@@ -183,6 +189,8 @@ pub enum AdapterReply {
     Evidence(State),
     /// What the core made of an attestation (`DEC-20`).
     Attested(AttestationVerdict),
+    /// What the core made of a new sequence (amendment 0041).
+    Epoch(EpochOutcome),
 }
 
 impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
@@ -302,6 +310,13 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                     AdapterReply::Evidence(self.evidence_checked(source, op, submission, now)?)
                 }
                 AdapterInput::Attest(a) => AdapterReply::Attested(self.attest(a, now)?),
+                AdapterInput::Epoch(epoch) => {
+                    // Amendment 0041: from `SETTLEMENT_EPOCHS` on only (the generation rule).
+                    if !self.epochs() {
+                        return Err(Refusal::MalformedCommand);
+                    }
+                    AdapterReply::Epoch(self.start_epoch(source, epoch, now)?)
+                }
             })
         })();
         self.leave(top, || crate::call::Summary::of(&r));

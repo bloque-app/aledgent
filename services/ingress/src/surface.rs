@@ -652,6 +652,12 @@ pub const ROUTES: &[Route] = &[
         "Settlement adapter: what the settlement layer's metadata states about an asset location it binds, at a finalised height (DEC-20). Registration reads it; a difference from the registry holds the asset. The adapter's principal only.",
     ),
     command(
+        "/v1/settlement/epochs",
+        CommandRoute::Settlement(SettlementRoute::Epoch),
+        "start_epoch",
+        "Settlement adapter: a new sequence of the settlement layer's record started under the book (amendment 0041); the core restarts its finalised head at its start, or refuses it. The adapter's principal only.",
+    ),
+    command(
         "/v1/settlement/anchor-acknowledgements",
         CommandRoute::Settlement(SettlementRoute::AcknowledgeAnchor),
         "ack_anchor",

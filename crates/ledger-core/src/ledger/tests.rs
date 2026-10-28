@@ -902,6 +902,7 @@ mod aliases;
 mod anchoring;
 mod asset_binding;
 mod custody;
+mod epochs;
 mod identities;
 mod lifecycle;
 mod opening;

@@ -27,6 +27,7 @@ impl SettlementStore {
             gaps,
             incidents,
             gap_end,
+            epoch,
             status,
             attestations,
             binds,
@@ -66,15 +67,24 @@ impl SettlementStore {
         // and only once it is set. A book that has none (every book before the chained
         // generation) exports exactly the 16 records it did before, so its section, and every
         // digest and root over it, is unchanged, and an export written before still imports.
-        if *gap_end.get() != 0 {
+        // T-043-14 (amendment 0041): the sequence the book follows, as an 18th record, and only once
+        // one is taken; the gap end is then the 17th even while 0, so the two never shift.
+        if *gap_end.get() != 0 || epoch.get().is_some() {
             out.push(canon::to_bytes(gap_end));
+        }
+        if epoch.get().is_some() {
+            out.push(canon::to_bytes(epoch));
         }
         out
     }
 
     /// The store from its records: [`SettlementStore::to_records`]'s, or those of an export
-    /// written before `T-043-07`, which has no gap end.
+    /// written before `T-043-07`, which has no gap end, or before `T-043-14`, which has no sequence.
     pub(crate) fn from_records(r: &[&[u8]]) -> Result<SettlementStore, DecodeError> {
+        let (r, epoch): (&[&[u8]], Option<&[u8]>) = match r.split_last() {
+            Some((last, rest)) if r.len() == 18 => (rest, Some(*last)),
+            _ => (r, None),
+        };
         let (r, gap_end): (&[&[u8]], Option<&[u8]>) = match r.split_last() {
             Some((last, rest)) if r.len() == 17 => (rest, Some(*last)),
             _ => (r, None),
@@ -119,6 +129,10 @@ impl SettlementStore {
                 Some(b) => canon::from_bytes(b)?,
                 None => Default::default(),
             },
+            epoch: match epoch {
+                Some(b) => canon::from_bytes(b)?,
+                None => Default::default(),
+            },
             status: canon::from_bytes(status)?,
             attestations: canon::from_bytes(attestations)?,
             binds: canon::from_bytes(binds)?,
@@ -160,6 +174,36 @@ mod tests {
         let refs: Vec<&[u8]> = records.iter().map(Vec::as_slice).collect();
         let back = SettlementStore::from_records(&refs).unwrap();
         assert_eq!(back.gap_end(), 9);
+        assert_eq!(back.to_records(), records);
+    }
+
+    /// `T-043-14`: a store that took a new sequence exports it as an 18th record, after the gap
+    /// end even while that is 0, and both read back; a store that took none exports as before.
+    #[test]
+    fn t043_14_the_sequence_is_an_18th_record_only_once_taken() {
+        use crate::settlement::{FinalisedHead, SettlementEpoch};
+        let e = SettlementEpoch {
+            epoch: 2,
+            base: 0,
+            from_seq: 0,
+            at: 195,
+            book: [0xB0; 32],
+            previous: None,
+        };
+        let mut s = SettlementStore::new();
+        s.apply(&SettlementWrite::Epoch {
+            epoch: e,
+            head: Some(FinalisedHead {
+                height: 195,
+                next_seq: 0,
+            }),
+        })
+        .unwrap();
+        let records = s.to_records();
+        assert_eq!(records.len(), 18);
+        let refs: Vec<&[u8]> = records.iter().map(Vec::as_slice).collect();
+        let back = SettlementStore::from_records(&refs).unwrap();
+        assert_eq!((back.epoch(), back.gap_end()), (Some(e), 0));
         assert_eq!(back.to_records(), records);
     }
 }

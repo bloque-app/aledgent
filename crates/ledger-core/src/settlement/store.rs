@@ -19,7 +19,10 @@
 //! - **A signing record per instruction, once, after its acknowledgement** (owner ruling,
 //!   2026-09-24): the one transaction signed for it, or the adapter's word that it never will
 //!   sign one. **Its nonce fact is decided once** and never changes.
-//! - **The finalised head never goes back.**
+//! - **The finalised head never goes back within a sequence.** Only the start of a strictly later
+//!   sequence of the layer's record moves it back, to that sequence's start (amendment 0041,
+//!   [`SettlementWrite::Epoch`]); the store refuses any other head that goes back, and a sequence
+//!   that is not later than the one it holds.
 //! - **Gaps and incidents are appended, never removed.** A re-scan's difference (`Missing`,
 //!   `Unknown`) is one incident however many re-scans find it: the store indexes the ones
 //!   recorded by key, so a re-scan that finds nothing new reads that index, never the incidents.
@@ -36,7 +39,8 @@ use alloc::vec::Vec;
 use super::assets::{AssetBind, Attested, BindStatus};
 use super::{
     AdapterStatus, Coordinate, FinalisedHead, Gap, Incident, NonceFact, Observation,
-    OutboundInstruction, SettlementConfig, SigningRecord, SourceId, SupportDeclaration,
+    OutboundInstruction, SettlementConfig, SettlementEpoch, SigningRecord, SourceId,
+    SupportDeclaration,
 };
 use crate::asset::{AssetId, AssetLocation};
 use crate::id::OperationId;
@@ -137,6 +141,16 @@ pub enum SettlementWrite {
     },
     /// Raise the finalised head.
     Head(FinalisedHead),
+    /// Record the start of a new sequence of the layer's record (amendment 0041): refused unless
+    /// its number is strictly later than the one the store holds. With `head`, the finalised head
+    /// becomes it, even below the one held: the one write that moves the head back.
+    Epoch {
+        /// The sequence.
+        epoch: SettlementEpoch,
+        /// The head it starts at, or none to keep the head (one at a later block is already the
+        /// new sequence's).
+        head: Option<FinalisedHead>,
+    },
     /// Record a skipped range.
     Gap(Gap),
     /// Empty the gaps leaf (`T-043-08`): the gaps moved to the gap end and the audit trail in the
@@ -213,6 +227,8 @@ pub enum SettlementRefusal {
     NoBindPending,
     /// The tally would go back, or count an operation twice.
     Tally,
+    /// A sequence not later than the one the store holds (amendment 0041).
+    EpochNotLater,
 }
 
 /// How to undo one applied write.
@@ -230,6 +246,7 @@ pub(crate) enum SettlementUndo {
     Unsign(OperationId),
     Undecide(OperationId),
     Head(Option<FinalisedHead>),
+    Epoch(Option<SettlementEpoch>, Option<FinalisedHead>),
     PopGap,
     GapEnd(u64),
     Gaps(Vec<Gap>),
@@ -272,6 +289,9 @@ pub struct SettlementStore {
     /// (amendment 0040, ruling a40c-gaps-watermark): `proof` cannot show a range that starts
     /// below it complete. Absent while 0, so a book that records no gap holds no leaf for it.
     gap_end: Slot<u64, { kind::GAP_END }>,
+    /// The last sequence of the layer's record whose start the book took (amendment 0041), from
+    /// [`super::SETTLEMENT_EPOCHS`] on. Absent until one is taken.
+    epoch: Slot<Option<SettlementEpoch>, { kind::SETTLEMENT_EPOCH }>,
     status: Slot<Option<AdapterStatus>, { kind::ADAPTER_STATUS }>,
     /// The latest attestation of each location (`DEC-20`).
     attestations: Leaves<AssetLocation, Attested, { kind::ASSET_ATTESTATION }>,
@@ -394,6 +414,10 @@ impl SettlementStore {
                 self.awaiting.insert(op, ());
             }
             SettlementUndo::Head(h) => {
+                self.head.set(h);
+            }
+            SettlementUndo::Epoch(e, h) => {
+                self.epoch.set(e);
                 self.head.set(h);
             }
             SettlementUndo::PopGap => {
@@ -633,6 +657,21 @@ impl SettlementStore {
                 }
                 let before = self.head.set(Some(*h));
                 Ok(SettlementUndo::Head(before))
+            }
+            SettlementWrite::Epoch { epoch, head } => {
+                if self
+                    .epoch
+                    .get()
+                    .is_some_and(|held| epoch.epoch <= held.epoch)
+                {
+                    return Err(SettlementRefusal::EpochNotLater);
+                }
+                let before = *self.head.get();
+                if let Some(h) = head {
+                    self.head.set(Some(*h));
+                }
+                let held = self.epoch.set(Some(*epoch));
+                Ok(SettlementUndo::Epoch(held, before))
             }
             SettlementWrite::Gap(g) => {
                 if g.to <= g.from {
@@ -1008,6 +1047,24 @@ impl SettlementStore {
         *self.head.get()
     }
 
+    /// The last sequence of the layer's record whose start the book took (amendment 0041).
+    pub fn epoch(&self) -> Option<SettlementEpoch> {
+        *self.epoch.get()
+    }
+
+    /// Whether any outbound instruction is not yet decided (amendment 0041): a read of the
+    /// instructions in flight, whole.
+    pub fn any_live(&self) -> Option<OperationId> {
+        self.live.first_key_value().map(|(op, _)| *op)
+    }
+
+    /// The final records of `instance` at positions at or above `from`, whole, in position order.
+    pub fn finals_from(&self, instance: u32, from: u64) -> impl Iterator<Item = &Coordinate> {
+        self.finals
+            .range((instance, from)..=(instance, u64::MAX))
+            .map(|(_, c)| c)
+    }
+
     /// Every recorded gap.
     pub fn gaps(&self) -> &[Gap] {
         self.gaps.get()
@@ -1090,6 +1147,7 @@ impl LeafHost for SettlementStore {
         out.push(&self.gaps);
         out.push(&self.incidents);
         out.push(&self.gap_end);
+        out.push(&self.epoch);
         out.push(&self.status);
         out.push(&self.attestations);
         out.push(&self.binds);
@@ -1115,6 +1173,7 @@ impl LeafHost for SettlementStore {
         out.push(&mut self.gaps);
         out.push(&mut self.incidents);
         out.push(&mut self.gap_end);
+        out.push(&mut self.epoch);
         out.push(&mut self.status);
         out.push(&mut self.attestations);
         out.push(&mut self.binds);

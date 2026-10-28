@@ -78,9 +78,10 @@ use crate::refusal::Refusal;
 use crate::reservation::{CHOSEN, ReservationBook, ReservationHandle, UnitBuilder};
 use crate::settlement::store::{Ingested, SettlementStore, SettlementWrite, Standing};
 use crate::settlement::{
-    CanonicalCheck, Coordinate, Destination, EventKind, FinalisedHead, Gap, HeadReport, Incident,
-    KeyNonce, NonceFact, Observation, OutboundInstruction, RescanReport, SettlementConfig,
-    SettlementPort, SigningRecord, SourceId, SupportDeclaration, Verdict, Verified,
+    CanonicalCheck, Coordinate, Destination, EpochOutcome, EpochRefusal, EventKind, FinalisedHead,
+    Gap, HeadReport, Incident, KeyNonce, NonceFact, Observation, OutboundInstruction, RescanReport,
+    SettlementConfig, SettlementEpoch, SettlementPort, SigningRecord, SourceId, SupportDeclaration,
+    Verdict, Verified,
 };
 use crate::state::{Command, OperationRecord, Write};
 
@@ -1944,6 +1945,103 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                 Ok(to)
             }
             Err(f) => Err(f.refusal),
+        }
+    }
+
+    // ------------------------------------------------------------------ a new sequence
+
+    /// The start of a new sequence of the layer's record under the book (amendment 0041,
+    /// `REQ-SA-10` as proposed, `T-043-14`, `[PENDING AMENDMENT 0041]`): governance reset the
+    /// instance, and its positions restart at `epoch.from_seq` from block `epoch.at`. Reached
+    /// through the adapter's input only ([`crate::ledger::settle_adapter::AdapterInput::Epoch`]),
+    /// from [`crate::settlement::SETTLEMENT_EPOCHS`] on; the caller gates the generation.
+    ///
+    /// In order:
+    ///
+    /// 1. The sequence the book holds, again and equal in every field: `Recorded`, nothing
+    ///    written. Any other sequence not later than it: refused ([`EpochRefusal::NotLater`]).
+    /// 2. Another book: refused. The sequence must name this book's genesis digest (its
+    ///    chainspec's seed digest, [`Ledger::code_binding`]); a book founded without one has the
+    ///    zero digest and can never match (decision 4).
+    /// 3. An outbound instruction not yet decided: refused. Its first position and expiry come
+    ///    from an earlier sequence, and the new one's records prove nothing about it (decision 2).
+    /// 4. A final record of the instance at or above `from_seq` observed at or before the reset's
+    ///    block: refused. It is an earlier sequence's, at a position the new one reuses, and
+    ///    `proof` would count it as the new one's (decision 5: one in the reset's own block cannot
+    ///    be told apart by block, so it counts as earlier). A record observed after the reset's
+    ///    block is the new sequence's, and stays.
+    /// 5. Otherwise the sequence is recorded and the head restarts at its start,
+    ///    `{ at, from_seq }`, unless the book holds a head at a later block: that one is already
+    ///    the new sequence's, and stays. Later heads compare against it as before.
+    ///
+    /// A refusal writes one audit record ([`Incident::EpochRefused`]) and nothing in the book's
+    /// state. The positions' tally, the gap end and the index by position are left as they are
+    /// (amendment 0041). This reads the instructions in flight and the instance's final
+    /// positions from `from_seq` whole: it comes once per reset.
+    pub(super) fn start_epoch(
+        &mut self,
+        source: SourceId,
+        epoch: SettlementEpoch,
+        now: Time,
+    ) -> Result<EpochOutcome, Refusal> {
+        let config = self.authoritative(&source).ok_or(Refusal::NotAuthorised)?;
+        let refusal = (|| {
+            let store = self.state.settlement();
+            if let Some(held) = store.epoch() {
+                if held == epoch {
+                    return Ok(None);
+                }
+                if epoch.epoch <= held.epoch {
+                    return Err(EpochRefusal::NotLater {
+                        recorded: held.epoch,
+                    });
+                }
+            }
+            let genesis = self.code_binding().genesis;
+            if genesis == [0; 32] || epoch.book != genesis {
+                return Err(EpochRefusal::OtherBook);
+            }
+            if let Some(op) = store.any_live() {
+                return Err(EpochRefusal::InFlight { op });
+            }
+            if let Some(c) = store
+                .finals_from(config.instance, epoch.from_seq)
+                .find(|c| {
+                    store
+                        .ingested(c)
+                        .is_none_or(|i| i.observation.at <= epoch.at)
+                })
+            {
+                return Err(EpochRefusal::EarlierFinal { seq: c.seq });
+            }
+            Ok(Some(()))
+        })();
+        match refusal {
+            Ok(None) => Ok(EpochOutcome::Recorded),
+            Ok(Some(())) => {
+                let start = epoch.start();
+                let head = match self.state.settlement().head() {
+                    Some(h) if h.height > epoch.at => None,
+                    _ => Some(start),
+                };
+                let writes = [Write::Settlement(SettlementWrite::Epoch { epoch, head })];
+                self.check(&writes)?;
+                self.commit(&writes)?;
+                Ok(EpochOutcome::Started(
+                    self.state.settlement().head().unwrap_or(start),
+                ))
+            }
+            Err(refusal) => {
+                let writes = [self.incident(
+                    Incident::EpochRefused {
+                        epoch: epoch.epoch,
+                        refusal,
+                    },
+                    now,
+                )];
+                self.commit(&writes)?;
+                Ok(EpochOutcome::Refused(refusal))
+            }
         }
     }
 
