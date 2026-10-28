@@ -293,6 +293,13 @@ pub struct ChainEpoch {
     pub from_seq: u64,
     /// The block of the reset.
     pub at: u64,
+    /// The anchor number the sequence starts after.
+    pub base: u64,
+    /// The book the sequence names (its chainspec digest, as governance gave it): what the core
+    /// checks against its own before it follows the sequence (amendment 0041).
+    pub book: [u8; 32],
+    /// The latest anchor of the sequence before, if it had one: its number and commitment.
+    pub previous: Option<(u64, [u8; 32])>,
 }
 
 /// What one of a block's events says of an instance's chain, in the order the block emitted them.

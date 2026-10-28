@@ -516,6 +516,9 @@ pub fn chain_epoch(cell: &AnchorEpochCell) -> super::ChainEpoch {
         epoch: cell.epoch,
         from_seq: cell.from_seq,
         at: u64::from(cell.at),
+        base: cell.base,
+        book: cell.book,
+        previous: cell.previous.map(|p| (p.number, p.commitment)),
     }
 }
 

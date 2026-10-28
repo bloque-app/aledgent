@@ -47,6 +47,14 @@ groups:
         annotations:
           summary: Observation waits for an operator, because no reader can serve a range or the settlement layer was reset under the running adapter.
           runbook: ops/runbooks/gap-filling.md
+      # Amendment 0041: the core refused to follow a new sequence of the layer's record (a reset of
+      # the instance); nothing of the new chain reaches it, and withdrawals wait.
+      - alert: AledgentSettlementEpochRefused
+        expr: aledgent_adapter_alerts{kind="epoch"} > 0
+        labels: { severity: page, owner: settlement-operations, signal: observation-completeness }
+        annotations:
+          summary: The core refused to follow a reset of the settlement layer's instance; nothing of the new chain reaches it.
+          runbook: ops/runbooks/gap-filling.md
       - alert: AledgentObservationLag
         expr: aledgent_observation_cursor_lag > 100
         for: 10m
@@ -410,6 +418,15 @@ groups:
         labels: { severity: page, owner: settlement-operations, signal: settlement-adapter }
         annotations:
           summary: A settlement key's signer (Vault Transit) is not ready; nothing is signed.
+          runbook: ops/runbooks/release/settlement-adapter-outage.md
+      # Amendment 0041: a reset the core cannot take yet (its code is before the amendment's
+      # generation). The adapter goes on; the core's head stays where it was until its upgrade.
+      - alert: AledgentSettlementEpochUnsupported
+        expr: aledgent_adapter_alerts{kind="epoch-unsupported"} > 0
+        for: 10m
+        labels: { severity: warning, owner: settlement-operations, signal: settlement-adapter }
+        annotations:
+          summary: The core cannot take a reset of the settlement layer's instance until it is upgraded; its finalised head is stale meanwhile.
           runbook: ops/runbooks/release/settlement-adapter-outage.md
       # Blocks come and finality does not: Kreivo's finality follows Kusama's.
       - alert: AledgentFinalityStalled

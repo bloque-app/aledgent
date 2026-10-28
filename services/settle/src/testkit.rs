@@ -94,6 +94,12 @@ pub struct KitOptions {
     /// Whether the lanes and the anchor key are native accounts (`F-045`, Ed25519 keys signing v4
     /// transactions) rather than PASS accounts' devices.
     pub native_accounts: bool,
+    /// The code generation the core decides at (amendment 0041 needs
+    /// `ledger_core::settlement::SETTLEMENT_EPOCHS`); 0, as every kit before it.
+    pub core_generation: u64,
+    /// Whether the book is founded on a chainspec (an empty seed), so it has a genesis digest a
+    /// settlement sequence can name ([`Kit::book`]); otherwise it has none.
+    pub named_book: bool,
 }
 
 impl Default for KitOptions {
@@ -111,6 +117,8 @@ impl Default for KitOptions {
             batch_gas_cap: None,
             batch_gas_margin_percent: crate::config::default_batch_gas_margin_percent(),
             native_accounts: false,
+            core_generation: 0,
+            named_book: false,
         }
     }
 }
@@ -183,8 +191,18 @@ impl Kit {
     /// configuration naming it, the fake layer with the instance registered and funded, and an
     /// adapter that has not yet run a step.
     pub async fn start_with(options: KitOptions) -> Kit {
+        let d = if options.named_book {
+            named_deployment().await
+        } else {
+            Deployment::start().await
+        };
         let (d, adapter_party) =
-            ingress_with_adapter(INSTANCE, options.expiry_window, options.block_time).await;
+            ingress_with_adapter_on(d, INSTANCE, options.expiry_window, options.block_time).await;
+        if options.core_generation > 0 {
+            d.core
+                .checkpoint(|l, _| l.set_generation(options.core_generation, false))
+                .unwrap_or_else(|| panic!("the core runs"));
+        }
         let lanes: Vec<Arc<dyn Signer>> = [
             (TEST_LANE_SECRET, TEST_PASS_USER),
             (TEST_LANE_SECRET_2, TEST_PASS_USER_2),
@@ -260,8 +278,53 @@ pub async fn ingress_with_adapter(
     expiry_window: u64,
     block_time: u64,
 ) -> (Deployment, Party) {
+    ingress_with_adapter_on(
+        Deployment::start().await,
+        instance,
+        expiry_window,
+        block_time,
+    )
+    .await
+}
+
+/// A deployment whose book is founded on a chainspec: the test genesis with an empty seed, so the
+/// book has a genesis digest ([`Kit::book`], amendment 0041).
+pub async fn named_deployment() -> Deployment {
+    use ingress::testkit::{T0, fast_config, genesis, test_clerk};
+    let mut g = genesis(T0);
+    let spec = ledger_core::chainspec::ChainSpec::build(
+        g.op,
+        g.at,
+        g.genesis.assets.clone(),
+        Vec::new(),
+        None,
+        None,
+        ledger_core::chainspec::ChunkLimits::DEFAULT,
+    )
+    .unwrap_or_else(|e| panic!("an empty seed builds: {e:?}"));
+    g.genesis.chainspec = Some(spec.commitment());
+    g.genesis.spec = Some(Arc::new(spec));
+    let journal = ingress::inprocess::MemJournal::new();
+    let core =
+        ingress::inprocess::InProcessCore::in_memory(g, journal.clone()).with_clerk(test_clerk());
+    core.start()
+        .unwrap_or_else(|e| panic!("the core starts: {e}"));
+    let founded = core
+        .founded()
+        .unwrap_or_else(|| panic!("a started core is founded"));
+    let config = fast_config("ingress-0");
+    let store = ingress::store::mem::MemStore::new(config.lease);
+    Deployment::assemble(store, config, core, founded, journal).await
+}
+
+/// [`ingress_with_adapter`] on the deployment `d`.
+pub async fn ingress_with_adapter_on(
+    d: Deployment,
+    instance: u32,
+    expiry_window: u64,
+    block_time: u64,
+) -> (Deployment, Party) {
     {
-        let d = Deployment::start().await;
         let op = d.operator.token.clone();
         let v = ok(
             &d,
@@ -309,6 +372,20 @@ pub async fn ingress_with_adapter(
 }
 
 impl Kit {
+    /// The book's genesis digest (its chainspec's), what a reset for it names (amendment 0041);
+    /// zero for a book founded without one.
+    pub fn book(&self) -> [u8; 32] {
+        self.d
+            .core
+            .with_ledger(|l| l.code_binding().genesis)
+            .unwrap_or_default()
+    }
+
+    /// The finalised head the core holds.
+    pub fn core_head(&self) -> Option<ledger_core::settlement::FinalisedHead> {
+        self.core_settlement(|s| s.head()).flatten()
+    }
+
     /// Replace the adapter with a fresh process over the same store, chain and ingress: a
     /// restart after a crash.
     pub fn restart(&mut self) {

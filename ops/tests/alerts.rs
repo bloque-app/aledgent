@@ -218,6 +218,13 @@ fn nfr_11_each_signal_over_its_line_pages_the_test_route() {
                 s.adapter.as_mut().unwrap().alerts.insert("reset".into(), 1);
             },
         ),
+        (
+            "AledgentSettlementEpochRefused",
+            "observation-completeness",
+            |s| {
+                s.adapter.as_mut().unwrap().alerts.insert("epoch".into(), 1);
+            },
+        ),
         ("AledgentObservationLag", "observation-completeness", |s| {
             s.adapter.as_mut().unwrap().cursor = 0;
             s.adapter.as_mut().unwrap().inbox = 101;
@@ -676,7 +683,7 @@ fn t_018_10_release_alerts_link_their_runbooks_and_route_to_the_pager() {
             r.alert
         );
     }
-    assert_eq!(release, 18, "the release alerts");
+    assert_eq!(release, 19, "the release alerts");
     let routing = Routing::committed().unwrap();
     let mut labels = BTreeMap::new();
     labels.insert("severity".to_owned(), "page".to_owned());
@@ -698,6 +705,16 @@ fn t_018_10_release_alerts_link_their_runbooks_and_route_to_the_pager() {
     let (pager, dashboard) = page(&s);
     assert!(pager.delivered.is_empty(), "{:#?}", pager.delivered);
     assert!(dashboard.got("AledgentVosAuthorityUnacknowledged"));
+    // Amendment 0041: a reset the core cannot take yet warns, and pages no one.
+    let mut s = healthy();
+    s.adapter
+        .as_mut()
+        .unwrap()
+        .alerts
+        .insert("epoch-unsupported".into(), 1);
+    let (pager, dashboard) = page(&s);
+    assert!(pager.delivered.is_empty(), "{:#?}", pager.delivered);
+    assert!(dashboard.got("AledgentSettlementEpochUnsupported"));
 }
 
 /// `T-005-15`, `NFR-4`: the exporter reads the Agent core's archiver status; the core's backup is

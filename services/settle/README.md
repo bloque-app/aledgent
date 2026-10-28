@@ -162,12 +162,18 @@ aledgent-settle settle.json gap <from> <to>
 Both `gap` and `refound` (below) hold the adapter's lease, so the running adapter is stopped first;
 each runs once and exits.
 
-A reset of the instance (governance's `set_anchor_head`) comes only with its book's re-founding. The
-first start on a reset instance folds from the reset, and a cursor kept from the chain before it is
-reset to the chain's start. No other cursor is moved: one past the start of a chain never reset
-raises `chain:`, and one behind it (positions the contract's earlier code wrote and nobody read)
-raises `unreadable:` until the operator records them as a gap. A reset under a running adapter raises `reset:<instance>`, and from then on nothing reaches the book
-it serves: no observation, head, anchor or position cut; once the adapter is pointed at the re-founded book, `aledgent-settle settle.json
+A reset of the instance (governance's `set_anchor_head`) starts a new sequence of its record. The first
+start on a reset instance folds from the reset, and a cursor kept from the chain before it is reset to the
+chain's start. No other cursor is moved: one past the start of a chain never reset raises `chain:`, and
+positions written before the chain's start and never read raise `unreadable:` until the operator records
+them as a gap. The adapter reports the new sequence to the core (amendment 0041,
+`[PENDING AMENDMENT 0041]`): live, when it reads the reset past its verified head with nothing of the
+chain before left unreported, and once per sequence it moved to on a first start. The core follows it,
+and the adapter goes on; or the core refuses it (`epoch:<instance>:<epoch>`, which pages) and nothing of
+the new chain is reported, the start being asked again every ten minutes; or it cannot take it yet
+(`epoch-unsupported:`, a core before the amendment's generation). A reset for another book, or one with
+entries of the chain before it left unreported, raises `reset:<instance>`, and from then on nothing reaches
+the book it serves; once the adapter is pointed at the re-founded book, `aledgent-settle settle.json
 refound` resets its cursor and accepted head, and the next run starts on the new chain.
 
 **There is no periodic re-scan** (`T-043-05`): nothing re-reads a range on a timer.

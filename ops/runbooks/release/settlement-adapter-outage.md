@@ -116,11 +116,21 @@ settlement-operations.
    - `unreadable:<instance>:<position>`: no reader serves that range. Give the adapter a history endpoint,
      or stop it, run once `aledgent-settle <config> gap <from> <to>` with the range the alert names (use the
      range the command reports if it refuses), and start it again;
-   - `reset:<instance>`: governance reset the layer's instance under it, and nothing reaches the book it
-     serves. Once the book is re-founded and the configuration points at it, stop the adapter, run once
+   - `reset:<instance>`: governance reset the layer's instance under it, and the core does not follow the
+     new chain (amendment 0041): the reset names another book, entries of the chain before it were left
+     unreported, or the core refused it or cannot take it yet (an `epoch` alert says which). Nothing
+     reaches the book it serves. A refusal the core may still lift is reported again every ten minutes,
+     and the adapter goes on by itself once it is taken. For another book's reset: once the book is
+     re-founded and the configuration points at it, stop the adapter, run once
      `aledgent-settle <config> refound`, and start it again.
    Both commands take the adapter's lease, so the running adapter is stopped first; each runs once and
    exits. The steps and their checks are in [gap-filling](../gap-filling.md).
+
+10. **A reset the core cannot take yet** (`AledgentSettlementEpochUnsupported`, a warning): the core runs
+    code before amendment 0041's generation, so its finalised head stays on the chain before the reset and
+    its withdrawals are refused or born expired. The adapter goes on. Upgrade the core; the adapter reports
+    the reset again within ten minutes and the warning clears. See [gap-filling](../gap-filling.md),
+    "After a reset".
 
 **To pause on purpose:** scale the service to zero (nothing is signed). If the keys are in doubt, the
 contract's admin clears a bound or empties the key set.

@@ -80,6 +80,9 @@ use crate::signer::{Signer, recover};
 /// The fee every transaction pays, in the native asset's smallest unit.
 pub const FEE: u128 = 10;
 
+/// The book a reset names unless a test names another ([`FakeChain::reset_for`]).
+pub const FAKE_BOOK: [u8; 32] = [0xB0; 32];
+
 /// The reason Kreivo gives a contract whose transfer it refused (`F-026` decision 19).
 pub const FUNDS_UNAVAILABLE: &str = "Kreivo(Assets(CannotTransfer))";
 
@@ -179,6 +182,10 @@ struct Deployment {
     epoch: u32,
     /// The block of the last reset.
     reset_at: u64,
+    /// The last reset's base, book and previous anchor (`anchor_epoch()`).
+    reset_base: u64,
+    reset_book: [u8; 32],
+    reset_previous: Option<(u64, [u8; 32])>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -221,6 +228,7 @@ enum Queued {
     Reset {
         instance: u32,
         base: u64,
+        book: [u8; 32],
     },
     Anchor {
         instance: u32,
@@ -942,9 +950,17 @@ impl FakeChain {
     /// next block: a new anchor sequence after `base`, a new chain at position 0 with the zero
     /// digest, `AnchorHeadSet` emitted. What is queued after it lands after it in the block.
     pub fn reset(&self, instance: u32, base: u64) {
-        lock(&self.state)
-            .queued
-            .push(Queued::Reset { instance, base });
+        self.reset_for(instance, base, FAKE_BOOK);
+    }
+
+    /// [`FakeChain::reset`], naming `book` (amendment 0041: the core follows a reset for its own
+    /// book only).
+    pub fn reset_for(&self, instance: u32, base: u64, book: [u8; 32]) {
+        lock(&self.state).queued.push(Queued::Reset {
+            instance,
+            base,
+            book,
+        });
     }
 
     /// An instance of the contract's earlier code, upgraded to this code and not reset (amendment
@@ -1183,7 +1199,11 @@ impl FakeChain {
                         );
                     }
                 }
-                Queued::Reset { instance, base } => {
+                Queued::Reset {
+                    instance,
+                    base,
+                    book,
+                } => {
                     let previous = world.deployments.get(&instance).and_then(|d| {
                         world.anchors.get(&(instance, d.last_anchor)).map(
                             |(commitment, at, seq)| kreivo::LatestAnchor {
@@ -1197,6 +1217,9 @@ impl FakeChain {
                     if let Some(d) = world.deployments.get_mut(&instance) {
                         d.epoch += 1;
                         d.reset_at = number;
+                        d.reset_base = base;
+                        d.reset_book = book;
+                        d.reset_previous = previous.map(|p| (p.number, p.commitment));
                         d.last_anchor = base;
                         d.next_seq = 0;
                         d.pruned_to = 0;
@@ -1208,7 +1231,7 @@ impl FakeChain {
                             epoch: d.epoch,
                             base,
                             from_seq: 0,
-                            book: [0xB0; 32],
+                            book,
                             previous,
                         };
                         world.events.push((
@@ -1655,6 +1678,9 @@ impl Chain for FakeChain {
                 epoch: d.epoch,
                 from_seq: 0,
                 at: d.reset_at,
+                base: d.reset_base,
+                book: d.reset_book,
+                previous: d.reset_previous,
             }))
     }
 

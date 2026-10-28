@@ -81,10 +81,11 @@ use std::sync::Arc;
 use ingress::clock::SharedClock;
 use ingress::settlement::{
     AcknowledgementBody, AnchorAcknowledgementBody, AnchorFactBody, AnchorFailureBody,
-    AttestationBody, CallBody, CheckBody, EventKindBody, GapBody, GapReasonBody, HeadBody,
-    KeyNonceBody, LayerAssetFactsBody, LayerAssetStatusBody, MovementBody, ObservationBody,
-    ObservedFinalityBody, PositionBody, PositionsBody, SettlementCallBody, SigningBody,
-    SigningRecordBody, destination as parse_destination, venue_body,
+    AttestationBody, CallBody, CheckBody, EpochBody, EventKindBody, GapBody, GapReasonBody,
+    HeadBody, KeyNonceBody, LayerAssetFactsBody, LayerAssetStatusBody, MovementBody,
+    ObservationBody, ObservedFinalityBody, PositionBody, PositionsBody, PreviousAnchorBody,
+    SettlementCallBody, SigningBody, SigningRecordBody, destination as parse_destination,
+    venue_body,
 };
 use ingress::wire::{AdapterLegBody, CoordinateBody, OperationKindBody};
 use ledger_core::account::Time;
@@ -327,6 +328,68 @@ pub struct Adapter<C: Chain, S: Store, T: Transport> {
 /// `AledgentSettlementChainMismatch` (`aledgent_observation_chain_mismatches`).
 pub const CHAIN_ALERT: &str = "chain";
 
+/// The alert of a new sequence the core refused to follow (amendment 0041, `REQ-SA-10` as
+/// proposed): `epoch:<instance>:<epoch>`, of kind `epoch`, which pages as
+/// `AledgentSettlementEpochRefused`. Nothing of the new chain is reported while it is open.
+pub const EPOCH_ALERT: &str = "epoch";
+
+/// The alert of a new sequence a core before amendment 0041's generation cannot take:
+/// `epoch-unsupported:<instance>:<epoch>`, of kind `epoch-unsupported`, which does not page. The
+/// adapter goes on as before (the core's head stays where it is, and its guard refuses
+/// withdrawals once it has one); the start is reported again once the core is upgraded.
+pub const EPOCH_UNSUPPORTED_ALERT: &str = "epoch-unsupported";
+
+/// How long a refused start waits before it is reported again (amendment 0041): ten minutes.
+pub const EPOCH_RETRY: Time = 600_000;
+
+/// The core's answer to a new sequence (amendment 0041), as the adapter keeps it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum EpochAnswer {
+    /// Started, or the same sequence recorded already: the core follows it.
+    Confirmed,
+    /// Refused by the core, with its reason (`other_book`, `in_flight`, `earlier_final`,
+    /// `not_later`).
+    Refused(String),
+    /// Not taken: the core cannot take the input (a code before the amendment's generation), with
+    /// its refusal code.
+    Unsupported(String),
+}
+
+impl EpochAnswer {
+    /// The answer a stored verdict records ([`epoch_verdict`]).
+    fn of(verdict: &str) -> EpochAnswer {
+        match verdict {
+            "started" | "recorded" => EpochAnswer::Confirmed,
+            v => match v.strip_prefix("refused:") {
+                Some(code) if code.starts_with("ERR-") => EpochAnswer::Unsupported(code.into()),
+                Some(reason) => EpochAnswer::Refused(reason.into()),
+                None => EpochAnswer::Unsupported(v.into()),
+            },
+        }
+    }
+}
+
+/// The verdict stored for the core's answer to a new sequence: `started`, `recorded`,
+/// `refused:<reason>` for the core's refusal, or `refused:<ERR-code>` for a command the core did
+/// not take.
+fn epoch_verdict(a: &Answer) -> String {
+    match a {
+        Answer::Decided { result, .. } => match &result.epoch {
+            Some(e) if e.outcome == "refused" => {
+                format!("refused:{}", e.refusal.as_deref().unwrap_or("unknown"))
+            }
+            Some(e) => e.outcome.clone(),
+            None => "refused:unanswered".into(),
+        },
+        Answer::Refused(code) => format!("refused:{code}"),
+    }
+}
+
+/// The report row that keeps the core's answer to the latest sequence of `instance`.
+fn epoch_key(instance: u32) -> String {
+    format!("settle/epoch/{instance}")
+}
+
 /// Where a walk back from the finalized head stops (amendment 0040).
 #[derive(Clone, Copy, Debug)]
 enum WalkTo {
@@ -344,6 +407,9 @@ struct Walked {
     entries: Vec<(u64, InboxEntry)>,
     /// The block of the last reset read, if any.
     reset: Option<u64>,
+    /// How many entries a reset read cleared: entries of a chain before it, past the head the
+    /// adapter verified, and so never reported (amendment 0041).
+    dropped: usize,
     /// The positions of events in the earlier code's shape.
     legacy: Vec<u64>,
 }
@@ -365,8 +431,10 @@ enum Stop {
     Unreadable(String),
     /// The events do not lead to the head, read twice.
     Mismatch(String),
-    /// The instance was reset since the accepted head, at this block.
-    Reset(u64),
+    /// The instance was reset since the accepted head, at this block, with this many entries of
+    /// the chain before it past the verified head (amendment 0041: none, or the reset is not
+    /// followed).
+    Reset(u64, usize),
 }
 
 /// The format the adapter signs in on a runtime, and that runtime's identity (`T-027-12`).
@@ -2611,6 +2679,7 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                 match e {
                     ChainEvent::Entry { seq, entry } => out.entries.push((seq, entry)),
                     ChainEvent::Reset => {
+                        out.dropped += out.entries.len() + out.legacy.len();
                         out.entries.clear();
                         out.legacy.clear();
                         out.reset = Some(b.block.number);
@@ -2668,13 +2737,19 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             Some(v) if v.position == head.position && v.digest == head.digest => {
                 // A chain with no entry reads `(0, zeros)` before a reset and after it alike: only
                 // its anchor sequence tells them apart.
-                if v.digest == ZERO_DIGEST {
-                    let epoch = self.chain.chain_epoch(fin, instance).await?;
-                    if epoch.map_or(0, |e| e.epoch) != v.epoch {
-                        return Ok(Err(Stop::Reset(epoch.map_or(fin.number, |e| e.at))));
-                    }
+                let reset = v.digest == ZERO_DIGEST
+                    && self
+                        .chain
+                        .chain_epoch(fin, instance)
+                        .await?
+                        .map_or(0, |e| e.epoch)
+                        != v.epoch;
+                if !reset {
+                    return Ok(Ok(Synced::Idle));
                 }
-                return Ok(Ok(Synced::Idle));
+                // The walk finds the reset, and any entry of the chain before it past the verified
+                // head, which a reset to an empty chain hides (amendment 0041).
+                (v.position, v.digest, WalkTo::After(v.block))
             }
             Some(v) => (v.position, v.digest, WalkTo::After(v.block)),
             // A first start: the chain from its start (the reset that began it, or the
@@ -2697,7 +2772,7 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             };
             if verified.is_some() {
                 if let Some(block) = walked.reset {
-                    return Ok(Err(Stop::Reset(block)));
+                    return Ok(Err(Stop::Reset(block, walked.dropped)));
                 }
             }
             let entries: Vec<(u64, InboxEntry)> = walked
@@ -2740,6 +2815,203 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             .await?
             .iter()
             .any(|a| a.key == key && a.cleared_at.is_none()))
+    }
+
+    // -------------------------------------------------------------------- a new sequence
+
+    /// Report the sequence `e` to the core (amendment 0041, `REQ-SA-10` as proposed), and keep its
+    /// answer under [`epoch_key`]: what it answered last for this sequence, if that is final or not
+    /// yet due again, without asking; otherwise asked, under a client key of its own for each
+    /// attempt ([`EPOCH_RETRY`] apart), so a refusal the core gave is not replayed to the next.
+    async fn report_epoch(&mut self, e: &crate::chain::ChainEpoch) -> StepResult<EpochAnswer> {
+        let instance = self.config.instance;
+        let now = self.now();
+        let key = epoch_key(instance);
+        if let Some(r) = self.store.report(&key).await? {
+            if r.body["epoch"].as_u64() == Some(u64::from(e.epoch)) {
+                if let (Some(v), Some(at)) = (r.verdict.as_deref(), r.answered_at) {
+                    let a = EpochAnswer::of(v);
+                    if a == EpochAnswer::Confirmed || now < at.saturating_add(EPOCH_RETRY) {
+                        return Ok(a);
+                    }
+                }
+            }
+        }
+        let body = EpochBody {
+            epoch: e.epoch,
+            base: e.base,
+            from_seq: e.from_seq,
+            at: e.at,
+            book: hex::encode(e.book),
+            previous: e.previous.map(|(number, commitment)| PreviousAnchorBody {
+                number,
+                commitment: hex::encode(commitment),
+            }),
+        };
+        let attempt = format!("{key}/{}/{}", e.epoch, now / EPOCH_RETRY);
+        let a = self.link.epoch(&attempt, &body).await?;
+        let verdict = epoch_verdict(&a);
+        tracing::info!(epoch = e.epoch, verdict = %verdict, "the new sequence reported to the core");
+        self.store
+            .put_report(&ReportRow {
+                key,
+                kind: "epoch".into(),
+                body: serde_json::to_value(&body).unwrap_or_default(),
+                verdict: Some(verdict.clone()),
+                sent_at: now,
+                answered_at: Some(now),
+            })
+            .await?;
+        let answer = EpochAnswer::of(&verdict);
+        self.epoch_alerts(e, &answer).await?;
+        Ok(answer)
+    }
+
+    /// The alerts of the core's answer to the sequence `e`: cleared once it follows it; `epoch:`
+    /// (pages) for a refusal; `epoch-unsupported:` (does not page) for a core that cannot take it.
+    async fn epoch_alerts(
+        &mut self,
+        e: &crate::chain::ChainEpoch,
+        answer: &EpochAnswer,
+    ) -> StepResult<()> {
+        let instance = self.config.instance;
+        let now = self.now();
+        let refused = format!("{EPOCH_ALERT}:{instance}:{}", e.epoch);
+        let unsupported = format!("{EPOCH_UNSUPPORTED_ALERT}:{instance}:{}", e.epoch);
+        match answer {
+            EpochAnswer::Confirmed => {
+                self.store.clear(&refused, now).await?;
+                self.store.clear(&unsupported, now).await?;
+            }
+            // Another book's reset: the stop until `refound` (`reset:`) is the alert.
+            EpochAnswer::Refused(why) if why == "other_book" => {}
+            EpochAnswer::Refused(why) => {
+                let detail = format!(
+                    "the core refused to follow sequence {} of the instance (reset at block #{}): \
+                     {why}. Nothing of the new chain is reported to it; the start is reported \
+                     again every ten minutes. See ops/runbooks/gap-filling.md, \"After a reset\"",
+                    e.epoch, e.at
+                );
+                if self.store.raise(&refused, &detail, now).await? {
+                    tracing::error!(alert = %refused, detail = %detail, "the core refused a new sequence");
+                }
+            }
+            EpochAnswer::Unsupported(code) => {
+                let detail = format!(
+                    "the core cannot take sequence {} of the instance (reset at block #{}): {code}. \
+                     Its code is before amendment 0041's generation; the start is reported again \
+                     every ten minutes, and taken once the core is upgraded",
+                    e.epoch, e.at
+                );
+                if self.store.raise(&unsupported, &detail, now).await? {
+                    tracing::warn!(alert = %unsupported, detail = %detail, "the core cannot take a new sequence yet");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A reset found live, past the verified head, with nothing of the chain before it left
+    /// unreported (amendment 0041): reported to the core, and once the core holds it, the
+    /// adapter's cursor and heads are reset to the new chain's start, as `refound` does, and the
+    /// next step starts on it. `false` if the core does not follow it: the caller stops as before.
+    async fn follow_reset(&mut self, fin: &BlockRef) -> StepResult<bool> {
+        let instance = self.config.instance;
+        let Some(e) = self.chain.chain_epoch(fin, instance).await? else {
+            return Ok(false);
+        };
+        if self.report_epoch(&e).await? != EpochAnswer::Confirmed {
+            return Ok(false);
+        }
+        self.store.reset_chain(instance, 0).await?;
+        tracing::warn!(
+            instance,
+            epoch = e.epoch,
+            at = e.at,
+            "the instance was reset and the core follows the new chain: the cursor and heads start \
+             on it"
+        );
+        Ok(true)
+    }
+
+    /// While a reset stops the adapter (`reset:`), a start the core refused, or could not take,
+    /// is reported again when due (amendment 0041); once the core holds it, the stop is lifted and
+    /// the adapter starts on the new chain. A stop with no such alert (another book's reset, or
+    /// entries left unreported) waits for the operator, as before.
+    async fn retry_epoch(&mut self, fin: &BlockRef) -> StepResult<()> {
+        let instance = self.config.instance;
+        let prefixes = [
+            format!("{EPOCH_ALERT}:{instance}:"),
+            format!("{EPOCH_UNSUPPORTED_ALERT}:{instance}:"),
+        ];
+        let retried = self.store.alerts().await?.iter().any(|a| {
+            a.cleared_at.is_none() && prefixes.iter().any(|p| a.key.starts_with(p.as_str()))
+        });
+        if !retried {
+            return Ok(());
+        }
+        if self.follow_reset(fin).await? {
+            let now = self.now();
+            self.store.clear(&format!("reset:{instance}"), now).await?;
+        }
+        Ok(())
+    }
+
+    /// Whether the core follows the sequence the verified head is on (amendment 0041): an instance
+    /// never reset has none to follow; otherwise the core's answer, asked once per sequence and
+    /// again every ten minutes while it refuses. While it refuses, nothing of the new chain is
+    /// reported (`false`); a refusal for another book is a reset under the adapter (`reset:`, until
+    /// `refound`). A core that cannot take the input does not stop the adapter. This is how a
+    /// sequence the adapter moved to on its first start reaches the core (test's, on 28 Oct).
+    async fn epoch_followed(&mut self, fin: &BlockRef) -> StepResult<bool> {
+        let instance = self.config.instance;
+        let Some(v) = self.store.verified_head(instance).await? else {
+            return Ok(true);
+        };
+        if v.epoch == 0 {
+            return Ok(true);
+        }
+        // The answer kept, while it holds: no chain read, so an idle sync stays one read.
+        if let Some(r) = self.store.report(&epoch_key(instance)).await? {
+            if r.body["epoch"].as_u64() == Some(u64::from(v.epoch)) {
+                if let (Some(verdict), Some(at)) = (r.verdict.as_deref(), r.answered_at) {
+                    let a = EpochAnswer::of(verdict);
+                    if a == EpochAnswer::Confirmed || self.now() < at.saturating_add(EPOCH_RETRY) {
+                        return Ok(matches!(
+                            a,
+                            EpochAnswer::Confirmed | EpochAnswer::Unsupported(_)
+                        ));
+                    }
+                }
+            }
+        }
+        // A sequence later than the verified head's is the sync's: it finds the reset first.
+        let Some(e) = self
+            .chain
+            .chain_epoch(fin, instance)
+            .await?
+            .filter(|e| e.epoch == v.epoch)
+        else {
+            return Ok(true);
+        };
+        Ok(match self.report_epoch(&e).await? {
+            EpochAnswer::Confirmed | EpochAnswer::Unsupported(_) => true,
+            EpochAnswer::Refused(why) if why == "other_book" => {
+                let now = self.now();
+                let key = format!("reset:{instance}");
+                let detail = format!(
+                    "sequence {} of the instance (reset at block #{}) names another book than the \
+                     one this adapter serves: nothing of its chain is reported. Restart the adapter \
+                     for the re-founded book with `aledgent-settle <config> refound`",
+                    e.epoch, e.at
+                );
+                if self.store.raise(&key, &detail, now).await? {
+                    tracing::error!(alert = %key, detail = %detail, "a reset for another book");
+                }
+                false
+            }
+            EpochAnswer::Refused(_) => false,
+        })
     }
 
     /// A first start on the chain (no head verified yet): where the cursor kept in the store stands
@@ -2806,6 +3078,8 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
         let instance = self.config.instance;
         let now = self.now();
         if self.refounding().await? {
+            // A reset the core may still follow (amendment 0041): reported again when due.
+            self.retry_epoch(fin).await?;
             return Ok(None);
         }
         let Some(head) = self.chain.chain_head(fin, instance).await? else {
@@ -2848,8 +3122,14 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                     self.cleared(from).await?;
                 }
             }
-            Err(Stop::Reset(block)) => {
-                self.stopped(from, &head, Stop::Reset(block)).await?;
+            Err(Stop::Reset(block, dropped)) => {
+                // Amendment 0041: a reset with nothing of the chain before it left unreported is
+                // reported to the core, and followed once the core holds it.
+                if dropped == 0 && self.follow_reset(fin).await? {
+                    return Ok(None);
+                }
+                self.stopped(from, &head, Stop::Reset(block, dropped))
+                    .await?;
                 return Ok(None);
             }
             Err(stop) => self.stopped(from, &head, stop).await?,
@@ -2869,6 +3149,10 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
         let Some(head) = self.verify(fin).await? else {
             return Ok((0, 0, false));
         };
+        // Amendment 0041: nothing of a new chain goes to a core that refused to follow it.
+        if !self.epoch_followed(fin).await? {
+            return Ok((0, 0, false));
+        }
         let verified = self.store.verified_head(instance).await?;
         let accepted = self.store.accepted_head(instance).await?;
         let verified_to = verified.map_or(0, |v| v.position);
@@ -3135,14 +3419,25 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                      gap (`aledgent-settle <config> gap {from} {to}`)"
                 ),
             ),
-            Stop::Reset(block) => (
+            Stop::Reset(block, dropped) => (
                 format!("reset:{instance}"),
-                format!(
-                    "the instance was reset at block #{block} (a new chain from position 0): the \
-                     book this adapter serves was re-founded. Nothing of the new chain is \
-                     reported to it; restart the adapter for the new book with \
-                     `aledgent-settle <config> refound`"
-                ),
+                if dropped > 0 {
+                    format!(
+                        "the instance was reset at block #{block} (a new chain from position 0), \
+                         and {dropped} entries of the chain before it past the verified head were \
+                         never reported: the reset is not followed. Record them as a gap, or, if \
+                         the book was re-founded, restart the adapter for the new book with \
+                         `aledgent-settle <config> refound`"
+                    )
+                } else {
+                    format!(
+                        "the instance was reset at block #{block} (a new chain from position 0), \
+                         and the core does not follow it: the reset names another book, or the core \
+                         refused it or cannot take it yet (the `epoch` alerts say which). Nothing of \
+                         the new chain is reported. If the book was re-founded, restart the adapter \
+                         for the new book with `aledgent-settle <config> refound`"
+                    )
+                },
             ),
         };
         if self.store.raise(&key, &detail, now).await? {
@@ -3246,6 +3541,21 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
         self.store.reset_chain(instance, 0).await?;
         let now = self.now();
         self.store.clear(&format!("reset:{instance}"), now).await?;
+        // The re-founded book's core is asked about the sequence afresh (amendment 0041).
+        if let Some(mut r) = self.store.report(&epoch_key(instance)).await? {
+            r.verdict = None;
+            r.answered_at = None;
+            self.store.put_report(&r).await?;
+        }
+        for a in self.store.alerts().await? {
+            if a.cleared_at.is_none()
+                && (a.key.starts_with(&format!("{EPOCH_ALERT}:{instance}:"))
+                    || a.key
+                        .starts_with(&format!("{EPOCH_UNSUPPORTED_ALERT}:{instance}:")))
+            {
+                self.store.clear(&a.key, now).await?;
+            }
+        }
         tracing::warn!(
             instance,
             "the adapter's cursor and accepted head are reset with the book's re-founding"
