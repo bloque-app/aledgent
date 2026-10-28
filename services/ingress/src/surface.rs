@@ -621,12 +621,6 @@ pub const ROUTES: &[Route] = &[
         "record_gap",
         "Settlement adapter: a range it was forced to skip, visible to operators (F-016).",
     ),
-    command(
-        "/v1/settlement/rescans",
-        CommandRoute::Settlement(SettlementRoute::Rescan),
-        "record_rescan",
-        "Settlement adapter: a re-scan of a range; every difference is an incident (F-016).",
-    ),
     query(
         "/v1/settlement/instructions",
         QueryRoute::Instructions,

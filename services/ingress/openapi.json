@@ -4605,37 +4605,6 @@
         ],
         "type": "object"
       },
-      "RescanBody": {
-        "additionalProperties": false,
-        "description": "A re-scan of `[from, to)` (`REQ-IN-5`, `AC-D2.1`).",
-        "properties": {
-          "from": {
-            "description": "The first position.",
-            "format": "uint64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "layer": {
-            "description": "Every position the layer holds in the range.",
-            "items": {
-              "$ref": "#/components/schemas/LayerEntryBody"
-            },
-            "type": "array"
-          },
-          "to": {
-            "description": "The first position after the range.",
-            "format": "uint64",
-            "minimum": 0,
-            "type": "integer"
-          }
-        },
-        "required": [
-          "from",
-          "to",
-          "layer"
-        ],
-        "type": "object"
-      },
       "RescanResultBody": {
         "additionalProperties": false,
         "description": "What a re-scan found.",
@@ -11890,80 +11859,6 @@
           }
         },
         "summary": "Settlement adapter: the settlement layer's positions at a finalized block, compared at once (F-017)."
-      }
-    },
-    "/v1/settlement/rescans": {
-      "post": {
-        "operationId": "record_rescan",
-        "parameters": [
-          {
-            "description": "The client key (REQ-OP-10). Without one, a key is derived from the request and returned (REQ-OP-11).",
-            "in": "header",
-            "name": "client-key",
-            "required": false,
-            "schema": {
-              "maxLength": 256,
-              "type": "string"
-            }
-          },
-          {
-            "description": "The identity the caller acts for, where different (REQ-PN-1).",
-            "in": "header",
-            "name": "on-behalf-of",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/RescanBody"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CommandReply"
-                }
-              }
-            },
-            "description": "Decided. For a transfer or a reservation, the reply to a repeat once the core has decided (REQ-CS-3)."
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Refusal"
-                }
-              }
-            },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
-          },
-          "5XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Refusal"
-                }
-              }
-            },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
-            "headers": {
-              "Retry-After": {
-                "$ref": "#/components/headers/RetryAfter"
-              }
-            }
-          }
-        },
-        "summary": "Settlement adapter: a re-scan of a range; every difference is an incident (F-016)."
       }
     },
     "/v1/settlement/signings": {

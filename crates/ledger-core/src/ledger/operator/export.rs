@@ -262,6 +262,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             scheduled: None,
             calls_in_input: (0, 0),
             writer: crate::code::authority::Position::default(),
+            generation: (0, false),
         };
         // At least once: a record the store does not take now stays in the outbox.
         let _ = ledger.ship_audit(sink);

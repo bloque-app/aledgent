@@ -23,6 +23,9 @@
 //! - **Gaps and incidents are appended, never removed.** A re-scan's difference (`Missing`,
 //!   `Unknown`) is one incident however many re-scans find it: the store indexes the ones
 //!   recorded by key, so a re-scan that finds nothing new reads that index, never the incidents.
+//!   Re-scans, and the two indexes only they read (`RESCAN_RECORDED`, `INGESTED_AT`), belong to
+//!   the generations before [`super::CHAINED_SETTLEMENT`] (`T-043-06`): their inputs replay as
+//!   they were decided, and a later generation writes neither.
 //! - **The latest attestation of each location** replaces the last (`DEC-20`).
 //! - **One binding of an asset in flight at a time**, and a binding's outcome is decided once: a
 //!   pending binding becomes bound or refused, and never changes after (`REQ-AS-8`).
@@ -91,6 +94,10 @@ pub enum SettlementWrite {
         observation: Observation,
         /// The operation it is evidence for.
         op: Option<OperationId>,
+        /// Whether the record is also indexed by its inbox position (`INGESTED_AT`), for a
+        /// re-scan to read: by the code of a generation before
+        /// [`super::CHAINED_SETTLEMENT`] only, which takes re-scans (`T-043-06`).
+        by_position: bool,
     },
     /// Keep a record from a corroborating source (`REQ-IN-6`). It never writes to the book.
     Corroborate(Observation),
@@ -446,7 +453,11 @@ impl SettlementStore {
                 let before = self.support.set(Some(d.clone()));
                 Ok(SettlementUndo::Declared(before))
             }
-            SettlementWrite::Ingest { observation, op } => {
+            SettlementWrite::Ingest {
+                observation,
+                op,
+                by_position,
+            } => {
                 let c = observation.coordinate;
                 if self.ingested.contains_key(&c) {
                     return Err(SettlementRefusal::Duplicate);
@@ -465,9 +476,11 @@ impl SettlementStore {
                 if let Some(named) = observation.operation_ref {
                     self.naming.entry_or_default(named).insert(c);
                 }
-                self.at_position
-                    .entry_or_default((c.instance, c.seq))
-                    .insert(c.digest);
+                if *by_position {
+                    self.at_position
+                        .entry_or_default((c.instance, c.seq))
+                        .insert(c.digest);
+                }
                 Ok(SettlementUndo::Uningest(c))
             }
             SettlementWrite::Corroborate(o) => {

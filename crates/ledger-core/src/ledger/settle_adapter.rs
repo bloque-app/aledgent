@@ -111,7 +111,9 @@ pub enum AdapterInput {
     },
     /// A range the adapter was forced to skip (`REQ-SA-7`).
     Gap(Gap),
-    /// A re-scan of `[from, to)`: every position the layer holds there, with its digest.
+    /// A re-scan of `[from, to)`: every position the layer holds there, with its digest. Kept so
+    /// a recorded one decodes and replays; refused from
+    /// [`crate::settlement::CHAINED_SETTLEMENT`] on (`T-043-06`, [`Ledger::rescan`]).
     Rescan {
         /// The first position.
         from: u64,
@@ -271,6 +273,10 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                     AdapterReply::Gap
                 }
                 AdapterInput::Rescan { from, to, layer } => {
+                    // Withdrawn from the chained generation on (`T-043-06`, [`Ledger::rescan`]).
+                    if self.chained() {
+                        return Err(Refusal::MalformedCommand);
+                    }
                     if to < from {
                         return Err(Refusal::EvidenceInsufficient);
                     }

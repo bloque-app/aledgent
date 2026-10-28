@@ -598,7 +598,8 @@ pub struct LayerEntryBody {
     pub digest: String,
 }
 
-/// A re-scan of `[from, to)` (`REQ-IN-5`, `AC-D2.1`).
+/// A re-scan of `[from, to)` (`REQ-IN-5`, `AC-D2.1`). Its route, `POST /v1/settlement/rescans`, is
+/// withdrawn (`T-043-06`): the settlement adapter checks completeness against the layer's head.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RescanBody {
@@ -630,7 +631,9 @@ pub enum AdapterCommandBody {
     EvidenceChecked(EvidenceCheckedBody),
     /// `record_observation`: a gap.
     Gap(GapBody),
-    /// `record_observation`: a re-scan.
+    /// `record_observation`: a re-scan. No route submits one any more (`T-043-06`, amendment
+    /// 0040): kept so a received-log entry from before still decodes, and the core decides it as
+    /// the generation that runs it decides (from the chained generation on, refused).
     Rescan(RescanBody),
     /// `ack_instruction` of an anchor (`F-017`).
     AcknowledgeAnchor(AnchorAcknowledgementBody),
@@ -867,8 +870,6 @@ pub enum SettlementRoute {
     Head,
     /// `POST /v1/settlement/gaps`.
     Gap,
-    /// `POST /v1/settlement/rescans`.
-    Rescan,
     /// `POST /v1/settlement/anchor-acknowledgements` (`F-017`).
     AcknowledgeAnchor,
     /// `POST /v1/settlement/anchor-failures` (`F-017`).
@@ -899,7 +900,6 @@ impl SettlementRoute {
             SettlementRoute::Check => "CheckBody",
             SettlementRoute::Head => "HeadBody",
             SettlementRoute::Gap => "GapBody",
-            SettlementRoute::Rescan => "RescanBody",
             SettlementRoute::AcknowledgeAnchor => "AnchorAcknowledgementBody",
             SettlementRoute::AnchorNotExecuted => "AnchorFailureBody",
             SettlementRoute::Positions => "PositionsBody",
@@ -927,7 +927,6 @@ impl SettlementRoute {
             SettlementRoute::Check => adapter(AdapterCommandBody::Check(json(bytes)?)),
             SettlementRoute::Head => adapter(AdapterCommandBody::Head(json(bytes)?)),
             SettlementRoute::Gap => adapter(AdapterCommandBody::Gap(json(bytes)?)),
-            SettlementRoute::Rescan => adapter(AdapterCommandBody::Rescan(json(bytes)?)),
             SettlementRoute::AcknowledgeAnchor => {
                 adapter(AdapterCommandBody::AcknowledgeAnchor(json(bytes)?))
             }

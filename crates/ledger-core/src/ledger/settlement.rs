@@ -889,7 +889,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                 | EventKind::AnchorRefused
                 | EventKind::Bound
                 | EventKind::BindRefused => {
-                    self.commit(&[ingest(&obs, None)])?;
+                    self.commit(&[ingest(&obs, None, !self.chained())])?;
                     Ok(Verdict::Ignored)
                 }
                 EventKind::Deposited => self.deposited(obs, &config, now),
@@ -909,7 +909,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
         refusal: Refusal,
     ) -> Result<Verdict, Refusal> {
         self.commit(&[
-            ingest(obs, op),
+            ingest(obs, op, !self.chained()),
             Write::Settlement(SettlementWrite::Incident(incident)),
         ])?;
         Err(refusal)
@@ -962,7 +962,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             at: now,
         };
         let writes = vec![
-            ingest(&obs, Some(op)),
+            ingest(&obs, Some(op), !self.chained()),
             Write::Settlement(SettlementWrite::Bind {
                 op,
                 coordinate: Some(c),
@@ -1018,7 +1018,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                     )
                     .map_err(stop_refusal)?;
                 let writes = vec![
-                    ingest(&obs, Some(op)),
+                    ingest(&obs, Some(op), !self.chained()),
                     Write::Settlement(SettlementWrite::Bind {
                         op,
                         coordinate: Some(c),
@@ -1030,7 +1030,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             // Before the acknowledgement, or beside the record `Observed` rests on: kept, and
             // applied if that record is orphaned or the acknowledgement arrives.
             State::Reserved | State::Observed => {
-                self.commit(&[ingest(&obs, Some(op))])?;
+                self.commit(&[ingest(&obs, Some(op), !self.chained())])?;
                 Ok(Verdict::Applied(o.shown()))
             }
             // Execution after the expiry passed with no record: non-inclusion can no longer be
@@ -1047,7 +1047,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                     )
                     .map_err(stop_refusal)?;
                 let writes = vec![
-                    ingest(&obs, Some(op)),
+                    ingest(&obs, Some(op), !self.chained()),
                     Write::Settlement(SettlementWrite::Incident(Incident::LateEvidence {
                         op,
                         coordinate: c,
@@ -1059,7 +1059,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             // Anything else waits for no record: kept, and raised.
             _ => {
                 self.commit(&[
-                    ingest(&obs, Some(op)),
+                    ingest(&obs, Some(op), !self.chained()),
                     Write::Settlement(SettlementWrite::Incident(Incident::LateEvidence {
                         op,
                         coordinate: c,
@@ -1078,7 +1078,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
     fn final_failure(&mut self, obs: &Observation, o: &Operation) -> Result<Verdict, Refusal> {
         let op = o.reference();
         self.commit(&[
-            ingest(obs, Some(op)),
+            ingest(obs, Some(op), !self.chained()),
             Write::Settlement(SettlementWrite::Incident(Incident::FinalFailure {
                 op,
                 coordinate: obs.coordinate,
@@ -1854,6 +1854,14 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
     /// the range and the digest the layer holds there. It is compared with what was ingested;
     /// every difference is an incident naming the coordinate, never a silent repair. The report
     /// names every difference found; a difference already recorded is not recorded again.
+    ///
+    /// **Withdrawn from [`crate::settlement::CHAINED_SETTLEMENT`] on** (amendment 0040,
+    /// `T-043-06`): the adapter checks completeness against the head the layer holds, and the
+    /// core trusts that check (ruling a40-q1). An input of that generation or a later one that
+    /// asks for a re-scan is refused, `ERR-MalformedCommand`, and nothing is written. An input of
+    /// an earlier generation is decided as its code decided it, so a book's recorded re-scans
+    /// replay (`NFR-22`, the generation rule): that is all this method is kept for. No surface
+    /// submits one any more (the ingress route is withdrawn).
     pub fn rescan(
         &mut self,
         source: SourceId,
@@ -1871,6 +1879,9 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
         });
         #[allow(clippy::redundant_closure_call)]
         let r: Result<RescanReport, Refusal> = (|| {
+            if self.chained() {
+                return Err(Refusal::MalformedCommand);
+            }
             let Some(config) = self.authoritative(&source) else {
                 return Err(Refusal::NotAuthorised);
             };
@@ -1938,11 +1949,14 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
     }
 }
 
-/// The ingest write of `obs`, associated with `op`.
-fn ingest(obs: &Observation, op: Option<OperationId>) -> Write {
+/// The ingest write of `obs`, associated with `op`. `by_position`: the record is also indexed by
+/// its inbox position, for a re-scan to read: only before [`crate::settlement::CHAINED_SETTLEMENT`]
+/// (`T-043-06`), whose code wrote the index and whose re-scans read it.
+fn ingest(obs: &Observation, op: Option<OperationId>, by_position: bool) -> Write {
     Write::Settlement(SettlementWrite::Ingest {
         observation: obs.clone(),
         op,
+        by_position,
     })
 }
 

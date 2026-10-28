@@ -488,7 +488,6 @@ fn schemas() -> Map<String, Value> {
     add::<crate::settlement::CheckBody>(&mut g);
     add::<crate::settlement::HeadBody>(&mut g);
     add::<crate::settlement::GapBody>(&mut g);
-    add::<crate::settlement::RescanBody>(&mut g);
     add::<crate::settlement::InstructionBody>(&mut g);
     add::<crate::settlement::CallBody>(&mut g);
     add::<crate::settlement::PendingEvidenceBody>(&mut g);
