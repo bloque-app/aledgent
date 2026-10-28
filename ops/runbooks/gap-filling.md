@@ -84,17 +84,27 @@ Incidents and gaps are written to the audit trail (`NFR-6`, `REQ-AT-1`), not to 
 ## After a reset
 
 A reset of the instance starts a new sequence of its record (`anchor_epoch()`: its number, the block, and
-the book it names). With `adapter.report_resets` on (off by default; on only once the core runs a build
-that knows the input, see the settle README), the adapter reports it to the core (amendment 0041): live, when it reads the reset
-past the head it verified and nothing of the chain before it was left unreported; and once per sequence,
+the book it names). With `adapter.report_resets` and ingress's `settlement_epochs` on (both off by default;
+on only once the core runs a build that knows the input, see the settle README), the adapter reports it
+to the core (amendment 0041): live, when it reads the reset past the head it verified and nothing of the
+chain before it was left unreported (it first reports any entry it verified before the reset that the core
+had not taken in); and once per sequence,
 when it moved to the new chain on its own at a first start. The core's answer is kept in the adapter's
-store (`settle/epoch/<instance>`):
+store (`settle/epoch/<instance>`).
+
+**While held, withdrawals are refused.** While `reset:<instance>`, `epoch:` or `epoch-unsupported:` is open,
+the adapter keeps stepping but declares to the core that it does not serve (`aledgent_adapter_serving` stays
+1; the core's status shows it unavailable). New withdrawals, and the settlement comparison, are refused with
+`ERR-SettlementLayerUnavailable`: this is not an adapter outage. It lifts when a start is taken (every
+`epoch` alert of the instance clears) or with `refound`.
+
 
 - **It follows it** (`started`, or `recorded`): the core's finalised head restarts at the reset's block
   and position 0, and the new chain's entries and heads reach it. Nothing to do. Check it with
   `GET /v1/ops/settlement/head`: the sequence and a head on the new chain.
 - **It refused it** (`AledgentSettlementEpochRefused`, `epoch:<instance>:<epoch>`, with the reason). Nothing
-  of the new chain reaches the core, and new withdrawals wait. The adapter reports the start again every
+  of the new chain reaches the core, and new withdrawals are refused (the adapter is held). The alert names
+  the operation in flight or the position of the final record. The adapter reports the start again every
   ten minutes, and goes on by itself once the core takes it. By reason:
   - `in_flight`: a withdrawal instructed before the reset is not decided. It cannot be proven against the
     new chain: resolve it with evidence through `CTR-OPS` (`POST /v1/ops/operations/{reference}/resolve`,
@@ -104,8 +114,12 @@ store (`settle/epoch/<instance>`):
     book cannot follow this reset (amendment 0041's trade-off): it needs a re-founding. Escalate to the
     owner; do not record a gap for it.
   - `not_later`: the reset is not later than one the core holds. Treat it as step 3's second case.
+  - an `ERR-` code (the adapter's authority lost, a limit): the command was refused before the core could
+    decide it. Fix the cause; the next attempt is taken.
 - **Another book's reset** (`reset:<instance>`, the reason `other_book`): the reset names another book, as
-  a re-founding does. Only with the owner's announcement of the book's re-founding:
+  a re-founding does. (A book re-founded after a reset that named the book before it stays here: `refound`
+  cannot help while the chain names the earlier book. Turn `report_resets` off, and escalate.) Only with the
+  owner's announcement of the book's re-founding:
   1. The book has been re-founded and the adapter's configuration points at it. Stop the running adapter.
   2. Run once `aledgent-settle <config> refound`. It takes the lease, resets the instance's cursor and
      accepted head, forgets the core's answer, and exits.
@@ -113,14 +127,21 @@ store (`settle/epoch/<instance>`):
      core, and nothing of the old chain is reported.
   4. Verify that `reset:` closes and `AledgentObservationStopped` clears, then that
      `aledgent_observation_cursor_lag` is about 0 and the next anchor goes final.
-- **Entries left unreported** (`reset:<instance>`, "entries of the chain before it past the verified head
-  were never reported"): the reset is not followed, and the adapter takes no gap while `reset:` is open.
-  Escalate to the owner: the book needs a re-founding (as above), and the operations those entries
-  settled are resolved as in step 6.
+- **Entries never read** (`reset:<instance>`, "entries of the chain before it past the verified head were
+  never read"): the reset is not followed, and the adapter takes no gap while `reset:` is open. Escalate to
+  the owner: the book needs a re-founding (as above), and the operations those entries settled are
+  resolved as in step 6.
+- **Entries verified and not taken in** (`reset:<instance>`, "verified ... were not taken in by the core"):
+  with `report_resets` on the adapter reports them first, every step, and follows the reset once the core
+  takes them; the `report:` alerts say why it does not. With it off, the reset stops as before. `refound`
+  drops them: only with the owner, as for entries never read.
+- **Switch off** (`reset:<instance>`, "`report_resets` is off"): the core was not told. A reset belongs to a
+  re-founding window: follow "Another book's reset" with the owner, or turn the switches on once the core
+  can take the start.
 - **A core that cannot take it yet** (`AledgentSettlementEpochUnsupported`, a warning,
   `epoch-unsupported:<instance>:<epoch>`): the core runs code before amendment 0041's generation. On a first
-  start the adapter goes on, and the core's head stays where it was, so its withdrawals are refused or born
-  expired: upgrade the core (the release order is the core first, then the adapter). On a live reset the
+  start the adapter goes on, and the core's head stays where it was; the adapter is held, so withdrawals are
+  refused: upgrade the core, or open ingress's `settlement_epochs` if it is the route that is closed (the release order is the core first, then the adapter). On a live reset the
   adapter also stops (`reset:`) until the upgrade; it then goes on by itself.
 
 With `report_resets` off, every reset under a running adapter is `reset:<instance>`, as before: follow

@@ -246,6 +246,9 @@ pub enum Refusing {
 pub struct StepReport {
     /// Whether the adapter serves.
     pub serving: bool,
+    /// Whether it is held back by a reset or a start not taken (amendment 0041): it declares to
+    /// the core that it does not serve, and goes on stepping.
+    pub held: bool,
     /// Instructions acknowledged.
     pub acknowledged: usize,
     /// Extrinsics signed and stored.
@@ -281,6 +284,8 @@ pub struct Adapter<C: Chain, S: Store, T: Transport> {
     clock: SharedClock,
     epoch: Option<u64>,
     serving: bool,
+    /// Whether the last heartbeat found the adapter held ([`Adapter::held`]).
+    held: bool,
     refusing: Vec<Refusing>,
     last_declared: Option<(Time, bool)>,
     steps: u64,
@@ -355,13 +360,19 @@ enum EpochAnswer {
     Unsupported(String),
 }
 
+/// The one refusal code read as "the core cannot take the input yet" (amendment 0041).
+const UNSUPPORTED_CODE: &str = "ERR-MalformedCommand";
+
 impl EpochAnswer {
     /// The answer a stored verdict records ([`epoch_verdict`]).
     fn of(verdict: &str) -> EpochAnswer {
         match verdict {
             "started" | "recorded" => EpochAnswer::Confirmed,
             v => match v.strip_prefix("refused:") {
-                Some(code) if code.starts_with("ERR-") => EpochAnswer::Unsupported(code.into()),
+                // What a core before the amendment's generation, or ingress with the route closed,
+                // answers: the input cannot be taken yet. Any other code (the adapter's authority
+                // lost, a limit) is a refusal, and holds the new chain back.
+                Some(UNSUPPORTED_CODE) => EpochAnswer::Unsupported(UNSUPPORTED_CODE.into()),
                 Some(reason) => EpochAnswer::Refused(reason.into()),
                 None => EpochAnswer::Unsupported(v.into()),
             },
@@ -372,6 +383,24 @@ impl EpochAnswer {
 /// The verdict stored for the core's answer to a new sequence: `started`, `recorded`,
 /// `refused:<reason>` for the core's refusal, or `refused:<ERR-code>` for a command the core did
 /// not take.
+/// What the core's refusal names, for the alert: the operation in flight, or the position of the
+/// earlier sequence's final record.
+fn epoch_refusal_detail(a: &Answer) -> String {
+    match a {
+        Answer::Decided { result, .. } => match &result.epoch {
+            Some(e) => match (&e.operation_reference, e.seq) {
+                (Some(op), _) => format!(" (operation {op} is in flight: resolve it first)"),
+                (None, Some(seq)) => format!(
+                    " (the book holds a final record of the chain before at position {seq})"
+                ),
+                _ => String::new(),
+            },
+            None => String::new(),
+        },
+        Answer::Refused(_) => String::new(),
+    }
+}
+
 fn epoch_verdict(a: &Answer) -> String {
     match a {
         Answer::Decided { result, .. } => match &result.epoch {
@@ -386,6 +415,15 @@ fn epoch_verdict(a: &Answer) -> String {
 }
 
 /// The report row that keeps the core's answer to the latest sequence of `instance`.
+/// The prefixes of the instance's epoch alerts: a refused start (`epoch:`) and one the core
+/// cannot take (`epoch-unsupported:`).
+fn epoch_alert_prefixes(instance: u32) -> [String; 2] {
+    [
+        format!("{EPOCH_ALERT}:{instance}:"),
+        format!("{EPOCH_UNSUPPORTED_ALERT}:{instance}:"),
+    ]
+}
+
 fn epoch_key(instance: u32) -> String {
     format!("settle/epoch/{instance}")
 }
@@ -432,9 +470,9 @@ enum Stop {
     /// The events do not lead to the head, read twice.
     Mismatch(String),
     /// The instance was reset since the accepted head, at this block, with this many entries of
-    /// the chain before it past the verified head (amendment 0041: none, or the reset is not
-    /// followed).
-    Reset(u64, usize),
+    /// the chain before it past the verified head, and this many verified that the core has not
+    /// taken in (amendment 0041: none of either, or the reset is not followed).
+    Reset(u64, usize, u64),
 }
 
 /// The format the adapter signs in on a runtime, and that runtime's identity (`T-027-12`).
@@ -594,6 +632,7 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             clock,
             epoch: None,
             serving: false,
+            held: false,
             refusing: Vec::new(),
             last_declared: None,
             steps: 0,
@@ -1111,10 +1150,15 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
         let refusing = self.assertions().await;
         let serving = refusing.is_empty();
         let now = self.now();
+        // Amendment 0041: while a reset or a start not taken holds the adapter back, it keeps
+        // running but declares that it does not serve, so the core refuses withdrawals rather than
+        // build one from a head the adapter stopped sending.
+        let held = self.held().await?;
+        let declared = serving && !held;
         let due = match self.last_declared {
             None => true,
             Some((at, was)) => {
-                was != serving || now.saturating_sub(at) >= self.config.status_lease / 2
+                was != declared || now.saturating_sub(at) >= self.config.status_lease / 2
             }
         };
         if !serving {
@@ -1127,10 +1171,11 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
         }
         self.serving = serving;
         self.refusing = refusing;
+        self.held = held;
         if serving {
             self.attest_assets().await?;
         }
-        let support_changed = serving && self.support() != self.declared_support;
+        let support_changed = declared && self.support() != self.declared_support;
         if !due && !support_changed {
             return Ok(());
         }
@@ -1138,17 +1183,17 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
         // the old declaration and never reach the core.
         self.declarations += 1;
         let key = format!(
-            "settle/declare/{}/{now}/{}/{serving}",
+            "settle/declare/{}/{now}/{}/{declared}",
             self.session, self.declarations
         );
-        let support = serving.then(|| self.support());
+        let support = declared.then(|| self.support());
         let body = serde_json::json!({
-            "serving": serving, "lease": self.config.status_lease, "support": support
+            "serving": declared, "lease": self.config.status_lease, "support": support
         });
         self.report_start(&key, "declare", body).await?;
         let a = self
             .link
-            .declare(&key, serving, self.config.status_lease, support.clone())
+            .declare(&key, declared, self.config.status_lease, support.clone())
             .await?;
         self.report_end(&key, &a).await?;
         if let Answer::Refused(code) = &a {
@@ -1161,7 +1206,7 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                 .await?;
         } else {
             self.store.clear("declare", now).await?;
-            self.last_declared = Some((now, serving));
+            self.last_declared = Some((now, declared));
             if let Some(s) = &support {
                 self.declared_support = s.clone();
             }
@@ -1331,6 +1376,7 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
         self.heartbeat().await?;
         let mut report = StepReport {
             serving: self.serving,
+            held: self.held,
             ..StepReport::default()
         };
         if !self.serving {
@@ -1367,6 +1413,8 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
         report.acknowledged = self.intake(&calls).await?;
         self.track(epoch, &fin).await?;
         let (observed, gaps, head_taken) = self.observe(&fin, &best).await?;
+        self.declare_hold().await?;
+        report.held = self.held;
         report.observed = observed;
         report.gaps = gaps;
         let (signed, parked, broadcast) = self.submit(epoch, &fin, &best, head_taken).await?;
@@ -1414,6 +1462,59 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             bound?;
         }
         Ok(report)
+    }
+
+    /// [`Adapter::observe`]'s step 3: the verified entries `kept` the core has not taken in, in
+    /// order from the cursor; the verified head `v` is accepted once the core has taken in every
+    /// one. How many were reported.
+    async fn report_kept(
+        &mut self,
+        fin: &BlockRef,
+        v: AcceptedHead,
+        accepted: Option<AcceptedHead>,
+        kept: &BTreeMap<u64, Vec<u8>>,
+    ) -> StepResult<usize> {
+        let instance = self.config.instance;
+        let now = self.now();
+        let mut reported = 0;
+        let cursor = self.store.cursor(instance).await?;
+        let mut all = true;
+        for (seq, raw) in kept.range(cursor..) {
+            let seq = *seq;
+            let e = self.chain.entry(raw.clone())?;
+            self.store
+                .insert_observation(&self.observation_row(seq, &e, true))
+                .await?;
+            self.fault(CrashPoint::AfterObserve)?;
+            let body = self.observation_body(seq, &e, true);
+            let a = self.report_observation(&body).await?;
+            if !a.ingested() {
+                // The core did not take it in: do not pass it.
+                self.store
+                    .raise(
+                        &format!("report:{instance}:{seq}"),
+                        &format!("the core refused an observation: {}", a.verdict()),
+                        now,
+                    )
+                    .await?;
+                all = false;
+                break;
+            }
+            self.store
+                .clear(&format!("report:{instance}:{seq}"), now)
+                .await?;
+            self.report_check(&body.coordinate, fin.number, true)
+                .await?;
+            reported += 1;
+            self.note_record(&e.event).await?;
+            self.fault(CrashPoint::AfterVerdict)?;
+            self.store.advance_cursor(instance, seq + 1).await?;
+        }
+        let moved = accepted.is_none_or(|a| (a.position, a.digest) != (v.position, v.digest));
+        if all && moved && self.store.cursor(instance).await? >= v.position {
+            self.store.accept_head(instance, &v).await?;
+        }
+        Ok(reported)
     }
 
     // ------------------------------------------------------------------------------ anchor
@@ -2733,20 +2834,22 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
         verified: Option<AcceptedHead>,
     ) -> StepResult<Result<Synced, Stop>> {
         let instance = self.config.instance;
+        // The block of a reset the anchor sequence shows on an empty chain, which the walk must find.
+        let mut expected_reset = None;
         let (from, digest, to) = match verified {
             Some(v) if v.position == head.position && v.digest == head.digest => {
                 // A chain with no entry reads `(0, zeros)` before a reset and after it alike: only
                 // its anchor sequence tells them apart.
-                let reset = v.digest == ZERO_DIGEST
-                    && self
-                        .chain
-                        .chain_epoch(fin, instance)
-                        .await?
-                        .map_or(0, |e| e.epoch)
-                        != v.epoch;
-                if !reset {
+                let moved = if v.digest == ZERO_DIGEST {
+                    let e = self.chain.chain_epoch(fin, instance).await?;
+                    (e.map_or(0, |e| e.epoch) != v.epoch).then(|| e.map_or(v.block, |e| e.at))
+                } else {
+                    None
+                };
+                let Some(at) = moved else {
                     return Ok(Ok(Synced::Idle));
-                }
+                };
+                expected_reset = Some(at);
                 // The walk finds the reset, and any entry of the chain before it past the verified
                 // head, which a reset to an empty chain hides (amendment 0041).
                 (v.position, v.digest, WalkTo::After(v.block))
@@ -2772,7 +2875,12 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             };
             if verified.is_some() {
                 if let Some(block) = walked.reset {
-                    return Ok(Err(Stop::Reset(block, walked.dropped)));
+                    return Ok(Err(Stop::Reset(block, walked.dropped, 0)));
+                }
+                // The anchor sequence moved on an empty chain, and the walk read no reset: a
+                // reader that missed the event. Stopped as a reset, as before amendment 0041.
+                if let Some(at) = expected_reset {
+                    return Ok(Err(Stop::Reset(at, 0, 0)));
                 }
             }
             let entries: Vec<(u64, InboxEntry)> = walked
@@ -2802,6 +2910,29 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             }
         }
         Ok(Err(Stop::Mismatch(last)))
+    }
+
+    /// Whether the adapter is held back (amendment 0041): a reset under it (`reset:<instance>`), or
+    /// a start the core refused (`epoch:`) or cannot take (`epoch-unsupported:`). It declares that
+    /// it does not serve while held.
+    async fn held(&self) -> StepResult<bool> {
+        let instance = self.config.instance;
+        let reset = format!("reset:{instance}");
+        let prefixes = epoch_alert_prefixes(instance);
+        Ok(self.store.alerts().await?.iter().any(|a| {
+            a.cleared_at.is_none()
+                && (a.key == reset || prefixes.iter().any(|p| a.key.starts_with(p.as_str())))
+        }))
+    }
+
+    /// Declare again at once when the step changed whether the adapter is held ([`Adapter::held`]):
+    /// a withdrawal accepted between a reset found and the next step's declaration would be built
+    /// from a stale head.
+    async fn declare_hold(&mut self) -> StepResult<()> {
+        if self.held().await? != self.held {
+            self.heartbeat().await?;
+        }
+        Ok(())
     }
 
     /// Whether a reset of the instance under this adapter is open (`reset:<instance>`): its book
@@ -2863,7 +2994,8 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             })
             .await?;
         let answer = EpochAnswer::of(&verdict);
-        self.epoch_alerts(e, &answer).await?;
+        self.epoch_alerts(e, &answer, &epoch_refusal_detail(&a))
+            .await?;
         Ok(answer)
     }
 
@@ -2873,23 +3005,34 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
         &mut self,
         e: &crate::chain::ChainEpoch,
         answer: &EpochAnswer,
+        named: &str,
     ) -> StepResult<()> {
         let instance = self.config.instance;
         let now = self.now();
         let refused = format!("{EPOCH_ALERT}:{instance}:{}", e.epoch);
         let unsupported = format!("{EPOCH_UNSUPPORTED_ALERT}:{instance}:{}", e.epoch);
         match answer {
+            // Every epoch alert of the instance, an earlier sequence's included: the core follows
+            // the latest.
             EpochAnswer::Confirmed => {
-                self.store.clear(&refused, now).await?;
-                self.store.clear(&unsupported, now).await?;
+                let prefixes = epoch_alert_prefixes(instance);
+                for a in self.store.alerts().await? {
+                    if a.cleared_at.is_none()
+                        && prefixes.iter().any(|p| a.key.starts_with(p.as_str()))
+                    {
+                        self.store.clear(&a.key, now).await?;
+                    }
+                }
             }
             // Another book's reset: the stop until `refound` (`reset:`) is the alert.
             EpochAnswer::Refused(why) if why == "other_book" => {}
             EpochAnswer::Refused(why) => {
                 let detail = format!(
                     "the core refused to follow sequence {} of the instance (reset at block #{}): \
-                     {why}. Nothing of the new chain is reported to it; the start is reported \
-                     again every ten minutes. See ops/runbooks/gap-filling.md, \"After a reset\"",
+                     {why}{named}. Nothing of the new chain is reported to it, and the adapter \
+                     declares itself not serving, so new withdrawals are refused; the start is \
+                     reported again every ten minutes. See ops/runbooks/gap-filling.md, \"After a \
+                     reset\"",
                     e.epoch, e.at
                 );
                 if self.store.raise(&refused, &detail, now).await? {
@@ -2899,8 +3042,10 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             EpochAnswer::Unsupported(code) => {
                 let detail = format!(
                     "the core cannot take sequence {} of the instance (reset at block #{}): {code}. \
-                     Its code is before amendment 0041's generation; the start is reported again \
-                     every ten minutes, and taken once the core is upgraded",
+                     Its code is before amendment 0041's generation, or ingress's \
+                     `settlement_epochs` is off; the adapter declares itself not serving, so new \
+                     withdrawals are refused. The start is reported again every ten minutes, and \
+                     taken once the core can take it",
                     e.epoch, e.at
                 );
                 if self.store.raise(&unsupported, &detail, now).await? {
@@ -2909,6 +3054,33 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             }
         }
         Ok(())
+    }
+
+    /// How many verified positions the core has not taken in: `[cursor, verified)`.
+    async fn unreported(&self) -> StepResult<u64> {
+        let instance = self.config.instance;
+        let Some(v) = self.store.verified_head(instance).await? else {
+            return Ok(0);
+        };
+        let cursor = self.store.cursor(instance).await?;
+        Ok(v.position.saturating_sub(cursor))
+    }
+
+    /// Report the verified entries the core has not taken in, from the cursor ([`Adapter::observe`]'s
+    /// step 3, alone): before a reset is followed, so none is dropped with the chain before it.
+    async fn report_verified(&mut self, fin: &BlockRef) -> StepResult<usize> {
+        let instance = self.config.instance;
+        let Some(v) = self.store.verified_head(instance).await? else {
+            return Ok(0);
+        };
+        let accepted = self.store.accepted_head(instance).await?;
+        let kept: BTreeMap<u64, Vec<u8>> = self
+            .store
+            .chain_entries(instance, accepted.map_or(0, |a| a.position), v.position)
+            .await?
+            .into_iter()
+            .collect();
+        self.report_kept(fin, v, accepted, &kept).await
     }
 
     /// A reset found live, past the verified head, with nothing of the chain before it left
@@ -2920,6 +3092,16 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
         let Some(e) = self.chain.chain_epoch(fin, instance).await? else {
             return Ok(false);
         };
+        // The entries verified before the reset that the core has not taken in (a core outage, a
+        // refused observation, a crash between the two): reported first, or the reset is not
+        // followed. `reset_chain` would drop them.
+        if self.unreported().await? > 0 {
+            let fin = *fin;
+            self.report_verified(&fin).await?;
+            if self.unreported().await? > 0 {
+                return Ok(false);
+            }
+        }
         if self.report_epoch(&e).await? != EpochAnswer::Confirmed {
             return Ok(false);
         }
@@ -2940,14 +3122,14 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
     /// entries left unreported) waits for the operator, as before.
     async fn retry_epoch(&mut self, fin: &BlockRef) -> StepResult<()> {
         let instance = self.config.instance;
-        let prefixes = [
-            format!("{EPOCH_ALERT}:{instance}:"),
-            format!("{EPOCH_UNSUPPORTED_ALERT}:{instance}:"),
-        ];
-        let retried = self.store.alerts().await?.iter().any(|a| {
+        let prefixes = epoch_alert_prefixes(instance);
+        let refused = self.store.alerts().await?.iter().any(|a| {
             a.cleared_at.is_none() && prefixes.iter().any(|p| a.key.starts_with(p.as_str()))
         });
-        if !retried {
+        // A reset not followed because verified entries were not taken in yet: tried again, as
+        // they are reported first.
+        let unreported = self.unreported().await? > 0;
+        if !refused && !unreported {
             return Ok(());
         }
         if self.follow_reset(fin).await? {
@@ -3124,13 +3306,14 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                     self.cleared(from).await?;
                 }
             }
-            Err(Stop::Reset(block, dropped)) => {
+            Err(Stop::Reset(block, dropped, _)) => {
                 // Amendment 0041: a reset with nothing of the chain before it left unreported is
                 // reported to the core, and followed once the core holds it.
                 if dropped == 0 && self.config.report_resets && self.follow_reset(fin).await? {
                     return Ok(None);
                 }
-                self.stopped(from, &head, Stop::Reset(block, dropped))
+                let unreported = self.unreported().await?;
+                self.stopped(from, &head, Stop::Reset(block, dropped, unreported))
                     .await?;
                 return Ok(None);
             }
@@ -3229,46 +3412,10 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
         }
         // 3. The verified entries the core has not taken in, from the store, in order from the
         // cursor; the verified head is accepted once the core has taken in every one.
-        let mut reported = 0;
-        if let Some(v) = verified {
-            let cursor = self.store.cursor(instance).await?;
-            let mut all = true;
-            for (seq, raw) in kept.range(cursor..) {
-                let seq = *seq;
-                let e = self.chain.entry(raw.clone())?;
-                self.store
-                    .insert_observation(&self.observation_row(seq, &e, true))
-                    .await?;
-                self.fault(CrashPoint::AfterObserve)?;
-                let body = self.observation_body(seq, &e, true);
-                let a = self.report_observation(&body).await?;
-                if !a.ingested() {
-                    // The core did not take it in: do not pass it.
-                    self.store
-                        .raise(
-                            &format!("report:{instance}:{seq}"),
-                            &format!("the core refused an observation: {}", a.verdict()),
-                            now,
-                        )
-                        .await?;
-                    all = false;
-                    break;
-                }
-                self.store
-                    .clear(&format!("report:{instance}:{seq}"), now)
-                    .await?;
-                self.report_check(&body.coordinate, fin.number, true)
-                    .await?;
-                reported += 1;
-                self.note_record(&e.event).await?;
-                self.fault(CrashPoint::AfterVerdict)?;
-                self.store.advance_cursor(instance, seq + 1).await?;
-            }
-            let moved = accepted.is_none_or(|a| (a.position, a.digest) != (v.position, v.digest));
-            if all && moved && self.store.cursor(instance).await? >= v.position {
-                self.store.accept_head(instance, &v).await?;
-            }
-        }
+        let mut reported = match verified {
+            Some(v) => self.report_kept(fin, v, accepted, &kept).await?,
+            None => 0,
+        };
         // 4. The adapter's own extrinsics seen above the finality point: provisional. Read only
         // while one of its withdrawals is in flight, so an idle sync reads the head alone.
         if best.number > fin.number {
@@ -3421,15 +3568,32 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                      gap (`aledgent-settle <config> gap {from} {to}`)"
                 ),
             ),
-            Stop::Reset(block, dropped) => (
+            Stop::Reset(block, dropped, unreported) => (
                 format!("reset:{instance}"),
                 if dropped > 0 {
                     format!(
                         "the instance was reset at block #{block} (a new chain from position 0), \
                          and {dropped} entries of the chain before it past the verified head were \
-                         never reported: the reset is not followed. Record them as a gap, or, if \
-                         the book was re-founded, restart the adapter for the new book with \
+                         never read: the reset is not followed, and nothing more is reported. The \
+                         book cannot take them from this chain any more. If the book was \
+                         re-founded, restart the adapter for the new book with \
                          `aledgent-settle <config> refound`"
+                    )
+                } else if unreported > 0 {
+                    format!(
+                        "the instance was reset at block #{block} (a new chain from position 0), \
+                         and {unreported} entries of the chain before it, verified below position \
+                         {from}, were not taken in by the core: the reset is not followed. With \
+                         `report_resets` on they are reported first, every step, and the reset \
+                         followed once the core takes them (the `report:` alerts say why it does \
+                         not). `refound` drops them"
+                    )
+                } else if !self.config.report_resets {
+                    format!(
+                        "the instance was reset at block #{block} (a new chain from position 0). \
+                         `report_resets` is off, so the core was not told; nothing of the new \
+                         chain is reported. If the book was re-founded, restart the adapter for \
+                         the new book with `aledgent-settle <config> refound`"
                     )
                 } else {
                     format!(
@@ -4316,5 +4480,29 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EpochAnswer;
+
+    /// Review of #97, S3: only `ERR-MalformedCommand` (a core before the amendment's generation,
+    /// or ingress's route closed) reads as "cannot take the input yet"; any other refusal code is
+    /// a refusal, which pages and holds the new chain back.
+    #[test]
+    fn t043_15_only_a_malformed_command_is_unsupported() {
+        assert_eq!(EpochAnswer::of("started"), EpochAnswer::Confirmed);
+        assert_eq!(EpochAnswer::of("recorded"), EpochAnswer::Confirmed);
+        assert_eq!(
+            EpochAnswer::of("refused:ERR-MalformedCommand"),
+            EpochAnswer::Unsupported("ERR-MalformedCommand".into())
+        );
+        for code in ["ERR-NotAuthorised", "ERR-RateLimited", "in_flight"] {
+            assert_eq!(
+                EpochAnswer::of(&format!("refused:{code}")),
+                EpochAnswer::Refused(code.into())
+            );
+        }
     }
 }

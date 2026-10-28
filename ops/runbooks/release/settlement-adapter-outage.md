@@ -17,6 +17,8 @@ settlement-operations.
 - **Internal transfers, reservations and queries carry on.** They never touch the settlement layer
   (guardrail 9).
 - **New external legs are refused** with `ERR-SettlementLayerUnavailable` once its status lease lapses.
+  The same error while the adapter runs and serves is its hold after a reset (amendment 0041): see
+  [gap-filling](../gap-filling.md), "After a reset".
 - **In-flight batches** land or expire on chain, and are decided when the adapter returns.
 - **Nothing is released on a timer** (`REQ-OP-9`). An operation past its deadline goes to `Needs-Review`.
 
@@ -119,7 +121,8 @@ settlement-operations.
    - `reset:<instance>`: governance reset the layer's instance under it, and the core does not follow the
      new chain (amendment 0041): the reset names another book, entries of the chain before it were left
      unreported, or the core refused it or cannot take it yet (an `epoch` alert says which). Nothing
-     reaches the book it serves. A refusal the core may still lift is reported again every ten minutes,
+     reaches the book it serves, and the adapter declares that it does not serve, so new withdrawals are
+     refused. A refusal the core may still lift is reported again every ten minutes,
      and the adapter goes on by itself once it is taken. For another book's reset: once the book is
      re-founded and the configuration points at it, stop the adapter, run once
      `aledgent-settle <config> refound`, and start it again.
@@ -127,8 +130,8 @@ settlement-operations.
    exits. The steps and their checks are in [gap-filling](../gap-filling.md).
 
 10. **A reset the core cannot take yet** (`AledgentSettlementEpochUnsupported`, a warning): the core runs
-    code before amendment 0041's generation, so its finalised head stays on the chain before the reset and
-    its withdrawals are refused or born expired. The adapter goes on. Upgrade the core; the adapter reports
+    code before amendment 0041's generation (or ingress's `settlement_epochs` is off), so its finalised head
+    stays on the chain before the reset. The adapter goes on stepping, held: withdrawals are refused. Upgrade the core; the adapter reports
     the reset again within ten minutes and the warning clears. See [gap-filling](../gap-filling.md),
     "After a reset".
 

@@ -268,6 +268,8 @@ struct State {
     keep_events: u64,
     /// Whether the history endpoint serves.
     history: bool,
+    /// Whether reads leave out `AnchorHeadSet` (a reader that misses it).
+    hide_resets: bool,
     /// The reader's faults ([`FakeChain::fault_reads`]).
     faults: Vec<(u64, ReaderFault, u32)>,
     /// Whether dry runs are answered with `Unavailable`.
@@ -693,6 +695,7 @@ impl FakeChain {
                 reads: Reads::default(),
                 keep_events: 256,
                 history: false,
+                hide_resets: false,
                 faults: Vec::new(),
                 no_dry_runs: false,
                 extrinsic_limit: kreivo::NORMAL_EXTRINSIC_MAX_0_16_9,
@@ -980,6 +983,12 @@ impl FakeChain {
     /// default 256, as a full node keeps them).
     pub fn keep_events(&self, blocks: u64) {
         lock(&self.state).keep_events = blocks;
+    }
+
+    /// Leave `AnchorHeadSet` out of every events read from now on: a reader that misses it, while
+    /// storage shows the reset (the anchor sequence moved).
+    pub fn hide_resets(&self, hidden: bool) {
+        lock(&self.state).hide_resets = hidden;
     }
 
     /// Turn the history endpoint on or off: a node that serves every block's events.
@@ -1521,7 +1530,9 @@ impl FakeChain {
         let mut out = Vec::new();
         for ev in events {
             let ChainEvent::Entry { seq, mut entry } = ev else {
-                out.push(ev);
+                if !(s.hide_resets && matches!(ev, ChainEvent::Reset)) {
+                    out.push(ev);
+                }
                 continue;
             };
             match &mut entry.event {

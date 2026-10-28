@@ -699,6 +699,19 @@ mod tests {
         m.insert("endpoint".into(), "ws://127.0.0.1:9944".into());
     }
 
+    /// Amendment 0041 (`T-043-15`): reporting a reset is off unless the file turns it on. The
+    /// README's example does not name it.
+    #[test]
+    fn t043_15_report_resets_is_off_by_default() {
+        let v = readme_example();
+        assert!(v["adapter"].get("report_resets").is_none());
+        assert!(!with(|_| {}).adapter.report_resets);
+        let on = with(|m| {
+            m.get_mut("adapter").unwrap()["report_resets"] = true.into();
+        });
+        assert!(on.adapter.report_resets);
+    }
+
     #[test]
     fn nfr_15_wake_poll_defaults_to_a_quarter_second_and_zero_turns_it_off() {
         assert_eq!(with(|_| {}).wake_poll, 250);

@@ -7,6 +7,8 @@
 //! it; a refusal or a core that cannot take the input yet is reported again every ten minutes.
 
 use ledger_core::settlement::{FinalisedHead, SETTLEMENT_EPOCHS};
+use serde_json::Value;
+use settle::CrashPoint;
 use settle::adapter::{EPOCH_ALERT, EPOCH_RETRY, EPOCH_UNSUPPORTED_ALERT};
 use settle::chain::Chain;
 use settle::store::Store;
@@ -14,10 +16,15 @@ use settle::testkit::{INSTANCE, Kit, KitOptions, chain_usd};
 
 /// A kit whose book is named, its core at `generation`, after its first step.
 async fn kit(generation: u64) -> Kit {
+    kit_with(generation, true).await
+}
+
+/// [`kit`], with `report_resets` as given.
+async fn kit_with(generation: u64, report_resets: bool) -> Kit {
     let mut k = Kit::start_with(KitOptions {
         named_book: true,
         core_generation: generation,
-        report_resets: true,
+        report_resets,
         ..KitOptions::default()
     })
     .await;
@@ -73,6 +80,29 @@ fn core_amounts(k: &Kit) -> Vec<u64> {
             .collect()
     })
     .unwrap()
+}
+
+/// A withdrawal of 250 by a new party, through ingress: its status and reply, and if it was taken,
+/// the reply to its `submit_outbound` and the expiry of the instruction built.
+async fn try_withdrawal(k: &Kit, label: &str) -> (u16, Value, Option<u64>) {
+    let alice = k.d.party(&format!("alice-{label}"), 10_000).await;
+    let (s, v) = k.withdraw(&alice, 250, &format!("w-{label}")).await;
+    if s != 200 {
+        return (s, v, None);
+    }
+    let reference = v["operation_reference"].as_str().unwrap().to_owned();
+    let (s, v) = k.submit(&alice, &reference).await;
+    let expiry = k
+        .core_settlement(|st| st.pending().map(|i| i.expiry()).max())
+        .flatten();
+    (s, v, expiry)
+}
+
+/// The adapter's last declaration to the core: whether it serves, now.
+fn declared_available(k: &Kit) -> bool {
+    k.core_settlement(|s| s.status().copied())
+        .flatten()
+        .is_some_and(|st| st.available(k.now()))
 }
 
 /// The block of the instance's last reset.
@@ -193,6 +223,11 @@ async fn t043_15_a_core_upgraded_later_follows_the_reset() {
     assert_eq!(open(&k, EPOCH_UNSUPPORTED_ALERT).await, 1);
     assert_eq!(open(&k, &format!("{EPOCH_ALERT}:")).await, 0);
     assert_eq!(open(&k, &format!("reset:{INSTANCE}")).await, 1);
+    // Held: the adapter declares that it does not serve, so a withdrawal is refused rather than
+    // built from the chain before's head.
+    assert!(!declared_available(&k));
+    let (s, v, _) = try_withdrawal(&k, "held").await;
+    assert_eq!(v["error"], "ERR-SettlementLayerUnavailable", "{s} {v}");
     // The core's in-place upgrade, then the next attempt.
     k.d.core
         .checkpoint(|l, _| l.set_generation(SETTLEMENT_EPOCHS, false))
@@ -204,8 +239,21 @@ async fn t043_15_a_core_upgraded_later_follows_the_reset() {
     assert_eq!(open(&k, "reset:").await, 0);
     assert_eq!(open(&k, EPOCH_UNSUPPORTED_ALERT).await, 0);
     k.chain.advance(1);
-    assert_eq!(k.step().await.unwrap().observed, 1);
+    let step = k.step().await.unwrap();
+    assert_eq!(step.observed, 1);
     assert_eq!(core_amounts(&k), vec![3]);
+    // The hold is lifted: declared serving again, and a withdrawal is built from the new chain's
+    // head, its expiry above the finalised height.
+    assert!(!step.held);
+    assert!(declared_available(&k));
+    let (s, v, expiry) = try_withdrawal(&k, "lifted").await;
+    assert_eq!(s, 200, "{v}");
+    let fin = k.chain.finalized().await.unwrap();
+    assert!(
+        expiry.is_some_and(|e| e > fin.number),
+        "{expiry:?} at {}",
+        fin.number
+    );
 }
 
 /// `report_resets` off (the default, until the core runs a build that knows the input): nothing
@@ -332,4 +380,130 @@ async fn t043_15_a_first_start_reports_the_sequence_once() {
         reads.epochs,
         "no epoch read once confirmed"
     );
+}
+
+/// Review of #97, M1: entries the adapter verified before a reset but the core had not taken in
+/// (a crash between the two) reach the core before the reset is followed; `reset_chain` would
+/// drop them. Here the deposit, once final in the core at position 0, makes the start refused
+/// (`earlier_final`, decision 3): the adapter stops with `epoch:` and `reset:`, held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t043_15_verified_entries_reach_the_core_before_a_reset() {
+    let mut k = kit(SETTLEMENT_EPOCHS).await;
+    k.chain.advance(1);
+    k.step().await.unwrap();
+    deposits(&k, 1, 4);
+    k.chain.finalize_all();
+    k.adapter.crash_at(CrashPoint::AfterObserve);
+    assert!(k.step().await.is_err());
+    let v = k.store.verified_head(INSTANCE).await.unwrap().unwrap();
+    assert!(
+        k.store.cursor(INSTANCE).await.unwrap() < v.position,
+        "verified and not reported"
+    );
+    k.chain.reset_for(INSTANCE, 0, k.book());
+    k.chain.advance(1);
+    k.restart();
+    k.step().await.unwrap();
+    k.chain.advance(1);
+    let step = k.step().await.unwrap();
+    assert_eq!(
+        core_amounts(&k),
+        vec![4],
+        "the verified entry reached the core"
+    );
+    assert_eq!(kept(&k).await.as_deref(), Some("refused:earlier_final"));
+    assert_eq!(open(&k, &format!("{EPOCH_ALERT}:{INSTANCE}:1")).await, 1);
+    assert_eq!(open(&k, &format!("reset:{INSTANCE}")).await, 1);
+    assert!(step.held);
+    let (_, v, _) = try_withdrawal(&k, "m1").await;
+    assert_eq!(v["error"], "ERR-SettlementLayerUnavailable");
+}
+
+/// Review of #99, M1 (the default configuration, prod's planned reset): with `report_resets` off a
+/// live reset stops the adapter (`reset:`) and it sends no head of the new chain; it declares that
+/// it does not serve, so a withdrawal through ingress is refused rather than built from the
+/// chain before's head and born expired.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t043_15_a_live_reset_with_the_switch_off_holds_withdrawals() {
+    let mut k = kit_with(SETTLEMENT_EPOCHS, false).await;
+    deposits(&k, 1, 1);
+    k.chain.finalize_all();
+    k.step().await.unwrap();
+    k.chain.reset_for(INSTANCE, 0, k.book());
+    k.chain.advance(3);
+    k.step().await.unwrap();
+    k.chain.advance(30);
+    let step = k.step().await.unwrap();
+    assert_eq!(open(&k, &format!("reset:{INSTANCE}")).await, 1);
+    assert!(step.serving && step.held);
+    assert!(!declared_available(&k));
+    let (s, v, expiry) = try_withdrawal(&k, "off").await;
+    assert_eq!(v["error"], "ERR-SettlementLayerUnavailable", "{s} {v}");
+    assert_eq!(expiry, None, "no instruction built");
+}
+
+/// Review of #99, M1: a start the core refused (`earlier_final`) holds the adapter: no head of the
+/// new chain is sent, and it declares that it does not serve, so a withdrawal is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t043_15_a_refused_start_holds_withdrawals() {
+    let mut k = kit(SETTLEMENT_EPOCHS).await;
+    deposits(&k, 2, 1);
+    k.chain.finalize_all();
+    k.step().await.unwrap();
+    k.chain.reset_for(INSTANCE, 0, k.book());
+    k.chain.advance(2);
+    k.step().await.unwrap();
+    k.chain.advance(30);
+    let step = k.step().await.unwrap();
+    assert_eq!(open(&k, &format!("{EPOCH_ALERT}:{INSTANCE}:1")).await, 1);
+    assert!(step.held);
+    assert!(!declared_available(&k));
+    let (s, v, expiry) = try_withdrawal(&k, "refused").await;
+    assert_eq!(v["error"], "ERR-SettlementLayerUnavailable", "{s} {v}");
+    assert_eq!(expiry, None);
+}
+
+/// Review of #97, S1: the anchor sequence moved on an empty chain and the reader missed the
+/// `AnchorHeadSet` event. The sync stops as a reset, as before amendment 0041, rather than go on
+/// idle with the old sequence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t043_15_a_reset_the_reader_missed_still_stops() {
+    let mut k = kit_with(SETTLEMENT_EPOCHS, false).await;
+    k.chain.advance(1);
+    k.step().await.unwrap();
+    k.chain.hide_resets(true);
+    k.chain.reset_for(INSTANCE, 0, k.book());
+    k.chain.advance(1);
+    k.step().await.unwrap();
+    assert_eq!(open(&k, &format!("reset:{INSTANCE}")).await, 1);
+}
+
+/// Review of #97, S2: once a start is taken, every epoch alert of the instance is cleared, an
+/// earlier sequence's page included (the core follows the latest). (S3, which codes page, is
+/// `adapter::tests::t043_15_only_a_malformed_command_is_unsupported`.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t043_15_a_taken_start_clears_every_epoch_alert() {
+    let mut k = kit(SETTLEMENT_EPOCHS).await;
+    // A stale page of an earlier sequence, and a warning.
+    let now = k.now();
+    k.store
+        .raise(&format!("{EPOCH_ALERT}:{INSTANCE}:7"), "old", now)
+        .await
+        .unwrap();
+    k.store
+        .raise(
+            &format!("{EPOCH_UNSUPPORTED_ALERT}:{INSTANCE}:6"),
+            "old",
+            now,
+        )
+        .await
+        .unwrap();
+    k.chain.advance(1);
+    k.step().await.unwrap();
+    k.chain.reset_for(INSTANCE, 0, k.book());
+    k.chain.advance(1);
+    k.step().await.unwrap();
+    assert_eq!(kept(&k).await.as_deref(), Some("started"));
+    assert_eq!(open(&k, &format!("{EPOCH_ALERT}:")).await, 0);
+    assert_eq!(open(&k, EPOCH_UNSUPPORTED_ALERT).await, 0);
 }
