@@ -475,9 +475,17 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
     /// `ERR-SettlementLayerUnavailable` while the adapter's last declaration says it refuses to
     /// serve, or once that declaration is stale (`REQ-SA-2`, `AC-E4.2`). Nothing is gated before
     /// its first declaration (see the module documentation).
+    ///
+    /// From [`crate::settlement::SETTLEMENT_EPOCHS`] on, also while the adapter has reported a head
+    /// at a later block than the book's, with a lower position, that the book did not take
+    /// (amendment 0041's guard, `REQ-SL-4` as proposed, `T-043-17`): an instruction built now
+    /// would take its expiry and first position from a stale head.
     pub fn require_available(&self, now: Time) -> Result<(), Refusal> {
         match self.state.settlement().status() {
             Some(s) if !s.available(now) => Err(Refusal::SettlementLayerUnavailable),
+            _ if self.epochs() && self.state.settlement().reported().is_some() => {
+                Err(Refusal::SettlementLayerUnavailable)
+            }
             _ => Ok(()),
         }
     }

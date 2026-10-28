@@ -420,10 +420,12 @@ fn t043_14_a_book_with_no_head_starts_at_the_sequence() {
 }
 
 /// `REQ-SA-10`: an instruction in flight refuses the start. One audit record, and nothing else
-/// changes.
+/// changes. (The instruction was built before the new chain's head reached the core: after it, the
+/// guard refuses it, `T-043-17`.)
 #[test]
 fn t043_14_an_instruction_in_flight_refuses_the_start() {
-    let (mut fx, adapter) = as_on_test();
+    let (mut fx, adapter) = book(SETTLEMENT_EPOCHS);
+    head(&mut fx, adapter, 142, 13);
     let (alice, acct) = funded(&mut fx, 100);
     declare(&mut fx, adapter, true, 10).unwrap();
     let ctx = fx.ctx(alice);
@@ -431,6 +433,7 @@ fn t043_14_an_instruction_in_flight_refuses_the_start() {
     fx.ledger
         .submit_outbound(&ctx, Destination::Account([1; 32]))
         .unwrap();
+    head(&mut fx, adapter, 207, 2);
     let before = (held(&fx), fx.ledger.state().settlement().epoch());
     let refusal = EpochRefusal::InFlight { op: ctx.op };
     assert_eq!(
@@ -721,4 +724,81 @@ fn t043_14_the_store_clears_earlier_gap_ends_at_a_start() {
             (9, &[(1, 11), (2, 5), (3, 7)][..], Some(h(142, 13)), None)
         );
     }
+}
+
+// ------------------------------------------------------------------ the guard (`T-043-17`)
+
+/// `REQ-SL-4` as amendment 0041 proposes it: while the adapter has reported a head at a later block
+/// with a lower position that the book did not take, `withdraw` and `submit_outbound` are refused
+/// with `ERR-SettlementLayerUnavailable`, so no instruction is born expired. The start of the new
+/// sequence clears it, and a withdrawal goes through again.
+#[test]
+fn t043_17_withdrawals_wait_while_the_head_is_behind() {
+    let (mut fx, adapter) = as_on_test();
+    assert_eq!(
+        fx.ledger.state().settlement().reported(),
+        Some(FinalisedHead {
+            height: 207,
+            next_seq: 2
+        })
+    );
+    let (alice, acct) = funded(&mut fx, 100);
+    declare(&mut fx, adapter, true, 10).unwrap();
+    let ctx = fx.ctx(alice);
+    assert_eq!(
+        fx.ledger.withdraw(&ctx, &withdrawal(acct)).map(|_| ()),
+        Err(Refusal::SettlementLayerUnavailable)
+    );
+    // A later dropped head keeps the first one.
+    head(&mut fx, adapter, 209, 3);
+    assert_eq!(
+        fx.ledger.state().settlement().reported().map(|h| h.height),
+        Some(207)
+    );
+    start(&mut fx, adapter, sequence(2, RESET, BOOK)).unwrap();
+    assert_eq!(fx.ledger.state().settlement().reported(), None);
+    head(&mut fx, adapter, 210, 3);
+    let ctx = fx.ctx(alice);
+    fx.ledger.withdraw(&ctx, &withdrawal(acct)).unwrap();
+    let i = fx
+        .ledger
+        .submit_outbound(&ctx, Destination::Account([1; 32]))
+        .unwrap()
+        .value;
+    assert_eq!(i.expiry(), 210 + 6);
+}
+
+/// The guard clears itself once the book takes a head again (the chain passed the old position),
+/// and a head at an earlier block is not a sign of a reset.
+#[test]
+fn t043_17_a_head_taken_clears_the_guard() {
+    let (mut fx, adapter) = book(SETTLEMENT_EPOCHS);
+    head(&mut fx, adapter, 142, 13);
+    head(&mut fx, adapter, 100, 2);
+    assert_eq!(fx.ledger.state().settlement().reported(), None);
+    head(&mut fx, adapter, 207, 2);
+    assert!(fx.ledger.state().settlement().reported().is_some());
+    head(&mut fx, adapter, 300, 14);
+    assert_eq!(fx.ledger.state().settlement().reported(), None);
+    assert_eq!(held(&fx).map(|h| h.next_seq), Some(14));
+}
+
+/// The generation rule: generation 0 records nothing and refuses nothing more; its withdrawal is
+/// built from the stale head, as before.
+#[test]
+fn t043_17_generation_0_has_no_guard() {
+    let (mut fx, adapter) = book(0);
+    head(&mut fx, adapter, 142, 13);
+    head(&mut fx, adapter, 207, 2);
+    assert_eq!(fx.ledger.state().settlement().reported(), None);
+    let (alice, acct) = funded(&mut fx, 100);
+    declare(&mut fx, adapter, true, 10).unwrap();
+    let ctx = fx.ctx(alice);
+    fx.ledger.withdraw(&ctx, &withdrawal(acct)).unwrap();
+    let i = fx
+        .ledger
+        .submit_outbound(&ctx, Destination::Account([1; 32]))
+        .unwrap()
+        .value;
+    assert_eq!(i.expiry(), 142 + 6, "born from the stale head, as before");
 }

@@ -192,6 +192,9 @@ pub mod kind {
     // The end of the highest gap of each sequence the adapter named (amendment 0041, decision 6
     // made exact, `T-043-14`): from `SETTLEMENT_EPOCHS` on, beside the untagged `GAP_END`.
     pub const GAP_END_BY_SEQUENCE: u8 = 34;
+    // A head the adapter reported at a later block with a lower position, not taken (amendment
+    // 0041's guard, `T-043-17`): while set, no instruction that can expire is built.
+    pub const HEAD_REPORTED: u8 = 35;
     // The operator records.
     pub const OPERATOR_GRANT: u8 = 60;
     pub const OPERATOR_GRANTS_BY_PRINCIPAL: u8 = 61;

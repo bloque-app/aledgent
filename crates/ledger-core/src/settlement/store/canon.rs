@@ -29,6 +29,7 @@ impl SettlementStore {
             gap_end,
             gap_ends,
             epoch,
+            reported,
             status,
             attestations,
             binds,
@@ -72,7 +73,10 @@ impl SettlementStore {
         // one is taken; the gap end is then the 17th even while 0, so the two never shift.
         // Amendment 0041, decision 6 made exact: the gap ends by sequence, as a 19th record, only
         // while any is held; the gap end and the sequence (even none) are then the 17th and 18th.
-        let (e, t) = (epoch.get().is_some(), !gap_ends.get().is_empty());
+        // T-043-17: a head reported and not taken, as a 20th record, only while set; the 17th to
+        // 19th are then held (even empty).
+        let (e, r) = (epoch.get().is_some(), reported.get().is_some());
+        let t = !gap_ends.get().is_empty() || r;
         if *gap_end.get() != 0 || e || t {
             out.push(canon::to_bytes(gap_end));
         }
@@ -82,13 +86,21 @@ impl SettlementStore {
         if t {
             out.push(canon::to_bytes(gap_ends));
         }
+        if r {
+            out.push(canon::to_bytes(reported));
+        }
         out
     }
 
     /// The store from its records: [`SettlementStore::to_records`]'s, or those of an export
     /// written before `T-043-07`, which has no gap end, before `T-043-14`, which has no sequence,
-    /// or one with no gap end by sequence.
+    /// one with no gap end by sequence, or before `T-043-17`, which has no head reported and not
+    /// taken.
     pub(crate) fn from_records(r: &[&[u8]]) -> Result<SettlementStore, DecodeError> {
+        let (r, reported): (&[&[u8]], Option<&[u8]>) = match r.split_last() {
+            Some((last, rest)) if r.len() == 20 => (rest, Some(*last)),
+            _ => (r, None),
+        };
         let (r, gap_ends): (&[&[u8]], Option<&[u8]>) = match r.split_last() {
             Some((last, rest)) if r.len() == 19 => (rest, Some(*last)),
             _ => (r, None),
@@ -146,6 +158,10 @@ impl SettlementStore {
                 None => Default::default(),
             },
             epoch: match epoch {
+                Some(b) => canon::from_bytes(b)?,
+                None => Default::default(),
+            },
+            reported: match reported {
                 Some(b) => canon::from_bytes(b)?,
                 None => Default::default(),
             },
@@ -242,5 +258,29 @@ mod tests {
         );
         let back = SettlementStore::from_records(&refs[..18]).unwrap();
         assert!(back.gap_ends().is_empty());
+    }
+
+    /// `T-043-17`: a head reported and not taken is a 20th record only while set, after the gap
+    /// end, the sequence and the gap ends by sequence (here none); it reads back, and cleared, the
+    /// store exports as before.
+    #[test]
+    fn t043_17_a_head_reported_is_a_20th_record_only_while_set() {
+        use crate::settlement::FinalisedHead;
+        use crate::settlement::store::SettlementWrite;
+        let h = FinalisedHead {
+            height: 207,
+            next_seq: 2,
+        };
+        let mut s = SettlementStore::new();
+        s.apply(&SettlementWrite::Reported(Some(h))).unwrap();
+        let records = s.to_records();
+        assert_eq!(records.len(), 20);
+        let refs: alloc::vec::Vec<&[u8]> = records.iter().map(alloc::vec::Vec::as_slice).collect();
+        let back = SettlementStore::from_records(&refs).unwrap();
+        assert_eq!((back.reported(), back.epoch()), (Some(h), None));
+        assert!(back.gap_ends().is_empty());
+        assert_eq!(back.to_records(), records);
+        s.apply(&SettlementWrite::Reported(None)).unwrap();
+        assert_eq!(s.to_records().len(), 16);
     }
 }

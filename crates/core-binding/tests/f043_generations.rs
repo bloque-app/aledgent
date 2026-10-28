@@ -781,6 +781,15 @@ fn t043_14_the_book_follows_a_new_sequence_from_its_generation() {
     )
     .unwrap();
     assert_eq!(fx.replica.state().settlement().gap_ends(), &[(2, 2)]);
+    // The guard (`T-043-17`): the new chain's head is recorded as reported and not taken.
+    adapter(&mut fx, who, head(208, 2)).unwrap();
+    assert_eq!(
+        fx.replica.state().settlement().reported(),
+        Some(FinalisedHead {
+            height: 208,
+            next_seq: 2
+        })
+    );
     // Another book's start: refused, one audit record, the head unchanged.
     let roots = fx.archive.last().unwrap().roots;
     assert!(matches!(
@@ -804,6 +813,7 @@ fn t043_14_the_book_follows_a_new_sequence_from_its_generation() {
     let store = fx.replica.state().settlement();
     assert_eq!(store.untagged_gap_end(), 0, "the chain before's, cleared");
     assert_eq!(store.gap_ends(), &[(2, 2)], "the new chain's, kept");
+    assert_eq!(fx.replica.state().settlement().reported(), None);
     adapter(&mut fx, who, head(210, 2)).unwrap();
     assert_eq!(
         held(&fx),
@@ -838,6 +848,18 @@ fn t043_14_generation_0_reads_no_sequence() {
     );
     let who = settlement(&mut fx);
     settlement_inputs(&mut fx, who);
+    // A head at a later block with a lower position: the guard's case, at generation 0.
+    let _ = adapter(
+        &mut fx,
+        who,
+        AdapterInput::Head {
+            head: FinalisedHead {
+                height: 50,
+                next_seq: 2,
+            },
+            nonces: Vec::new(),
+        },
+    );
     let _ = adapter(
         &mut fx,
         who,
@@ -871,5 +893,9 @@ fn t043_14_generation_0_reads_no_sequence() {
     assert!(
         !seen.contains(&ledger_core::leaves::kind::GAP_END_BY_SEQUENCE),
         "a generation-0 input read the gap ends by sequence"
+    );
+    assert!(
+        !seen.contains(&ledger_core::leaves::kind::HEAD_REPORTED),
+        "a generation-0 input read the guard's head"
     );
 }
