@@ -26,6 +26,7 @@ impl SettlementStore {
             head,
             gaps,
             incidents,
+            gap_end,
             status,
             attestations,
             binds,
@@ -60,11 +61,19 @@ impl SettlementStore {
             // starts from. The operations it counts are derived again from its cursor, and its
             // sums checked against them (`crate::state::State`'s import).
             canon::to_bytes(tally),
+            // T-043-07: the end of the highest gap, from the chained generation on. Last, so an
+            // export written before it (without it) still reads, as 0.
+            canon::to_bytes(gap_end),
         ]
     }
 
-    /// The store from its records.
+    /// The store from its records: [`SettlementStore::to_records`]'s, or those of an export
+    /// written before `T-043-07`, which has no gap end.
     pub(crate) fn from_records(r: &[&[u8]]) -> Result<SettlementStore, DecodeError> {
+        let (r, gap_end): (&[&[u8]], Option<&[u8]>) = match r.split_last() {
+            Some((last, rest)) if r.len() == 17 => (rest, Some(*last)),
+            _ => (r, None),
+        };
         let [
             config,
             support,
@@ -101,6 +110,10 @@ impl SettlementStore {
             head: canon::from_bytes(head)?,
             gaps: canon::from_bytes(gaps)?,
             incidents: canon::from_bytes(incidents)?,
+            gap_end: match gap_end {
+                Some(b) => canon::from_bytes(b)?,
+                None => Default::default(),
+            },
             status: canon::from_bytes(status)?,
             attestations: canon::from_bytes(attestations)?,
             binds: canon::from_bytes(binds)?,

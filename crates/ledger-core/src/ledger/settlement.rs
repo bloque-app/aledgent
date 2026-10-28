@@ -217,6 +217,28 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             .map_err(Refusal::from)
     }
 
+    /// The write that records the settlement incident `i`, raised at `now` (`T-043-07`): before
+    /// [`crate::settlement::CHAINED_SETTLEMENT`], appended to the book's incidents leaf, as that
+    /// generation's code did; from it on, an audit record of the batch that raises it and nothing
+    /// in the book's state (ruling a40-q2). Either way in the same batch.
+    ///
+    /// Before the chained generation it reads nothing it did not read before: what an input reads
+    /// is its witness, and the code of an earlier generation refuses a witness of leaves it does
+    /// not know, so an earlier generation's input must read exactly what its code read.
+    pub(crate) fn incident(&self, i: Incident, now: Time) -> Write {
+        if !self.chained() {
+            return Write::Settlement(SettlementWrite::Incident(i));
+        }
+        match self.state.settlement().config().map(|c| c.authoritative) {
+            Some(source) => Write::Incident(crate::audit::IncidentNote {
+                incident: i,
+                source,
+                at: now,
+            }),
+            None => Write::Settlement(SettlementWrite::Incident(i)),
+        }
+    }
+
     /// Mark `op` for review, alone in its own batch (`INV-23`).
     fn flag_for_review(&mut self, op: OperationId) {
         let _ = self.state.commit(&[Write::Op(OpWrite::Flag(op))]);
@@ -907,10 +929,11 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
         op: Option<OperationId>,
         incident: Incident,
         refusal: Refusal,
+        now: Time,
     ) -> Result<Verdict, Refusal> {
         self.commit(&[
             ingest(obs, op, !self.chained()),
-            Write::Settlement(SettlementWrite::Incident(incident)),
+            self.incident(incident, now),
         ])?;
         Err(refusal)
     }
@@ -930,6 +953,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                 None,
                 Incident::Unusable { coordinate: c },
                 Refusal::EvidenceInsufficient,
+                now,
             );
         }
         // Only a bound asset takes deposits: a book-only one has no external leg (`REQ-AS-7`).
@@ -945,6 +969,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                 None,
                 Incident::Unassociated { coordinate: c },
                 Refusal::ObservationUnassociated,
+                now,
             );
         };
         let op = inbound_reference(&c.bytes());
@@ -984,6 +1009,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                 None,
                 Incident::Unassociated { coordinate: c },
                 Refusal::ObservationUnassociated,
+                now,
             );
         };
         let op = o.reference();
@@ -999,10 +1025,11 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                 None,
                 Incident::Unusable { coordinate: c },
                 Refusal::EvidenceInsufficient,
+                now,
             );
         }
         if obs.kind == EventKind::WithdrawRefused {
-            return self.final_failure(&obs, &o);
+            return self.final_failure(&obs, &o, now);
         }
         let facts = self.facts_of(&o, now);
         match o.state() {
@@ -1048,10 +1075,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                     .map_err(stop_refusal)?;
                 let writes = vec![
                     ingest(&obs, Some(op), !self.chained()),
-                    Write::Settlement(SettlementWrite::Incident(Incident::LateEvidence {
-                        op,
-                        coordinate: c,
-                    })),
+                    self.incident(Incident::LateEvidence { op, coordinate: c }, now),
                 ];
                 self.commit_moves(now, writes, None, vec![planned])?;
                 Ok(Verdict::Applied(Shown::of(State::NeedsReview)))
@@ -1060,10 +1084,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             _ => {
                 self.commit(&[
                     ingest(&obs, Some(op), !self.chained()),
-                    Write::Settlement(SettlementWrite::Incident(Incident::LateEvidence {
-                        op,
-                        coordinate: c,
-                    })),
+                    self.incident(Incident::LateEvidence { op, coordinate: c }, now),
                 ])?;
                 Ok(Verdict::Applied(o.shown()))
             }
@@ -1075,14 +1096,22 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
     /// sees why. While the record is provisional nothing moves; once it is final, and the signing
     /// key's nonce shows its transaction included, it is a proved rejection and the reservation is
     /// released at once (amendment 0006 item 3; [`Ledger::release_rejected`]).
-    fn final_failure(&mut self, obs: &Observation, o: &Operation) -> Result<Verdict, Refusal> {
+    fn final_failure(
+        &mut self,
+        obs: &Observation,
+        o: &Operation,
+        now: Time,
+    ) -> Result<Verdict, Refusal> {
         let op = o.reference();
         self.commit(&[
             ingest(obs, Some(op), !self.chained()),
-            Write::Settlement(SettlementWrite::Incident(Incident::FinalFailure {
-                op,
-                coordinate: obs.coordinate,
-            })),
+            self.incident(
+                Incident::FinalFailure {
+                    op,
+                    coordinate: obs.coordinate,
+                },
+                now,
+            ),
         ])?;
         Ok(Verdict::Applied(o.shown()))
     }
@@ -1250,7 +1279,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                 }
                 // A binding's record, now final: the binding is decided (`REQ-AS-8`).
                 if now_final && Self::is_bind_record(&i.observation) {
-                    marks.extend(self.bind_final_writes(&i.observation));
+                    marks.extend(self.bind_final_writes(&i.observation, now));
                 }
                 let changed = !marks.is_empty();
                 if changed {
@@ -1686,7 +1715,11 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             return Proof::Unprovable;
         }
         let (from, to) = (i.from_seq, head.next_seq);
-        if store.gap_within(from, to) {
+        // The gaps' list of the earlier generations, and the end of the highest gap recorded
+        // since (`T-043-07`). An earlier generation's head reads the list alone, as its code did
+        // (the gap end is 0 until a chained input sets it, and reading it would put a leaf its
+        // code does not know in its witness).
+        if store.gap_within(from, to) || (self.chained() && store.gap_starts_below(from)) {
             return Proof::Unprovable;
         }
         if store.naming(op).any(|r| names_op(store, r, op)) {
@@ -1771,13 +1804,14 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                 .instruction(&op)
                 .and_then(|i| i.signing)
             {
-                writes.push(Write::Settlement(SettlementWrite::Incident(
+                writes.push(self.incident(
                     Incident::IncludedWithoutRecord {
                         op,
                         key: s.key,
                         nonce: s.nonce,
                     },
-                )));
+                    now,
+                ));
             }
         }
         let mut unit = None;
@@ -1827,12 +1861,12 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
 
     /// A range of inbox positions the adapter was forced to skip (`REQ-SA-7`, `AC-D2.2`):
     /// recorded, visible, raised as an incident, and never marked ingested.
-    pub fn record_gap(&mut self, source: SourceId, gap: Gap, _now: Time) -> Result<(), Refusal> {
-        let top = self.enter(|| crate::call::Call::RecordGap {
-            source,
-            gap,
-            now: _now,
-        });
+    ///
+    /// From [`crate::settlement::CHAINED_SETTLEMENT`] on (`T-043-07`, ruling a40c-gaps-watermark)
+    /// the gap is an audit record, and the book keeps only the end of the highest gap, which
+    /// `proof` reads; before it, the gap and its incident were appended to the book's state.
+    pub fn record_gap(&mut self, source: SourceId, gap: Gap, now: Time) -> Result<(), Refusal> {
+        let top = self.enter(|| crate::call::Call::RecordGap { source, gap, now });
         #[allow(clippy::redundant_closure_call)]
         let r: Result<(), Refusal> = (|| {
             if self.authoritative(&source).is_none() {
@@ -1841,10 +1875,12 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             if gap.to <= gap.from {
                 return Err(Refusal::EvidenceInsufficient);
             }
-            self.commit(&[
-                Write::Settlement(SettlementWrite::Gap(gap)),
-                Write::Settlement(SettlementWrite::Incident(Incident::Gap(gap))),
-            ])
+            let record = if self.chained() {
+                Write::Settlement(SettlementWrite::GapEnd(gap.to))
+            } else {
+                Write::Settlement(SettlementWrite::Gap(gap))
+            };
+            self.commit(&[record, self.incident(Incident::Gap(gap), now)])
         })();
         self.leave(top, || crate::call::Summary::of(&r));
         r
@@ -1986,7 +2022,7 @@ mod finality {
     use crate::lifecycle::{KindClass, Shown, State, Trigger};
     use crate::refusal::Refusal;
     use crate::reservation::{CHOSEN, ReservationBook, UnitBuilder};
-    use crate::settlement::store::{SettlementWrite, Standing};
+    use crate::settlement::store::Standing;
     use crate::settlement::{CanonicalCheck, Coordinate, Incident, Verdict, Verified};
     use crate::state::Write;
 
@@ -2195,10 +2231,7 @@ mod finality {
                         Err(Stop::Stay(_)) => return Err(Refusal::InvalidTransition),
                     };
                     let mut writes = marks.clone();
-                    writes.extend(
-                        s.incident
-                            .map(|i| Write::Settlement(SettlementWrite::Incident(i))),
-                    );
+                    writes.extend(s.incident.map(|i| self.incident(i, now)));
                     let plan = Plan {
                         unit: Some(s.unit),
                         writes,
@@ -2222,13 +2255,14 @@ mod finality {
             };
             // INV-23: Final, and queued, with the refusal on record.
             let mut writes = marks;
-            writes.extend(incident.map(|i| Write::Settlement(SettlementWrite::Incident(i))));
-            writes.push(Write::Settlement(SettlementWrite::Incident(
+            writes.extend(incident.map(|i| self.incident(i, now)));
+            writes.push(self.incident(
                 Incident::SettlementRefused {
                     op,
                     refusal: refused,
                 },
-            )));
+                now,
+            ));
             self.commit_moves(now, writes, None, alloc::vec![to_final])?;
             self.flag_for_review(op);
             Ok(Verified {
@@ -2492,7 +2526,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                 | ledger_kernel::posting::PostingKind::Issue,
             ) => {
                 let (u, incident) = settling.ok_or(Refusal::EvidenceInsufficient)?;
-                writes.extend(incident.map(|i| Write::Settlement(SettlementWrite::Incident(i))));
+                writes.extend(incident.map(|i| self.incident(i, now)));
                 Some(u)
             }
             Some(_) => return Ok(None),

@@ -42,18 +42,20 @@ use crate::authority::{AuthorityKind, AuthorityUsed};
 use crate::id::{AccountId, CredentialId, GrantId, IdentityId, OperationId};
 use crate::lifecycle::{State, Trigger};
 use crate::refusal::Refusal;
+use crate::settlement::Incident;
 use crate::state::Command;
 
 pub mod emit;
 pub mod trail;
 
-pub use emit::{AuditLog, AuditNote};
+pub use emit::{AuditLog, AuditNote, IncidentNote};
 pub use trail::{AuditQuery, AuditSink, AuditTrail, SinkError, TrailError};
 
 /// Domain of the record hash.
 const RECORD_DOMAIN: &[u8] = b"aledgent/audit/v1";
 
-/// The five classes of `REQ-AT-1`.
+/// The classes of `REQ-AT-1`: its five, and the settlement incidents and gaps amendment 0040 adds
+/// to it (`T-043-07`, `[PENDING AMENDMENT 0040]`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AuditClass {
     /// A value-moving operation.
@@ -66,16 +68,22 @@ pub enum AuditClass {
     OperatorIntervention,
     /// A disclosure (`REQ-DS-5`, `F-017`).
     Disclosure,
+    /// A settlement incident or a gap (`REQ-IN-5`, `REQ-SA-7`; amendment 0040, `T-043-07`): a
+    /// condition the core detected in what the settlement adapter reported, or a range it was
+    /// forced to skip. From [`crate::settlement::CHAINED_SETTLEMENT`] on, these are recorded here
+    /// and nowhere in the book's state.
+    SettlementIncident,
 }
 
 impl AuditClass {
     /// Every class.
-    pub const ALL: [AuditClass; 5] = [
+    pub const ALL: [AuditClass; 6] = [
         AuditClass::ValueMoving,
         AuditClass::AuthorityChange,
         AuditClass::PrivilegedRead,
         AuditClass::OperatorIntervention,
         AuditClass::Disclosure,
+        AuditClass::SettlementIncident,
     ];
 
     /// A stable one-byte code. Never reorder.
@@ -86,6 +94,7 @@ impl AuditClass {
             AuditClass::PrivilegedRead => 3,
             AuditClass::OperatorIntervention => 4,
             AuditClass::Disclosure => 5,
+            AuditClass::SettlementIncident => 6,
         }
     }
 
@@ -337,6 +346,9 @@ pub enum AuditAction {
     },
     /// A privileged read.
     PrivilegedRead(ReadKind),
+    /// A settlement incident or a gap, whole (`T-043-07`): the record carries what the book's
+    /// incidents leaf held for it before the chained generation.
+    Incident(Incident),
 }
 
 /// What an audit record is about. Never a credential (`REQ-AU-8`).
@@ -460,6 +472,10 @@ impl AuditRecord {
                 e.u8(3);
                 e.u8(k.code());
             }
+            AuditAction::Incident(i) => {
+                e.u8(4);
+                e.bytes(&crate::export::canon::to_bytes(&i));
+            }
         }
         e.u64(self.authorities.len() as u64);
         for a in &self.authorities {
@@ -544,6 +560,7 @@ impl AuditRecord {
                 AuditAction::Transition { from, to, trigger }
             }
             3 => AuditAction::PrivilegedRead(ReadKind::from_code(d.u8()?)?),
+            4 => AuditAction::Incident(crate::export::canon::from_bytes(d.bytes()?).ok()?),
             _ => return None,
         };
         let n = d.u64()?;

@@ -183,6 +183,9 @@ pub mod kind {
     // A re-scan's differences already recorded (`REQ-IN-5`), read by key instead of the
     // incidents whole.
     pub const RESCAN_RECORDED: u8 = 38;
+    // The end of the highest gap (amendment 0040, ruling a40c-gaps-watermark, `T-043-07`): one
+    // number in place of the gaps' list, from the chained generation on.
+    pub const GAP_END: u8 = 37;
     // The operator records.
     pub const OPERATOR_GRANT: u8 = 60;
     pub const OPERATOR_GRANTS_BY_PRINCIPAL: u8 = 61;

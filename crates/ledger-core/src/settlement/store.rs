@@ -139,6 +139,10 @@ pub enum SettlementWrite {
     Head(FinalisedHead),
     /// Record a skipped range.
     Gap(Gap),
+    /// Raise the end of the highest gap to at least this position (`T-043-07`): the one number
+    /// the book keeps for gaps from [`super::CHAINED_SETTLEMENT`] on, each gap itself going to
+    /// the audit trail. It never goes down.
+    GapEnd(u64),
     /// Raise an incident.
     Incident(Incident),
     /// Record the settlement adapter's status declaration, replacing the last (`F-016`).
@@ -221,6 +225,7 @@ pub(crate) enum SettlementUndo {
     Undecide(OperationId),
     Head(Option<FinalisedHead>),
     PopGap,
+    GapEnd(u64),
     PopIncident,
     PopRescanned((u8, Coordinate)),
     Status(Option<AdapterStatus>),
@@ -249,8 +254,16 @@ pub struct SettlementStore {
     /// the nonces for. Derived, never exported (`F-005`).
     awaiting: Leaves<OperationId, (), { kind::AWAITING_NONCE }>,
     head: Slot<Option<FinalisedHead>, { kind::FINALISED_HEAD }>,
+    /// The gaps recorded by the generations before [`super::CHAINED_SETTLEMENT`]. From it on a gap
+    /// goes to the audit trail and raises `gap_end` instead (`T-043-07`).
     gaps: Slot<Vec<Gap>, { kind::GAPS }>,
+    /// The incidents recorded by the generations before [`super::CHAINED_SETTLEMENT`]. From it on
+    /// an incident goes to the audit trail only (`T-043-07`, ruling a40-q2).
     incidents: Slot<Vec<Incident>, { kind::SETTLEMENT_INCIDENTS }>,
+    /// The end of the highest gap recorded from [`super::CHAINED_SETTLEMENT`] on, 0 for none
+    /// (amendment 0040, ruling a40c-gaps-watermark): `proof` cannot show a range that starts
+    /// below it complete. Absent while 0, so a book that records no gap holds no leaf for it.
+    gap_end: Slot<u64, { kind::GAP_END }>,
     status: Slot<Option<AdapterStatus>, { kind::ADAPTER_STATUS }>,
     /// The latest attestation of each location (`DEC-20`).
     attestations: Leaves<AssetLocation, Attested, { kind::ASSET_ATTESTATION }>,
@@ -377,6 +390,9 @@ impl SettlementStore {
             }
             SettlementUndo::PopGap => {
                 self.gaps.get_mut().pop();
+            }
+            SettlementUndo::GapEnd(before) => {
+                self.gap_end.set(before);
             }
             SettlementUndo::PopIncident => {
                 self.incidents.get_mut().pop();
@@ -610,6 +626,14 @@ impl SettlementStore {
                 }
                 self.gaps.get_mut().push(*g);
                 Ok(SettlementUndo::PopGap)
+            }
+            SettlementWrite::GapEnd(to) => {
+                let before = *self.gap_end.get();
+                if *to <= before {
+                    return Ok(SettlementUndo::Nothing);
+                }
+                self.gap_end.set(*to);
+                Ok(SettlementUndo::GapEnd(before))
             }
             SettlementWrite::Incident(i) => {
                 let key = self
@@ -966,9 +990,24 @@ impl SettlementStore {
         self.gaps.get()
     }
 
-    /// Whether a recorded gap covers any position of `[from, to)`.
+    /// Whether a recorded gap covers any position of `[from, to)`: one in the list the
+    /// generations before [`super::CHAINED_SETTLEMENT`] kept.
     pub fn gap_within(&self, from: u64, to: u64) -> bool {
         self.gaps.get().iter().any(|g| g.from < to && from < g.to)
+    }
+
+    /// The end of the highest gap recorded from [`super::CHAINED_SETTLEMENT`] on; 0 for none
+    /// (`T-043-07`).
+    pub fn gap_end(&self) -> u64 {
+        *self.gap_end.get()
+    }
+
+    /// Whether a range that starts at `from` starts below the end of the highest gap recorded
+    /// from the chained generation on (`proof`, amendment 0040). Never less cautious than the
+    /// list it replaces: once the head has passed the gap they answer alike, and before that it
+    /// may answer that a range is unprovable where the list would not.
+    pub fn gap_starts_below(&self, from: u64) -> bool {
+        from < self.gap_end()
     }
 
     /// Every incident, in order.
@@ -1027,6 +1066,7 @@ impl LeafHost for SettlementStore {
         out.push(&self.head);
         out.push(&self.gaps);
         out.push(&self.incidents);
+        out.push(&self.gap_end);
         out.push(&self.status);
         out.push(&self.attestations);
         out.push(&self.binds);
@@ -1051,6 +1091,7 @@ impl LeafHost for SettlementStore {
         out.push(&mut self.head);
         out.push(&mut self.gaps);
         out.push(&mut self.incidents);
+        out.push(&mut self.gap_end);
         out.push(&mut self.status);
         out.push(&mut self.attestations);
         out.push(&mut self.binds);

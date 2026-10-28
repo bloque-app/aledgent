@@ -27,6 +27,12 @@ const WATCHER: SourceId = SourceId([0xC0; 16]);
 const TO: Destination = Destination::Account([0x70; 32]);
 const WINDOW: u64 = 6;
 
+std::thread_local! {
+    /// The code generation [`Lx::new`] runs its ledger at (`T-043-07`): 0, as every test here was
+    /// written, unless a test runs others at the chained generation.
+    static GENERATION: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
 /// A customer account of a new person, holding nothing.
 fn empty(fx: &mut Fx) -> AccountId {
     let p = fx.person();
@@ -90,6 +96,8 @@ impl Lx {
             .unwrap();
         let mut sim = Sim::new(SimConfig::default(), 0xF010);
         sim.seed_position(usd(), 1_000_000);
+        fx.ledger
+            .set_generation(GENERATION.with(|g| g.get()), false);
         Lx {
             fx,
             sim,
@@ -148,8 +156,16 @@ impl Lx {
         (v.available, v.reserved)
     }
 
-    fn incidents(&self) -> &[Incident] {
-        self.fx.ledger.state().settlement().incidents()
+    /// Every settlement incident recorded: in the book's incidents leaf (the generations before
+    /// the chained one), then on the audit trail's outbox (from it on, `T-043-07`).
+    fn incidents(&self) -> Vec<Incident> {
+        let state = self.fx.ledger.state();
+        let mut out = state.settlement().incidents().to_vec();
+        out.extend(state.audit().outbox().filter_map(|r| match r.action {
+            crate::audit::AuditAction::Incident(i) => Some(i),
+            _ => None,
+        }));
+        out
     }
 }
 
@@ -1177,4 +1193,213 @@ fn req_op_9_an_acknowledged_instruction_is_released_only_once_its_signing_is_kno
             .record_signing(ADAPTER, ctx.op, i.digest(), signing(WINDOW), 10),
         Err(Refusal::EvidenceInsufficient)
     );
+}
+
+// ------------------------------------------------------------------ the chained generation
+
+/// Run `f` with [`Lx::new`] at the chained generation (`T-043-07`).
+fn chained(f: impl FnOnce()) {
+    GENERATION.with(|g| g.set(crate::settlement::CHAINED_SETTLEMENT));
+    f();
+    GENERATION.with(|g| g.set(0));
+}
+
+/// `T-043-07`, `REQ-SA-7`: at the chained generation a pruned range is still a gap, never
+/// ingested, and raised; but it is an audit record and the end of the highest gap, and the
+/// book's gaps and incidents leaves stay empty.
+#[test]
+fn t043_07_a_gap_is_an_audit_record_and_the_gap_end() {
+    chained(|| {
+        let mut lx = Lx::new();
+        let a = empty(&mut lx.fx);
+        for _ in 0..5 {
+            lx.sim.deposit(crate::id::account_reference(&a), usd(), 1);
+            lx.sim.produce();
+        }
+        lx.sim.finalise_to(5);
+        lx.sim.prune(2);
+        lx.cycle();
+        let store = lx.fx.ledger.state().settlement();
+        assert!(store.gaps().is_empty(), "no gap in the book's list");
+        assert!(
+            store.incidents().is_empty(),
+            "no incident in the book's state"
+        );
+        assert_eq!(store.gap_end(), 2);
+        for seq in 0..2 {
+            assert!(store.final_at(1, seq).is_none());
+        }
+        let gap = lx
+            .fx
+            .ledger
+            .state()
+            .audit()
+            .outbox()
+            .find(|r| {
+                matches!(
+                    r.action,
+                    crate::audit::AuditAction::Incident(Incident::Gap(_))
+                )
+            })
+            .cloned()
+            .expect("the gap's audit record");
+        assert_eq!(gap.class, crate::audit::AuditClass::SettlementIncident);
+        assert!(
+            gap.subject
+                .contains(&crate::audit::AuditSubject::Identity(ADAPTER.identity()))
+        );
+        assert_eq!(lx.driver.cursor(), 5);
+        assert_eq!(lx.view(&a), (3, 0));
+    });
+}
+
+/// `T-043-07`: at the chained generation an incident is one audit record of its batch, of the
+/// settlement-incident class, carrying the incident whole, and the book's incidents leaf does
+/// not grow.
+#[test]
+fn t043_07_an_incident_is_an_audit_record_and_no_leaf() {
+    chained(|| {
+        let mut lx = Lx::new();
+        let o = Observation {
+            source: ADAPTER,
+            coordinate: Coordinate {
+                instance: 1,
+                seq: 0,
+                digest: [7; 32],
+            },
+            at: 1,
+            kind: EventKind::Withdrawn,
+            payload: Payload::default(),
+            observed_finality: ObservedFinality::Provisional,
+            operation_ref: None,
+            account_ref: None,
+            movement: None,
+            anchor: None,
+        };
+        let before = lx.fx.ledger.state().audit().emitted();
+        assert_eq!(
+            lx.fx.ledger.record_observation(o.clone(), 10),
+            Err(Refusal::ObservationUnassociated)
+        );
+        let state = lx.fx.ledger.state();
+        assert!(state.settlement().incidents().is_empty());
+        assert!(state.settlement().ingested(&o.coordinate).is_some());
+        assert_eq!(state.audit().emitted(), before + 1);
+        let r = state.audit().outbox().last().unwrap();
+        assert_eq!(r.class, crate::audit::AuditClass::SettlementIncident);
+        assert_eq!(
+            r.action,
+            crate::audit::AuditAction::Incident(Incident::Unassociated {
+                coordinate: o.coordinate
+            })
+        );
+        assert!(r.authorities.is_empty(), "no principal asked for it");
+        assert_eq!(r.at, 10);
+        // The record reads back from its encoding.
+        assert_eq!(
+            crate::audit::AuditRecord::decode(&r.encode()).as_ref(),
+            Some(r)
+        );
+    });
+}
+
+/// `T-043-07`: `proof` gives the same answers at the chained generation, the end of the highest
+/// gap in place of the gaps' list, over the tests above whose outcome a finalised head's proof
+/// decides.
+#[test]
+fn t043_07_proof_answers_the_same_with_the_gap_end() {
+    chained(|| {
+        an_unacknowledged_instruction_is_released_once_it_provably_cannot_execute();
+        req_in_4_an_orphaned_withdrawal_is_watched_again_and_settles_when_reincluded();
+        req_op_9_an_execution_seen_after_expiry_goes_to_review();
+        req_op_9_a_proved_rejection_releases_at_once();
+        req_op_9_a_refusal_without_its_proof_releases_nothing();
+        inv_23_resume_settles_from_the_finality_witness();
+        req_sl_4_a_normal_expiry_with_the_nonce_unconsumed_is_released();
+        req_op_9_an_unreported_nonce_releases_nothing();
+        inv_11_a_nonce_consumed_by_our_own_transaction_is_never_released();
+        req_sl_4_a_nonce_reused_after_the_transaction_died_is_not_read_as_its_inclusion();
+        req_op_9_an_acknowledged_instruction_is_released_only_once_its_signing_is_known();
+        a_gap_over_the_expiry_interval_makes_non_inclusion_unprovable();
+    });
+}
+
+/// `REQ-SA-7`, `REQ-OP-9`, `AC-E1.5`: a gap over the interval from the instruction to its expiry
+/// makes non-inclusion unprovable: `Expired`, then `Needs-Review`, never `Released`. At both
+/// generations (`t043_07_proof_answers_the_same_with_the_gap_end`).
+#[test]
+fn a_gap_over_the_expiry_interval_makes_non_inclusion_unprovable() {
+    let mut lx = Lx::new();
+    let (alice, a) = funded(&mut lx.fx, 100);
+    let c = empty(&mut lx.fx);
+    let ctx = lx.withdraw(alice, a, 40, 500);
+    lx.fx.ledger.submit_outbound(&ctx, TO).unwrap();
+    lx.cycle();
+    lx.sim.drop_instruction(ctx.op);
+    // Records the driver never reads: the layer finalises and prunes them first.
+    for _ in 0..(WINDOW + 4) {
+        lx.sim.deposit(crate::id::account_reference(&c), usd(), 1);
+        lx.sim.produce();
+    }
+    let best = lx.sim.best();
+    lx.sim.finalise_to(best);
+    lx.sim.prune(1);
+    lx.cycle();
+    assert_eq!(lx.state(&ctx.op), OpState::NeedsReview);
+    let path = lx.path(&ctx.op);
+    assert_eq!(
+        &path[path.len() - 2..],
+        &[OpState::Expired, OpState::NeedsReview]
+    );
+    assert_eq!(lx.view(&a), (60, 40));
+}
+
+/// The generation rule, at the witness: a generation-0 head whose proof decides an instruction
+/// reads only what the code before `F-043` read. The code of generation 0 refuses a witness that
+/// holds a leaf kind it does not know, so the gap end (kind 37) must not be read; at the chained
+/// generation it is.
+#[test]
+fn t043_07_a_generation_0_head_reads_no_gap_end() {
+    for chained in [false, true] {
+        let mut lx = Lx::new();
+        if chained {
+            lx.fx
+                .ledger
+                .set_generation(crate::settlement::CHAINED_SETTLEMENT, false);
+        }
+        let (alice, a) = funded(&mut lx.fx, 100);
+        let ctx = lx.withdraw(alice, a, 30, 500);
+        lx.fx.ledger.submit_outbound(&ctx, TO).unwrap();
+        lx.fx.ledger.record_calls(true);
+        let _ = lx.fx.ledger.state().take_touched();
+        let report = lx
+            .fx
+            .ledger
+            .observe_head(
+                ADAPTER,
+                FinalisedHead {
+                    height: WINDOW,
+                    next_seq: 0,
+                },
+                &[],
+                10,
+            )
+            .unwrap();
+        assert_eq!(report.moved, vec![(ctx.op, OpState::Released)]);
+        let kinds: Vec<u8> = lx
+            .fx
+            .ledger
+            .state()
+            .take_touched()
+            .iter()
+            .map(|t| t.kind)
+            .collect();
+        assert!(kinds.contains(&crate::leaves::kind::GAPS), "{kinds:?}");
+        assert_eq!(
+            kinds.contains(&crate::leaves::kind::GAP_END),
+            chained,
+            "generation {}: {kinds:?}",
+            u8::from(chained)
+        );
+    }
 }
