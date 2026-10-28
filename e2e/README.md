@@ -107,16 +107,17 @@ polkadot-sdk binaries, spawns the network, runs the phases, writes the job summa
 
 Inputs: `kreivo_ref` (build Kreivo's runtime from a commit instead, as Kreivo's release workflow
 builds it: about seven minutes on the fleet), `aledgent_connection`, `kreivo_release` (default
-`0.17.0`, `3e0a5c3`, spec 133: the runtime Kreivo mainnet runs from 2026-09-30, and the one the
-canary deploys on; a release tag gates on it), `psdk_release` (default `polkadot-stable2606-2`, which
-0.17 needs; the collator must be at least as new as the runtime needs), `driver`, and
+`0.18.1`, `5cd5003`, spec 136 and `transaction_version` 14: the runtime Kreivo mainnet runs from
+2026-10-27; a release tag gates on it), `psdk_release` (default `polkadot-stable2606-3`, the newest
+collator release; the collator must be at least as new as the runtime needs), `driver`, and
 `mainnet_parity` (a run warns, and a release tag fails, when the runtime under test is not the one
 Kreivo mainnet runs).
 
-Kreivo `0.16.9` (spec 132) stays selectable, with its own collator:
+Kreivo `0.17.0` (spec 133) and `0.16.9` (spec 132) stay selectable, the latter with its own collator:
 
 ```sh
-gh workflow run e2e-zombienet.yml --ref <branch> -f driver=aledgent     # 0.17.0 on stable2606-2
+gh workflow run e2e-zombienet.yml --ref <branch> -f driver=aledgent     # 0.18.1 on stable2606-3
+gh workflow run e2e-zombienet.yml --ref <branch> -f kreivo_release=0.17.0 -f driver=aledgent
 gh workflow run e2e-zombienet.yml --ref <branch> -f kreivo_release=0.16.9 \
   -f psdk_release=polkadot-stable2603-4 -f driver=aledgent
 ```
