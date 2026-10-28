@@ -50,8 +50,13 @@ name: Core release
 #
 # A pull request that touches this workflow, the Dockerfile or these scripts runs it as a check, against
 # the newest release's core, publishing nothing: a case that must be refused (this tree's GENERATION
-# is not the predecessor's plus one) and a case that must pass (the same tree with GENERATION bumped in
-# the runner's copy, never published).
+# is not the predecessor's plus one), a case that must pass (the same tree with GENERATION bumped in
+# the runner's copy, never published), and a case check-upgrade must refuse (that copy with one of
+# the book's decisions changed: a capture into a customer account refused).
+#
+# Two jobs. core-code checks and builds with read access alone, on every event; publish, the only job
+# that may write a package or sign an attestation, runs only for a dispatch from main or develop that
+# asked to publish, and takes the set core-code built as an artifact.
 #
 # Running it: `workflow_dispatch` works from main and develop once this file is on the default branch
 # (main); from any other branch it builds and checks and publishes nothing, as images.yml does.
@@ -90,8 +95,10 @@ on:
 
 permissions: {}
 
+# A dispatch for one deployment (its host image and code in force) never waits behind or replaces a
+# pending one for another; a pull request's newer push cancels its older run.
 concurrency:
-  group: core-release-${{ github.event_name }}-${{ github.ref }}
+  group: core-release-${{ github.event_name }}-${{ github.ref }}-${{ inputs.host_image }}-${{ inputs.predecessor_code }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -142,24 +149,21 @@ jobs:
     needs: [scripts, code-history]
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    # Read only: nothing here writes a package or signs anything (the job publish below does).
     permissions:
       contents: read
-      packages: write # the code set's repository, and nothing else
-      id-token: write # the provenance attestation's signature (GitHub OIDC)
-      attestations: write
     strategy:
       fail-fast: false
       matrix:
-        case: ${{ fromJSON(github.event_name == 'pull_request' && '["refuse","accept"]' || '["release"]') }}
+        case: ${{ fromJSON(github.event_name == 'pull_request' && '["refuse","accept","diverge"]' || '["release"]') }}
+    outputs:
+      proceed: ${{ steps.gen.outputs.proceed }}
     env:
       CASE: ${{ matrix.case }}
-      # Published only by a dispatch from main or develop that asked for it, and never for a check case.
-      PUBLISH: ${{ github.event_name == 'workflow_dispatch' && inputs.publish && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop') }}
       HOST_IMAGE: ${{ inputs.host_image }}
       PRED_CODE: ${{ inputs.predecessor_code }}
       PRED_MANIFEST: ${{ inputs.predecessor_manifest }}
       PRED_SET: ${{ inputs.predecessor_set }}
-      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -182,6 +186,7 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }} # gh release: the newest release's core, on a pull request
         run: |
           set -euo pipefail
           w="$RUNNER_TEMP/core-release"
@@ -231,6 +236,8 @@ jobs:
           CODE: ${{ steps.in.outputs.code }}
           EVENT: ${{ github.event_name }}
           PR_REVISION: ${{ steps.in.outputs.pr_revision }}
+          GH_TOKEN: ${{ github.token }} # gh attestation verify: the predecessor set's provenance
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           docker pull --quiet --platform linux/amd64 "$HOST"
@@ -246,6 +253,16 @@ jobs:
           git cat-file -e "$rev^{commit}" || { echo "::error::the host image's commit $rev is not in this repository's history"; exit 1; }
 
           if [ -n "$PRED_SET" ]; then
+            # Only a set this workflow published from main or develop: its build provenance, signed
+            # by this workflow at one of those refs, before anything of it is read.
+            verified=false
+            for src in refs/heads/develop refs/heads/main; do
+              if gh attestation verify "oci://$PRED_SET" -R "$REPO" \
+                  --signer-workflow "$REPO/.github/workflows/core-release.yml" --source-ref "$src" >/dev/null; then
+                verified=true; echo "predecessor_set: attested by core-release.yml at $src"; break
+              fi
+            done
+            $verified || { echo "::error::predecessor_set $PRED_SET has no provenance attestation from $REPO's core-release.yml at refs/heads/develop or refs/heads/main"; exit 1; }
             # A previous release's set, read back and checked as it was written (core-code-read.sh).
             from_set=$(tools/release/core-code-read.sh "$PRED_SET" "$W/set-in")
             if [ -n "$CODE" ] && [ "$CODE" != "$from_set" ]; then
@@ -335,8 +352,8 @@ jobs:
             msg="agents/core/src/lib.rs has GENERATION $have; the code in force is generation $GENERATION_IN_FORCE, so an upgrade built from it must be generation $want"
             case "$CASE" in
               refuse) echo "Refused, as it must be: $msg" | tee -a "$GITHUB_STEP_SUMMARY"; proceed=false ;;
-              accept)
-                # The runner's copy only: nothing built from it is published (PUBLISH is false on a pull request).
+              accept | diverge)
+                # The runner's copy only: nothing built from it is published (a pull request never publishes).
                 echo "::notice::$msg. This check builds a copy with GENERATION $want."
                 sed -i "s/^const GENERATION: u64 = $have;\$/const GENERATION: u64 = $want;/" agents/core/src/lib.rs
                 grep -qx "const GENERATION: u64 = $want;" agents/core/src/lib.rs ;;
@@ -345,6 +362,14 @@ jobs:
           elif [ "$CASE" = refuse ]; then
             echo "::notice::this tree's GENERATION is already the next ($want): the refusal case has nothing to refuse"
             proceed=false
+          fi
+          if [ "$CASE" = diverge ] && [ "$proceed" = true ]; then
+            # One of the book's decisions changed in the runner's copy: a capture into a customer
+            # account refused. The recorded book captures into one, so check-upgrade must refuse N.
+            f=crates/ledger-core/src/ledger/reservations.rs
+            grep -q 'if dest.kind() == AccountKind::Issuance {' "$f" || { echo "::error::$f: the decision this case changes is gone; pick another"; exit 1; }
+            sed -i 's/if dest.kind() == AccountKind::Issuance {/if dest.kind() == AccountKind::Customer {/' "$f"
+            echo "::notice::the diverge case builds N with a changed capture decision; check-upgrade must refuse it"
           fi
           echo "proceed=$proceed" >>"$GITHUB_OUTPUT"
 
@@ -361,16 +386,33 @@ jobs:
           file: deploy/docker/core.Dockerfile
           target: core-upgrade
           platforms: linux/amd64
-          build-args: ROOTS=${{ steps.pred.outputs.roots }}
+          build-args: |
+            ROOTS=${{ steps.pred.outputs.roots }}
+            CHECK_MUST_PASS=${{ matrix.case == 'diverge' && '0' || '1' }}
           build-contexts: previous-code=${{ steps.in.outputs.w }}/pred-pkg
           cache-from: type=gha,scope=core${{ steps.pred.outputs.roots == 'v1' && '-roots-v1' || '' }}
           outputs: type=local,dest=${{ steps.in.outputs.w }}/upgrade
           push: false
 
+      # The diverge case: the build kept going only to show the refusal; it must be there, and for
+      # the recorded book, not for anything else.
+      - name: check-upgrade refused the divergent package
+        if: steps.gen.outputs.proceed == 'true' && matrix.case == 'diverge'
+        env:
+          W: ${{ steps.in.outputs.w }}
+        run: |
+          set -euo pipefail
+          cat "$W/upgrade/upgrade-check.log"
+          jq -e '.refused == true' "$W/upgrade/upgrade-check.json" >/dev/null \
+            || { echo "::error::check-upgrade accepted a package with a changed decision"; exit 1; }
+          grep -q 'check-upgrade refused: the recorded book does not replay through the packages' "$W/upgrade/upgrade-check.log" \
+            || { echo "::error::check-upgrade refused for another reason than the replay"; exit 1; }
+          echo "Refused, as it must be: check-upgrade did not let a changed decision through" | tee -a "$GITHUB_STEP_SUMMARY"
+
       # The node's host writes the manifest: its binary is the manifest's `native-decide`.
       - name: The code manifest
         id: manifest
-        if: steps.gen.outputs.proceed == 'true'
+        if: steps.gen.outputs.proceed == 'true' && matrix.case != 'diverge'
         env:
           W: ${{ steps.in.outputs.w }}
           HOST: ${{ steps.in.outputs.host }}
@@ -383,6 +425,8 @@ jobs:
           test -s "$W/upgrade/core.vos"
           # The build ran check-upgrade and gives nothing out unless it passed; its report.
           test -s "$W/upgrade/upgrade-check.json"
+          jq -e '.refused != true and .generation >= 1' "$W/upgrade/upgrade-check.json" >/dev/null \
+            || { echo "::error::check-upgrade did not pass"; exit 1; }
           { echo '### The real-package check (check-upgrade)'; echo '```json'; cat "$W/upgrade/upgrade-check.json"; echo '```'; } >>"$GITHUB_STEP_SUMMARY"
           cp "$W/upgrade/upgrade-check.json" "$W/upgrade-check.json"
           cp "$W/upgrade/core.vos" "$W/new/core.vos"
@@ -419,7 +463,7 @@ jobs:
       # The files, each named by its digest and hashed again by a tool that shares no code with the host.
       - name: The code set
         id: set
-        if: steps.gen.outputs.proceed == 'true'
+        if: steps.gen.outputs.proceed == 'true' && matrix.case != 'diverge'
         env:
           W: ${{ steps.in.outputs.w }}
           PRED: ${{ steps.pred.outputs.code }}
@@ -430,7 +474,7 @@ jobs:
           echo "layer_sha256=$(sha256sum "$W/layer.tar" | cut -d' ' -f1)" >>"$GITHUB_OUTPUT"
 
       - name: Keep the set
-        if: steps.gen.outputs.proceed == 'true'
+        if: steps.gen.outputs.proceed == 'true' && matrix.case != 'diverge'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: core-code-set-${{ matrix.case }}
@@ -439,22 +483,90 @@ jobs:
             ${{ steps.in.outputs.w }}/set.json
             ${{ steps.in.outputs.w }}/report.json
             ${{ steps.in.outputs.w }}/upgrade-check.json
+            ${{ steps.in.outputs.w }}/layer.tar
             ${{ steps.in.outputs.w }}/new/profile
           if-no-files-found: error
 
-      # Only a dispatch from main or develop that asked for it. By digest: the tag is a label, nothing
-      # reads it, and a node never follows it.
-      - name: Publish the code set
-        id: publish
-        if: steps.gen.outputs.proceed == 'true' && env.PUBLISH == 'true'
+      - name: Checked
+        if: steps.gen.outputs.proceed == 'true' && matrix.case != 'diverge'
         env:
           W: ${{ steps.in.outputs.w }}
           H: ${{ steps.manifest.outputs.code }}
+          GEN: ${{ steps.manifest.outputs.generation }}
+          PRED: ${{ steps.pred.outputs.code }}
+          HOST: ${{ steps.in.outputs.host }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Core code version \`$H\` (case \`$CASE\`)"
+            echo
+            echo "- generation $GEN, following \`$PRED\` (generation $((GEN - 1)))"
+            echo "- manifest written by the host of \`$HOST\`; commit \`$GITHUB_SHA\`"
+            echo "- check-upgrade: $(jq -c '{inputs, switch_at, way_outs_decided_by_both}' "$W/upgrade-check.json")"
+            echo "- files (each named by its blake2b-256 digest):"
+            jq -r '.files[] | "  - \(.role): `\(.digest)` (\(.len) bytes)"' "$W/set.json"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # The only job that writes a package or signs: a dispatch from main or develop that asked to
+  # publish, after core-code passed, from the set it built (the artifact), never on a pull request.
+  publish:
+    name: publish
+    needs: core-code
+    if: >-
+      github.event_name == 'workflow_dispatch' && inputs.publish &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop') &&
+      needs.core-code.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write # the code set's repository, and nothing else
+      id-token: write # the provenance attestation's signature (GitHub OIDC)
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install crane
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 5 -o /tmp/crane.tar.gz \
+            "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz"
+          echo "${CRANE_SHA256}  /tmp/crane.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin" && tar -xzf /tmp/crane.tar.gz -C "$RUNNER_TEMP/bin" crane
+          echo "$RUNNER_TEMP/bin" >>"$GITHUB_PATH"
+
+      - name: The set core-code built
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: core-code-set-release
+          path: ${{ runner.temp }}/core-release
+
+      - name: The set again, as core-code wrote it
+        id: set
+        env:
+          W: ${{ runner.temp }}/core-release
+        run: |
+          set -euo pipefail
+          H=$(jq -er .code "$W/set.json")
+          [[ $H =~ ^[0-9a-f]{64}$ ]]
+          [ "$(jq -r .version "$W/report.json")" = "$H" ] || { echo "::error::the set and the report name different versions"; exit 1; }
+          jq -e '.refused != true' "$W/upgrade-check.json" >/dev/null || { echo "::error::check-upgrade did not pass"; exit 1; }
+          echo "code=$H" >>"$GITHUB_OUTPUT"
+
+      # By digest: the tag is a label, nothing reads it, and a node never follows it.
+      - name: Publish the code set
+        id: publish
+        env:
+          W: ${{ runner.temp }}/core-release
+          H: ${{ steps.set.outputs.code }}
+          GH_TOKEN: ${{ github.token }} # the registry login, this step only
         run: |
           set -euo pipefail
           crane auth login ghcr.io -u "$GITHUB_ACTOR" --password-stdin <<<"$GH_TOKEN"
-          # Pushes the set, or finds exactly these files already there under H; anything else is refused.
-          digest=$(tools/release/core-code-publish.sh "$CODE_REPO" "$H" "$W/set" "$W/layer.tar")
+          # Pushes the set, or finds exactly this image already there under H; anything else is refused.
+          digest=$(tools/release/core-code-publish.sh "$CODE_REPO" "$H" "$W/set" "$W/layer.tar" "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}")
           [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]]
           # Anonymous pull, as release.yml checks for every image: the node and the delivery pull with no credential.
           name="${CODE_REPO#ghcr.io/}"
@@ -467,7 +579,6 @@ jobs:
           echo "ref=$CODE_REPO@$digest" >>"$GITHUB_OUTPUT"
 
       - name: Attest the code set's provenance
-        if: steps.publish.outputs.digest != ''
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ env.CODE_REPO }}
@@ -475,33 +586,17 @@ jobs:
           push-to-registry: true
 
       - name: Record
-        if: steps.gen.outputs.proceed == 'true'
         env:
-          W: ${{ steps.in.outputs.w }}
-          H: ${{ steps.manifest.outputs.code }}
-          GEN: ${{ steps.manifest.outputs.generation }}
-          PRED: ${{ steps.pred.outputs.code }}
+          H: ${{ steps.set.outputs.code }}
           REF: ${{ steps.publish.outputs.ref }}
-          HOST: ${{ steps.in.outputs.host }}
         run: |
           set -euo pipefail
           {
-            echo "### Core code version \`$H\`"
+            echo "Published: \`$REF\`"
             echo
-            echo "- generation $GEN, following \`$PRED\` (generation $((GEN - 1)))"
-            echo "- manifest written by the host of \`$HOST\`; commit \`$GITHUB_SHA\`"
-            echo "- files (each named by its blake2b-256 digest):"
-            jq -r '.files[] | "  - \(.role): `\(.digest)` (\(.len) bytes)"' "$W/set.json"
+            echo "Verify: \`gh attestation verify oci://$REF -R $GITHUB_REPOSITORY --signer-workflow $GITHUB_REPOSITORY/.github/workflows/core-release.yml --source-ref $GITHUB_REF\`"
             echo
-            if [ -n "$REF" ]; then
-              echo "Published: \`$REF\`"
-              echo
-              echo "Verify: \`gh attestation verify oci://$REF -R $GITHUB_REPOSITORY\`"
-              echo
-              echo "The operator submits \`Upgrade { code: $H, from: <an input not yet decided> }\` once the files are on the node"
-              echo "(delivery: #284). Nothing was delivered, deployed or restarted by this run, and the core image and"
-              echo "\`aledgent_core_image_tag\` are untouched."
-            else
-              echo "Checked, not published (case \`$CASE\`)."
-            fi
+            echo "The operator submits \`Upgrade { code: $H, from: <an input not yet decided> }\` once the files are on the node"
+            echo "(delivery: #284). Nothing was delivered, deployed or restarted by this run, and the core image and"
+            echo "\`aledgent_core_image_tag\` are untouched."
           } | tee -a "$GITHUB_STEP_SUMMARY"

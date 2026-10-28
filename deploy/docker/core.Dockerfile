@@ -265,6 +265,10 @@ FROM scratch AS previous-code
 
 FROM host AS upgrade
 ARG ROOTS
+# 1: the build fails unless check-upgrade passes (every real build). 0 only for the core release
+# job's `diverge` case, which must see the refusal: the report says `refused` and the build goes on,
+# and the job refuses to publish anything it built.
+ARG CHECK_MUST_PASS=1
 RUN --mount=type=bind,from=previous-code,target=/previous \
     --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
@@ -288,13 +292,21 @@ RUN --mount=type=bind,from=previous-code,target=/previous \
       echo "core-upgrade: the recorded history (T-037-12) is a book in roots v2; there is none in roots $ROOTS to check the upgrade against" >&2; \
       exit 1; \
     fi \
- && /out/bin/aledgent-core-host check-upgrade --runtime /previous/agent_runtime.pvm \
+ && if /out/bin/aledgent-core-host check-upgrade --runtime /previous/agent_runtime.pvm \
       --previous /previous/core.vos --package /out/share/core.vos \
       --history /w/aledgent/crates/core-binding/tests/fixtures/code-history \
-      --out /out/share/upgrade-check.json
+      --out /out/share/upgrade-check.json 2>/out/share/upgrade-check.log; then \
+      cat /out/share/upgrade-check.log >&2; \
+    elif [ "$CHECK_MUST_PASS" = 0 ]; then \
+      cat /out/share/upgrade-check.log >&2; \
+      echo '{"refused": true}' > /out/share/upgrade-check.json; \
+    else \
+      cat /out/share/upgrade-check.log >&2; \
+      exit 1; \
+    fi
 
 FROM scratch AS core-upgrade
-COPY --from=upgrade /out/share/core.vos /out/share/core.Cargo.lock /out/share/upgrade-check.json /
+COPY --from=upgrade /out/share/core.vos /out/share/core.Cargo.lock /out/share/upgrade-check.json /out/share/upgrade-check.log /
 
 # The default target: the core built from source.
 FROM ${RUNTIME_IMAGE} AS core
