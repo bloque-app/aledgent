@@ -1989,19 +1989,19 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
         let config = self.authoritative(&source).ok_or(Refusal::NotAuthorised)?;
         let refusal = (|| {
             let store = self.state.settlement();
-            if let Some(held) = store.epoch() {
-                if held == epoch {
-                    return Ok(None);
-                }
-                if epoch.epoch <= held.epoch {
-                    return Err(EpochRefusal::NotLater {
-                        recorded: held.epoch,
-                    });
-                }
+            let held = store.epoch();
+            if held == Some(epoch) {
+                return Ok(None);
             }
+            // Another book first, whatever its number: it is the adapter's `reset:`, not a page.
             let genesis = self.code_binding().genesis;
             if genesis == [0; 32] || epoch.book != genesis {
                 return Err(EpochRefusal::OtherBook);
+            }
+            if let Some(held) = held.filter(|h| epoch.epoch <= h.epoch) {
+                return Err(EpochRefusal::NotLater {
+                    recorded: held.epoch,
+                });
             }
             if let Some(op) = store.any_live() {
                 return Err(EpochRefusal::InFlight { op });
@@ -2009,6 +2009,8 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             if let Some(c) = store
                 .finals_from(config.instance, epoch.from_seq)
                 .find(|c| {
+                    // A final record is always ingested; one that were not would be counted as
+                    // earlier, defensively.
                     store
                         .ingested(c)
                         .is_none_or(|i| i.observation.at <= epoch.at)

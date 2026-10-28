@@ -1443,6 +1443,21 @@ mod tests {
         serde_json::from_value(v).unwrap()
     }
 
+    /// Amendment 0041 (`T-043-14`): the epoch route is closed unless the deployment opens it. A
+    /// file that does not name `settlement_epochs` (the template) leaves it off, and so does the
+    /// running configuration's default; naming it `true` opens it.
+    #[test]
+    fn t043_14_settlement_epochs_is_off_by_default() {
+        assert!(!crate::service::Config::default().settlement_epochs);
+        let v = template();
+        assert!(v.get("settlement_epochs").is_none());
+        assert!(!deployment(v.clone()).settlement_epochs);
+        assert!(!deployment(v.clone()).service().settlement_epochs);
+        let mut on = v;
+        on["settlement_epochs"] = serde_json::Value::Bool(true);
+        assert!(deployment(on).service().settlement_epochs);
+    }
+
     /// `F-042`: the feed key on an engine. The example (`ingress-feed-key-transit.json`) put in the
     /// template's place checks in production, with `stream.feed_key` taken out; the kind and the
     /// scheme are checked; `keys.feed` and `stream.feed_key` are one or the other; and an in-process

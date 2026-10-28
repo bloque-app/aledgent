@@ -421,6 +421,78 @@ fn t043_14_an_earlier_sequence_is_refused() {
         fx.ledger.state().settlement().epoch().map(|e| e.at),
         Some(RESET)
     );
+    // An earlier number naming another book is refused as another book's (the adapter's `reset:`,
+    // not the `epoch:` page).
+    assert_eq!(
+        start(&mut fx, adapter, sequence(1, 100, [0xC1; 32])),
+        Ok(EpochOutcome::Refused(EpochRefusal::OtherBook))
+    );
+}
+
+/// An instruction acknowledged and submitted, taken to `state` by the heads and the clock: the
+/// start is refused while it is live, whatever its state short of a terminal one (decision 2).
+fn in_flight_refuses(to_review: bool) {
+    let (mut fx, adapter) = as_on_test();
+    let (alice, acct) = funded(&mut fx, 100);
+    declare(&mut fx, adapter, true, 10).unwrap();
+    let ctx = fx.ctx(alice);
+    fx.ledger.withdraw(&ctx, &withdrawal(acct)).unwrap();
+    let i = fx
+        .ledger
+        .submit_outbound(&ctx, Destination::Account([1; 32]))
+        .unwrap()
+        .value;
+    input(
+        &mut fx,
+        adapter,
+        AdapterInput::Acknowledge {
+            op: ctx.op,
+            instruction: i.digest(),
+        },
+    )
+    .unwrap();
+    // Past its expiry.
+    head(&mut fx, adapter, 160, 13);
+    let expected = if to_review {
+        // Past its deadline.
+        fx.ledger.tick(10_001).unwrap();
+        crate::lifecycle::State::NeedsReview
+    } else {
+        crate::lifecycle::State::Expired
+    };
+    assert_eq!(fx.ledger.operation(&ctx.op).unwrap().state(), expected);
+    assert_eq!(
+        start(&mut fx, adapter, sequence(2, RESET, BOOK)),
+        Ok(EpochOutcome::Refused(EpochRefusal::InFlight { op: ctx.op }))
+    );
+}
+
+/// Decision 2: an `Expired` instruction is in flight; `proof` may still decide it.
+#[test]
+fn t043_14_an_expired_instruction_refuses_the_start() {
+    in_flight_refuses(false);
+}
+
+/// Decision 2: so is one in `Needs-Review`, until the operator resolves it.
+#[test]
+fn t043_14_an_instruction_in_review_refuses_the_start() {
+    in_flight_refuses(true);
+}
+
+/// Step 5: a head at the reset's own block is not after the reset (decision 5's rule for that
+/// block): the head restarts at the sequence's start.
+#[test]
+fn t043_14_a_head_at_the_reset_block_restarts() {
+    let (mut fx, adapter) = book(SETTLEMENT_EPOCHS);
+    head(&mut fx, adapter, 142, 2);
+    head(&mut fx, adapter, RESET, 3);
+    assert_eq!(
+        start(&mut fx, adapter, sequence(2, RESET, BOOK)),
+        Ok(EpochOutcome::Started(FinalisedHead {
+            height: RESET,
+            next_seq: 0
+        }))
+    );
 }
 
 /// A second start works the same way: after a sequence that settled nothing it is taken; after one
@@ -502,6 +574,15 @@ fn t043_14_the_store_takes_only_a_later_sequence() {
     })
     .unwrap();
     assert_eq!(s.head(), Some(h(RESET, 0)));
+    // The head moves back only to the sequence's start.
+    assert_eq!(
+        s.apply(&SettlementWrite::Epoch {
+            epoch: sequence(3, 400, BOOK),
+            head: Some(h(300, 0)),
+        })
+        .unwrap_err(),
+        SettlementRefusal::EpochHeadNotStart
+    );
     for e in [2, 1] {
         assert_eq!(
             s.apply(&SettlementWrite::Epoch {

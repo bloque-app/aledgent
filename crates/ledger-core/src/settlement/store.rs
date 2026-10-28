@@ -235,6 +235,9 @@ pub enum SettlementRefusal {
     Tally,
     /// A sequence not later than the one the store holds (amendment 0041).
     EpochNotLater,
+    /// A start whose head is not the sequence's start (amendment 0041): the head moves back only
+    /// to it.
+    EpochHeadNotStart,
 }
 
 /// How to undo one applied write.
@@ -675,6 +678,9 @@ impl SettlementStore {
                     .is_some_and(|held| epoch.epoch <= held.epoch)
                 {
                     return Err(SettlementRefusal::EpochNotLater);
+                }
+                if head.is_some_and(|h| h != epoch.start()) {
+                    return Err(SettlementRefusal::EpochHeadNotStart);
                 }
                 let before = *self.head.get();
                 let mut gap_end = None;
