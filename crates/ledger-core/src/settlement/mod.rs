@@ -67,6 +67,21 @@ pub use port::SettlementPort;
 
 const INSTRUCTION_DOMAIN: &[u8] = b"aledgent/instruction/v1";
 
+/// The code generation from which the book takes settlement as a chain of entries (amendment
+/// 0040, `F-043`, `[PENDING AMENDMENT 0040]`): the settlement adapter checks completeness against
+/// the head the layer holds, so the core takes no re-scan (`T-043-06`), and keeps no index by
+/// position for one.
+///
+/// **The generation rule.** An input of an earlier generation is decided exactly as the code of
+/// that generation decided it (`T-037-12`'s gate, the core release's `check-upgrade`): a book's
+/// recorded re-scans replay, and the indexes they wrote are written again. Only an input decided
+/// by this generation or a later one takes the new rules ([`crate::Ledger::set_generation`]).
+///
+/// It is 1: the test and the production books run their genesis code (generation 0), so the
+/// first upgrade of either is generation 1. A book whose code is already past it when it takes
+/// this build, or one founded on this build at generation 0, needs another ruling.
+pub const CHAINED_SETTLEMENT: u64 = 1;
+
 /// Who submitted an observation: an opaque identity of an observing source. Exactly one source
 /// is authoritative for the book ([`SettlementConfig::authoritative`], `REQ-IN-6`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

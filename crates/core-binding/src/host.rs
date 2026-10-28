@@ -1402,6 +1402,9 @@ impl<P: AgentPort> Driver<P> {
         // The upgrade the writer has scheduled, which a move of it must go strictly later than
         // (owner ruling w6, `T-037-05`).
         replica.set_scheduled_upgrade(self.writer.upgrade);
+        // The generation that decides it (the generation rule): the next one once the scheduled
+        // upgrade applies. A way out at that input is decided the same by either.
+        replica.set_generation(self.writer.generation, self.writer.due(next));
         replica.set_input(next);
     }
 
@@ -2291,6 +2294,7 @@ fn replay_with(
         let authority = replica.authority();
         replica.set_code(e.code, authority);
         replica.set_scheduled_upgrade(writer.upgrade);
+        replica.set_generation(writer.generation, writer.due(e.seq));
         replica.set_input(e.seq);
         for c in &e.calls {
             let clerk = clerk.as_deref().map(|c| c as &dyn ClerkSigner);

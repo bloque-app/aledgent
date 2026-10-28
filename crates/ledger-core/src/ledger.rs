@@ -270,6 +270,9 @@ pub struct Ledger<S: LeafStore, V: VaultBackend> {
     /// The writer's upgrade-authority position (`T-037-05`): any scheduled change of mode, and
     /// what this input has decided. Not service state either.
     writer: crate::code::authority::Position,
+    /// The code generation in force before the current input, and whether its calls are decided
+    /// by the next one ([`Ledger::set_generation`]). Not service state.
+    generation: (u64, bool),
 }
 
 fn policy_used(p: &Principal) -> AuthorityUsed {
@@ -393,6 +396,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             scheduled: None,
             calls_in_input: (0, 0),
             writer: crate::code::authority::Position::default(),
+            generation: (0, false),
         };
         if let Some(sp) = spec {
             ledger.build_genesis_state(&founded, &sp)?;
@@ -446,6 +450,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             scheduled: None,
             calls_in_input: (0, 0),
             writer: crate::code::authority::Position::default(),
+            generation: (0, false),
         }
     }
 
@@ -469,6 +474,35 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
         self.input = input;
         self.calls_in_input.1 = 0;
         self.writer.begin(&mut self.code.1, input);
+    }
+
+    /// The code generation that decides the commands that follow (the generation rule, amendment
+    /// 0033 and the `code-history` gate, `T-037-12`): `in_force`, the writer's generation before
+    /// the input, and `next`, whether the input is decided by the generation after it (an
+    /// upgrade applies to it). A change in how the book decides an input comes in under a new
+    /// generation and leaves every earlier one as it was, so the same build decides an input of
+    /// any generation exactly as the code of that generation did: what the book takes from a
+    /// generation on is read here ([`Ledger::generation`]).
+    ///
+    /// The core Agent sets it from its hot row and the generation compiled into the code that
+    /// runs the input, the host's replica from the writer's code before the input it stages, and a
+    /// replay from the code map. A ledger never told decides as generation 0.
+    pub fn set_generation(&mut self, in_force: u64, next: bool) {
+        self.generation = (in_force, next);
+    }
+
+    /// The code generation that decides the commands that follow ([`Ledger::set_generation`]).
+    pub fn generation(&self) -> u64 {
+        self.generation
+            .0
+            .saturating_add(u64::from(self.generation.1))
+    }
+
+    /// Whether the book takes settlement as a chain of entries (amendment 0040, `F-043`): from
+    /// [`crate::settlement::CHAINED_SETTLEMENT`] on. Before it, an input is decided as the code
+    /// of its generation decided it (the re-scan, the incidents and gaps in the book's state).
+    pub(crate) fn chained(&self) -> bool {
+        self.generation() >= crate::settlement::CHAINED_SETTLEMENT
     }
 
     /// The upgrade the writer has scheduled, as its hot row holds it, before the input that

@@ -96,7 +96,10 @@ const SURFACE: &[(&str, &str)] = &[
         "the finalised head and the signing keys' nonces (F-010)",
     ),
     ("record_gap", "a skipped range, recorded (F-010, REQ-SA-7)"),
-    ("rescan", "a re-scan against an archive (F-010, REQ-IN-5)"),
+    (
+        "rescan",
+        "a re-scan against an archive (F-010, REQ-IN-5); refused from the chained generation (T-043-06)",
+    ),
     (
         "adapter",
         "the settlement adapter's three capabilities, as its principal only (F-016, REQ-SA-8)",
@@ -227,6 +230,13 @@ const SURFACE: &[(&str, &str)] = &[
     (
         "set_input",
         "sets the input number a way out of an upgrade is decided against (T-037-15)",
+    ),
+    // The generation rule (F-043, T-043-06): the code generation that decides the commands that
+    // follow. It writes nothing to the book; only `core-binding` calls it, from the Agent's hot
+    // row and its compiled generation, the replica's writer code, and a replay's code map.
+    (
+        "set_generation",
+        "sets the code generation that decides the commands that follow (T-043-06)",
     ),
     (
         "take_way_out",
