@@ -9,8 +9,10 @@
 //! - **Reorgs above the finality point** ([`FakeChain::reorg`]): the blocks above it are dropped
 //!   and their transactions go back to the pool, as a node's pool does.
 //! - **Transactions are Kreivo's own bytes**: v5 general transactions authorised by
-//!   `PassAuthenticate` ([`super::kreivo`]), built by [`Chain::sign_batch`] and decoded and
-//!   checked here as the runtime checks them. The era must contain the block (the birth block's
+//!   `PassAuthenticate`, or a native account's v4 signed transactions (`F-045`), both
+//!   ([`super::kreivo`]) built by [`Chain::sign_batch`] and decoded and checked here as the runtime
+//!   checks them. A native transaction's signature must verify over its signed payload against its
+//!   account, which the call then runs as; the rest of this item is the PASS form's. The era must contain the block (the birth block's
 //!   hash is part of what the device signed); the challenge's context must be a block of this
 //!   chain no older than the challenger's window, and the challenge must be the one Kreivo's
 //!   `BlockHashChallenger` derives from the call and every extension after `PassAuthenticate`;
@@ -203,7 +205,7 @@ struct Block {
     /// The runtime in its state: the one that validates a transaction at it and executes the
     /// block after it.
     runtime: FakeConfig,
-    extrinsics: Vec<(SignedExtrinsic, kreivo::DecodedTx, Included)>,
+    extrinsics: Vec<(SignedExtrinsic, kreivo::AnyTx, Included)>,
 }
 
 /// An operation a test queues for the next block.
@@ -236,7 +238,7 @@ struct State {
     metadata: BTreeMap<ChainAsset, LayerAssetFacts>,
     blocks: Vec<Block>,
     finalized: u64,
-    pool: Vec<(SignedExtrinsic, kreivo::DecodedTx)>,
+    pool: Vec<(SignedExtrinsic, kreivo::AnyTx)>,
     queued: Vec<Queued>,
     halted: bool,
     drop_submissions: bool,
@@ -1075,11 +1077,36 @@ impl FakeChain {
         s: &State,
         runtime: &FakeConfig,
         number: u64,
-        tx: &kreivo::DecodedTx,
+        tx: &kreivo::AnyTx,
     ) -> Option<AccountId32> {
-        let (period, phase) = kreivo::era_of(tx.era);
+        let (period, phase) = kreivo::era_of(tx.era());
         let birth = (number.max(phase) - phase) / period * period + phase;
         let birth_hash = s.blocks.get(usize::try_from(birth).ok()?)?.hash;
+        let tx = match tx {
+            kreivo::AnyTx::Pass(tx) => tx,
+            // F-045: a native account's signature over the signed payload, as
+            // `UncheckedExtrinsic::check` verifies it; the call runs as that account.
+            kreivo::AnyTx::Native(tx) => {
+                let p = TxParams {
+                    genesis: runtime.genesis,
+                    spec_version: runtime.spec_version,
+                    transaction_version: runtime.transaction_version,
+                    era: Mortality {
+                        birth,
+                        period,
+                        checkpoint: birth,
+                    },
+                    birth_hash,
+                    nonce: tx.nonce,
+                    tip: tx.tip,
+                };
+                let payload = kreivo::signed_payload(&tx.call, &p);
+                return tx
+                    .signature
+                    .verify(&payload, &tx.account)
+                    .then_some(tx.account);
+            }
+        };
         let c = &tx.credential;
         let context = u64::from(c.context);
         if context.saturating_add(runtime.challenge_window) < number {
@@ -1208,8 +1235,7 @@ impl FakeChain {
         // The pool, in (account, nonce) order; loop so a run of nonces lands in one block.
         let mut pool = std::mem::take(&mut s.pool);
         pool.sort_by(|a, b| {
-            (kreivo::pass_account(&a.1.credential.user_id), a.1.nonce)
-                .cmp(&(kreivo::pass_account(&b.1.credential.user_id), b.1.nonce))
+            (a.1.claimed_account(), a.1.nonce()).cmp(&(b.1.claimed_account(), b.1.nonce()))
         });
         let mut kept = Vec::new();
         for (ext, tx) in pool {
@@ -1217,7 +1243,7 @@ impl FakeChain {
                 continue;
             };
             let expected = world.nonces.get(&who).copied().unwrap_or(0);
-            let nonce = u64::from(tx.nonce);
+            let nonce = u64::from(tx.nonce());
             if nonce < expected {
                 continue;
             }
@@ -1232,7 +1258,7 @@ impl FakeChain {
             }
             world.native.insert(who, native - FEE);
             world.nonces.insert(who, expected + 1);
-            let included = match kreivo::decode_contracts_call(&tx.call) {
+            let included = match kreivo::decode_contracts_call(tx.call()) {
                 None => Included {
                     block: number,
                     success: false,
@@ -1868,7 +1894,7 @@ impl Chain for FakeChain {
         if let Some(v) = &s.validity {
             return Ok(v.clone());
         }
-        let Ok(tx) = kreivo::decode_extrinsic(&extrinsic.bytes) else {
+        let Ok(tx) = kreivo::AnyTx::decode(&extrinsic.bytes) else {
             return Ok(Validity::Refused(
                 "the runtime cannot decode it: Bad input data".into(),
             ));
@@ -1877,7 +1903,7 @@ impl Chain for FakeChain {
             return Ok(Validity::Refused("Invalid(BadProof)".into()));
         };
         let expected = world.nonces.get(&who).copied().unwrap_or(0);
-        Ok(match u64::from(tx.nonce).cmp(&expected) {
+        Ok(match u64::from(tx.nonce()).cmp(&expected) {
             std::cmp::Ordering::Less => Validity::NotNow("Invalid(Stale)".into()),
             std::cmp::Ordering::Greater => Validity::NotNow("Invalid(Future)".into()),
             std::cmp::Ordering::Equal if world.native.get(&who).copied().unwrap_or(0) < FEE => {
@@ -1888,8 +1914,8 @@ impl Chain for FakeChain {
     }
 
     async fn submit(&self, extrinsic: &SignedExtrinsic) -> ChainResult<()> {
-        let tx = kreivo::decode_extrinsic(&extrinsic.bytes).map_err(ChainError::Invalid)?;
-        let calls: Vec<Envelope> = kreivo::decode_contracts_call(&tx.call)
+        let tx = kreivo::AnyTx::decode(&extrinsic.bytes).map_err(ChainError::Invalid)?;
+        let calls: Vec<Envelope> = kreivo::decode_contracts_call(tx.call())
             .and_then(|(_, _, _, data)| {
                 let mut args = data.strip_prefix(&kreivo::selector::EXECUTE[..])?;
                 Vec::<Envelope>::decode(&mut args).ok()

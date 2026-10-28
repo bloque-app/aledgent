@@ -20,7 +20,7 @@ use crate::chain::fake::{FakeChain, FakeConfig};
 use crate::chain::{AccountId32, ChainAsset};
 use crate::config::{AdapterConfig, AssetBinding};
 use crate::link::RouterTransport;
-use crate::signer::{DevSigner, PassAccount, Signer};
+use crate::signer::{DevEd25519, DevSigner, PassAccount, Signer};
 use crate::store::mem::MemStore;
 
 /// The deployment's instance on the fake layer.
@@ -58,6 +58,12 @@ pub fn pass_lane(secret: &[u8; 32], user: [u8; 32]) -> Arc<dyn Signer> {
     Arc::new(PassAccount::new(device, user))
 }
 
+/// A test native account (`F-045`): the Ed25519 key of the test constant `secret`, acting as its own
+/// account.
+pub fn native_lane(secret: &[u8; 32]) -> Arc<dyn Signer> {
+    Arc::new(DevEd25519::from_secret(secret))
+}
+
 /// How a kit starts.
 #[derive(Clone, Debug)]
 pub struct KitOptions {
@@ -85,6 +91,9 @@ pub struct KitOptions {
     /// A batch's gas margin over its dry run, in percent
     /// ([`AdapterConfig::batch_gas_margin_percent`]).
     pub batch_gas_margin_percent: u64,
+    /// Whether the lanes and the anchor key are native accounts (`F-045`, Ed25519 keys signing v4
+    /// transactions) rather than PASS accounts' devices.
+    pub native_accounts: bool,
 }
 
 impl Default for KitOptions {
@@ -101,6 +110,7 @@ impl Default for KitOptions {
             anchoring: false,
             batch_gas_cap: None,
             batch_gas_margin_percent: crate::config::default_batch_gas_margin_percent(),
+            native_accounts: false,
         }
     }
 }
@@ -140,6 +150,7 @@ pub fn adapter_config(genesis: [u8; 32]) -> AdapterConfig {
             chain: chain_usd(),
         }],
         keys: Vec::new(),
+        accounts: Vec::new(),
         fee_floor: 100,
         lease_ttl: 30_000,
         status_lease: 120_000,
@@ -149,6 +160,7 @@ pub fn adapter_config(genesis: [u8; 32]) -> AdapterConfig {
         rescan_every: None,
         rescan_window: None,
         anchor_key: None,
+        anchor_account: None,
         batch_gas_cap: None,
         batch_gas_margin_percent: crate::config::default_batch_gas_margin_percent(),
         not_now_alert_after: crate::config::default_not_now_alert_after(),
@@ -179,12 +191,22 @@ impl Kit {
         ]
         .iter()
         .take(options.lanes.max(1))
-        .map(|(s, u)| pass_lane(s, *u))
+        .map(|(s, u)| {
+            if options.native_accounts {
+                native_lane(s)
+            } else {
+                pass_lane(s, *u)
+            }
+        })
         .collect();
         let chain = FakeChain::new(options.fake.clone());
-        let anchor_signer: Option<Arc<dyn Signer>> = options
-            .anchoring
-            .then(|| pass_lane(&TEST_ANCHOR_SECRET, TEST_ANCHOR_PASS_USER));
+        let anchor_signer: Option<Arc<dyn Signer>> = options.anchoring.then(|| {
+            if options.native_accounts {
+                native_lane(&TEST_ANCHOR_SECRET)
+            } else {
+                pass_lane(&TEST_ANCHOR_SECRET, TEST_ANCHOR_PASS_USER)
+            }
+        });
         if options.registered {
             let mut keys: Vec<AccountId32> = lanes.iter().map(|l| l.account()).collect();
             keys.extend(anchor_signer.iter().map(|s| s.account()));

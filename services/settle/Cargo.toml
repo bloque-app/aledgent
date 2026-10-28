@@ -3,7 +3,7 @@
 [package]
 name = "settle"
 version.workspace = true
-description = "aledgent-settle (F-016, F-027): the settlement adapter and executor of the call outbox. The only component that touches the settlement layer; it holds the signing keys, outside the core, executes calls in batches on the settlement contract as the community PASS account, and reports what the layer did as observations."
+description = "aledgent-settle (F-016, F-027, F-045): the settlement adapter and executor of the call outbox. The only component that touches the settlement layer; it holds the signing keys' handles, outside the core, executes calls in batches on the settlement contract as its lanes' native accounts (or community PASS accounts), and reports what the layer did as observations."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -16,7 +16,10 @@ path = "src/main.rs"
 required-features = ["light-client", "http", "postgres"]
 
 [features]
-default = ["light-client", "http", "postgres"]
+default = ["light-client", "http", "postgres", "transit"]
+# The Vault Transit engine (F-042) for the lane and anchor keys of native accounts (F-045): the
+# adapter logs in to Vault itself, under AWS IAM auth with its task's role, and asks Vault to sign.
+transit = ["signer/transit"]
 # The settlement layer through subxt's embedded smoldot light client: how the adapter connects
 # unless its configuration opts into a node's RPC (NOTES.md, decisions 1, 25 and 29). Includes `rpc`.
 light-client = ["rpc", "dep:smoldot-light", "dep:ed25519-zebra"]
@@ -47,13 +50,16 @@ ledger-kernel = { path = "../../crates/ledger-kernel", default-features = false 
 # The wire forms of the settlement surface, defined once, in ingress; and its in-process
 # deployment for the test kit. Without PostgreSQL or the HTTP transport.
 ingress = { path = "../ingress", default-features = false }
-# The key boundary (F-035): the signer service's client only. The lane and anchor keys are the
-# signer's (AWS KMS in production); the adapter holds their identifiers and public halves.
+# The key boundary (F-035, F-042): the signer service's client, and (feature `transit`) the Vault
+# Transit engine, where a native account's Ed25519 key is made and never leaves (F-045). The adapter
+# holds the keys' public halves only.
 signer = { path = "../signer", default-features = false }
 axum = { version = "0.8", default-features = false }
 blake2 = "0.10"
 hex = "0.4"
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+# Native accounts' Ed25519 keys (F-045): development keys, and the fake layer's check of a signature.
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"] }
 parity-scale-codec = { version = "3", default-features = false, features = ["derive", "std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

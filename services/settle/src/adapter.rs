@@ -315,6 +315,11 @@ pub struct Adapter<C: Chain, S: Store, T: Transport> {
     /// cleared (a store error, a crash in between) would otherwise leave the alert open, paging,
     /// since every later step finds the runtime confirmed and never reaches the clearing.
     alert_settled: BTreeSet<String>,
+    /// Steps in a row that ended because a key's signer did not sign (`F-045`), and the last reason.
+    signer_failures: (u32, String),
+    /// Whether the `signer:engines` alert, as this process last wrote it while holding the lease, is
+    /// open; `None` before it has written it.
+    signer_alert: Option<bool>,
 }
 
 /// The alert of a chain that does not lead to its head (amendment 0040, `REQ-IN-5`):
@@ -372,8 +377,12 @@ struct Chosen {
     /// The runtime's surface.
     surface: kreivo::Surface,
     /// The runtime, as its confirmation is recorded: `spec_version`, the surface's fingerprint
-    /// and the format's name.
+    /// and [`Chosen::format_name`].
     key: String,
+    /// The format's name as the confirmation records it: the format's own for PASS transactions,
+    /// [`kreivo::TxFormat::native_name`] for a native account's (`F-045`), so that a runtime confirmed
+    /// for one form is not taken as confirmed for the other.
+    format_name: String,
     /// The block the runtime was read at ([`RuntimeInfo::at`]): what is signed for it is
     /// validated there (`F-027` NOTES, decision 51).
     at: BlockRef,
@@ -485,6 +494,18 @@ fn summary(e: &InboxEvent) -> String {
     }
 }
 
+/// The alert a settlement key that does not sign raises (`F-045`): kind `signer` in the signals.
+pub const SIGNER_ALERT: &str = "signer:engines";
+
+/// After how many steps in a row ended because a key did not sign [`SIGNER_ALERT`] is raised
+/// (`F-045`): about 6 s of the deployment's 2 s steps, past a blip.
+pub const SIGNER_FAILURES_ALERT_AFTER: u32 = 3;
+
+/// Whether `r` ended because a key's signer did not sign (`F-045`).
+fn signer_failed<T>(r: &StepResult<T>) -> bool {
+    matches!(r, Err(AdapterError::Chain(ChainError::Signer(_))))
+}
+
 impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
     /// An adapter over `chain`, `store` and `transport`, signing with `lanes`. It does nothing
     /// until [`Adapter::step`].
@@ -522,6 +543,8 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             refused: BTreeMap::new(),
             not_now: BTreeMap::new(),
             alert_settled: BTreeSet::new(),
+            signer_failures: (0, String::new()),
+            signer_alert: None,
         }
     }
 
@@ -608,6 +631,61 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
     }
 
     // ------------------------------------------------------------------------------ lease
+
+    /// Report the signers' health after a step (`F-045`): the alert [`SIGNER_ALERT`] is open while an
+    /// engine is not ready (`engines`: ready, and why not), or once [`SIGNER_FAILURES_ALERT_AFTER`]
+    /// steps in a row ended because a key did not sign (`stepped`: a Vault that answers but refuses
+    /// `sign/` leaves the engine ready, and only this shows it); a step that ends otherwise resets the
+    /// count. The alert is written only on a change, and **only while this process holds the lease**,
+    /// so a standby never writes over the active instance's alerts. Returns whether it is open, or
+    /// `None` when nothing was written.
+    pub async fn report_signers(
+        &mut self,
+        engines: (bool, &str),
+        stepped: &StepResult<StepReport>,
+    ) -> StepResult<Option<bool>> {
+        match stepped {
+            Err(AdapterError::Chain(ChainError::Signer(e))) => {
+                self.signer_failures = (self.signer_failures.0.saturating_add(1), e.clone());
+            }
+            Ok(_) => self.signer_failures = (0, String::new()),
+            Err(_) => {}
+        }
+        if self.epoch.is_none() || matches!(stepped, Err(AdapterError::LeaseLost)) {
+            // Another instance holds it: its alerts are its own. Written afresh once it is ours.
+            self.signer_alert = None;
+            return Ok(None);
+        }
+        let (n, why) = &self.signer_failures;
+        let detail = if !engines.0 {
+            Some(format!(
+                "a signing key's engine is not ready: {}; nothing is signed until it is",
+                engines.1
+            ))
+        } else if *n >= SIGNER_FAILURES_ALERT_AFTER {
+            Some(format!("{n} steps in a row could not sign: {why}"))
+        } else {
+            None
+        };
+        let open = detail.is_some();
+        if self.signer_alert == Some(open) {
+            return Ok(None);
+        }
+        let now = self.now();
+        match &detail {
+            Some(d) => {
+                self.store.raise(SIGNER_ALERT, d, now).await?;
+                tracing::error!(detail = %d, "a settlement key does not sign");
+            }
+            None => {
+                if self.store.clear(SIGNER_ALERT, now).await? {
+                    tracing::info!("the settlement keys sign again");
+                }
+            }
+        }
+        self.signer_alert = Some(open);
+        Ok(Some(open))
+    }
 
     async fn hold_lease(&mut self) -> StepResult<u64> {
         let now = self.now();
@@ -705,11 +783,16 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                 types: runtime.surface.types.map(hex::encode).unwrap_or_default(),
             });
         };
+        let format_name = if self.native() {
+            format.native_name()
+        } else {
+            format.name.to_owned()
+        };
         let key = format!(
             "{}:{}:{}",
             runtime.spec_version,
             hex::encode(runtime.surface.fingerprint()),
-            format.name
+            format_name
         );
         if let Some(r) = self.refused.get(&key) {
             return Err(r.clone());
@@ -722,8 +805,20 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             },
             surface: runtime.surface.clone(),
             key,
+            format_name,
             at: runtime.at,
         })
+    }
+
+    /// Whether the adapter signs as native accounts (`F-045`): its keys are no PASS account's
+    /// devices. The configuration gives every lane and the anchor key one form, so the first lane
+    /// says it for all.
+    fn native(&self) -> bool {
+        self.lanes
+            .iter()
+            .chain(self.anchor_signer.iter())
+            .next()
+            .is_some_and(|l| l.pass_user().is_none())
     }
 
     /// Whether `ext`, just signed for `chosen`, may be broadcast (`T-027-12`, `REQ-SA-9`): **the
@@ -783,7 +878,7 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
         }
         let now = self.now();
         let spec_version = chosen.signing.spec_version;
-        let format = chosen.signing.format.name;
+        let format = chosen.format_name.as_str();
         let alert = format!("runtime:{spec_version}");
         match self.chain.validate(&chosen.at, ext).await? {
             Validity::Valid => {
@@ -1218,7 +1313,13 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                 }
                 SettlementCallBody::Withdraw { .. } | SettlementCallBody::Bind { .. } => None,
             });
-            self.anchor(epoch, &fin, &best, anchor).await?;
+            // F-045: the anchor key's signer not signing (Vault Transit down, say) ends the step, but
+            // only after the bindings and the position reports, which it must not starve: the
+            // positions sign nothing.
+            let anchored = self.anchor(epoch, &fin, &best, anchor).await;
+            if !signer_failed(&anchored) {
+                anchored.clone()?;
+            }
             // The bindings in flight (amendment 0011, `REQ-AS-8`), on the anchor key's lane.
             let binds: Vec<BindAsked> = calls
                 .iter()
@@ -1236,8 +1337,13 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                     _ => None,
                 })
                 .collect();
-            self.binds(epoch, &fin, &best, &binds).await?;
+            let bound = self.binds(epoch, &fin, &best, &binds).await;
+            if !signer_failed(&bound) {
+                bound.clone()?;
+            }
             self.positions(&fin).await?;
+            anchored?;
+            bound?;
         }
         Ok(report)
     }

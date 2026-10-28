@@ -16,7 +16,7 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/bloque-app/aledgent"
-description = "Pins aledgent-settle's Kreivo v5 PassAuthenticate transactions to Kreivo's own types at 4aef055."
+description = "Pins aledgent-settle's Kreivo transactions (v5 PassAuthenticate, and v4 signed from native accounts) to Kreivo's own types at 4aef055."
 publish = false
 
 [lib]

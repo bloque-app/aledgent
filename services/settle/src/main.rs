@@ -9,6 +9,12 @@
 //! is news for it (`wake_poll`, `NFR-15`). Only one instance per
 //! set of keys acts at a time: the others wait for the lease.
 //!
+//! `aledgent-settle <config.json> keys` (`F-045`) opens the keys, prints each lane's and the anchor
+//! key's account and public key as JSON (public halves only), and exits: nothing is read from the
+//! settlement layer, the store or ingress. It is how an operator reads the accounts a contract's
+//! `set_keys` must list, and checks that the keys open (for a Vault Transit key, the AWS IAM login and
+//! the key's read) before the adapter is turned on.
+//!
 //! Two operator commands run once, holding the lease, and exit (amendment 0040, `T-043-04`):
 //!
 //! - `aledgent-settle <config.json> gap <from> <to>`: **the operator's gap** (ruling a40-q3). When
@@ -31,22 +37,35 @@ use settle::adapter::{Adapter, AdapterError};
 use settle::chain::rpc::{Names, RpcChain};
 use settle::config::{ChainSource, KeySource, PassKey, ProcessConfig};
 use settle::link::HttpTransport;
-use settle::signer::{DevSigner, PassAccount, ServiceSigner, Signer};
+use settle::signer::{DevEd25519, DevSigner, EngineEd25519, PassAccount, ServiceSigner, Signer};
 use settle::store::pg::PgStore;
 
 /// How long every step may find the settlement layer unreachable before the process ends, for its
 /// supervisor to start a new one.
 const BLIND_RESTART: Duration = Duration::from_secs(180);
 
+/// The lanes, in the file's form (`F-045`): native accounts, or PASS accounts.
 fn lanes(config: &ProcessConfig, keys: &Keys) -> Result<Vec<Arc<dyn Signer>>, String> {
     let mut out: Vec<Arc<dyn Signer>> = Vec::new();
     for k in &config.adapter.keys {
         out.push(pass(k, keys)?);
     }
+    for k in &config.adapter.accounts {
+        out.push(native(k, keys)?);
+    }
     if out.is_empty() {
         return Err("no lane: configure at least one key".into());
     }
     Ok(out)
+}
+
+/// The anchor key, if any, in the file's form.
+fn anchor(config: &ProcessConfig, keys: &Keys) -> Result<Option<Arc<dyn Signer>>, String> {
+    match (&config.adapter.anchor_key, &config.adapter.anchor_account) {
+        (Some(k), _) => pass(k, keys).map(Some),
+        (None, Some(k)) => native(k, keys).map(Some),
+        (None, None) => Ok(None),
+    }
 }
 
 /// Where the keys come from: the signer service, connected once, and whether development keys
@@ -59,6 +78,21 @@ struct Keys {
 }
 
 impl Keys {
+    /// Whether every engine in use can sign now, and why not (`F-042`'s `Engine::health`: no I/O).
+    fn ready(&self) -> (bool, String) {
+        let Some(open) = &self.engines else {
+            return (true, String::new());
+        };
+        let not: Vec<String> = open
+            .engines()
+            .iter()
+            .map(|e| e.health())
+            .filter(|h| !h.ready)
+            .map(|h| h.detail)
+            .collect();
+        (not.is_empty(), not.join("; "))
+    }
+
     fn of(config: &ProcessConfig) -> Result<Keys, String> {
         let wants_signer = config.check_key_sources()?;
         let signer = match (&config.signer, wants_signer) {
@@ -71,9 +105,10 @@ impl Keys {
         let engines = if names.is_empty() {
             None
         } else {
+            let native = config.adapter.native()?;
             let needs = names
                 .iter()
-                .map(|n| settle::config::engine_key_need(n))
+                .map(|n| settle::config::engine_key_need(n, native))
                 .collect::<Vec<_>>();
             Some(signer::engine::config::open(
                 &signer::engine::config::Registry::builtin(),
@@ -98,6 +133,43 @@ fn pass(k: &PassKey, keys: &Keys) -> Result<Arc<dyn Signer>, String> {
         .and_then(|v| v.try_into().ok())
         .ok_or("a PASS account's user id is 32 bytes of hex")?;
     Ok(Arc::new(PassAccount::new(signer(&k.device, keys)?, user)))
+}
+
+/// A native account (`F-045`): an Ed25519 key, acting as its own account. Its key is on an engine (the
+/// sidecar or Vault Transit), on the signer service, or, in development, in a file; never in the
+/// environment (the configuration's check refuses it first).
+fn native(k: &KeySource, keys: &Keys) -> Result<Arc<dyn Signer>, String> {
+    match k {
+        KeySource::Signer { key } => {
+            let client = keys
+                .signer
+                .as_ref()
+                .ok_or("a key of the signer service needs \"signer\"")?;
+            Ok(Arc::new(
+                EngineEd25519::from_service(Arc::clone(client), key).map_err(|e| e.to_string())?,
+            ))
+        }
+        KeySource::Engine(name) => {
+            let handle = keys
+                .engines
+                .as_ref()
+                .and_then(|e| e.handle(name))
+                .ok_or_else(|| format!("keys.{name}: not opened"))?;
+            Ok(Arc::new(
+                EngineEd25519::from_key(handle).map_err(|e| e.to_string())?,
+            ))
+        }
+        KeySource::File(path) if keys.development => {
+            tracing::warn!("a native account's key is read from a file: development only (NFR-8)");
+            Ok(Arc::new(
+                DevEd25519::from_file(path).map_err(|e| e.to_string())?,
+            ))
+        }
+        KeySource::File(_) => Err("a key from a file is for development only (NFR-8)".into()),
+        KeySource::Env(_) => {
+            Err("a native account's key is never read from the environment (NFR-8)".into())
+        }
+    }
 }
 
 fn signer(k: &KeySource, keys: &Keys) -> Result<Arc<dyn Signer>, String> {
@@ -147,9 +219,11 @@ enum Command {
     Gap { from: u64, to: u64 },
     /// Reset the cursor and the accepted head with the book's re-founding, and exit.
     Refound,
+    /// Open the keys, print the accounts, and exit (`F-045`).
+    Keys,
 }
 
-const USAGE: &str = "usage: aledgent-settle <config.json> [gap <from> <to> | refound]";
+const USAGE: &str = "usage: aledgent-settle <config.json> [gap <from> <to> | refound | keys]";
 
 async fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
@@ -167,6 +241,7 @@ async fn run() -> Result<(), String> {
             }
         }
         Some("refound") => Command::Refound,
+        Some("keys") => Command::Keys,
         Some(_) => return Err(USAGE.into()),
     };
     let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
@@ -205,6 +280,58 @@ async fn run() -> Result<(), String> {
     // F-035: the keys behind the signer service; development keys only if the file says so.
     let keys = Keys::of(&config)?;
     let lanes = lanes(&config, &keys)?;
+    let anchor = anchor(&config, &keys)?;
+    // F-045: each lane and the anchor key on an account of its own.
+    let all: Vec<&dyn Signer> = lanes
+        .iter()
+        .chain(anchor.iter())
+        .map(|s| s.as_ref())
+        .collect();
+    settle::signer::distinct(&all)?;
+    if matches!(command, Command::Keys) {
+        // F-045: public halves only, and a probe each key signs and that is verified against its
+        // pinned public half: opening a key reads it, and only signing proves the key may sign (a
+        // Vault role that reads `keys/` but is refused `sign/` passes the opening). Nothing else is
+        // opened.
+        let mut failed = false;
+        let mut show = async |role: &str, s: &Arc<dyn Signer>| {
+            let probe = settle::signer::probe(s.as_ref()).await;
+            failed |= probe.is_err();
+            serde_json::json!({
+                "role": role,
+                "account": hex::encode(s.account()),
+                "public": hex::encode(s.public()),
+                "scheme": match s.public() {
+                    settle::signer::Public::Ed25519(_) => "ed25519",
+                    settle::signer::Public::Ecdsa(_) => "secp256k1",
+                },
+                "pass_user": s.pass_user().map(hex::encode),
+                "signs": probe.as_ref().is_ok(),
+                "probe_error": probe.err().map(|e| e.to_string()),
+            })
+        };
+        let mut out: Vec<serde_json::Value> = Vec::new();
+        for l in &lanes {
+            out.push(show("lane", l).await);
+        }
+        if let Some(a) = &anchor {
+            out.push(show("anchor", a).await);
+        }
+        let (ready, detail) = keys.ready();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "keys": out,
+                "ready": ready && !failed,
+                "detail": detail,
+            }))
+            .map_err(|e| e.to_string())?
+        );
+        if failed || !ready {
+            return Err("a key does not sign, or its engine is not ready (see above)".into());
+        }
+        return Ok(());
+    }
     let assets: Vec<_> = config
         .adapter
         .assets
@@ -282,8 +409,8 @@ async fn run() -> Result<(), String> {
         Arc::new(SystemClock),
     );
     // F-017: anchors are published with a key of their own, used for nothing else.
-    if let Some(k) = &config.adapter.anchor_key {
-        adapter = adapter.with_anchor_signer(pass(k, &keys)?);
+    if let Some(a) = anchor {
+        adapter = adapter.with_anchor_signer(a);
     }
     // Feature `fault-injection` only (the zombienet suite's build, never a release): die the first
     // time the step reaches the point `ALEDGENT_SETTLE_CRASH_AT` names.
@@ -314,6 +441,7 @@ async fn run() -> Result<(), String> {
             adapter.refound().await.map_err(|e| e.to_string())?;
             return Ok(());
         }
+        Command::Keys => return Ok(()),
     }
     let interval = Duration::from_millis(config.interval.max(100));
     // `NFR-15`: within the interval, a check for news every `wake_poll` starts a step as soon as
@@ -345,6 +473,14 @@ async fn run() -> Result<(), String> {
         let stepped = adapter.step().await;
         if let Some(path) = &config.signals_file {
             write_signals(&adapter, path).await;
+        }
+        // F-045: the signers' health, as the alert `signer:engines` (the signals count it by kind,
+        // and it pages): an engine not ready, or steps in a row that could not sign (a Vault that
+        // answers but refuses `sign/` leaves the engine ready). Written only while this process
+        // holds the lease. A step that could not sign does not count as the layer being unreachable.
+        let (ready, detail) = keys.ready();
+        if let Err(e) = adapter.report_signers((ready, &detail), &stepped).await {
+            tracing::warn!(error = %e, "the signer alert was not written; the next step tries again");
         }
         // Blind: the layer does not answer; or, in a process that has never served, it answers
         // from before the deployment existed (a light client that has not caught up: seen on the
