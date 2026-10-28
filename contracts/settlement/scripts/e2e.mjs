@@ -17,16 +17,24 @@
 //            deposit of a non-sufficient asset, and a deposit Kreivo refuses. Records the weight
 //            and storage deposit of a deposit and of a full batch. Writes what it did to
 //            `expect.json`; it asserts nothing about outcomes itself.
-//   check    Driver-independent: reads the inbox by raw child-trie storage at the finalized head,
-//            the adapter's path, and checks every expectation in `expect.json` (one outcome per
-//            reference, each with the right kind, amount and reason), that the inbox is gapless,
-//            that each position equals the contract's holding, and that events agree with storage.
+//   check    Driver-independent: reads the chain's head (amendment 0040) by raw child-trie storage
+//            at the finalized head, the adapter's path, folds the contract's events to it (every
+//            position once, in order, and the digest equal), and checks every expectation in
+//            `expect.json` against the folded entries (one outcome per reference, each with the
+//            right kind, amount and reason), and that each position equals the contract's holding.
+//            The contract stores no entry: the events are the entries.
 //            The aledgent driver (e2e/aledgent-driver) writes the same `expect.json`, so switching
 //            drivers changes nothing here.
 //   faults   Fault injection with the script driver: drop the connection mid-submit, kill the
 //            submitter between signing and submitting, prune node state, and land a deposit in the
 //            same gap as a withdrawal. Starving a light client of peers is the aledgent driver's
 //            (`e2e/drivers/aledgent.sh faults`, which runs every case through the adapter).
+//   upgrade  The upgrade from v2 (T-043-03), with V2_BUNDLE set to v2's `.contract` bundle: a
+//            second app of the same community runs v2 and takes entries, which v2 stores; then the
+//            community upgrades it to this code (`publish_upgrade`, `upgrade`); more entries,
+//            a call that fails in its own frame, governance named, and the full reset; the fold of
+//            the events equals the chain's head at every step. The suite's own contract is left
+//            as `check final` expects it.
 //   summary  Render `report.json` as Markdown (`summary.md`), for the job summary.
 //   all      deploy, drive, check, faults, summary.
 //
@@ -50,6 +58,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { contractEventsOf, decodeChainHead, startOf } from './chain.mjs';
 import * as drive from './drive.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -89,7 +98,7 @@ function record(list, name, status, detail) {
   if (at >= 0) report[list][at] = entry;
   else report[list].push(entry);
   saveReport();
-  log(`[${status}] ${name}${detail ? `: ${typeof detail === 'string' ? detail : JSON.stringify(detail)}` : ''}`);
+  log(`[${status}] ${name}${detail ? `: ${typeof detail === 'string' ? detail : JSON.stringify(detail, (_, v) => (typeof v === 'bigint' ? v.toString() : v))}` : ''}`);
 }
 
 /// Run one case; a thrown error is the case's failure, recorded, and the phase carries on so that
@@ -135,7 +144,7 @@ async function until(label, fn, timeoutMs = 180_000, everyMs = 3_000) {
 }
 
 /// Decode raw storage bytes with the type a read message returns: `Result<T, LangError>`, and
-/// `Option<T>` inside it for `inbox_entry` and `latest_anchor`. Prefixing `Ok` (and `Some`) lets the
+/// `Option<T>` inside it for `latest_anchor`. Prefixing `Ok` (and `Some`) lets the
 /// ABI's own codec decode exactly what the contract stored.
 function decodeAs(abi, message, raw, optional) {
   const m = abi.findMessage(message);
@@ -147,9 +156,10 @@ function decodeAs(abi, message, raw, optional) {
   return optional ? ok.unwrap() : ok;
 }
 
-/// The contract's storage at one block, by child-trie key: `head`, `inbox[seq]`, `latest_anchor`,
-/// `positions[asset]`. This is the adapter's path (F-026 NOTES, "How the adapter reads outcomes at
-/// finality").
+/// The contract's storage at one block, by child-trie key: `head`, the chain's head cell,
+/// `latest_anchor`, `positions[asset]`. This is the adapter's path (F-026 NOTES, "How the adapter
+/// reads outcomes at finality"). No entry is stored (amendment 0040): entries are read from events
+/// (`entriesAt`).
 async function view(api, abi, address, hash) {
   const at = await api.at(hash);
   const info = (await at.query.contracts.contractInfoOf(address)).unwrap();
@@ -168,12 +178,18 @@ async function view(api, abi, address, hash) {
       const h = decodeAs(abi, 'head', bytes, false);
       return { lastAnchor: Number(h.lastAnchor.toString()), nextSeq: Number(h.nextSeq.toString()), prunedTo: Number(h.prunedTo.toString()) };
     },
-    async entryBytes(seq) {
-      return raw(drive.contractKey(K.inbox, u64(seq)));
+    /// The chain's head cell as stored (null if absent), and as the contract reads it.
+    async chainCell() {
+      return raw(drive.contractKey(K.chain));
     },
-    async entry(seq) {
-      const bytes = await raw(drive.contractKey(K.inbox, u64(seq)));
-      return bytes ? decodeAs(abi, 'inboxEntry', bytes, true) : null;
+    async chainHead() {
+      const h = await this.head();
+      return decodeChainHead(await raw(drive.contractKey(K.chain)), h.nextSeq);
+    },
+    /// Whether v2's stored entry at `seq` is present (only an instance upgraded from v2 and not
+    /// reset since has any).
+    async storedEntry(seq) {
+      return raw(drive.contractKey(K.inbox, u64(seq)));
     },
     async latestAnchor() {
       const bytes = await raw(drive.contractKey(K.latestAnchor));
@@ -192,54 +208,26 @@ async function assetBalance(api, hash, asset, who) {
   return account.isSome ? big(account.unwrap().balance) : 0n;
 }
 
-/// `Refusal` (and nested enums) as `BoundExceeded` or `Kreivo(Assets(CannotTransfer))`.
-function renderEnum(codec) {
-  const isEnum = (c) => c && typeof c.type === 'string' && 'isBasic' in c;
-  if (!isEnum(codec)) return codec?.toString();
-  if (codec.isBasic) return codec.type;
-  const inner = codec.value;
-  // Not `isEmpty`: an enum whose own value is a unit variant reports itself empty too.
-  if (isEnum(inner)) return `${codec.type}(${renderEnum(inner)})`;
-  if (!inner || inner.toRawType?.() === 'Null') return codec.type;
-  return `${codec.type}(${inner.toString()})`;
-}
+const renderEnum = drive.renderEnum;
 
 /// `{"here":1}` (a codec's JSON) against `{"Here":1}` (the configuration's).
 const sameAsset = (json, asset) => json.toLowerCase() === JSON.stringify(asset).toLowerCase();
 
-/// An inbox entry as plain values: `{ seq, at, kind, operationRef, accountRef, from, to, asset,
-/// amount, reason, number, commitment }`.
-function plainEntry(seq, entry) {
-  const ev = entry.event;
-  const body = ev.value;
-  const get = (name) => (body.get ? body.get(name) : body[name]);
-  const out = { seq, at: Number(entry.at.toString()), kind: ev.type };
-  const opt = (name, f) => {
-    const v = get(name);
-    if (v !== undefined && v !== null) out[name] = f(v);
+/// Every entry of the contract's current chain at finalized block `fin`, rebuilt from its events
+/// and folded: fails unless every position from the chain's start appears once, in order, and the
+/// fold equals the chain's head (read by raw key and by query at `fin`, `drive.mjs` `foldAt`).
+/// `{ head, chain, entries }`, entries as plain values with BigInt amounts.
+async function entriesAt(api, abi, address, fin) {
+  const { head, chain, fold } = await drive.foldAt(api, abi, address, fin);
+  const entries = fold.entries.map((e) => (e.amount === undefined ? e : { ...e, amount: BigInt(e.amount) }));
+  return {
+    head: { lastAnchor: Number(head.lastAnchor), nextSeq: Number(head.nextSeq), prunedTo: Number(head.prunedTo) },
+    chain: { position: Number(chain.position), digest: chain.digest, start: startOf(chain) === null ? null : Number(startOf(chain)) },
+    // Where the fold's chain started: at instantiation, at an upgrade, or at the last reset.
+    foldStart: Number(fold.start),
+    resets: fold.resets,
+    entries,
   };
-  opt('operationRef', (v) => v.toHex());
-  opt('accountRef', (v) => v.toHex());
-  opt('from', (v) => v.toHex());
-  opt('to', (v) => (v.type === 'Account' ? v.value.toHex() : JSON.stringify(v.toJSON())));
-  opt('asset', (v) => JSON.stringify(v.toJSON()));
-  opt('amount', (v) => big(v));
-  opt('reason', (v) => renderEnum(v));
-  opt('number', (v) => Number(v.toString()));
-  opt('commitment', (v) => v.toHex());
-  return out;
-}
-
-/// Every unpruned inbox entry at `hash`, in order, failing on a gap (`REQ-SL-9`).
-async function inbox(v) {
-  const head = await v.head();
-  const entries = [];
-  for (let seq = head.prunedTo; seq < head.nextSeq; seq++) {
-    const e = await v.entry(seq);
-    if (!e) fail(`inbox[${seq}] is missing below next_seq ${head.nextSeq}: the inbox has a gap`);
-    entries.push(plainEntry(seq, e));
-  }
-  return { head, entries };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -297,10 +285,47 @@ async function dryRunExecute(ctx, envelopes, gasLimit = gasMax(ctx.api)) {
   return {
     refTime: big(q.gasRequired.refTime),
     proofSize: big(q.gasRequired.proofSize),
+    consumed: { refTime: big(q.gasConsumed.refTime), proofSize: big(q.gasConsumed.proofSize) },
     storageDeposit: q.storageDeposit.isCharge ? big(q.storageDeposit.asCharge) : -big(q.storageDeposit.asRefund),
     outcomes,
   };
 }
+
+/// `execute_with_limits(envelopes, limits)` dry run, as `dryRunExecute`.
+async function dryRunWithLimits(ctx, envelopes, limits, gasLimit = gasMax(ctx.api)) {
+  const { api, accounts, abi } = ctx;
+  const contract = drive.contractOf(api, abi);
+  const q = await contract.query.executeWithLimits(accounts.key.address, { gasLimit, storageDepositLimit: null }, envelopes, limits);
+  if (q.result.isErr) return { failed: q.result.asErr.toString() };
+  if (q.result.asOk.flags.isRevert) fail(`execute_with_limits dry run reverted: ${JSON.stringify(q.output?.toHuman())}`);
+  const result = q.output.asOk ?? q.output;
+  if (result.isErr) fail(`execute_with_limits refused the batch: ${JSON.stringify(result.asErr.toHuman())}`);
+  return {
+    refTime: big(q.gasRequired.refTime),
+    proofSize: big(q.gasRequired.proofSize),
+    consumed: { refTime: big(q.gasConsumed.refTime), proofSize: big(q.gasConsumed.proofSize) },
+    outcomes: result.asOk.map((o) => (o.isApplied ? 'Applied' : `Refused(${renderEnum(o.asRefused.reason)})`)),
+  };
+}
+
+/// What `execute` keeps back to record one call as refused (`src/types.rs` `REFUSAL_RESERVE`),
+/// checked here against what recording a refusal costs. The contract does not expose it, so it is
+/// read from the source the bundle was built from (`Weight::new(ref_time, proof_size)`, each an
+/// integer or `a * b`); `REFUSAL_RESERVE=refTime,proofSize` overrides it, to measure another build.
+function refusalReserve() {
+  if (env('REFUSAL_RESERVE', '')) {
+    const [r, p] = env('REFUSAL_RESERVE', '').split(',');
+    return { refTime: BigInt(r), proofSize: BigInt(p) };
+  }
+  const source = readFileSync(resolve(here, '../src/types.rs'), 'utf8');
+  const m = /pub const REFUSAL_RESERVE: Weight = Weight::new\(([^,]+),\s*([^)]+)\);/.exec(source) ?? fail('REFUSAL_RESERVE not found in src/types.rs');
+  const value = (expr) => expr.split('*').map((t) => BigInt(t.trim().replace(/_/g, ''))).reduce((a, b) => a * b, 1n);
+  return { refTime: value(m[1]), proofSize: value(m[2]) };
+}
+const REFUSAL_RESERVE = refusalReserve();
+/// The largest asset id a call can carry (`AssetId::External` with an Ethereum network and a
+/// parachain), so that a refusal's event, which carries the call, is as large as it gets.
+const LARGEST_ASSET = { External: { network: { Ethereum: { chainId: '18446744073709551615' } }, child: { id: 65535, pallet: 255, index: 4294967295 } } };
 
 /// Whether the deployed code runs each call in a frame of its own (`apply`, F-026 decision 23).
 const isolatesCalls = (abi) => abi.messages.some((m) => m.method === 'apply');
@@ -471,14 +496,27 @@ const phases = {
       saveExpect();
     });
 
-    ok &= await runCase('scenarios', `full batch of ${MAX_CALLS} withdrawals`, async () => {
-      const refs = Array.from({ length: MAX_CALLS }, ref);
+    // `MAX_CALLS` withdrawals to accounts, if their dry run fits a normal extrinsic less the
+    // headroom `executeTx` keeps; otherwise the most that fit. Under v2 the full batch dry-ran at
+    // 2.05 MB; each entry now also reads and writes the chain's head (about 10 KB of proof size
+    // more), and 32 dry-run at about 2.41 MB of the 2.45 MB an extrinsic may prove (T-043-03). The
+    // adapter sizes every batch by its dry run (`F-027`, T-027-09); `MAX_CALLS` is only the
+    // contract's bound.
+    ok &= await runCase('scenarios', `full batch of withdrawals (${MAX_CALLS}, or the most that fit an extrinsic)`, async () => {
+      const max = api.consts.system.blockWeights.perClass.normal.maxExtrinsic.unwrap();
+      const cap = BigInt(max.proofSize.toString()) - 64n * 1024n;
+      const one = await dryRunExecute(ctx, [withdrawal(ref(), accounts.payee, ASSET, WITHDRAW)]);
+      const all = await dryRunExecute(ctx, Array.from({ length: MAX_CALLS }, () => withdrawal(ref(), accounts.payee, ASSET, WITHDRAW)));
+      const per = (all.proofSize - one.proofSize) / BigInt(MAX_CALLS - 1);
+      const n = all.proofSize <= cap ? MAX_CALLS : Number((cap - one.proofSize) / per) + 1;
+      report.findings.fullBatchToAccounts = { maxCalls: MAX_CALLS, dryRunProofSize: all.proofSize, perCall: per, extrinsicProofSize: big(max.proofSize), sent: n };
+      const refs = Array.from({ length: n }, ref);
       const { tx, query } = await executeTx(ctx, refs.map((r) => withdrawal(r, accounts.payee, ASSET, WITHDRAW)));
-      const { events, blockHash } = await drive.send(tx, accounts.key, `execute (${MAX_CALLS} withdrawals)`);
-      report.measurements.executeFullBatch = costOf(api, query, events);
+      const { events, blockHash } = await drive.send(tx, accounts.key, `execute (${n} withdrawals)`);
+      report.measurements.executeFullBatch = { calls: n, ...costOf(api, query, events) };
       for (const r of refs) expectations.push({ kind: 'Withdrawn', operationRef: r, to: accounts.payee, asset: ASSET, amount: WITHDRAW });
       saveExpect();
-      return `finalized in ${blockHash.toHex()}`;
+      return `${n} withdrawals${n < MAX_CALLS ? ` (${MAX_CALLS} dry-run at ${all.proofSize} B, over the ${cap} B an extrinsic leaves them)` : ''}; finalized in ${blockHash.toHex()}`;
     });
 
     // What one more call costs, by destination: dry runs of a batch of one and of `MAX_CALLS`, at
@@ -575,13 +613,39 @@ const phases = {
       const holdingAfter = await assetBalance(api, blockHash, ASSET, peer);
       if (peerAfter.nextSeq - peerBefore.nextSeq !== 1) fail(`the receiving deployment wrote ${peerAfter.nextSeq - peerBefore.nextSeq} entries, expected 1`);
       if (holdingAfter - holdingBefore !== WITHDRAW) fail(`the receiving deployment got ${holdingAfter - holdingBefore}, expected ${WITHDRAW}`);
+      // A failed frame's events are gone with it (amendment 0040: the events are the entries). In
+      // the batch's block, the sender emitted a `Withdrawn` for the first call and a `Refused` for
+      // the second, and no `Withdrawn` for it; the receiver emitted one `Deposited` from the
+      // sender, the first call's, and not the second's, which its frame had emitted before it ran
+      // out. Each side's events fold to its own head at that block.
+      const number = (await api.rpc.chain.getHeader(blockHash)).number.toNumber();
+      const records = await (await api.at(blockHash)).query.system.events();
+      const ours = contractEventsOf(abi, contract.address.toString(), records).filter((e) => e.args.operationRef);
+      const theirs = contractEventsOf(abi, peer, records).filter((e) => e.kind === 'Deposited');
+      const op = (e) => e.args.operationRef.toHex();
+      const emitted = ours.map((e) => `${e.kind}:${op(e) === a ? 'a' : op(e) === b ? 'b' : '?'}`).join(',');
+      if (emitted !== 'Withdrawn:a,Refused:b') fail(`the sender's events in #${number}: ${emitted}, expected Withdrawn:a,Refused:b`);
+      const refusedB = ours.find((e) => e.kind === 'Refused');
+      if (renderEnum(refusedB.args.reason) !== 'CallFailed(OutOfGas)') fail(`b refused as ${renderEnum(refusedB.args.reason)}`);
+      if (!refusedB.args.call.isWithdraw || !refusedB.args.call.asWithdraw.to.isDeployment) fail(`b's Refused event does not carry its call: ${JSON.stringify(refusedB.args.call.toJSON())}`);
+      if (theirs.length !== 1 || pk(theirs[0].args.from.toString()) !== pk(contract.address.toString())) fail(`the receiver's Deposited events in #${number}: ${theirs.length}, expected the first call's only`);
+      const peerFold = await entriesAt(api, abi, peer, { hash: blockHash, number });
+      const ourFold = await entriesAt(api, abi, contract.address.toString(), { hash: blockHash, number });
+      report.findings.failedFrameEvents = {
+        block: number,
+        senderEvents: emitted,
+        refusedCall: refusedB.args.call.toJSON(),
+        receiverDeposited: theirs.length,
+        receiverChain: peerFold.chain,
+        senderChain: ourFold.chain,
+      };
       expectations.push(
         { kind: 'Withdrawn', operationRef: a, toDeployment: peer, asset: ASSET, amount: WITHDRAW },
         { kind: 'Refused', operationRef: b, reason: 'CallFailed(OutOfGas)' },
       );
       saveExpect();
       report.findings.callIsolation = { proofSizeGiven: lo, proofSizeToApplyBoth: hi, dryRunBoth: full.proofSize, peerEntries: peerAfter.nextSeq - peerBefore.nextSeq };
-      return `with ${lo} of proof size the second call is refused as CallFailed(OutOfGas) (${hi} applies both); the receiver recorded and holds only the first`;
+      return `with ${lo} of proof size the second call is refused as CallFailed(OutOfGas) (${hi} applies both); the receiver recorded and holds only the first; the starved frame's events are gone (sender ${emitted}, receiver one Deposited), and both sides' events fold to their heads at #${number}`;
     });
 
     // The same, with the weights known ahead of time (the owner, 2026-09-29): each call's limit is
@@ -634,6 +698,125 @@ const phases = {
       saveExpect();
       report.findings.perCallLimits = { dryRunLimits: limits, halved: short[1] };
       return `limits ${JSON.stringify(limits, (_, v) => (typeof v === 'bigint' ? v.toString() : v))}: all applied; with the second halved it is refused as CallFailed(OutOfGas) and the others apply (checked at finality)`;
+    });
+
+    // `REFUSAL_RESERVE` (T-043-03, the reviewer's worst case): what `execute` keeps back to record a
+    // call as refused, now that a refusal reads and writes the chain's head, hashes twice and emits
+    // the call in its event. Measured by the marginal cost of one more refusal of the largest call
+    // (a withdrawal to another deployment, of the largest asset id), three ways, then checked by
+    // behaviour: a batch of such calls whose frames are starved still records every refusal, at
+    // every gas limit from the least that records any outcome up.
+    ok &= await runCase('scenarios', 'the cost of recording a refusal, against REFUSAL_RESERVE (the largest call)', async () => {
+      const peer = await peerDeployment(ctx);
+      const K = 8;
+      const toPeer = () => toDeployment(ref(), peer, ref(), LARGEST_ASSET, U128_MAX);
+      const toAccount = () => withdrawal(ref(), accounts.payee, LARGEST_ASSET, U128_MAX);
+      const marginal = (one, many) => ({
+        required: { refTime: (many.refTime - one.refTime) / BigInt(K - 1), proofSize: (many.proofSize - one.proofSize) / BigInt(K - 1) },
+        consumed: { refTime: (many.consumed.refTime - one.consumed.refTime) / BigInt(K - 1), proofSize: (many.consumed.proofSize - one.consumed.proofSize) / BigInt(K - 1) },
+      });
+      const outcomesOf = (d, want) => {
+        if (d.failed || d.outcomes.some((o) => o !== want)) fail(`expected every call ${want}: ${d.failed ?? d.outcomes.join(', ')}`);
+      };
+      const out = {};
+      // (a) A refusal alone: an anchor out of order, whose check reads nothing, refused in the
+      //     batch's own frame. What the reserve must cover (proof size does not grow with the
+      //     event's bytes; ref time does, a little).
+      {
+        const head = await (await view(api, abi, contract.address.toString(), (await finalized(api)).hash)).head();
+        const outOfOrder = () => anchorCall(ref(), head.lastAnchor + 5, u8aToHex(randomBytes(32)));
+        const one = await dryRunExecute(ctx, [outOfOrder()]);
+        const many = await dryRunExecute(ctx, Array.from({ length: K }, outOfOrder));
+        outcomesOf(one, 'Refused(AnchorOutOfOrder)');
+        outcomesOf(many, 'Refused(AnchorOutOfOrder)');
+        out.refusalAlone = marginal(one, many);
+        // Every dry run asks for more than it uses: a storage read is charged for the whole
+        // buffer first (ink!'s 16 KiB) and the rest given back after, so a refusal needs that
+        // much room on top while it reads the chain's head.
+        out.transient = { proofSize: one.proofSize - one.consumed.proofSize, refTime: one.refTime - one.consumed.refTime };
+      }
+      // (a') Inline, the largest withdrawal to an account (no bound): the refusal and its checks.
+      {
+        const one = await dryRunExecute(ctx, [toAccount()]);
+        const many = await dryRunExecute(ctx, Array.from({ length: K }, toAccount));
+        outcomesOf(one, 'Refused(NoWithdrawalBound)');
+        outcomesOf(many, 'Refused(NoWithdrawalBound)');
+        out.inlineRefusal = marginal(one, many);
+      }
+      // (b) A withdrawal to another deployment, refused in its own frame (no bound): the frame and
+      //     the refusal in it.
+      {
+        const one = await dryRunExecute(ctx, [toPeer()]);
+        const many = await dryRunExecute(ctx, Array.from({ length: K }, toPeer));
+        outcomesOf(one, 'Refused(NoWithdrawalBound)');
+        outcomesOf(many, 'Refused(NoWithdrawalBound)');
+        out.deploymentRefusedInFrame = marginal(one, many);
+      }
+      // (c) The same, each frame given a limit of 1 so that it runs out at once: the batch records
+      //     each as `CallFailed(OutOfGas)` from what it kept back. The making of the frame and the
+      //     refusal recorded by the batch, which is the path the reserve exists for.
+      if (abi.messages.some((m) => m.method === 'executeWithLimits')) {
+        const tiny = { refTime: 1n, proofSize: 1n };
+        const one = await dryRunWithLimits(ctx, [toPeer()], [tiny]);
+        const many = await dryRunWithLimits(ctx, Array.from({ length: K }, toPeer), Array.from({ length: K }, () => tiny));
+        outcomesOf(one, 'Refused(CallFailed(OutOfGas))');
+        outcomesOf(many, 'Refused(CallFailed(OutOfGas))');
+        out.deploymentFrameFailed = marginal(one, many);
+      }
+      // (d) Behaviour: K withdrawals to the deployment by `execute`, at gas limits from the least
+      //     that records anything to what applies them all, in proof size (ref time ample) and in
+      //     ref time (proof size ample). Above the least limit that records every call, no limit
+      //     may revert the batch whole: that would be a frame that ran out leaving too little to
+      //     record its refusal.
+      const envelopes = Array.from({ length: K }, toPeer);
+      const full = await dryRunExecute(ctx, envelopes);
+      outcomesOf(full, 'Refused(NoWithdrawalBound)');
+      const ample = gasMax(api);
+      const sweep = async (part, top) => {
+        const points = [];
+        const steps = 96;
+        for (let i = 1; i <= steps; i++) {
+          const v = (top * BigInt(i)) / BigInt(steps);
+          const limit = part === 'proofSize' ? { refTime: big(ample.refTime), proofSize: v } : { refTime: v, proofSize: big(ample.proofSize) };
+          const d = await dryRunExecute(ctx, envelopes, api.registry.createType('WeightV2', limit));
+          points.push({ [part]: v, result: d.failed ? `reverted: ${d.failed}` : d.outcomes.map((o) => (o === 'Refused(NoWithdrawalBound)' ? 'R' : o === 'Refused(CallFailed(OutOfGas))' ? 'O' : o)).join('') });
+        }
+        const firstAll = points.findIndex((p) => !p.result.startsWith('reverted'));
+        const trapsAbove = firstAll < 0 ? [] : points.slice(firstAll).filter((p) => p.result.startsWith('reverted'));
+        return { leastRecordingAll: firstAll < 0 ? null : points[firstAll][part], trapsAbove, points };
+      };
+      out.sweep = {
+        calls: K,
+        fullDryRun: { refTime: full.refTime, proofSize: full.proofSize, consumed: full.consumed },
+        proofSize: await sweep('proofSize', full.proofSize + full.proofSize / 8n),
+        refTime: await sweep('refTime', full.refTime + full.refTime / 8n),
+      };
+      report.measurements.refusalReserve = { reserve: REFUSAL_RESERVE, ...out };
+      saveReport();
+      const fits = (m) => m.consumed.refTime <= REFUSAL_RESERVE.refTime && m.consumed.proofSize <= REFUSAL_RESERVE.proofSize;
+      const problems = [];
+      if (!fits(out.refusalAlone)) problems.push(`a refusal costs ${out.refusalAlone.consumed.refTime} ps and ${out.refusalAlone.consumed.proofSize} B, more than the reserve (${REFUSAL_RESERVE.refTime} ps, ${REFUSAL_RESERVE.proofSize} B)`);
+      for (const part of ['proofSize', 'refTime']) {
+        const s = out.sweep[part];
+        if (s.leastRecordingAll === null) problems.push(`${part}: no limit in the sweep records the batch`);
+        if (s.trapsAbove.length) problems.push(`${part}: the batch reverts whole at ${s.trapsAbove.map((p) => p[part]).join(', ')}, above ${s.leastRecordingAll}, which records every call`);
+        if (!s.points.some((p) => p.result.includes('O'))) problems.push(`${part}: no limit in the sweep starved a frame`);
+      }
+      if (problems.length) fail(problems.join('; '));
+      // One such batch for real, at the least proof size the sweep found records every call plus
+      // an eighth: every call is refused under its reference, none reverts the batch.
+      const least = out.sweep.proofSize.leastRecordingAll;
+      const sent = Array.from({ length: K }, toPeer);
+      const gasLimit = api.registry.createType('WeightV2', { refTime: full.refTime * 2n, proofSize: least + least / 8n });
+      const { blockHash } = await drive.send(contract.tx.execute({ gasLimit, storageDepositLimit: null }, sent), accounts.key, `execute (${K} refused withdrawals to a deployment, the largest call)`);
+      const number = (await api.rpc.chain.getHeader(blockHash)).number.toNumber();
+      const { entries } = await entriesAt(api, abi, contract.address.toString(), { hash: blockHash, number });
+      const reasons = sent.map((e) => entries.filter((x) => x.operationRef === e.operationRef));
+      if (reasons.some((r) => r.length !== 1 || r[0].kind !== 'Refused')) fail(`the real batch: ${JSON.stringify(reasons.map((r) => r.map((x) => `${x.kind}(${x.reason})`)))}`);
+      for (const [i, e] of sent.entries()) expectations.push({ kind: 'Refused', operationRef: e.operationRef, reason: reasons[i][0].reason });
+      saveExpect();
+      const fmt = (m) => `${m.consumed.refTime} ps / ${m.consumed.proofSize} B consumed (${m.required.refTime} / ${m.required.proofSize} required)`;
+      return `reserve ${REFUSAL_RESERVE.refTime} ps / ${REFUSAL_RESERVE.proofSize} B; one more refusal: alone ${fmt(out.refusalAlone)} (and ${out.transient.proofSize} B of room while it reads); inline withdrawal ${fmt(out.inlineRefusal)}; to a deployment, in its frame ${fmt(out.deploymentRefusedInFrame)}${out.deploymentFrameFailed ? `; frame run out ${fmt(out.deploymentFrameFailed)}` : ''}. Sweep of ${K} starved calls: every limit from ${out.sweep.proofSize.leastRecordingAll} B and from ${out.sweep.refTime.leastRecordingAll} ps records every call. Sent at ${least + least / 8n} B: ${reasons.map((r) => r[0].reason).join(', ')}`;
     });
 
     ok &= await runCase('scenarios', 'deposit of a non-sufficient asset', async () => {
@@ -689,16 +872,18 @@ const phases = {
     let fin;
     let v;
     let head;
+    let chain;
+    let foldStart;
     let entries;
     const deadline = Date.now() + 180_000;
     for (;;) {
       fin = await finalized(api);
       v = await view(api, abi, address, fin.hash);
-      ({ head, entries } = await inbox(v));
+      ({ head, chain, foldStart, entries } = await entriesAt(api, abi, address, fin));
       if (expected(entries) || Date.now() > deadline) break;
       await sleep(6_000);
     }
-    report[tag ? 'inboxFinal' : 'inbox'] = { finalized: fin.number, head, entries: entries.length };
+    report[tag ? 'chainFinal' : 'chain'] = { finalized: fin.number, head, chain, entries: entries.length };
     let ok = true;
 
     ok &= await runCase('scenarios', `every expectation has exactly one outcome, at finality${tag}`, async () => {
@@ -771,32 +956,17 @@ const phases = {
       return out;
     });
 
-    ok &= await runCase('scenarios', `events agree with storage at finality${tag}`, async () => {
-      // Events at each entry's block, from the collator (default pruning keeps 256 blocks).
-      const byBlock = new Map();
-      for (const e of entries) byBlock.set(e.at, [...(byBlock.get(e.at) ?? []), e]);
-      let matched = 0;
-      const problems = [];
-      for (const [number, list] of byBlock) {
-        const hash = await api.rpc.chain.getBlockHash(number);
-        const records = await (await api.at(hash)).query.system.events();
-        const emitted = new Map();
-        for (const record of records) {
-          const { event } = record;
-          if (event.section !== 'contracts' || event.method !== 'ContractEmitted' || event.data[0].toString() !== address) continue;
-          const decoded = abi.decodeEvent(record);
-          const name = decoded.event.identifier.split('::').pop();
-          if (!['Deposited', 'Withdrawn', 'Anchored', 'Refused', 'Bound'].includes(name)) continue;
-          emitted.set(Number(decoded.args[0].toString()), name);
-        }
-        for (const e of list) {
-          if (emitted.get(e.seq) === e.kind) matched++;
-          else problems.push(`inbox[${e.seq}] ${e.kind} at #${number}: event ${emitted.get(e.seq) ?? 'missing'}`);
-        }
-      }
-      report.findings.eventsVersusStorage = { entries: entries.length, eventsMatching: matched, problems };
-      if (problems.length) fail(problems.join('; '));
-      return `${matched} of ${entries.length} entries have their event, at the entry's block`;
+    ok &= await runCase('scenarios', `the events fold to the chain's head at finality, and nothing is stored per entry${tag}`, async () => {
+      // `entriesAt` has already failed unless every position appears once, in order, and the fold
+      // equals the head. Here: the cell as stored agrees with the head, and no entry is stored
+      // anywhere a v2 reader would look (`inbox[seq]`, root key 4) for any position of the chain.
+      const cell = await v.chainCell();
+      const stored = [];
+      for (let seq = foldStart; seq < chain.position; seq++) if (await v.storedEntry(seq)) stored.push(seq);
+      if (stored.length) fail(`entries stored at ${stored.join(', ')}`);
+      const detail = { finalized: fin.number, position: chain.position, start: foldStart, digest: chain.digest, cell: cell ? 'stored' : 'absent (no entry yet)', entries: entries.length };
+      report.findings[tag ? 'foldFinal' : 'fold'] = detail;
+      return detail;
     });
 
     saveReport();
@@ -823,11 +993,12 @@ const phases = {
       }
     }
 
-    // Both proofs of "not executed" (owner, 2026-09-24): the inbox at finality has no entry for
-    // the reference, and the signing key's nonce the extrinsic used is still unconsumed.
+    // Both proofs of "not executed" (owner, 2026-09-24): the chain at finality has no entry for
+    // the reference (its events, folded to the head), and the signing key's nonce the extrinsic
+    // used is still unconsumed.
     const proofs = async (operationRef, nonce) => {
       const fin = await finalized(api);
-      const { entries } = await inbox(await view(api, abi, address, fin.hash));
+      const { entries } = await entriesAt(api, abi, address, fin);
       const entry = entries.find((e) => e.operationRef === operationRef) ?? null;
       const finalizedNonce = (await (await api.at(fin.hash)).query.system.account(key.address)).nonce.toNumber();
       return { fin, entry, nonceConsumed: finalizedNonce > nonce, finalizedNonce };
@@ -885,7 +1056,7 @@ const phases = {
         const payeeAfter = await payeeBalance();
         const credited = payeeAfter - payeeBefore;
         if (settled.nonceConsumed) {
-          if (!settled.entry) fail(`${variant}: the nonce was consumed but the inbox has no entry for the reference`);
+          if (!settled.entry) fail(`${variant}: the nonce was consumed but the chain has no entry for the reference`);
           if (settled.entry.kind !== 'Withdrawn' || credited !== WITHDRAW) fail(`${variant}: ${settled.entry.kind}, payee credited ${credited}`);
         } else {
           if (settled.entry) fail(`${variant}: an entry exists but the nonce is unconsumed`);
@@ -894,11 +1065,11 @@ const phases = {
         const rejected = await expectRejected(hex, variant);
         await sleep(12_000);
         const again = await proofs(r, nonce);
-        const count = (await inbox(await view(api, abi, address, again.fin.hash))).entries.filter((e) => e.operationRef === r).length;
+        const count = (await entriesAt(api, abi, address, again.fin)).entries.filter((e) => e.operationRef === r).length;
         if (count > 1) fail(`${variant}: ${count} entries for one reference`);
         if (settled.entry) expectations.push({ kind: 'Withdrawn', operationRef: r, to: accounts.payee, asset: ASSET, amount: WITHDRAW });
         results.push(
-          `${variant}: ${settled.nonceConsumed ? `executed once (inbox[${settled.entry.seq}], payee +${credited})` : 'provably not executed (no entry, nonce unconsumed, expired)'}; resubmitting the same bytes is refused (${rejected})`,
+          `${variant}: ${settled.nonceConsumed ? `executed once (entry ${settled.entry.seq}, payee +${credited})` : 'provably not executed (no entry, nonce unconsumed, expired)'}; resubmitting the same bytes is refused (${rejected})`,
         );
       }
       saveExpect();
@@ -946,13 +1117,17 @@ const phases = {
     // driver submits through a node's RPC and has none.
     record('faults', 'starve the light client of peers', 'pending', 'n/a with the script driver, which has no light client: the aledgent driver runs it (e2e/README.md, "Fault cases")');
 
+    // With no stored entries (amendment 0040), a node that keeps 16 blocks of state serves the
+    // chain's head at its finalized block but not the events of the blocks before: it can say
+    // whether anything is new, not what. A reader behind its window needs a node with the history
+    // (settle's history endpoint, T-043-04).
     ok &= await runCase('faults', 'prune node state', async () => {
       const pruned = await connectPruned();
       if (!pruned) fail('KREIVO_PRUNED_WS is not set');
       try {
         const collatorFin = await finalized(api);
-        const { entries } = await inbox(await view(api, abi, address, collatorFin.hash));
-        const oldest = entries.reduce((a, e) => (a && a.at <= e.at ? a : e), null) ?? fail('the inbox is empty');
+        const { entries } = await entriesAt(api, abi, address, collatorFin);
+        const oldest = entries.reduce((a, e) => (a && a.at <= e.at ? a : e), null) ?? fail('the chain has no entry');
         // Wait until the pruned node has finalized well past its window over the oldest entry.
         const target = oldest.at + PRUNED_STATE_BLOCKS + 8;
         const pf = await until(`pruned node finalizes #${target}`, async () => {
@@ -974,18 +1149,24 @@ const phases = {
         } catch (error) {
           eventsOnCollator = `unreadable: ${String(error.message ?? error).slice(0, 160)}`;
         }
-        // The adapter's path on the pruned node: head and the whole range at its finalized head.
+        // The adapter's path on the pruned node: the chain's head cell at its finalized head, byte
+        // for byte the collator's at that block; and the collator's events fold to it.
         const pv = await view(pruned, abi, address, pf.hash);
         const cv = await view(api, abi, address, pf.hash);
-        const ph = await pv.head();
-        let same = 0;
-        for (let seq = ph.prunedTo; seq < ph.nextSeq; seq++) {
-          const a = await pv.entryBytes(seq);
-          const b = await cv.entryBytes(seq);
-          if (!a || !b || !u8aEq(a, b)) fail(`inbox[${seq}] differs between the pruned node and the collator at #${pf.number}`);
-          same++;
-        }
-        report.findings.prunedNode = { stateBlocks: PRUNED_STATE_BLOCKS, oldestEntryBlock: oldest.at, prunedFinalized: pf.number, eventsAtOldBlock, eventsOnCollator, inboxEntriesReadAtHead: same };
+        const [a, b] = [await pv.chainCell(), await cv.chainCell()];
+        if (!a || !b || !u8aEq(a, b)) fail(`the chain's head differs between the pruned node and the collator at #${pf.number}`);
+        const folded = await entriesAt(api, abi, address, pf);
+        const head = await pv.chainHead();
+        if (head.position !== BigInt(folded.chain.position) || head.digest !== folded.chain.digest) fail(`the pruned node's head (${head.position}, ${head.digest}) is not the collator's fold (${folded.chain.position}, ${folded.chain.digest})`);
+        report.findings.prunedNode = {
+          stateBlocks: PRUNED_STATE_BLOCKS,
+          oldestEntryBlock: oldest.at,
+          prunedFinalized: pf.number,
+          eventsAtOldBlock,
+          eventsOnCollator,
+          chainHeadAtPrunedHead: { position: head.position.toString(), digest: head.digest },
+          foldedFromCollatorEvents: folded.entries.length,
+        };
         if (eventsAtOldBlock.startsWith('readable')) fail(`the pruned node still serves #${oldest.at}'s events at #${pf.number}: pruning did not take effect`);
         return report.findings.prunedNode;
       } finally {
@@ -1007,13 +1188,9 @@ const phases = {
       const [dep, wd] = await Promise.all([drive.send(depositTx, accounts.depositor, 'deposit (same gap)'), drive.send(withdrawTx, key, 'execute (same gap)')]);
       const f1 = await finalized(api);
       const v1 = await view(api, abi, address, f1.hash);
-      const head = await v1.head();
-      const range = [];
-      for (let seq = cursor; seq < head.nextSeq; seq++) {
-        const e = await v1.entry(seq);
-        if (!e) fail(`gap at inbox[${seq}]`);
-        range.push(plainEntry(seq, e));
-      }
+      const { head, entries } = await entriesAt(api, abi, address, f1);
+      // One range from the cursor: every entry after it, folded to the head.
+      const range = entries.filter((e) => e.seq >= cursor);
       const kinds = range.map((e) => e.kind).sort();
       if (range.length !== 2 || kinds[0] !== 'Deposited' || kinds[1] !== 'Withdrawn') fail(`one range read from the cursor returned ${JSON.stringify(range.map((e) => e.kind))}`);
       if (range.find((e) => e.kind === 'Deposited').accountRef !== d || range.find((e) => e.kind === 'Withdrawn').operationRef !== w) fail('the entries carry other references');
@@ -1027,7 +1204,7 @@ const phases = {
         { kind: 'Withdrawn', operationRef: w, to: accounts.payee, asset: ASSET, amount: WITHDRAW },
       );
       saveExpect();
-      return `inbox[${cursor}..${head.nextSeq}) = ${range.map((e) => `${e.kind}@#${e.at}`).join(', ')} (${sameBlock ? 'same block' : 'different blocks'}; finalized in ${dep.blockHash.toHex().slice(0, 10)} and ${wd.blockHash.toHex().slice(0, 10)}); position ${position0} -> ${position1}`;
+      return `entries [${cursor}..${head.nextSeq}) = ${range.map((e) => `${e.kind}@#${e.at}`).join(', ')} (${sameBlock ? 'same block' : 'different blocks'}; finalized in ${dep.blockHash.toHex().slice(0, 10)} and ${wd.blockHash.toHex().slice(0, 10)}); position ${position0} -> ${position1}`;
     });
 
     saveReport();
@@ -1043,7 +1220,7 @@ const phases = {
     for (const [title, list] of [['Scenarios', report.scenarios], ['Fault injection (T-027-06)', report.faults]]) {
       lines.push('', `### ${title}`, '', '| Case | Result | Detail |', '|---|---|---|');
       for (const c of list) {
-        const detail = (typeof c.detail === 'string' ? c.detail : JSON.stringify(c.detail ?? '')).replace(/\n/g, ' ').replace(/\|/g, '\\|').slice(0, 600);
+        const detail = (typeof c.detail === 'string' ? c.detail : JSON.stringify(c.detail ?? '', (_, v) => (typeof v === 'bigint' ? v.toString() : v))).replace(/\n/g, ' ').replace(/\|/g, '\\|').slice(0, 600);
         lines.push(`| ${c.name} | ${icon[c.status] ?? c.status} | ${detail} |`);
       }
     }
@@ -1062,7 +1239,7 @@ const phases = {
       }
     }
     lines.push('', '### Findings', '', '```json', JSON.stringify(report.findings ?? {}, (_, v) => (typeof v === 'bigint' ? v.toString() : v), 2), '```');
-    if (report.inbox) lines.push('', `Inbox at finalized #${report.inbox.finalized}: ${report.inbox.entries} entries, head ${JSON.stringify(report.inbox.head)}.`);
+    if (report.chain) lines.push('', `Chain at finalized #${report.chain.finalized}: ${report.chain.entries} entries folded to the head ${JSON.stringify(report.chain.chain)}.`);
     writeFileSync(resolve(OUT, 'summary.md'), `${lines.join('\n')}\n`);
     console.log(lines.join('\n'));
   },
@@ -1155,14 +1332,14 @@ phases['deposit-to'] = async (ctx) => {
 };
 
 // `nonexecution <operation-ref> <account> <nonce>`: both proofs of "not executed" (the owner's
-// ruling of 2026-09-24) at the finalized head: the inbox's entry for the reference, if any, and
-// whether the account's nonce has passed `nonce`.
+// ruling of 2026-09-24) at the finalized head: the chain's entry for the reference, if any (its
+// events folded to the head), and whether the account's nonce has passed `nonce`.
 phases.nonexecution = async (ctx) => {
   const [operationRef, account, nonce] = process.argv.slice(3);
   const { api, abi } = ctx;
   const address = drive.contractOf(api, abi).address.toString();
   const fin = await finalized(api);
-  const { entries } = await inbox(await view(api, abi, address, fin.hash));
+  const { entries } = await entriesAt(api, abi, address, fin);
   const entry = entries.find((e) => e.operationRef === operationRef.toLowerCase()) ?? null;
   const finalizedNonce = (await (await api.at(fin.hash)).query.system.account(account)).nonce.toNumber();
   console.log(`RESULT ${JSON.stringify({ finalized: fin.number, entry, finalizedNonce, nonceConsumed: finalizedNonce > Number(nonce) }, (_, v) => (typeof v === 'bigint' ? v.toString() : v))}`);
@@ -1198,6 +1375,247 @@ phases['pruned-events'] = async (ctx) => {
 phases['record-fault'] = async () => {
   const [name, status, detail] = process.argv.slice(3);
   record('faults', name, status, detail);
+};
+
+// ---------------------------------------------------------------------------------------------
+// The upgrade from v2 (T-043-03, amendment 0040)
+// ---------------------------------------------------------------------------------------------
+
+/// Every cell of a contract's child trie at block `hash`, as `{ key (hashed, hex): value (hex) }`.
+async function trieCells(api, address, hash) {
+  const info = (await (await api.at(hash)).query.contracts.contractInfoOf(address)).unwrap();
+  const child = u8aToHex(u8aConcat(stringToU8a(':child_storage:default:'), info.trieId));
+  const cells = {};
+  let start = null;
+  for (;;) {
+    const keys = await api.rpc.childstate.getKeysPaged(child, '0x', 256, start, hash);
+    for (const k of keys) {
+      const v = await api.rpc.childstate.getStorage(child, k, hash);
+      cells[k.toHex()] = v.isSome ? u8aToHex(v.unwrap().toU8a(true)) : null;
+    }
+    if (keys.length < 256) break;
+    start = keys[keys.length - 1];
+  }
+  return { codeHash: info.codeHash.toHex(), items: info.storageItems.toNumber(), bytes: info.storageBytes.toNumber(), cells };
+}
+
+/// The marginal cost of one more inline refusal of the largest call (see the drive phase's
+/// `REFUSAL_RESERVE` case), on the contract `drive.state.contract` names, with `ctx`'s ABI.
+async function inlineRefusalCost(ctx, payee) {
+  const K = 8;
+  const make = () => withdrawal(ref(), payee, LARGEST_ASSET, U128_MAX);
+  const one = await dryRunExecute(ctx, [make()]);
+  const many = await dryRunExecute(ctx, Array.from({ length: K }, make));
+  for (const d of [one, many]) if (d.failed || d.outcomes.some((o) => o !== 'Refused(NoWithdrawalBound)')) fail(`inline refusals: ${d.failed ?? d.outcomes.join(', ')}`);
+  return {
+    consumed: { refTime: (many.consumed.refTime - one.consumed.refTime) / BigInt(K - 1), proofSize: (many.consumed.proofSize - one.consumed.proofSize) / BigInt(K - 1) },
+    required: { refTime: (many.refTime - one.refTime) / BigInt(K - 1), proofSize: (many.proofSize - one.proofSize) / BigInt(K - 1) },
+  };
+}
+
+phases.upgrade = async (ctx) => {
+  const { api, accounts } = ctx;
+  const v2Path = env('V2_BUNDLE', '') || fail('V2_BUNDLE is not set: the path of v2\'s .contract bundle (code 0x268de8fb…)');
+  const v2Bundle = JSON.parse(readFileSync(resolve(v2Path), 'utf8'));
+  const { Abi } = await import('@polkadot/api-contract');
+  const v2 = { ...ctx, bundle: v2Bundle, abi: new Abi(v2Bundle, api.registry.getChainProperties()) };
+  const peer = report.deploy?.peer ?? fail('no peer deployment: run drive first');
+  const saved = { appId: drive.state.appId, licenseId: drive.state.licenseId, contract: drive.state.contract };
+  const out = (report.upgrade = { v2CodeHash: v2Bundle.source.hash, newCodeHash: ctx.bundle.source.hash, steps: {} });
+  let ok = true;
+  const at = async () => finalized(api);
+  // The fold of the upgraded instance, at the finalized head, against its head: every step.
+  const foldNow = async (label) => {
+    const fin = await at();
+    const r = await entriesAt(api, ctx.abi, drive.state.contract, fin);
+    out.steps[label] = { finalized: fin.number, chain: r.chain, head: r.head, entries: r.entries.length };
+    saveReport();
+    return r;
+  };
+  try {
+    // 1. v2, as a second app of the community, with its own licence and instance.
+    let address;
+    let n;
+    ok &= await runCase('scenarios', 'upgrade: v2 deployed as its own app, with entries v2 stores', async () => {
+      for (const step of ['publish', 'license', 'instantiate']) await drive.steps[step](v2);
+      address = drive.state.contract;
+      out.app = { appId: drive.state.appId, licenseId: drive.state.licenseId, contract: address };
+      const c2 = drive.contractOf(api, v2.abi);
+      await drive.callContract(api, c2, accounts.admin, 'setWithdrawalBound', [ASSET, { amount: BOUND.toString(), period: BOUND_PERIOD }], 'set_withdrawal_bound (v2)');
+      await drive.callContract(api, c2, accounts.depositor, 'deposit', [ref(), ASSET, DEPOSIT.toString()], 'deposit (v2)');
+      const head = (await drive.read(api, c2, 'head')).toJSON();
+      const { tx } = await executeTx(v2, [withdrawal(ref(), accounts.payee, ASSET, WITHDRAW), withdrawal(ref(), accounts.payee, ASSET, U128_MAX), anchorCall(ref(), Number(head.lastAnchor) + 1, u8aToHex(randomBytes(32)))]);
+      await drive.send(tx, accounts.key, 'execute (v2)');
+      out.v2InlineRefusal = await inlineRefusalCost(v2, accounts.payee);
+      const fin = await at();
+      const h = await (await view(api, v2.abi, address, fin.hash)).head();
+      n = h.nextSeq;
+      const stored = [];
+      for (let seq = 0; seq < n; seq++) if (await (await view(api, v2.abi, address, fin.hash)).storedEntry(seq)) stored.push(seq);
+      if (stored.length !== n) fail(`v2 stored ${stored.length} of ${n} entries`);
+      return `v2 app ${out.app.appId}, licence ${out.app.licenseId}, ${address}; ${n} entries stored at #${fin.number}`;
+    });
+    if (!ok) fail('v2 could not be deployed');
+
+    // 2. The upgrade: the community publishes this code as the app's next version and upgrades its
+    //    licence's instance (one batch, as the referendum on mainnet dispatches it).
+    let before;
+    let upgradedAt;
+    ok &= await runCase('scenarios', 'upgrade: publish_upgrade and upgrade by the community; every cell byte for byte; the chain head (n, zeros, n)', async () => {
+      before = await trieCells(api, address, (await at()).hash);
+      const code = ctx.bundle.source.wasm;
+      const batch = api.tx.utility.batchAll([api.tx.contractsStore.publishUpgrade(out.app.appId, code), api.tx.contractsStore.upgrade(out.app.appId, out.app.licenseId)]);
+      const { blockHash, events } = await drive.send(batch, accounts.admin, 'contractsStore.publish_upgrade + upgrade');
+      if (!events.some(({ event }) => event.section === 'contracts' && event.method === 'ContractCodeUpdated')) fail('no ContractCodeUpdated');
+      upgradedAt = (await api.rpc.chain.getHeader(blockHash)).number.toNumber();
+      const after = await trieCells(api, address, blockHash);
+      if (after.codeHash !== ctx.bundle.source.hash) fail(`code ${after.codeHash}, expected ${ctx.bundle.source.hash}`);
+      const changed = [...new Set([...Object.keys(before.cells), ...Object.keys(after.cells)])].filter((k) => before.cells[k] !== after.cells[k]);
+      if (changed.length) fail(`cells changed by the upgrade: ${changed.join(', ')}`);
+      const chain = await drive.startFold(api, ctx.abi, address, upgradedAt, { upgrade: true });
+      if (chain.position !== BigInt(n) || (startOf(chain) !== null && startOf(chain) !== BigInt(n)) || chain.digest !== u8aToHex(new Uint8Array(32))) fail(`chain head ${JSON.stringify(chain, drive.big)}, expected (${n}, zeros, ${n})`);
+      out.upgrade = { block: upgradedAt, codeHashBefore: before.codeHash, codeHashAfter: after.codeHash, cells: Object.keys(after.cells).length, chain: { position: Number(chain.position), start: startOf(chain) === null ? null : Number(startOf(chain)), digest: chain.digest } };
+      return out.upgrade;
+    });
+    if (!ok) fail('the upgrade did not go through');
+
+    // 3. Entries under this code: a deposit, a batch (withdrawal, refusal, anchor), and a call to
+    //    another deployment that runs out in its own frame after the receiver recorded it.
+    ok &= await runCase('scenarios', 'upgrade: entries after the upgrade fold to the head; nothing stored; v2 entries untouched', async () => {
+      const c = drive.contractOf(api, ctx.abi);
+      await drive.callContract(api, c, accounts.depositor, 'deposit', [ref(), ASSET, DEPOSIT.toString()], 'deposit (upgraded)');
+      await foldNow('afterDeposit');
+      const head = (await drive.read(api, c, 'head')).toJSON();
+      const { tx } = await executeTx(ctx, [withdrawal(ref(), accounts.payee, ASSET, WITHDRAW), withdrawal(ref(), accounts.payee, ASSET, U128_MAX), anchorCall(ref(), Number(head.lastAnchor) + 1, u8aToHex(randomBytes(32)))]);
+      await drive.send(tx, accounts.key, 'execute (upgraded)');
+      const r = await foldNow('afterBatch');
+      const kinds = r.entries.map((e) => e.kind).join(',');
+      if (kinds !== 'Deposited,Withdrawn,Refused,Anchored') fail(`entries since the upgrade: ${kinds}`);
+      const v = await view(api, ctx.abi, address, (await at()).hash);
+      for (let seq = n; seq < r.chain.position; seq++) if (await v.storedEntry(seq)) fail(`entry ${seq} is stored`);
+      for (let seq = 0; seq < n; seq++) if (!(await v.storedEntry(seq))) fail(`v2's entry ${seq} is gone before the reset`);
+      out.newInlineRefusal = await inlineRefusalCost(ctx, accounts.payee);
+      out.refusalDeltaOverV2 = {
+        refTime: out.newInlineRefusal.consumed.refTime - out.v2InlineRefusal.consumed.refTime,
+        proofSize: out.newInlineRefusal.consumed.proofSize - out.v2InlineRefusal.consumed.proofSize,
+      };
+      return `${kinds} at ${n}..${r.chain.position}, folded to ${r.chain.digest}; v2's ${n} entries still stored; one more inline refusal costs ${out.newInlineRefusal.consumed.refTime} ps / ${out.newInlineRefusal.consumed.proofSize} B (v2: ${out.v2InlineRefusal.consumed.refTime} / ${out.v2InlineRefusal.consumed.proofSize})`;
+    });
+
+    ok &= await runCase('scenarios', 'upgrade: a call that fails in its own frame leaves no event and no entry; both sides fold', async () => {
+      const c = drive.contractOf(api, ctx.abi);
+      const [a, b] = [ref(), ref()];
+      const envelopes = [toDeployment(a, peer, ref(), ASSET, WITHDRAW), toDeployment(b, peer, ref(), ASSET, WITHDRAW)];
+      const single = await dryRunExecute(ctx, [envelopes[1]]);
+      if (single.failed || single.outcomes[0] !== 'Applied') fail(`the second call alone: ${single.failed ?? single.outcomes}`);
+      const limits = [{ refTime: single.refTime, proofSize: single.proofSize }, { refTime: single.refTime, proofSize: single.proofSize / 2n }];
+      const q = await c.query.executeWithLimits(accounts.key.address, { gasLimit: gasMax(api), storageDepositLimit: null }, envelopes, limits);
+      if (q.result.isErr) fail(`dry run: ${q.result.asErr.toString()}`);
+      const gasLimit = api.registry.createType('WeightV2', { refTime: (big(q.gasRequired.refTime) * 3n) / 2n, proofSize: (big(q.gasRequired.proofSize) * 3n) / 2n });
+      const { blockHash } = await drive.send(c.tx.executeWithLimits({ gasLimit, storageDepositLimit: null }, envelopes, limits), accounts.key, 'execute_with_limits (upgraded; second call given half)');
+      const number = (await api.rpc.chain.getHeader(blockHash)).number.toNumber();
+      const records = await (await api.at(blockHash)).query.system.events();
+      const ours = contractEventsOf(ctx.abi, address, records).filter((e) => e.args.operationRef);
+      const theirs = contractEventsOf(ctx.abi, peer, records).filter((e) => e.kind === 'Deposited');
+      const op = (e) => e.args.operationRef.toHex();
+      const emitted = ours.map((e) => `${e.kind}:${op(e) === a ? 'a' : op(e) === b ? 'b' : '?'}`).join(',');
+      if (emitted !== 'Withdrawn:a,Refused:b') fail(`the sender's events in #${number}: ${emitted}`);
+      const reason = renderEnum(ours[1].args.reason);
+      if (reason !== 'CallFailed(OutOfGas)') fail(`b refused as ${reason}`);
+      if (theirs.length !== 1) fail(`the receiver emitted ${theirs.length} Deposited events in #${number}, expected the first call's only`);
+      const mine = await entriesAt(api, ctx.abi, address, { hash: blockHash, number });
+      const theirsFold = await entriesAt(api, ctx.abi, peer, { hash: blockHash, number });
+      await foldNow('afterFailedFrame');
+      out.failedFrame = { block: number, sender: emitted, reason, receiverDeposited: theirs.length, senderChain: mine.chain, receiverChain: theirsFold.chain };
+      return out.failedFrame;
+    });
+
+    // 4. Governance named, then the full reset: who may and who may not, and what it removes.
+    ok &= await runCase('scenarios', 'upgrade: set_anchor_head passes as governance only; the full reset removes v2\'s entries and refunds the origin', async () => {
+      const c = drive.contractOf(api, ctx.abi);
+      const governance = new Keyring({ type: 'sr25519' }).addFromUri(env('GOVERNANCE_SURI', '//Charlie'));
+      // Governance pays its own fees; funded once (dev chains give //Charlie a balance already).
+      if (big((await api.query.system.account(governance.address)).data.free) < 1_000_000_000_000n) {
+        await drive.send(api.tx.balances.transferKeepAlive(governance.address, '10000000000000'), accounts.admin, 'fund governance');
+      }
+      await drive.callContract(api, c, accounts.admin, 'setGovernance', [governance.address], 'set_governance');
+      const head = (await drive.read(api, c, 'head')).toJSON();
+      const book = u8aToHex(randomBytes(32));
+      const dry = async (who, expected) => {
+        const q = await c.query.setAnchorHead(who.address ?? who, { gasLimit: gasMax(api), storageDepositLimit: null }, expected, 0, book);
+        if (q.result.isErr) return `failed: ${q.result.asErr.toString()}`;
+        const o = q.output.asOk ?? q.output;
+        return o.isOk ? 'Ok' : renderEnum(o.asErr);
+      };
+      const random = new Keyring({ type: 'sr25519' }).addFromUri(`//aledgent-random-${Date.now()}`);
+      const origins = {
+        governance: await dry(governance, head.lastAnchor),
+        admin: await dry(accounts.admin, head.lastAnchor),
+        key: await dry(accounts.key, head.lastAnchor),
+        randomAccount: await dry(random, head.lastAnchor),
+        governanceStale: await dry(governance, Number(head.lastAnchor) + 1),
+      };
+      if (origins.governance !== 'Ok' || origins.admin !== 'NotGovernance' || origins.key !== 'NotGovernance' || origins.randomAccount !== 'NotGovernance' || origins.governanceStale !== 'HeadMoved') fail(`dry runs: ${JSON.stringify(origins)}`);
+      // The admin's real attempt is refused on chain too (it reverts, so the extrinsic fails).
+      let adminOnChain;
+      try {
+        await drive.send(c.tx.setAnchorHead({ gasLimit: api.registry.createType('WeightV2', { refTime: 20_000_000_000n, proofSize: 1_000_000n }), storageDepositLimit: null }, head.lastAnchor, 0, book), accounts.admin, 'set_anchor_head as the admin');
+        adminOnChain = 'accepted';
+      } catch (error) {
+        adminOnChain = String(error.message).replace(/^.*dispatch failed: /, '');
+      }
+      if (adminOnChain === 'accepted') fail('the admin reset the chain');
+      const fin0 = await at();
+      const v0 = await view(api, ctx.abi, address, fin0.hash);
+      const storedBefore = [];
+      for (let seq = 0; seq < n; seq++) if (await v0.storedEntry(seq)) storedBefore.push(seq);
+      const trieBefore = await trieCells(api, address, fin0.hash);
+      const { blockHash, events, query } = await drive.callContract(api, c, governance, 'setAnchorHead', [head.lastAnchor, 0, book], 'set_anchor_head as governance (the full reset)');
+      const number = (await api.rpc.chain.getHeader(blockHash)).number.toNumber();
+      const released = events.filter(({ event }) => event.section === 'contracts' && event.method === 'StorageDepositTransferredAndReleased').map(({ event }) => ({ from: event.data[0].toString(), to: event.data[1].toString(), amount: event.data[2].toString() }));
+      const weight = events.find(({ event }) => event.section === 'system' && event.method === 'ExtrinsicSuccess')?.event.data[0].weight;
+      const v = await view(api, ctx.abi, address, blockHash);
+      const left = [];
+      for (let seq = 0; seq < n + 8; seq++) if (await v.storedEntry(seq)) left.push(seq);
+      if (left.length) fail(`entries still stored after the reset: ${left.join(', ')}`);
+      const h = await v.head();
+      if (h.nextSeq !== 0 || h.prunedTo !== 0 || h.lastAnchor !== 0) fail(`head after the reset: ${JSON.stringify(h)}`);
+      if (await v.chainCell()) fail('the chain cell is still stored');
+      const chain = await v.chainHead();
+      if (chain.position !== 0n || chain.digest !== u8aToHex(new Uint8Array(32)) || (startOf(chain) !== null && startOf(chain) !== 0n)) fail(`chain head after the reset: ${JSON.stringify(chain, drive.big)}`);
+      if (!released.some((r) => pk(r.from) === pk(address) && pk(r.to) === pk(governance.address))) fail(`no deposit released from the contract to the origin: ${JSON.stringify(released)}`);
+      const trieAfter = await trieCells(api, address, blockHash);
+      const r = await foldNow('afterReset');
+      if (r.resets < 1 || r.entries.length !== 0) fail(`the fold after the reset: ${r.resets} resets, ${r.entries.length} entries`);
+      out.reset = {
+        block: number,
+        origins,
+        adminOnChain,
+        storedBefore: storedBefore.length,
+        released,
+        dryRun: { refTime: big(query.gasRequired.refTime), proofSize: big(query.gasRequired.proofSize), consumedRefTime: big(query.gasConsumed.refTime), consumedProofSize: big(query.gasConsumed.proofSize) },
+        weight: weight && { refTime: big(weight.refTime), proofSize: big(weight.proofSize) },
+        storage: { itemsBefore: trieBefore.items, itemsAfter: trieAfter.items, bytesBefore: trieBefore.bytes, bytesAfter: trieAfter.bytes },
+      };
+      return out.reset;
+    });
+
+    // 5. The new book's first entries: from (0, zeros); the first anchor is d_0.
+    ok &= await runCase('scenarios', 'upgrade: entries after the reset fold from (0, zeros) to the head', async () => {
+      const c = drive.contractOf(api, ctx.abi);
+      const { tx } = await executeTx(ctx, [anchorCall(ref(), 1, u8aToHex(randomBytes(32)))]);
+      await drive.send(tx, accounts.key, 'execute (anchor 1 of the new book)');
+      await drive.callContract(api, c, accounts.depositor, 'deposit', [ref(), ASSET, DEPOSIT.toString()], 'deposit (after the reset)');
+      const r = await foldNow('afterResetEntries');
+      if (r.entries.map((e) => `${e.seq}:${e.kind}`).join(',') !== '0:Anchored,1:Deposited') fail(`entries after the reset: ${JSON.stringify(r.entries.map((e) => `${e.seq}:${e.kind}`))}`);
+      return `0:Anchored, 1:Deposited, folded to ${r.chain.digest} = the head (${r.chain.position}, the chain from ${r.foldStart})`;
+    });
+  } finally {
+    Object.assign(drive.state, saved);
+    drive.save();
+    saveReport();
+  }
+  if (!ok) fail('an upgrade case failed; see report.json');
 };
 
 phases.all = async (ctx) => {
