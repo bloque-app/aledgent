@@ -1635,3 +1635,78 @@ fn req_pv_5_every_query_is_attributed() {
     assert!(got.iter().all(|x| x.principal == alice.principal));
     assert_eq!(got[0].query, crate::query::QueryKind::Balances);
 }
+
+/// Two per-asset grants over one account to one principal (the service key caps rollout,
+/// 2026-10-28): each asset's operations must be decided under that asset's grant. Today the
+/// candidate is chosen by narrowness alone (ops, then per-operation bound, then id), before the
+/// asset is looked at, so the EUR grant (the smaller per-operation bound) is chosen for a USD
+/// transfer and refuses it with `ERR-BoundExceeded`.
+#[test]
+fn per_asset_grants_over_one_account_each_decide_their_own_asset() {
+    let mut q = Q::new();
+    let alice = q.person();
+    let bob = q.person();
+    let acct = q.account(&alice, Custody::Owned);
+    q.issue(acct, usd(), 10_000);
+    q.issue(acct, eur(), 10_000);
+    for (a, per_op) in [(usd(), 1_000), (eur(), 100)] {
+        let ctx = q.ctx(alice);
+        q.ledger
+            .grant_authority(
+                &ctx,
+                GrantRequest {
+                    kind: GrantKind::Delegated,
+                    principal: bob.principal,
+                    subject: Subject::Account(acct),
+                    ops: NonEmptySet::one(OperationKind::Transfer),
+                    per_operation: Some(nz(per_op)),
+                    per_window: None,
+                    assets: Some(NonEmptySet::one(a)),
+                    counterparties: None,
+                    parent: None,
+                    expires: None,
+                },
+            )
+            .unwrap();
+    }
+    let ask = |q: &mut Q<MemStore>, a: AssetId, n: u64| {
+        let ctx = q.ctx(bob);
+        q.ledger
+            .authorise(
+                &ctx,
+                &crate::eval::Request {
+                    kind: OperationKind::Transfer,
+                    account: acct,
+                    asset: Some(a),
+                    amount: Some(nz(n)),
+                    counterparty: None,
+                },
+            )
+            .map(|_| ())
+    };
+    assert_eq!(ask(&mut q, eur(), 100), Ok(()), "EUR under the EUR grant");
+    assert_eq!(ask(&mut q, usd(), 500), Ok(()), "USD under the USD grant");
+}
+
+/// Prints the seeded grant ids of a book (`GENESIS_OP` = the 32 hex digits of its genesis op).
+#[test]
+#[ignore = "a tool, not a test: prints seeded grant ids"]
+fn print_seeded_grant_ids() {
+    let hex = std::env::var("GENESIS_OP").unwrap();
+    let mut b = [0u8; 16];
+    for (i, byte) in b.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap();
+    }
+    let g = OperationId::from_ref(OperationRef(b));
+    for (section, name, n) in [
+        (crate::chainspec::Section::Grants, "grants", 60u64),
+        (crate::chainspec::Section::IssuanceGrants, "issuance", 10),
+    ] {
+        for ordinal in 0..n {
+            std::println!(
+                "{name}\t{ordinal}\t{}",
+                crate::chainspec::grant_of(&g, section, ordinal).to_did()
+            );
+        }
+    }
+}
