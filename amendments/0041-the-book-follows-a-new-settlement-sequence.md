@@ -68,7 +68,8 @@ position from the stale head, and is born expired.
      The core holds no final record of that chain; its only trace is 13 `Missing` incidents from a re-scan.
    - **New-chain anchors:** anchors 1 and 2 went final in the core at positions 0 and 1 of the new chain, in
      blocks #40,205,617 and #40,205,633, after the reset.
-   - **Instructions:** none in flight (`GET /v1/settlement/instructions` is empty).
+   - **Instructions:** none can be in flight. Every test asset is `book_only`, so no withdrawal can be
+     instructed at all.
 7. **Prod's core has never seen settlement.** `p2` holds no head, no final record and no instruction.
 8. **No real book has run generation 1.** The core Agent is still built as `GENERATION = 0`
    (`agents/core/src/lib.rs:36`), and both books run their genesis code. `CHAINED_SETTLEMENT` is 1
@@ -189,22 +190,34 @@ sequence (`REQ-SL-1`); one book's record MAY run over several sequences".
 
 ## Migration and rollout
 
-- **Release order: the core first, then the adapter.**
-  - An adapter that reports a start to a core before `SETTLEMENT_EPOCHS` is refused, and raises a non-paging
-    alert.
-  - A core at `SETTLEMENT_EPOCHS` with the old adapter is never told; the guard then refuses withdrawals while
+- **Release order: the core first, then the adapter's switch.**
+  - A core host built before this amendment cannot decode the new input. It refuses the whole feed the input
+    arrives in, so the book's inputs would wait behind it. Merge order alone cannot prevent this: test's
+    ingress and settle follow every `develop` merge, while its core runs a pinned image.
+  - So the adapter reports a start only when its configuration says `report_resets` (off by default). It is
+    turned on in a deployment template once that deployment's core runs a build with `T-043-14` at
+    `SETTLEMENT_EPOCHS`.
+  - A core of such a build still at generation 0 refuses the input cleanly (`ERR-MalformedCommand`). The
+    adapter then raises a non-paging alert.
+  - A core at `SETTLEMENT_EPOCHS` with the switch off is never told. The guard then refuses withdrawals while
     the head is stale, as it should.
+  - The core changes of `T-043-14` and `T-043-17` both decide generation-1 inputs. No generation-1 core
+    package may be built or applied before both are on `develop` (decision 1).
 - **Test.**
   1. The core's in-place upgrade to the package built as generation 1 (`T-037-19`'s path, the same upgrade that
      takes `T-043-06` to `T-043-08`).
-  2. Then a develop release of the adapter, which reports epoch 2 once.
+  2. Then `report_resets: true` in test's settle template (bloque-ledgent). The adapter reports epoch 2
+     once.
 
   The core takes it: no instruction is in flight, and its only finals are positions 0 and 1, both after the
   reset's block. Its head becomes `{ 40,195,735, 0 }`, and the adapter's next head (`next_seq` 2) is taken at
   once. Done when `GET /v1/ops/settlement/head` shows epoch 2 and a head at `next_seq` 2 or later, and a withdrawal
   created then has a first position at the head and an expiry above the finalised height.
-- **Prod.** The same two releases before 0040's reset of the prod instance. After the reset, the adapter reports
-  epoch 1 to a core with no head (fact 7), and the core takes it.
+- **Prod.** The same two steps before 0040's reset of the prod instance. The reset's `book` **must be
+  `p2`'s chainspec digest**: the core refuses any other (`OtherBook`), and the adapter then stops with
+  `reset:`. After the reset, the adapter reports epoch 1 to a core with no head (fact 7), and the core
+  takes it. Prod would not hit the stale head anyway, since its core has none; the start mainly records
+  the sequence there.
 - **Rollback.** A core built before this amendment refuses the input and keeps its head. The adapter's
   confirmation table is a cache of the core's answers and can be emptied.
 
@@ -223,7 +236,8 @@ sequence (`REQ-SL-1`); one book's record MAY run over several sequences".
 1. **The generation.** *Built:* `SETTLEMENT_EPOCHS = CHAINED_SETTLEMENT = 1`, so test needs one core upgrade,
    0 to 1, the same one `T-043-06` to `T-043-08` need. *Alternative:* a new generation 2, which costs a second
    in-place upgrade (1 to 2) on each book. Generation 1 is safe only because no book has decided an input at
-   generation 1 yet (fact 8). Once one has, the rule needs 2.
+   generation 1 yet (fact 8). Once one has, the rule needs 2. So no generation-1 package may be built or
+   applied before `T-043-14` and `T-043-17` are both on `develop`.
 2. **Instructions in flight at a start.** *Built:* the start is refused while any instruction is not yet
    decided. Such an instruction then cannot be decided by proof, so the operator resolves it through review
    with evidence (`REQ-RC-5`) before the start can be taken. *Alternative:* take the start and move each such
