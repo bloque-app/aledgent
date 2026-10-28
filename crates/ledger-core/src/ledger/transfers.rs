@@ -506,6 +506,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                     counterparty: Some(leg.to),
                 },
                 ctx.now,
+                self.generation(),
             )?);
         }
         let charges = self.bounds_together(t, &decisions, ctx.now)?;

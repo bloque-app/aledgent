@@ -16,7 +16,12 @@
 //!    covers the account), then the delegated grant with the narrowest effective scope, then an
 //!    operator grant, which counts only while the account's custody is delegated (`REQ-AU-5`,
 //!    `REQ-AU-6`). None left is `ERR-NotAuthorised`; only revoked ones left is
-//!    `ERR-AuthorityRevoked`;
+//!    `ERR-AuthorityRevoked`. From code generation [`ASSET_CANDIDATES`] on, a candidate whose
+//!    effective assets exclude the operation's asset is not preferred: the first, in that same
+//!    order, that includes it is chosen; only when none does is the first of them all chosen,
+//!    whose asset bound then refuses (`T-003-11`, `AC-G1.2`). The other bounds are looked at only
+//!    in step 6, so they still shadow (F-003 plan §7). Before that generation, the first of them
+//!    all is chosen whatever its assets, as the code of those generations decided;
 //! 6. the bounds of the one candidate chosen: `ERR-BoundExceeded` (`REQ-AG-2`).
 //!
 //! Anything that cannot be evaluated — a missing record, a broken chain — counts as no authority
@@ -44,6 +49,24 @@ use crate::principal::{Caller, Principal, resolve};
 use crate::refusal::Refusal;
 use crate::state::State;
 
+/// The code generation from which the evaluator chooses a delegated or operator grant among those
+/// whose effective assets include the operation's asset (`T-003-11`, owner ruling `q28-caps-core`,
+/// 2026-10-28; `REQ-AU-1`, `REQ-AG-2`, `AC-G1.2`).
+///
+/// Before it, the candidate was chosen by narrowness alone (operation kinds, then per-operation
+/// bound, then grant id) before its assets were looked at, so of a principal's per-asset grants
+/// over one account the narrowest decided every asset, and refused each asset it did not list with
+/// `ERR-BoundExceeded`. An input of an earlier generation is still decided that way (the generation
+/// rule, amendment 0033): the code map gives every input its generation, and [`Ledger::generation`]
+/// hands it here.
+///
+/// It is [`crate::settlement::CHAINED_SETTLEMENT`]: no book has decided an input at that
+/// generation yet, so one in-place upgrade takes both. Once a book has, a change here needs a new
+/// generation.
+///
+/// [`Ledger::generation`]: crate::ledger::Ledger::generation
+pub const ASSET_CANDIDATES: u64 = crate::settlement::CHAINED_SETTLEMENT;
+
 /// One operation to authorise on one account.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Request {
@@ -68,15 +91,17 @@ pub struct Decision {
     pub charges: Vec<Charge>,
 }
 
-/// Authorise `request` for `caller` at `now`. See the module documentation for the order.
+/// Authorise `request` for `caller` at `now`, as code generation `generation` decides it. See the
+/// module documentation for the order.
 pub fn authorise(
     state: &State,
     caller: &Caller,
     request: &Request,
     now: Time,
+    generation: u64,
 ) -> Result<Decision, Refusal> {
     let p = resolve(state, caller)?;
-    authorise_principal(state, &p, request, now)
+    authorise_principal(state, &p, request, now, generation)
 }
 
 fn used(p: &Principal, kind: AuthorityKind, grant: Option<crate::id::GrantId>) -> AuthorityUsed {
@@ -146,8 +171,9 @@ pub fn authorise_principal(
     p: &Principal,
     request: &Request,
     now: Time,
+    generation: u64,
 ) -> Result<Decision, Refusal> {
-    authorise_as(state, p, request, now, None)
+    authorise_as(state, p, request, now, None, generation)
 }
 
 /// [`authorise_principal`] for a later transition of an operation already accepted — its
@@ -160,8 +186,9 @@ pub fn authorise_in_flight(
     request: &Request,
     now: Time,
     snapshot: Option<Custody>,
+    generation: u64,
 ) -> Result<Decision, Refusal> {
-    authorise_as(state, p, request, now, snapshot)
+    authorise_as(state, p, request, now, snapshot, generation)
 }
 
 fn authorise_as(
@@ -170,6 +197,7 @@ fn authorise_as(
     request: &Request,
     now: Time,
     snapshot: Option<Custody>,
+    generation: u64,
 ) -> Result<Decision, Refusal> {
     // 2. Reach.
     let account = state
@@ -220,7 +248,18 @@ fn authorise_as(
     }
     delegated.sort_by_key(Effective::narrowness);
     operator.sort_by_key(Effective::narrowness);
-    let Some(eff) = delegated.into_iter().chain(operator).next() else {
+    let mut ordered = delegated;
+    ordered.extend(operator);
+    // From `ASSET_CANDIDATES` on, the first candidate that admits the operation's asset; with none,
+    // the first of all, as before, whose asset bound refuses it at step 6.
+    let at = match request.asset {
+        Some(asset) if generation >= ASSET_CANDIDATES => ordered
+            .iter()
+            .position(|eff| eff.admits_asset(&asset))
+            .unwrap_or(0),
+        _ => 0,
+    };
+    let Some(eff) = ordered.into_iter().nth(at) else {
         return Err(if revoked {
             Refusal::AuthorityRevoked
         } else {

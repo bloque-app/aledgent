@@ -250,6 +250,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                     counterparty: Some(roles.issuance),
                 },
                 ctx.now,
+                self.generation(),
             )?;
             let on_asset = eval::authorise_issuance(
                 &self.state,

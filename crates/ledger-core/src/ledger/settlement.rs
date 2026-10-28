@@ -531,6 +531,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                 counterparty: Some(roles.issuance),
             },
             ctx.now,
+            self.generation(),
         )?;
         // F-016: the adapter refuses to serve, or has stopped declaring (`REQ-SA-2`).
         self.require_available(ctx.now)?;
@@ -674,6 +675,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                 },
                 ctx.now,
                 crate::custody::snapshot(&self.state, &ctx.op),
+                self.generation(),
             )?;
             if o.class() != KindClass::Outbound {
                 return Err(Refusal::UnsupportedLeg);

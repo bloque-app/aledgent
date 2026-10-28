@@ -271,6 +271,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                 counterparty: None,
             },
             now,
+            self.generation(),
         )
         .map_err(|e| match e {
             Refusal::NotAuthorised
