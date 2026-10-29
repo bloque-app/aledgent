@@ -57,7 +57,10 @@ The production-class drill below still runs by hand, on the deployment's own arc
      does: `opsctl restore core --from <spec> … --report <drills dir> --core-host aledgent-core-host …`,
      run from the core image (`--entrypoint /usr/local/bin/opsctl`), then the core host on the restored
      directory, then `opsctl restore core-tail`. The report is the drill's record
-     (`aledgent_drill_passed`, `aledgent_drill_last_age_ms`).
+     (`aledgent_drill_passed`, `aledgent_drill_last_age_ms`). Add `--code-config <file>` when the core unit's
+     `serve` has it, which is for any book that may have upgraded (`T-037-09`): without it the core host
+     refuses an archive that needs a code version other than the genesis package. The flags go together, and a
+     retry needs a new, empty `--state` directory ([total-loss-recovery](total-loss-recovery.md) step 1).
    - Record the archive's point, the replayed tail and the restore time, and the archive's read time
      (`read and checked … segments in … ms`).
 2. **The keys.** Restore the signer's Vault secrets (the key-ring root, the clerk key, the Agent's keys;

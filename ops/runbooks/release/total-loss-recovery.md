@@ -104,6 +104,19 @@ recovery point").
    archive's copy. Pass `--unnamed-code` and `--genesis-manifest <file>` when the core unit's `serve`
    has them; `opsctl` hands both to the core host.
 
+   Pass `--code-config <file>` too when the core unit's `serve` has it, which is for any book that may have
+   upgraded (`T-037-09`; [restore](../restore.md), "A book that has upgraded"). Without it the core host
+   refuses an archive that needs a code version other than the genesis package. The file names a cache and
+   its sources, and they must hold every version from the archive's latest checkpoint on; if the cache went
+   with the volume, a source must hold them. In the command above, add before the image the mounts
+   `-v /etc/aledgent/code.json:/etc/aledgent/code.json:ro`, `-v <code source dir>:<code source dir>:ro` for
+   each source and `-v <code cache dir>:<code cache dir>` (writable, and outside `--state`), at the same
+   absolute paths the file names; and after `restore core` the flag `--code-config /etc/aledgent/code.json`.
+
+   `--core-host`, `--runtime`, `--actor` and `--code-config` go together: `opsctl` lays the archive out in
+   `--state` before it reads `--runtime` and `--actor`, so a missing one fails with the layout already
+   written, and a retry into that directory is refused. Start again from a new, empty `--state` directory.
+
    It reads every segment and checks each one: its digest, its offsets and the entries' hash chain.
    The segments are read 32 at a time (`--fetch-concurrency <n>`, 1 to 256) and checked strictly in
    order, as one at a time would: a missing or damaged segment ends or fails the read exactly as
