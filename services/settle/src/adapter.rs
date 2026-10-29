@@ -518,7 +518,8 @@ enum Stop {
     Reset(u64, usize, u64),
     /// The anchor sequence moved past the verified head's, and the range since cannot be read: a
     /// reset at this block whose chain before could not be read up to it (the delta review's
-    /// finding 1). Never followed by the adapter; the owner re-founds.
+    /// finding 1). Not followed while it stays unreadable, and never gapped across; the sync runs
+    /// again each step, and once the range reads the reset takes its normal path.
     ResetUnread(u64, String),
 }
 
@@ -3379,12 +3380,19 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
     async fn verify(&mut self, fin: &BlockRef) -> StepResult<Option<ChainHead>> {
         let instance = self.config.instance;
         let now = self.now();
+        // A reset whose chain before could not be read up to it (the fixes review): not a latch.
+        // The sync runs again each step, `reset:` held open meanwhile (so the adapter is held and
+        // nothing more is reported); once the range reads, the reset takes the normal path.
+        let mut unread = false;
         if self.refounding().await? {
-            // A reset the core may still follow (amendment 0041): reported again when due.
-            if self.config.report_resets {
-                self.retry_epoch(fin).await?;
+            unread = self.stored_reset_reason().await? == Some(ResetReason::Unread);
+            if !unread {
+                // A reset the core may still follow (amendment 0041): reported again when due.
+                if self.config.report_resets {
+                    self.retry_epoch(fin).await?;
+                }
+                return Ok(None);
             }
-            return Ok(None);
         }
         let Some(head) = self.chain.chain_head(fin, instance).await? else {
             self.store
@@ -3397,7 +3405,20 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
         let from = verified.map_or(head.start, |v| v.position);
         // 1. The sync. What it shows complete is kept, entries and head, before anything is
         // reported: however long the core takes them in, the next sync folds only the blocks after.
-        match self.sync(fin, &head, verified).await? {
+        let synced = self.sync(fin, &head, verified).await?;
+        if unread {
+            if matches!(synced, Err(Stop::ResetUnread(..))) {
+                // Still unreadable: stays stopped and held.
+                return Ok(None);
+            }
+            // The range reads now: the stop is lifted, and what the sync found decides.
+            self.store.clear(&format!("reset:{instance}"), now).await?;
+            tracing::warn!(
+                instance,
+                "the chain before the reset reads now: the late-reset stop is lifted"
+            );
+        }
+        match synced {
             Ok(Synced::Idle) => {
                 if let Some(v) = verified.filter(|v| fin.number > v.block) {
                     let v = AcceptedHead {
@@ -3710,12 +3731,12 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                     format!(
                         "the instance was reset at block #{block} (its anchor sequence moved past the \
                          verified head's), and the chain before it could not be read up to the reset \
-                         from position {from}: {why}. The reset is not followed, and nothing more is \
-                         reported; do not record a gap (it would take the new chain's head as the old \
-                         one's). The entries of the chain before it past position {from} cannot reach \
-                         the book from this chain: escalate to the owner, who re-founds \
-                         (`aledgent-settle <config> refound`), or give the adapter a history endpoint \
-                         that reaches back to position {from}"
+                         from position {from}: {why}. Nothing more is reported, and the adapter is \
+                         held; it reads the range again every step and, once it reads, takes the \
+                         reset as a live one. Do not record a gap (it would take the new chain's head \
+                         as the old one's). If the range stays unreadable, give the adapter a history \
+                         endpoint that reaches back to position {from}, or escalate to the owner, who \
+                         re-founds (`aledgent-settle <config> refound`)"
                     ),
                 )
             }

@@ -732,3 +732,98 @@ async fn t043_15_the_retry_never_follows_a_reset_it_could_not_read() {
     );
     assert_eq!(open(&k, &format!("reset:{INSTANCE}")).await, 1);
 }
+
+/// The fixes review: one failed events read (no history endpoint) at the step that sees a live
+/// reset is not a latch. The adapter stops and is held while the range cannot be read, reads it
+/// again each step, and once it reads follows the reset as a live one: the stop closes, and the
+/// core takes the start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t043_15_a_transient_read_error_at_a_live_reset_heals() {
+    let mut k = kit(SETTLEMENT_EPOCHS).await;
+    k.chain.advance(1);
+    k.step().await.unwrap();
+    k.chain.reset_for(INSTANCE, 0, k.book());
+    k.chain.advance(3);
+    k.chain.finalize_all();
+    // The node cannot serve the blocks for one step.
+    k.chain.keep_events(0);
+    let _ = k.step().await;
+    assert_eq!(open(&k, &format!("reset:{INSTANCE}")).await, 1);
+    let step = k.step().await;
+    assert!(step.is_ok_and(|s| s.held), "held while unreadable");
+    assert_eq!(k.core_settlement(|s| s.epoch()).unwrap(), None);
+    // It serves again.
+    k.chain.keep_events(256);
+    for _ in 0..2 {
+        k.d.clock.advance(EPOCH_RETRY);
+        k.chain.advance(1);
+        k.chain.finalize_all();
+        k.step().await.unwrap();
+    }
+    assert_eq!(open(&k, &format!("reset:{INSTANCE}")).await, 0, "healed");
+    assert_eq!(
+        k.core_settlement(|s| s.epoch().map(|e| e.epoch)).unwrap(),
+        Some(1)
+    );
+    assert!(!k.step().await.unwrap().held);
+}
+
+/// The fixes review: the operator's gap asked for before the adapter has stepped past a reset (so
+/// no `reset:` refuses it first) is refused by its own check that the chain's sequence is the
+/// verified head's, with either switch position; nothing of either chain is skipped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t043_15_no_operator_gap_spans_a_reset_not_yet_stepped() {
+    for report in [true, false] {
+        let mut k = kit_with(SETTLEMENT_EPOCHS, report).await;
+        deposits(&k, 2, 1);
+        k.chain.finalize_all();
+        k.step().await.unwrap();
+        k.chain.reset_for(INSTANCE, 0, k.book());
+        deposits(&k, 5, 7);
+        k.chain.advance(300);
+        k.chain.finalize_all();
+        assert_eq!(open(&k, "reset:").await, 0, "not stepped yet");
+        let r = k.adapter.record_operator_gap(2, 5).await;
+        assert!(
+            matches!(&r, Err(settle::AdapterError::Refused(why)) if why.contains("reset under the verified head")),
+            "[{report}] {r:?}"
+        );
+        assert_eq!(core_amounts(&k), vec![1, 1]);
+        assert!(k.store.gaps().await.unwrap().is_empty());
+    }
+}
+
+/// The fixes review: a gap refused for any reason but `ERR-MalformedCommand` (here a link whose
+/// token ingress does not know, so the command is refused before the core) is not recorded. The
+/// operator's command fails, `gap:` stays open, and neither the cursor nor the accepted head moves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t043_15_a_refused_gap_is_not_recorded() {
+    let mut k = kit_with(SETTLEMENT_EPOCHS, false).await;
+    deposits(&k, 3, 1);
+    k.chain.advance(300);
+    k.step().await.unwrap();
+    assert_eq!(open(&k, "unreadable:").await, 1);
+    let cursor = k.store.cursor(INSTANCE).await.unwrap();
+    let accepted = k.store.accepted_head(INSTANCE).await.unwrap();
+    let mut refused = settle::Adapter::new(
+        k.adapter.config().clone(),
+        k.chain.clone(),
+        k.store.clone(),
+        settle::link::RouterTransport::new(k.d.router.clone(), "not-the-adapters-token"),
+        k.lanes.clone(),
+        std::sync::Arc::new(k.d.clock.clone()),
+    );
+    let r = refused.record_operator_gap(0, 3).await;
+    assert!(
+        matches!(&r, Err(settle::AdapterError::Refused(why)) if why.contains("refused the gap")),
+        "{r:?}"
+    );
+    assert_eq!(open(&k, "gap:").await, 1, "gap: stays open");
+    assert_eq!(k.store.cursor(INSTANCE).await.unwrap(), cursor);
+    assert_eq!(k.store.accepted_head(INSTANCE).await.unwrap(), accepted);
+    assert!(k.store.gaps().await.unwrap().is_empty());
+    assert!(
+        k.core_settlement(|s| s.gaps().is_empty() && s.gap_end() == 0)
+            .unwrap()
+    );
+}

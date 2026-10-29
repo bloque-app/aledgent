@@ -139,9 +139,11 @@ By the core's answer:
   then refused (`earlier_final`): the book needs a re-founding, as for `earlier_final` above. With it off, the reset stops as before. `refound`
   drops them: only with the owner, as for entries never read.
 - **A reset found too late** (`reset:<instance>`, "the chain before it could not be read up to the reset"):
-  the adapter fell behind the node's events (no history endpoint) across a reset. Do **not** record a gap:
+  the adapter could not read the blocks since its verified head across a reset (no history endpoint, or a
+  node that failed a read). It is held, reports nothing more, and reads the range again every step; once
+  the range reads, it takes the reset as a live one (above) and the alert closes. Do **not** record a gap:
   the adapter refuses one that spans a reset, since it would take the new chain's head as the old one's and
-  lose the new chain's entries. The reset is never followed by the adapter. Give it a history endpoint that
+  lose the new chain's entries. If the range stays unreadable, give the adapter a history endpoint that
   reaches back to the position named, or escalate to the owner for a re-founding.
 - **Switch off** (`reset:<instance>`, "`report_resets` is off"): the core was not told. A reset belongs to a
   re-founding window: follow "Another book's reset" with the owner, or turn the switches on once the core
