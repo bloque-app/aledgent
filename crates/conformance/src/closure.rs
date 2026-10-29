@@ -385,6 +385,7 @@ mod tests {
         // Rules version 1 is the core's release that ended amendment 0037's allowance: the line is
         // in `Refusal`, nothing is allowed to be missing, and the closed list equals §10 exactly.
         assert!(SPEC_AHEAD_OF_PROGRAM.is_empty());
+        assert_eq!(core_generation(), Ok(1));
         assert!(
             refusals()
                 .iter()
