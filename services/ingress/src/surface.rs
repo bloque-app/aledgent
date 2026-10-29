@@ -1427,6 +1427,9 @@ fn prepare_request<S: Store, C: Core>(
         .archived
         .check(param.as_deref(), None, bytes)?;
     let (mut body, pending) = build(route, param, bytes)?;
+    if !shared.config.settlement_epochs {
+        crate::settlement::drop_gap_sequence(&mut body);
+    }
     // REQ-PO-5: the caller's pass-through data comes off the command here. It is part of the
     // request (its digest) and of the row, never of the canonical body the core receives.
     let pass_through = take_pass_through(&mut body);

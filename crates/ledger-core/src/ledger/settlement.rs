@@ -2058,6 +2058,21 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
     /// the gap is an audit record, and the book keeps only the end of the highest gap, which
     /// `proof` reads; before it, the gap and its incident were appended to the book's state.
     pub fn record_gap(&mut self, source: SourceId, gap: Gap, now: Time) -> Result<(), Refusal> {
+        self.record_gap_of(source, gap, None, now)
+    }
+
+    /// [`Ledger::record_gap`], of the chain of `sequence` if the adapter named it (amendment 0041,
+    /// decision 6 made exact, from [`crate::settlement::SETTLEMENT_EPOCHS`] on). A gap of a
+    /// sequence later than the one the book holds raises that sequence's gap end, which the next
+    /// start keeps if it is of that sequence or an earlier one; any other gap (none named, or of the
+    /// sequence held or earlier) raises the untagged gap end, which every start clears.
+    pub(super) fn record_gap_of(
+        &mut self,
+        source: SourceId,
+        gap: Gap,
+        sequence: Option<u32>,
+        now: Time,
+    ) -> Result<(), Refusal> {
         let top = self.enter(|| crate::call::Call::RecordGap { source, gap, now });
         #[allow(clippy::redundant_closure_call)]
         let r: Result<(), Refusal> = (|| {
@@ -2067,10 +2082,17 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             if gap.to <= gap.from {
                 return Err(Refusal::EvidenceInsufficient);
             }
-            let record = if self.chained() {
-                Write::Settlement(SettlementWrite::GapEnd(gap.to))
-            } else {
-                Write::Settlement(SettlementWrite::Gap(gap))
+            // The sequence held is read only for a gap that names one: a generation-0 input reads
+            // no leaf the code before amendment 0041 did not know.
+            let later =
+                sequence.filter(|s| *s > self.state.settlement().epoch().map_or(0, |e| e.epoch));
+            let record = match later {
+                Some(sequence) => Write::Settlement(SettlementWrite::SequenceGapEnd {
+                    sequence,
+                    to: gap.to,
+                }),
+                None if self.chained() => Write::Settlement(SettlementWrite::GapEnd(gap.to)),
+                None => Write::Settlement(SettlementWrite::Gap(gap)),
             };
             self.commit(&[record, self.incident(Incident::Gap(gap), now)])
         })();

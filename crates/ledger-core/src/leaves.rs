@@ -189,6 +189,9 @@ pub mod kind {
     // The settlement sequence the book follows (amendment 0041, `T-043-14`): the last start the
     // core took, from `SETTLEMENT_EPOCHS` on.
     pub const SETTLEMENT_EPOCH: u8 = 36;
+    // The end of the highest gap of each sequence the adapter named (amendment 0041, decision 6
+    // made exact, `T-043-14`): from `SETTLEMENT_EPOCHS` on, beside the untagged `GAP_END`.
+    pub const GAP_END_BY_SEQUENCE: u8 = 34;
     // The operator records.
     pub const OPERATOR_GRANT: u8 = 60;
     pub const OPERATOR_GRANTS_BY_PRINCIPAL: u8 = 61;

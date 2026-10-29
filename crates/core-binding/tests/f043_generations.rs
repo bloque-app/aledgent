@@ -766,6 +766,21 @@ fn t043_14_the_book_follows_a_new_sequence_from_its_generation() {
     )
     .unwrap();
     assert_eq!(fx.replica.state().settlement().gap_end(), 9);
+    // A gap of the new chain, named with its sequence (decision 6 made exact): kept by the start.
+    adapter(
+        &mut fx,
+        who,
+        AdapterInput::SequenceGap {
+            gap: Gap {
+                from: 1,
+                to: 2,
+                reason: GapReason::Unreadable,
+            },
+            sequence: 2,
+        },
+    )
+    .unwrap();
+    assert_eq!(fx.replica.state().settlement().gap_ends(), &[(2, 2)]);
     // Another book's start: refused, one audit record, the head unchanged.
     let roots = fx.archive.last().unwrap().roots;
     assert!(matches!(
@@ -786,7 +801,9 @@ fn t043_14_the_book_follows_a_new_sequence_from_its_generation() {
         })))
     ));
     assert_eq!(fx.replica.state().settlement().epoch(), Some(start(book)));
-    assert_eq!(fx.replica.state().settlement().gap_end(), 0, "cleared");
+    let store = fx.replica.state().settlement();
+    assert_eq!(store.untagged_gap_end(), 0, "the chain before's, cleared");
+    assert_eq!(store.gap_ends(), &[(2, 2)], "the new chain's, kept");
     adapter(&mut fx, who, head(210, 2)).unwrap();
     assert_eq!(
         held(&fx),
@@ -833,10 +850,26 @@ fn t043_14_generation_0_reads_no_sequence() {
             previous: None,
         }),
     );
+    let _ = adapter(
+        &mut fx,
+        who,
+        AdapterInput::SequenceGap {
+            gap: Gap {
+                from: 0,
+                to: 2,
+                reason: GapReason::Unreadable,
+            },
+            sequence: 2,
+        },
+    );
     let seen = &fx.driver.port().seen;
     assert!(seen.contains(&ledger_core::leaves::kind::FINALISED_HEAD));
     assert!(
         !seen.contains(&ledger_core::leaves::kind::SETTLEMENT_EPOCH),
         "a generation-0 input read the sequence"
+    );
+    assert!(
+        !seen.contains(&ledger_core::leaves::kind::GAP_END_BY_SEQUENCE),
+        "a generation-0 input read the gap ends by sequence"
     );
 }

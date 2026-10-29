@@ -259,6 +259,76 @@ fn gap(fx: &mut Fx, adapter: Caller, from: u64, to: u64) {
     .unwrap();
 }
 
+/// A gap of `[from, to)` the adapter names the sequence of (decision 6 made exact).
+fn sequence_gap(fx: &mut Fx, adapter: Caller, from: u64, to: u64, sequence: u32) {
+    input(
+        fx,
+        adapter,
+        AdapterInput::SequenceGap {
+            gap: Gap {
+                from,
+                to,
+                reason: GapReason::Unreadable,
+            },
+            sequence,
+        },
+    )
+    .unwrap();
+}
+
+/// Decision 6 made exact, test's case: a gap of the new chain the adapter reported, named with its
+/// sequence (2), before the core took the start survives the start; a gap of the chain before
+/// (reported without a sequence, so the one the book held) is cleared. Before the start both count:
+/// `proof` reads the highest. A refused start clears neither.
+#[test]
+fn t043_14_a_new_chain_gap_reported_before_the_start_survives_it() {
+    let (mut fx, adapter) = as_on_test();
+    gap(&mut fx, adapter, 15, 18);
+    sequence_gap(&mut fx, adapter, 3, 5, 2);
+    let ends = |fx: &Fx| {
+        let s = fx.ledger.state().settlement();
+        (s.untagged_gap_end(), s.gap_ends().to_vec(), s.gap_end())
+    };
+    assert_eq!(ends(&fx), (18, alloc::vec![(2, 5)], 18));
+    assert!(matches!(
+        start(&mut fx, adapter, sequence(2, RESET, [0xC1; 32])),
+        Ok(EpochOutcome::Refused(EpochRefusal::OtherBook))
+    ));
+    assert_eq!(ends(&fx), (18, alloc::vec![(2, 5)], 18));
+    start(&mut fx, adapter, sequence(2, RESET, BOOK)).unwrap();
+    assert_eq!(ends(&fx), (0, alloc::vec![(2, 5)], 5));
+    assert!(fx.ledger.state().settlement().gap_starts_below(4));
+    assert!(!fx.ledger.state().settlement().gap_starts_below(5));
+    // After the start, a gap named with the sequence held is the untagged end's, which the next
+    // start clears.
+    sequence_gap(&mut fx, adapter, 6, 7, 2);
+    assert_eq!(ends(&fx), (7, alloc::vec![(2, 5)], 7));
+}
+
+/// The generation rule: generation 0 refuses a gap that names its sequence, `ERR-MalformedCommand`,
+/// and writes nothing.
+#[test]
+fn t043_14_generation_0_refuses_a_gap_with_its_sequence() {
+    let (mut fx, adapter) = book(0);
+    let before = fx.ledger.state().settlement().gaps().len();
+    assert_eq!(
+        input(
+            &mut fx,
+            adapter,
+            AdapterInput::SequenceGap {
+                gap: Gap {
+                    from: 0,
+                    to: 2,
+                    reason: GapReason::Unreadable,
+                },
+                sequence: 2,
+            },
+        ),
+        Err(Refusal::MalformedCommand)
+    );
+    assert_eq!(fx.ledger.state().settlement().gaps().len(), before);
+}
+
 /// Ruling q28 (amendment 0041, decision 6): a start that restarts the head clears the gap end. In
 /// test's case a gap of the chain before (positions 5 to 8) would otherwise keep every withdrawal
 /// of the new chain, whose first positions are far below it, from being proven not executed:
@@ -295,19 +365,26 @@ fn t043_14_a_restart_clears_the_gap_end() {
     assert_eq!(store(&fx), (4, true));
 }
 
-/// Ruling q28, read narrowly: a start that keeps a head at a later block (already the new
-/// sequence's) keeps the gap end, since a gap recorded since may be the new sequence's.
+/// Decision 6 made exact: a start that keeps a head at a later block (exact, by its block after
+/// the reset) still clears an untagged gap end (a gap reported without its sequence is the one the
+/// book held, earlier), and keeps the end of a gap the adapter named the started sequence for.
 #[test]
-fn t043_14_a_kept_head_keeps_the_gap_end() {
+fn t043_14_a_kept_head_clears_an_earlier_gap_end_and_keeps_the_new_one() {
     let (mut fx, adapter) = book(SETTLEMENT_EPOCHS);
     head(&mut fx, adapter, 142, 2);
     gap(&mut fx, adapter, 0, 2);
     head(&mut fx, adapter, 250, 3);
+    sequence_gap(&mut fx, adapter, 1, 3, 2);
+    assert_eq!(fx.ledger.state().settlement().gap_end(), 3);
     assert!(matches!(
         start(&mut fx, adapter, sequence(2, RESET, BOOK)),
         Ok(EpochOutcome::Started(h)) if h.height == 250
     ));
-    assert_eq!(fx.ledger.state().settlement().gap_end(), 2);
+    let store = fx.ledger.state().settlement();
+    assert_eq!(
+        (store.untagged_gap_end(), store.gap_ends(), store.gap_end()),
+        (0, &[(2, 3)][..], 3)
+    );
 }
 
 /// Amendment 0041, step 5: a book that already holds a head at a later block than the reset's
@@ -601,34 +678,39 @@ fn t043_14_the_store_takes_only_a_later_sequence() {
     assert_eq!(s.head(), Some(h(RESET, 0)));
 }
 
-/// The store rule for the gap end (ruling q28): a start with a head clears it and its undo puts
-/// it back; a start without one leaves it, and its undo does not touch it.
+/// The store rule for the gap ends (ruling q28, made exact): a start clears the untagged end and
+/// every end of an earlier sequence, and keeps those of its own sequence and later ones, with or
+/// without a head; its undo puts every one back.
 #[test]
-fn t043_14_the_store_clears_the_gap_end_only_at_a_restart() {
+fn t043_14_the_store_clears_earlier_gap_ends_at_a_start() {
     let h = |height, next_seq| FinalisedHead { height, next_seq };
-    let mut s = SettlementStore::new();
-    s.apply(&SettlementWrite::Head(h(142, 13))).unwrap();
-    s.apply(&SettlementWrite::GapEnd(9)).unwrap();
-    let u = s
-        .apply(&SettlementWrite::Epoch {
-            epoch: sequence(2, RESET, BOOK),
-            head: Some(h(RESET, 0)),
-        })
-        .unwrap();
-    assert_eq!(s.gap_end(), 0);
-    s.undo(u);
-    assert_eq!(
-        (s.gap_end(), s.head(), s.epoch()),
-        (9, Some(h(142, 13)), None)
-    );
-    let u = s
-        .apply(&SettlementWrite::Epoch {
-            epoch: sequence(2, RESET, BOOK),
-            head: None,
-        })
-        .unwrap();
-    assert_eq!(s.gap_end(), 9);
-    s.apply(&SettlementWrite::GapEnd(12)).unwrap();
-    s.undo(u);
-    assert_eq!((s.gap_end(), s.epoch()), (12, None));
+    for head in [Some(h(RESET, 0)), None] {
+        let mut s = SettlementStore::new();
+        s.apply(&SettlementWrite::Head(h(142, 13))).unwrap();
+        s.apply(&SettlementWrite::GapEnd(9)).unwrap();
+        for (sequence, to) in [(1, 11), (2, 5), (3, 6)] {
+            s.apply(&SettlementWrite::SequenceGapEnd { sequence, to })
+                .unwrap();
+        }
+        // A lower end of a sequence already held changes nothing.
+        s.apply(&SettlementWrite::SequenceGapEnd { sequence: 2, to: 4 })
+            .unwrap();
+        assert_eq!(s.gap_end(), 11);
+        let u = s
+            .apply(&SettlementWrite::Epoch {
+                epoch: sequence(2, RESET, BOOK),
+                head,
+            })
+            .unwrap();
+        // Untagged and sequence 1 cleared; 2 (the started one) and 3 (later) kept.
+        assert_eq!(
+            (s.untagged_gap_end(), s.gap_ends(), s.gap_end()),
+            (0, &[(2, 5), (3, 6)][..], 6)
+        );
+        s.undo(u);
+        assert_eq!(
+            (s.untagged_gap_end(), s.gap_ends(), s.head(), s.epoch()),
+            (9, &[(1, 11), (2, 5), (3, 6)][..], Some(h(142, 13)), None)
+        );
+    }
 }

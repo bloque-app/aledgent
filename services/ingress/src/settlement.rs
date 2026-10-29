@@ -650,6 +650,12 @@ pub struct GapBody {
     pub to: u64,
     /// Why.
     pub reason: GapReasonBody,
+    /// The sequence of the layer's record the gap is of (amendment 0041, decision 6 made exact):
+    /// a start keeps the gap only if it is of the started sequence or a later one. Forwarded only
+    /// while the deployment's `settlement_epochs` is on, else dropped (a core host built before it
+    /// could not decode the input).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<u32>,
 }
 
 /// One position of a re-scan and the digest the layer holds there.
@@ -1232,14 +1238,20 @@ fn adapter_input(b: &AdapterCommandBody) -> Result<AdapterInput, Refusal> {
                 None => None,
             },
         }),
-        AdapterCommandBody::Gap(g) => AdapterInput::Gap(Gap {
-            from: g.from,
-            to: g.to,
-            reason: match g.reason {
-                GapReasonBody::Pruned => GapReason::Pruned,
-                GapReasonBody::Unreadable => GapReason::Unreadable,
-            },
-        }),
+        AdapterCommandBody::Gap(g) => {
+            let gap = Gap {
+                from: g.from,
+                to: g.to,
+                reason: match g.reason {
+                    GapReasonBody::Pruned => GapReason::Pruned,
+                    GapReasonBody::Unreadable => GapReason::Unreadable,
+                },
+            };
+            match g.sequence {
+                Some(sequence) => AdapterInput::SequenceGap { gap, sequence },
+                None => AdapterInput::Gap(gap),
+            }
+        }
         AdapterCommandBody::Rescan(r) => AdapterInput::Rescan {
             from: r.from,
             to: r.to,
@@ -1266,6 +1278,26 @@ fn adapter_input(b: &AdapterCommandBody) -> Result<AdapterInput, Refusal> {
                 .collect::<Result<Vec<_>, Refusal>>()?,
         }),
     })
+}
+
+fn gap_body(g: &Gap, sequence: Option<u32>) -> GapBody {
+    GapBody {
+        from: g.from,
+        to: g.to,
+        reason: match g.reason {
+            GapReason::Pruned => GapReasonBody::Pruned,
+            GapReason::Unreadable => GapReasonBody::Unreadable,
+        },
+        sequence,
+    }
+}
+
+/// Amendment 0041: a gap's sequence is forwarded only while the deployment says its core knows
+/// the input that carries it (`settlement_epochs`); otherwise the gap goes as before, without it.
+pub(crate) fn drop_gap_sequence(body: &mut CommandBody) {
+    if let CommandBody::Adapter(AdapterCommandBody::Gap(g)) = body {
+        g.sequence = None;
+    }
 }
 
 fn adapter_body(i: &AdapterInput) -> AdapterCommandBody {
@@ -1350,14 +1382,10 @@ fn adapter_body(i: &AdapterInput) -> AdapterCommandBody {
                 })
                 .collect(),
         }),
-        AdapterInput::Gap(g) => AdapterCommandBody::Gap(GapBody {
-            from: g.from,
-            to: g.to,
-            reason: match g.reason {
-                GapReason::Pruned => GapReasonBody::Pruned,
-                GapReason::Unreadable => GapReasonBody::Unreadable,
-            },
-        }),
+        AdapterInput::Gap(g) => AdapterCommandBody::Gap(gap_body(g, None)),
+        AdapterInput::SequenceGap { gap, sequence } => {
+            AdapterCommandBody::Gap(gap_body(gap, Some(*sequence)))
+        }
         AdapterInput::Rescan { from, to, layer } => AdapterCommandBody::Rescan(RescanBody {
             from: *from,
             to: *to,
@@ -1839,6 +1867,40 @@ mod tests {
         let c = SettlementCommand::parse(&back).unwrap().unwrap();
         let again = SettlementCommand::parse(&c.to_body()).unwrap().unwrap();
         assert_eq!(c, again);
+    }
+
+    /// Amendment 0041, decision 6 made exact: a gap that names its sequence becomes
+    /// `AdapterInput::SequenceGap` and round-trips; one without stays `AdapterInput::Gap`, with no
+    /// `sequence` on the wire; and with the deployment's `settlement_epochs` off the sequence is
+    /// dropped before the command is formed, so the core gets a plain gap.
+    #[test]
+    fn t043_14_a_gap_with_its_sequence_round_trips_and_is_dropped_while_closed() {
+        let gap = Gap {
+            from: 3,
+            to: 5,
+            reason: GapReason::Unreadable,
+        };
+        let with = serde_json::to_vec(&gap_body(&gap, Some(2))).unwrap();
+        let body = SettlementRoute::Gap.build(None, &with).unwrap();
+        let c = SettlementCommand::parse(&body).unwrap().unwrap();
+        assert_eq!(
+            c,
+            SettlementCommand::Adapter(AdapterInput::SequenceGap { gap, sequence: 2 })
+        );
+        assert_eq!(SettlementCommand::parse(&c.to_body()).unwrap().unwrap(), c);
+        let without = SettlementCommand::Adapter(AdapterInput::Gap(gap));
+        let json = serde_json::to_value(without.to_body()).unwrap();
+        assert!(json.get("sequence").is_none(), "{json}");
+        assert_eq!(
+            SettlementCommand::parse(&without.to_body())
+                .unwrap()
+                .unwrap(),
+            without
+        );
+        // Closed: the sequence goes.
+        let mut closed = SettlementRoute::Gap.build(None, &with).unwrap();
+        drop_gap_sequence(&mut closed);
+        assert_eq!(SettlementCommand::parse(&closed).unwrap().unwrap(), without);
     }
 
     /// Amendment 0041: the adapter's report of a new sequence round-trips, on its route and

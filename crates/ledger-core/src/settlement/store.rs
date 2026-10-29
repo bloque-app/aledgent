@@ -23,9 +23,9 @@
 //!   sequence of the layer's record moves it back, to that sequence's start (amendment 0041,
 //!   [`SettlementWrite::Epoch`]); the store refuses any other head that goes back, and a sequence
 //!   that is not later than the one it holds.
-//! - **The gap end is cleared only by a restart** (amendment 0041, ruling q28): the start of a
-//!   strictly later sequence that moves the head back to its start also sets the gap end to 0,
-//!   since every position below it belonged to the chain before. Otherwise it only rises.
+//! - **A gap end is cleared only by a start** (amendment 0041, ruling q28, made exact): the start
+//!   of a strictly later sequence clears the untagged gap end and every gap end of an earlier
+//!   sequence, and keeps those of the started sequence or later. Otherwise each only rises.
 //! - **Gaps and incidents are appended, never removed.** A re-scan's difference (`Missing`,
 //!   `Unknown`) is one incident however many re-scans find it: the store indexes the ones
 //!   recorded by key, so a re-scan that finds nothing new reads that index, never the incidents.
@@ -146,10 +146,10 @@ pub enum SettlementWrite {
     Head(FinalisedHead),
     /// Record the start of a new sequence of the layer's record (amendment 0041): refused unless
     /// its number is strictly later than the one the store holds. With `head`, the finalised head
-    /// becomes it, even below the one held: the one write that moves the head back; and the gap
-    /// end is cleared (ruling q28), the positions below it being the chain before's. Without
-    /// `head`, the gap end stays: the head held is the new sequence's already, and a gap recorded
-    /// since may be the new sequence's too.
+    /// becomes it (refused unless it is the sequence's start), even below the one held: the one
+    /// write that moves the head back. With or without `head`, the untagged gap end and every gap
+    /// end of an earlier sequence are cleared, and those of this sequence or a later one kept
+    /// (ruling q28, made exact).
     Epoch {
         /// The sequence.
         epoch: SettlementEpoch,
@@ -169,6 +169,14 @@ pub enum SettlementWrite {
     /// the book keeps for gaps from [`super::CHAINED_SETTLEMENT`] on, each gap itself going to
     /// the audit trail. It never goes down but at a restart ([`SettlementWrite::Epoch`]).
     GapEnd(u64),
+    /// Raise the end of the highest gap of `sequence` to at least `to` (amendment 0041, decision 6
+    /// made exact): a gap the adapter named the sequence of. It never goes down but at a start.
+    SequenceGapEnd {
+        /// The sequence the gap is of.
+        sequence: u32,
+        /// The first position after it.
+        to: u64,
+    },
     /// Raise an incident.
     Incident(Incident),
     /// Record the settlement adapter's status declaration, replacing the last (`F-016`).
@@ -255,8 +263,14 @@ pub(crate) enum SettlementUndo {
     Unsign(OperationId),
     Undecide(OperationId),
     Head(Option<FinalisedHead>),
-    /// The sequence, the head, and the gap end a restart cleared, before a start.
-    Epoch(Option<SettlementEpoch>, Option<FinalisedHead>, Option<u64>),
+    /// The sequence, the head, the untagged gap end and the gap ends by sequence, before a start.
+    Epoch(
+        Option<SettlementEpoch>,
+        Option<FinalisedHead>,
+        u64,
+        Vec<(u32, u64)>,
+    ),
+    GapEnds(Vec<(u32, u64)>),
     PopGap,
     GapEnd(u64),
     Gaps(Vec<Gap>),
@@ -299,6 +313,11 @@ pub struct SettlementStore {
     /// (amendment 0040, ruling a40c-gaps-watermark): `proof` cannot show a range that starts
     /// below it complete. Absent while 0, so a book that records no gap holds no leaf for it.
     gap_end: Slot<u64, { kind::GAP_END }>,
+    /// The end of the highest gap of each sequence the adapter named with it (amendment 0041,
+    /// decision 6 made exact): `(sequence, end)`, in sequence order, one per sequence. From
+    /// [`super::SETTLEMENT_EPOCHS`] on; absent while empty. [`SettlementStore::gap_end`] is the
+    /// highest over it and the untagged `gap_end`, which counts as the sequence the book holds.
+    gap_ends: Slot<Vec<(u32, u64)>, { kind::GAP_END_BY_SEQUENCE }>,
     /// The last sequence of the layer's record whose start the book took (amendment 0041), from
     /// [`super::SETTLEMENT_EPOCHS`] on. Absent until one is taken.
     epoch: Slot<Option<SettlementEpoch>, { kind::SETTLEMENT_EPOCH }>,
@@ -426,12 +445,14 @@ impl SettlementStore {
             SettlementUndo::Head(h) => {
                 self.head.set(h);
             }
-            SettlementUndo::Epoch(e, h, gap_end) => {
+            SettlementUndo::Epoch(e, h, gap_end, gap_ends) => {
                 self.epoch.set(e);
                 self.head.set(h);
-                if let Some(g) = gap_end {
-                    self.gap_end.set(g);
-                }
+                self.gap_end.set(gap_end);
+                self.gap_ends.set(gap_ends);
+            }
+            SettlementUndo::GapEnds(before) => {
+                self.gap_ends.set(before);
             }
             SettlementUndo::PopGap => {
                 self.gaps.get_mut().pop();
@@ -683,15 +704,24 @@ impl SettlementStore {
                     return Err(SettlementRefusal::EpochHeadNotStart);
                 }
                 let before = *self.head.get();
-                let mut gap_end = None;
                 if let Some(h) = head {
                     self.head.set(Some(*h));
-                    // Ruling q28: a restart clears the gap end (kind 37, which the generation
-                    // that takes a start already reads).
-                    gap_end = Some(self.gap_end.set(0));
                 }
+                // Decision 6, made exact (ruling q28, Pablo 28 Oct): the end of every gap of an
+                // earlier sequence is cleared, whether or not the head is kept; that of the started
+                // sequence or a later one is kept. The untagged end is a gap reported without its
+                // sequence (the one the book held, earlier than this) or moved by `T-043-08`.
+                let gap_end = self.gap_end.set(0);
+                let kept: Vec<(u32, u64)> = self
+                    .gap_ends
+                    .get()
+                    .iter()
+                    .copied()
+                    .filter(|(sequence, _)| *sequence >= epoch.epoch)
+                    .collect();
+                let gap_ends = self.gap_ends.set(kept);
                 let held = self.epoch.set(Some(*epoch));
-                Ok(SettlementUndo::Epoch(held, before, gap_end))
+                Ok(SettlementUndo::Epoch(held, before, gap_end, gap_ends))
             }
             SettlementWrite::Gap(g) => {
                 if g.to <= g.from {
@@ -716,6 +746,15 @@ impl SettlementStore {
                 }
                 self.gap_end.set(*to);
                 Ok(SettlementUndo::GapEnd(before))
+            }
+            SettlementWrite::SequenceGapEnd { sequence, to } => {
+                let mut ends = self.gap_ends.get().clone();
+                match ends.binary_search_by_key(sequence, |(s, _)| *s) {
+                    Ok(i) if ends[i].1 >= *to => return Ok(SettlementUndo::Nothing),
+                    Ok(i) => ends[i].1 = *to,
+                    Err(i) => ends.insert(i, (*sequence, *to)),
+                }
+                Ok(SettlementUndo::GapEnds(self.gap_ends.set(ends)))
             }
             SettlementWrite::Incident(i) => {
                 let key = self
@@ -1099,6 +1138,21 @@ impl SettlementStore {
     /// The end of the highest gap recorded from [`super::CHAINED_SETTLEMENT`] on; 0 for none
     /// (`T-043-07`).
     pub fn gap_end(&self) -> u64 {
+        // The untagged end alone while no sequence named one: an input that names none reads no
+        // other leaf.
+        let ends = self.gap_ends.get();
+        ends.iter()
+            .map(|(_, end)| *end)
+            .fold(*self.gap_end.get(), u64::max)
+    }
+
+    /// The end of the highest gap of each sequence the adapter named (amendment 0041).
+    pub fn gap_ends(&self) -> &[(u32, u64)] {
+        self.gap_ends.get()
+    }
+
+    /// The untagged gap end: gaps reported without their sequence, or moved by `T-043-08`.
+    pub fn untagged_gap_end(&self) -> u64 {
         *self.gap_end.get()
     }
 
@@ -1167,6 +1221,7 @@ impl LeafHost for SettlementStore {
         out.push(&self.gaps);
         out.push(&self.incidents);
         out.push(&self.gap_end);
+        out.push(&self.gap_ends);
         out.push(&self.epoch);
         out.push(&self.status);
         out.push(&self.attestations);
@@ -1193,6 +1248,7 @@ impl LeafHost for SettlementStore {
         out.push(&mut self.gaps);
         out.push(&mut self.incidents);
         out.push(&mut self.gap_end);
+        out.push(&mut self.gap_ends);
         out.push(&mut self.epoch);
         out.push(&mut self.status);
         out.push(&mut self.attestations);

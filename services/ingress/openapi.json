@@ -2046,6 +2046,15 @@
             "$ref": "#/components/schemas/GapReasonBody",
             "description": "Why."
           },
+          "sequence": {
+            "description": "The sequence of the layer's record the gap is of (amendment 0041, decision 6 made exact):\na start keeps the gap only if it is of the started sequence or a later one. Forwarded only\nwhile the deployment's `settlement_epochs` is on, else dropped (a core host built before it\ncould not decode the input).",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "to": {
             "description": "The first position after it.",
             "format": "uint64",

@@ -158,6 +158,16 @@ pub enum AdapterInput {
     /// writing nothing, before [`crate::settlement::SETTLEMENT_EPOCHS`]. Appended last, so every
     /// recorded input decodes as before.
     Epoch(SettlementEpoch),
+    /// A range the adapter was forced to skip (`REQ-SA-7`), of the chain of `sequence`: the
+    /// sequence of its record the gap is of (amendment 0041, decision 6 made exact), so a start
+    /// clears it only if it is of an earlier sequence. Refused with `ERR-MalformedCommand`,
+    /// writing nothing, before [`crate::settlement::SETTLEMENT_EPOCHS`]. Appended last.
+    SequenceGap {
+        /// The range.
+        gap: Gap,
+        /// The sequence of the layer's record it is of.
+        sequence: u32,
+    },
 }
 
 /// What the core derived from an adapter input (`REQ-SI-5`): never more than a verdict, a state
@@ -316,6 +326,14 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                         return Err(Refusal::MalformedCommand);
                     }
                     AdapterReply::Epoch(self.start_epoch(source, epoch, now)?)
+                }
+                AdapterInput::SequenceGap { gap, sequence } => {
+                    // Amendment 0041: from `SETTLEMENT_EPOCHS` on only (the generation rule).
+                    if !self.epochs() {
+                        return Err(Refusal::MalformedCommand);
+                    }
+                    self.record_gap_of(source, gap, Some(sequence), now)?;
+                    AdapterReply::Gap
                 }
             })
         })();
