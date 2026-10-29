@@ -1043,12 +1043,9 @@ async fn req_cs_4_every_refusal_matches_its_openapi_description() {
         .as_array()
         .unwrap()
         .clone();
-    // The core's closed list, and the refusals only ingress sends until the next core
-    // (amendment 0037, R2; `tests/refusal.rs` checks those).
-    assert_eq!(
-        alternatives.len(),
-        Refusal::ALL.len() + ingress::refusal::IngressRefusal::ALL.len()
-    );
+    // The core's closed list, and nothing else (`tests/refusal.rs` checks `ERR-CommandApprovalRequired`,
+    // the last of it, which the core carries from rules version 1: `T-041-06`).
+    assert_eq!(alternatives.len(), Refusal::ALL.len());
     for r in Refusal::ALL {
         let published = alternatives
             .iter()

@@ -118,11 +118,19 @@ pub enum Refusal {
     IdentifierArchived,
     /// `ERR-Internal`: An unexpected fault inside aledgent. No detail is returned to the caller, and an incident is raised (`REQ-ER-2`).
     Internal,
+    /// `ERR-CommandApprovalRequired`: A command that needs a credential's approval of that one command (`REQ-AU-23`) was submitted without one. A presented approval that does not verify is `ERR-CredentialInvalid`.
+    ///
+    /// Appended last (`T-041-06`, amendment 0037): the closed list only grows at its end, so no
+    /// earlier refusal's position moves. SPEC §10 holds it beside the approval errors, so the
+    /// order of [`Refusal::ALL`] is SPEC §10's up to this one entry.
+    CommandApprovalRequired,
 }
 
 impl Refusal {
-    /// Every variant, in the order of SPEC §10.
-    pub const ALL: [Refusal; 41] = [
+    /// Every variant, in the order of SPEC §10 but for `ERR-CommandApprovalRequired`, which was
+    /// appended at the end when the core gained it (rules version 1, `T-041-06`): an existing
+    /// refusal never moves.
+    pub const ALL: [Refusal; 42] = [
         Refusal::NotAuthorised,
         Refusal::AuthorityRevoked,
         Refusal::CredentialInvalid,
@@ -164,6 +172,7 @@ impl Refusal {
         Refusal::InitialStateNotSealed,
         Refusal::IdentifierArchived,
         Refusal::Internal,
+        Refusal::CommandApprovalRequired,
     ];
 
     /// The SPEC §10 identifier, e.g. `"ERR-ZeroAmount"`.
@@ -210,6 +219,7 @@ impl Refusal {
             Refusal::InitialStateNotSealed => "ERR-InitialStateNotSealed",
             Refusal::IdentifierArchived => "ERR-IdentifierArchived",
             Refusal::Internal => "ERR-Internal",
+            Refusal::CommandApprovalRequired => "ERR-CommandApprovalRequired",
         }
     }
 
@@ -314,6 +324,9 @@ impl Refusal {
             }
             Refusal::Internal => {
                 "An unexpected fault inside aledgent. No detail is returned to the caller, and an incident is raised (`REQ-ER-2`)"
+            }
+            Refusal::CommandApprovalRequired => {
+                "A command that needs a credential's approval of that one command (`REQ-AU-23`) was submitted without one. A presented approval that does not verify is `ERR-CredentialInvalid`"
             }
         }
     }
@@ -495,9 +508,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn err_list_is_closed_at_forty_one() {
-        assert_eq!(Refusal::ALL.len(), 41);
-        let mut codes: [&str; 41] = [""; 41];
+    fn err_list_is_closed_at_forty_two() {
+        assert_eq!(Refusal::ALL.len(), 42);
+        let mut codes: [&str; 42] = [""; 42];
         for (i, r) in Refusal::ALL.iter().enumerate() {
             codes[i] = r.code();
         }
@@ -505,6 +518,16 @@ mod tests {
         for pair in codes.windows(2) {
             assert_ne!(pair[0], pair[1], "duplicate code");
         }
+    }
+
+    /// `T-041-06`: the closed list only grows at its end. The refusals before `ERR-CommandApprovalRequired`
+    /// keep the positions they had at 41, and the new one is last.
+    #[test]
+    fn err_a_refusal_added_to_the_list_goes_at_its_end() {
+        assert_eq!(Refusal::ALL[0], Refusal::NotAuthorised);
+        assert_eq!(Refusal::ALL[40], Refusal::Internal);
+        assert_eq!(Refusal::ALL[41], Refusal::CommandApprovalRequired);
+        assert!(Refusal::Internal < Refusal::CommandApprovalRequired);
     }
 
     #[test]

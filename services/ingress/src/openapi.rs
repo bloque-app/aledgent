@@ -24,7 +24,6 @@ use crate::query::{
     AssetBody, AssetParams, BalancesBody, BalancesParams, CanSpendBody, MovementsParams, PageBody,
     StatementBody, StatementParams, TrialBalanceBody,
 };
-use crate::refusal::IngressRefusal;
 use crate::surface::{
     AnsweringRoute, AuthRoute, CLIENT_KEY, CommandRoute, Handler, ON_BEHALF_OF, QueryRoute, ROUTES,
     status_of,
@@ -90,20 +89,6 @@ pub fn refusal_schema() -> Value {
                 "x-http-status": status_of(*r).as_u16(),
             })
         })
-        .chain(IngressRefusal::ALL.iter().map(|r| {
-            // Refusals only ingress sends until the next core carries them (amendment 0037, R2).
-            json!({
-                "title": r.code(),
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["error", "description"],
-                "properties": {
-                    "error": { "const": r.code() },
-                    "description": { "const": r.description() },
-                },
-                "x-http-status": r.status().as_u16(),
-            })
-        }))
         .collect();
     json!({
         "title": "Refusal",

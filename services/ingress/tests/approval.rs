@@ -11,9 +11,7 @@ use authn::webauthn::testing::Soft;
 use axum::http::StatusCode;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use ingress::approval::{
-    APPROVAL_HEADER, ApprovalBody, ApprovalMode, Approvals, COMMAND_APPROVAL_REQUIRED,
-};
+use ingress::approval::{APPROVAL_HEADER, ApprovalBody, ApprovalMode, Approvals};
 use ingress::auth::Passkeys;
 use ingress::boundary::{
     CallerBody, Core, CoreError, CoreInput, CoreReply, CredentialBody, OutboxPage, Query,
@@ -242,7 +240,7 @@ async fn ac_a10_1_2_5_no_approval_refused_an_approval_taken_in_a_retry_answered(
     let body = transfer(&w, "10");
     let (st, v) = submit(d, s, "/v1/transfers", "t-1", &body, None).await;
     assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
-    assert_eq!(v["error"], COMMAND_APPROVAL_REQUIRED);
+    assert_eq!(v["error"], Refusal::CommandApprovalRequired.code());
     assert!(!logged(d, &w, "t-1").await, "nothing is taken in");
 
     let a = step_a(d, s, "/v1/transfers", "t-1", &body).await;
@@ -500,7 +498,7 @@ async fn ac_a10_8_12_adding_a_passkey_needs_an_approval_of_that_passkey() {
     let body = reg(&new, &ch);
     let (st, v) = submit(d, s, "/v1/credentials", "c-1", &body, None).await;
     assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
-    assert_eq!(v["error"], COMMAND_APPROVAL_REQUIRED);
+    assert_eq!(v["error"], Refusal::CommandApprovalRequired.code());
     // Approved for `new`, sent with the thief's registration: refused.
     let a = step_a(d, s, "/v1/credentials", "c-1", &body).await;
     let h = approve(&a, &w.alice_soft, &w.alice_cred);
