@@ -885,6 +885,7 @@ pub fn shape(q: &crate::boundary::Query) -> Result<(), Refusal> {
         | Query::Anchor
         | Query::VerifyDisclosure { .. }
         | Query::Anchoring
+        | Query::SettlementHead
         | Query::Signals
         | Query::IntegratingParties
         | Query::Alias { .. } => {}

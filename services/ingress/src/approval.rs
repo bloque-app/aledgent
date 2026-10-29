@@ -21,8 +21,6 @@
 //! the route is no oracle. No assertion, challenge or credential reaches a log (`REQ-AU-8`).
 
 use authn::approval::{self as fmt, CommandContext};
-use axum::http::StatusCode;
-use axum::response::{IntoResponse as _, Response};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ledger_core::Refusal;
@@ -50,29 +48,6 @@ pub const APPROVAL_HEADER: &str = "aledgent-approval";
 /// `POST /v1/approvals/transfers` for `POST /v1/transfers`. Same authentication, same body, same
 /// headers; it takes nothing in.
 pub const APPROVAL_PREFIX: &str = "/v1/approvals";
-
-/// The refusal of a command that needs an approval and carries none (amendment 0037, R2).
-/// Held in ingress until the next core carries it in its own list (`T-040-10` reconciles this
-/// with the published refusal table).
-pub const COMMAND_APPROVAL_REQUIRED: &str = "ERR-CommandApprovalRequired";
-
-/// Its description, verbatim from amendment 0037, R2.
-pub const COMMAND_APPROVAL_REQUIRED_DESCRIPTION: &str = "A command that needs a credential's \
-    approval of that one command (`REQ-AU-23`) was submitted without one. A presented approval \
-    that does not verify is `ERR-CredentialInvalid`";
-
-/// The refusal [`COMMAND_APPROVAL_REQUIRED`], as the surface sends it: the status of
-/// `ERR-NotAuthorised` (the amendment's proposal), and a body of the shape every refusal has.
-pub fn approval_required() -> Response {
-    (
-        StatusCode::FORBIDDEN,
-        axum::Json(serde_json::json!({
-            "error": COMMAND_APPROVAL_REQUIRED,
-            "description": COMMAND_APPROVAL_REQUIRED_DESCRIPTION,
-        })),
-    )
-        .into_response()
-}
 
 // ----------------------------------------------------------------------------- the switch
 

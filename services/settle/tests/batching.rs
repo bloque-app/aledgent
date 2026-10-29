@@ -42,7 +42,7 @@ async fn until(k: &mut Kit, p: &Party, op: &str, want: &str, n: usize) -> String
 fn spec_133() -> Signing {
     Signing {
         spec_version: 133,
-        transaction_version: FORMAT_133.transaction_version,
+        transaction_version: FORMAT_133.transaction_versions[0],
         format: FORMAT_133,
     }
 }

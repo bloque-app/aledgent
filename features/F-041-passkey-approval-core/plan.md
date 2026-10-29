@@ -215,7 +215,7 @@ plan must not relax them silently).
 | `NFR-19` credit lag 2 s p99 | (b), (c): none expected | The stress suite's credit lag | p99 at or under 2 s, and not more than the owner's regression margin above the baseline's p99 (Q-F) |
 | `NFR-20` revocation lag 1 s p99 | (b), (c): the core's check that the approving credential is still in the set | A revocation of a credential, then an approval from it | The approval is refused within 1 s of the revocation's commit; for (c) the same, because ingress reads the set through the stream (`F-038`) |
 | `NFR-21` scale out, replace and lose a node; bring a new node up to date in 15 minutes by design | (b), (c2): the book is larger, checkpoints and exports include the records | Time to admit and catch up a new node at the book's size, with records; the decision rate while a node is admitted | The time stays within the design value (15 minutes), or any miss is reported as `NFR-21` says, with `NFR-1`, `NFR-15` and `NFR-16` holding throughout |
-| `NFR-22` retention of what replay needs | (b), (c2): the records are inputs' content; the trusted key set is part of what replay needs | A replay from genesis on a book with records, under every code generation that wrote them | Replay re-derives the same roots; the trusted key set at each input is recoverable from the inputs |
+| `NFR-22` retention of what replay needs | (b), (c2): the records are inputs' content; the trusted key set is part of what replay needs | A replay from genesis on a book with records, under every rules version that wrote them | Replay re-derives the same roots; the trusted key set at each input is recoverable from the inputs |
 
 `NFR-12` and `NFR-13` are not in `SPEC.md`'s list (a gap in the sequence, not an omission of this table).
 

@@ -257,6 +257,8 @@ pub enum Call {
         gap: Gap,
         now: Time,
     },
+    /// Stays decodable so a book's recorded re-scans replay (`NFR-22`); the code of
+    /// [`crate::settlement::CHAINED_SETTLEMENT`] and later refuses it (`T-043-06`).
     Rescan {
         source: SourceId,
         from: u64,

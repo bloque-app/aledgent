@@ -70,6 +70,9 @@ pub struct Driver {
     pub noise: Noise,
     cursor: u64,
     rng: Rng,
+    /// The gaps it recorded: its own list, since from the chained generation on the book keeps
+    /// only the end of the highest one (`T-043-07`).
+    gaps: Vec<Gap>,
 }
 
 /// The observation of `r` on `instance`, with the finality as observed.
@@ -156,6 +159,7 @@ impl Driver {
             noise: Noise::default(),
             cursor: 0,
             rng: Rng::new(seed),
+            gaps: Vec::new(),
         }
     }
 
@@ -309,7 +313,7 @@ impl Driver {
         while self.cursor < head.next_seq {
             let c = self.cursor;
             let done = store.final_at(instance, c).is_some()
-                || store.gaps().iter().any(|g| g.from <= c && c < g.to);
+                || self.gaps.iter().any(|g| g.from <= c && c < g.to);
             if !done {
                 break;
             }
@@ -326,21 +330,16 @@ impl Driver {
         now: Time,
         stats: &mut CycleStats,
     ) {
-        let known = port
-            .settlement()
-            .gaps()
-            .iter()
-            .any(|g| g.from <= from && to <= g.to);
+        let known = self.gaps.iter().any(|g| g.from <= from && to <= g.to);
         if !known {
-            let _ = port.record_gap(
-                self.source,
-                Gap {
-                    from,
-                    to,
-                    reason: GapReason::Pruned,
-                },
-                now,
-            );
+            let gap = Gap {
+                from,
+                to,
+                reason: GapReason::Pruned,
+            };
+            if port.record_gap(self.source, gap, now).is_ok() {
+                self.gaps.push(gap);
+            }
             stats.gaps += 1;
         }
     }

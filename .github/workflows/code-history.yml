@@ -1,0 +1,133 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+name: Code history
+
+# The code-history gate (T-037-12; REQ-RT-3, REQ-RT-17, REQ-RT-19; amendment 0023 (f), amendment 0033
+# (d) and D18; bloque-app/bloque-ledgent#286).
+#
+# A book keeps every input it ever took, and a restore must be able to replay all of them, each range
+# under the code that ran it. This build must therefore still decide every recorded input exactly as
+# the build that recorded it did, under that input's code generation (the frozen host spec, ruling
+# a0023-q6). The gate replays a recorded history (crates/core-binding/tests/fixtures/code-history)
+# from genesis, natively, under its code map, and requires every archived root and log hash; and it
+# decides every way-out input at an upgrade's input under the generation in force and the next one,
+# and requires the same writer state (D18). The recorded part of the history may only grow: a change
+# that rewrote it would pass by re-recording what it breaks.
+#
+# It runs on every change to Rust anywhere but the paths it lists as skipped, and it is a reusable
+# workflow (workflow_call): the core release job of aledgent#80 calls it before a code version is
+# built, once aledgent#88 wires it in. Until then it is advisory: a red run here blocks nothing by
+# itself, unless the repository makes it a required check.
+#
+# Not here yet: a construction migration (T-037-10) and a continuation (T-037-17), neither built;
+# the platform's execution of each range under its replayer, with the real packages; and the read-only
+# replay of a deployment's archive, which needs read access to the archive.
+
+on:
+  # Every change to Rust, its manifests, its lock files or its toolchain, anywhere: the history a
+  # book replays depends on more than the core's own crates (ledger-core's dependencies, the
+  # kernel, the toolchain). Skipped only for the paths listed after the `!`, which no core links.
+  pull_request:
+    paths:
+      - "**.rs"
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - "**/rust-toolchain.toml"
+      - "rust-toolchain.toml"
+      - "crates/core-binding/tests/fixtures/code-history/**"
+      - "tools/ci/check-code-history-fixture.sh"
+      - ".github/workflows/code-history.yml"
+      - "!spikes/**"
+      - "!e2e/**"
+  push:
+    branches: [develop, main]
+    paths:
+      - "**.rs"
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - "**/rust-toolchain.toml"
+      - "rust-toolchain.toml"
+      - "crates/core-binding/tests/fixtures/code-history/**"
+      - "tools/ci/check-code-history-fixture.sh"
+      - ".github/workflows/code-history.yml"
+      - "!spikes/**"
+      - "!e2e/**"
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  code-history:
+    name: code history (T-037-12)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # The base the recorded history is compared with must be in the clone.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: The recorded history only grew
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          zero=0000000000000000000000000000000000000000
+          case "$EVENT" in
+            pull_request) base="$PR_BASE" ;;
+            # A push that creates the branch has no "before": its parent is the base.
+            push) base="$BEFORE"; [ "$base" != "$zero" ] || base=$(git rev-parse HEAD^) ;;
+            # A release, or a run by hand: against the newest release tag before this commit (a tagged
+            # commit is never compared with its own tag).
+            *) base=$(git describe --tags --abbrev=0 --match 'v*' "$(git rev-parse HEAD)^" 2>/dev/null || true) ;;
+          esac
+          # Fail closed: no base, nothing proven to have only grown. The very first recording is the
+          # script's own case (a base that holds no fixture), never a missing base.
+          if [ -z "$base" ] || [ "$base" = "$zero" ]; then
+            echo "::error::no base to compare the recorded history with (event $EVENT): refusing rather than skipping"
+            exit 1
+          fi
+          # The base's copy of the check, not this change's: a change cannot loosen the rule it is
+          # held to. Only where the base has none yet (the change that adds it) is this one used.
+          script=tools/ci/check-code-history-fixture.sh
+          if git cat-file -e "$base:$script" 2>/dev/null; then
+            git show "$base:$script" >"$RUNNER_TEMP/check-code-history-fixture.sh"
+          else
+            echo "::notice::$script is not on the base yet: this change's copy runs"
+            cp "$script" "$RUNNER_TEMP/check-code-history-fixture.sh"
+          fi
+          bash "$RUNNER_TEMP/check-code-history-fixture.sh" "$base" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: code-history
+
+      - name: This build replays the recorded history, and decides each way out the same by either generation
+        run: |
+          set -euo pipefail
+          cargo test -p core-binding --features ingress --test code_history 2>&1 | tee "$RUNNER_TEMP/gate.log"
+          # Each check ran and passed: the gate cannot pass by running nothing.
+          for t in t037_12_the_fixture_replays_from_genesis_under_its_code_map \
+                   t037_12_every_way_out_at_n_is_decided_the_same_by_either_generation \
+                   t037_12_the_fixture_covers_every_call; do
+            grep -qx "test $t ... ok" "$RUNNER_TEMP/gate.log" || { echo "::error::$t did not run and pass"; exit 1; }
+          done
+
+      - name: Restore and replay across upgrades (AC-K7.3, AC-K7.18), and the code map
+        run: |
+          cargo test -p core-binding --features ingress --lib code_map
+          cargo test -p core-binding --features ingress --test roll_forward --test switch_driver --test fence
+          cargo test -p conformance -- AC-K7

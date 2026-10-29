@@ -281,6 +281,10 @@ pub fn fast_config(replica: &str) -> Config {
         decision_wait: Duration::from_secs(30),
         core_batch: crate::service::DEFAULT_CORE_BATCH,
         genesis_gate: false,
+        // Amendment 0041: the in-process core knows the input.
+        settlement_epochs: true,
+        // Likewise the head query (`T-043-19`).
+        settlement_head: true,
         archived: Arc::default(),
         feed_signer: None,
         // The tests exercise `F-038`'s sequenced feed; the legacy link's own tests set

@@ -1840,6 +1840,116 @@
         "description": "A command with nothing in its body but what its path names (`release`, `close`, `revoke`).",
         "type": "object"
       },
+      "EpochBody": {
+        "additionalProperties": false,
+        "description": "A new sequence of the settlement layer's record started under the book (amendment 0041,\n`[PENDING AMENDMENT 0041]`), as the layer holds it (`anchor_epoch()`).",
+        "properties": {
+          "at": {
+            "description": "The block of the reset.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "base": {
+            "description": "The anchor number it starts after.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "book": {
+            "description": "The book it names: its chainspec digest, 32 bytes of hex.",
+            "type": "string"
+          },
+          "epoch": {
+            "description": "The sequence's number.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "from_seq": {
+            "description": "The position of its first entry.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "previous": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PreviousAnchorBody"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The latest anchor of the sequence before, if it had one."
+          }
+        },
+        "required": [
+          "epoch",
+          "base",
+          "from_seq",
+          "at",
+          "book"
+        ],
+        "type": "object"
+      },
+      "EpochResultBody": {
+        "additionalProperties": false,
+        "description": "What the core made of a new sequence (amendment 0041).",
+        "properties": {
+          "head": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FinalisedHeadBody"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "For `started`: the finalised head the book holds now."
+          },
+          "operation_reference": {
+            "description": "For `in_flight`: the first operation in flight.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "outcome": {
+            "description": "`started`, `recorded` or `refused`.",
+            "type": "string"
+          },
+          "recorded": {
+            "description": "For `not_later`: the sequence the book holds.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "refusal": {
+            "description": "For `refused`: `other_book`, `not_later`, `in_flight` or `earlier_final`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "seq": {
+            "description": "For `earlier_final`: the first position an earlier sequence's final record holds.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "outcome"
+        ],
+        "type": "object"
+      },
       "EventKindBody": {
         "description": "The event a record names, as the settlement layer names it.",
         "oneOf": [
@@ -1899,6 +2009,29 @@
         ],
         "type": "object"
       },
+      "FinalisedHeadBody": {
+        "additionalProperties": false,
+        "description": "A finalised head: a height and the position the record has reached there.",
+        "properties": {
+          "height": {
+            "description": "The finalised height.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "next_seq": {
+            "description": "The position of the next entry at that height.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "height",
+          "next_seq"
+        ],
+        "type": "object"
+      },
       "GapBody": {
         "additionalProperties": false,
         "description": "A range `[from, to)` the adapter was forced to skip (`REQ-SA-7`, `AC-D2.2`).",
@@ -1912,6 +2045,15 @@
           "reason": {
             "$ref": "#/components/schemas/GapReasonBody",
             "description": "Why."
+          },
+          "sequence": {
+            "description": "The sequence of the layer's record the gap is of (amendment 0041, decision 6 made exact):\na start keeps the gap only if it is of the started sequence or a later one. Forwarded only\nwhile the deployment's `settlement_epochs` is on, else dropped (a core host built before it\ncould not decode the input).",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "to": {
             "description": "The first position after it.",
@@ -3574,6 +3716,27 @@
         ],
         "type": "object"
       },
+      "PreviousAnchorBody": {
+        "additionalProperties": false,
+        "description": "The latest anchor of the sequence before a new one (amendment 0039's `previous`).",
+        "properties": {
+          "commitment": {
+            "description": "Its commitment, 32 bytes of hex.",
+            "type": "string"
+          },
+          "number": {
+            "description": "Its number.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "number",
+          "commitment"
+        ],
+        "type": "object"
+      },
       "ReclaimCustodyBody": {
         "additionalProperties": false,
         "description": "`reclaim_custody` of the account in the path (`REQ-AU-13`, `F-012`).",
@@ -4605,37 +4768,6 @@
         ],
         "type": "object"
       },
-      "RescanBody": {
-        "additionalProperties": false,
-        "description": "A re-scan of `[from, to)` (`REQ-IN-5`, `AC-D2.1`).",
-        "properties": {
-          "from": {
-            "description": "The first position.",
-            "format": "uint64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "layer": {
-            "description": "Every position the layer holds in the range.",
-            "items": {
-              "$ref": "#/components/schemas/LayerEntryBody"
-            },
-            "type": "array"
-          },
-          "to": {
-            "description": "The first position after the range.",
-            "format": "uint64",
-            "minimum": 0,
-            "type": "integer"
-          }
-        },
-        "required": [
-          "from",
-          "to",
-          "layer"
-        ],
-        "type": "object"
-      },
       "RescanResultBody": {
         "additionalProperties": false,
         "description": "What a re-scan found.",
@@ -4952,6 +5084,54 @@
           }
         ]
       },
+      "SettlementHeadBody": {
+        "description": "Where the book stands on the settlement layer's record (amendment 0041, `T-043-16`):\n`GET /v1/ops/settlement/head`. Unknown fields are not refused: a field a later core adds (as\n`reported`, `T-043-17`) still reads where ingress is older than the core.",
+        "properties": {
+          "epoch": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EpochBody"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The last sequence of the layer's record whose start the book took; absent while it follows\nthe sequence the instance began with."
+          },
+          "head": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FinalisedHeadBody"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The finalised head the book holds."
+          },
+          "instance": {
+            "description": "The instance the book settles on, once configured.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "reported": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FinalisedHeadBody"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The first head the adapter reported at a later block with a lower position that the book\ndid not take (amendment 0041's guard): while present, withdrawals are refused with\n`ERR-SettlementLayerUnavailable`."
+          }
+        },
+        "type": "object"
+      },
       "SettlementResultBody": {
         "additionalProperties": false,
         "description": "What a settlement command produced.",
@@ -4991,6 +5171,17 @@
               "string",
               "null"
             ]
+          },
+          "epoch": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EpochResultBody"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "What the core made of a new sequence (amendment 0041)."
           },
           "instruction": {
             "anyOf": [
@@ -10131,6 +10322,49 @@
         "summary": "Operator: compare the book with the settlement layer's positions at the latest cut (F-017)."
       }
     },
+    "/v1/ops/settlement/head": {
+      "get": {
+        "operationId": "settlement_head",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SettlementHeadBody"
+                }
+              }
+            },
+            "description": "The answer, from one consistent view (REQ-QR-2)."
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Refusal"
+                }
+              }
+            },
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Refusal"
+                }
+              }
+            },
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
+          }
+        },
+        "summary": "Operator: the book's finalised settlement head and the sequence of the settlement layer's record it follows (amendment 0041). Read-only."
+      }
+    },
     "/v1/ops/signals": {
       "get": {
         "operationId": "signals",
@@ -11430,6 +11664,80 @@
         "summary": "Settlement adapter: its status and what it supports (F-016). The adapter's principal only."
       }
     },
+    "/v1/settlement/epochs": {
+      "post": {
+        "operationId": "start_epoch",
+        "parameters": [
+          {
+            "description": "The client key (REQ-OP-10). Without one, a key is derived from the request and returned (REQ-OP-11).",
+            "in": "header",
+            "name": "client-key",
+            "required": false,
+            "schema": {
+              "maxLength": 256,
+              "type": "string"
+            }
+          },
+          {
+            "description": "The identity the caller acts for, where different (REQ-PN-1).",
+            "in": "header",
+            "name": "on-behalf-of",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EpochBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandReply"
+                }
+              }
+            },
+            "description": "Decided. For a transfer or a reservation, the reply to a repeat once the core has decided (REQ-CS-3)."
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Refusal"
+                }
+              }
+            },
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Refusal"
+                }
+              }
+            },
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
+          }
+        },
+        "summary": "Settlement adapter: a new sequence of the settlement layer's record started under the book (amendment 0041); the core restarts its finalised head at its start, or refuses it. The adapter's principal only."
+      }
+    },
     "/v1/settlement/evidence": {
       "get": {
         "operationId": "pending_evidence",
@@ -11890,80 +12198,6 @@
           }
         },
         "summary": "Settlement adapter: the settlement layer's positions at a finalized block, compared at once (F-017)."
-      }
-    },
-    "/v1/settlement/rescans": {
-      "post": {
-        "operationId": "record_rescan",
-        "parameters": [
-          {
-            "description": "The client key (REQ-OP-10). Without one, a key is derived from the request and returned (REQ-OP-11).",
-            "in": "header",
-            "name": "client-key",
-            "required": false,
-            "schema": {
-              "maxLength": 256,
-              "type": "string"
-            }
-          },
-          {
-            "description": "The identity the caller acts for, where different (REQ-PN-1).",
-            "in": "header",
-            "name": "on-behalf-of",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/RescanBody"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CommandReply"
-                }
-              }
-            },
-            "description": "Decided. For a transfer or a reservation, the reply to a repeat once the core has decided (REQ-CS-3)."
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Refusal"
-                }
-              }
-            },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
-          },
-          "5XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Refusal"
-                }
-              }
-            },
-            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
-            "headers": {
-              "Retry-After": {
-                "$ref": "#/components/headers/RetryAfter"
-              }
-            }
-          }
-        },
-        "summary": "Settlement adapter: a re-scan of a range; every difference is an incident (F-016)."
       }
     },
     "/v1/settlement/signings": {

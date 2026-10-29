@@ -1,0 +1,28 @@
+{
+  "ranges": [
+    {
+      "from": 1,
+      "to": 31,
+      "code": "0000000000000000000000000000000000000000000000000000000000000000",
+      "generation": 0
+    },
+    {
+      "from": 32,
+      "to": 65,
+      "code": "26ff15aeb10dace544febfd5a843f6fb8a42f6554b2c47d4c227939a48cf2d12",
+      "generation": 1
+    },
+    {
+      "from": 66,
+      "to": 99,
+      "code": "cd01a289467597f5fa363942a0a007af31d761656e25cf38a62c6c2064d1f3b9",
+      "generation": 2
+    },
+    {
+      "from": 100,
+      "to": 105,
+      "code": "14fcdf2c2dfced80493e259b117a7f5c590326be4f7da1d0fdba935aa49ad46b",
+      "generation": 3
+    }
+  ]
+}

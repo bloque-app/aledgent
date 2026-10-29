@@ -1,0 +1,44 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# F-027 (REQ-SA-9): pins the settlement executor's Kreivo transactions on Kreivo release 0.18.1
+# (spec 136, transaction_version 14, `5cd5003`), the runtime live on mainnet from 2026-10-27, to the
+# crates that release locks.
+#
+# A workspace of its own, like `../kreivo-pin` (spec 133, Kreivo `4aef055`) and `../kreivo-pin-132`
+# (release 0.16.9): 0.18.1 locks frame-contrib 3.0.0-pre.2 and pass-authenticators 2.0.0-pre.1 by git
+# revision (through Kreivo's `[patch.crates-io]`), which cannot share a lock file with `kreivo-pin`'s
+# crates.io releases of them. The Polkadot SDK crates are the same versions as `kreivo-pin`'s.
+# `services/settle` builds its transactions with its own plain SCALE encoder (`src/chain/kreivo.rs`,
+# format `kreivo-133`) and pins them in `vectors.json` and `vectors-native.json`; this crate rebuilds
+# the same bytes from the same inputs with Kreivo 0.18.1's types and checks them against those files.
+# `Cargo.lock` was seeded from Kreivo 0.18.1's own lock file. Run it with
+# `cargo test --locked --manifest-path services/settle/kreivo-pin-136/Cargo.toml`.
+[workspace]
+
+[package]
+name = "kreivo-pin-136"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/bloque-app/aledgent"
+description = "Pins aledgent-settle's Kreivo transactions (v5 PassAuthenticate, and v4 signed from native accounts) to Kreivo 0.18.1's own types."
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+codec = { package = "parity-scale-codec", version = "=3.7.5", features = ["derive"] }
+scale-info = { version = "=2.11.6", features = ["derive"] }
+sp-core = { version = "=43.0.0", features = ["std"] }
+sp-crypto-hashing = "=0.1.0"
+sp-runtime = { version = "=48.0.0", features = ["std"] }
+sp-weights = { version = "=36.0.0", features = ["std"] }
+frame-support = { version = "=48.1.0", features = ["std"] }
+# The authenticator Kreivo 0.18.1's `Pass` composite uses for substrate keys, and its traits: the
+# message the device signs (`context ‖ challenge ‖ authority`, unchanged since 1.0.0), the
+# credential, and the device's own verification of it. The revisions Kreivo 0.18.1 locks.
+fc-traits-authn = { git = "https://github.com/virto-network/frame-contrib", rev = "4d16b1e196621a62f48ca8f1a8fea1ae7807d18a", features = ["std", "runtime"] }
+pass-authenticators-substrate-keys = { git = "https://github.com/virto-network/pass-authenticators", rev = "86674b2f191d8e4a11cf78ca6d8c61af38a7998b", default-features = false, features = ["std", "runtime", "full-crypto"] }
+serde_json = "1"
+hex = "0.4"

@@ -36,10 +36,11 @@ use ledger_core::settlement::assets::{
     AssetAttestation, AttestationVerdict, LAYER_TEXT_MAX, LayerAssetFacts, LayerAssetStatus,
 };
 use ledger_core::settlement::{
-    AdapterStatus, AnchorFact, Coordinate, Destination, EventKind, FinalisedHead, Gap, GapReason,
-    HeadReport, KeyNonce, Movement, Observation, ObservedFinality, OutboundInstruction, OutboxCall,
-    Payload, RescanReport, SettlementCall, SettlementConfig, Signing, SigningRecord, SourceId,
-    SupportDeclaration, Venue, Verdict,
+    AdapterStatus, AnchorFact, Coordinate, Destination, EpochOutcome, EpochRefusal, EventKind,
+    FinalisedHead, Gap, GapReason, HeadReport, KeyNonce, Movement, Observation, ObservedFinality,
+    OutboundInstruction, OutboxCall, Payload, PreviousAnchor, RescanReport, SettlementCall,
+    SettlementConfig, SettlementEpoch, Signing, SigningRecord, SourceId, SupportDeclaration, Venue,
+    Verdict,
 };
 use ledger_kernel::store::LeafStore;
 use ledger_kernel::vault::VaultBackend;
@@ -566,6 +567,113 @@ pub struct HeadBody {
     pub nonces: Vec<KeyNonceBody>,
 }
 
+/// The latest anchor of the sequence before a new one (amendment 0039's `previous`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PreviousAnchorBody {
+    /// Its number.
+    pub number: u64,
+    /// Its commitment, 32 bytes of hex.
+    pub commitment: String,
+}
+
+/// A new sequence of the settlement layer's record started under the book (amendment 0041,
+/// `[PENDING AMENDMENT 0041]`), as the layer holds it (`anchor_epoch()`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EpochBody {
+    /// The sequence's number.
+    pub epoch: u32,
+    /// The anchor number it starts after.
+    pub base: u64,
+    /// The position of its first entry.
+    pub from_seq: u64,
+    /// The block of the reset.
+    pub at: u64,
+    /// The book it names: its chainspec digest, 32 bytes of hex.
+    pub book: String,
+    /// The latest anchor of the sequence before, if it had one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<PreviousAnchorBody>,
+}
+
+/// Where the book stands on the settlement layer's record (amendment 0041, `T-043-16`):
+/// `GET /v1/ops/settlement/head`. Unknown fields are not refused: a field a later core adds (as
+/// `reported`, `T-043-17`) still reads where ingress is older than the core.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SettlementHeadBody {
+    /// The instance the book settles on, once configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<u32>,
+    /// The finalised head the book holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<FinalisedHeadBody>,
+    /// The last sequence of the layer's record whose start the book took; absent while it follows
+    /// the sequence the instance began with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<EpochBody>,
+    /// The first head the adapter reported at a later block with a lower position that the book
+    /// did not take (amendment 0041's guard): while present, withdrawals are refused with
+    /// `ERR-SettlementLayerUnavailable`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported: Option<FinalisedHeadBody>,
+}
+
+/// The settlement head on the wire (amendment 0041).
+pub fn settlement_head_body(v: &ledger_core::settlement::SettlementHeadView) -> SettlementHeadBody {
+    SettlementHeadBody {
+        instance: v.instance,
+        head: v.head.as_ref().map(finalised_head_body),
+        epoch: v.epoch.as_ref().map(epoch_body),
+        reported: v.reported.as_ref().map(finalised_head_body),
+    }
+}
+
+/// `GET /v1/ops/settlement/head` (amendment 0041): the operator's read.
+pub fn settlement_head<S: LeafStore, V: VaultBackend>(
+    l: &Ledger<S, V>,
+    caller: &Caller,
+    now: ledger_core::account::Time,
+) -> QueryReply {
+    match l.settlement_head_view(caller, now) {
+        Ok(v) => QueryReply::SettlementHead(settlement_head_body(&v)),
+        Err(error) => QueryReply::Refused { error },
+    }
+}
+
+/// What the core made of a new sequence (amendment 0041).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EpochResultBody {
+    /// `started`, `recorded` or `refused`.
+    pub outcome: String,
+    /// For `started`: the finalised head the book holds now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<FinalisedHeadBody>,
+    /// For `refused`: `other_book`, `not_later`, `in_flight` or `earlier_final`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
+    /// For `not_later`: the sequence the book holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded: Option<u32>,
+    /// For `in_flight`: the first operation in flight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_reference: Option<String>,
+    /// For `earlier_final`: the first position an earlier sequence's final record holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+}
+
+/// A finalised head: a height and the position the record has reached there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FinalisedHeadBody {
+    /// The finalised height.
+    pub height: u64,
+    /// The position of the next entry at that height.
+    pub next_seq: u64,
+}
+
 /// Why a range was skipped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -586,6 +694,12 @@ pub struct GapBody {
     pub to: u64,
     /// Why.
     pub reason: GapReasonBody,
+    /// The sequence of the layer's record the gap is of (amendment 0041, decision 6 made exact):
+    /// a start keeps the gap only if it is of the started sequence or a later one. Forwarded only
+    /// while the deployment's `settlement_epochs` is on, else dropped (a core host built before it
+    /// could not decode the input).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<u32>,
 }
 
 /// One position of a re-scan and the digest the layer holds there.
@@ -598,7 +712,8 @@ pub struct LayerEntryBody {
     pub digest: String,
 }
 
-/// A re-scan of `[from, to)` (`REQ-IN-5`, `AC-D2.1`).
+/// A re-scan of `[from, to)` (`REQ-IN-5`, `AC-D2.1`). Its route, `POST /v1/settlement/rescans`, is
+/// withdrawn (`T-043-06`): the settlement adapter checks completeness against the layer's head.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RescanBody {
@@ -630,7 +745,9 @@ pub enum AdapterCommandBody {
     EvidenceChecked(EvidenceCheckedBody),
     /// `record_observation`: a gap.
     Gap(GapBody),
-    /// `record_observation`: a re-scan.
+    /// `record_observation`: a re-scan. No route submits one any more (`T-043-06`, amendment
+    /// 0040): kept so a received-log entry from before still decodes, and the core decides it as
+    /// the generation that runs it decides (from the chained generation on, refused).
     Rescan(RescanBody),
     /// `ack_instruction` of an anchor (`F-017`).
     AcknowledgeAnchor(AnchorAcknowledgementBody),
@@ -640,6 +757,8 @@ pub enum AdapterCommandBody {
     Positions(PositionsBody),
     /// What the layer's metadata states about an asset location (`DEC-20`).
     Attest(AttestationBody),
+    /// A new sequence of the layer's record started under the book (amendment 0041).
+    Epoch(EpochBody),
 }
 
 /// An instruction in the outbox, as the adapter reads it (`REQ-SO-5`).
@@ -842,6 +961,9 @@ pub struct SettlementResultBody {
     /// What the core made of an attestation (`DEC-20`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attestation: Option<AttestationVerdictBody>,
+    /// What the core made of a new sequence (amendment 0041).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<EpochResultBody>,
 }
 
 // ------------------------------------------------------------------------------------ routes
@@ -867,8 +989,6 @@ pub enum SettlementRoute {
     Head,
     /// `POST /v1/settlement/gaps`.
     Gap,
-    /// `POST /v1/settlement/rescans`.
-    Rescan,
     /// `POST /v1/settlement/anchor-acknowledgements` (`F-017`).
     AcknowledgeAnchor,
     /// `POST /v1/settlement/anchor-failures` (`F-017`).
@@ -879,6 +999,8 @@ pub enum SettlementRoute {
     EvidenceChecked,
     /// `POST /v1/settlement/attestations` (`DEC-20`).
     Attest,
+    /// `POST /v1/settlement/epochs` (amendment 0041).
+    Epoch,
 }
 
 fn json<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, Refusal> {
@@ -899,12 +1021,12 @@ impl SettlementRoute {
             SettlementRoute::Check => "CheckBody",
             SettlementRoute::Head => "HeadBody",
             SettlementRoute::Gap => "GapBody",
-            SettlementRoute::Rescan => "RescanBody",
             SettlementRoute::AcknowledgeAnchor => "AnchorAcknowledgementBody",
             SettlementRoute::AnchorNotExecuted => "AnchorFailureBody",
             SettlementRoute::Positions => "PositionsBody",
             SettlementRoute::EvidenceChecked => "EvidenceCheckedBody",
             SettlementRoute::Attest => "AttestationBody",
+            SettlementRoute::Epoch => "EpochBody",
         }
     }
 
@@ -927,7 +1049,6 @@ impl SettlementRoute {
             SettlementRoute::Check => adapter(AdapterCommandBody::Check(json(bytes)?)),
             SettlementRoute::Head => adapter(AdapterCommandBody::Head(json(bytes)?)),
             SettlementRoute::Gap => adapter(AdapterCommandBody::Gap(json(bytes)?)),
-            SettlementRoute::Rescan => adapter(AdapterCommandBody::Rescan(json(bytes)?)),
             SettlementRoute::AcknowledgeAnchor => {
                 adapter(AdapterCommandBody::AcknowledgeAnchor(json(bytes)?))
             }
@@ -939,6 +1060,7 @@ impl SettlementRoute {
                 adapter(AdapterCommandBody::EvidenceChecked(json(bytes)?))
             }
             SettlementRoute::Attest => adapter(AdapterCommandBody::Attest(json(bytes)?)),
+            SettlementRoute::Epoch => adapter(AdapterCommandBody::Epoch(json(bytes)?)),
         }
     }
 }
@@ -1146,14 +1268,34 @@ fn adapter_input(b: &AdapterCommandBody) -> Result<AdapterInput, Refusal> {
             submission: operation(&e.submission)?,
         },
         AdapterCommandBody::Attest(a) => AdapterInput::Attest(attestation(a)?),
-        AdapterCommandBody::Gap(g) => AdapterInput::Gap(Gap {
-            from: g.from,
-            to: g.to,
-            reason: match g.reason {
-                GapReasonBody::Pruned => GapReason::Pruned,
-                GapReasonBody::Unreadable => GapReason::Unreadable,
+        AdapterCommandBody::Epoch(e) => AdapterInput::Epoch(SettlementEpoch {
+            epoch: e.epoch,
+            base: e.base,
+            from_seq: e.from_seq,
+            at: e.at,
+            book: hex32(&e.book)?,
+            previous: match &e.previous {
+                Some(p) => Some(PreviousAnchor {
+                    number: p.number,
+                    commitment: hex32(&p.commitment)?,
+                }),
+                None => None,
             },
         }),
+        AdapterCommandBody::Gap(g) => {
+            let gap = Gap {
+                from: g.from,
+                to: g.to,
+                reason: match g.reason {
+                    GapReasonBody::Pruned => GapReason::Pruned,
+                    GapReasonBody::Unreadable => GapReason::Unreadable,
+                },
+            };
+            match g.sequence {
+                Some(sequence) => AdapterInput::SequenceGap { gap, sequence },
+                None => AdapterInput::Gap(gap),
+            }
+        }
         AdapterCommandBody::Rescan(r) => AdapterInput::Rescan {
             from: r.from,
             to: r.to,
@@ -1180,6 +1322,26 @@ fn adapter_input(b: &AdapterCommandBody) -> Result<AdapterInput, Refusal> {
                 .collect::<Result<Vec<_>, Refusal>>()?,
         }),
     })
+}
+
+fn gap_body(g: &Gap, sequence: Option<u32>) -> GapBody {
+    GapBody {
+        from: g.from,
+        to: g.to,
+        reason: match g.reason {
+            GapReason::Pruned => GapReasonBody::Pruned,
+            GapReason::Unreadable => GapReasonBody::Unreadable,
+        },
+        sequence,
+    }
+}
+
+/// Amendment 0041: a gap's sequence is forwarded only while the deployment says its core knows
+/// the input that carries it (`settlement_epochs`); otherwise the gap goes as before, without it.
+pub(crate) fn drop_gap_sequence(body: &mut CommandBody) {
+    if let CommandBody::Adapter(AdapterCommandBody::Gap(g)) = body {
+        g.sequence = None;
+    }
 }
 
 fn adapter_body(i: &AdapterInput) -> AdapterCommandBody {
@@ -1264,14 +1426,10 @@ fn adapter_body(i: &AdapterInput) -> AdapterCommandBody {
                 })
                 .collect(),
         }),
-        AdapterInput::Gap(g) => AdapterCommandBody::Gap(GapBody {
-            from: g.from,
-            to: g.to,
-            reason: match g.reason {
-                GapReason::Pruned => GapReasonBody::Pruned,
-                GapReason::Unreadable => GapReasonBody::Unreadable,
-            },
-        }),
+        AdapterInput::Gap(g) => AdapterCommandBody::Gap(gap_body(g, None)),
+        AdapterInput::SequenceGap { gap, sequence } => {
+            AdapterCommandBody::Gap(gap_body(gap, Some(*sequence)))
+        }
         AdapterInput::Rescan { from, to, layer } => AdapterCommandBody::Rescan(RescanBody {
             from: *from,
             to: *to,
@@ -1299,6 +1457,7 @@ fn adapter_body(i: &AdapterInput) -> AdapterCommandBody {
             })
         }
         AdapterInput::Attest(a) => AdapterCommandBody::Attest(attestation_body(a)),
+        AdapterInput::Epoch(e) => AdapterCommandBody::Epoch(epoch_body(e)),
         AdapterInput::Positions(c) => AdapterCommandBody::Positions(PositionsBody {
             next_seq: c.next_seq,
             height: c.height,
@@ -1611,9 +1770,81 @@ pub fn execute<S: LeafStore, V: VaultBackend>(
                         ..SettlementResultBody::default()
                     },
                 ),
+                AdapterReply::Epoch(o) => decided(
+                    op,
+                    None,
+                    SettlementResultBody {
+                        epoch: Some(epoch_result_body(&o)),
+                        ..SettlementResultBody::default()
+                    },
+                ),
             }
         }
     })
+}
+
+/// A new sequence on the wire (amendment 0041).
+pub fn epoch_body(e: &SettlementEpoch) -> EpochBody {
+    EpochBody {
+        epoch: e.epoch,
+        base: e.base,
+        from_seq: e.from_seq,
+        at: e.at,
+        book: hex::encode(e.book),
+        previous: e.previous.map(|p| PreviousAnchorBody {
+            number: p.number,
+            commitment: hex::encode(p.commitment),
+        }),
+    }
+}
+
+/// A finalised head on the wire.
+pub fn finalised_head_body(h: &FinalisedHead) -> FinalisedHeadBody {
+    FinalisedHeadBody {
+        height: h.height,
+        next_seq: h.next_seq,
+    }
+}
+
+/// What the core made of a new sequence, on the wire (amendment 0041).
+pub fn epoch_result_body(o: &EpochOutcome) -> EpochResultBody {
+    let mut b = EpochResultBody {
+        outcome: String::new(),
+        head: None,
+        refusal: None,
+        recorded: None,
+        operation_reference: None,
+        seq: None,
+    };
+    match o {
+        EpochOutcome::Started(h) => {
+            b.outcome = "started".into();
+            b.head = Some(finalised_head_body(h));
+        }
+        EpochOutcome::Recorded => b.outcome = "recorded".into(),
+        EpochOutcome::Refused(r) => {
+            b.outcome = "refused".into();
+            b.refusal = Some(
+                match r {
+                    EpochRefusal::OtherBook => "other_book",
+                    EpochRefusal::NotLater { recorded } => {
+                        b.recorded = Some(*recorded);
+                        "not_later"
+                    }
+                    EpochRefusal::InFlight { op } => {
+                        b.operation_reference = Some(op.to_did());
+                        "in_flight"
+                    }
+                    EpochRefusal::EarlierFinal { seq } => {
+                        b.seq = Some(*seq);
+                        "earlier_final"
+                    }
+                }
+                .into(),
+            );
+        }
+    }
+    b
 }
 
 /// Pending evidence on the wire (`REQ-RC-5`, step 2).
@@ -1680,6 +1911,89 @@ mod tests {
         let c = SettlementCommand::parse(&back).unwrap().unwrap();
         let again = SettlementCommand::parse(&c.to_body()).unwrap().unwrap();
         assert_eq!(c, again);
+    }
+
+    /// Amendment 0041, decision 6 made exact: a gap that names its sequence becomes
+    /// `AdapterInput::SequenceGap` and round-trips; one without stays `AdapterInput::Gap`, with no
+    /// `sequence` on the wire; and with the deployment's `settlement_epochs` off the sequence is
+    /// dropped before the command is formed, so the core gets a plain gap.
+    #[test]
+    fn t043_14_a_gap_with_its_sequence_round_trips_and_is_dropped_while_closed() {
+        let gap = Gap {
+            from: 3,
+            to: 5,
+            reason: GapReason::Unreadable,
+        };
+        let with = serde_json::to_vec(&gap_body(&gap, Some(2))).unwrap();
+        let body = SettlementRoute::Gap.build(None, &with).unwrap();
+        let c = SettlementCommand::parse(&body).unwrap().unwrap();
+        assert_eq!(
+            c,
+            SettlementCommand::Adapter(AdapterInput::SequenceGap { gap, sequence: 2 })
+        );
+        assert_eq!(SettlementCommand::parse(&c.to_body()).unwrap().unwrap(), c);
+        let without = SettlementCommand::Adapter(AdapterInput::Gap(gap));
+        let json = serde_json::to_value(without.to_body()).unwrap();
+        assert!(json.get("sequence").is_none(), "{json}");
+        assert_eq!(
+            SettlementCommand::parse(&without.to_body())
+                .unwrap()
+                .unwrap(),
+            without
+        );
+        // Closed: the sequence goes.
+        let mut closed = SettlementRoute::Gap.build(None, &with).unwrap();
+        drop_gap_sequence(&mut closed);
+        assert_eq!(SettlementCommand::parse(&closed).unwrap().unwrap(), without);
+    }
+
+    /// Amendment 0041: the adapter's report of a new sequence round-trips, on its route and
+    /// through the canonical form, and a book that is not 32 bytes of hex is malformed.
+    #[test]
+    fn t043_14_a_new_sequence_round_trips() {
+        let e = SettlementEpoch {
+            epoch: 2,
+            base: 0,
+            from_seq: 0,
+            at: 40_195_735,
+            book: [0x1B; 32],
+            previous: Some(PreviousAnchor {
+                number: 1,
+                commitment: [0x91; 32],
+            }),
+        };
+        let bytes = serde_json::to_vec(&epoch_body(&e)).unwrap();
+        let body = SettlementRoute::Epoch.build(None, &bytes).unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["command"], "adapter");
+        assert_eq!(json["input"], "epoch");
+        let c = SettlementCommand::parse(&body).unwrap().unwrap();
+        assert_eq!(c, SettlementCommand::Adapter(AdapterInput::Epoch(e)));
+        let again = SettlementCommand::parse(&c.to_body()).unwrap().unwrap();
+        assert_eq!(c, again);
+        let mut bad = epoch_body(&e);
+        bad.book = "1b".into();
+        let body = SettlementRoute::Epoch
+            .build(None, &serde_json::to_vec(&bad).unwrap())
+            .unwrap();
+        assert_eq!(
+            SettlementCommand::parse(&body).unwrap(),
+            Err(Refusal::MalformedCommand)
+        );
+        // Each answer on the wire.
+        let op = OperationId::from_ref(ledger_kernel::posting::OperationRef([6; 16]));
+        let r = epoch_result_body(&EpochOutcome::Refused(EpochRefusal::InFlight { op }));
+        assert_eq!(
+            (r.outcome.as_str(), r.refusal.as_deref()),
+            ("refused", Some("in_flight"))
+        );
+        assert_eq!(r.operation_reference, Some(op.to_did()));
+        let r = epoch_result_body(&EpochOutcome::Started(FinalisedHead {
+            height: 40_195_735,
+            next_seq: 0,
+        }));
+        assert_eq!(r.outcome, "started");
+        assert_eq!(r.head.map(|h| h.height), Some(40_195_735));
     }
 
     /// `REQ-RC-5`: the adapter's report that it checked submitted evidence round-trips.

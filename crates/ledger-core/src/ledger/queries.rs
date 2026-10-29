@@ -260,6 +260,7 @@ impl<S: LeafStore, V: VaultBackend> ReadView<'_, S, V> {
                 counterparty: None,
             },
             self.now,
+            self.ledger.generation(),
         )?;
         let net = self.available(acct, &asset_rec)?;
         match acct.kind() {

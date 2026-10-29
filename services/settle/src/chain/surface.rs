@@ -23,7 +23,7 @@
 //! so a type moved between crates keeps its digest, and a field renamed does not.
 //!
 //! The digest is this crate's own and does not change with subxt's releases. The pinned values
-//! are derived from Kreivo's live metadata at specs 132, 133 and 134, kept as reduced fixtures
+//! are derived from Kreivo's live metadata at specs 132, 133, 134 and 136, kept as reduced fixtures
 //! (`services/settle/fixtures/surface-<spec>.json`: the type registry cut down to the types the
 //! digest reads, which [`fixture`] rebuilds from a runtime's metadata and checks against the
 //! full metadata's digest).
@@ -294,16 +294,30 @@ mod tests {
     /// `T-027-12`, `AC-E4.3`, `AC-E4.4`: the pinned formats' surfaces are those Kreivo's live
     /// metadata describes. Spec 133 and spec 134 (Kreivo `0.17.1`, enacted on mainnet on
     /// 2026-10-14) carry the same surface, so 134 is signed for in 133's format with no entry of
-    /// its own; spec 132's differs in all three parts.
+    /// its own; spec 132's differs in all three parts. Spec 136 (Kreivo `0.18.1`, live on mainnet
+    /// from 2026-10-27) differs from 134 in its `transaction_version` alone (14), and is signed for
+    /// in 133's format, which lists 14 since it was pinned against 0.18.1's crates
+    /// (`kreivo-pin-136`).
     #[test]
     fn t_027_12_the_pinned_surfaces_are_kreivos_own() {
         let (s132, _) = fixture_surface(132);
         let (s133, _) = fixture_surface(133);
         let (s134, t134) = fixture_surface(134);
+        let (s136, t136) = fixture_surface(136);
         assert_eq!(TxFormat::by_surface(&s132), Some(FORMAT_132));
         assert_eq!(TxFormat::by_surface(&s133), Some(FORMAT_133));
         assert_eq!(TxFormat::by_surface(&s134), Some(FORMAT_133));
+        assert_eq!(TxFormat::by_surface(&s136), Some(FORMAT_133));
         assert_eq!(s133, s134);
+        assert_eq!(
+            (s134.transaction_version, s136.transaction_version),
+            (13, 14)
+        );
+        assert_eq!(
+            (&s134.extensions, s134.types),
+            (&s136.extensions, s136.types)
+        );
+        assert_eq!((t136.pallet_index, t136.call.index), (80, 6));
         assert_ne!(s132.transaction_version, s133.transaction_version);
         assert_ne!(s132.extensions, s133.extensions);
         assert_ne!(s132.types, s133.types);

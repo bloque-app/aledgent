@@ -85,6 +85,7 @@ most likely to slip back in:
 | **the settlement layer** / **settlement adapter** | rail, rail name, chain operator, Kreivo (in `SPEC.md`) | One settlement layer, defined by requirements; named only in `notes/` and `PLAN.md` |
 | **`did:`-shaped identifier** | URN | Identifiers are `did:`-shaped |
 | **issuance counterparty** | `@world`, the zero address | The named position value enters from and leaves to |
+| **rules version** vs **code version** | code generation, generation (alone) | The count of a writer's upgrades; the code version is the digest of the exact build (amendment 0042) |
 
 Say "aledgent" for the service; say "the book" for the record.
 

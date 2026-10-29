@@ -48,9 +48,17 @@ jobs:
         run: "! grep -rnw --include='*.rs' unsafe src"
       - name: No floating point (INV-7)
         run: ../../tools/ci/check-no-float.sh src
-      - name: The driving script and the zombienet suite parse
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # T-043-03: the gate's fold of the chain of entries, offline, against the contract's own
+      # digests (`scripts/test/chain-vectors.json`, printed by `scripts/test/vecgen`).
+      - name: The driving script and the zombienet suite parse; the chain's fold matches the contract
         working-directory: contracts/settlement/scripts
-        run: node --check drive.mjs && node --check e2e.mjs
+        run: |
+          npm ci --no-audit --no-fund
+          npm run check
+          npm test
 
   build:
     name: cargo contract build

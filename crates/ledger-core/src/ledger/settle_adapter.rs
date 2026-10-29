@@ -51,9 +51,9 @@ use crate::refusal::Refusal;
 use crate::settlement::assets::{AssetAttestation, AttestationVerdict, Attested, admit};
 use crate::settlement::store::SettlementWrite;
 use crate::settlement::{
-    AdapterStatus, CallEnvelope, CanonicalCheck, Coordinate, FinalisedHead, Gap, HeadReport,
-    KeyNonce, MAX_ADAPTER_LEASE, Observation, OutboundInstruction, OutboxCall, RescanReport,
-    SigningRecord, SourceId, SupportDeclaration, Verdict, Verified,
+    AdapterStatus, CallEnvelope, CanonicalCheck, Coordinate, EpochOutcome, FinalisedHead, Gap,
+    HeadReport, KeyNonce, MAX_ADAPTER_LEASE, Observation, OutboundInstruction, OutboxCall,
+    RescanReport, SettlementEpoch, SigningRecord, SourceId, SupportDeclaration, Verdict, Verified,
 };
 use crate::state::Write;
 
@@ -111,7 +111,9 @@ pub enum AdapterInput {
     },
     /// A range the adapter was forced to skip (`REQ-SA-7`).
     Gap(Gap),
-    /// A re-scan of `[from, to)`: every position the layer holds there, with its digest.
+    /// A re-scan of `[from, to)`: every position the layer holds there, with its digest. Kept so
+    /// a recorded one decodes and replays; refused from
+    /// [`crate::settlement::CHAINED_SETTLEMENT`] on (`T-043-06`, [`Ledger::rescan`]).
     Rescan {
         /// The first position.
         from: u64,
@@ -150,6 +152,22 @@ pub enum AdapterInput {
     /// at a finalised height (`DEC-20`). A binding reads it; after the binding it is ignored
     /// (`REQ-AS-9`).
     Attest(AssetAttestation),
+    /// A new sequence of the settlement layer's record started under the book (amendment 0041,
+    /// `[PENDING AMENDMENT 0041]`): the core restarts its finalised head at its start, or refuses
+    /// it ([`Ledger::start_epoch`](crate::ledger::Ledger)). Refused with `ERR-MalformedCommand`,
+    /// writing nothing, before [`crate::settlement::SETTLEMENT_EPOCHS`]. Appended last, so every
+    /// recorded input decodes as before.
+    Epoch(SettlementEpoch),
+    /// A range the adapter was forced to skip (`REQ-SA-7`), of the chain of `sequence`: the
+    /// sequence of its record the gap is of (amendment 0041, decision 6 made exact), so a start
+    /// clears it only if it is of an earlier sequence. Refused with `ERR-MalformedCommand`,
+    /// writing nothing, before [`crate::settlement::SETTLEMENT_EPOCHS`]. Appended last.
+    SequenceGap {
+        /// The range.
+        gap: Gap,
+        /// The sequence of the layer's record it is of.
+        sequence: u32,
+    },
 }
 
 /// What the core derived from an adapter input (`REQ-SI-5`): never more than a verdict, a state
@@ -181,6 +199,8 @@ pub enum AdapterReply {
     Evidence(State),
     /// What the core made of an attestation (`DEC-20`).
     Attested(AttestationVerdict),
+    /// What the core made of a new sequence (amendment 0041).
+    Epoch(EpochOutcome),
 }
 
 impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
@@ -219,6 +239,13 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             let p = resolve_adapter(&self.state, &ctx.caller)?;
             let source = SourceId::of_identity(&p.identity);
             let now = ctx.now;
+            // A running book's incidents still in its state move to the audit trail, a bounded
+            // number per adapter input, from the chained generation on (`T-043-08`). Not at the
+            // switch input itself: its end moves the first chunk (`Ledger::switch_settlement`),
+            // and two chunks in one invocation could take more than the guest's arena.
+            if !self.switching_input() {
+                self.move_incidents(now)?;
+            }
             Ok(match input {
                 AdapterInput::Declare {
                     serving,
@@ -271,6 +298,10 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                     AdapterReply::Gap
                 }
                 AdapterInput::Rescan { from, to, layer } => {
+                    // Withdrawn from the chained generation on (`T-043-06`, [`Ledger::rescan`]).
+                    if self.chained() {
+                        return Err(Refusal::MalformedCommand);
+                    }
                     if to < from {
                         return Err(Refusal::EvidenceInsufficient);
                     }
@@ -289,6 +320,21 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                     AdapterReply::Evidence(self.evidence_checked(source, op, submission, now)?)
                 }
                 AdapterInput::Attest(a) => AdapterReply::Attested(self.attest(a, now)?),
+                AdapterInput::Epoch(epoch) => {
+                    // Amendment 0041: from `SETTLEMENT_EPOCHS` on only (the generation rule).
+                    if !self.epochs() {
+                        return Err(Refusal::MalformedCommand);
+                    }
+                    AdapterReply::Epoch(self.start_epoch(source, epoch, now)?)
+                }
+                AdapterInput::SequenceGap { gap, sequence } => {
+                    // Amendment 0041: from `SETTLEMENT_EPOCHS` on only (the generation rule).
+                    if !self.epochs() {
+                        return Err(Refusal::MalformedCommand);
+                    }
+                    self.record_gap_of(source, gap, Some(sequence), now)?;
+                    AdapterReply::Gap
+                }
             })
         })();
         self.leave(top, || crate::call::Summary::of(&r));
@@ -429,9 +475,17 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
     /// `ERR-SettlementLayerUnavailable` while the adapter's last declaration says it refuses to
     /// serve, or once that declaration is stale (`REQ-SA-2`, `AC-E4.2`). Nothing is gated before
     /// its first declaration (see the module documentation).
+    ///
+    /// From [`crate::settlement::SETTLEMENT_EPOCHS`] on, also while the adapter has reported a head
+    /// at a later block than the book's, with a lower position, that the book did not take
+    /// (amendment 0041's guard, `REQ-SL-4` as proposed, `T-043-17`): an instruction built now
+    /// would take its expiry and first position from a stale head.
     pub fn require_available(&self, now: Time) -> Result<(), Refusal> {
         match self.state.settlement().status() {
             Some(s) if !s.available(now) => Err(Refusal::SettlementLayerUnavailable),
+            _ if self.epochs() && self.state.settlement().reported().is_some() => {
+                Err(Refusal::SettlementLayerUnavailable)
+            }
             _ => Ok(()),
         }
     }

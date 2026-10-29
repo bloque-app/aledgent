@@ -8,7 +8,7 @@ SPDX-License-Identifier: CC-BY-4.0
 `REQ-SA-5`, `REQ-SA-6`, `REQ-SA-7`, `REQ-OP-6`, `REQ-OP-9`, `INV-10`, `INV-11` · `F-016`, `F-027` ·
 **Pages:** `AledgentAdapterNotServing` (not serving for 5 minutes), `AledgentAdapterRuntimeUnconfirmed`
 (a `runtime:<spec_version>` alert open), `AledgentAdapterSignalsStale`,
-`AledgentSignalsDown`, `AledgentObservationLag`,
+`AledgentSignalsDown`, `AledgentObservationLag`, `AledgentObservationStopped`,
 `AledgentAnchorLag`, `AledgentLaneUnderFeeFloor`, the platform's task-not-running alarm · **Owner:**
 settlement-operations.
 
@@ -17,6 +17,10 @@ settlement-operations.
 - **Internal transfers, reservations and queries carry on.** They never touch the settlement layer
   (guardrail 9).
 - **New external legs are refused** with `ERR-SettlementLayerUnavailable` once its status lease lapses.
+  The same error while the adapter runs and serves is its hold after a reset, or the core's guard against
+  a stale head (`reported` set on `GET /v1/ops/settlement/head`, which answers 503 while ingress's `settlement_head`
+  is off, `T-043-19`) (amendment 0041): see
+  [gap-filling](../gap-filling.md), "After a reset".
 - **In-flight batches** land or expire on chain, and are decided when the adapter returns.
 - **Nothing is released on a timer** (`REQ-OP-9`). An operation past its deadline goes to `Needs-Review`.
 
@@ -54,7 +58,12 @@ settlement-operations.
      If the change is known not to touch what the adapter signs (an asset location type that gained a
      variant, for instance), the operator can instead name a known format for that `spec_version` in
      `adapter.formats` (`{ "<spec_version>": "kreivo-133" }`) and restart: the layer still has to
-     confirm it before anything is broadcast. Record either as a finding.
+     confirm it before anything is broadcast. Record either as a finding. To see what changed, run
+     `cargo run -p settle --example surface_probe -- <kreivo-rpc-url>` (read only): it prints the live
+     surface and the format chosen for it, and has the runtime validate a transaction signed in that
+     format by throwaway, unfunded keys, broadcasting nothing (`Invalid(Payment)` for the native form
+     means the format is accepted). Kreivo `0.18.1` (spec 136) was this case: only the
+     `transaction_version` moved, to 14, and the release that lists 14 for `kreivo-133` serves it.
    - **`unconfirmed`** (with a `runtime:<spec_version>` alert): the surface matched a format, but the
      runtime refused a transaction signed in it (`BadProof`, `BadSigner`, `UnknownOrigin`, an
      extension's `Custom` error, bytes it cannot decode). The format changed in a way the metadata
@@ -98,7 +107,7 @@ settlement-operations.
      ends released when its expiry passes; nothing can hold it past that (`REQ-SL-4`). Payers can
      retry once the runtime is confirmed.
 6. **Database.** If the adapter cannot reach `aledgent_settle`, follow the database server's own failover.
-   The adapter resumes from its cursor.
+   The adapter resumes from the head it last accepted.
 7. **Keys.** If signing fails, read the signer's log: a signer that cannot log in to Vault or read its
    secret does not start (check its Vault role's binding to the task's identity); for a lane opted into
    KMS, check KMS reachability and the task role's `kms:Sign` grant. Do not fall back to a key in the
@@ -106,14 +115,37 @@ settlement-operations.
 8. **Liquidity.** A lane or anchor key under its fee floor parks instructions. Treasury tops up
    ([crank-outage](../crank-outage.md), "Liquidity or fees short").
 
+9. **Running, but observation is stopped** (`AledgentObservationStopped`). The adapter serves and signs,
+   and waits for an operator on one instance:
+   - `unreadable:<instance>:<position>`: no reader serves that range. Give the adapter a history endpoint,
+     or stop it, run once `aledgent-settle <config> gap <from> <to>` with the range the alert names (use the
+     range the command reports if it refuses), and start it again;
+   - `reset:<instance>`: governance reset the layer's instance under it, and the core does not follow the
+     new chain (amendment 0041): the reset names another book, entries of the chain before it were left
+     unreported, or the core refused it or cannot take it yet (an `epoch` alert says which). Nothing
+     reaches the book it serves, and the adapter declares that it does not serve, so new withdrawals are
+     refused. A refusal the core may still lift is reported again every ten minutes,
+     and the adapter goes on by itself once it is taken. For another book's reset: once the book is
+     re-founded and the configuration points at it, stop the adapter, run once
+     `aledgent-settle <config> refound`, and start it again.
+   Both commands take the adapter's lease, so the running adapter is stopped first; each runs once and
+   exits. The steps and their checks are in [gap-filling](../gap-filling.md).
+
+10. **A reset the core cannot take yet** (`AledgentSettlementEpochUnsupported`, which pages): the core runs
+    code before amendment 0041's rules version (or ingress's `settlement_epochs` is off), so its finalised head
+    stays on the chain before the reset. The adapter goes on stepping, held: withdrawals are refused. Upgrade the core; the adapter reports
+    the reset again within ten minutes and the warning clears. See [gap-filling](../gap-filling.md),
+    "After a reset".
+
 **To pause on purpose:** scale the service to zero (nothing is signed). If the keys are in doubt, the
 contract's admin clears a bound or empties the key set.
 
 ## Verification
 
 - [ ] `aledgent_adapter_serving == 1`, and the signals are fresh.
-- [ ] `aledgent_observation_cursor_lag` returns to about 0. The re-scan finds no difference; if it does,
-  follow [gap-filling](../gap-filling.md).
+- [ ] `aledgent_observation_cursor_lag` returns to about 0 and the adapter accepts the layer's head. If it
+  raises `AledgentSettlementChainMismatch` or `AledgentObservationStopped`, or cannot read the range it missed, follow
+  [gap-filling](../gap-filling.md).
 - [ ] Parked withdrawals resume by themselves; nothing is resubmitted by hand. The oldest non-terminal
   age falls.
 - [ ] Anchors resume, and the anchor lag falls under the interval.

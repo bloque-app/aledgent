@@ -445,6 +445,9 @@ fn input(
     // The scheduled upgrade as this input finds it: a move of it goes strictly later than it
     // (owner ruling w6, `T-037-05`), the same for code of either generation.
     ledger.set_scheduled_upgrade(code.upgrade);
+    // The generation that decides it: the code's own, which the fence admitted, beside the
+    // generation in force (the generation rule; `ledger_core::settlement::CHAINED_SETTLEMENT`).
+    ledger.set_generation(code.generation, inv.generation > code.generation);
     ledger.set_input(i.seq);
     let clerk_ref = private.clerk.as_ref().map(|c| c as &dyn ClerkSigner);
     let mut summaries = Vec::with_capacity(i.calls.len());
@@ -457,6 +460,16 @@ fn input(
             return Err(AgentRefusal::Fault(e.clone()));
         }
         summaries.push(s);
+    }
+    // The switch to the chained generation moves the book's incidents and gaps to the audit
+    // trail, at the end of the input that takes it (`T-043-08`); a way out never takes it.
+    if !way_out {
+        if let Err(e) = ledger.switch_settlement() {
+            return Err(AgentRefusal::Fault(alloc::format!("{e:?}")));
+        }
+        if ledger.state().missed() {
+            return Err(AgentRefusal::UnprovenRead);
+        }
     }
     // What the input did to the writer's code (`T-037-15`), decided the same by either generation.
     let taken = ledger.take_way_out();

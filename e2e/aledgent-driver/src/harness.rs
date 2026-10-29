@@ -28,6 +28,9 @@ pub enum Variant {
     /// Through the pruned full node only: its chain spec names it, and the collator's parachain
     /// port is blocked in the adapter's namespace.
     PrunedOnly,
+    /// As [`Variant::PrunedOnly`], with the collator's RPC (an archive) as the adapter's history
+    /// endpoint (`T-043-04`): what it cannot read from the pruned node it reads from there.
+    PrunedWithHistory,
 }
 
 /// A transaction the adapter stored.
@@ -302,6 +305,8 @@ impl Harness {
             // The suite's PostgreSQL has no TLS.
             profile: ingress::config::Profile::Development,
             adapter,
+            engines: Default::default(),
+            keys: Default::default(),
             connection: Connection::LightClient,
             chain_spec: Some("/cfg/kreivo.json".into()),
             relay_chain_spec: Some("/cfg/relay.json".into()),
@@ -325,6 +330,7 @@ impl Harness {
                 .unwrap_or_else(settle::config::default_wake_poll),
             signals_file: None,
             dry_run_endpoint: None,
+            history_endpoint: None,
             // A zombienet run's lane keys are test values in files (F-035: development keys,
             // declared as such; production's are the signer service's).
             signer: None,
@@ -352,6 +358,19 @@ impl Harness {
             config.chain_spec = Some("/cfg/kreivo-pruned.json".into());
             write(
                 "settle-pruned.json",
+                &serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?,
+            )?;
+            // The history endpoint: the collator's RPC (archive-canonical), forwarded from the
+            // loopback, where it listens, to where the adapter's namespace reaches the runner.
+            let ws = env("KREIVO_WS");
+            let to: u16 = port_of(&ws.replace("ws://", "/ip4/").replace(':', "/tcp/"))
+                .and_then(|p| p.parse().ok())
+                .ok_or_else(|| format!("KREIVO_WS {ws}: no port"))?;
+            let listen = ingress_port + 2;
+            forward(listen, to).await?;
+            config.history_endpoint = Some(format!("ws://{gateway}:{listen}"));
+            write(
+                "settle-pruned-history.json",
                 &serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?,
             )?;
         }
@@ -395,7 +414,7 @@ impl Harness {
         self.stop().await;
         match variant {
             Variant::Normal => self.rule("-F PRUNE").await?,
-            Variant::PrunedOnly => {
+            Variant::PrunedOnly | Variant::PrunedWithHistory => {
                 let port = self
                     .collator_port
                     .clone()
@@ -410,6 +429,7 @@ impl Harness {
         let config = match variant {
             Variant::Normal => "/cfg/settle.json",
             Variant::PrunedOnly => "/cfg/settle-pruned.json",
+            Variant::PrunedWithHistory => "/cfg/settle-pruned-history.json",
         };
         if !self.dir.join(config.trim_start_matches("/cfg/")).exists() {
             return Err(format!(

@@ -46,9 +46,10 @@ use crate::reservation::{Closing, Position, Reservation, Status};
 use crate::set::NonEmptySet;
 use crate::settlement::store::{Ingested, Instructed, Standing};
 use crate::settlement::{
-    AnchorFact, Coordinate, Destination, EventKind, FinalisedHead, Gap, GapReason,
+    AnchorFact, Coordinate, Destination, EpochRefusal, EventKind, FinalisedHead, Gap, GapReason,
     Incident as SetIncident, Movement, NonceFact, Observation, ObservedFinality, Payload,
-    SettlementConfig, Signing, SigningRecord, SourceId, SupportDeclaration, Venue,
+    PreviousAnchor, SettlementConfig, SettlementEpoch, Signing, SigningRecord, SourceId,
+    SupportDeclaration, Venue,
 };
 use crate::state::{Command, OperationRecord, Roles};
 
@@ -1064,6 +1065,67 @@ impl Canonical for FinalisedHead {
     }
 }
 
+impl Canonical for PreviousAnchor {
+    fn encode(&self, e: &mut Enc) {
+        e.put(&self.number).put(&self.commitment);
+    }
+    fn decode(d: &mut Dec<'_>) -> Result<Self, DecodeError> {
+        Ok(PreviousAnchor {
+            number: d.get()?,
+            commitment: d.get()?,
+        })
+    }
+}
+
+impl Canonical for SettlementEpoch {
+    fn encode(&self, e: &mut Enc) {
+        e.put(&self.epoch)
+            .put(&self.base)
+            .put(&self.from_seq)
+            .put(&self.at)
+            .put(&self.book)
+            .put(&self.previous);
+    }
+    fn decode(d: &mut Dec<'_>) -> Result<Self, DecodeError> {
+        Ok(SettlementEpoch {
+            epoch: d.get()?,
+            base: d.get()?,
+            from_seq: d.get()?,
+            at: d.get()?,
+            book: d.get()?,
+            previous: d.get()?,
+        })
+    }
+}
+
+impl Canonical for EpochRefusal {
+    fn encode(&self, e: &mut Enc) {
+        match self {
+            EpochRefusal::OtherBook => {
+                e.tag(1);
+            }
+            EpochRefusal::NotLater { recorded } => {
+                e.tag(2).put(recorded);
+            }
+            EpochRefusal::InFlight { op } => {
+                e.tag(3).put(op);
+            }
+            EpochRefusal::EarlierFinal { seq } => {
+                e.tag(4).put(seq);
+            }
+        }
+    }
+    fn decode(d: &mut Dec<'_>) -> Result<Self, DecodeError> {
+        Ok(match d.tag()? {
+            1 => EpochRefusal::OtherBook,
+            2 => EpochRefusal::NotLater { recorded: d.get()? },
+            3 => EpochRefusal::InFlight { op: d.get()? },
+            4 => EpochRefusal::EarlierFinal { seq: d.get()? },
+            _ => return Err(DecodeError("epoch refusal")),
+        })
+    }
+}
+
 impl Canonical for SupportDeclaration {
     fn encode(&self, e: &mut Enc) {
         e.put(&self.legs);
@@ -1177,6 +1239,9 @@ impl Canonical for SetIncident {
             SetIncident::BindRefused { asset, coordinate } => {
                 e.tag(11).put(asset).put(coordinate);
             }
+            SetIncident::EpochRefused { epoch, refusal } => {
+                e.tag(12).put(epoch).put(refusal);
+            }
         }
     }
     fn decode(d: &mut Dec<'_>) -> Result<Self, DecodeError> {
@@ -1220,6 +1285,10 @@ impl Canonical for SetIncident {
             11 => SetIncident::BindRefused {
                 asset: d.get()?,
                 coordinate: d.get()?,
+            },
+            12 => SetIncident::EpochRefused {
+                epoch: d.get()?,
+                refusal: d.get()?,
             },
             _ => return Err(DecodeError("settlement incident")),
         })

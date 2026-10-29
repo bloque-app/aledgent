@@ -1293,9 +1293,12 @@ async fn starve(cx: &mut Ctx) -> Result<String, String> {
 }
 
 /// The adapter reaches Kreivo through the pruned node alone (the collator's parachain port
-/// blocked), which keeps 16 blocks of state. A deposit made while the adapter was down, whose
-/// block's events the pruned node no longer serves, is still credited: the adapter reads the
-/// inbox by position at the finalized head, never events. A withdrawal settles through it too.
+/// blocked), which keeps 16 blocks of state. A deposit is made while the adapter is down, and the
+/// pruned node no longer serves its block's events. The contract stores no entry (amendment 0040):
+/// the entries are the events, so the pruned node can say the chain's head moved but not with
+/// what. Without a history endpoint the adapter credits nothing and raises `unreadable` (`T-043-04`);
+/// with the collator's RPC as its history endpoint it reads the block there, folds the entry to the
+/// head, and credits it. A withdrawal then settles through the pruned node.
 async fn prune(cx: &mut Ctx) -> Result<String, String> {
     cx.h.stop().await;
     let (before, _) = balances(&cx.d, &cx.alice).await;
@@ -1309,7 +1312,20 @@ async fn prune(cx: &mut Ctx) -> Result<String, String> {
             "the pruned node still serves #{block}'s events: {events}"
         ));
     }
+    // 1. No history endpoint: unreadable, and nothing credited.
     cx.h.start(Variant::PrunedOnly, None).await?;
+    cx.h.wait_log("unreadable:", 1, AFTER_FAULT)
+        .await
+        .map_err(|e| format!("no history endpoint: {e}"))?;
+    let (held, _) = balances(&cx.d, &cx.alice).await;
+    if held != before {
+        return Err(format!(
+            "with no history endpoint the adapter credited {} it could not read",
+            held.saturating_sub(before)
+        ));
+    }
+    // 2. The collator's RPC as the history endpoint: caught up, credited.
+    cx.h.start(Variant::PrunedWithHistory, None).await?;
     cx.available(before + FAULT_DEPOSIT, AFTER_FAULT).await?;
     let op = cx.withdraw(FAULT_WITHDRAW).await?;
     cx.settled(&op, AFTER_FAULT).await?;
@@ -1317,7 +1333,8 @@ async fn prune(cx: &mut Ctx) -> Result<String, String> {
     cx.h.stop().await;
     Ok(format!(
         "through kreivo-pruned only: the deposit at #{block} (its events {} there at #{}) was \
-         credited, and a withdrawal settled",
+         unreadable with no history endpoint (nothing credited), and credited once the collator's \
+         RPC was the history endpoint; a withdrawal settled",
         events["eventsOnPruned"]
             .as_str()
             .unwrap_or_default()

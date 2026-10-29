@@ -24,7 +24,6 @@ use crate::query::{
     AssetBody, AssetParams, BalancesBody, BalancesParams, CanSpendBody, MovementsParams, PageBody,
     StatementBody, StatementParams, TrialBalanceBody,
 };
-use crate::refusal::IngressRefusal;
 use crate::surface::{
     AnsweringRoute, AuthRoute, CLIENT_KEY, CommandRoute, Handler, ON_BEHALF_OF, QueryRoute, ROUTES,
     status_of,
@@ -90,20 +89,6 @@ pub fn refusal_schema() -> Value {
                 "x-http-status": status_of(*r).as_u16(),
             })
         })
-        .chain(IngressRefusal::ALL.iter().map(|r| {
-            // Refusals only ingress sends until the next core carries them (amendment 0037, R2).
-            json!({
-                "title": r.code(),
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["error", "description"],
-                "properties": {
-                    "error": { "const": r.code() },
-                    "description": { "const": r.description() },
-                },
-                "x-http-status": r.status().as_u16(),
-            })
-        }))
         .collect();
     json!({
         "title": "Refusal",
@@ -287,6 +272,7 @@ fn operation(route: &crate::surface::Route) -> Value {
                     false,
                 ),
                 QueryRoute::Anchoring => (None, "AnchoringBody", false),
+                QueryRoute::SettlementHead => (None, "SettlementHeadBody", false),
                 QueryRoute::Signals => (None, "SignalsBody", false),
                 QueryRoute::IntegratingParties => (None, "IntegratingPartiesBody", false),
                 QueryRoute::Alias => (
@@ -488,7 +474,6 @@ fn schemas() -> Map<String, Value> {
     add::<crate::settlement::CheckBody>(&mut g);
     add::<crate::settlement::HeadBody>(&mut g);
     add::<crate::settlement::GapBody>(&mut g);
-    add::<crate::settlement::RescanBody>(&mut g);
     add::<crate::settlement::InstructionBody>(&mut g);
     add::<crate::settlement::CallBody>(&mut g);
     add::<crate::settlement::PendingEvidenceBody>(&mut g);
@@ -497,6 +482,8 @@ fn schemas() -> Map<String, Value> {
     add::<crate::settlement::AnchorFailureBody>(&mut g);
     add::<crate::settlement::PositionsBody>(&mut g);
     add::<crate::settlement::AttestationBody>(&mut g);
+    add::<crate::settlement::EpochBody>(&mut g);
+    add::<crate::settlement::SettlementHeadBody>(&mut g);
     add::<crate::settlement::AnchorReadBody>(&mut g);
     add::<crate::anchoring::DisclosureBody>(&mut g);
     add::<crate::anchoring::AnchoringJustifiedBody>(&mut g);

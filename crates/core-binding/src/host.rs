@@ -1402,6 +1402,9 @@ impl<P: AgentPort> Driver<P> {
         // The upgrade the writer has scheduled, which a move of it must go strictly later than
         // (owner ruling w6, `T-037-05`).
         replica.set_scheduled_upgrade(self.writer.upgrade);
+        // The generation that decides it (the generation rule): the next one once the scheduled
+        // upgrade applies. A way out at that input is decided the same by either.
+        replica.set_generation(self.writer.generation, self.writer.due(next));
         replica.set_input(next);
     }
 
@@ -1619,17 +1622,32 @@ impl<P: AgentPort> Driver<P> {
         deliveries: Vec<([u8; 32], Time)>,
     ) -> Result<Option<u64>, DriveError> {
         let recorded: Vec<Recorded> = replica.take_calls();
+        let unsupported = recorded
+            .iter()
+            .find(|r| matches!(r.call, Call::Unsupported { .. }))
+            .map(|r| r.call.method().to_string());
+        // The switch to the chained generation moves the book's incidents and gaps to the audit
+        // trail at the end of the input that takes it, as the Agent does (`T-043-08`): before the
+        // input's keys and leaves are taken, so its witness holds what the move reads. Not for an
+        // input this driver refuses to send (an unsupported call): the switch is one-shot, and the
+        // input that takes it must be the one the Agent commits.
+        if unsupported.is_none()
+            && !(recorded.is_empty() && deliveries.is_empty())
+            && !crate::fence::way_out_input(recorded.iter().map(|r| &r.call), deliveries.len())
+                .unwrap_or(false)
+        {
+            replica.switch_settlement().map_err(|e| {
+                DriveError::Replica(format!("the switch's move to the audit trail: {e:?}"))
+            })?;
+        }
         let keys = replica.book().store().take_keys();
         let before = replica.book().vault_backend_take();
         let touched = Touches::take(replica, &deliveries);
         if recorded.is_empty() && deliveries.is_empty() {
             return Ok(None);
         }
-        if let Some(r) = recorded
-            .iter()
-            .find(|r| matches!(r.call, Call::Unsupported { .. }))
-        {
-            return Err(DriveError::Unsupported(r.call.method().to_string()));
+        if let Some(method) = unsupported {
+            return Err(DriveError::Unsupported(method));
         }
         // Whether it is a way-out input, and the way out it took, the replica's: what the input
         // does to the writer's code (`T-037-15`). An input that mixes a way out with anything else
@@ -2066,14 +2084,20 @@ impl<P: AgentPort> Driver<P> {
     /// follows [`Driver::log_head`]. On success the Agent stands at the last entry; the host has
     /// them archived already (they came from its archive), so the next invocation acknowledges
     /// them.
+    ///
+    /// **Per range** (`T-037-09`): each input is sent under the code version the code map names
+    /// for it, read from the inputs before it ([`crate::code_map`]), and the platform is switched
+    /// to that version before the batch that starts its range, as the live upgrade switched it
+    /// (`T-037-14`). An entry naming another version is refused. Returns the map of the entries.
     pub fn roll_forward(
         &mut self,
         replica: &mut Replica,
         entries: &[RingEntry],
-    ) -> Result<(), DriveError> {
+    ) -> Result<crate::code_map::CodeMap, DriveError> {
         // F-035: the recording clerk, so that the Agent receives what it signs.
         let clerk = self.recorder.clerk();
         let chunk = self.batch_cap();
+        let mut map = crate::code_map::CodeMap::default();
         for part in entries.chunks(chunk) {
             for e in part {
                 let (tip, prev) = self.tip();
@@ -2083,13 +2107,16 @@ impl<P: AgentPort> Driver<P> {
                         e.seq
                     )));
                 }
-                // The code that executed it, as the Agent's ring names it (`T-037-02`), is what
-                // its checkpoints bind (`T-037-03`), unless an upgrade takes effect at it: then the
-                // code map's (`T-037-15`). The mode is the one the inputs before it left in force
-                // (`T-037-05`).
-                if !self.writer.due(e.seq) {
-                    self.writer.code = e.code;
-                }
+                // The code that executes it is the one the code map names, read from the inputs
+                // before it as the Agent read them (`T-037-09`, [`crate::fence::decide`]): the
+                // entry's own word is checked, never taken. It is what its checkpoints bind
+                // (`T-037-03`), and the platform is switched to it before it is sent
+                // ([`Driver::stage`] ends a batch where the code changes). The mode is the one the
+                // inputs before it left in force (`T-037-05`).
+                let way_out =
+                    crate::fence::way_out_input(&e.calls, e.deliveries.len()).unwrap_or(false);
+                map.step(&self.writer, e, way_out)
+                    .map_err(|why| DriveError::Diverged(format!("roll forward: {why}")))?;
                 self.prepare(replica, e.seq);
                 for c in &e.calls {
                     let clerk = clerk.as_deref().map(|c| c as &dyn ClerkSigner);
@@ -2119,7 +2146,7 @@ impl<P: AgentPort> Driver<P> {
             // Archived already: the next invocation carries the acknowledgement.
             self.archived();
         }
-        Ok(())
+        Ok(map)
     }
 }
 
@@ -2282,6 +2309,7 @@ fn replay_with(
         let authority = replica.authority();
         replica.set_code(e.code, authority);
         replica.set_scheduled_upgrade(writer.upgrade);
+        replica.set_generation(writer.generation, writer.due(e.seq));
         replica.set_input(e.seq);
         for c in &e.calls {
             let clerk = clerk.as_deref().map(|c| c as &dyn ClerkSigner);
@@ -2290,6 +2318,16 @@ fn replay_with(
         let _ = replica.take_calls();
         // An archived input was taken whole: a way-out input is one call and no delivery.
         let way_out = crate::fence::way_out_input(&e.calls, e.deliveries.len()).unwrap_or(false);
+        // The switch to the chained generation, at the end of the input that takes it
+        // (`T-043-08`, [`Driver::stage`]).
+        if !way_out {
+            replica.switch_settlement().map_err(|why| {
+                DriveError::Diverged(format!(
+                    "replay: input {}: the switch's move: {why:?}",
+                    e.seq
+                ))
+            })?;
+        }
         let (taken, scheduled) = (replica.take_way_out(), replica.take_upgrade());
         crate::fence::decide(&mut writer, e.seq, way_out, taken, scheduled);
         let touched = Touches::take(&replica, &e.deliveries);

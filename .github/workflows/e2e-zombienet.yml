@@ -32,9 +32,9 @@ on:
   workflow_dispatch:
     inputs:
       kreivo_release:
-        description: "Kreivo release tag of virto-network/kreivo. Default 0.17.0 (3e0a5c3, spec 133), the runtime mainnet runs from 2026-09-30; 0.16.9 (spec 132) stays selectable, with psdk_release polkadot-stable2603-4"
+        description: "Kreivo release tag of virto-network/kreivo. Default 0.18.1 (5cd5003, spec 136, transaction_version 14), the runtime mainnet runs from 2026-10-27; 0.17.0 (spec 133) and 0.16.9 (spec 132, with psdk_release polkadot-stable2603-4) stay selectable"
         type: string
-        default: "0.17.0"
+        default: "0.18.1"
       kreivo_ref:
         description: "Or build Kreivo's runtime from this branch, tag or commit instead of a release (about 20 minutes more)"
         type: string
@@ -42,7 +42,7 @@ on:
       psdk_release:
         description: "polkadot-sdk release for polkadot and polkadot-parachain (Kreivo 0.17 needs stable2606: the default; 0.16.9 needs stable2603 or newer, e.g. polkadot-stable2603-4)"
         type: string
-        default: polkadot-stable2606-2
+        default: polkadot-stable2606-3
       driver:
         description: "Who drives steps 3 and 4: the script (contracts/settlement/scripts) or aledgent (ingress and the core, and the adapter as its own process with PostgreSQL, over the light client)"
         type: choice
@@ -62,6 +62,14 @@ on:
         description: "Stress scenario c (F-032), aledgent driver only: after step 3, the book under load (name:commands_per_min:secs,...) while withdrawals settle through the adapter. Empty: skipped"
         type: string
         default: ""
+      upgrade_from:
+        description: "Rehearse the upgrade from the contract at this commit (T-043-03): deployed, given entries, upgraded to this code, reset. 210ca4b is v2's source, the code both mainnet instances run (0x268de8fb...). Empty: skipped"
+        type: string
+        default: ""
+      upgrade_from_code_hash:
+        description: "With upgrade_from: the code hash its build must have, or the step fails. Empty: v2's (0x268de8fb...) when upgrade_from is 210ca4b; any other commit is not checked"
+        type: string
+        default: ""
   # The release gate: a release tag runs the full suite with the script driver and requires the
   # runtime mainnet runs. A release workflow calls this one and `needs:` it.
   push:
@@ -70,13 +78,13 @@ on:
     inputs:
       kreivo_release:
         type: string
-        default: "0.17.0"
+        default: "0.18.1"
       kreivo_ref:
         type: string
         default: ""
       psdk_release:
         type: string
-        default: polkadot-stable2606-2
+        default: polkadot-stable2606-3
       driver:
         type: string
         default: script
@@ -108,13 +116,15 @@ jobs:
       IMAGE: rust:1-bookworm
       # The aledgent driver's containers (the adapter, its namespace, PostgreSQL) and network.
       ALEDGENT_TAG: ${{ github.run_id }}-${{ github.run_attempt }}
-      # A release tag has no inputs: it gates on the defaults, Kreivo 0.17.0 on stable2606-2.
-      KREIVO_RELEASE: ${{ inputs.kreivo_release || '0.17.0' }}
+      # A release tag has no inputs: it gates on the defaults, Kreivo 0.18.1 on stable2606-3.
+      KREIVO_RELEASE: ${{ inputs.kreivo_release || '0.18.1' }}
       KREIVO_REF: ${{ inputs.kreivo_ref || '' }}
-      PSDK_RELEASE: ${{ inputs.psdk_release || 'polkadot-stable2606-2' }}
+      PSDK_RELEASE: ${{ inputs.psdk_release || 'polkadot-stable2606-3' }}
       DRIVER: ${{ inputs.driver || 'script' }}
       ALEDGENT_CONNECTION: ${{ inputs.aledgent_connection || 'light-client' }}
       MAINNET_PARITY: ${{ inputs.mainnet_parity || 'require' }}
+      UPGRADE_FROM: ${{ inputs.upgrade_from || '' }}
+      UPGRADE_FROM_CODE_HASH: ${{ inputs.upgrade_from_code_hash || '' }}
       # The deployment, as on mainnet: the operator's own community publishes,
       # licenses and instantiates. On a fresh network it does not exist, so the suite registers it
       # first. //Alice administers it and is the contract's admin; //Bob is the contract's key;
@@ -137,6 +147,9 @@ jobs:
           docker --version
 
       - uses: actions/checkout@v4
+        with:
+          # The upgrade rehearsal builds the contract of an earlier commit.
+          fetch-depth: ${{ inputs.upgrade_from != '' && '0' || '1' }}
 
       - name: Job-local work directory
         run: |
@@ -153,6 +166,11 @@ jobs:
                    "$WORK/cargo-registry" "$WORK/cargo-git"
           # A copy of this commit: the container never writes into the runner's checkout.
           git archive HEAD | tar -x -C "$WORK/src"
+          # And of the contract to upgrade from, if the rehearsal runs.
+          if [ -n "${UPGRADE_FROM:-}" ]; then
+            mkdir -p "$WORK/v2src"
+            git archive "$UPGRADE_FROM" contracts/settlement | tar -x -C "$WORK/v2src"
+          fi
           # Whether this job pulls the image, so that cleanup removes only what it added.
           if docker image inspect "$IMAGE" >/dev/null 2>&1; then echo "PULLED_IMAGE=no" >> "$GITHUB_ENV"; else echo "PULLED_IMAGE=yes" >> "$GITHUB_ENV"; fi
           for i in 1 2 3 4 5; do docker pull -q "$IMAGE" && break; sleep $((i * 15)); done
@@ -392,6 +410,31 @@ jobs:
         timeout-minutes: 10
         working-directory: contracts/settlement/scripts
         run: node e2e.mjs check final
+
+      # T-043-03: the upgrade from an earlier contract to this one, on a second app of the same
+      # community, after the final checks (it leaves the suite's own contract as they read it).
+      - name: "Upgrade rehearsal: ${{ env.UPGRADE_FROM }} to this code"
+        if: ${{ !cancelled() && steps.deploy.outcome == 'success' && env.UPGRADE_FROM != '' }}
+        timeout-minutes: 30
+        working-directory: contracts/settlement/scripts
+        run: |
+          set -euo pipefail
+          bundle="$WORK/dist/v2/aledgent_settlement_contract.contract"
+          # The code the rehearsal upgrades from must be the code mainnet runs, byte for byte: the
+          # build of 210ca4b here (Linux x86-64, Rust 1.91, cargo-contract 5.0.3, as v2 was built)
+          # must have v2's hash. A build on another host (aarch64 macOS) has the same ABI, storage
+          # layout and code size but other bytes, so this is checked here only.
+          expected="$UPGRADE_FROM_CODE_HASH"
+          if [ -z "$expected" ] && [ "$(git rev-parse "$UPGRADE_FROM^{commit}")" = 210ca4bb13713780586882c2a6512ab6b39ed256 ]; then
+            expected=0x268de8fba38af3a9e3257dc8e11cad7e2f782631dce13a4cca39189904b758d5
+          fi
+          built="$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).source.hash)' "$bundle")"
+          echo "code to upgrade from: $built (expected ${expected:-not checked})"
+          if [ -n "$expected" ] && [ "$built" != "$expected" ]; then
+            echo "::error::the build of $UPGRADE_FROM has code hash $built, not $expected: the rehearsal would not start from the code mainnet runs"
+            exit 1
+          fi
+          V2_BUNDLE="$bundle" node e2e.mjs upgrade
 
       # Before the artifacts are uploaded: the adapter's last log is kept, its test keys are not.
       - name: Stop the aledgent driver

@@ -621,12 +621,6 @@ pub const ROUTES: &[Route] = &[
         "record_gap",
         "Settlement adapter: a range it was forced to skip, visible to operators (F-016).",
     ),
-    command(
-        "/v1/settlement/rescans",
-        CommandRoute::Settlement(SettlementRoute::Rescan),
-        "record_rescan",
-        "Settlement adapter: a re-scan of a range; every difference is an incident (F-016).",
-    ),
     query(
         "/v1/settlement/instructions",
         QueryRoute::Instructions,
@@ -656,6 +650,12 @@ pub const ROUTES: &[Route] = &[
         CommandRoute::Settlement(SettlementRoute::Attest),
         "attest_asset",
         "Settlement adapter: what the settlement layer's metadata states about an asset location it binds, at a finalised height (DEC-20). Registration reads it; a difference from the registry holds the asset. The adapter's principal only.",
+    ),
+    command(
+        "/v1/settlement/epochs",
+        CommandRoute::Settlement(SettlementRoute::Epoch),
+        "start_epoch",
+        "Settlement adapter: a new sequence of the settlement layer's record started under the book (amendment 0041); the core restarts its finalised head at its start, or refuses it. The adapter's principal only.",
     ),
     command(
         "/v1/settlement/anchor-acknowledgements",
@@ -704,6 +704,12 @@ pub const ROUTES: &[Route] = &[
         QueryRoute::Anchoring,
         "anchoring",
         "Operator: every checkpoint, the recorded settlement comparisons, and anchoring's incidents (F-017).",
+    ),
+    query(
+        "/v1/ops/settlement/head",
+        QueryRoute::SettlementHead,
+        "settlement_head",
+        "Operator: the book's finalised settlement head and the sequence of the settlement layer's record it follows (amendment 0041). Read-only.",
     ),
     command(
         "/v1/ops/settlement/comparisons",
@@ -822,9 +828,13 @@ pub fn status_of(r: Refusal) -> StatusCode {
     use Refusal::*;
     match r {
         CredentialInvalid => StatusCode::UNAUTHORIZED,
-        NotAuthorised | AuthorityRevoked | IdentityRestricted | NotDisclosable => {
-            StatusCode::FORBIDDEN
-        }
+        // `ERR-CommandApprovalRequired` has the status of `ERR-NotAuthorised` (owner's answer to
+        // Q-D, amendment 0037, R2; `T-041-06` moved the refusal into the core's list).
+        NotAuthorised
+        | AuthorityRevoked
+        | IdentityRestricted
+        | NotDisclosable
+        | CommandApprovalRequired => StatusCode::FORBIDDEN,
         UnknownAccount | UnknownAsset | UnknownOperation => StatusCode::NOT_FOUND,
         ClientKeyReused
         | OperationTerminal
@@ -1361,6 +1371,13 @@ async fn handle_command<S: Store, C: Core>(
     if !crate::service::takes_commands(&shared).await {
         return logged(refusal(Refusal::InitialStateNotSealed), Some(&who), name);
     }
+    // Amendment 0041: a new settlement sequence is taken only once the deployment says its core
+    // knows the input; a core host built before it would refuse the whole feed it arrives in.
+    // Nothing of a refused one is logged.
+    if route == CommandRoute::Settlement(SettlementRoute::Epoch) && !shared.config.settlement_epochs
+    {
+        return logged(refusal(Refusal::MalformedCommand), Some(&who), name);
+    }
     let arrival = Arrival {
         at: started,
         clock: arrived_at,
@@ -1420,6 +1437,9 @@ fn prepare_request<S: Store, C: Core>(
         .archived
         .check(param.as_deref(), None, bytes)?;
     let (mut body, pending) = build(route, param, bytes)?;
+    if !shared.config.settlement_epochs {
+        crate::settlement::drop_gap_sequence(&mut body);
+    }
     // REQ-PO-5: the caller's pass-through data comes off the command here. It is part of the
     // request (its digest) and of the row, never of the canonical body the core receives.
     let pass_through = take_pass_through(&mut body);
@@ -1808,7 +1828,9 @@ async fn approve<S: Store, C: Core>(
     };
     match (mode, outcome) {
         (_, Ok(_credential)) => None,
-        (approval::ApprovalMode::Enforce, Err(None)) => Some(approval::approval_required()),
+        (approval::ApprovalMode::Enforce, Err(None)) => {
+            Some(refusal(Refusal::CommandApprovalRequired))
+        }
         (approval::ApprovalMode::Enforce, Err(Some(r))) => Some(refusal(r)),
         (_, Err(why)) => {
             approval::report(kind, who.proof, why.is_some());
@@ -2009,6 +2031,15 @@ async fn ask<S: Store, C: Core>(
     who: &Authenticated,
     query: &Query,
 ) -> QueryReply {
+    // `T-043-19`: a query the deployment has not said its core host decodes is not sent. A host
+    // built before it cannot read the request, and drops the stream it came on, with every call
+    // in flight on it; so the read is answered as a core that cannot decide now answers it
+    // (`REQ-CS-8`), without a call.
+    if matches!(query, Query::SettlementHead) && !shared.config.settlement_head {
+        return QueryReply::Refused {
+            error: Refusal::DecisionUnavailable,
+        };
+    }
     let caller = who.caller(None);
     let mut wait = shared.config.retry_base;
     let until = tokio::time::Instant::now() + crate::answering::NFR_16;
@@ -2207,6 +2238,7 @@ fn query_response(reply: QueryReply) -> Response {
         QueryReply::Anchor(a) => json(serde_json::to_value(a)),
         QueryReply::Verified(v) => json(serde_json::to_value(v)),
         QueryReply::Anchoring(a) => json(serde_json::to_value(a)),
+        QueryReply::SettlementHead(h) => json(serde_json::to_value(h)),
         QueryReply::Signals(s) => json(serde_json::to_value(s)),
         QueryReply::IntegratingParties(p) => json(serde_json::to_value(p)),
         QueryReply::Alias(a) => json(serde_json::to_value(a)),
@@ -2251,6 +2283,8 @@ pub enum QueryRoute {
     VerifyDisclosure,
     /// `GET /v1/ops/anchors` (`F-017`).
     Anchoring,
+    /// `GET /v1/ops/settlement/head` (amendment 0041).
+    SettlementHead,
     /// `GET /v1/ops/signals` (`F-018`).
     Signals,
     /// `GET /v1/ops/integrating-parties` (`REQ-ID-7`).
@@ -2357,6 +2391,10 @@ fn query_unchecked(
         QueryRoute::Anchoring => {
             let _: AssetParams = params(raw)?;
             Query::Anchoring
+        }
+        QueryRoute::SettlementHead => {
+            let _: AssetParams = params(raw)?;
+            Query::SettlementHead
         }
         QueryRoute::VerifyDisclosure => {
             let p: crate::anchoring::VerifyParams = params(raw)?;
@@ -2488,7 +2526,11 @@ async fn handle_metrics<S: Store, C: Core>(
         .ok()
         .flatten()
         .map(|t| now.saturating_sub(t));
-    let text = shared.metrics.render(oldest, tick_age);
+    let mut text = shared.metrics.render(oldest, tick_age);
+    if let Some(k) = &shared.config.feed_signer {
+        // The feed key's own (`F-042`): Vault Transit's latency and failures, when it is there.
+        text.push_str(&k.0.metrics_text());
+    }
     let resp = (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],

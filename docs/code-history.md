@@ -45,10 +45,21 @@ Two builds of the same source with different settings are two code versions.
 
   Changing the mode is an input of its own, authorised under the mode in force at that moment. It cancels
   pending proposals, and the next anchor binds the new mode.
-- **The code map** (which inputs ran under which version) is read off the book itself: every archived entry
-  names its code version.
+- **The code map** (which inputs ran under which version, and of which rules version) is read off the book
+  itself, from its `Upgrade`, `RescheduleUpgrade` and `CancelUpgrade` inputs as the book decided them.
+  Every archived entry also names its code version; a replay holds that to the map and refuses an entry that
+  names another.
 - **Replay and restore** fetch each range's code and run each range under it, checking every entry against
-  its archived log hash.
+  its archived log hash. `aledgent-core-host restore --code-config <file>` stages every version the archive
+  names before it re-sends anything, refuses up front a version it cannot have (naming its inputs), and
+  records the map it used in `restore.done.json`.
+- **The `code-history` gate** (`.github/workflows/code-history.yml`) replays a small recorded history under
+  every change to the core, the kernel or the library, and the core release job runs it before it builds a
+  code version. A build must still decide every recorded input exactly as before, under that input's
+  rules version: a change in how a transition decides comes in under a new rules version and leaves the earlier
+  ones as they were. The recorded history only grows. A release that adds a rules version extends it by
+  one range: `ALEDGENT_CODE_HISTORY_EXTEND=1 cargo test -p core-binding --features ingress --test
+  code_history -- --ignored extend`.
 - **Checkpoints and anchors** name the code version and the construction of the state commitment, so a
   verifier holding an anchor knows what produced the anchored state and how it is committed. A change of
   construction is itself an input (a migration), and its checkpoint binds both roots.
@@ -61,18 +72,18 @@ no new genesis (amendment 0033).
 - **A code version names its platform**, and lists each artefact's identities on that platform beside its
   own digest. Nothing the platform supplies (its clock, its slot, its identities, its encoding of state)
   enters a root, a log hash, a checkpoint or an anchor.
-- **A code generation counts the upgrades.** Each writer holds the generation of its code: 0 at genesis, one
-  more after every upgrade. Every package is built with its generation compiled in, and the manifest's digest
+- **A rules version counts the upgrades.** Each writer holds the rules version of its code: 0 at genesis, one
+  more after every upgrade. Every package is built with its rules version compiled in, and the manifest's digest
   binds that constant to the code version.
 - **The switch of code is one host operation**, taken between two inputs, installing only bytes fetched and
   checked before the upgrade was accepted. The code also fences itself, at every input: code whose
-  generation is not the writer's (or, from a scheduled upgrade's input *n*, the next one) refuses the input,
+  rules version is not the writer's (or, from a scheduled upgrade's input *n*, the next one) refuses the input,
   with nothing written. A missed switch, or a stale package after one, halts the writer; it never runs an
-  input under the wrong generation. Within a generation, the bytes are checked by digest before they are
+  input under the wrong rules version. Within a rules version, the bytes are checked by digest before they are
   installed, and the node checks every artefact it runs, the runtime included, when it starts and at every
   switch, installing whatever the code map names for the next input.
 - **The fence has a way out.** While it holds, the old code still takes an input that moves the upgrade to a
-  later input or cancels it, under the upgrade-authority mode. Either generation decides that input the same
+  later input or cancels it, under the upgrade-authority mode. Either rules version decides that input the same
   way, so the outcome never depends on whether the switch was already made. An alert fires when a writer stays fenced longer
   than the deployment's bound (five minutes by default).
 - **Only the book's upgrade-authority mode authorises an upgrade.** A runtime's own authority to install

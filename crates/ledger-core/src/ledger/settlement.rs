@@ -78,9 +78,10 @@ use crate::refusal::Refusal;
 use crate::reservation::{CHOSEN, ReservationBook, ReservationHandle, UnitBuilder};
 use crate::settlement::store::{Ingested, SettlementStore, SettlementWrite, Standing};
 use crate::settlement::{
-    CanonicalCheck, Coordinate, Destination, EventKind, FinalisedHead, Gap, HeadReport, Incident,
-    KeyNonce, NonceFact, Observation, OutboundInstruction, RescanReport, SettlementConfig,
-    SettlementPort, SigningRecord, SourceId, SupportDeclaration, Verdict, Verified,
+    CanonicalCheck, Coordinate, Destination, EpochOutcome, EpochRefusal, EventKind, FinalisedHead,
+    Gap, HeadReport, Incident, KeyNonce, NonceFact, Observation, OutboundInstruction, RescanReport,
+    SettlementConfig, SettlementEpoch, SettlementPort, SigningRecord, SourceId, SupportDeclaration,
+    Verdict, Verified,
 };
 use crate::state::{Command, OperationRecord, Write};
 
@@ -215,6 +216,118 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
         self.commit_plan(now, plan)
             .map(|_| ())
             .map_err(Refusal::from)
+    }
+
+    /// The write that records the settlement incident `i`, raised at `now` (`T-043-07`): before
+    /// [`crate::settlement::CHAINED_SETTLEMENT`], appended to the book's incidents leaf, as that
+    /// generation's code did; from it on, an audit record of the batch that raises it and nothing
+    /// in the book's state (ruling a40-q2). Either way in the same batch.
+    ///
+    /// Before the chained generation it reads nothing it did not read before: what an input reads
+    /// is its witness, and the code of an earlier generation refuses a witness of leaves it does
+    /// not know, so an earlier generation's input must read exactly what its code read.
+    pub(crate) fn incident(&self, i: Incident, now: Time) -> Write {
+        if !self.chained() {
+            return Write::Settlement(SettlementWrite::Incident(i));
+        }
+        match self.state.settlement().config().map(|c| c.authoritative) {
+            Some(source) => Write::Incident(crate::audit::IncidentNote {
+                incident: i,
+                source,
+                at: now,
+                moved: false,
+            }),
+            None => Write::Settlement(SettlementWrite::Incident(i)),
+        }
+    }
+
+    /// The end of an input that is not a way out (`T-043-08`, amendment 0040 a40b-existing-books,
+    /// `NFR-22`): if it is the input at which the writer switches to
+    /// [`crate::settlement::CHAINED_SETTLEMENT`] ([`Ledger::set_generation`]), begin moving the
+    /// book's settlement incidents and gaps, which the earlier generations kept in its state, to
+    /// the audit trail. In one batch:
+    ///
+    /// - the gaps leaf is emptied, the end of its highest gap becomes the gap end `proof` reads,
+    ///   and a gap the incidents leaf has no record of (none should exist) gets its audit record;
+    /// - the first [`MOVE_PER_INPUT`] incidents become audit records (`Ledger::move_incidents`).
+    ///
+    /// The rest move [`MOVE_PER_INPUT`] at a time, at the start of each settlement adapter input
+    /// that follows: moving them all at once could take more than the guest's arena (about 2.4 KB
+    /// an incident in one invocation). Nothing reads the incidents leaf to decide anything, so
+    /// what is still in it changes no answer while it drains.
+    ///
+    /// A book with neither writes nothing, so the switch of a book that never recorded one leaves
+    /// every root as the code before it would. The writer calls it once per input, whatever the
+    /// input holds, after its calls (the calls decide alike before or after: `proof` reads the
+    /// list or the gap end). An input that is a way out never switches the writer, and moves
+    /// nothing (D18): the writer does not call it then.
+    ///
+    /// The indexes only a re-scan read (`INGESTED_AT`, `RESCAN_RECORDED`) are left as they are:
+    /// nothing reads them from this generation on.
+    pub fn switch_settlement(&mut self) -> Result<(), Refusal> {
+        if !core::mem::take(&mut self.switching) {
+            return Ok(());
+        }
+        let recording = self.calls.is_some();
+        self.state.record_leaves(recording);
+        let at = self.state.operations().clock().unwrap_or(0);
+        let r = self.move_gaps(at).and_then(|()| self.move_incidents(at));
+        if recording {
+            self.state.record_leaves(false);
+        }
+        r
+    }
+
+    /// The gaps' part of the switch ([`Ledger::switch_settlement`]).
+    fn move_gaps(&mut self, at: Time) -> Result<(), Refusal> {
+        let store = self.state.settlement();
+        let gaps = store.gaps().to_vec();
+        if gaps.is_empty() {
+            return Ok(());
+        }
+        let Some(source) = store.config().map(|c| c.authoritative) else {
+            return Err(Refusal::Internal);
+        };
+        let incidents = store.incidents();
+        let mut writes: Vec<Write> = gaps
+            .iter()
+            .filter(|g| !incidents.contains(&Incident::Gap(**g)))
+            .map(|g| moved(Incident::Gap(*g), source, at))
+            .collect();
+        if let Some(end) = gaps.iter().map(|g| g.to).max() {
+            writes.push(Write::Settlement(SettlementWrite::GapEnd(end)));
+        }
+        writes.push(Write::Settlement(SettlementWrite::DropGaps));
+        self.commit(&writes)
+    }
+
+    /// Move the first [`MOVE_PER_INPUT`] incidents the earlier generations kept in the book's
+    /// state to the audit trail, in their order, each with the justification that it was moved
+    /// (`T-043-08`). Only from the chained generation on, which is when anything reads the leaf
+    /// for it: the switch input, and each settlement adapter input after it until the leaf is
+    /// empty. At most once an input ([`Ledger::set_input`] starts one), however many adapter
+    /// calls it holds, so one input never moves more than one chunk. With the leaf empty it
+    /// writes nothing.
+    pub(crate) fn move_incidents(&mut self, at: Time) -> Result<(), Refusal> {
+        if !self.chained() || self.moved_in_input {
+            return Ok(());
+        }
+        self.moved_in_input = true;
+        let store = self.state.settlement();
+        let incidents = store.incidents();
+        if incidents.is_empty() {
+            return Ok(());
+        }
+        let Some(source) = store.config().map(|c| c.authoritative) else {
+            return Err(Refusal::Internal);
+        };
+        let n = incidents.len().min(MOVE_PER_INPUT);
+        let mut writes: Vec<Write> = incidents[..n]
+            .iter()
+            .map(|i| moved(*i, source, at))
+            .collect();
+        writes.push(Write::Settlement(SettlementWrite::DropIncidents(n as u32)));
+        self.commit(&writes)
     }
 
     /// Mark `op` for review, alone in its own batch (`INV-23`).
@@ -419,6 +532,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                 counterparty: Some(roles.issuance),
             },
             ctx.now,
+            self.generation(),
         )?;
         // F-016: the adapter refuses to serve, or has stopped declaring (`REQ-SA-2`).
         self.require_available(ctx.now)?;
@@ -562,6 +676,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                 },
                 ctx.now,
                 crate::custody::snapshot(&self.state, &ctx.op),
+                self.generation(),
             )?;
             if o.class() != KindClass::Outbound {
                 return Err(Refusal::UnsupportedLeg);
@@ -889,7 +1004,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                 | EventKind::AnchorRefused
                 | EventKind::Bound
                 | EventKind::BindRefused => {
-                    self.commit(&[ingest(&obs, None)])?;
+                    self.commit(&[ingest(&obs, None, !self.chained())])?;
                     Ok(Verdict::Ignored)
                 }
                 EventKind::Deposited => self.deposited(obs, &config, now),
@@ -907,10 +1022,11 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
         op: Option<OperationId>,
         incident: Incident,
         refusal: Refusal,
+        now: Time,
     ) -> Result<Verdict, Refusal> {
         self.commit(&[
-            ingest(obs, op),
-            Write::Settlement(SettlementWrite::Incident(incident)),
+            ingest(obs, op, !self.chained()),
+            self.incident(incident, now),
         ])?;
         Err(refusal)
     }
@@ -930,6 +1046,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                 None,
                 Incident::Unusable { coordinate: c },
                 Refusal::EvidenceInsufficient,
+                now,
             );
         }
         // Only a bound asset takes deposits: a book-only one has no external leg (`REQ-AS-7`).
@@ -945,6 +1062,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                 None,
                 Incident::Unassociated { coordinate: c },
                 Refusal::ObservationUnassociated,
+                now,
             );
         };
         let op = inbound_reference(&c.bytes());
@@ -962,7 +1080,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             at: now,
         };
         let writes = vec![
-            ingest(&obs, Some(op)),
+            ingest(&obs, Some(op), !self.chained()),
             Write::Settlement(SettlementWrite::Bind {
                 op,
                 coordinate: Some(c),
@@ -984,6 +1102,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                 None,
                 Incident::Unassociated { coordinate: c },
                 Refusal::ObservationUnassociated,
+                now,
             );
         };
         let op = o.reference();
@@ -999,10 +1118,11 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                 None,
                 Incident::Unusable { coordinate: c },
                 Refusal::EvidenceInsufficient,
+                now,
             );
         }
         if obs.kind == EventKind::WithdrawRefused {
-            return self.final_failure(&obs, &o);
+            return self.final_failure(&obs, &o, now);
         }
         let facts = self.facts_of(&o, now);
         match o.state() {
@@ -1018,7 +1138,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                     )
                     .map_err(stop_refusal)?;
                 let writes = vec![
-                    ingest(&obs, Some(op)),
+                    ingest(&obs, Some(op), !self.chained()),
                     Write::Settlement(SettlementWrite::Bind {
                         op,
                         coordinate: Some(c),
@@ -1030,7 +1150,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             // Before the acknowledgement, or beside the record `Observed` rests on: kept, and
             // applied if that record is orphaned or the acknowledgement arrives.
             State::Reserved | State::Observed => {
-                self.commit(&[ingest(&obs, Some(op))])?;
+                self.commit(&[ingest(&obs, Some(op), !self.chained())])?;
                 Ok(Verdict::Applied(o.shown()))
             }
             // Execution after the expiry passed with no record: non-inclusion can no longer be
@@ -1047,11 +1167,8 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                     )
                     .map_err(stop_refusal)?;
                 let writes = vec![
-                    ingest(&obs, Some(op)),
-                    Write::Settlement(SettlementWrite::Incident(Incident::LateEvidence {
-                        op,
-                        coordinate: c,
-                    })),
+                    ingest(&obs, Some(op), !self.chained()),
+                    self.incident(Incident::LateEvidence { op, coordinate: c }, now),
                 ];
                 self.commit_moves(now, writes, None, vec![planned])?;
                 Ok(Verdict::Applied(Shown::of(State::NeedsReview)))
@@ -1059,11 +1176,8 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             // Anything else waits for no record: kept, and raised.
             _ => {
                 self.commit(&[
-                    ingest(&obs, Some(op)),
-                    Write::Settlement(SettlementWrite::Incident(Incident::LateEvidence {
-                        op,
-                        coordinate: c,
-                    })),
+                    ingest(&obs, Some(op), !self.chained()),
+                    self.incident(Incident::LateEvidence { op, coordinate: c }, now),
                 ])?;
                 Ok(Verdict::Applied(o.shown()))
             }
@@ -1075,14 +1189,22 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
     /// sees why. While the record is provisional nothing moves; once it is final, and the signing
     /// key's nonce shows its transaction included, it is a proved rejection and the reservation is
     /// released at once (amendment 0006 item 3; [`Ledger::release_rejected`]).
-    fn final_failure(&mut self, obs: &Observation, o: &Operation) -> Result<Verdict, Refusal> {
+    fn final_failure(
+        &mut self,
+        obs: &Observation,
+        o: &Operation,
+        now: Time,
+    ) -> Result<Verdict, Refusal> {
         let op = o.reference();
         self.commit(&[
-            ingest(obs, Some(op)),
-            Write::Settlement(SettlementWrite::Incident(Incident::FinalFailure {
-                op,
-                coordinate: obs.coordinate,
-            })),
+            ingest(obs, Some(op), !self.chained()),
+            self.incident(
+                Incident::FinalFailure {
+                    op,
+                    coordinate: obs.coordinate,
+                },
+                now,
+            ),
         ])?;
         Ok(Verdict::Applied(o.shown()))
     }
@@ -1250,7 +1372,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                 }
                 // A binding's record, now final: the binding is decided (`REQ-AS-8`).
                 if now_final && Self::is_bind_record(&i.observation) {
-                    marks.extend(self.bind_final_writes(&i.observation));
+                    marks.extend(self.bind_final_writes(&i.observation, now));
                 }
                 let changed = !marks.is_empty();
                 if changed {
@@ -1564,8 +1686,28 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                     return Err(Refusal::EvidenceInsufficient);
                 }
             }
+            // Amendment 0041's guard (`T-043-17`), from `SETTLEMENT_EPOCHS` on: a head at a later
+            // block with a lower position (a reset the book has not followed) is recorded as
+            // reported and not taken, once, and a head taken clears it.
+            //
+            // Not while `T-043-08`'s move of a running book's incidents is under way: the leaf is
+            // absent until set, and proving it absent then reads the incidents leaf's whole value
+            // into the witness, which takes the move's input past the guest's arena (30 KB on a
+            // book of 520). The move reads that leaf on every adapter input anyway (it ran before
+            // this arm), so asking whether it is empty reads nothing more; the move ends within
+            // incidents / `MOVE_PER_INPUT` adapter inputs of the switch, and the guard arms on the
+            // next dropped head after it.
+            let guard = self.epochs() && self.state.settlement().incidents().is_empty();
+            let reported = if guard {
+                self.state.settlement().reported()
+            } else {
+                None
+            };
             if let Some(last) = self.state.settlement().head() {
                 if head.height < last.height || head.next_seq < last.next_seq {
+                    if guard && head.height > last.height && reported.is_none() {
+                        self.commit(&[Write::Settlement(SettlementWrite::Reported(Some(head)))])?;
+                    }
                     return Ok(report);
                 }
                 if head != last {
@@ -1573,6 +1715,9 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                 }
             } else {
                 self.commit(&[Write::Settlement(SettlementWrite::Head(head))])?;
+            }
+            if reported.is_some() {
+                self.commit(&[Write::Settlement(SettlementWrite::Reported(None))])?;
             }
             let store = self.state.settlement();
             let facts: Vec<Write> = work
@@ -1686,7 +1831,11 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             return Proof::Unprovable;
         }
         let (from, to) = (i.from_seq, head.next_seq);
-        if store.gap_within(from, to) {
+        // The gaps' list of the earlier generations, and the end of the highest gap recorded
+        // since (`T-043-07`). An earlier generation's head reads the list alone, as its code did
+        // (the gap end is 0 until a chained input sets it, and reading it would put a leaf its
+        // code does not know in its witness).
+        if store.gap_within(from, to) || (self.chained() && store.gap_starts_below(from)) {
             return Proof::Unprovable;
         }
         if store.naming(op).any(|r| names_op(store, r, op)) {
@@ -1771,13 +1920,14 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                 .instruction(&op)
                 .and_then(|i| i.signing)
             {
-                writes.push(Write::Settlement(SettlementWrite::Incident(
+                writes.push(self.incident(
                     Incident::IncludedWithoutRecord {
                         op,
                         key: s.key,
                         nonce: s.nonce,
                     },
-                )));
+                    now,
+                ));
             }
         }
         let mut unit = None;
@@ -1823,16 +1973,136 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
         }
     }
 
+    // ------------------------------------------------------------------ a new sequence
+
+    /// The start of a new sequence of the layer's record under the book (amendment 0041,
+    /// `REQ-SA-10` as proposed, `T-043-14`, `[PENDING AMENDMENT 0041]`): governance reset the
+    /// instance, and its positions restart at `epoch.from_seq` from block `epoch.at`. Reached
+    /// through the adapter's input only ([`crate::ledger::settle_adapter::AdapterInput::Epoch`]),
+    /// from [`crate::settlement::SETTLEMENT_EPOCHS`] on; the caller gates the generation.
+    ///
+    /// In order:
+    ///
+    /// 1. The sequence the book holds, again and equal in every field: `Recorded`, nothing
+    ///    written. Any other sequence not later than it: refused ([`EpochRefusal::NotLater`]).
+    /// 2. Another book: refused. The sequence must name this book's genesis digest (its
+    ///    chainspec's seed digest, [`Ledger::code_binding`]); a book founded without one has the
+    ///    zero digest and can never match (decision 4).
+    /// 3. An outbound instruction not yet decided: refused. Its first position and expiry come
+    ///    from an earlier sequence, and the new one's records prove nothing about it (decision 2).
+    /// 4. A final record of the instance at or above `from_seq` observed at or before the reset's
+    ///    block: refused. It is an earlier sequence's, at a position the new one reuses, and
+    ///    `proof` would count it as the new one's (decision 5: one in the reset's own block cannot
+    ///    be told apart by block, so it counts as earlier). A record observed after the reset's
+    ///    block is the new sequence's, and stays.
+    /// 5. Otherwise the sequence is recorded and the head restarts at its start,
+    ///    `{ at, from_seq }`, unless the book holds a head at a later block: that one is already
+    ///    the new sequence's, and stays. Later heads compare against it as before.
+    ///
+    /// A refusal writes one audit record ([`Incident::EpochRefused`]) and nothing in the book's
+    /// state. A restart of the head also clears the gap end (ruling q28): every position below it
+    /// was the chain before's; a start that keeps a later head keeps it, as that head, and a gap
+    /// recorded since, may be the new sequence's. The positions' tally and the index by position
+    /// are left as they are (amendment 0041). This reads the instructions in flight and the instance's final
+    /// positions from `from_seq` whole: it comes once per reset.
+    pub(super) fn start_epoch(
+        &mut self,
+        source: SourceId,
+        epoch: SettlementEpoch,
+        now: Time,
+    ) -> Result<EpochOutcome, Refusal> {
+        let config = self.authoritative(&source).ok_or(Refusal::NotAuthorised)?;
+        let refusal = (|| {
+            let store = self.state.settlement();
+            let held = store.epoch();
+            if held == Some(epoch) {
+                return Ok(None);
+            }
+            // Another book first, whatever its number: it is the adapter's `reset:`, not a page.
+            let genesis = self.code_binding().genesis;
+            if genesis == [0; 32] || epoch.book != genesis {
+                return Err(EpochRefusal::OtherBook);
+            }
+            if let Some(held) = held.filter(|h| epoch.epoch <= h.epoch) {
+                return Err(EpochRefusal::NotLater {
+                    recorded: held.epoch,
+                });
+            }
+            if let Some(op) = store.any_live() {
+                return Err(EpochRefusal::InFlight { op });
+            }
+            if let Some(c) = store
+                .finals_from(config.instance, epoch.from_seq)
+                .find(|c| {
+                    // A final record is always ingested; one that were not would be counted as
+                    // earlier, defensively.
+                    store
+                        .ingested(c)
+                        .is_none_or(|i| i.observation.at <= epoch.at)
+                })
+            {
+                return Err(EpochRefusal::EarlierFinal { seq: c.seq });
+            }
+            Ok(Some(()))
+        })();
+        match refusal {
+            Ok(None) => Ok(EpochOutcome::Recorded),
+            Ok(Some(())) => {
+                let start = epoch.start();
+                let head = match self.state.settlement().head() {
+                    Some(h) if h.height > epoch.at => None,
+                    _ => Some(start),
+                };
+                let mut writes = vec![Write::Settlement(SettlementWrite::Epoch { epoch, head })];
+                // The guard's head reported and not taken was this reset's (`T-043-17`).
+                if self.state.settlement().reported().is_some() {
+                    writes.push(Write::Settlement(SettlementWrite::Reported(None)));
+                }
+                self.check(&writes)?;
+                self.commit(&writes)?;
+                Ok(EpochOutcome::Started(
+                    self.state.settlement().head().unwrap_or(start),
+                ))
+            }
+            Err(refusal) => {
+                let writes = [self.incident(
+                    Incident::EpochRefused {
+                        epoch: epoch.epoch,
+                        refusal,
+                    },
+                    now,
+                )];
+                self.commit(&writes)?;
+                Ok(EpochOutcome::Refused(refusal))
+            }
+        }
+    }
+
     // ------------------------------------------------------------------ completeness
 
     /// A range of inbox positions the adapter was forced to skip (`REQ-SA-7`, `AC-D2.2`):
     /// recorded, visible, raised as an incident, and never marked ingested.
-    pub fn record_gap(&mut self, source: SourceId, gap: Gap, _now: Time) -> Result<(), Refusal> {
-        let top = self.enter(|| crate::call::Call::RecordGap {
-            source,
-            gap,
-            now: _now,
-        });
+    ///
+    /// From [`crate::settlement::CHAINED_SETTLEMENT`] on (`T-043-07`, ruling a40c-gaps-watermark)
+    /// the gap is an audit record, and the book keeps only the end of the highest gap, which
+    /// `proof` reads; before it, the gap and its incident were appended to the book's state.
+    pub fn record_gap(&mut self, source: SourceId, gap: Gap, now: Time) -> Result<(), Refusal> {
+        self.record_gap_of(source, gap, None, now)
+    }
+
+    /// [`Ledger::record_gap`], of the chain of `sequence` if the adapter named it (amendment 0041,
+    /// decision 6 made exact, from [`crate::settlement::SETTLEMENT_EPOCHS`] on). A gap of a
+    /// sequence later than the one the book holds raises that sequence's gap end, which the next
+    /// start keeps if it is of that sequence or an earlier one; any other gap (none named, or of the
+    /// sequence held or earlier) raises the untagged gap end, which every start clears.
+    pub(super) fn record_gap_of(
+        &mut self,
+        source: SourceId,
+        gap: Gap,
+        sequence: Option<u32>,
+        now: Time,
+    ) -> Result<(), Refusal> {
+        let top = self.enter(|| crate::call::Call::RecordGap { source, gap, now });
         #[allow(clippy::redundant_closure_call)]
         let r: Result<(), Refusal> = (|| {
             if self.authoritative(&source).is_none() {
@@ -1841,10 +2111,19 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             if gap.to <= gap.from {
                 return Err(Refusal::EvidenceInsufficient);
             }
-            self.commit(&[
-                Write::Settlement(SettlementWrite::Gap(gap)),
-                Write::Settlement(SettlementWrite::Incident(Incident::Gap(gap))),
-            ])
+            // The sequence held is read only for a gap that names one: a generation-0 input reads
+            // no leaf the code before amendment 0041 did not know.
+            let later =
+                sequence.filter(|s| *s > self.state.settlement().epoch().map_or(0, |e| e.epoch));
+            let record = match later {
+                Some(sequence) => Write::Settlement(SettlementWrite::SequenceGapEnd {
+                    sequence,
+                    to: gap.to,
+                }),
+                None if self.chained() => Write::Settlement(SettlementWrite::GapEnd(gap.to)),
+                None => Write::Settlement(SettlementWrite::Gap(gap)),
+            };
+            self.commit(&[record, self.incident(Incident::Gap(gap), now)])
         })();
         self.leave(top, || crate::call::Summary::of(&r));
         r
@@ -1852,7 +2131,16 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
 
     /// A re-scan of the inbox positions `[from, to)` (`REQ-IN-5`): `layer` is every position of
     /// the range and the digest the layer holds there. It is compared with what was ingested;
-    /// every difference is an incident naming the coordinate, never a silent repair.
+    /// every difference is an incident naming the coordinate, never a silent repair. The report
+    /// names every difference found; a difference already recorded is not recorded again.
+    ///
+    /// **Withdrawn from [`crate::settlement::CHAINED_SETTLEMENT`] on** (amendment 0040,
+    /// `T-043-06`): the adapter checks completeness against the head the layer holds, and the
+    /// core trusts that check (ruling a40-q1). An input of that generation or a later one that
+    /// asks for a re-scan is refused, `ERR-MalformedCommand`, and nothing is written. An input of
+    /// an earlier generation is decided as its code decided it, so a book's recorded re-scans
+    /// replay (`NFR-22`, the generation rule): that is all this method is kept for. No surface
+    /// submits one any more (the ingress route is withdrawn).
     pub fn rescan(
         &mut self,
         source: SourceId,
@@ -1870,6 +2158,9 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
         });
         #[allow(clippy::redundant_closure_call)]
         let r: Result<RescanReport, Refusal> = (|| {
+            if self.chained() {
+                return Err(Refusal::MalformedCommand);
+            }
             let Some(config) = self.authoritative(&source) else {
                 return Err(Refusal::NotAuthorised);
             };
@@ -1907,6 +2198,10 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                         .count()
                 })
                 .sum();
+            // The report names every difference; the book records each once, however many
+            // re-scans find it. Before, every re-scan appended its differences again to the one
+            // leaf that holds every incident, and a range re-scanned on a schedule grew it until
+            // the Agent's heap could not hold it (finding F18's class, `REQ-RT-1`).
             let writes: Vec<Write> = report
                 .missing
                 .iter()
@@ -1920,6 +2215,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                         .iter()
                         .map(|c| Incident::Unknown { coordinate: *c }),
                 )
+                .filter(|i| !store.rescan_recorded(config.instance, i))
                 .map(|i| Write::Settlement(SettlementWrite::Incident(i)))
                 .collect();
             if !writes.is_empty() {
@@ -1932,11 +2228,29 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
     }
 }
 
-/// The ingest write of `obs`, associated with `op`.
-fn ingest(obs: &Observation, op: Option<OperationId>) -> Write {
+/// How many of the incidents the earlier generations kept in the book's state one input moves to
+/// the audit trail (`T-043-08`): sized so the input stays well inside the guest's arena
+/// (`tests/f043_incidents_heap.rs`).
+pub const MOVE_PER_INPUT: usize = 32;
+
+/// The audit record of an incident moved from the book's state (`T-043-08`).
+fn moved(incident: Incident, source: SourceId, at: Time) -> Write {
+    Write::Incident(crate::audit::IncidentNote {
+        incident,
+        source,
+        at,
+        moved: true,
+    })
+}
+
+/// The ingest write of `obs`, associated with `op`. `by_position`: the record is also indexed by
+/// its inbox position, for a re-scan to read: only before [`crate::settlement::CHAINED_SETTLEMENT`]
+/// (`T-043-06`), whose code wrote the index and whose re-scans read it.
+fn ingest(obs: &Observation, op: Option<OperationId>, by_position: bool) -> Write {
     Write::Settlement(SettlementWrite::Ingest {
         observation: obs.clone(),
         op,
+        by_position,
     })
 }
 
@@ -1966,7 +2280,7 @@ mod finality {
     use crate::lifecycle::{KindClass, Shown, State, Trigger};
     use crate::refusal::Refusal;
     use crate::reservation::{CHOSEN, ReservationBook, UnitBuilder};
-    use crate::settlement::store::{SettlementWrite, Standing};
+    use crate::settlement::store::Standing;
     use crate::settlement::{CanonicalCheck, Coordinate, Incident, Verdict, Verified};
     use crate::state::Write;
 
@@ -2175,10 +2489,7 @@ mod finality {
                         Err(Stop::Stay(_)) => return Err(Refusal::InvalidTransition),
                     };
                     let mut writes = marks.clone();
-                    writes.extend(
-                        s.incident
-                            .map(|i| Write::Settlement(SettlementWrite::Incident(i))),
-                    );
+                    writes.extend(s.incident.map(|i| self.incident(i, now)));
                     let plan = Plan {
                         unit: Some(s.unit),
                         writes,
@@ -2202,13 +2513,14 @@ mod finality {
             };
             // INV-23: Final, and queued, with the refusal on record.
             let mut writes = marks;
-            writes.extend(incident.map(|i| Write::Settlement(SettlementWrite::Incident(i))));
-            writes.push(Write::Settlement(SettlementWrite::Incident(
+            writes.extend(incident.map(|i| self.incident(i, now)));
+            writes.push(self.incident(
                 Incident::SettlementRefused {
                     op,
                     refusal: refused,
                 },
-            )));
+                now,
+            ));
             self.commit_moves(now, writes, None, alloc::vec![to_final])?;
             self.flag_for_review(op);
             Ok(Verified {
@@ -2472,7 +2784,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                 | ledger_kernel::posting::PostingKind::Issue,
             ) => {
                 let (u, incident) = settling.ok_or(Refusal::EvidenceInsufficient)?;
-                writes.extend(incident.map(|i| Write::Settlement(SettlementWrite::Incident(i))));
+                writes.extend(incident.map(|i| self.incident(i, now)));
                 Some(u)
             }
             Some(_) => return Ok(None),

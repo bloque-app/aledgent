@@ -464,17 +464,9 @@ fn ac_i1_1__service(_: &mut dyn Harness) -> Outcome {
         pass(&k, ANCHOR_INTERVAL_MS).await?;
         until_final(&mut k, 1, 12).await?;
         let c = anchoring(&k, |s| s.latest_final().copied())?.ok_or("no final checkpoint")?;
-        let fin = settle::chain::Chain::finalized(&k.chain)
-            .await
-            .map_err(|e| e.to_string())?;
-        let page = settle::chain::Chain::inbox(&k.chain, &fin, INSTANCE, 0, 64)
-            .await
-            .map_err(|e| e.to_string())?;
+        // The entries, rebuilt from the contract's events at the finalized head (amendment 0040).
         let mut anchors = 0;
-        for (_, read) in page {
-            let settle::chain::InboxRead::Entry(e) = read else {
-                continue;
-            };
+        for (_, e) in k.chain.finalized_entries(INSTANCE) {
             let settle::chain::InboxEvent::Anchored { number, commitment } = e.event else {
                 continue;
             };

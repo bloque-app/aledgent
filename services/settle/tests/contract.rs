@@ -17,7 +17,7 @@ use settle::adapter::{CrashPoint, Refusing};
 use settle::chain::fake::FakeConfig;
 use settle::chain::fake::position_account;
 use settle::chain::kreivo::{self, Envelope};
-use settle::chain::{Chain, InboxEvent, InboxRead, Validity, blake2_256};
+use settle::chain::{Chain, InboxEvent, Validity, blake2_256};
 use settle::signer::recover;
 use settle::store::{ExtrinsicRow, ExtrinsicStatus, InstructionState, NotExecuted, Store};
 use settle::testkit::{ADAPTER_TOKEN, INSTANCE, Kit, KitOptions, PAYEE, TEST_PASS_USER, chain_usd};
@@ -81,19 +81,15 @@ fn envelopes(e: &ExtrinsicRow) -> (kreivo::DecodedTx, [u8; 32], Vec<Envelope>) {
     (tx, contract, calls)
 }
 
-/// Every inbox entry of the deployment at the finalized head.
+/// Every entry of the deployment's chain at the finalized head, rebuilt from its events; checked
+/// against the head the contract holds there (amendment 0040).
 async fn inbox(k: &Kit) -> Vec<(u64, settle::chain::InboxEntry)> {
     let fin = k.chain.finalized().await.unwrap();
-    k.chain
-        .inbox(&fin, INSTANCE, 0, 1_000)
-        .await
-        .unwrap()
-        .into_iter()
-        .filter_map(|(s, r)| match r {
-            InboxRead::Entry(e) => Some((s, e)),
-            _ => None,
-        })
-        .collect()
+    let entries = k.chain.finalized_entries(INSTANCE);
+    let head = k.chain.chain_head(&fin, INSTANCE).await.unwrap().unwrap();
+    settle::chain::fold(0, &settle::chain::ZERO_DIGEST, &entries, &head)
+        .expect("the events fold to the head");
+    entries
 }
 
 // ------------------------------------------------------------------------------ T-027-01
@@ -750,6 +746,47 @@ async fn ac_e4_3_t_027_12_an_upgrade_that_changes_nothing_a_transaction_carries_
     until_all(&mut k, &alice, std::slice::from_ref(&third), "Settled", 5).await;
     assert_eq!(k.chain.validations(), 2);
     assert_eq!(k.chain.balance_of(&PAYEE, &chain_usd()), 60);
+}
+
+/// `AC-E4.3`, `REQ-SA-9`: Kreivo 134 to 136 (release `0.18.1`, 2026-10-27) changed the
+/// `spec_version` and the `transaction_version` (13 to 14, for two `CommunitiesManager` calls it
+/// removed), and nothing else a transaction carries. `kreivo-133` is pinned for 14 too
+/// (`kreivo-pin-136`, `fixtures/surface-136.json`), so the adapter keeps serving with no
+/// configuration: the next batch is signed with 14 in its implicit data, confirmed by the layer
+/// on 136, broadcast and settled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ac_e4_3_kreivo_0_18_1_spec_136_transaction_version_14_keeps_serving() {
+    let mut k = serving_kit(KitOptions::default()).await;
+    let alice = k.d.party("alice", 1_000).await;
+    k.chain.set_spec_version(134);
+    k.chain.advance(1);
+    let first = k.withdrawal(&alice, 10, "on-134").await;
+    until_all(&mut k, &alice, std::slice::from_ref(&first), "Settled", 5).await;
+    assert!(k.adapter.config().formats.is_empty());
+    k.chain.upgrade(|c| {
+        c.spec_version = 136;
+        c.transaction_version = 14;
+    });
+    k.chain.advance(1);
+    assert!(k.step().await.unwrap().serving, "{:?}", k.adapter.status());
+    let second = k.withdrawal(&alice, 20, "on-136").await;
+    let r = k.step().await.unwrap();
+    assert_eq!((r.signed, r.broadcast), (1, 1));
+    assert_eq!(
+        k.chain.validations(),
+        2,
+        "confirmed on 136 before it went out"
+    );
+    until_all(&mut k, &alice, std::slice::from_ref(&second), "Settled", 5).await;
+    assert_eq!(signed_in(&extrinsic(&k, &second).await), vec!["kreivo-133"]);
+    assert_eq!(
+        served(&k).await,
+        vec![
+            (134, "kreivo-133".to_owned()),
+            (136, "kreivo-133".to_owned())
+        ]
+    );
+    assert_eq!(k.chain.balance_of(&PAYEE, &chain_usd()), 30);
 }
 
 /// `AC-E4.4`, `T-027-12`, `REQ-SA-9`: on a runtime whose surface is unchanged, a transaction the

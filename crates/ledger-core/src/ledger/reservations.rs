@@ -197,6 +197,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                 counterparty: None,
             },
             ctx.now,
+            self.generation(),
         )?;
         let acct = self
             .state
@@ -310,6 +311,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             },
             ctx.now,
             crate::custody::snapshot(&self.state, &ctx.op),
+            self.generation(),
         )?;
         if let Status::Closed(..) = status {
             return Err(Refusal::OperationTerminal);

@@ -19,8 +19,19 @@
 //! - **A signing record per instruction, once, after its acknowledgement** (owner ruling,
 //!   2026-09-24): the one transaction signed for it, or the adapter's word that it never will
 //!   sign one. **Its nonce fact is decided once** and never changes.
-//! - **The finalised head never goes back.**
-//! - **Gaps and incidents are appended, never removed.**
+//! - **The finalised head never goes back within a sequence.** Only the start of a strictly later
+//!   sequence of the layer's record moves it back, to that sequence's start (amendment 0041,
+//!   [`SettlementWrite::Epoch`]); the store refuses any other head that goes back, and a sequence
+//!   that is not later than the one it holds.
+//! - **A gap end is cleared only by a start** (amendment 0041, ruling q28, made exact): the start
+//!   of a strictly later sequence clears the untagged gap end and every gap end of an earlier
+//!   sequence, and keeps those of the started sequence or later. Otherwise each only rises.
+//! - **Gaps and incidents are appended, never removed.** A re-scan's difference (`Missing`,
+//!   `Unknown`) is one incident however many re-scans find it: the store indexes the ones
+//!   recorded by key, so a re-scan that finds nothing new reads that index, never the incidents.
+//!   Re-scans, and the two indexes only they read (`RESCAN_RECORDED`, `INGESTED_AT`), belong to
+//!   the generations before [`super::CHAINED_SETTLEMENT`] (`T-043-06`): their inputs replay as
+//!   they were decided, and a later generation writes neither.
 //! - **The latest attestation of each location** replaces the last (`DEC-20`).
 //! - **One binding of an asset in flight at a time**, and a binding's outcome is decided once: a
 //!   pending binding becomes bound or refused, and never changes after (`REQ-AS-8`).
@@ -31,7 +42,8 @@ use alloc::vec::Vec;
 use super::assets::{AssetBind, Attested, BindStatus};
 use super::{
     AdapterStatus, Coordinate, FinalisedHead, Gap, Incident, NonceFact, Observation,
-    OutboundInstruction, SettlementConfig, SigningRecord, SourceId, SupportDeclaration,
+    OutboundInstruction, SettlementConfig, SettlementEpoch, SigningRecord, SourceId,
+    SupportDeclaration,
 };
 use crate::asset::{AssetId, AssetLocation};
 use crate::id::OperationId;
@@ -89,6 +101,10 @@ pub enum SettlementWrite {
         observation: Observation,
         /// The operation it is evidence for.
         op: Option<OperationId>,
+        /// Whether the record is also indexed by its inbox position (`INGESTED_AT`), for a
+        /// re-scan to read: by the code of a generation before
+        /// [`super::CHAINED_SETTLEMENT`] only, which takes re-scans (`T-043-06`).
+        by_position: bool,
     },
     /// Keep a record from a corroborating source (`REQ-IN-6`). It never writes to the book.
     Corroborate(Observation),
@@ -128,8 +144,39 @@ pub enum SettlementWrite {
     },
     /// Raise the finalised head.
     Head(FinalisedHead),
+    /// Record the start of a new sequence of the layer's record (amendment 0041): refused unless
+    /// its number is strictly later than the one the store holds. With `head`, the finalised head
+    /// becomes it (refused unless it is the sequence's start), even below the one held: the one
+    /// write that moves the head back. With or without `head`, the untagged gap end and every gap
+    /// end of an earlier sequence are cleared, and those of this sequence or a later one kept
+    /// (ruling q28, made exact).
+    Epoch {
+        /// The sequence.
+        epoch: SettlementEpoch,
+        /// The head it starts at, or none to keep the head (one at a later block is already the
+        /// new sequence's).
+        head: Option<FinalisedHead>,
+    },
     /// Record a skipped range.
     Gap(Gap),
+    /// Empty the gaps leaf (`T-043-08`): the gaps moved to the gap end and the audit trail in the
+    /// same batch, at the switch to [`super::CHAINED_SETTLEMENT`].
+    DropGaps,
+    /// Take the first this many incidents out of the incidents leaf (`T-043-08`): moved to the
+    /// audit trail in the same batch. Refused if the leaf holds fewer.
+    DropIncidents(u32),
+    /// Raise the end of the highest gap to at least this position (`T-043-07`): the one number
+    /// the book keeps for gaps from [`super::CHAINED_SETTLEMENT`] on, each gap itself going to
+    /// the audit trail. It never goes down but at a restart ([`SettlementWrite::Epoch`]).
+    GapEnd(u64),
+    /// Raise the end of the highest gap of `sequence` to at least `to` (amendment 0041, decision 6
+    /// made exact): a gap the adapter named the sequence of. It never goes down but at a start.
+    SequenceGapEnd {
+        /// The sequence the gap is of.
+        sequence: u32,
+        /// The first position after it.
+        to: u64,
+    },
     /// Raise an incident.
     Incident(Incident),
     /// Record the settlement adapter's status declaration, replacing the last (`F-016`).
@@ -149,6 +196,9 @@ pub enum SettlementWrite {
         /// The final record.
         coordinate: Coordinate,
     },
+    /// Record a head the adapter reported at a later block than the one held, with a lower
+    /// position, which the book did not take (amendment 0041's guard, `T-043-17`), or clear it.
+    Reported(Option<FinalisedHead>),
     /// Advance the positions' tally (`REQ-PR-5`) over every inbox position below `through`, all
     /// final: `counted` are the operations with a final deposit or withdrawal record in the
     /// positions passed, and `held` the tally afterwards. Refused if it would go back or count an
@@ -194,6 +244,11 @@ pub enum SettlementRefusal {
     NoBindPending,
     /// The tally would go back, or count an operation twice.
     Tally,
+    /// A sequence not later than the one the store holds (amendment 0041).
+    EpochNotLater,
+    /// A start whose head is not the sequence's start (amendment 0041): the head moves back only
+    /// to it.
+    EpochHeadNotStart,
 }
 
 /// How to undo one applied write.
@@ -211,8 +266,21 @@ pub(crate) enum SettlementUndo {
     Unsign(OperationId),
     Undecide(OperationId),
     Head(Option<FinalisedHead>),
+    /// The sequence, the head, the untagged gap end and the gap ends by sequence, before a start.
+    Epoch(
+        Option<SettlementEpoch>,
+        Option<FinalisedHead>,
+        u64,
+        Vec<(u32, u64)>,
+    ),
+    GapEnds(Vec<(u32, u64)>),
+    Reported(Option<FinalisedHead>),
     PopGap,
+    GapEnd(u64),
+    Gaps(Vec<Gap>),
+    Incidents(Vec<Incident>),
     PopIncident,
+    PopRescanned((u8, Coordinate)),
     Status(Option<AdapterStatus>),
     Attested(AssetLocation, Option<Attested>),
     AssetBind(AssetId, Option<AssetBind>),
@@ -239,8 +307,28 @@ pub struct SettlementStore {
     /// the nonces for. Derived, never exported (`F-005`).
     awaiting: Leaves<OperationId, (), { kind::AWAITING_NONCE }>,
     head: Slot<Option<FinalisedHead>, { kind::FINALISED_HEAD }>,
+    /// The gaps recorded by the generations before [`super::CHAINED_SETTLEMENT`]. From it on a gap
+    /// goes to the audit trail and raises `gap_end` instead (`T-043-07`).
     gaps: Slot<Vec<Gap>, { kind::GAPS }>,
+    /// The incidents recorded by the generations before [`super::CHAINED_SETTLEMENT`]. From it on
+    /// an incident goes to the audit trail only (`T-043-07`, ruling a40-q2).
     incidents: Slot<Vec<Incident>, { kind::SETTLEMENT_INCIDENTS }>,
+    /// The end of the highest gap recorded from [`super::CHAINED_SETTLEMENT`] on, 0 for none
+    /// (amendment 0040, ruling a40c-gaps-watermark): `proof` cannot show a range that starts
+    /// below it complete. Absent while 0, so a book that records no gap holds no leaf for it.
+    gap_end: Slot<u64, { kind::GAP_END }>,
+    /// The end of the highest gap of each sequence the adapter named with it (amendment 0041,
+    /// decision 6 made exact): `(sequence, end)`, in sequence order, one per sequence. From
+    /// [`super::SETTLEMENT_EPOCHS`] on; absent while empty. [`SettlementStore::gap_end`] is the
+    /// highest over it and the untagged `gap_end`, which counts as the sequence the book holds.
+    gap_ends: Slot<Vec<(u32, u64)>, { kind::GAP_END_BY_SEQUENCE }>,
+    /// The last sequence of the layer's record whose start the book took (amendment 0041), from
+    /// [`super::SETTLEMENT_EPOCHS`] on. Absent until one is taken.
+    epoch: Slot<Option<SettlementEpoch>, { kind::SETTLEMENT_EPOCH }>,
+    /// The first head the adapter reported at a later block with a lower position that the book
+    /// did not take, since the last head it took (amendment 0041's guard, `T-043-17`): while set,
+    /// `withdraw` and `submit_outbound` are refused. Absent otherwise.
+    reported: Slot<Option<FinalisedHead>, { kind::HEAD_REPORTED }>,
     status: Slot<Option<AdapterStatus>, { kind::ADAPTER_STATUS }>,
     /// The latest attestation of each location (`DEC-20`).
     attestations: Leaves<AssetLocation, Attested, { kind::ASSET_ATTESTATION }>,
@@ -262,6 +350,30 @@ pub struct SettlementStore {
     /// cursor. A settling posting of one of them made later is added to the tally as it is
     /// written (`crate::state::State`). Derived, never exported.
     counted: Leaves<OperationId, (), { kind::POSITION_COUNTED }>,
+    /// The re-scan differences recorded in `incidents`, by [`rescan_key`]: how a re-scan that
+    /// finds a difference again knows it is recorded without reading every incident (`REQ-IN-5`;
+    /// finding F18's class: before, each re-scan appended its differences again, and the one
+    /// leaf holding every incident grew with every re-scan until the Agent's heap ran out).
+    /// Derived, never exported.
+    rescanned: Leaves<(u8, Coordinate), (), { kind::RESCAN_RECORDED }>,
+}
+
+/// The key of a re-scan difference in the index of those recorded, on instance `instance`;
+/// `None` for an incident of another kind. A `Missing` record is keyed by the coordinate the
+/// layer holds, an `Unknown` one by the coordinate aledgent holds.
+pub(crate) fn rescan_key(instance: u32, i: &Incident) -> Option<(u8, Coordinate)> {
+    match i {
+        Incident::Missing { seq, digest } => Some((
+            0,
+            Coordinate {
+                instance,
+                seq: *seq,
+                digest: *digest,
+            },
+        )),
+        Incident::Unknown { coordinate } => Some((1, *coordinate)),
+        _ => None,
+    }
 }
 
 /// Take `c` out of `op`'s set in an index of coordinates by operation, and the set once empty.
@@ -341,11 +453,36 @@ impl SettlementStore {
             SettlementUndo::Head(h) => {
                 self.head.set(h);
             }
+            SettlementUndo::Epoch(e, h, gap_end, gap_ends) => {
+                self.epoch.set(e);
+                self.head.set(h);
+                self.gap_end.set(gap_end);
+                self.gap_ends.set(gap_ends);
+            }
+            SettlementUndo::GapEnds(before) => {
+                self.gap_ends.set(before);
+            }
+            SettlementUndo::Reported(r) => {
+                self.reported.set(r);
+            }
             SettlementUndo::PopGap => {
                 self.gaps.get_mut().pop();
             }
+            SettlementUndo::GapEnd(before) => {
+                self.gap_end.set(before);
+            }
+            SettlementUndo::Gaps(gaps) => {
+                self.gaps.set(gaps);
+            }
+            SettlementUndo::Incidents(incidents) => {
+                self.incidents.set(incidents);
+            }
             SettlementUndo::PopIncident => {
                 self.incidents.get_mut().pop();
+            }
+            SettlementUndo::PopRescanned(k) => {
+                self.incidents.get_mut().pop();
+                self.rescanned.remove(&k);
             }
             SettlementUndo::Status(s) => {
                 self.status.set(s);
@@ -415,7 +552,11 @@ impl SettlementStore {
                 let before = self.support.set(Some(d.clone()));
                 Ok(SettlementUndo::Declared(before))
             }
-            SettlementWrite::Ingest { observation, op } => {
+            SettlementWrite::Ingest {
+                observation,
+                op,
+                by_position,
+            } => {
                 let c = observation.coordinate;
                 if self.ingested.contains_key(&c) {
                     return Err(SettlementRefusal::Duplicate);
@@ -434,9 +575,11 @@ impl SettlementStore {
                 if let Some(named) = observation.operation_ref {
                     self.naming.entry_or_default(named).insert(c);
                 }
-                self.at_position
-                    .entry_or_default((c.instance, c.seq))
-                    .insert(c.digest);
+                if *by_position {
+                    self.at_position
+                        .entry_or_default((c.instance, c.seq))
+                        .insert(c.digest);
+                }
                 Ok(SettlementUndo::Uningest(c))
             }
             SettlementWrite::Corroborate(o) => {
@@ -560,6 +703,41 @@ impl SettlementStore {
                 let before = self.head.set(Some(*h));
                 Ok(SettlementUndo::Head(before))
             }
+            SettlementWrite::Reported(r) => {
+                let before = self.reported.set(*r);
+                Ok(SettlementUndo::Reported(before))
+            }
+            SettlementWrite::Epoch { epoch, head } => {
+                if self
+                    .epoch
+                    .get()
+                    .is_some_and(|held| epoch.epoch <= held.epoch)
+                {
+                    return Err(SettlementRefusal::EpochNotLater);
+                }
+                if head.is_some_and(|h| h != epoch.start()) {
+                    return Err(SettlementRefusal::EpochHeadNotStart);
+                }
+                let before = *self.head.get();
+                if let Some(h) = head {
+                    self.head.set(Some(*h));
+                }
+                // Decision 6, made exact (ruling q28, Pablo 28 Oct): the end of every gap of an
+                // earlier sequence is cleared, whether or not the head is kept; that of the started
+                // sequence or a later one is kept. The untagged end is a gap reported without its
+                // sequence (the one the book held, earlier than this) or moved by `T-043-08`.
+                let gap_end = self.gap_end.set(0);
+                let kept: Vec<(u32, u64)> = self
+                    .gap_ends
+                    .get()
+                    .iter()
+                    .copied()
+                    .filter(|(sequence, _)| *sequence >= epoch.epoch)
+                    .collect();
+                let gap_ends = self.gap_ends.set(kept);
+                let held = self.epoch.set(Some(*epoch));
+                Ok(SettlementUndo::Epoch(held, before, gap_end, gap_ends))
+            }
             SettlementWrite::Gap(g) => {
                 if g.to <= g.from {
                     return Err(SettlementRefusal::EmptyGap);
@@ -567,9 +745,51 @@ impl SettlementStore {
                 self.gaps.get_mut().push(*g);
                 Ok(SettlementUndo::PopGap)
             }
+            SettlementWrite::DropGaps => Ok(SettlementUndo::Gaps(self.gaps.set(Vec::new()))),
+            SettlementWrite::DropIncidents(n) => {
+                let n = *n as usize;
+                if n > self.incidents.get().len() {
+                    return Err(SettlementRefusal::Missing);
+                }
+                let rest = self.incidents.get()[n..].to_vec();
+                Ok(SettlementUndo::Incidents(self.incidents.set(rest)))
+            }
+            SettlementWrite::GapEnd(to) => {
+                let before = *self.gap_end.get();
+                if *to <= before {
+                    return Ok(SettlementUndo::Nothing);
+                }
+                self.gap_end.set(*to);
+                Ok(SettlementUndo::GapEnd(before))
+            }
+            SettlementWrite::SequenceGapEnd { sequence, to } => {
+                let mut ends = self.gap_ends.get().clone();
+                match ends.binary_search_by_key(sequence, |(s, _)| *s) {
+                    Ok(i) if ends[i].1 >= *to => return Ok(SettlementUndo::Nothing),
+                    Ok(i) => ends[i].1 = *to,
+                    Err(i) => ends.insert(i, (*sequence, *to)),
+                }
+                Ok(SettlementUndo::GapEnds(self.gap_ends.set(ends)))
+            }
             SettlementWrite::Incident(i) => {
+                let key = self
+                    .config
+                    .get()
+                    .as_ref()
+                    .and_then(|c| rescan_key(c.instance, i));
+                if let Some(k) = key
+                    && self.rescanned.contains_key(&k)
+                {
+                    return Err(SettlementRefusal::Duplicate);
+                }
                 self.incidents.get_mut().push(*i);
-                Ok(SettlementUndo::PopIncident)
+                Ok(match key {
+                    Some(k) => {
+                        self.rescanned.insert(k, ());
+                        SettlementUndo::PopRescanned(k)
+                    }
+                    None => SettlementUndo::PopIncident,
+                })
             }
             SettlementWrite::Status(s) => {
                 let before = self.status.set(Some(*s));
@@ -725,9 +945,10 @@ impl SettlementStore {
         self.awaiting.keys_unrecorded()
     }
 
-    /// Derive the index by reference, by position and the operations the tally counts again
-    /// after an import: every binding's reference, every ingested record's position, and every
-    /// operation with a final deposit or withdrawal record below the tally's cursor.
+    /// Derive the index by reference, by position, the operations the tally counts and the
+    /// re-scan differences recorded again after an import: every binding's reference, every
+    /// ingested record's position, every operation with a final deposit or withdrawal record
+    /// below the tally's cursor, and every `Missing` and `Unknown` incident.
     pub(crate) fn rebuild_indexes(&mut self) {
         let binds: Vec<AssetBind> = self.binds.values().copied().collect();
         for b in binds {
@@ -741,6 +962,17 @@ impl SettlementStore {
         }
         for op in self.counted_below(self.tally.get().0) {
             self.counted.insert(op, ());
+        }
+        if let Some(instance) = self.config().map(|c| c.instance) {
+            let keys: Vec<(u8, Coordinate)> = self
+                .incidents
+                .get()
+                .iter()
+                .filter_map(|i| rescan_key(instance, i))
+                .collect();
+            for k in keys {
+                self.rescanned.insert(k, ());
+            }
         }
     }
 
@@ -889,19 +1121,78 @@ impl SettlementStore {
         *self.head.get()
     }
 
+    /// The last sequence of the layer's record whose start the book took (amendment 0041).
+    pub fn epoch(&self) -> Option<SettlementEpoch> {
+        *self.epoch.get()
+    }
+
+    /// The head the adapter reported and the book did not take, if any (amendment 0041's guard).
+    pub fn reported(&self) -> Option<FinalisedHead> {
+        *self.reported.get()
+    }
+
+    /// Whether any outbound instruction is not yet decided (amendment 0041): a read of the
+    /// instructions in flight, whole.
+    pub fn any_live(&self) -> Option<OperationId> {
+        self.live.first_key_value().map(|(op, _)| *op)
+    }
+
+    /// The final records of `instance` at positions at or above `from`, whole, in position order.
+    pub fn finals_from(&self, instance: u32, from: u64) -> impl Iterator<Item = &Coordinate> {
+        self.finals
+            .range((instance, from)..=(instance, u64::MAX))
+            .map(|(_, c)| c)
+    }
+
     /// Every recorded gap.
     pub fn gaps(&self) -> &[Gap] {
         self.gaps.get()
     }
 
-    /// Whether a recorded gap covers any position of `[from, to)`.
+    /// Whether a recorded gap covers any position of `[from, to)`: one in the list the
+    /// generations before [`super::CHAINED_SETTLEMENT`] kept.
     pub fn gap_within(&self, from: u64, to: u64) -> bool {
         self.gaps.get().iter().any(|g| g.from < to && from < g.to)
+    }
+
+    /// The end of the highest gap recorded from [`super::CHAINED_SETTLEMENT`] on; 0 for none
+    /// (`T-043-07`).
+    pub fn gap_end(&self) -> u64 {
+        // The highest over the untagged end and every sequence's (kind 34, read every time:
+        // `proof` calls this only from `CHAINED_SETTLEMENT` on, where kind 34 is known).
+        let ends = self.gap_ends.get();
+        ends.iter()
+            .map(|(_, end)| *end)
+            .fold(*self.gap_end.get(), u64::max)
+    }
+
+    /// The end of the highest gap of each sequence the adapter named (amendment 0041).
+    pub fn gap_ends(&self) -> &[(u32, u64)] {
+        self.gap_ends.get()
+    }
+
+    /// The untagged gap end: gaps reported without their sequence, or moved by `T-043-08`.
+    pub fn untagged_gap_end(&self) -> u64 {
+        *self.gap_end.get()
+    }
+
+    /// Whether a range that starts at `from` starts below the end of the highest gap recorded
+    /// from the chained generation on (`proof`, amendment 0040). Never less cautious than the
+    /// list it replaces: once the head has passed the gap they answer alike, and before that it
+    /// may answer that a range is unprovable where the list would not.
+    pub fn gap_starts_below(&self, from: u64) -> bool {
+        from < self.gap_end()
     }
 
     /// Every incident, in order.
     pub fn incidents(&self) -> &[Incident] {
         self.incidents.get()
+    }
+
+    /// Whether the re-scan difference `i` on instance `instance` is recorded already: a read by
+    /// key, never of the incidents whole. `false` for an incident of another kind.
+    pub fn rescan_recorded(&self, instance: u32, i: &Incident) -> bool {
+        rescan_key(instance, i).is_some_and(|k| self.rescanned.contains_key(&k))
     }
 
     /// The unassociated bucket: ingested records that relate to no operation, anchors (and
@@ -949,6 +1240,10 @@ impl LeafHost for SettlementStore {
         out.push(&self.head);
         out.push(&self.gaps);
         out.push(&self.incidents);
+        out.push(&self.gap_end);
+        out.push(&self.gap_ends);
+        out.push(&self.epoch);
+        out.push(&self.reported);
         out.push(&self.status);
         out.push(&self.attestations);
         out.push(&self.binds);
@@ -956,6 +1251,7 @@ impl LeafHost for SettlementStore {
         out.push(&self.at_position);
         out.push(&self.tally);
         out.push(&self.counted);
+        out.push(&self.rescanned);
     }
     fn leaf_maps_mut<'a>(&'a mut self, out: &mut Vec<&'a mut dyn LeafMap>) {
         out.push(&mut self.config);
@@ -972,6 +1268,10 @@ impl LeafHost for SettlementStore {
         out.push(&mut self.head);
         out.push(&mut self.gaps);
         out.push(&mut self.incidents);
+        out.push(&mut self.gap_end);
+        out.push(&mut self.gap_ends);
+        out.push(&mut self.epoch);
+        out.push(&mut self.reported);
         out.push(&mut self.status);
         out.push(&mut self.attestations);
         out.push(&mut self.binds);
@@ -979,6 +1279,7 @@ impl LeafHost for SettlementStore {
         out.push(&mut self.at_position);
         out.push(&mut self.tally);
         out.push(&mut self.counted);
+        out.push(&mut self.rescanned);
     }
 }
 

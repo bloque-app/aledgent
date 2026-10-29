@@ -9,8 +9,10 @@
 //! - **Reorgs above the finality point** ([`FakeChain::reorg`]): the blocks above it are dropped
 //!   and their transactions go back to the pool, as a node's pool does.
 //! - **Transactions are Kreivo's own bytes**: v5 general transactions authorised by
-//!   `PassAuthenticate` ([`super::kreivo`]), built by [`Chain::sign_batch`] and decoded and
-//!   checked here as the runtime checks them. The era must contain the block (the birth block's
+//!   `PassAuthenticate`, or a native account's v4 signed transactions (`F-045`), both
+//!   ([`super::kreivo`]) built by [`Chain::sign_batch`] and decoded and checked here as the runtime
+//!   checks them. A native transaction's signature must verify over its signed payload against its
+//!   account, which the call then runs as; the rest of this item is the PASS form's. The era must contain the block (the birth block's
 //!   hash is part of what the device signed); the challenge's context must be a block of this
 //!   chain no older than the challenger's window, and the challenge must be the one Kreivo's
 //!   `BlockHashChallenger` derives from the call and every extension after `PassAuthenticate`;
@@ -23,13 +25,19 @@
 //!   — applied, or refused with the contract's reason or Kreivo's (`Kreivo(Assets(
 //!   CannotTransfer))` when the account holds less than a withdrawal moves) — and the message
 //!   failing as a whole (`Contracts::ContractReverted`, nothing written) when the caller is not
-//!   a key or the batch is empty or too long; `deposit` from an account; a sequenced inbox of the
-//!   contract's own SCALE bytes, gapless, readable by position; `prune_inbox` moving the
-//!   watermark ([`FakeChain::prune`]), keeping the latest anchor's entry; anchors in order, a
-//!   replay of the latest a no-op, an older number refused (`AnchorOutOfOrder`): the contract
-//!   keeps only its latest anchor (owner's ruling of 2026-10-11). Every anchor stays in this
-//!   fake's history for tests to read ([`FakeChain::anchor_at_finalized`]), as a chain's past
+//!   a key or the batch is empty or too long; `deposit` from an account; **the chain of entries**
+//!   (amendment 0040): each entry folded into the head cell `(position, digest, start)` and emitted
+//!   as the contract's event, exactly as ink! 5 encodes it, in its block, and stored nowhere; a
+//!   failed batch takes its events and its head write with it; the full reset by governance
+//!   ([`FakeChain::reset`]), which starts a new chain at 0 and emits `AnchorHeadSet`; anchors in
+//!   order, a replay of the latest a no-op, an older number refused (`AnchorOutOfOrder`): the
+//!   contract keeps only its latest anchor (owner's ruling of 2026-10-11). Every anchor stays in
+//!   this fake's history for tests to read ([`FakeChain::anchor_at_finalized`]), as a chain's past
 //!   blocks keep it.
+//! - **Who serves events** (amendment 0040): the adapter's own client serves the events of the
+//!   blocks within [`FakeChain::keep_events`] of the finalized head (256 by default, as a full
+//!   node keeps them) and no older; the history endpoint, once [`FakeChain::serve_history`] turns
+//!   it on, serves every block's. Each read is counted ([`FakeChain::reads`]).
 //! - **Gas** (`F-027`, finding 2 of the first zombienet runs): `execute` costs
 //!   [`EXECUTE_BASE`] and, per call, [`WITHDRAWAL_APPLIED`], [`CALL_REFUSED`] or [`ANCHOR`],
 //!   after the suite's measures; a batch whose cost exceeds its `Contracts::call` gas limit fails
@@ -48,9 +56,10 @@
 //!   (`F-027` NOTES, decision 51), or answers what a test says ([`FakeChain::answer_validations`]).
 //!   A test can act at a precise point of a step ([`FakeChain::before_next_runtime_read`],
 //!   [`FakeChain::before_next_validation`]), as an upgrade enacted between two reads would.
-//! - **A reader fault** ([`FakeChain::misread_reference_of`]): an inbox entry the chain holds is
-//!   read back naming no operation of the deployment, as a faulty decoder would read it. The
-//!   stored bytes, and so the coordinate, are unchanged.
+//! - **Reader faults.** [`FakeChain::misread_reference_of`]: an entry the chain holds is read back
+//!   naming no operation of the deployment, as a faulty decoder would read it; its bytes, and so
+//!   its coordinate, are unchanged. [`FakeChain::fault_reads`]: an entry hidden, repeated or
+//!   altered by the reader, for some reads or for all.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -61,14 +70,18 @@ use parity_scale_codec::{Decode, Encode};
 
 use super::kreivo::{self, AssetId, Call, Envelope, Refusal, TxParams, Weight};
 use super::{
-    AccountId32, BatchCall, BatchFailure, BlockRef, Chain, ChainAsset, ChainError, ChainResult,
-    DryRun, InboxEvent, InboxRead, Included, InstanceView, Mortality, RuntimeInfo, RuntimeVersion,
-    SignedExtrinsic, Validity, blake2_256,
+    AccountId32, BatchCall, BatchFailure, BlockEvents, BlockRef, Chain, ChainAsset, ChainEpoch,
+    ChainError, ChainEvent, ChainHead, ChainResult, DryRun, InboxEvent, Included, InstanceView,
+    Mortality, RuntimeInfo, RuntimeVersion, SignedExtrinsic, Validity, ZERO_DIGEST, blake2_256,
+    chain_digest,
 };
 use crate::signer::{Signer, recover};
 
 /// The fee every transaction pays, in the native asset's smallest unit.
 pub const FEE: u128 = 10;
+
+/// The book a reset names unless a test names another ([`FakeChain::reset_for`]).
+pub const FAKE_BOOK: [u8; 32] = [0xB0; 32];
 
 /// The reason Kreivo gives a contract whose transfer it refused (`F-026` decision 19).
 pub const FUNDS_UNAVAILABLE: &str = "Kreivo(Assets(CannotTransfer))";
@@ -111,7 +124,7 @@ impl FakeConfig {
 
     /// This runtime with `format`'s surface and authenticator.
     pub fn with_format(mut self, format: &kreivo::TxFormat) -> FakeConfig {
-        self.transaction_version = format.transaction_version;
+        self.transaction_version = format.transaction_versions[0];
         self.extensions = format.extensions.iter().map(|e| (*e).to_owned()).collect();
         self.types = Some(format.types);
         self.order = format.order;
@@ -128,7 +141,7 @@ impl Default for FakeConfig {
             spec_version: 133,
             pallet: true,
             block_hash_count: 256,
-            transaction_version: f.transaction_version,
+            transaction_version: f.transaction_versions[0],
             challenge_window: 300,
             extensions: f.extensions.iter().map(|e| (*e).to_owned()).collect(),
             types: Some(f.types),
@@ -161,6 +174,18 @@ struct Deployment {
     unbounded: bool,
     /// The assets bound by a `Bind` call (amendment 0011, `F-026` decision 24).
     bound: std::collections::BTreeSet<ChainAsset>,
+    /// The chain digest after the last entry (amendment 0040); its position is `next_seq`.
+    digest: [u8; 32],
+    /// The position the chain started at.
+    start: u64,
+    /// The anchor sequence: how many resets.
+    epoch: u32,
+    /// The block of the last reset.
+    reset_at: u64,
+    /// The last reset's base, book and previous anchor (`anchor_epoch()`).
+    reset_base: u64,
+    reset_book: [u8; 32],
+    reset_previous: Option<(u64, [u8; 32])>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -169,8 +194,12 @@ struct World {
     native: BTreeMap<AccountId32, u128>,
     balances: BTreeMap<(AccountId32, ChainAsset), u128>,
     deployments: BTreeMap<u32, Deployment>,
-    /// The contract's `InboxEntry` bytes, by position.
-    inbox: BTreeMap<(u32, u64), Vec<u8>>,
+    /// How many entries were ever appended (the storage deposit's stand-in: a batch is charged
+    /// per entry, as `v2` charged for each it stored).
+    appended: u64,
+    /// The events emitted in this block so far, in order, with their contract: a failed batch
+    /// rolls them back with the rest of the world.
+    events: Vec<(AccountId32, kreivo::EmittedEvent)>,
     /// Every anchor stored, never pruned: `(commitment, block, seq)`.
     anchors: BTreeMap<(u32, u64), ([u8; 32], u64, u64)>,
 }
@@ -183,7 +212,7 @@ struct Block {
     /// The runtime in its state: the one that validates a transaction at it and executes the
     /// block after it.
     runtime: FakeConfig,
-    extrinsics: Vec<(SignedExtrinsic, kreivo::DecodedTx, Included)>,
+    extrinsics: Vec<(SignedExtrinsic, kreivo::AnyTx, Included)>,
 }
 
 /// An operation a test queues for the next block.
@@ -196,9 +225,15 @@ enum Queued {
         asset: ChainAsset,
         amount: u128,
     },
-    Prune {
+    Reset {
         instance: u32,
-        up_to: u64,
+        base: u64,
+        book: [u8; 32],
+    },
+    Anchor {
+        instance: u32,
+        number: u64,
+        commitment: [u8; 32],
     },
     Keys {
         instance: u32,
@@ -211,7 +246,7 @@ struct State {
     metadata: BTreeMap<ChainAsset, LayerAssetFacts>,
     blocks: Vec<Block>,
     finalized: u64,
-    pool: Vec<(SignedExtrinsic, kreivo::DecodedTx)>,
+    pool: Vec<(SignedExtrinsic, kreivo::AnyTx)>,
     queued: Vec<Queued>,
     halted: bool,
     drop_submissions: bool,
@@ -226,6 +261,17 @@ struct State {
     poisoned: BTreeSet<[u8; 32]>,
     /// How many batches were dry-run.
     dry_runs: usize,
+    /// Reads of the chain's head, and of a block's events from the adapter's client and from the
+    /// history endpoint.
+    reads: Reads,
+    /// How many blocks below the finalized head the adapter's client still serves events for.
+    keep_events: u64,
+    /// Whether the history endpoint serves.
+    history: bool,
+    /// Whether reads leave out `AnchorHeadSet` (a reader that misses it).
+    hide_resets: bool,
+    /// The reader's faults ([`FakeChain::fault_reads`]).
+    faults: Vec<(u64, ReaderFault, u32)>,
     /// Whether dry runs are answered with `Unavailable`.
     no_dry_runs: bool,
     /// The runtime's normal-extrinsic maximum, as it would read now.
@@ -242,6 +288,30 @@ struct State {
     before_runtime: Option<Hook>,
     /// What a test does before the next [`Chain::validate`] answers.
     before_validation: Option<Hook>,
+}
+
+/// How many reads the adapter made of the chain ([`FakeChain::reads`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Reads {
+    /// `chain_head()` reads.
+    pub heads: u64,
+    /// `anchor_epoch()` reads.
+    pub epochs: u64,
+    /// Blocks whose events were read from the adapter's own client.
+    pub blocks: u64,
+    /// Blocks whose events were read from the history endpoint.
+    pub history: u64,
+}
+
+/// How a faulty reader misreads an entry ([`FakeChain::fault_reads`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReaderFault {
+    /// The entry is not read at all.
+    Hide,
+    /// The entry is read twice: an entry added.
+    Extra,
+    /// The entry is read with another block number: its bytes, and so its digest, differ.
+    Alter,
 }
 
 /// What a test does at a point of a step ([`FakeChain::before_next_runtime_read`]).
@@ -314,6 +384,8 @@ pub const ANCHOR: Weight = Weight {
 };
 
 impl World {
+    /// The contract's `append` (amendment 0040): the entry folds into the head cell and is
+    /// emitted as its event; nothing is stored per entry.
     fn append(&mut self, instance: u32, at: u64, event: kreivo::InboxEvent) -> Option<u64> {
         let d = self.deployments.get_mut(&instance)?;
         let seq = d.next_seq;
@@ -322,7 +394,10 @@ impl World {
             at: u32::try_from(at).unwrap_or(u32::MAX),
             event,
         };
-        self.inbox.insert((instance, seq), entry.encode());
+        d.digest = chain_digest(&d.digest, seq, &blake2_256(&entry.encode()));
+        self.appended += 1;
+        self.events
+            .push((position_account(instance), kreivo::entry_event(seq, &event)));
         Some(seq)
     }
 
@@ -572,16 +647,6 @@ impl World {
         at: u64,
         operation_ref: [u8; 32],
     ) {
-        // The contract removes the entry of the anchor this one supersedes when a prune has
-        // already passed it (`F-026` decision 25).
-        if let Some(d) = self.deployments.get(&instance) {
-            let pruned_to = d.pruned_to;
-            if let Some((_, _, old)) = self.anchors.get(&(instance, d.last_anchor)) {
-                if *old < pruned_to {
-                    self.inbox.remove(&(instance, *old));
-                }
-            }
-        }
         let Some(seq) = self.append(
             instance,
             at,
@@ -627,6 +692,11 @@ impl FakeChain {
                 misread: BTreeSet::new(),
                 poisoned: BTreeSet::new(),
                 dry_runs: 0,
+                reads: Reads::default(),
+                keep_events: 256,
+                history: false,
+                hide_resets: false,
+                faults: Vec::new(),
                 no_dry_runs: false,
                 extrinsic_limit: kreivo::NORMAL_EXTRINSIC_MAX_0_16_9,
                 gas: BTreeMap::new(),
@@ -686,10 +756,14 @@ impl FakeChain {
     }
 
     /// Store an anchor directly, as another key of the deployment would (`F-017`: a commitment the
-    /// deployment did not submit). Applied to the best block.
+    /// deployment did not submit). Queued for the next block, ahead of its transactions: a past
+    /// block's state, and so its events, never changes.
     pub fn inject_anchor(&self, instance: u32, number: u64, commitment: [u8; 32]) {
-        let at = self.best_number();
-        self.with_best(|w| w.store_anchor(instance, number, commitment, at, [0xAA; 32]));
+        lock(&self.state).queued.push(Queued::Anchor {
+            instance,
+            number,
+            commitment,
+        });
     }
 
     /// The anchor `number` of `instance` at the finalized block, if stored: `(commitment, the
@@ -875,11 +949,90 @@ impl FakeChain {
         });
     }
 
-    /// Queue a `prune_inbox(instance, up_to)` for the next block.
-    pub fn prune(&self, instance: u32, up_to: u64) {
-        lock(&self.state)
-            .queued
-            .push(Queued::Prune { instance, up_to });
+    /// Queue governance's full reset of `instance` (`set_anchor_head`, amendment 0040) for the
+    /// next block: a new anchor sequence after `base`, a new chain at position 0 with the zero
+    /// digest, `AnchorHeadSet` emitted. What is queued after it lands after it in the block.
+    pub fn reset(&self, instance: u32, base: u64) {
+        self.reset_for(instance, base, FAKE_BOOK);
+    }
+
+    /// [`FakeChain::reset`], naming `book` (amendment 0041: the core follows a reset for its own
+    /// book only).
+    pub fn reset_for(&self, instance: u32, base: u64, book: [u8; 32]) {
+        lock(&self.state).queued.push(Queued::Reset {
+            instance,
+            base,
+            book,
+        });
+    }
+
+    /// An instance of the contract's earlier code, upgraded to this code and not reset (amendment
+    /// 0040): its head stands at `next_seq`, and its chain starts there, from the zero digest. The
+    /// earlier code's entries below it are not modelled. Genesis state, in the best block.
+    pub fn upgraded_at(&self, instance: u32, next_seq: u64) {
+        self.with_best(|w| {
+            if let Some(d) = w.deployments.get_mut(&instance) {
+                d.next_seq = next_seq;
+                d.start = next_seq;
+                d.digest = ZERO_DIGEST;
+            }
+        });
+    }
+
+    /// How many blocks below the finalized head the adapter's own client serves events for (by
+    /// default 256, as a full node keeps them).
+    pub fn keep_events(&self, blocks: u64) {
+        lock(&self.state).keep_events = blocks;
+    }
+
+    /// Leave `AnchorHeadSet` out of every events read from now on: a reader that misses it, while
+    /// storage shows the reset (the anchor sequence moved).
+    pub fn hide_resets(&self, hidden: bool) {
+        lock(&self.state).hide_resets = hidden;
+    }
+
+    /// Turn the history endpoint on or off: a node that serves every block's events.
+    pub fn serve_history(&self, on: bool) {
+        lock(&self.state).history = on;
+    }
+
+    /// The entries of `instance`'s current chain at the finalized block, rebuilt from every
+    /// block's events as a reader would, for tests to inspect: counted as no read, and through no
+    /// fault.
+    pub fn finalized_entries(&self, instance: u32) -> Vec<(u64, super::InboxEntry)> {
+        let s = lock(&self.state);
+        let contract = position_account(instance);
+        let mut out = Vec::new();
+        for b in s
+            .blocks
+            .iter()
+            .take(usize::try_from(s.finalized).unwrap_or(0) + 1)
+        {
+            for (by, e) in &b.world.events {
+                if *by != contract {
+                    continue;
+                }
+                match kreivo::contract_event(&e.topics, &e.data, b.number, |a| {
+                    instance_of(&b.world.deployments, a)
+                }) {
+                    Ok(Some(ChainEvent::Entry { seq, entry })) => out.push((seq, entry)),
+                    Ok(Some(ChainEvent::Reset)) => out.clear(),
+                    _ => {}
+                }
+            }
+        }
+        out
+    }
+
+    /// The reads made so far.
+    pub fn reads(&self) -> Reads {
+        lock(&self.state).reads
+    }
+
+    /// Misread the entry at position `seq` as `fault` in the next `reads` reads of its block (by
+    /// either source); `u32::MAX` for every read.
+    pub fn fault_reads(&self, seq: u64, fault: ReaderFault, reads: u32) {
+        lock(&self.state).faults.push((seq, fault, reads));
     }
 
     /// Halt or resume block production.
@@ -949,11 +1102,36 @@ impl FakeChain {
         s: &State,
         runtime: &FakeConfig,
         number: u64,
-        tx: &kreivo::DecodedTx,
+        tx: &kreivo::AnyTx,
     ) -> Option<AccountId32> {
-        let (period, phase) = kreivo::era_of(tx.era);
+        let (period, phase) = kreivo::era_of(tx.era());
         let birth = (number.max(phase) - phase) / period * period + phase;
         let birth_hash = s.blocks.get(usize::try_from(birth).ok()?)?.hash;
+        let tx = match tx {
+            kreivo::AnyTx::Pass(tx) => tx,
+            // F-045: a native account's signature over the signed payload, as
+            // `UncheckedExtrinsic::check` verifies it; the call runs as that account.
+            kreivo::AnyTx::Native(tx) => {
+                let p = TxParams {
+                    genesis: runtime.genesis,
+                    spec_version: runtime.spec_version,
+                    transaction_version: runtime.transaction_version,
+                    era: Mortality {
+                        birth,
+                        period,
+                        checkpoint: birth,
+                    },
+                    birth_hash,
+                    nonce: tx.nonce,
+                    tip: tx.tip,
+                };
+                let payload = kreivo::signed_payload(&tx.call, &p);
+                return tx
+                    .signature
+                    .verify(&payload, &tx.account)
+                    .then_some(tx.account);
+            }
+        };
         let c = &tx.credential;
         let context = u64::from(c.context);
         if context.saturating_add(runtime.challenge_window) < number {
@@ -997,6 +1175,7 @@ impl FakeChain {
         let parent = s.blocks.last().cloned()?;
         let number = parent.number + 1;
         let mut world = parent.world.clone();
+        world.events.clear();
         let mut extrinsics = Vec::new();
         for q in std::mem::take(&mut s.queued) {
             match q {
@@ -1029,26 +1208,55 @@ impl FakeChain {
                         );
                     }
                 }
-                Queued::Prune { instance, up_to } => {
-                    // Only the latest anchor's entry is kept.
-                    let anchors: BTreeSet<u64> = world
-                        .deployments
-                        .get(&instance)
-                        .and_then(|d| world.anchors.get(&(instance, d.last_anchor)))
-                        .map(|(_, _, seq)| *seq)
-                        .into_iter()
-                        .collect();
+                Queued::Reset {
+                    instance,
+                    base,
+                    book,
+                } => {
+                    let previous = world.deployments.get(&instance).and_then(|d| {
+                        world.anchors.get(&(instance, d.last_anchor)).map(
+                            |(commitment, at, seq)| kreivo::LatestAnchor {
+                                number: d.last_anchor,
+                                commitment: *commitment,
+                                at: u32::try_from(*at).unwrap_or(u32::MAX),
+                                seq: *seq,
+                            },
+                        )
+                    });
                     if let Some(d) = world.deployments.get_mut(&instance) {
-                        let up_to = up_to.min(d.next_seq);
-                        let from = d.pruned_to;
-                        d.pruned_to = d.pruned_to.max(up_to);
-                        for seq in from..up_to {
-                            if !anchors.contains(&seq) {
-                                world.inbox.remove(&(instance, seq));
-                            }
-                        }
+                        d.epoch += 1;
+                        d.reset_at = number;
+                        d.reset_base = base;
+                        d.reset_book = book;
+                        d.reset_previous = previous.map(|p| (p.number, p.commitment));
+                        d.last_anchor = base;
+                        d.next_seq = 0;
+                        d.pruned_to = 0;
+                        d.digest = ZERO_DIGEST;
+                        d.start = 0;
+                        let mut epoch = [0u8; 32];
+                        epoch[..4].copy_from_slice(&d.epoch.to_le_bytes());
+                        let event = kreivo::AnchorHeadSetEvent {
+                            epoch: d.epoch,
+                            base,
+                            from_seq: 0,
+                            book,
+                            previous,
+                        };
+                        world.events.push((
+                            position_account(instance),
+                            kreivo::EmittedEvent {
+                                topics: vec![kreivo::topic::ANCHOR_HEAD_SET, epoch],
+                                data: event.encode(),
+                            },
+                        ));
                     }
                 }
+                Queued::Anchor {
+                    instance,
+                    number: n,
+                    commitment,
+                } => world.store_anchor(instance, n, commitment, number, [0xAA; 32]),
                 Queued::Keys { instance, keys } => {
                     if let Some(d) = world.deployments.get_mut(&instance) {
                         d.keys = keys;
@@ -1059,8 +1267,7 @@ impl FakeChain {
         // The pool, in (account, nonce) order; loop so a run of nonces lands in one block.
         let mut pool = std::mem::take(&mut s.pool);
         pool.sort_by(|a, b| {
-            (kreivo::pass_account(&a.1.credential.user_id), a.1.nonce)
-                .cmp(&(kreivo::pass_account(&b.1.credential.user_id), b.1.nonce))
+            (a.1.claimed_account(), a.1.nonce()).cmp(&(b.1.claimed_account(), b.1.nonce()))
         });
         let mut kept = Vec::new();
         for (ext, tx) in pool {
@@ -1068,7 +1275,7 @@ impl FakeChain {
                 continue;
             };
             let expected = world.nonces.get(&who).copied().unwrap_or(0);
-            let nonce = u64::from(tx.nonce);
+            let nonce = u64::from(tx.nonce());
             if nonce < expected {
                 continue;
             }
@@ -1083,7 +1290,7 @@ impl FakeChain {
             }
             world.native.insert(who, native - FEE);
             world.nonces.insert(who, expected + 1);
-            let included = match kreivo::decode_contracts_call(&tx.call) {
+            let included = match kreivo::decode_contracts_call(tx.call()) {
                 None => Included {
                     block: number,
                     success: false,
@@ -1102,8 +1309,9 @@ impl FakeChain {
                                     let (mut included, cost) =
                                         world.execute(instance, number, who, &calls, &s.poisoned);
                                     let deposit = ENTRY_DEPOSIT
-                                        * (world.inbox.len() as u128)
-                                            .saturating_sub(before.inbox.len() as u128);
+                                        * u128::from(
+                                            world.appended.saturating_sub(before.appended),
+                                        );
                                     let fail = |e: &str| Included {
                                         block: number,
                                         success: false,
@@ -1288,6 +1496,97 @@ impl FakeChain {
     }
 }
 
+impl FakeChain {
+    /// The events of `block` about `instance`'s chain, decoded as the adapter decodes Kreivo's
+    /// (`kreivo::contract_event`), through the reader's faults.
+    fn read_events(&self, block: &BlockRef, instance: u32) -> ChainResult<BlockEvents> {
+        let mut s = lock(&self.state);
+        let b = s
+            .blocks
+            .get(usize::try_from(block.number).unwrap_or(usize::MAX))
+            .filter(|b| b.hash == block.hash)
+            .ok_or_else(|| ChainError::Unavailable(format!("unknown block {}", block.number)))?;
+        let parent = match block.number {
+            0 => [0; 32],
+            n => s.blocks[usize::try_from(n - 1).unwrap_or(0)].hash,
+        };
+        let w = b.world.clone();
+        let contract = position_account(instance);
+        let mut events = Vec::new();
+        for (by, e) in &w.events {
+            if *by != contract {
+                continue;
+            }
+            if let Some(ev) = kreivo::contract_event(&e.topics, &e.data, block.number, |a| {
+                instance_of(&w.deployments, a)
+            })
+            .map_err(ChainError::Invalid)?
+            {
+                events.push(ev);
+            }
+        }
+        let lost = [0xFF; 32];
+        let misread = s.misread.clone();
+        let mut out = Vec::new();
+        for ev in events {
+            let ChainEvent::Entry { seq, mut entry } = ev else {
+                if !(s.hide_resets && matches!(ev, ChainEvent::Reset)) {
+                    out.push(ev);
+                }
+                continue;
+            };
+            match &mut entry.event {
+                InboxEvent::Withdrawn { operation_ref, .. }
+                | InboxEvent::WithdrawRefused { operation_ref, .. }
+                    if misread.contains(operation_ref) =>
+                {
+                    *operation_ref = lost;
+                }
+                _ => {}
+            }
+            let fault = s
+                .faults
+                .iter_mut()
+                .find(|(at, _, left)| *at == seq && *left > 0)
+                .map(|(_, f, left)| {
+                    if *left != u32::MAX {
+                        *left -= 1;
+                    }
+                    *f
+                });
+            match fault {
+                None => out.push(ChainEvent::Entry { seq, entry }),
+                Some(ReaderFault::Hide) => {}
+                Some(ReaderFault::Extra) => {
+                    out.push(ChainEvent::Entry {
+                        seq,
+                        entry: entry.clone(),
+                    });
+                    out.push(ChainEvent::Entry { seq, entry });
+                }
+                Some(ReaderFault::Alter) => {
+                    let mut raw = kreivo::InboxEntry::decode(&mut &entry.raw[..])
+                        .map_err(|e| ChainError::Invalid(e.to_string()))?;
+                    raw.at += 1;
+                    let mut altered =
+                        kreivo::inbox_entry(raw.encode(), |a| instance_of(&w.deployments, a))
+                            .map_err(ChainError::Invalid)?;
+                    altered.event = entry.event;
+                    out.push(ChainEvent::Entry {
+                        seq,
+                        entry: altered,
+                    });
+                }
+            }
+        }
+        Ok(BlockEvents {
+            block: *block,
+            parent,
+            events: out,
+        })
+    }
+}
+
 impl Chain for FakeChain {
     /// The runtime in the best block's state, and that block.
     async fn runtime(&self) -> ChainResult<RuntimeInfo> {
@@ -1363,44 +1662,84 @@ impl Chain for FakeChain {
             }))
     }
 
-    async fn inbox(
-        &self,
-        at: &BlockRef,
-        instance: u32,
-        from: u64,
-        count: u32,
-    ) -> ChainResult<Vec<(u64, InboxRead)>> {
+    async fn chain_head(&self, at: &BlockRef, instance: u32) -> ChainResult<Option<ChainHead>> {
         let w = self.world_at(at)?;
-        let misread = lock(&self.state).misread.clone();
-        let Some(d) = w.deployments.get(&instance) else {
-            return Ok(Vec::new());
-        };
-        let to = from.saturating_add(u64::from(count)).min(d.next_seq);
-        let lost = [0xFF; 32];
-        let mut out = Vec::new();
-        for seq in from..to {
-            let read = match w.inbox.get(&(instance, seq)) {
-                Some(raw) => {
-                    let mut e =
-                        kreivo::inbox_entry(raw.clone(), |a| instance_of(&w.deployments, a))
-                            .map_err(ChainError::Invalid)?;
-                    match &mut e.event {
-                        InboxEvent::Withdrawn { operation_ref, .. }
-                        | InboxEvent::WithdrawRefused { operation_ref, .. }
-                            if misread.contains(operation_ref) =>
-                        {
-                            *operation_ref = lost;
-                        }
-                        _ => {}
-                    }
-                    InboxRead::Entry(e)
-                }
-                None if seq < d.pruned_to => InboxRead::Pruned,
-                None => InboxRead::Absent,
-            };
-            out.push((seq, read));
+        let mut s = lock(&self.state);
+        s.reads.heads += 1;
+        if !s.config.pallet {
+            return Ok(None);
         }
-        Ok(out)
+        // As the contract answers `chain_head()`, decoded in the adapter's one place.
+        Ok(w.deployments.get(&instance).map(|d| {
+            kreivo::chain_head(&kreivo::ChainHeadCell {
+                position: d.next_seq,
+                digest: d.digest,
+                start: d.start,
+            })
+        }))
+    }
+
+    async fn chain_epoch(&self, at: &BlockRef, instance: u32) -> ChainResult<Option<ChainEpoch>> {
+        let w = self.world_at(at)?;
+        lock(&self.state).reads.epochs += 1;
+        Ok(w.deployments
+            .get(&instance)
+            .filter(|d| d.epoch > 0)
+            .map(|d| ChainEpoch {
+                epoch: d.epoch,
+                from_seq: 0,
+                at: d.reset_at,
+                base: d.reset_base,
+                book: d.reset_book,
+                previous: d.reset_previous,
+            }))
+    }
+
+    /// Decoded with the best block's deployments, through the reader's misread references.
+    fn entry(&self, raw: Vec<u8>) -> ChainResult<super::InboxEntry> {
+        let s = lock(&self.state);
+        let w = &s.blocks[s.blocks.len() - 1].world;
+        let mut e = kreivo::inbox_entry(raw, |a| instance_of(&w.deployments, a))
+            .map_err(ChainError::Invalid)?;
+        match &mut e.event {
+            InboxEvent::Withdrawn { operation_ref, .. }
+            | InboxEvent::WithdrawRefused { operation_ref, .. }
+                if s.misread.contains(operation_ref) =>
+            {
+                *operation_ref = [0xFF; 32];
+            }
+            _ => {}
+        }
+        Ok(e)
+    }
+
+    async fn block_events(&self, block: &BlockRef, instance: u32) -> ChainResult<BlockEvents> {
+        {
+            let mut s = lock(&self.state);
+            s.reads.blocks += 1;
+            if block.number.saturating_add(s.keep_events) < s.finalized {
+                return Err(ChainError::Unavailable(format!(
+                    "State already discarded for #{}: the node keeps {} blocks of events",
+                    block.number, s.keep_events
+                )));
+            }
+        }
+        self.read_events(block, instance)
+    }
+
+    async fn history_events(
+        &self,
+        block: &BlockRef,
+        instance: u32,
+    ) -> ChainResult<Option<BlockEvents>> {
+        {
+            let mut s = lock(&self.state);
+            if !s.history {
+                return Ok(None);
+            }
+            s.reads.history += 1;
+        }
+        self.read_events(block, instance).map(Some)
     }
 
     async fn asset_metadata(
@@ -1494,10 +1833,10 @@ impl Chain for FakeChain {
             s.poisoned.clone()
         };
         // As the next block would run it, with no gas limit.
-        let entries = world.inbox.len();
+        let entries = world.appended;
         let (included, cost) =
             world.execute(instance, at.number + 1, *origin, &envelopes, &poisoned);
-        let storage_deposit = ENTRY_DEPOSIT * (world.inbox.len().saturating_sub(entries) as u128);
+        let storage_deposit = ENTRY_DEPOSIT * u128::from(world.appended.saturating_sub(entries));
         let failure = (!included.success).then(|| {
             let e = included.error.unwrap_or_default();
             if e == TRAPPED {
@@ -1592,7 +1931,7 @@ impl Chain for FakeChain {
         if let Some(v) = &s.validity {
             return Ok(v.clone());
         }
-        let Ok(tx) = kreivo::decode_extrinsic(&extrinsic.bytes) else {
+        let Ok(tx) = kreivo::AnyTx::decode(&extrinsic.bytes) else {
             return Ok(Validity::Refused(
                 "the runtime cannot decode it: Bad input data".into(),
             ));
@@ -1601,7 +1940,7 @@ impl Chain for FakeChain {
             return Ok(Validity::Refused("Invalid(BadProof)".into()));
         };
         let expected = world.nonces.get(&who).copied().unwrap_or(0);
-        Ok(match u64::from(tx.nonce).cmp(&expected) {
+        Ok(match u64::from(tx.nonce()).cmp(&expected) {
             std::cmp::Ordering::Less => Validity::NotNow("Invalid(Stale)".into()),
             std::cmp::Ordering::Greater => Validity::NotNow("Invalid(Future)".into()),
             std::cmp::Ordering::Equal if world.native.get(&who).copied().unwrap_or(0) < FEE => {
@@ -1612,8 +1951,8 @@ impl Chain for FakeChain {
     }
 
     async fn submit(&self, extrinsic: &SignedExtrinsic) -> ChainResult<()> {
-        let tx = kreivo::decode_extrinsic(&extrinsic.bytes).map_err(ChainError::Invalid)?;
-        let calls: Vec<Envelope> = kreivo::decode_contracts_call(&tx.call)
+        let tx = kreivo::AnyTx::decode(&extrinsic.bytes).map_err(ChainError::Invalid)?;
+        let calls: Vec<Envelope> = kreivo::decode_contracts_call(tx.call())
             .and_then(|(_, _, _, data)| {
                 let mut args = data.strip_prefix(&kreivo::selector::EXECUTE[..])?;
                 Vec::<Envelope>::decode(&mut args).ok()

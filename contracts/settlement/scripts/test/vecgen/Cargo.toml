@@ -1,0 +1,16 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Prints the vectors of ../chain-vectors.json (the entries on stdout, the entry after a reset on
+# stderr) from the contract's own event structs and `entry_digest`/`chain_digest` (T-043-03):
+#   cargo run --manifest-path contracts/settlement/scripts/test/vecgen/Cargo.toml > out.json 2> reset.txt
+# A workspace of its own, built by nobody but whoever regenerates the vectors.
+[workspace]
+[package]
+name = "aledgent-chain-vectors"
+version = "0.0.0"
+publish = false
+license = "Apache-2.0 OR MIT"
+edition = "2021"
+[dependencies]
+aledgent-settlement-contract = { path = "../../..", features = ["ink-as-dependency"] }
+scale = { package = "parity-scale-codec", version = "3.6.12", features = ["derive"] }

@@ -507,6 +507,7 @@ fn inv_12_an_observation_coordinate_applies_at_most_once__store(h: &mut dyn Harn
         Write::Settlement(SettlementWrite::Ingest {
             observation: o,
             op: None,
+            by_position: true,
         })
     };
     st.commit(&[ingest(obs(0, 1))]).unwrap();

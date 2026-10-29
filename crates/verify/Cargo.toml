@@ -25,8 +25,18 @@ default = ["std"]
 # (verify::cli), so the suite tests it on every run. aledgent's core takes this crate without it.
 std = []
 # The public read of the settlement layer over a node's JSON-RPC (a thin reader of two storage
-# items at the finalized head).
-rpc = ["std", "dep:ureq", "dep:serde_json", "dep:twox-hash"]
+# items at the finalized head, and, for an anchor superseded in the block that stored it, that
+# block's contract events, decoded with the runtime's own metadata).
+rpc = [
+    "std",
+    "dep:ureq",
+    "dep:serde_json",
+    "dep:twox-hash",
+    "dep:frame-metadata",
+    "dep:parity-scale-codec",
+    "dep:scale-info",
+    "dep:scale-value",
+]
 # The command-line verifier.
 cli = ["rpc"]
 # Serialisable envelope types, for the core's calls to carry a disclosure request (F-005).
@@ -42,8 +52,17 @@ ureq = { version = "3", default-features = false, features = ["rustls"], optiona
 serde_json = { version = "1", optional = true }
 twox-hash = { version = "2", default-features = false, features = ["xxhash64"], optional = true }
 serde = { version = "1", default-features = false, features = ["derive", "alloc"], optional = true }
+# Decoding a block's events with the runtime's metadata (feature `rpc` only; the core's guest build
+# takes none of these): the same crates the settlement adapter's metadata-driven reads use.
+frame-metadata = { version = "23", default-features = false, features = ["current", "decode"], optional = true }
+parity-scale-codec = { version = "3", default-features = false, features = ["std"], optional = true }
+scale-info = { version = "2", default-features = false, features = ["std", "decode"], optional = true }
+scale-value = { version = "0.18", default-features = false, optional = true }
 
 [dev-dependencies]
+# A stand-in runtime for the events read's tests: types with `TypeInfo`, encoded as a block's events.
+parity-scale-codec = { version = "3", features = ["derive", "std"] }
+scale-info = { version = "2", features = ["derive", "std"] }
 # The kernel's own disclosure verifiers, to show the claim's wire form is CipherClerk's.
 cipher-clerk = { workspace = true, features = ["disclosure", "signing"] }
 rand_core = { version = "0.6", features = ["getrandom"] }

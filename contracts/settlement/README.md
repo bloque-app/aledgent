@@ -21,10 +21,23 @@ choices, the storage layout and how the adapter reads it are in
 | `credit(account_ref, asset, amount)` | another deployment, only | Record value it has just moved here |
 | `set_keys(keys, attestation_key)` | the admin | Rotate keys |
 | `set_withdrawal_bound(asset, Option<bound>)` | the admin | Bound withdrawals per asset per window; an asset with no bound cannot leave (`NoWithdrawalBound`) |
-| `prune_inbox(up_to)` | the admin | Remove old movement, refusal and superseded anchor entries; bind entries and the latest anchor's entry stay. **Never past the adapter's cursor**: an unread `Anchored` entry is what makes its checkpoint final |
 | `set_governance(account)` | the admin while none is set; then governance only | Name the deployment's governance (on Kreivo: the licence-owning community's account, reached by a referendum through `Communities.dispatch_as_account`). Amendment 0039 |
-| `set_anchor_head(expected_last, base, book)` | governance only | Start a new anchor sequence for a re-founded book: the next anchor is `base + 1`; refused `HeadMoved` unless the head's `last_anchor` is `expected_last`. Moves no value; touches no position, bound, binding, key or inbox entry. Amendment 0039 |
-| `registration`, `head`, `inbox_entry`, `latest_anchor`, `position`, `withdrawal_window`, `bound`, `anchor_epoch`, `governance` | anyone | Reads (`bound(asset)`: the inbox position of the asset's `Bound` entry, if bound; `latest_anchor()`, selector `0x0000_0307`, replaces `anchor_record(number)`; `anchor_epoch()` (`0x0000_0308`): the sequence governance started last, `None` for the instance's first) |
+| `set_anchor_head(expected_last, base, book)` | governance only | Start a new anchor sequence for a re-founded book: the next anchor is `base + 1`; refused `HeadMoved` unless the head's `last_anchor` is `expected_last`. **A full reset** (amendment 0040): removes every entry the earlier code stored (at most 64, `TooManyStoredEntries` otherwise; the storage deposits go to the call's origin, governance), sets the head to `{ base, 0, 0 }` and starts a new chain at `(0, zeros)`. Moves no value; touches no position, bound, binding or key. Amendments 0039 and 0040 |
+| `registration`, `head`, `chain_head`, `latest_anchor`, `position`, `withdrawal_window`, `bound`, `anchor_epoch`, `governance` | anyone | Reads (`chain_head()` (`0x0000_030A`): the chain's next position, digest and start; `bound(asset)`: the position of the asset's `Bound` entry in the chain it was bound in; `latest_anchor()`, selector `0x0000_0307`, replaces `anchor_record(number)`; `anchor_epoch()` (`0x0000_0308`): the sequence governance started last, `None` for the instance's first) |
+
+`prune_inbox` (`0x0000_0202`) and `inbox_entry` (`0x0000_0302`) are gone with the stored entries
+(amendment 0040); their selectors are never reused, so an old caller fails to dispatch.
+
+**The chain of entries** (amendment 0040, `[PENDING AMENDMENT 0040]`). Every movement, anchor,
+binding and refusal is one entry at the next position, and the contract stores none of them. It
+keeps one cell, `chain_head` at `0C000000`: `{ position, digest, start }`, 48 bytes, overwritten by
+each entry. Entry `n` is `e_n = blake2b-256(SCALE(InboxEntry { at, event }))` (the bytes the earlier
+code stored), and `d_n = blake2b-256("aledgent/settlement-entry/v1" ‖ d_(n-1) ‖ n as u64
+big-endian ‖ e_n)`, from the 32 zero bytes. Each entry's event (`Deposited`, now with `from`;
+`Withdrawn`; `Anchored`; `Bound`; `Refused`, now with `call`) carries its position and every field
+of its entry; with its block's number, a reader rebuilds `e_n`, folds from the head it last
+accepted, and compares with `chain_head`. An absent cell reads as a chain with no entry starting at
+the head's `next_seq`: `(0, zeros, 0)` on an instance this code instantiated or reset.
 
 Calls (`Call`): `Withdraw { to: Account(..) | Deployment { contract, account_ref }, asset, amount }`
 (0), `Anchor { number, commitment }` (1) and `Bind { asset, amount }` (2). A bind runs inline,
@@ -32,25 +45,24 @@ like an anchor.
 
 **Anchors: the latest only, in place** (owner's ruling of 2026-10-11; decisions 25 and 26 in
 `NOTES.md`). An anchor `{ number, commitment }` is applied if `number` is the last one plus one: it
-writes its `Anchored` inbox entry and overwrites `latest_anchor` (`{ number, commitment, at, seq
-}`, one 52-byte cell, rewritten at the same size). The latest anchor again with the same commitment
+appends its `Anchored` entry to the chain and overwrites `latest_anchor` (`{ number, commitment, at,
+seq }`, one 52-byte cell, rewritten at the same size). The latest anchor again with the same commitment
 is a replay, applied at its original entry, writing nothing; with another commitment it is
 `AnchorConflict`; any other number, a gap or one below the latest, is `AnchorOutOfOrder`. So an
-anchor adds one storage item, its entry, and `prune_inbox` removes that once a later anchor
-supersedes it. Earlier anchors are in their entries until pruned, in their `Anchored` events, and
-in the chain's finalized history (`latest_anchor` at the blocks where each was the latest), which is
-where `crates/verify` reads them.
+anchor adds no storage item. Earlier anchors are in their `Anchored` events and in the chain's
+finalized history (`latest_anchor` at the blocks where each was the latest), which is where
+`crates/verify` reads them.
 
 *Per anchor, at Kreivo's prices* (`DepositPerItem` 6 666 666 660, `DepositPerByte` 333 333, the
-value's bytes counted): before, two items and 121 bytes, **13 373 666 613 (0.0134 KSM) held for
-good**; now one item and 77 bytes, **6 692 333 301 (0.0067 KSM) until it is pruned**, and once per
-deployment 6 683 999 976 for `latest_anchor`.
+value's bytes counted): before 2026-10-11, two items and 121 bytes, **13 373 666 613 (0.0134 KSM)
+held for good**; under amendment 0040, nothing per anchor or entry, and once per deployment
+6 683 999 976 for `latest_anchor` and 6 682 666 644 for `chain_head`.
 
 **Upgrading a deployment of the earlier code.** That code kept every anchor by number
 (`anchors[n]`, root key `03000000`). The new code keeps every existing cell's key and encoding and
 migrates by itself, since `ContractsStore.upgrade` swaps the code without running any of it: the
 next state-changing message a key or the admin signs (`execute`, `execute_with_limits`, `set_keys`,
-`set_withdrawal_bound`, `prune_inbox`; never `deposit` or `credit`) seeds `latest_anchor` from the
+`set_withdrawal_bound`, `set_governance`; never `deposit` or `credit`) seeds `latest_anchor` from the
 highest record and removes up to 32 records (`MIGRATION_STEP`), with each one's inbox entry if the
 earlier code kept it below the pruning watermark; each later such message removes 32 more; the last
 emits `AnchorsMigrated { through }` and from then on the check writes nothing. The released storage
@@ -67,13 +79,13 @@ one window.
 First the issuer puts exactly the book's outstanding balance of the asset in the contract's account,
 by a plain transfer or a mint on Kreivo: that records no deposit, so no account is credited. Then a
 key submits `Bind { asset, amount }` with that amount. The contract reads its own holding of the
-asset and applies the bind only if the holding equals the position its inbox already records plus
-`amount`, to the unit: it records `amount` into the position, writes a `Bound` entry under the
+asset and applies the bind only if the holding equals the position its entries already record plus
+`amount`, to the unit: it records `amount` into the position, appends a `Bound` entry under the
 call's operation reference, and remembers the entry's position (`bound(asset)`). Otherwise the call
-is refused with `HoldingMismatch { holding }`, the holding it read, and nothing but the inbox
-changes; a second bind of the same asset is refused with `AlreadyBound`. The equality is checked at
-the block that records the binding, so it is final with it (`REQ-SL-3`). A bind of zero is allowed.
-`Bound` entries are never pruned. Withdrawing the asset still needs a withdrawal bound.
+is refused with `HoldingMismatch { holding }`, the holding it read, and nothing but the chain
+changes; a second bind of the same asset is refused with `AlreadyBound`, after a reset too. The
+equality is checked at the block that records the binding, so it is final with it (`REQ-SL-3`). A
+bind of zero is allowed. Withdrawing the asset still needs a withdrawal bound.
 
 **How value moves.** Through Kreivo's own contract API, its chain extension (`KreivoChainExtensions`,
 assets API): `deposit` pulls from the contract's caller, `transfer` pays out, `balance` reads the
@@ -187,6 +199,12 @@ Kreivo 0.17.0 (spec 133), the runtime mainnet runs from 2026-09-30 (0.16.9 stays
 exactly the steps below, in order, from a test community. What it found is in
 `features/F-026-settlement-contract/NOTES.md`, "The first real run".
 
+**Amendment 0040.** The scripts read no stored entries: `drive.mjs read` and every read in `e2e.mjs` fold
+the entries from the contract's events (`scripts/chain.mjs`, the only place that decodes `chain_head`) and
+compare the fold with the head. `e2e.mjs upgrade` takes v2 to this code with entries before and after, a
+failing frame and the full reset; the Chopsticks rehearsal of the upgrade and the reset on forks of the test
+and prod instances is in `scripts/fork/` (`T-043-03`).
+
 `scripts/drive.mjs` takes each step in turn and keeps what it learns (app id, license id, contract
 address) in `scripts/.state.json` (gitignored):
 
@@ -200,7 +218,7 @@ address) in `scripts/.state.json` (gitignored):
 | `bound` | `ADMIN` | `set_withdrawal_bound(ASSET, { amount: BOUND, period: BOUND_PERIOD })` |
 | `deposit` | `DEPOSITOR` | `deposit(ref, ASSET, DEPOSIT)`: the contract pulls it through the chain extension, no approval |
 | `execute` | `KEY` | A batch: withdraw `WITHDRAW` to `PAYEE` (applied), withdraw `u128::MAX` (refused by the bound), the next anchor (applied) |
-| `read` | nobody | Every unpruned inbox entry, by contract query and by raw child-trie storage at the finalized block; fails if they differ |
+| `read` | nobody | The contract's events folded from the chain's start and compared with `chain_head` at the finalized block; fails if they differ |
 | `events` | nobody | The contract's events in the last `BLOCKS` finalized blocks |
 | `all` | | All of the above, in order |
 

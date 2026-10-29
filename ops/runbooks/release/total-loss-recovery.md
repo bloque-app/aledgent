@@ -55,8 +55,10 @@ one node is not this runbook ([replace-node](replace-node.md)).
    holds undecided. Rows decided after the last certified commit come back with **the reply the log
    recorded**; an exact retry answers from the retained result (`INV-18`). A different reply is a
    divergence: **stop** ([divergence](divergence.md)).
-5. **The adapter** starts on its database. It reads Kreivo from its cursor (the layer is the truth for
-   settlement), and its re-scan compares the inbox with what the core ingested.
+5. **The adapter** starts on its database. It resumes from the head it last accepted (the layer is the
+   truth for settlement), reads the events since and folds them to check them against the head Kreivo
+   holds; behind what a full node keeps, it catches up from the history endpoint. A difference raises
+   `AledgentSettlementChainMismatch` ([gap-filling](../gap-filling.md)).
 6. **The audit store** is restored into an empty directory, on media apart from the book
    (`opsctl restore audit`).
    - Restore it from a backup taken **at or before** the core's restore point. The core ships from the
@@ -101,6 +103,19 @@ recovery point").
    out the chainspec and its kept `verify-genesis` report. `--chainspec <file>` overrides the
    archive's copy. Pass `--unnamed-code` and `--genesis-manifest <file>` when the core unit's `serve`
    has them; `opsctl` hands both to the core host.
+
+   Pass `--code-config <file>` too when the core unit's `serve` has it, which is for any book that may have
+   upgraded (`T-037-09`; [restore](../restore.md), "A book that has upgraded"). Without it the core host
+   refuses an archive that needs a code version other than the genesis package. The file names a cache and
+   its sources, and they must hold every version from the archive's latest checkpoint on; if the cache went
+   with the volume, a source must hold them. In the command above, add before the image the mounts
+   `-v /etc/aledgent/code.json:/etc/aledgent/code.json:ro`, `-v <code source dir>:<code source dir>:ro` for
+   each source and `-v <code cache dir>:<code cache dir>` (writable, and outside `--state`), at the same
+   absolute paths the file names; and after `restore core` the flag `--code-config /etc/aledgent/code.json`.
+
+   `--core-host`, `--runtime`, `--actor` and `--code-config` go together: `opsctl` lays the archive out in
+   `--state` before it reads `--runtime` and `--actor`, so a missing one fails with the layout already
+   written, and a retry into that directory is refused. Start again from a new, empty `--state` directory.
 
    It reads every segment and checks each one: its digest, its offsets and the entries' hash chain.
    The segments are read 32 at a time (`--fetch-concurrency <n>`, 1 to 256) and checked strictly in

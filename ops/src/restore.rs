@@ -19,9 +19,13 @@
 //! 4. **The leaf store**, rebuilt from the restored book's committed delta log
 //!    ([`rebuild_leaf_store`], `F-006`): every commit's root checked, the final root the book's,
 //!    and the store's commitment checks of `INV-6` and `INV-5` run on it.
-//! 5. **The adapter**: its PostgreSQL store to the latest point, then a step from its cursor and a
-//!    re-scan of the inbox ([`rescan_adapter`]). The settlement layer is the truth for settlement:
-//!    anything the layer recorded while aledgent was down is read from it.
+//! 5. **The adapter**: its PostgreSQL store to the latest point, then steps that **resume from the
+//!    head of the chain of entries it last accepted** ([`resume_adapter`], amendment 0040): each
+//!    folds the entries the layer recorded since that head, checks them against the head the layer
+//!    holds, and reports them, until it accepts the layer's head. Behind the node's 256 blocks of
+//!    events, it catches up from the history endpoint. The settlement layer is the truth for
+//!    settlement: anything it recorded while aledgent was down is read from it, and the chain's
+//!    head shows it was read in full.
 //!
 //! Undecided rows — logged by ingress and not yet decided when the core failed — are left to the
 //! forwarder, which sends them once ingress runs over the restored core.
@@ -45,7 +49,7 @@ use ledger_kernel::keys::KeyRing;
 use ledger_kernel::store::{LeafStore, composite_root};
 use ledger_kernel::vault::VaultBackend;
 use serde::{Deserialize, Serialize};
-use settle::adapter::{Adapter, Rescanned};
+use settle::adapter::{Adapter, CHAIN_ALERT};
 use settle::chain::Chain;
 use settle::link::Transport;
 
@@ -346,77 +350,98 @@ pub fn rebuild_leaf_store<S: LeafStore + ?Sized>(
     })
 }
 
-/// What the adapter's re-scan found (step 5).
+/// Where the restored adapter stands after resuming (step 5, amendment 0040).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RescanReport {
-    /// The inbox range re-scanned, `[from, to)`.
-    pub range: (u64, u64),
-    /// Positions the layer holds that the adapter's restored store never recorded.
-    pub adapter_missing: Vec<u64>,
-    /// Positions the core never ingested.
-    pub core_missing: Vec<u64>,
-    /// Final records the layer no longer shows.
-    pub core_unknown: Vec<u64>,
-    /// Steps it took for the cursor to reach the finalized inbox.
+pub struct ResumeReport {
+    /// The head the adapter's store had accepted when it was restored: its position, if any.
+    pub resumed_from: Option<u64>,
+    /// The position of the layer's chain head at the finalized block when the adapter stopped.
+    pub head: u64,
+    /// The head the adapter accepted then: its position.
+    pub accepted: Option<u64>,
+    /// Whether the accepted head is the layer's, position and digest: every entry since the head
+    /// it resumed from was read, shown complete, and taken in by the core.
+    pub at_head: bool,
+    /// The adapter's open alerts that stop observation (`chain:`, `unreadable:`, `reset:`).
+    pub stopped: Vec<String>,
+    /// Steps it took.
     pub steps: u64,
 }
 
-impl RescanReport {
-    /// Whether the book, the adapter and the layer agree.
+impl ResumeReport {
+    /// Whether the book, the adapter and the layer agree: the layer's head accepted, nothing
+    /// stopping observation.
     pub fn is_clean(&self) -> bool {
-        self.adapter_missing.is_empty()
-            && self.core_missing.is_empty()
-            && self.core_unknown.is_empty()
+        self.at_head && self.stopped.is_empty()
     }
 }
 
-/// Step 5: run the restored adapter from its cursor until it has read the finalized inbox (at
-/// most `max_steps` steps), then re-scan the whole inbox against the adapter's store and the
-/// book. The adapter itself reports every difference as an incident (`REQ-IN-5`).
-pub async fn rescan_adapter<C: Chain, S: settle::store::Store, T: Transport>(
+/// Step 5: run the restored adapter, which resumes from the head it last accepted, until it
+/// accepts the layer's head at the finalized block (at most `max_steps` steps), or an alert stops
+/// it at the first position it cannot show complete. Nothing is re-read on a timer: each step
+/// folds only the entries since the accepted head (`REQ-IN-5`).
+pub async fn resume_adapter<C: Chain, S: settle::store::Store, T: Transport>(
     adapter: &mut Adapter<C, S, T>,
     max_steps: u64,
-) -> Result<RescanReport, Error> {
+) -> Result<ResumeReport, Error> {
     let instance = adapter.config().instance;
     let failed = |e: settle::adapter::AdapterError| Error::Restore(format!("the adapter: {e}"));
+    let layer = |e: settle::chain::ChainError| Error::Restore(format!("the layer: {e:?}"));
+    let store =
+        |e: settle::store::StoreError| Error::Restore(format!("the adapter's store: {e:?}"));
+    let resumed_from = adapter
+        .store()
+        .accepted_head(instance)
+        .await
+        .map_err(store)?
+        .map(|a| a.position);
     let mut steps = 0;
-    let to = loop {
+    loop {
         adapter.step().await.map_err(failed)?;
         steps += 1;
-        let fin = adapter
+        let fin = adapter.chain().finalized().await.map_err(layer)?;
+        let head = adapter
             .chain()
-            .finalized()
+            .chain_head(&fin, instance)
             .await
-            .map_err(|e| Error::Restore(format!("the layer: {e:?}")))?;
-        let len = adapter
-            .chain()
-            .instance(&fin, instance)
-            .await
-            .map_err(|e| Error::Restore(format!("the layer: {e:?}")))?
-            .map_or(0, |i| i.next_seq);
-        let cursor = adapter
+            .map_err(layer)?
+            .ok_or_else(|| Error::Restore("the instance is not registered".into()))?;
+        let accepted = adapter
             .store()
-            .cursor(instance)
+            .accepted_head(instance)
             .await
-            .map_err(|e| Error::Restore(format!("the adapter's store: {e:?}")))?;
-        if cursor >= len {
-            break len;
+            .map_err(store)?;
+        let at_head =
+            accepted.is_some_and(|a| a.position == head.position && a.digest == head.digest);
+        let stopped: Vec<String> = adapter
+            .store()
+            .alerts()
+            .await
+            .map_err(store)?
+            .into_iter()
+            .filter(|a| a.cleared_at.is_none())
+            .map(|a| a.key)
+            .filter(|k| {
+                k.starts_with(&format!("{CHAIN_ALERT}:"))
+                    || k.starts_with("unreadable:")
+                    || k.starts_with("reset:")
+            })
+            .collect();
+        if at_head || !stopped.is_empty() {
+            return Ok(ResumeReport {
+                resumed_from,
+                head: head.position,
+                accepted: accepted.map(|a| a.position),
+                at_head,
+                stopped,
+                steps,
+            });
         }
         if steps >= max_steps {
             return Err(Error::Restore(format!(
-                "the adapter's cursor is at {cursor} of {len} after {steps} steps"
+                "the adapter has not accepted the layer's head at {} after {steps} steps",
+                head.position
             )));
         }
-    };
-    let Rescanned {
-        core,
-        adapter_missing,
-    } = adapter.rescan(0, to).await.map_err(failed)?;
-    Ok(RescanReport {
-        range: (0, to),
-        adapter_missing,
-        core_missing: core.missing.iter().map(|m| m.seq).collect(),
-        core_unknown: core.unknown.iter().map(|u| u.seq).collect(),
-        steps,
-    })
+    }
 }

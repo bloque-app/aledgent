@@ -62,6 +62,19 @@ echo "contract code: $size bytes"
 echo "METER phase=build_contract s=$(( $(date +%s) - start ))"
 echo "::endgroup::"
 
+# The code an upgrade starts from (the `upgrade` phase, T-043-03), when the workflow extracted it
+# to /w/v2src (its `upgrade_from` input): the same toolchain, its own target.
+if [ -d /w/v2src/contracts/settlement ]; then
+  echo "::group::settlement contract to upgrade from"
+  start=$(date +%s)
+  cd /w/v2src/contracts/settlement
+  PATH="/w/tools/bin:$PATH" CARGO_TARGET_DIR=/w/target/contract-v2 cargo contract build --release
+  mkdir -p /w/dist/v2
+  cp /w/target/contract-v2/ink/aledgent_settlement_contract.contract /w/dist/v2/
+  echo "METER phase=build_contract_v2 s=$(( $(date +%s) - start ))"
+  echo "::endgroup::"
+fi
+
 # The aledgent driver (e2e/aledgent-driver) and the adapter's binary (`aledgent-settle`, with
 # `fault-injection`, which only this build enables), only when step 3 runs through aledgent: they
 # link the root workspace (ingress, the core, services/settle with its light client). Their target

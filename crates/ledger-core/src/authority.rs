@@ -529,11 +529,9 @@ impl Effective {
         now: Time,
         used: impl Fn(&WindowKey) -> Minor,
     ) -> Result<Vec<Charge>, Refusal> {
-        if let Some(assets) = &self.assets {
-            if let Some(a) = op.asset {
-                if !assets.contains(&a) {
-                    return Err(Refusal::BoundExceeded);
-                }
+        if let Some(a) = op.asset {
+            if !self.admits_asset(&a) {
+                return Err(Refusal::BoundExceeded);
             }
         }
         if let Some(parties) = &self.counterparties {
@@ -575,6 +573,11 @@ impl Effective {
             }
         }
         Ok(charges)
+    }
+
+    /// Whether every link of the chain allows `asset`: no asset bound, or one that names it.
+    pub fn admits_asset(&self, asset: &AssetId) -> bool {
+        self.assets.as_ref().is_none_or(|a| a.contains(asset))
     }
 
     /// A key that orders candidates from the narrowest: fewest operation kinds, then smallest

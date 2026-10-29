@@ -266,7 +266,7 @@ async fn ac_e4_4_a_runtime_with_an_unknown_transaction_version_stops_service() {
     let options = KitOptions {
         fake: FakeConfig {
             spec_version: 135,
-            transaction_version: 14,
+            transaction_version: 15,
             ..FakeConfig::default()
         },
         ..KitOptions::default()
@@ -277,7 +277,7 @@ async fn ac_e4_4_a_runtime_with_an_unknown_transaction_version_stops_service() {
         why,
         vec![Refusing::UnknownSurface {
             spec_version: 135,
-            transaction_version: 14,
+            transaction_version: 15,
             extensions: f.extensions.iter().map(|e| (*e).to_owned()).collect(),
             types: hex::encode(f.types),
         }]
@@ -640,7 +640,7 @@ async fn ac_e4_4_an_upgrade_to_an_unknown_surface_stops_submission_and_signing()
     let op = v["operation_reference"].as_str().unwrap().to_owned();
     k.chain.upgrade(|c| {
         c.spec_version = 200;
-        c.transaction_version = 14;
+        c.transaction_version = 15;
     });
     let r = k.step().await.unwrap();
     assert!(!r.serving);
@@ -879,28 +879,6 @@ async fn req_sa_7_the_cursor_never_passes_a_position_it_did_not_report() {
     // Every report has its verdict, and one coordinate was applied once.
     let reports = k.store.reports().await.unwrap();
     assert!(reports.iter().all(|r| r.verdict.is_some()), "{reports:?}");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ac_d2_2_a_range_pruned_before_it_was_read_becomes_a_visible_gap() {
-    let mut k = serving_kit(KitOptions::default()).await;
-    let from = [0x77; 32];
-    k.chain.mint(from, &chain_usd(), 1_000);
-    for _ in 0..5 {
-        k.chain.deposit(from, INSTANCE, [0x42; 32], &chain_usd(), 1);
-        k.chain.produce();
-    }
-    k.chain.prune(INSTANCE, 3);
-    k.chain.advance(1);
-    let r = k.step().await.unwrap();
-    assert_eq!(r.gaps, 1);
-    let gaps = k.store.gaps().await.unwrap();
-    assert_eq!((gaps[0].from, gaps[0].to), (0, 3));
-    assert!(!open_alerts(&k, "gap:").await.is_empty());
-    // Visible to the core too, and never taken as ingested.
-    let core = k.core_settlement(|s| s.gaps().to_vec()).unwrap();
-    assert_eq!((core[0].from, core[0].to), (0, 3));
-    assert_eq!(k.store.cursor(INSTANCE).await.unwrap(), 5);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1291,32 +1269,8 @@ async fn ac_e3_3_an_operation_already_executing_is_never_parked() {
     assert!(open_alerts(&k, "position:").await.is_empty());
 }
 
-// ------------------------------------------------------------------------------ T-016-09
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ac_d2_1_a_coordinate_the_core_lacks_is_an_incident_on_the_next_rescan() {
-    let mut k = serving_kit(KitOptions::default()).await;
-    let from = [0x77; 32];
-    k.chain.mint(from, &chain_usd(), 1_000);
-    for _ in 0..3 {
-        k.chain.deposit(from, INSTANCE, [0x42; 32], &chain_usd(), 1);
-        k.chain.produce();
-    }
-    k.chain.finalize_all();
-    // The core's copy loses position 1.
-    k.adapter.drop_report_of(1);
-    k.step().await.unwrap();
-    assert_eq!(k.store.cursor(INSTANCE).await.unwrap(), 3);
-    let found = k.adapter.rescan(0, 3).await.unwrap();
-    assert_eq!(
-        found.core.missing.iter().map(|m| m.seq).collect::<Vec<_>>(),
-        vec![1]
-    );
-    assert!(found.adapter_missing.is_empty());
-    assert_eq!(open_alerts(&k, "incident:missing:").await.len(), 1);
-    let incidents = k.core_settlement(|s| s.incidents().len()).unwrap();
-    assert!(incidents >= 1);
-}
+// The re-scan's case (`T-016-09`, `AC-D2.1`) and the pruned gap's (`AC-D2.2`) are the chain's
+// since amendment 0040: `tests/chain.rs`.
 
 // ------------------------------------------------------------------------------ INV-11
 

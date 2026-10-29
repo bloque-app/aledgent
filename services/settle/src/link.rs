@@ -19,8 +19,8 @@ use std::sync::Arc;
 
 use ingress::settlement::{
     AcknowledgementBody, AdapterDeclarationBody, AnchorAcknowledgementBody, AnchorFailureBody,
-    AnchorReadBody, AttestationBody, CallBody, CheckBody, GapBody, HeadBody, InstructionBody,
-    ObservationBody, PositionsBody, RescanBody, SettlementResultBody, SigningBody,
+    AnchorReadBody, AttestationBody, CallBody, CheckBody, EpochBody, GapBody, HeadBody,
+    InstructionBody, ObservationBody, PositionsBody, SettlementResultBody, SigningBody,
 };
 use ingress::wire::{AdapterLegBody, CommandResult};
 use serde::Serialize;
@@ -357,9 +357,9 @@ impl<T: Transport> CoreLink<T> {
         self.post("/v1/settlement/gaps", key, json(body)).await
     }
 
-    /// `record_observation`: a re-scan.
-    pub async fn rescan(&self, key: &str, body: &RescanBody) -> Result<Answer, LinkError> {
-        self.post("/v1/settlement/rescans", key, json(body)).await
+    /// A new sequence of the settlement layer's record started under the book (amendment 0041).
+    pub async fn epoch(&self, key: &str, body: &EpochBody) -> Result<Answer, LinkError> {
+        self.post("/v1/settlement/epochs", key, json(body)).await
     }
 
     /// The checkpoint in flight and whether a comparison is due (`F-017`).

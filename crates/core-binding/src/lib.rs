@@ -25,6 +25,8 @@
 //!   builds its witness and private inputs from `F-006`'s store, invokes the Agent through an
 //!   [`host::AgentPort`], and checks the reply against the native run (`T-005-08`).
 //!
+//! - [`code_map`] (feature `std`): which code version and generation executed each input, read
+//!   from the inputs alone, for a restore and a replay per range (`T-037-09`).
 //! - [`switch`] (feature `std`): `switch(H, n)`, the host's one operation for changing a writer's
 //!   code, behind a platform-neutral installer trait (`T-037-14`).
 //!
@@ -45,6 +47,8 @@ extern crate alloc;
 extern crate std;
 
 pub mod calls;
+#[cfg(feature = "std")]
+pub mod code_map;
 #[cfg(feature = "mapped")]
 pub mod committed;
 pub mod envelope;

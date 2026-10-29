@@ -28,18 +28,33 @@ groups:
           summary: Ingress holds a row the core has not decided within the decision bound.
           runbook: ops/runbooks/restore.md
 
-      # REQ-SA-7, REQ-IN-5: observation completeness. Any gap or re-scan difference pages.
+      # REQ-SA-7, REQ-IN-5: observation completeness. Any gap or chain mismatch pages.
       - alert: AledgentObservationGap
         expr: aledgent_adapter_alerts{kind="gap"} > 0
         labels: { severity: page, owner: settlement-operations, signal: observation-completeness }
         annotations:
           summary: The adapter skipped a range of the settlement layer's inbox.
           runbook: ops/runbooks/gap-filling.md
-      - alert: AledgentRescanDifference
-        expr: aledgent_observation_rescan_differences > 0
+      - alert: AledgentSettlementChainMismatch
+        expr: aledgent_observation_chain_mismatches > 0
         labels: { severity: page, owner: settlement-operations, signal: observation-completeness }
         annotations:
-          summary: A re-scan found a record aledgent never ingested, or one the layer no longer shows.
+          summary: The entries the adapter read do not lead to the head the settlement layer holds, and a second read did not change that.
+          runbook: ops/runbooks/gap-filling.md
+      - alert: AledgentObservationStopped
+        expr: aledgent_observation_stopped > 0
+        labels: { severity: page, owner: settlement-operations, signal: observation-completeness }
+        annotations:
+          summary: Observation waits for an operator, because no reader can serve a range or the settlement layer was reset under the running adapter.
+          runbook: ops/runbooks/gap-filling.md
+      # Amendment 0041: the core refused to follow a new sequence of the layer's record (a reset of
+      # the instance); nothing of the new chain reaches it, and the adapter declares that it does
+      # not serve, so new withdrawals are refused (ERR-SettlementLayerUnavailable).
+      - alert: AledgentSettlementEpochRefused
+        expr: aledgent_adapter_alerts{kind="epoch"} > 0
+        labels: { severity: page, owner: settlement-operations, signal: observation-completeness }
+        annotations:
+          summary: The core refused to follow a reset of the settlement layer's instance; nothing of the new chain reaches it.
           runbook: ops/runbooks/gap-filling.md
       - alert: AledgentObservationLag
         expr: aledgent_observation_cursor_lag > 100
@@ -394,6 +409,25 @@ groups:
         labels: { severity: page, owner: settlement-operations, signal: settlement-adapter }
         annotations:
           summary: The settlement layer has not confirmed its runtime; nothing is broadcast on it.
+          runbook: ops/runbooks/release/settlement-adapter-outage.md
+      # F-045: a signing key's engine is not ready (Vault Transit has not answered for its window,
+      # or a key is no longer what was pinned). Nothing is signed meanwhile: withdrawals and anchors
+      # wait, observation carries on. A Vault blip does not raise it (the engine's own 30 s window).
+      - alert: AledgentAdapterSignerNotReady
+        expr: aledgent_adapter_alerts{kind="signer"} > 0
+        for: 2m
+        labels: { severity: page, owner: settlement-operations, signal: settlement-adapter }
+        annotations:
+          summary: A settlement key's signer (Vault Transit) is not ready; nothing is signed.
+          runbook: ops/runbooks/release/settlement-adapter-outage.md
+      # Amendment 0041: a reset the core cannot take yet (its code is before the amendment's
+      # generation, or ingress's route is closed). The adapter declares that it does not serve, so
+      # new withdrawals are refused: it pages, as a withdrawal outage does.
+      - alert: AledgentSettlementEpochUnsupported
+        expr: aledgent_adapter_alerts{kind="epoch-unsupported"} > 0
+        labels: { severity: page, owner: settlement-operations, signal: settlement-adapter }
+        annotations:
+          summary: The core cannot take a reset of the settlement layer's instance until it is upgraded; withdrawals are refused meanwhile.
           runbook: ops/runbooks/release/settlement-adapter-outage.md
       # Blocks come and finality does not: Kreivo's finality follows Kusama's.
       - alert: AledgentFinalityStalled

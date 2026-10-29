@@ -19,11 +19,25 @@ required-features = ["server"]
 default = ["server", "vault", "kms"]
 # The service itself: the listener, the backends and the configuration. Clients (the core host,
 # ingress, the adapter) depend on this crate without it: they link the protocol and the client only.
-server = ["dep:tokio", "dep:tracing", "dep:tracing-subscriber", "dep:serde_json", "dep:sha2", "dep:subtle", "dep:hex"]
+server = ["dep:tokio", "dep:tracing", "dep:tracing-subscriber", "dep:sha2", "dep:subtle"]
+# The session with Vault that the signer's KV reads and a component's Vault Transit engine share
+# (F-042): the login under AWS IAM auth (signed with the instance's or task's role), the token's
+# lifecycle and the retries. It does not imply `server`: ingress links it for its feed key and not the
+# signer's listener or the KMS SDK.
+vault-session = ["dep:tokio", "dep:tracing", "dep:aws-config", "dep:aws-credential-types", "dep:aws-sigv4", "dep:aws-smithy-runtime-api", "dep:reqwest", "dep:base64"]
 # Vault (the default key source, owner ruling `key-custody-opt-in-kms`): a KV v1 read after a login
 # under AWS IAM auth, signed with the instance's or task's role. Without it, a `vault` key source
 # fails the start.
-vault = ["server", "dep:aws-config", "dep:aws-credential-types", "dep:aws-sigv4", "dep:aws-smithy-runtime-api", "dep:reqwest", "dep:base64"]
+vault = ["server", "vault-session"]
+# The Vault Transit engine (F-042): an Ed25519 key that never leaves Vault, which the component that
+# signs with it uses in place, beside the sidecar. A component that links it holds a Vault role, so the
+# core host's build does not enable it.
+transit = ["vault-session"]
+# A test-only login to Vault (a token from the test), for the end-to-end test against a Vault in dev
+# mode, where the AWS login cannot run. Never in a release: the crate refuses to compile with it
+# unless debug assertions are on (src/lib.rs), no configuration can name it (it is a constructor, not a
+# login method), and nothing enables it but a command line. CI proves all three.
+test-vault-auth = ["vault-session"]
 # AWS KMS, opt-in per key, for secp256k1 lane and anchor keys only. Without it, a `kms` key source
 # fails the start.
 kms = ["server", "dep:aws-config", "dep:aws-sdk-kms"]
@@ -43,10 +57,11 @@ k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "fs"], optional = true }
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "std"], optional = true }
-serde_json = { version = "1", optional = true }
+# The engines' locators and configuration are JSON (F-042), in the client build too.
+serde_json = "1"
 sha2 = { version = "0.10", optional = true }
 subtle = { version = "2", optional = true }
-hex = { version = "0.4", optional = true }
+hex = "0.4"
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client", "credentials-process"], optional = true }
 aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"], optional = true }
 aws-credential-types = { version = "1", optional = true }
@@ -56,10 +71,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 base64 = { version = "0.22", optional = true }
 
 [dev-dependencies]
-signer = { path = ".", features = ["testing"] }
+signer = { path = ".", features = ["testing", "transit"] }
 tempfile = "3"
-hex = "0.4"
-serde_json = "1"
 sha2 = "0.10"
 # tests/key_absent.rs: the book over the core Agent, its keys in the signer's process.
 core-binding = { path = "../../crates/core-binding", features = ["ingress"] }
@@ -69,6 +82,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 aws-credential-types = "1"
 base64 = "0.22"
+# tests/transit_e2e.rs: the set-up of a real Vault in CI (keys, a policy, tokens).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 [lints]
 workspace = true

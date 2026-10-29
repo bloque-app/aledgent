@@ -224,9 +224,43 @@ fn err_settlement_layer_unavailable__service(_: &mut dyn Harness) -> Outcome {
 
 // ------------------------------------------------------------------------------ AC-D2
 
-/// `AC-D2.1`: a comparison of the layer's records with the ingested observations is available,
-/// and a difference is an incident — here a record the core's copy lacks.
+/// `AC-D2.1` (as amendment 0040 restates it): at each sync the adapter states the position up to
+/// which the layer's record and the ingested observations are shown to agree, or the first at
+/// which they do not, and a difference is an incident. Here a reader alters an entry: the adapter
+/// stops at the first new position with an alert of kind `chain`, and the core takes in nothing
+/// past it.
 fn ac_d2_1__service(_: &mut dyn Harness) -> Outcome {
+    run(|| async {
+        let mut k = serving(KitOptions::default()).await?;
+        let from = [0x77; 32];
+        k.chain.mint(from, &chain_usd(), 100);
+        k.chain.deposit(from, INSTANCE, [0x42; 32], &chain_usd(), 1);
+        k.chain.advance(1);
+        step(&mut k).await?;
+        for _ in 0..3 {
+            k.chain.deposit(from, INSTANCE, [0x42; 32], &chain_usd(), 1);
+            k.chain.produce();
+        }
+        k.chain.finalize_all();
+        k.chain
+            .fault_reads(2, settle::chain::fake::ReaderFault::Alter, u32::MAX);
+        step(&mut k).await?;
+        let cursor = k.store.cursor(INSTANCE).await.map_err(|e| e.to_string())?;
+        check(cursor == 1, || {
+            format!("the cursor passed position 1: {cursor}")
+        })?;
+        check(open_alerts(&k, "chain:1:1").await? == 1, || {
+            "no chain alert at the first new position".into()
+        })?;
+        let ingested = k.core_settlement(|s| s.all_ingested().count()).unwrap_or(0);
+        check(ingested == 1, || format!("{ingested} records ingested"))
+    })
+}
+
+/// `AC-D2.2`: a range that could not be read is an explicit gap, visible to operators: here the
+/// adapter is behind the node's events with no history endpoint, and the operator has it record
+/// the range through its own source (amendment 0040, ruling a40-q3).
+fn ac_d2_2__service(_: &mut dyn Harness) -> Outcome {
     run(|| async {
         let mut k = serving(KitOptions::default()).await?;
         let from = [0x77; 32];
@@ -235,40 +269,31 @@ fn ac_d2_1__service(_: &mut dyn Harness) -> Outcome {
             k.chain.deposit(from, INSTANCE, [0x42; 32], &chain_usd(), 1);
             k.chain.produce();
         }
-        k.chain.finalize_all();
-        k.adapter.drop_report_of(1);
+        k.chain.advance(300);
         step(&mut k).await?;
-        let found = k.adapter.rescan(0, 3).await.map_err(|e| e.to_string())?;
-        let missing: Vec<u64> = found.core.missing.iter().map(|m| m.seq).collect();
-        check(missing == vec![1], || format!("missing {missing:?}"))?;
-        check(open_alerts(&k, "incident:missing:").await? == 1, || {
-            "no incident raised".into()
+        check(open_alerts(&k, "unreadable:").await? == 1, || {
+            "no unreadable alert".into()
         })?;
-        let incidents = k.core_settlement(|s| s.incidents().len()).unwrap_or(0);
-        check(incidents >= 1, || "the core raised no incident".into())
-    })
-}
-
-/// `AC-D2.2`: a range pruned before it was read is an explicit gap, visible to operators.
-fn ac_d2_2__service(_: &mut dyn Harness) -> Outcome {
-    run(|| async {
-        let mut k = serving(KitOptions::default()).await?;
-        let from = [0x77; 32];
-        k.chain.mint(from, &chain_usd(), 100);
-        for _ in 0..5 {
-            k.chain.deposit(from, INSTANCE, [0x42; 32], &chain_usd(), 1);
-            k.chain.produce();
-        }
-        k.chain.prune(INSTANCE, 3);
-        k.chain.advance(1);
-        step(&mut k).await?;
+        k.adapter
+            .record_operator_gap(0, 3)
+            .await
+            .map_err(|e| e.to_string())?;
         let gaps = k.store.gaps().await.map_err(|e| e.to_string())?;
         check(
             gaps.len() == 1 && gaps[0].from == 0 && gaps[0].to == 3,
             || format!("adapter gaps {gaps:?}"),
         )?;
-        check(open_alerts(&k, "gap:").await? == 1, || {
-            "no gap alert".into()
+        // Visible to operators: in the adapter's store and the core's, and in the alert history
+        // (raised, then cleared, since the operator recorded it), so it does not page on.
+        let alerts = k.store.alerts().await.map_err(|e| e.to_string())?;
+        check(
+            alerts
+                .iter()
+                .any(|a| a.key.starts_with("gap:") && a.cleared_at.is_some()),
+            || format!("no gap alert: {alerts:?}"),
+        )?;
+        check(open_alerts(&k, "gap:").await? == 0, || {
+            "the operator's gap still pages".into()
         })?;
         let core = k.core_settlement(|s| s.gaps().to_vec()).unwrap_or_default();
         check(
@@ -576,7 +601,7 @@ fn ac_e4_4__service(_: &mut dyn Harness) -> Outcome {
         let mut k = serving(KitOptions::default()).await?;
         k.chain.upgrade(|c| {
             c.spec_version = 134;
-            c.transaction_version = 14;
+            c.transaction_version = 15;
         });
         let r = k.step().await.map_err(|e| e.to_string())?;
         check(!r.serving, || "the adapter served a changed surface".into())?;

@@ -88,13 +88,14 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
     /// with the binding's asset and amount; or returned to book-only, if the layer refused it.
     /// A record of a binding already decided changes nothing (a second execution, refused as
     /// already bound); any other record is an incident. Called in the check's commit.
-    pub(super) fn bind_final_writes(&self, obs: &Observation) -> Vec<Write> {
+    pub(super) fn bind_final_writes(
+        &self,
+        obs: &Observation,
+        now: crate::account::Time,
+    ) -> Vec<Write> {
         let coordinate = obs.coordinate;
-        let incident = |asset| {
-            vec![Write::Settlement(SettlementWrite::Incident(
-                Incident::BindRefused { asset, coordinate },
-            ))]
-        };
+        let incident =
+            |asset| vec![self.incident(Incident::BindRefused { asset, coordinate }, now)];
         let Some(bind) = obs
             .operation_ref
             .and_then(|r| self.state.settlement().asset_bind_by_reference(&r))

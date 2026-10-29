@@ -100,13 +100,16 @@ jobs:
       - run: cargo test -p shards --features native-decide --test native_decide
       # DEC-25, owner ruling cs-q04: v1 roots are a supported opt-in. The crates with a root version,
       # built with v1 (the default run above is v2, and its differential already runs every unit
-      # under both versions). The conformance suite from a v1 genesis is its own job below.
+      # under both versions). The conformance suite from a v1 genesis is its own job below. The
+      # code-history gate (T-037-12) is skipped by name: its recorded book is a v2 book, which a v1
+      # build founds differently, and it fails loudly if run here (code-history.yml runs it, in v2).
       - name: v1 roots (supported opt-in)
         env:
           LEDGER_KERNEL_DIFF_CASES: "1000"
         run: >-
           cargo test -p compact-smt -p ledger-kernel -p ledger-core -p leaf-store -p core-binding -p shards
           --features compact-smt/v1,ledger-kernel/smt-v1,ledger-core/smt-v1,leaf-store/smt-v1,core-binding/smt-v1,core-binding/ingress,shards/smt-v1
+          -- --skip t037_12_
       # The cross-host relay (an experiment, feature net): hosts in threads and as processes.
       - run: cargo test -p shards --features net --test multihost
       - name: disk left after the tests
@@ -171,6 +174,80 @@ jobs:
       - name: MinIO's log
         if: failure()
         run: docker logs minio | tail -n 60
+
+  # F-042: the Vault Transit engine against a real Vault in dev mode: a non-exportable Ed25519 key, two
+  # versions, a role's policy and real tokens (the lease, a revocation). The image is ECR Public's, not
+  # Docker Hub's (#220), pinned by digest: a missing image fails the job, it does not change what it tests.
+  vault-transit:
+    name: vault transit (F-042)
+    runs-on: ubuntu-latest
+    env:
+      VAULT_IMAGE: public.ecr.aws/hashicorp/vault:2.0.3@sha256:a296a888b118615dc01d5f1a6846e6d4a7277946caaed5b447008fff5fe06b54
+      # A dev-mode Vault in the runner, for this job's tests only: not a secret.
+      ALEDGENT_TEST_VAULT: http://127.0.0.1:8200
+      ALEDGENT_TEST_VAULT_TOKEN: aledgent-ci-dev-root
+      ALEDGENT_REQUIRE_VAULT_TEST: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: vault-transit
+      - name: Vault in dev mode, with Transit and a non-exportable Ed25519 key
+        run: |
+          set -eu
+          # ECR Public rate-limits anonymous pulls from shared runners ("toomanyrequests", "Data limit
+          # exceeded"). The same image, by the same digest, is on Docker Hub: try each registry in turn,
+          # a few times. Pinning the digest means a mirror can never serve different bytes.
+          DIGEST="${VAULT_IMAGE#*@}"
+          image=""
+          for i in 1 2 3; do
+            for ref in "$VAULT_IMAGE" "docker.io/hashicorp/vault@$DIGEST"; do
+              if docker pull -q "$ref"; then image="$ref"; break 2; fi
+              echo "::warning::pull of $ref failed (attempt $i)"
+            done
+            sleep $((i * 20))
+          done
+          [ -n "$image" ] || { echo "::error::could not pull the Vault image ($DIGEST) from any registry"; exit 1; }
+          docker run -d --name vault --cap-add=IPC_LOCK -p 127.0.0.1:8200:8200 "$image" \
+            server -dev -dev-listen-address=0.0.0.0:8200 -dev-root-token-id="$ALEDGENT_TEST_VAULT_TOKEN"
+          for _ in $(seq 1 60); do
+            curl -sf "$ALEDGENT_TEST_VAULT/v1/sys/health" >/dev/null && break
+            sleep 1
+          done
+          curl -sf "$ALEDGENT_TEST_VAULT/v1/sys/health" | head -c 300; echo
+          vault_api() {
+            curl -sf -H "X-Vault-Token: $ALEDGENT_TEST_VAULT_TOKEN" -X POST -d "$2" "$ALEDGENT_TEST_VAULT/v1/$1"
+          }
+          vault_api sys/mounts/transit '{"type":"transit"}'
+          vault_api transit/keys/lane-1 '{"type":"ed25519","exportable":false}'
+      # The test-only login (`test-vault-auth`) is what lets these tests log in to a dev-mode Vault. The
+      # AWS IAM login is never run against a real Vault here (dev mode cannot): a staging smoke test with a
+      # real role is required before a deployment uses Transit in production.
+      - run: cargo test -p signer --features test-vault-auth --test transit_e2e -- --nocapture
+      # F-044: the archive's seal, wrapped to a Transit rsa-4096 key's public half and opened by
+      # Vault's decrypt, per version, under a decrypt-only policy (it mounts Transit of its own).
+      - run: cargo test -p core-archive --test transit -- --nocapture
+      - name: Vault's log
+        if: failure()
+        run: docker logs vault | tail -n 60
+      # The test-only login must not be buildable into anything shipped. Three guards; the first two
+      # must be able to fail: (1) a release build with the feature is refused by the compiler; (2) no
+      # feature graph of the workspace's own builds (dev-dependencies excluded, never --all-features)
+      # enables it, and the same query sees it when asked for it; (3) no configuration names it (it is a
+      # constructor, not a login method), which the session's types show.
+      - name: the test-only login is not built into a release
+        run: |
+          set -u
+          out=$(cargo check --release -p signer --features test-vault-auth 2>&1) && {
+            echo "::error::a release build accepted test-vault-auth"; exit 1; }
+          echo "$out" | grep -q 'cannot be built without debug assertions' || {
+            echo "$out" | tail -n 20; echo "::error::the release build failed for another reason"; exit 1; }
+          n=$(cargo tree --workspace -e normal,build,features -i signer | grep -c 'test-vault-auth' || true)
+          [ "$n" = 0 ] || { echo "::error::the workspace's own feature graph enables test-vault-auth"; exit 1; }
+          m=$(cargo tree -p signer -F test-vault-auth -e normal,build,features -i signer | grep -c 'test-vault-auth' || true)
+          [ "$m" != 0 ] || { echo "::error::the feature-graph check does not see test-vault-auth: it cannot bite"; exit 1; }
+          echo "test-vault-auth: refused in a release, absent from the shipped feature graph"
 
   no-float:
     name: no floating point in crates
@@ -400,18 +477,18 @@ jobs:
             exit 1
           fi
 
-  # F-027 (T-027-03, T-027-07): the settlement executor's Kreivo PASS transactions, rebuilt with
-  # Kreivo's own crates in both formats it signs: spec 133 (Kreivo 4aef055, kreivo-pin) and spec 132
-  # (release 0.16.9, live on mainnet, kreivo-pin-132). Each is a workspace of its own, built from
-  # its committed lock file; services/settle's own tests check its encoder against the same
-  # vectors.json.
+  # F-027 (T-027-03, T-027-07, REQ-SA-9): the settlement executor's Kreivo transactions, rebuilt with
+  # Kreivo's own crates for each runtime they are pinned to: spec 133 (Kreivo 4aef055, kreivo-pin),
+  # spec 136 (release 0.18.1, live on mainnet from 2026-10-27, kreivo-pin-136; same format as 133)
+  # and spec 132 (release 0.16.9, kreivo-pin-132). Each is a workspace of its own, built from its
+  # committed lock file; services/settle's own tests check its encoder against the same vectors.
   kreivo-pin:
     name: kreivo pin (${{ matrix.crate }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        crate: [kreivo-pin, kreivo-pin-132]
+        crate: [kreivo-pin, kreivo-pin-136, kreivo-pin-132]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

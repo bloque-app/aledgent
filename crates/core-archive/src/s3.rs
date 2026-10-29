@@ -13,19 +13,25 @@
 //!   delete or overwrite a segment within it (compliance mode); the bucket must have Object Lock
 //!   enabled, and S3 refuses the PUT otherwise. Each PUT carries its SHA-256 checksum and MD5, as
 //!   S3 requires of a locked upload, and S3 checks them.
-//! - **KMS.** Every PUT asks for server-side encryption under the deployment's KMS key
-//!   (`aws:kms`). Reads decrypt transparently for a role allowed to use the key.
+//! - **KMS, optional.** With `kms-key-id`, every PUT asks for server-side encryption under the
+//!   deployment's KMS key (`aws:kms`); reads decrypt transparently for a role allowed to use the
+//!   key. Since `F-044` aledgent seals every object itself ([`crate::seal`]), so the archive
+//!   depends on no KMS key; KMS may be kept as a second layer.
 //!
-//! A writer refuses to start without both ([`S3Config::check_writer`]): the archive holds every
-//! decision the core committed. The lock defaults to compliance mode for 400 days, the owner's
-//! ruling of 2026-10-05 (`crate::archive::DEFAULT_RETAIN_DAYS`). Reads need neither, so a restore can read a bucket with a
-//! read-only role.
+//! A writer refuses to start without Object Lock, or without either encryption
+//! ([`S3Config::check_writer`]): the archive holds every decision the core committed. The lock
+//! defaults to compliance mode for [`crate::archive::DEFAULT_RETAIN_DAYS`] days. Reads need
+//! neither, so a restore can read a bucket with a read-only role.
 //!
-//! **Credentials** come from the environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
-//! `AWS_SESSION_TOKEN`) or, on an EC2 execution node, from the instance role through IMDSv2,
-//! refreshed before they expire. None is ever an argument, a default, or in a log line
-//! (`REQ-AU-8`).
+//! **Credentials** come, in order, from the file named by `ALEDGENT_ARCHIVE_CREDENTIALS_FILE`
+//! (short-lived credentials in the instance metadata service's JSON shape, `AccessKeyId`,
+//! `SecretAccessKey`, `Token`, `Expiration`, kept fresh by an agent on the host such as Vault
+//! Agent rendering from Vault's AWS secrets engine; read again before they expire), from the
+//! environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`), or, on an EC2
+//! execution node, from the instance role through IMDSv2, refreshed before they expire. None is
+//! ever an argument, a default, or in a log line (`REQ-AU-8`).
 
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -78,10 +84,11 @@ pub struct S3Config {
 }
 
 impl S3Config {
-    /// A writer must encrypt under KMS and lock what it writes (module documentation).
-    pub fn check_writer(&self) -> Result<(), String> {
-        if self.kms_key_id.as_deref().is_none_or(str::is_empty) {
-            return Err("the archive's S3 sink needs kms-key-id: every object is encrypted under the deployment's KMS key".into());
+    /// A writer must lock what it writes, and encrypt it: sealed by aledgent (`sealed`, `F-044`),
+    /// under KMS, or both (module documentation).
+    pub fn check_writer(&self, sealed: bool) -> Result<(), String> {
+        if !sealed && self.kms_key_id.as_deref().is_none_or(str::is_empty) {
+            return Err("the archive's S3 sink needs seal= (aledgent seals every object) or kms-key-id (S3 encrypts it under the deployment's KMS key)".into());
         }
         match self.lock {
             Some((_, days)) if days > 0 => Ok(()),
@@ -140,9 +147,16 @@ impl core::fmt::Debug for Credentials {
 pub enum CredentialSource {
     /// Given (tests).
     Fixed(Credentials),
-    /// The environment, else the instance role through IMDSv2 (module documentation).
+    /// A file of short-lived credentials an agent on the host keeps fresh (module
+    /// documentation), read again whenever the ones read last are about to expire.
+    File(PathBuf),
+    /// The file named by [`CREDENTIALS_FILE_ENV`] if set, else the environment, else the
+    /// instance role through IMDSv2 (module documentation).
     Default,
 }
+
+/// The environment variable naming a credentials file ([`CredentialSource::File`]).
+pub const CREDENTIALS_FILE_ENV: &str = "ALEDGENT_ARCHIVE_CREDENTIALS_FILE";
 
 /// The S3 backend (module documentation).
 pub struct S3Store {
@@ -193,14 +207,28 @@ impl S3Store {
             return Ok(c.clone());
         }
         let fresh = match &self.source {
-            CredentialSource::Fixed(c) => c.clone(),
-            CredentialSource::Default => match from_env() {
-                Some(c) => c,
-                None => from_imds(&self.agent)?,
+            CredentialSource::Fixed(c) => Ok(c.clone()),
+            CredentialSource::File(path) => from_file(path),
+            CredentialSource::Default => match std::env::var_os(CREDENTIALS_FILE_ENV) {
+                Some(path) if !path.is_empty() => from_file(std::path::Path::new(&path)),
+                _ => match from_env() {
+                    Some(c) => Ok(c),
+                    None => from_imds(&self.agent),
+                },
             },
         };
-        *cached = Some(fresh.clone());
-        Ok(fresh)
+        match fresh {
+            Ok(fresh) => {
+                *cached = Some(fresh.clone());
+                Ok(fresh)
+            }
+            // A source that fails while the credentials held are still valid (a credentials file
+            // caught mid-rewrite, a slow metadata service): keep using them until they expire.
+            Err(e) => match cached.as_ref() {
+                Some(c) if c.expires.is_some_and(|x| x > now) => Ok(c.clone()),
+                _ => Err(e),
+            },
+        }
     }
 
     fn key(&self, name: &str) -> String {
@@ -504,6 +532,44 @@ fn from_env() -> Option<Credentials> {
     })
 }
 
+/// Temporary credentials in the instance metadata service's JSON shape, which a credentials file
+/// uses too.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct CredentialsDoc {
+    access_key_id: String,
+    secret_access_key: String,
+    token: String,
+    expiration: String,
+}
+
+impl CredentialsDoc {
+    fn into_credentials(self) -> Credentials {
+        Credentials {
+            access_key: self.access_key_id,
+            secret: self.secret_access_key,
+            token: Some(self.token),
+            expires: parse_rfc3339(&self.expiration),
+        }
+    }
+}
+
+/// Credentials from a file an agent on the host keeps fresh. Its content is never in an error.
+fn from_file(path: &std::path::Path) -> Result<Credentials, StoreError> {
+    let fail = |what: &str| {
+        StoreError::Unavailable(format!("the credentials file {} {what}", path.display()))
+    };
+    let body = std::fs::read_to_string(path).map_err(|e| fail(&format!("cannot be read: {e}")))?;
+    let doc: CredentialsDoc = serde_json::from_str(&body).map_err(|_| {
+        fail("is not credentials (AccessKeyId, SecretAccessKey, Token, Expiration)")
+    })?;
+    let c = doc.into_credentials();
+    if c.expires.is_none() {
+        return Err(fail("has an Expiration that does not parse"));
+    }
+    Ok(c)
+}
+
 const IMDS: &str = "http://169.254.169.254";
 
 /// The instance role's credentials through IMDSv2.
@@ -543,21 +609,8 @@ fn from_imds(agent: &ureq::Agent) -> Result<Credentials, StoreError> {
     let body = get(&format!(
         "/latest/meta-data/iam/security-credentials/{role}"
     ))?;
-    #[derive(serde::Deserialize)]
-    #[serde(rename_all = "PascalCase")]
-    struct Imds {
-        access_key_id: String,
-        secret_access_key: String,
-        token: String,
-        expiration: String,
-    }
-    let c: Imds = serde_json::from_str(&body).map_err(|e| fail("credentials", &e))?;
-    Ok(Credentials {
-        access_key: c.access_key_id,
-        secret: c.secret_access_key,
-        token: Some(c.token),
-        expires: parse_rfc3339(&c.expiration),
-    })
+    let c: CredentialsDoc = serde_json::from_str(&body).map_err(|e| fail("credentials", &e))?;
+    Ok(c.into_credentials())
 }
 
 /// URI-encode as SigV4 wants: every byte but `A-Z a-z 0-9 - _ . ~` as `%XX`, and `/` too unless
@@ -702,6 +755,129 @@ mod tests {
         }
     }
 
+    fn rfc3339(secs: u64) -> String {
+        // Days since the epoch to a civil date (Howard Hinnant's algorithm).
+        let days = (secs / 86_400) as i64;
+        let rem = secs % 86_400;
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = yoe + era * 400 + i64::from(m <= 2);
+        format!(
+            "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+            rem / 3600,
+            rem % 3600 / 60,
+            rem % 60
+        )
+    }
+
+    fn credentials_file(name: &str, key: &str, expires: u64) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "aledgent-archive-creds-{}-{name}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"AccessKeyId":"{key}","SecretAccessKey":"s3cr3t","Token":"tok","Expiration":"{}"}}"#,
+                rfc3339(expires)
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    fn store(source: CredentialSource) -> S3Store {
+        let config = S3Config {
+            bucket: "b".into(),
+            prefix: String::new(),
+            region: "us-east-2".into(),
+            endpoint: None,
+            path_style: false,
+            kms_key_id: None,
+            lock: None,
+        };
+        S3Store::new(config, source)
+    }
+
+    /// A credentials file is read, with its session token and expiry.
+    #[test]
+    fn credentials_come_from_a_file() {
+        let path = credentials_file("read", "AKIAFILE", unix_now() + 3600);
+        let c = store(CredentialSource::File(path.clone()))
+            .credentials()
+            .unwrap();
+        assert_eq!(c.access_key, "AKIAFILE");
+        assert_eq!(c.token.as_deref(), Some("tok"));
+        assert!(c.expires.is_some_and(|e| e > unix_now()));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// Credentials about to expire are read again from the file, so the host's agent can rotate
+    /// them without a restart.
+    #[test]
+    fn a_credentials_file_is_read_again_before_its_credentials_expire() {
+        let path = credentials_file("rotate", "AKIAOLD", unix_now() + 60);
+        let s = store(CredentialSource::File(path.clone()));
+        assert_eq!(s.credentials().unwrap().access_key, "AKIAOLD");
+        credentials_file("rotate", "AKIANEW", unix_now() + 3600);
+        assert_eq!(s.credentials().unwrap().access_key, "AKIANEW");
+        // Fresh ones are cached: a later rewrite is not read until they near expiry.
+        credentials_file("rotate", "AKIALATER", unix_now() + 3600);
+        assert_eq!(s.credentials().unwrap().access_key, "AKIANEW");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// A credentials file caught mid-rewrite near expiry: the credentials held, still valid, are
+    /// used; once they have expired, the failure is the caller's.
+    #[test]
+    fn a_torn_credentials_file_keeps_the_valid_credentials_held() {
+        let path = credentials_file("torn", "AKIAHELD", unix_now() + 60);
+        let s = store(CredentialSource::File(path.clone()));
+        assert_eq!(s.credentials().unwrap().access_key, "AKIAHELD");
+        std::fs::write(&path, r#"{"AccessKeyId":"AKIAN"#).unwrap();
+        assert_eq!(s.credentials().unwrap().access_key, "AKIAHELD");
+        let expired = store(CredentialSource::File(path.clone()));
+        assert!(expired.credentials().is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// A file that is not credentials, or has no parsable expiry, is refused, and its content is
+    /// not in the error.
+    #[test]
+    fn a_bad_credentials_file_is_refused_without_its_content() {
+        let path = std::env::temp_dir().join(format!(
+            "aledgent-archive-creds-{}-bad.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"{"AccessKeyId":"AKIABAD","SecretAccessKey":"s3cr3t"}"#,
+        )
+        .unwrap();
+        let e = store(CredentialSource::File(path.clone()))
+            .credentials()
+            .unwrap_err()
+            .to_string();
+        assert!(!e.contains("s3cr3t") && !e.contains("AKIABAD"), "{e}");
+        std::fs::write(
+            &path,
+            r#"{"AccessKeyId":"AKIABAD","SecretAccessKey":"s3cr3t","Token":"t","Expiration":"soon"}"#,
+        )
+        .unwrap();
+        let e = store(CredentialSource::File(path.clone()))
+            .credentials()
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("Expiration") && !e.contains("s3cr3t"), "{e}");
+        std::fs::remove_file(path).unwrap();
+    }
+
     /// AWS's "GET Object" example of Signature Version 4 for S3.
     #[test]
     fn t_005_15_sigv4_matches_aws_get_object_example() {
@@ -761,13 +937,17 @@ mod tests {
             kms_key_id: None,
             lock: None,
         };
-        assert!(c.check_writer().is_err());
+        assert!(c.check_writer(false).is_err());
+        assert!(c.check_writer(true).is_err(), "sealed, but not locked");
         c.kms_key_id = Some("alias/aledgent-archive".into());
-        assert!(c.check_writer().is_err());
+        assert!(c.check_writer(false).is_err());
         c.lock = Some((LockMode::Compliance, 0));
-        assert!(c.check_writer().is_err());
-        c.lock = Some((LockMode::Compliance, 400));
-        assert!(c.check_writer().is_ok());
+        assert!(c.check_writer(false).is_err());
+        c.lock = Some((LockMode::Compliance, 180));
+        assert!(c.check_writer(false).is_ok());
+        c.kms_key_id = None;
+        assert!(c.check_writer(false).is_err());
+        assert!(c.check_writer(true).is_ok());
         assert_eq!(
             c.host_and_base(),
             (

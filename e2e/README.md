@@ -20,8 +20,9 @@ network on the same kind of runner for weeks.
 | 1. Network | A relay chain (`rococo-local`, alice and bob) and Kreivo (para 2281): the collator `kreivo01`, archive, and a full node `kreivo-pruned` that keeps 16 blocks of state. No Asset Hub: the contract moves Kreivo assets only | `network/` (`spawn_network`, zombienet-sdk 0.4.15) |
 | 2. Deploy | Through the contracts store, with the steps a mainnet deployment runs, in order (`contracts/settlement/README.md`): `preflight`, `community` (finds the community and funds it), `publish`, `license`, `instantiate`, `bound`. A fresh network has no community, so `community` first registers it | `contracts/settlement/scripts/e2e.mjs deploy`, which calls `drive.mjs`'s own steps |
 | 3. Drive | `drive.mjs`'s `deposit`, `execute`, `read` and `events` as an operator runs them; then a deposit with an account reference, a withdrawal, a withdrawal the bound refuses and one Kreivo refuses (the contract's account frozen), an anchor, a full batch of 32 withdrawals, a deposit of a non-sufficient asset, and a deposit Kreivo refuses (it would leave the depositor below the minimum). Records the weight and storage deposit of a deposit and of a full batch | `e2e.mjs drive` (script driver), or `drivers/aledgent.sh drive` with `aledgent-driver/` (the aledgent driver: the deposit, the withdrawal, a refusal and an anchor, through aledgent; then the book-only asset `BKO`: registered book-only, issued and moved, bound one unit short (refused on chain), funded with polkadot-api (`papi/fund-contract.mjs`), bound at zero divergence, anchored, and compared at zero difference: `F-029`, amendment 0011) |
-| 3. Check | At a finalized block, reading the contract's child trie as the adapter does: one outcome per reference with the right kind, amount and reason; a gapless inbox; each position equal to the contract's holding; each entry's event present in its block | `e2e.mjs check` |
+| 3. Check | At a finalized block, reading the contract's child trie as the adapter does: the chain's head (amendment 0040) by raw key and by query; the contract's events folded from the chain's start, every position once and in order, to that head; one outcome per reference with the right kind, amount and reason among the folded entries; no entry stored; each position equal to the contract's holding | `e2e.mjs check` |
 | 4. Faults | Drop the connection mid-submit; kill the submitter (the adapter) between signing and submitting; starve the light client of peers (aledgent driver); prune node state; a deposit in the same gap as a withdrawal. Then the checks again, over the final state | `e2e.mjs faults` (script driver) or `drivers/aledgent.sh faults` (every case through the adapter), then `e2e.mjs check final` |
+| Upgrade (optional) | With the `upgrade_from` input (`210ca4b`, v2): v2 as a second app of the community, with entries it stores; `publish_upgrade` and `upgrade` by the community, every cell byte for byte and the chain's head `(n, zeros, n)`; entries after, and a call that fails in its own frame (its events gone with it); governance named, `set_anchor_head` refused as anyone else, then the full reset (v2's entries removed, the deposit to the origin, the head `(0, zeros, 0)`); entries after it. The events fold to the head at every step | `e2e.mjs upgrade` (`V2_BUNDLE`) |
 
 What a run found is recorded in `features/F-026-settlement-contract/NOTES.md`, "The first real run".
 
@@ -73,16 +74,16 @@ supervisor would restart it: it aborts on any panic, and smoldot panics (decisio
 ### Fault cases (T-027-06)
 
 Each checks that nothing is taken as "not executed" without both proofs (the owner's ruling of
-2026-09-24): the inbox has no entry for the reference at finality, and the key's nonce is
-unconsumed; and that the final state is correct.
+2026-09-24): the chain has no entry for the reference at finality (its events, folded to the
+head), and the key's nonce is unconsumed; and that the final state is correct.
 
 | Case | Script driver | aledgent driver |
 |---|---|---|
 | Drop the connection mid-submit | Two variants: after the pool took the extrinsic, and before any answer. Recovery from the chain alone; resubmitting the same bytes is refused | Every peer of the adapter's light client is cut the moment it stores a signed batch, for 30 s. Back, it settles the withdrawal from that one signed batch |
 | Kill the submitter between signing and submitting | A child process signs and dies by SIGKILL. Both proofs hold but the bytes still validate; only consuming the nonce makes "not executed" final | The adapter's process dies (`ALEDGENT_SETTLE_CRASH_AT=after-persist`) with the signed batch stored and neither recorded with the core nor sent. Both proofs hold and the core releases nothing; a new process over the same store sends the same bytes (no new signature) and the withdrawal settles once |
 | Starve the light client of peers | n/a (no light client) | Every peer cut for 90 s while the chain goes on, with a withdrawal submitted meanwhile: neither settled nor released while blind (or refused while the adapter declares the layer unavailable). Peers back, it resyncs and the withdrawal settles from one signed batch |
-| Prune node state | Through `kreivo-pruned`: a past block's events are gone; the inbox at the finalized head is complete and equals the collator's | The adapter reaches Kreivo through `kreivo-pruned` alone. A deposit made while it was down, whose block's events that node no longer serves, is credited (the inbox is read by position at the finalized head); a withdrawal settles through it |
-| A deposit in the same gap as a withdrawal | Two signers, submitted together: one range read from the cursor returns both, positions move by both | A customer's deposit lands right behind a batch the adapter signed: both reported, the ledger account moves by both |
+| Prune node state | Through `kreivo-pruned`: a past block's events are gone; the chain's head at its finalized head equals the collator's, byte for byte, and the collator's events fold to it. With no stored entries the pruned node can say whether anything is new, not what: a reader behind its window needs the history (settle's history endpoint, `T-043-04`) | The adapter reaches Kreivo through `kreivo-pruned` alone. A deposit made while it was down, whose block's events that node no longer serves: with no history endpoint it is not credited and the adapter raises `unreadable` (the entries are the events, amendment 0040); with the collator's RPC as its history endpoint (`T-043-04`) it is credited; a withdrawal settles through it |
+| A deposit in the same gap as a withdrawal | Two signers, submitted together: the entries folded from the cursor are both, positions move by both | A customer's deposit lands right behind a batch the adapter signed: both reported, the ledger account moves by both |
 
 ### Stress scenario c (F-032)
 
@@ -106,16 +107,17 @@ polkadot-sdk binaries, spawns the network, runs the phases, writes the job summa
 
 Inputs: `kreivo_ref` (build Kreivo's runtime from a commit instead, as Kreivo's release workflow
 builds it: about seven minutes on the fleet), `aledgent_connection`, `kreivo_release` (default
-`0.17.0`, `3e0a5c3`, spec 133: the runtime Kreivo mainnet runs from 2026-09-30, and the one the
-canary deploys on; a release tag gates on it), `psdk_release` (default `polkadot-stable2606-2`, which
-0.17 needs; the collator must be at least as new as the runtime needs), `driver`, and
+`0.18.1`, `5cd5003`, spec 136 and `transaction_version` 14: the runtime Kreivo mainnet runs from
+2026-10-27; a release tag gates on it), `psdk_release` (default `polkadot-stable2606-3`, the newest
+collator release; the collator must be at least as new as the runtime needs), `driver`, and
 `mainnet_parity` (a run warns, and a release tag fails, when the runtime under test is not the one
 Kreivo mainnet runs).
 
-Kreivo `0.16.9` (spec 132) stays selectable, with its own collator:
+Kreivo `0.17.0` (spec 133) and `0.16.9` (spec 132) stay selectable, the latter with its own collator:
 
 ```sh
-gh workflow run e2e-zombienet.yml --ref <branch> -f driver=aledgent     # 0.17.0 on stable2606-2
+gh workflow run e2e-zombienet.yml --ref <branch> -f driver=aledgent     # 0.18.1 on stable2606-3
+gh workflow run e2e-zombienet.yml --ref <branch> -f kreivo_release=0.17.0 -f driver=aledgent
 gh workflow run e2e-zombienet.yml --ref <branch> -f kreivo_release=0.16.9 \
   -f psdk_release=polkadot-stable2603-4 -f driver=aledgent
 ```

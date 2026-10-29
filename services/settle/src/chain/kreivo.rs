@@ -11,12 +11,20 @@
 //!   runtime since whose surface is the same: Kreivo release `0.17.1` (spec 134), enacted on
 //!   mainnet on 2026-10-14, is one (it adds asset calls to the contracts' chain extension; its
 //!   transaction extensions, their types, `transaction_version` and PASS crates are spec 133's).
+//!   So is Kreivo release `0.18.1` (spec 136, `transaction_version` 14, `5cd5003`): it bumped
+//!   `transaction_version` because it removed two `CommunitiesManager` calls, none of which a
+//!   transaction here carries; its transaction extensions and their types are 133's, and its PASS
+//!   crates (`fc-traits-authn` 3.0.0-pre.2, `pass-authenticators-substrate-keys` 2.0.0-pre.1)
+//!   sign and verify the same message in the same order (`services/settle/kreivo-pin-136`).
 //!
 //! What it speaks:
 //!
 //! - **The settlement contract** (`F-026`, `contracts/settlement`): the types it takes, returns
 //!   and stores, mirrored byte for byte, and its messages by selector — `execute(Vec<Envelope>)`
-//!   and the reads of its inbox, head, registration, anchors and positions.
+//!   and the reads of its chain's head, head, registration, anchors and positions — and **the events
+//!   it emits** for each entry of its chain, by their ink! signature topics ([`topic`],
+//!   [`contract_event`]): every entry is rebuilt from its event and its block's number
+//!   (amendment 0040).
 //! - **`Contracts::call`**, which carries a batch to the contract, and `ContractsApi_call`, the
 //!   runtime API that dry-runs the contract's reads at a block.
 //! - **The transaction** (T-027-03): a **v5 general transaction authorised by Kreivo's
@@ -24,11 +32,15 @@
 //!   key signs a challenge bound to the exact call and to every extension after
 //!   `PassAuthenticate`; the runtime then dispatches the call as the PASS account, whose ordinary
 //!   nonce it bumps.
+//! - **Or, for a native account** (`F-045`): a **v4 signed transaction**, from the lane's own
+//!   account, its key's `MultiSignature` over the signed payload (below). `PassAuthenticate` carries
+//!   no credential, and a signed origin passes through it unchanged.
 //!
 //! Everything here is plain SCALE, written from Kreivo's source at the pinned revisions, with no
 //! runtime metadata: [`crate::chain::fake`] builds and checks transactions with it, and
 //! `crate::chain::rpc` sends them. `services/settle/kreivo-pin` proves the spec 133 bytes against
-//! Kreivo's own crates at the versions `4aef055` locks, and `services/settle/kreivo-pin-132` the
+//! Kreivo's own crates at the versions `4aef055` locks, `services/settle/kreivo-pin-136` the spec
+//! 136 bytes against the versions release `0.18.1` locks, and `services/settle/kreivo-pin-132` the
 //! spec 132 bytes against the versions release `0.16.9` locks.
 //!
 //! ## The transaction, as Kreivo decodes it
@@ -72,11 +84,30 @@
 //! ([`TxFormat::by_surface`]), and the layer itself confirms the format on each runtime before
 //! the first transaction signed in it is broadcast ([`transaction_validity`]): an order flipped
 //! with no change of surface fails there.
+//!
+//! ## The native transaction (`F-045`)
+//!
+//! The same runtime type, in its v4 signed form:
+//!
+//! ```text
+//! compact(len) ‖ 0x84 (v4, signed)
+//!   ‖ MultiAddress::Id(account) ‖ MultiSignature
+//!   ‖ None (PassAuthenticate) ‖ Era ‖ compact(nonce: u32) ‖ compact(tip) ‖ None (fee asset)
+//!   ‖ call
+//! ```
+//!
+//! The key signs `SignedPayload`: `call ‖ explicit ‖ implicit` over every extension (`PassAuthenticate`'s
+//! explicit is the `None` above, its implicit is `()`), replaced by its blake2b-256 when it is longer
+//! than 256 bytes; an Ed25519 key signs those bytes, a secp256k1 key their blake2b-256 again
+//! (`MultiSignature::verify`). Its account is the key's (`MultiSigner::into_account`): an Ed25519
+//! key's own 32 bytes. Nothing of the message order above applies, so one encoding serves both
+//! formats' runtimes; the layer still confirms it on each runtime before anything signed in it is
+//! broadcast, under its own name ([`TxFormat::native_name`]).
 
 use parity_scale_codec::{Compact, Decode, Encode};
 
 use super::{AccountId32, Mortality, SignedExtrinsic, blake2_256};
-use crate::signer::{Signer, SignerError};
+use crate::signer::{Signature, Signer, SignerError};
 
 // ------------------------------------------------------------------------------ the contract
 
@@ -98,8 +129,11 @@ pub mod selector {
     pub const REGISTRATION: [u8; 4] = [0, 0, 0x03, 0x00];
     /// `head()`.
     pub const HEAD: [u8; 4] = [0, 0, 0x03, 0x01];
-    /// `inbox_entry(seq)`.
-    pub const INBOX_ENTRY: [u8; 4] = [0, 0, 0x03, 0x02];
+    /// `chain_head()` (amendment 0040): the head of the chain of entries. It replaces
+    /// `inbox_entry(seq)` (`0x0000_0302`), which the contract no longer answers.
+    pub const CHAIN_HEAD: [u8; 4] = [0, 0, 0x03, 0x0A];
+    /// `anchor_epoch()` (amendment 0039): the anchor sequence governance started last.
+    pub const ANCHOR_EPOCH: [u8; 4] = [0, 0, 0x03, 0x08];
     /// `latest_anchor()`: the only anchor the contract keeps, overwritten by each new one
     /// (owner's ruling of 2026-10-11). It replaces `anchor_record(number)` (`0x0000_0303`).
     pub const LATEST_ANCHOR: [u8; 4] = [0, 0, 0x03, 0x07];
@@ -424,14 +458,14 @@ pub struct Registration {
 pub struct Head {
     /// The last anchor's number; zero for none.
     pub last_anchor: u64,
-    /// The next inbox position.
+    /// The position the next entry takes in the current chain.
     pub next_seq: u64,
-    /// Entries below this may be pruned.
+    /// The earlier code's prune watermark; zero after a reset.
     pub pruned_to: u64,
 }
 
 /// The latest anchor, as stored (`latest_anchor`, `ManualKey<0x0000_0008>`): the only one the
-/// contract keeps. Earlier anchors are in their `Anchored` inbox entries until pruned.
+/// contract keeps. Earlier anchors are in their `Anchored` events.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct LatestAnchor {
     /// Its number: always the head's `last_anchor`.
@@ -442,6 +476,392 @@ pub struct LatestAnchor {
     pub at: u32,
     /// Its inbox position.
     pub seq: u64,
+}
+
+/// The head of the chain of entries, as `chain_head()` returns it (amendment 0040): `(position,
+/// digest, start)`, 48 bytes.
+///
+/// **The one place it is decoded** ([`chain_head`]): its third field, `start`, is not yet
+/// approved by the owner; if it is dropped, this struct and that function change, and nothing else.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
+pub struct ChainHeadCell {
+    /// The position the next entry takes.
+    pub position: u64,
+    /// The chain digest after the last entry.
+    pub digest: [u8; 32],
+    /// The position the chain started at, from the zero digest.
+    pub start: u64,
+}
+
+/// `anchor_epoch()`'s answer, as stored (`AnchorEpoch`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct AnchorEpochCell {
+    /// The sequence's number.
+    pub epoch: u32,
+    /// The number it starts after.
+    pub base: u64,
+    /// The position of its first entry.
+    pub from_seq: u64,
+    /// The block it started at.
+    pub at: u32,
+    /// The book it anchors.
+    pub book: [u8; 32],
+    /// The latest anchor before it.
+    pub previous: Option<LatestAnchor>,
+}
+
+/// `anchor_epoch()`'s answer in the adapter's terms.
+pub fn chain_epoch(cell: &AnchorEpochCell) -> super::ChainEpoch {
+    super::ChainEpoch {
+        epoch: cell.epoch,
+        from_seq: cell.from_seq,
+        at: u64::from(cell.at),
+        base: cell.base,
+        book: cell.book,
+        previous: cell.previous.map(|p| (p.number, p.commitment)),
+    }
+}
+
+/// `chain_head()`'s answer in the adapter's terms.
+pub fn chain_head(cell: &ChainHeadCell) -> super::ChainHead {
+    super::ChainHead {
+        position: cell.position,
+        digest: cell.digest,
+        start: cell.start,
+    }
+}
+
+/// The ink! 5 signature topics of the contract's events: `blake2b-256` of the event's name and
+/// its fields' types as written, `Name(Type,Type,...)` ([`signature_topic`]). The first topic of
+/// every event the contract emits; the event's data is its fields, SCALE-encoded, in order.
+/// Pinned against the contract's own `SIGNATURE_TOPIC`s.
+pub mod topic {
+    /// `Deposited(InboxSeq,AccountId,AccountRef,AssetId,Balance)` (amendment 0040: with `from`).
+    pub const DEPOSITED: [u8; 32] =
+        super::h32("6f3471c2dc5c795f61ba65b3ece7867b0d93ff759c6be6744897e635b030d425");
+    /// `Withdrawn(InboxSeq,OperationRef,Destination,AssetId,Balance)`; unchanged since v2.
+    pub const WITHDRAWN: [u8; 32] =
+        super::h32("f24c44013e1a81be45e81c95af8737894c25aadcb9dfda47a6672528b149075b");
+    /// `Anchored(InboxSeq,OperationRef,AnchorNumber,Commitment)`; unchanged since v2.
+    pub const ANCHORED: [u8; 32] =
+        super::h32("1978d6331d5625c5147056235631ac680e9e1b4bb1294d7aa28780f804555682");
+    /// `Bound(InboxSeq,OperationRef,AssetId,Balance)`; unchanged since v2.
+    pub const BOUND: [u8; 32] =
+        super::h32("044b4c00da4144811ead3b89b304f92d5a58150c29c18a3bb49ebcf449f6b9d1");
+    /// `Refused(InboxSeq,OperationRef,Call,Refusal)` (amendment 0040: with `call`).
+    pub const REFUSED: [u8; 32] =
+        super::h32("abdd66eaa766d1d09a4c48bfd3ef9d5030828d45c111be41c336796e1144ea5a");
+    /// `AnchorHeadSet(u32,AnchorNumber,InboxSeq,Commitment,Option<LatestAnchor>)`: a reset.
+    pub const ANCHOR_HEAD_SET: [u8; 32] =
+        super::h32("7769b2a1fed276d4fb3e485627b9af8e0258c24ad57cf8beb248f5d349ac9a49");
+    /// The earlier code's `Deposited(InboxSeq,AccountRef,AssetId,Balance)`, without `from`.
+    pub const DEPOSITED_V2: [u8; 32] =
+        super::h32("64531aab6a2a1c81575152b6cd256fd30aa7081745fac257467b14bec39c2558");
+    /// The earlier code's `Refused(InboxSeq,OperationRef,Refusal)`, without `call`.
+    pub const REFUSED_V2: [u8; 32] =
+        super::h32("735b10554d195d3829913de561e7b992273d3d561734c8820d824e3e2b21d175");
+}
+
+/// 32 bytes from 64 hex digits, at compile time.
+const fn h32(hex: &str) -> [u8; 32] {
+    const fn digit(c: u8) -> u8 {
+        match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            _ => panic!("not a lowercase hex digit"),
+        }
+    }
+    let b = hex.as_bytes();
+    assert!(b.len() == 64, "64 hex digits");
+    let mut out = [0u8; 32];
+    let mut i = 0;
+    while i < 32 {
+        out[i] = digit(b[2 * i]) << 4 | digit(b[2 * i + 1]);
+        i += 1;
+    }
+    out
+}
+
+/// An ink! 5 event's signature topic: `blake2b-256(name(Type,Type,...))`, the field types as
+/// written in the contract with no spaces (`ink_macro` 5.1.1, `event::signature_topic`).
+pub fn signature_topic(signature: &str) -> [u8; 32] {
+    blake2_256(signature.as_bytes())
+}
+
+/// `Deposited`'s fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct DepositedEvent {
+    /// Its position.
+    pub seq: u64,
+    /// The sender.
+    pub from: AccountId32,
+    /// The account reference.
+    pub account_ref: [u8; 32],
+    /// The asset.
+    pub asset: AssetId,
+    /// The amount.
+    pub amount: u128,
+}
+
+/// `Withdrawn`'s fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct WithdrawnEvent {
+    /// Its position.
+    pub seq: u64,
+    /// The call's reference (also a topic).
+    pub operation_ref: [u8; 32],
+    /// Where it went.
+    pub to: Destination,
+    /// The asset.
+    pub asset: AssetId,
+    /// The amount.
+    pub amount: u128,
+}
+
+/// `Anchored`'s fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct AnchoredEvent {
+    /// Its position.
+    pub seq: u64,
+    /// The call's reference (also a topic).
+    pub operation_ref: [u8; 32],
+    /// The anchor's number.
+    pub number: u64,
+    /// The commitment.
+    pub commitment: [u8; 32],
+}
+
+/// `Bound`'s fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct BoundEvent {
+    /// Its position.
+    pub seq: u64,
+    /// The call's reference (also a topic).
+    pub operation_ref: [u8; 32],
+    /// The asset.
+    pub asset: AssetId,
+    /// The amount bound.
+    pub amount: u128,
+}
+
+/// `Refused`'s fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct RefusedEvent {
+    /// Its position.
+    pub seq: u64,
+    /// The call's reference (also a topic).
+    pub operation_ref: [u8; 32],
+    /// The call, as submitted.
+    pub call: Call,
+    /// Why.
+    pub reason: Refusal,
+}
+
+/// `AnchorHeadSet`'s fields: a reset by governance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct AnchorHeadSetEvent {
+    /// The new sequence's number (also a topic).
+    pub epoch: u32,
+    /// The number it starts after.
+    pub base: u64,
+    /// The position of its first entry: 0.
+    pub from_seq: u64,
+    /// The book it anchors.
+    pub book: [u8; 32],
+    /// The previous sequence's latest anchor.
+    pub previous: Option<LatestAnchor>,
+}
+
+/// An event a contract emitted (`Contracts::ContractEmitted`): its topics, its data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmittedEvent {
+    /// Its topics: the signature first.
+    pub topics: Vec<[u8; 32]>,
+    /// Its fields, SCALE-encoded.
+    pub data: Vec<u8>,
+}
+
+/// The event the contract emits for the entry `event` at position `seq`, as ink! 5 emits it: the
+/// signature topic, then the reference for the events that carry it as a topic.
+pub fn entry_event(seq: u64, event: &InboxEvent) -> EmittedEvent {
+    match *event {
+        InboxEvent::Deposited {
+            from,
+            account_ref,
+            asset,
+            amount,
+        } => EmittedEvent {
+            topics: vec![topic::DEPOSITED],
+            data: DepositedEvent {
+                seq,
+                from,
+                account_ref,
+                asset,
+                amount,
+            }
+            .encode(),
+        },
+        InboxEvent::Withdrawn {
+            operation_ref,
+            to,
+            asset,
+            amount,
+        } => EmittedEvent {
+            topics: vec![topic::WITHDRAWN, operation_ref],
+            data: WithdrawnEvent {
+                seq,
+                operation_ref,
+                to,
+                asset,
+                amount,
+            }
+            .encode(),
+        },
+        InboxEvent::Anchored {
+            operation_ref,
+            number,
+            commitment,
+        } => EmittedEvent {
+            topics: vec![topic::ANCHORED, operation_ref],
+            data: AnchoredEvent {
+                seq,
+                operation_ref,
+                number,
+                commitment,
+            }
+            .encode(),
+        },
+        InboxEvent::Refused {
+            operation_ref,
+            call,
+            reason,
+        } => EmittedEvent {
+            topics: vec![topic::REFUSED, operation_ref],
+            data: RefusedEvent {
+                seq,
+                operation_ref,
+                call,
+                reason,
+            }
+            .encode(),
+        },
+        InboxEvent::Bound {
+            operation_ref,
+            asset,
+            amount,
+        } => EmittedEvent {
+            topics: vec![topic::BOUND, operation_ref],
+            data: BoundEvent {
+                seq,
+                operation_ref,
+                asset,
+                amount,
+            }
+            .encode(),
+        },
+    }
+}
+
+/// Decode `T` from all of `data`; trailing bytes are an error.
+fn exactly<T: Decode>(data: &[u8], what: &str) -> Result<T, String> {
+    let mut input = data;
+    let v = T::decode(&mut input).map_err(|e| format!("a {what} event: {e}"))?;
+    if !input.is_empty() {
+        return Err(format!(
+            "a {what} event with {} bytes left over",
+            input.len()
+        ));
+    }
+    Ok(v)
+}
+
+/// What one of an instance's contract events says of its chain (amendment 0040), from the event's
+/// topics and data and the number `at` of its block; `None` for an event that is not about the
+/// chain (`Registered`, `KeysSet`, ...). Dispatched on the signature topic only, never on a blind
+/// decode. An entry is rebuilt as `InboxEntry { at, event }` from the event's own fields and
+/// encoded; its bytes are what the chain's digest covers and what the earlier code stored.
+pub fn contract_event(
+    topics: &[[u8; 32]],
+    data: &[u8],
+    at: u64,
+    instance_of: impl Fn(&AccountId32) -> Option<u32>,
+) -> Result<Option<super::ChainEvent>, String> {
+    let Some(signature) = topics.first() else {
+        return Ok(None);
+    };
+    let (seq, event) = match *signature {
+        topic::DEPOSITED => {
+            let e: DepositedEvent = exactly(data, "Deposited")?;
+            (
+                e.seq,
+                InboxEvent::Deposited {
+                    from: e.from,
+                    account_ref: e.account_ref,
+                    asset: e.asset,
+                    amount: e.amount,
+                },
+            )
+        }
+        topic::WITHDRAWN => {
+            let e: WithdrawnEvent = exactly(data, "Withdrawn")?;
+            (
+                e.seq,
+                InboxEvent::Withdrawn {
+                    operation_ref: e.operation_ref,
+                    to: e.to,
+                    asset: e.asset,
+                    amount: e.amount,
+                },
+            )
+        }
+        topic::ANCHORED => {
+            let e: AnchoredEvent = exactly(data, "Anchored")?;
+            (
+                e.seq,
+                InboxEvent::Anchored {
+                    operation_ref: e.operation_ref,
+                    number: e.number,
+                    commitment: e.commitment,
+                },
+            )
+        }
+        topic::BOUND => {
+            let e: BoundEvent = exactly(data, "Bound")?;
+            (
+                e.seq,
+                InboxEvent::Bound {
+                    operation_ref: e.operation_ref,
+                    asset: e.asset,
+                    amount: e.amount,
+                },
+            )
+        }
+        topic::REFUSED => {
+            let e: RefusedEvent = exactly(data, "Refused")?;
+            (
+                e.seq,
+                InboxEvent::Refused {
+                    operation_ref: e.operation_ref,
+                    call: e.call,
+                    reason: e.reason,
+                },
+            )
+        }
+        topic::ANCHOR_HEAD_SET => {
+            exactly::<AnchorHeadSetEvent>(data, "AnchorHeadSet")?;
+            return Ok(Some(super::ChainEvent::Reset));
+        }
+        // The earlier code's shapes: the position only; the entry cannot be rebuilt.
+        topic::DEPOSITED_V2 | topic::REFUSED_V2 => {
+            let seq = u64::decode(&mut &data[..]).map_err(|e| format!("an earlier event: {e}"))?;
+            return Ok(Some(super::ChainEvent::Legacy { seq }));
+        }
+        _ => return Ok(None),
+    };
+    let at32 = u32::try_from(at).map_err(|_| format!("a block number past Kreivo's u32: {at}"))?;
+    let raw = InboxEntry { at: at32, event }.encode();
+    let entry = inbox_entry(raw, instance_of)?;
+    Ok(Some(super::ChainEvent::Entry { seq, entry }))
 }
 
 /// The input of a contract message: its selector, then its arguments.
@@ -502,7 +922,7 @@ pub fn envelope(
     })
 }
 
-/// A stored inbox entry, decoded and mapped into the adapter's terms. `instance_of` names the
+/// An entry's SCALE bytes, decoded and mapped into the adapter's terms. `instance_of` names the
 /// instance of another deployment's contract; one it does not know stays a plain account.
 pub fn inbox_entry(
     raw: Vec<u8>,
@@ -964,12 +1384,15 @@ pub enum MessageOrder {
 pub struct TxFormat {
     /// Its name, as an operator names it in the configuration's `formats`.
     pub name: &'static str,
-    /// The Kreivo revision the format is pinned against.
+    /// The Kreivo revisions the format is pinned against.
     pub kreivo: &'static str,
     /// The order of the message the device signs.
     pub order: MessageOrder,
-    /// The runtime's `transaction_version` the format applies to.
-    pub transaction_version: u32,
+    /// The runtime `transaction_version`s the format applies to: the one it was first pinned
+    /// against, then each later one whose surface is otherwise this one's and whose transactions
+    /// were pinned again against that runtime's own crates (a `transaction_version` can change
+    /// for a call nothing here carries, as 14 did). A version not listed matches nothing.
+    pub transaction_versions: &'static [u32],
     /// The runtime's transaction extensions, as its metadata names them for extension version 0,
     /// in order.
     pub extensions: &'static [&'static str],
@@ -993,10 +1416,10 @@ pub struct Surface {
 }
 
 impl Surface {
-    /// The surface of `format`, as a runtime that matches it describes it.
+    /// The surface of `format`, as the first runtime it was pinned against describes it.
     pub fn of(format: &TxFormat) -> Surface {
         Surface {
-            transaction_version: format.transaction_version,
+            transaction_version: format.transaction_versions[0],
             extensions: format.extensions.iter().map(|e| (*e).to_owned()).collect(),
             types: Some(format.types),
         }
@@ -1060,19 +1483,22 @@ pub const FORMAT_132: TxFormat = TxFormat {
     name: "kreivo-132",
     kreivo: "0.16.9 (db3d8af)",
     order: MessageOrder::AuthorityFirst,
-    transaction_version: 12,
+    transaction_versions: &[12],
     extensions: EXTENSIONS_132,
     types: TYPES_132,
 };
 
 /// Kreivo `4aef055`'s format (spec 133, `transaction_version` 13), and every runtime since whose
 /// surface is the same: Kreivo `0.17.1` (spec 134, enacted on mainnet on 2026-10-14) is one
-/// (`fixtures/surface-134.json`). Pinned by `services/settle/kreivo-pin`.
+/// (`fixtures/surface-134.json`), and so is Kreivo `0.18.1` (spec 136, `transaction_version` 14,
+/// `fixtures/surface-136.json`), whose only change to the surface is its `transaction_version`.
+/// Pinned by `services/settle/kreivo-pin` (spec 133) and `services/settle/kreivo-pin-136`
+/// (spec 136).
 pub const FORMAT_133: TxFormat = TxFormat {
     name: "kreivo-133",
-    kreivo: "4aef055",
+    kreivo: "4aef055; 0.18.1 (5cd5003)",
     order: MessageOrder::ChallengeFirst,
-    transaction_version: 13,
+    transaction_versions: &[13, 14],
     extensions: EXTENSIONS_133,
     types: TYPES_133,
 };
@@ -1084,8 +1510,9 @@ pub const TYPES_132: [u8; 32] = [
     0xcd, 0x08, 0xe5, 0x6e, 0x52, 0xa9, 0x93, 0xd0, 0xc3, 0x64, 0x5f, 0x12, 0xba, 0x99, 0x9b, 0xb9,
 ];
 
-/// The digest of spec 133's types (`fixtures/surface-133.json`), and spec 134's
-/// (`fixtures/surface-134.json`): `2da44f419d560b7bff6d56438e512190d93e6079703f584c67bbd8061ef34064`.
+/// The digest of spec 133's types (`fixtures/surface-133.json`), and specs 134's and 136's
+/// (`fixtures/surface-134.json`, `fixtures/surface-136.json`):
+/// `2da44f419d560b7bff6d56438e512190d93e6079703f584c67bbd8061ef34064`.
 pub const TYPES_133: [u8; 32] = [
     0x2d, 0xa4, 0x4f, 0x41, 0x9d, 0x56, 0x0b, 0x7b, 0xff, 0x6d, 0x56, 0x43, 0x8e, 0x51, 0x21, 0x90,
     0xd9, 0x3e, 0x60, 0x79, 0x70, 0x3f, 0x58, 0x4c, 0x67, 0xbb, 0xd8, 0x06, 0x1e, 0xf3, 0x40, 0x64,
@@ -1106,10 +1533,18 @@ impl TxFormat {
         FORMATS.iter().copied().find(|f| f.name == name)
     }
 
-    /// Whether `surface` is this format's: the same `transaction_version`, the same extensions in
-    /// the same order, and the same types.
+    /// The name the layer's confirmation of a native transaction on a runtime of this format is
+    /// recorded under (`F-045`): `<name>+native`. A runtime confirmed for PASS transactions has not
+    /// confirmed native ones, nor the reverse.
+    pub fn native_name(&self) -> String {
+        format!("{}+native", self.name)
+    }
+
+    /// Whether `surface` is this format's: one of its `transaction_version`s, the same extensions
+    /// in the same order, and the same types.
     pub fn matches(&self, surface: &Surface) -> bool {
-        surface.transaction_version == self.transaction_version
+        self.transaction_versions
+            .contains(&surface.transaction_version)
             && surface
                 .extensions
                 .iter()
@@ -1320,15 +1755,16 @@ impl From<SignerError> for SignError {
 impl From<SignError> for super::ChainError {
     fn from(e: SignError) -> Self {
         match e {
-            SignError::Signer(e) => super::ChainError::Unavailable(e.to_string()),
+            SignError::Signer(e) => super::ChainError::Signer(e.to_string()),
         }
     }
 }
 
-/// Sign `call` as the PASS account behind `signer` (its hashed user id, and its device key), with
-/// the challenge's context at block `context` (its number and hash), in `format`: the one the
-/// adapter chose for the runtime's surface (`T-027-12`), never one guessed from `p`. The device
-/// key signs through [`Signer`] and is never seen here.
+/// Sign `call` as `signer`'s account: as the PASS account behind it (its hashed user id, and its
+/// device key) with the challenge's context at block `context` (its number and hash), in `format`:
+/// the one the adapter chose for the runtime's surface (`T-027-12`), never one guessed from `p`;
+/// or, for a native account (`F-045`, no PASS user), as a v4 signed transaction ([`sign_native`]).
+/// The key signs through [`Signer`] and is never seen here.
 pub async fn sign(
     signer: &dyn Signer,
     format: &TxFormat,
@@ -1336,13 +1772,17 @@ pub async fn sign(
     p: &TxParams,
     context: (u32, [u8; 32]),
 ) -> Result<SignedExtrinsic, SignError> {
-    let user_id = signer
-        .pass_user()
-        .ok_or_else(|| SignerError::Unavailable("the key is not a PASS account's device".into()))?;
+    let Some(user_id) = signer.pass_user() else {
+        return sign_native(signer, call, p).await;
+    };
     let xtc = extrinsic_context(call, p);
     let challenge = challenge(&context.1, &xtc);
-    let digest = blake2_256(&signed_message(format, context.0, &challenge));
-    let signature = signer.sign(digest).await?;
+    let Signature::Ecdsa(signature) = signer
+        .sign(signed_message(format, context.0, &challenge))
+        .await?
+    else {
+        return Err(SignerError::Key("a PASS device key is a secp256k1 key".into()).into());
+    };
     let credential = PassCredential {
         device_id: signer.device(),
         user_id,
@@ -1353,6 +1793,201 @@ pub async fn sign(
     let bytes = extrinsic(&credential, p, call);
     let hash = blake2_256(&bytes);
     Ok(SignedExtrinsic { bytes, hash })
+}
+
+// ------------------------------------------------------------------------------ native accounts
+
+/// `0b1000_0100`: extrinsic format version 4, signed.
+pub const SIGNED_V4: u8 = 0x84;
+
+/// `MultiAddress::Id`.
+pub const MULTI_ADDRESS_ID: u8 = 0;
+
+/// Every extension's explicit data, in order, for a native transaction: `PassAuthenticate`'s `None`
+/// (no credential), then [`explicit_after_pass`].
+pub fn explicit_native(p: &TxParams) -> Vec<u8> {
+    let mut out = vec![0u8];
+    out.extend_from_slice(&explicit_after_pass(p));
+    out
+}
+
+/// What a native account's key signs (`SignedPayload`): `call ‖ explicit ‖ implicit` over every
+/// extension, `PassAuthenticate`'s implicit being `()`; its blake2b-256 when longer than 256 bytes.
+pub fn signed_payload(call: &[u8], p: &TxParams) -> Vec<u8> {
+    let mut b = call.to_vec();
+    b.extend_from_slice(&explicit_native(p));
+    b.extend_from_slice(&implicit_after_pass(p));
+    if b.len() > 256 {
+        blake2_256(&b).to_vec()
+    } else {
+        b
+    }
+}
+
+/// A native transaction's bytes, as broadcast: `compact(len) ‖ 0x84 ‖ MultiAddress::Id(account) ‖
+/// MultiSignature ‖ explicit ‖ call`.
+pub fn native_extrinsic(
+    account: &AccountId32,
+    signature: &Signature,
+    p: &TxParams,
+    call: &[u8],
+) -> Vec<u8> {
+    let mut body = vec![SIGNED_V4, MULTI_ADDRESS_ID];
+    body.extend_from_slice(account);
+    body.extend_from_slice(&signature.encode_multi());
+    body.extend_from_slice(&explicit_native(p));
+    body.extend_from_slice(call);
+    let mut out = Compact(u32::try_from(body.len()).unwrap_or(u32::MAX)).encode();
+    out.extend_from_slice(&body);
+    out
+}
+
+/// Sign `call` as `signer`'s own account (`F-045`): a v4 signed transaction (module documentation).
+/// The key's signature is checked against the account before the bytes are built.
+pub async fn sign_native(
+    signer: &dyn Signer,
+    call: &[u8],
+    p: &TxParams,
+) -> Result<SignedExtrinsic, SignError> {
+    if signer.account() != signer.device() {
+        return Err(SignerError::Key("a native account is its key's own account".into()).into());
+    }
+    let account = signer.account();
+    let payload = signed_payload(call, p);
+    let signature = signer.sign(payload.clone()).await?;
+    if !signature.verify(&payload, &account) {
+        return Err(SignerError::Unavailable(
+            "the signature does not verify against the account".into(),
+        )
+        .into());
+    }
+    let bytes = native_extrinsic(&account, &signature, p, call);
+    let hash = blake2_256(&bytes);
+    Ok(SignedExtrinsic { bytes, hash })
+}
+
+/// A native transaction, decoded (for the fake chain, and for the tests).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecodedNative {
+    /// The account that signed it.
+    pub account: AccountId32,
+    /// Its signature.
+    pub signature: Signature,
+    /// Its era's bytes.
+    pub era: [u8; 2],
+    /// Its nonce.
+    pub nonce: u32,
+    /// Its tip.
+    pub tip: u128,
+    /// Its call.
+    pub call: Vec<u8>,
+}
+
+/// Decode a native transaction. Anything else is an error.
+pub fn decode_native(bytes: &[u8]) -> Result<DecodedNative, String> {
+    let mut b = bytes;
+    let len = Compact::<u32>::decode(&mut b).map_err(|e| e.to_string())?.0;
+    if usize::try_from(len).ok() != Some(b.len()) {
+        return Err("the length prefix does not match".into());
+    }
+    let take = |b: &mut &[u8], n: usize| -> Result<Vec<u8>, String> {
+        if b.len() < n {
+            return Err("truncated".into());
+        }
+        let (h, t) = b.split_at(n);
+        *b = t;
+        Ok(h.to_vec())
+    };
+    if take(&mut b, 2)? != [SIGNED_V4, MULTI_ADDRESS_ID] {
+        return Err("not a v4 signed transaction from an account id".into());
+    }
+    let account: AccountId32 = take(&mut b, 32)?.try_into().unwrap_or([0; 32]);
+    let signature = match take(&mut b, 1)?[..] {
+        [0] => Signature::Ed25519(take(&mut b, 64)?.try_into().unwrap_or([0; 64])),
+        [2] => Signature::Ecdsa(take(&mut b, 65)?.try_into().unwrap_or([0; 65])),
+        _ => return Err("a signature neither Ed25519 nor ECDSA".into()),
+    };
+    if take(&mut b, 1)? != [0] {
+        return Err("PassAuthenticate carries a credential".into());
+    }
+    let era: [u8; 2] = take(&mut b, 2)?.try_into().unwrap_or([0; 2]);
+    let nonce = Compact::<u32>::decode(&mut b).map_err(|e| e.to_string())?.0;
+    let tip = Compact::<u128>::decode(&mut b)
+        .map_err(|e| e.to_string())?
+        .0;
+    if take(&mut b, 1)? != [0] {
+        return Err("a fee asset".into());
+    }
+    Ok(DecodedNative {
+        account,
+        signature,
+        era,
+        nonce,
+        tip,
+        call: b.to_vec(),
+    })
+}
+
+/// A transaction of either form, decoded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AnyTx {
+    /// A PASS transaction.
+    Pass(DecodedTx),
+    /// A native account's (`F-045`).
+    Native(DecodedNative),
+}
+
+impl AnyTx {
+    /// Decode a transaction of either form. Anything else is an error.
+    pub fn decode(bytes: &[u8]) -> Result<AnyTx, String> {
+        match decode_extrinsic(bytes) {
+            Ok(t) => Ok(AnyTx::Pass(t)),
+            Err(pass) => decode_native(bytes).map(AnyTx::Native).map_err(|native| {
+                format!("neither a PASS transaction ({pass}) nor a native one ({native})")
+            }),
+        }
+    }
+
+    /// Its era's bytes.
+    pub fn era(&self) -> [u8; 2] {
+        match self {
+            AnyTx::Pass(t) => t.era,
+            AnyTx::Native(t) => t.era,
+        }
+    }
+
+    /// Its nonce.
+    pub fn nonce(&self) -> u32 {
+        match self {
+            AnyTx::Pass(t) => t.nonce,
+            AnyTx::Native(t) => t.nonce,
+        }
+    }
+
+    /// Its tip.
+    pub fn tip(&self) -> u128 {
+        match self {
+            AnyTx::Pass(t) => t.tip,
+            AnyTx::Native(t) => t.tip,
+        }
+    }
+
+    /// Its call.
+    pub fn call(&self) -> &[u8] {
+        match self {
+            AnyTx::Pass(t) => &t.call,
+            AnyTx::Native(t) => &t.call,
+        }
+    }
+
+    /// The account it claims to act as (checked by the layer, not here): the PASS account of its
+    /// user, or the native account that signed.
+    pub fn claimed_account(&self) -> AccountId32 {
+        match self {
+            AnyTx::Pass(t) => pass_account(&t.credential.user_id),
+            AnyTx::Native(t) => t.account,
+        }
+    }
 }
 
 /// A transaction of this form, decoded (for the fake chain, and for the tests).
@@ -1906,6 +2541,15 @@ mod tests {
         check_pinned_vector(&FORMAT_132, 132, 12, "kreivo-pin-132/vectors.json").await;
     }
 
+    /// The spec 136 vector (`services/settle/kreivo-pin-136/vectors.json`): Kreivo release
+    /// `0.18.1`, `transaction_version` 14, signed in `kreivo-133`. `kreivo-pin-136` rebuilds it
+    /// with the crates that release locks (`fc-traits-authn` 3.0.0-pre.2 and
+    /// `pass-authenticators-substrate-keys` 2.0.0-pre.1, by git revision).
+    #[tokio::test]
+    async fn the_spec_136_transaction_matches_its_pinned_vector() {
+        check_pinned_vector(&FORMAT_133, 136, 14, "kreivo-pin-136/vectors.json").await;
+    }
+
     /// `T-027-07`, `T-027-12`: each known surface has one format, chosen by the surface alone, and
     /// no other surface is guessed at.
     #[test]
@@ -1916,21 +2560,34 @@ mod tests {
         // The same nine extensions; 133 appends DynamicMaxBlockWeight, which encodes nothing.
         assert_eq!(f132.extensions, &f133.extensions[..9]);
         assert_eq!(f133.extensions[9..], ["DynamicMaxBlockWeight"]);
-        // The one real format change came with a transaction_version bump.
+        // The one real format change came with a transaction_version bump (12 to 13); 14 (Kreivo
+        // 0.18.1, spec 136) changed a call nothing here carries, and is pinned to 133's format.
         assert_eq!(
-            (f132.transaction_version, f133.transaction_version),
-            (12, 13)
+            (f132.transaction_versions, f133.transaction_versions),
+            (&[12][..], &[13, 14][..])
         );
         assert_eq!(TxFormat::by_surface(&Surface::of(&f132)), Some(f132));
         assert_eq!(TxFormat::by_surface(&Surface::of(&f133)), Some(f133));
+        let s136 = Surface {
+            transaction_version: 14,
+            ..Surface::of(&f133)
+        };
+        assert_eq!(TxFormat::by_surface(&s136), Some(f133));
+        assert_ne!(s136.fingerprint(), Surface::of(&f133).fingerprint());
         assert_eq!(TxFormat::named("kreivo-132"), Some(f132));
         assert_eq!(TxFormat::named("kreivo-133"), Some(f133));
         assert_eq!(TxFormat::named("kreivo-134"), None);
-        // Any part of the surface changed: no format.
+        assert_eq!(TxFormat::named("kreivo-136"), None);
+        // Any part of the surface changed: no format. A transaction_version no format lists is a
+        // change, however unchanged the rest is.
         let changed = [
             Surface {
-                transaction_version: 14,
+                transaction_version: 15,
                 ..Surface::of(&f133)
+            },
+            Surface {
+                transaction_version: 14,
+                ..Surface::of(&f132)
             },
             Surface {
                 extensions: f133.extensions[..9]
@@ -2047,16 +2704,175 @@ mod tests {
         );
         let format = FORMAT_133;
         let digest = blake2_256(&signed_message(&format, 9, &tx.credential.challenge));
+        // The device signs the message's blake2b-256 (MultiSignature::Ecdsa).
         let public = crate::signer::recover(&digest, &tx.credential.signature).unwrap();
         assert_eq!(blake2_256(&public), tx.credential.device_id);
         // The PASS account, not the device, is who the call runs as.
         assert_eq!(pass.account(), pass_account(&[0x51; 32]));
         assert_ne!(pass.account(), device.account());
-        // A plain key is not a PASS account's device.
+        // A plain key is no PASS account's device: it signs as its own account (F-045).
+        let plain = sign(device.as_ref(), &FORMAT_133, &call, &p, (9, [0xc0; 32]))
+            .await
+            .unwrap();
+        assert!(decode_extrinsic(&plain.bytes).is_err());
+        assert_eq!(
+            decode_native(&plain.bytes).unwrap().account,
+            device.account()
+        );
+    }
+
+    fn native_params() -> TxParams {
+        TxParams {
+            genesis: [0x6e; 32],
+            spec_version: 134,
+            transaction_version: 13,
+            era: Mortality::at(64, 1_000),
+            birth_hash: [0xb1; 32],
+            nonce: 7,
+            tip: 0,
+        }
+    }
+
+    /// `F-045`: a native account's transaction is v4 signed, from its own account, with no PASS
+    /// credential; its Ed25519 signature is over the signed payload; and it round-trips. The payload
+    /// is hashed only past 256 bytes, as `SignedPayload` does.
+    #[tokio::test]
+    async fn f_045_a_native_transaction_round_trips_and_verifies_against_its_account() {
+        let key = crate::signer::DevEd25519::from_secret(&[0x5e; 32]);
+        let p = native_params();
+        // A short call: the payload is signed as it is.
+        let short = vec![0x50, 0x06, 1, 2, 3];
+        let signed = sign(&key, &FORMAT_133, &short, &p, (9, [0xc0; 32]))
+            .await
+            .unwrap();
+        assert_eq!(signed.hash, blake2_256(&signed.bytes));
+        assert!(decode_extrinsic(&signed.bytes).is_err(), "not PASS");
+        let tx = decode_native(&signed.bytes).unwrap();
+        assert_eq!(tx.account, key.account());
+        assert_eq!((tx.nonce, tx.tip, era_of(tx.era)), (7, 0, (64, 40)));
+        assert_eq!(tx.call, short);
+        let payload = signed_payload(&short, &p);
+        assert!(payload.len() <= 256);
+        assert_eq!(
+            payload,
+            [&short[..], &explicit_native(&p), &implicit_after_pass(&p)].concat()
+        );
+        assert!(tx.signature.verify(&payload, &key.account()));
+        assert!(matches!(tx.signature, Signature::Ed25519(_)));
+        // Another nonce is another payload: the signature does not verify for it.
+        let other = TxParams { nonce: 8, ..p };
         assert!(
-            sign(device.as_ref(), &FORMAT_133, &call, &p, (9, [0xc0; 32]))
-                .await
-                .is_err()
+            !tx.signature
+                .verify(&signed_payload(&short, &other), &key.account())
+        );
+        // A long call: the payload is its blake2b-256.
+        let long = contracts_call(&[9; 32], &CallLimits::default(), &[0x77; 300]);
+        let signed = sign(&key, &FORMAT_133, &long, &p, (9, [0xc0; 32]))
+            .await
+            .unwrap();
+        let tx = decode_native(&signed.bytes).unwrap();
+        let payload = signed_payload(&long, &p);
+        assert_eq!(
+            payload,
+            blake2_256(&[&long[..], &explicit_native(&p), &implicit_after_pass(&p)].concat())
+        );
+        assert!(tx.signature.verify(&payload, &key.account()));
+        assert_eq!(
+            AnyTx::decode(&signed.bytes).unwrap().claimed_account(),
+            key.account()
+        );
+        assert!(AnyTx::decode(&[1, 2, 3]).is_err());
+    }
+
+    /// `F-045`: the native vector (`services/settle/kreivo-pin/vectors-native.json`). `kreivo-pin`
+    /// decodes the same bytes with Kreivo's own types (`sp-runtime` 48.0.0's `UncheckedExtrinsic`, its
+    /// v4 signed preamble, `MultiAddress`, `MultiSignature`) and verifies the signature over the payload
+    /// `UncheckedExtrinsic::check` builds, so this test and that crate pin the native transaction too.
+    #[tokio::test]
+    async fn f_045_the_native_transaction_matches_the_pinned_vector() {
+        check_native_vector(native_params(), "kreivo-pin/vectors-native.json").await;
+    }
+
+    /// `F-045`: the native vector on Kreivo `0.18.1` (spec 136, `transaction_version` 14,
+    /// `services/settle/kreivo-pin-136/vectors-native.json`), which `kreivo-pin-136` decodes and
+    /// verifies with that release's crates.
+    #[tokio::test]
+    async fn f_045_the_spec_136_native_transaction_matches_its_pinned_vector() {
+        let p = TxParams {
+            spec_version: 136,
+            transaction_version: 14,
+            ..native_params()
+        };
+        check_native_vector(p, "kreivo-pin-136/vectors-native.json").await;
+    }
+
+    /// The native transaction for `p`, built as [`sign_native`] builds it, against the vector at
+    /// `path` (relative to `services/settle`).
+    async fn check_native_vector(p: TxParams, path: &str) {
+        let key = crate::signer::DevEd25519::from_secret(&[0x5e; 32]);
+        let contract = [0xc0; 32];
+        let envelopes = vec![Envelope {
+            operation_ref: [1; 32],
+            call: Call::Withdraw {
+                to: Destination::Account([0xab; 32]),
+                asset: AssetId::Here(9001),
+                amount: 250,
+            },
+        }];
+        let limits = CallLimits {
+            gas_limit: Weight {
+                ref_time: 50_000_000_000,
+                proof_size: 1_000_000,
+            },
+            storage_deposit_limit: Some(1_000_000_000_000),
+        };
+        let data = execute_data(&envelopes);
+        let call = contracts_call(&contract, &limits, &data);
+        let signed = sign_native(&key, &call, &p).await.unwrap();
+        let tx = decode_native(&signed.bytes).unwrap();
+        fn h(b: impl AsRef<[u8]>) -> String {
+            hex::encode(b)
+        }
+        let got = serde_json::json!({
+            "inputs": {
+                "public": h(key.public()),
+                "contract": h(contract),
+                "execute_data": h(&data),
+                "gas_ref_time": limits.gas_limit.ref_time,
+                "gas_proof_size": limits.gas_limit.proof_size,
+                "storage_deposit_limit": limits.storage_deposit_limit.map(|l| l.to_string()),
+                "genesis": h(p.genesis),
+                "spec_version": p.spec_version,
+                "transaction_version": p.transaction_version,
+                "era_period": p.era.period,
+                "era_current": p.era.checkpoint,
+                "birth_hash": h(p.birth_hash),
+                "nonce": p.nonce,
+                "tip": p.tip.to_string(),
+            },
+            "outputs": {
+                "account": h(key.account()),
+                "era": h(era_bytes(&p.era)),
+                "call": h(&call),
+                "explicit": h(explicit_native(&p)),
+                "implicit": h(implicit_after_pass(&p)),
+                "signed_payload": h(signed_payload(&call, &p)),
+                "signature": h(&tx.signature.encode_multi()[1..]),
+                "extrinsic": h(&signed.bytes),
+                "extrinsic_hash": h(signed.hash),
+            },
+        });
+        let full = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
+        if std::env::var_os("UPDATE_KREIVO_VECTORS").is_some() {
+            let text = serde_json::to_string_pretty(&got).unwrap() + "\n";
+            std::fs::write(&full, text).unwrap();
+        }
+        let pinned: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&full).unwrap()).unwrap();
+        assert_eq!(
+            got, pinned,
+            "services/settle/{path} is stale: the encoding changed. Rerun with \
+             UPDATE_KREIVO_VECTORS=1 only after its pin crate agrees with Kreivo's types"
         );
     }
 }

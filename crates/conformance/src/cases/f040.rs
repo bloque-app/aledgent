@@ -6,8 +6,9 @@
 //! All seventeen are registered as pending when the amendment is applied (amendment 0013's
 //! practice), before `F-040` is built. They need the two steps of an approval, the policy of which
 //! commands need one, and the durable one-time use of its challenge (`T-040-02` to `T-040-06`).
-//! The refusal `ERR-CommandApprovalRequired` is held at ingress until the next core carries it
-//! (`T-040-10`; `closure::SPEC_AHEAD_OF_PROGRAM`).
+//! The refusal `ERR-CommandApprovalRequired` was held at ingress until the core carried it
+//! (`T-040-10`); the core's closed list has it from rules version 1 (`T-041-06`), and the
+//! conformance allowance (`closure::SPEC_AHEAD_OF_PROGRAM`) that named it is gone.
 
 // Case names end in `__<layer>`, so a test can be found by id and layer.
 #![allow(non_snake_case)]

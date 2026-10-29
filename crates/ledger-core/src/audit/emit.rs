@@ -18,6 +18,10 @@
 //! command, a privileged read. Such a note must name its action and its principal, or the store
 //! refuses the batch (`INV-20`).
 //!
+//! A settlement incident or a gap from [`crate::settlement::CHAINED_SETTLEMENT`] on is an
+//! [`IncidentNote`] in the batch that raises it (`T-043-07`): always a record of its own, after
+//! the batch's others, never joined to the batch's command record.
+//!
 //! Each record takes the next sequence number and the hash of the record before it. The records
 //! wait in the store's outbox until the audit store has acknowledged them
 //! ([`crate::Ledger::ship_audit`]).
@@ -51,6 +55,88 @@ pub struct AuditNote {
     pub outcome: AuditOutcome,
     /// The time input.
     pub at: Time,
+}
+
+/// A settlement incident or a gap, recorded on the audit trail and not in the book's state
+/// (`T-043-07`, amendment 0040, `REQ-AT-1` as amended): one record of the class
+/// [`AuditClass::SettlementIncident`], its action the incident whole.
+///
+/// It names no authority: the core detects an incident in what the settlement adapter reports,
+/// and no principal asked for it. The record names the adapter's identity, the source whose
+/// input raised it, as its subject, and the incident's operation where it has one; for one with
+/// none (a record of no operation, a gap), its operation reference is derived from the incident.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IncidentNote {
+    /// The incident.
+    pub incident: crate::settlement::Incident,
+    /// The source whose input raised it: the settlement configuration's authoritative source.
+    pub source: crate::settlement::SourceId,
+    /// The time input of the transition.
+    pub at: Time,
+    /// Moved from the book's state at the switch to the chained generation (`T-043-08`): the
+    /// record carries the justification that says so, and its time is the book's clock then.
+    pub moved: bool,
+}
+
+/// The justification of a record [`IncidentNote::moved`].
+pub const MOVED_TO_AUDIT: &[u8] =
+    b"moved from the book's state to the audit trail at the switch to the chained generation (F-043)";
+
+impl IncidentNote {
+    /// The operation the incident is of, if it names one.
+    pub fn op(&self) -> Option<OperationId> {
+        use crate::settlement::Incident as I;
+        match self.incident {
+            I::AmountMismatch { op, .. }
+            | I::LateEvidence { op, .. }
+            | I::FinalFailure { op, .. }
+            | I::SettlementRefused { op, .. }
+            | I::IncludedWithoutRecord { op, .. }
+            | I::EpochRefused {
+                refusal: crate::settlement::EpochRefusal::InFlight { op },
+                ..
+            } => Some(op),
+            I::Unassociated { .. }
+            | I::Unusable { .. }
+            | I::Gap(_)
+            | I::Missing { .. }
+            | I::Unknown { .. }
+            | I::BindRefused { .. }
+            | I::EpochRefused { .. } => None,
+        }
+    }
+
+    /// The record's operation reference: the incident's operation, or one derived from the
+    /// incident (`aledgent/settlement-incident/v1`).
+    fn operation_ref(&self) -> OperationId {
+        self.op().unwrap_or_else(|| {
+            let d = cipher_clerk::crypto::blake2b_256(
+                b"aledgent/settlement-incident/v1",
+                &[&crate::export::canon::to_bytes(&self.incident)],
+            );
+            let mut r = [0u8; 16];
+            r.copy_from_slice(&d[..16]);
+            OperationId::from_ref(ledger_kernel::posting::OperationRef(r))
+        })
+    }
+
+    fn draft(&self) -> Draft {
+        let op = self.operation_ref();
+        let mut subject = alloc::vec![AuditSubject::Identity(self.source.identity())];
+        if let Some(o) = self.op() {
+            subject.push(AuditSubject::Operation(o));
+        }
+        Draft {
+            class: AuditClass::SettlementIncident,
+            action: AuditAction::Incident(self.incident),
+            authorities: Vec::new(),
+            subject,
+            op,
+            at: self.at,
+            justification: self.moved.then(|| Justification(MOVED_TO_AUDIT.to_vec())),
+            outcome: AuditOutcome::Accepted,
+        }
+    }
 }
 
 /// A record before it takes its place in the chain.
@@ -197,6 +283,10 @@ pub(crate) fn derive(writes: &[Write]) -> Result<Vec<Draft>, StoreRefusal> {
     }
     out.extend(primary);
     out.extend(alone);
+    out.extend(writes.iter().filter_map(|w| match w {
+        Write::Incident(n) => Some(n.draft()),
+        _ => None,
+    }));
     Ok(out)
 }
 

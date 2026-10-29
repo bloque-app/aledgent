@@ -24,7 +24,7 @@
 //!                     (--anchors-rpc <node URL> | --no-anchors) [--from-genesis] [--report <dir>]
 //!                     [--accept-damaged-archive] [--fetch-concurrency <n>]
 //!                     [--chainspec <file>] [--genesis-manifest <file>] [--unnamed-code]
-//!                     [--core-host <aledgent-core-host> --runtime <pvm> --actor <vos> [--budget <bytes>]]
+//!                     [--core-host <aledgent-core-host> --runtime <pvm> --actor <vos> [--budget <bytes>] [--code-config <file>]]
 //!                                                 restore the Agent core from its off-node archive
 //!                                                 (T-005-16): check it, re-derive the book and run
 //!                                                 the drill's checks, lay it out on the fresh node,
@@ -310,7 +310,7 @@ async fn restore_core(args: &[String]) -> Result<(), Error> {
         },
         replay,
         rebuild,
-        rescan: None,
+        resume: None,
         size,
         checks,
     };
@@ -422,21 +422,18 @@ fn founding(
         }
         genesis.spec = Some(std::sync::Arc::new(spec));
     }
-    let keys = match &config.core_keys {
-        Some(k) => {
-            use signer::client::{Patience, RemoteClerk, RemoteCustody, SignerClient};
-            let client = std::sync::Arc::new(
-                SignerClient::connect(&k.signer).map_err(|e| Error::Config(e.to_string()))?,
-            );
-            let custody = RemoteCustody::new(
-                std::sync::Arc::clone(&client),
-                &k.key_ring,
-                Patience::PRODUCTION,
-            )
-            .map_err(|e| Error::Config(format!("core_keys.key_ring: {e}")))?;
-            let clerk = match &k.clerk {
-                Some(id) => Some(std::sync::Arc::new(
-                    RemoteClerk::new(client, id, Patience::PRODUCTION)
+    // The key ring and the clerk key, as before F-042: the Agent's keys are not this command's.
+    let keys = match config
+        .host_key_handles()
+        .map_err(|e| Error::Config(e.to_string()))?
+    {
+        Some(h) => {
+            use signer::client::{Patience, RemoteClerk, RemoteCustody};
+            let custody = RemoteCustody::from_key(h.key_ring, Patience::PRODUCTION)
+                .map_err(|e| Error::Config(format!("core_keys.key_ring: {e}")))?;
+            let clerk = match h.clerk {
+                Some(c) => Some(std::sync::Arc::new(
+                    RemoteClerk::from_key(c, Patience::PRODUCTION)
                         .map_err(|e| Error::Config(format!("core_keys.clerk: {e}")))?,
                 ) as core_binding::host::SharedClerk),
                 None => None,
@@ -576,7 +573,7 @@ fn restore_core_from(args: &[String]) -> Result<(), Error> {
             ..ops::restore::ReplayReport::default()
         },
         rebuild: verified.rebuild.clone(),
-        rescan: None,
+        resume: None,
         size: ops::drill::Size {
             postings: verified.postings,
             kernel_accounts: 0,
@@ -632,6 +629,11 @@ fn restore_core_from(args: &[String]) -> Result<(), Error> {
         ];
         if let Some(b) = opt(args, "--budget") {
             v.extend(["--budget".into(), b]);
+        }
+        // T-037-09: a book that has upgraded is re-sent range by range, each range under its own
+        // code version, which the core host fetches through the code sources it is given.
+        if let Some(c) = opt(args, "--code-config") {
+            v.extend(["--code-config".into(), c]);
         }
         // F-036: a chainspec book's core host needs its chainspec too, and the verify-genesis
         // report kept beside it, or the restored book takes no command. It reads both from the

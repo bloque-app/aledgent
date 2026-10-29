@@ -26,6 +26,13 @@
 //!   device_id, credential }>)` and its address generator; `pallet-asset-tx-payment` 49.0.0's
 //!   `ChargeAssetTxPayment { #[codec(compact)] tip, asset_id: Option<_> }`; and Kreivo's
 //!   `BlockHashChallenger`, copied below.
+//!
+//! **`F-045`: the native transaction** (`vectors-native.json`, pinned by
+//! `f_045_the_native_transaction_matches_the_pinned_vector` in `src/chain/kreivo.rs`): the same
+//! `UncheckedExtrinsic`, in its v4 signed form, from a native account (`MultiAddress::Id`) with a
+//! `MultiSignature::Ed25519`, `PassAuthenticate` carrying `None`; and the signature checked over the
+//! payload `UncheckedExtrinsic::check` builds (`sp-runtime` 48.0.0: `call ‖ explicit ‖ implicit`,
+//! hashed past 256 bytes), with `sp-core`'s Ed25519.
 
 #[cfg(test)]
 mod tests {
@@ -40,7 +47,9 @@ mod tests {
     use sp_core::{Pair, H256};
     use sp_crypto_hashing::blake2_256;
     use sp_runtime::generic::{Era, Preamble, UncheckedExtrinsic};
-    use sp_runtime::traits::{ExtensionVariant, ImplicationParts, TxBaseImplication, Verify};
+    use sp_runtime::traits::{
+        ExtensionVariant, IdentifyAccount, ImplicationParts, TxBaseImplication, Verify,
+    };
     use sp_runtime::{MultiAddress, MultiSignature};
     use sp_weights::Weight;
 
@@ -181,6 +190,120 @@ mod tests {
     /// Kreivo's `UncheckedExtrinsic`, with the call as bytes.
     type Extrinsic =
         UncheckedExtrinsic<MultiAddress<AccountId32, u16>, RawCall, MultiSignature, Extensions>;
+
+    fn native_vector() -> Value {
+        serde_json::from_str(include_str!("../vectors-native.json")).expect("vectors-native.json")
+    }
+
+    /// `F-045`: a native account's transaction, as Kreivo's crates decode and check it, equals the
+    /// pinned vector: v4 signed, from the key's own account, `PassAuthenticate` with no credential,
+    /// and an Ed25519 signature over `SignedPayload`'s bytes that `MultiSignature::verify` accepts
+    /// for that account and for no other payload.
+    #[test]
+    fn f_045_the_pinned_native_transaction_is_kreivos() {
+        let v = native_vector();
+        let (i, o) = (&v["inputs"], &v["outputs"]);
+        // The account is the key: `MultiSigner::Ed25519(public).into_account()`.
+        let public = sp_core::ed25519::Public::from_raw(arr32(&i["public"]));
+        let account: AccountId32 = sp_runtime::MultiSigner::Ed25519(public).into_account();
+        assert_eq!(
+            account,
+            AccountId32::from(arr32(&o["account"])),
+            "the account"
+        );
+        // The key is `services/settle`'s test seed (`DevEd25519::from_secret`).
+        let key = sp_core::ed25519::Pair::from_seed(&DEVICE_SECRET);
+        assert_eq!(key.public(), public, "the vector's key");
+        let current = num(&i["era_current"]);
+        let era = Era::mortal(num(&i["era_period"]), current);
+        assert_eq!(era.encode(), bytes(&o["era"]), "the era");
+        let contract = arr32(&i["contract"]);
+        let sdl: Option<u128> = i["storage_deposit_limit"]
+            .as_str()
+            .map(|s| s.parse().expect("a u128"));
+        let call = (
+            80u8,
+            6u8,
+            MultiAddress::<AccountId32, u16>::Id(AccountId32::from(contract)),
+            Compact(0u128),
+            Weight::from_parts(num(&i["gas_ref_time"]), num(&i["gas_proof_size"])),
+            sdl.map(Compact),
+            bytes(&i["execute_data"]),
+        )
+            .encode();
+        assert_eq!(call, bytes(&o["call"]), "the call");
+        let nonce = u32::try_from(num(&i["nonce"])).expect("Kreivo's nonce is u32");
+        let tip: u128 = i["tip"].as_str().unwrap().parse().unwrap();
+        let explicit: Extensions = (
+            PassAuthenticate(None),
+            (),
+            (),
+            (),
+            (),
+            era,
+            Compact(nonce),
+            (),
+            ChargeAssetTxPayment {
+                tip,
+                asset_id: None,
+            },
+        );
+        assert_eq!(
+            explicit.encode(),
+            bytes(&o["explicit"]),
+            "the explicit data"
+        );
+        // Every extension's implicit data, `PassAuthenticate`'s `()` first.
+        let implicit = (
+            (),
+            (),
+            u32::try_from(num(&i["spec_version"])).unwrap(),
+            u32::try_from(num(&i["transaction_version"])).unwrap(),
+            H256(arr32(&i["genesis"])),
+            H256(arr32(&i["birth_hash"])),
+            (),
+            (),
+            (),
+        );
+        assert_eq!(
+            implicit.encode(),
+            bytes(&o["implicit"]),
+            "the implicit data"
+        );
+        // The transaction, as Kreivo decodes it, and re-encodes to the same bytes.
+        let raw = bytes(&o["extrinsic"]);
+        let xt = Extrinsic::decode(&mut &raw[..]).expect("Kreivo decodes the transaction");
+        assert_eq!(xt.encode(), raw);
+        assert_eq!(blake2_256(&raw).to_vec(), bytes(&o["extrinsic_hash"]));
+        let Preamble::Signed(address, signature, ext) = &xt.preamble else {
+            panic!("not a v4 signed transaction: {:?}", xt.preamble)
+        };
+        assert_eq!(*address, MultiAddress::Id(account.clone()));
+        assert_eq!(*ext, explicit);
+        assert_eq!(xt.function, RawCall(call.clone()));
+        let MultiSignature::Ed25519(sig) = signature else {
+            panic!("not an Ed25519 signature: {signature:?}")
+        };
+        assert_eq!(sig.0.to_vec(), bytes(&o["signature"]), "the signature");
+        // `UncheckedExtrinsic::check`'s payload: `(call, explicit, implicit)` encoded, its
+        // blake2b-256 past 256 bytes; and the signature verifies over it for this account.
+        let payload = (RawCall(call.clone()), explicit.clone(), implicit).encode();
+        let payload = if payload.len() > 256 {
+            blake2_256(&payload).to_vec()
+        } else {
+            payload
+        };
+        assert_eq!(payload, bytes(&o["signed_payload"]), "the signed payload");
+        assert!(
+            signature.verify(&payload[..], &account),
+            "the signature verifies"
+        );
+        // Not over another payload, nor for another account.
+        let mut other = payload.clone();
+        other[0] ^= 1;
+        assert!(!signature.verify(&other[..], &account));
+        assert!(!signature.verify(&payload[..], &AccountId32::from([0x11; 32])));
+    }
 
     /// `T-027-03`: the transaction, its call, its extensions, the challenge and the device's
     /// signature, as Kreivo's crates build and check them, equal the pinned vector.

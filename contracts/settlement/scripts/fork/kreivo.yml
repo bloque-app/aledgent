@@ -1,0 +1,19 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Chopsticks: a local fork of Kreivo mainnet with mock signatures, for rehearse.mjs only. Nothing
+# reaches mainnet but reads. PassAuthenticate is registered so that every extrinsic decodes.
+endpoint:
+  - wss://rpc.kreivo.bloque.sh
+host: 127.0.0.1
+mock-signature-host: true
+build-block-mode: Manual
+runtime-log-level: 0
+registered-types:
+  typesBundle:
+    spec:
+      kreivo-parachain:
+        signedExtensions:
+          PassAuthenticate:
+            extrinsic:
+              authenticateParams: Option<FcPalletPassExtensionsAuthenticateParams>
+            payload: {}

@@ -180,6 +180,21 @@ pub mod kind {
     pub const INGESTED_AT: u8 = 58;
     pub const POSITION_TALLY: u8 = 59;
     pub const POSITION_COUNTED: u8 = 39;
+    // A re-scan's differences already recorded (`REQ-IN-5`), read by key instead of the
+    // incidents whole.
+    pub const RESCAN_RECORDED: u8 = 38;
+    // The end of the highest gap (amendment 0040, ruling a40c-gaps-watermark, `T-043-07`): one
+    // number in place of the gaps' list, from the chained generation on.
+    pub const GAP_END: u8 = 37;
+    // The settlement sequence the book follows (amendment 0041, `T-043-14`): the last start the
+    // core took, from `SETTLEMENT_EPOCHS` on.
+    pub const SETTLEMENT_EPOCH: u8 = 36;
+    // The end of the highest gap of each sequence the adapter named (amendment 0041, decision 6
+    // made exact, `T-043-14`): from `SETTLEMENT_EPOCHS` on, beside the untagged `GAP_END`.
+    pub const GAP_END_BY_SEQUENCE: u8 = 34;
+    // A head the adapter reported at a later block with a lower position, not taken (amendment
+    // 0041's guard, `T-043-17`): while set, no instruction that can expire is built.
+    pub const HEAD_REPORTED: u8 = 35;
     // The operator records.
     pub const OPERATOR_GRANT: u8 = 60;
     pub const OPERATOR_GRANTS_BY_PRINCIPAL: u8 = 61;

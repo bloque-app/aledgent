@@ -46,8 +46,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::archive::{Archive, ArchiveSink as _, ArchiveSource as _, contiguous_end};
 use crate::record::{
-    CheckpointHeader, FORMAT, Point, SegmentHeader, Span, decode_checkpoint, decode_segment,
-    encode_checkpoint, encode_segment, sha256_hex,
+    CheckpointHeader, FORMAT, Point, SegmentHeader, Span, encode_checkpoint, encode_segment,
+    sha256_hex,
 };
 use crate::store::StoreError;
 
@@ -361,9 +361,10 @@ enum Failed {
 impl From<StoreError> for Failed {
     fn from(e: StoreError) -> Self {
         match e {
-            StoreError::Conflict(_) | StoreError::Corrupt(_) | StoreError::InvalidName(_) => {
-                Failed::Conflict(e.to_string())
-            }
+            StoreError::Conflict(_)
+            | StoreError::Corrupt(_)
+            | StoreError::InvalidName(_)
+            | StoreError::Sealed(_) => Failed::Conflict(e.to_string()),
             StoreError::TooLarge(_) | StoreError::Unavailable(_) => Failed::Retry(e.to_string()),
         }
     }
@@ -519,21 +520,23 @@ impl Run {
             ));
         }
         if end > 0 {
-            let rec = self
+            // F-044: the header and digest only, which a sealed archive keeps in clear, so the
+            // core host resumes with no key that opens the archive. The local logs are checked
+            // against the header's SHA-256 of each payload below, as before.
+            let (header, digest) = self
                 .archive
-                .get_segment(end)
+                .segment_head(end)
                 .map_err(|e| e.to_string())?
                 .ok_or("the last segment vanished")?;
-            let s = decode_segment(&rec).map_err(|e| e.to_string())?;
-            if s.header.book != self.book {
+            if header.book != self.book {
                 return Err(format!(
                     "the archive is of book {}, this host's is {}",
-                    s.header.book, self.book
+                    header.book, self.book
                 ));
             }
             for (name, span) in [
-                (ARCHIVE_FILE, &s.header.archive),
-                (REPLIES_FILE, &s.header.replies),
+                (ARCHIVE_FILE, &header.archive),
+                (REPLIES_FILE, &header.replies),
             ] {
                 let local =
                     read_range(&self.dir.join(name), span.start, span.end).map_err(|_| {
@@ -546,19 +549,18 @@ impl Run {
                 }
             }
             self.next = end + 1;
-            self.prev = s.digest;
-            self.off_archive = s.header.archive.end;
-            self.off_replies = s.header.replies.end;
-            self.point = s.header.point;
+            self.prev = digest;
+            self.off_archive = header.archive.end;
+            self.off_replies = header.replies.end;
+            self.point = header.point;
             if let Ok(cps) = self.archive.checkpoints()
                 && let Some(&n) = cps.iter().rev().find(|n| **n <= end)
-                && let Ok(Some(rec)) = self.archive.get_checkpoint(n)
-                && let Ok(c) = decode_checkpoint(&rec)
+                && let Ok(Some(c)) = self.archive.checkpoint_head(n)
             {
                 self.checkpoint = Some(CheckpointAt {
                     n,
-                    entries: c.header.point.entries,
-                    at: c.header.taken_at,
+                    entries: c.point.entries,
+                    at: c.taken_at,
                 });
             }
         }

@@ -717,8 +717,8 @@ pub struct Drilled<I: IngressStore, A: AdapterStore> {
 /// Run the restore drill (`T-018-03`): restore the audit store, the core from its backup against
 /// the received-log in `ingress_store`, check the restored book before anything else reaches it,
 /// rebuild the leaf store, start a replica, let it decide what the log holds undecided, check that
-/// every acknowledged operation exists, and re-scan the layer with the adapter over
-/// `adapter_store`. `ingress_store` and `adapter_store` are restored to their latest point.
+/// every acknowledged operation exists, and resume the adapter over `adapter_store` from the head
+/// it accepted until it accepts the layer's. `ingress_store` and `adapter_store` are restored to their latest point.
 pub async fn run_drill<I: IngressStore, A: AdapterStore>(
     plan: &DrillPlan<'_>,
     outside: &Outside<A>,
@@ -843,17 +843,17 @@ pub async fn run_drill<I: IngressStore, A: AdapterStore>(
         c.verdict = Verdict::Failed;
         c.detail = format!("{}; after the forwarder: {}", c.detail, lost.join("; "));
     }
-    // The adapter, from its cursor, and the re-scan.
+    // The adapter, resuming from the head it accepted (amendment 0040).
     let mut adapter = (outside.adapter)(adapter_store, &router);
-    let rescan = crate::restore::rescan_adapter(&mut adapter, 64).await?;
+    let resume = crate::restore::resume_adapter(&mut adapter, 64).await?;
     found.push(Check {
         name: "REQ-IN-5".into(),
-        verdict: if rescan.is_clean() {
+        verdict: if resume.is_clean() {
             Verdict::Passed
         } else {
             Verdict::Failed
         },
-        detail: format!("{rescan:?}"),
+        detail: format!("{resume:?}"),
     });
     let inputs_restored = replay.last_input;
     let inputs_before = plan.expected.map(|e| e.inputs);
@@ -871,7 +871,7 @@ pub async fn run_drill<I: IngressStore, A: AdapterStore>(
         },
         replay,
         rebuild,
-        rescan: Some(rescan),
+        resume: Some(resume),
         size,
         checks: found,
     };

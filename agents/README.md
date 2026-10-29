@@ -55,7 +55,7 @@ anywhere with the toolchain and `rust-src`.
 
     # Package the actor, run a few commands through VOS, measure the reservation path
     aledgent-core-host package aledgent_core.elf core.vos
-    # A later generation claims the state of the previous generation's program (T-037-19), which
+    # A later rules version claims the state of the previous rules version's program (T-037-19), which
     # the runtime needs to change the stateful core's program in place; the genesis claims none
     aledgent-core-host package aledgent_core.elf core.vos --previous previous-core.vos
     aledgent-core-host smoke agent_runtime.pvm core.vos

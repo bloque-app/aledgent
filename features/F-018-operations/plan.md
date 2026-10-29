@@ -49,7 +49,7 @@ plug in.
 | Core Agent | roots, hot records, committed delta log, outbox, operation records | `F-014` export on a cadence; VOS space backup when qualified | backup, then replay of the input log |
 | Leaf store | leaves, history, indexes | none | rebuilt from the delta log (`DEC-4`, `F-006`) |
 | Ingress | received-log, input order, delivery attempts, recipients | PostgreSQL base backup and WAL archive | itself, to the latest point |
-| Adapter | instructions, extrinsics, cursors, gaps | PostgreSQL base backup and WAL archive | itself, then an inbox re-scan |
+| Adapter | instructions, extrinsics, cursors, gaps | PostgreSQL base backup and WAL archive | itself, then a resume from its accepted head (amendment 0040) |
 | Audit trail | append-only records | its own retention store (`F-013`, `NFR-6`) | itself |
 | Keys | signer, clerk key, core root | the KMS or HSM's own backup | never in these backups |
 
@@ -64,7 +64,7 @@ the `F-014` export, on a cadence. A VOS space backup runs in a short stop window
 3. Replay every ingress input with `core_input_seq > s_b`, in order. Every core input passes through
    ingress (`F-009`): commands, ticks, observations and delivery records. So this replay is complete.
 4. Rebuild the leaf store from the delta log (`F-006`).
-5. Restore the adapter store and re-scan the inbox from its cursor. The chain is the truth for settlement.
+5. Restore the adapter store and resume from the head it last accepted for each instance, catching up from the history endpoint if it is behind what a full node keeps. It checks the entries it reads against the head the layer holds, so no range is re-read on a timer (amendment 0040). The chain is the truth for settlement.
 
 **Drill** (`NFR-10`). The same procedure, on an isolated host with no network path to production. One VOS
 identity must never run on two live machines. It checks:
@@ -83,7 +83,7 @@ VOS or CipherClerk pin. *Alternative:* quarterly.
 | Signal | Source | Pages when |
 |---|---|---|
 | Age of the oldest non-terminal operation (`REQ-OP-8`) | core query; oldest `Received` row in ingress | over its service level; `Received` over the `REQ-CS-7` bound |
-| Observation completeness | adapter: cursor lag behind the finalized inbox head, open gaps, last re-scan difference | any gap or difference; lag over a limit |
+| Observation completeness | adapter: cursor lag behind the finalized inbox head, open gaps, open chain mismatches (`AledgentSettlementChainMismatch`) | any gap or mismatch; lag over a limit |
 | Undelivered notifications, count and age (`REQ-EV-6`) | core outbox, through the delivery worker | oldest over a limit |
 | Anchor lag | core: time since the newest `Final` checkpoint was created | over twice the cadence |
 | Reconciliation outcome per axis | reconciliation job | any non-zero result, or no run in 24 h |

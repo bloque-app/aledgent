@@ -7,8 +7,9 @@
 //! - no case cites an id the catalogue does not hold;
 //! - case names are unique and owners are features of PLAN §4;
 //! - `ledger-core`'s closed [`Refusal`] list equals the catalogue's `ERR-*`
-//!   ids and descriptions, both ways (`REQ-ER-1`), with the one named allowance of
-//!   [`SPEC_AHEAD_OF_PROGRAM`] (amendment 0037), which fails once its release ships.
+//!   ids and descriptions, both ways (`REQ-ER-1`), with the named allowances of
+//!   [`SPEC_AHEAD_OF_PROGRAM`], each of which fails once its release ships. There is none today:
+//!   amendment 0037's one ended with rules version 1 (`T-041-06`).
 //!
 //! Each check is a pure function of the catalogue and a case table, so the
 //! tests below run it on fixture tables that must fail.
@@ -118,8 +119,8 @@ pub fn refusals() -> Vec<(&'static str, &'static str)> {
 ///
 /// The only way the spec may hold an error the program's closed list does not: the line is in
 /// `SPEC.md` §10 and in no `Refusal`, and the check below is told so by name. The allowance names
-/// the amendment that put the line in the spec and the release that ends it, as the core's code
-/// generation (`ends_at_generation`), and the check **fails once that release ships**, whether or
+/// the amendment that put the line in the spec and the release that ends it, as the core's rules
+/// version (`ends_at_generation`), and the check **fails once that release ships**, whether or
 /// not the core got the line, so the allowance cannot outlive its reason. The other direction, a `Refusal` with no line in §10, stays a hard failure.
 /// `T-040-15` makes this data on the spec item; this list is the stopgap until it is decided.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,14 +131,14 @@ pub struct SpecAhead {
     pub amendment: &'static str,
     /// The release that ends the allowance, in words.
     pub ends_with: &'static str,
-    /// The release, as a number that changes by itself: the code generation of the core that
+    /// The release, as a number that changes by itself: the rules version of the core that
     /// ends the allowance (`REQ-RT-20`; every upgrade of the core raises it). While the core's
     /// compiled generation is below it, the allowance holds; at it, the allowance fails whether
     /// or not the core got the line.
     pub ends_at_generation: u64,
 }
 
-/// The code generation the core Agent is compiled with: the `GENERATION` of `agents/core`, read
+/// The rules version the core Agent is compiled with: the `GENERATION` of `agents/core`, read
 /// from its source so that the check follows the code and not a copy.
 pub fn core_generation() -> Result<u64, String> {
     const CORE: &str = include_str!("../../../agents/core/src/lib.rs");
@@ -152,17 +153,12 @@ pub fn core_generation() -> Result<u64, String> {
         .map_err(|e| format!("the core's GENERATION does not parse: {e}"))
 }
 
-/// The one allowance. It **weakens `REQ-ER-1`** (the closed list is closed in both directions)
-/// until the next core: `ERR-CommandApprovalRequired` is answered by ingress from its own type
-/// (`ingress::refusal::IngressRefusal`), and the core's `Refusal` gets the line, with its audit code
-/// appended at the end, in the release of `T-041-06`, which removes this entry in the same change.
-pub const SPEC_AHEAD_OF_PROGRAM: &[SpecAhead] = &[SpecAhead {
-    id: "ERR-CommandApprovalRequired",
-    amendment: "0037",
-    ends_with: "the next core, the first of code generation 1, which carries the core's line for \
-                the refusal (T-041-06)",
-    ends_at_generation: 1,
-}];
+/// The allowances in force: none. The one there was, for `ERR-CommandApprovalRequired`
+/// (amendment 0037, `T-040-10`), ended with rules version 1: the line is in `ledger-core`'s
+/// `Refusal`, appended at the end so no audit code moves, and ingress sends it from there
+/// (`T-041-06`). The mechanism stays for the next spec line that runs ahead of the core
+/// (`T-040-15`).
+pub const SPEC_AHEAD_OF_PROGRAM: &[SpecAhead] = &[];
 
 /// The closed refusal list equals the catalogue's errors, both ways, and
 /// each description is the published one (`REQ-ER-1`), with the named
@@ -370,27 +366,47 @@ mod tests {
         assert!(err[0].starts_with("ERR-NotAuthorised: the runtime description"));
     }
 
-    #[test]
-    fn the_one_allowance_names_its_amendment_and_release() {
-        assert_eq!(SPEC_AHEAD_OF_PROGRAM.len(), 1);
-        let a = SPEC_AHEAD_OF_PROGRAM[0];
-        assert_eq!(a.id, "ERR-CommandApprovalRequired");
-        assert_eq!(a.amendment, "0037");
-        assert!(a.ends_with.contains("T-041-06"));
-        assert_eq!(a.ends_at_generation, 1);
+    /// A fixture allowance, as the one `T-040-10` added was: a spec line ahead of the core, ended by
+    /// rules version 2 (the real list is empty, so the expiry logic is tested on this).
+    const FIXTURE: SpecAhead = SpecAhead {
+        id: "ERR-CommandApprovalRequired",
+        amendment: "0037",
+        ends_with: "a fixture release, the first of rules version 2",
+        ends_at_generation: 2,
+    };
+
+    /// The core's refusals but one, as a core that did not have the line would list them.
+    fn refusals_without(id: &str) -> Vec<(&'static str, &'static str)> {
+        refusals().into_iter().filter(|(c, _)| *c != id).collect()
     }
 
     #[test]
-    fn the_allowance_holds_today_and_fails_at_the_next_core_even_without_the_line() {
-        // The core as compiled today is generation 0: the allowance holds.
-        assert_eq!(core_generation(), Ok(0));
+    fn there_is_no_allowance_in_force_and_the_core_carries_the_line_t_041_06() {
+        // Rules version 1 is the core's release that ended amendment 0037's allowance: the line is
+        // in `Refusal`, nothing is allowed to be missing, and the closed list equals §10 exactly.
+        assert!(SPEC_AHEAD_OF_PROGRAM.is_empty());
+        assert_eq!(core_generation(), Ok(1));
         assert!(
-            refusal_matches_catalogue(&cat(), &refusals(), SPEC_AHEAD_OF_PROGRAM, 0).is_ok(),
-            "the allowance holds while the core is at generation 0"
+            refusals()
+                .iter()
+                .any(|(code, _)| *code == "ERR-CommandApprovalRequired"),
+            "Refusal carries ERR-CommandApprovalRequired"
         );
-        // The next core is generation 1. Whether or not it carries the line, the allowance is over.
-        let err =
-            refusal_matches_catalogue(&cat(), &refusals(), SPEC_AHEAD_OF_PROGRAM, 1).unwrap_err();
+        assert_eq!(
+            refusal_matches_catalogue(&cat(), &refusals(), SPEC_AHEAD_OF_PROGRAM, 1),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_fixture_allowance_holds_until_its_rules_version_and_fails_at_it_even_without_the_line() {
+        let list = refusals_without("ERR-CommandApprovalRequired");
+        assert!(
+            refusal_matches_catalogue(&cat(), &list, &[FIXTURE], 1).is_ok(),
+            "the allowance holds while the core is below the rules version that ends it"
+        );
+        // At the rules version that ends it, the allowance is over, whether or not the line is in.
+        let err = refusal_matches_catalogue(&cat(), &list, &[FIXTURE], 2).unwrap_err();
         assert_eq!(err.len(), 1, "{err:?}");
         assert!(
             err[0].contains("the allowance of amendment 0037 ended"),
@@ -400,7 +416,8 @@ mod tests {
 
     #[test]
     fn without_the_allowance_the_spec_line_ahead_of_the_program_fails() {
-        let err = refusal_matches_catalogue(&cat(), &refusals(), &[], 0).unwrap_err();
+        let list = refusals_without("ERR-CommandApprovalRequired");
+        let err = refusal_matches_catalogue(&cat(), &list, &[], 1).unwrap_err();
         assert_eq!(
             err,
             vec!["SPEC §10 names ERR-CommandApprovalRequired, which Refusal lacks".to_string()]
@@ -409,14 +426,8 @@ mod tests {
 
     #[test]
     fn the_allowance_fails_once_the_core_carries_the_line() {
-        let mut list = refusals();
-        let description = cat()
-            .error("ERR-CommandApprovalRequired")
-            .unwrap()
-            .condition
-            .clone();
-        list.push(("ERR-CommandApprovalRequired", description.leak()));
-        let err = refusal_matches_catalogue(&cat(), &list, SPEC_AHEAD_OF_PROGRAM, 0).unwrap_err();
+        // The core as it is, with the line: an allowance for it is left over and must go.
+        let err = refusal_matches_catalogue(&cat(), &refusals(), &[FIXTURE], 1).unwrap_err();
         assert_eq!(err.len(), 1, "{err:?}");
         assert!(err[0].ends_with("remove the allowance"), "{err:?}");
     }
@@ -424,12 +435,12 @@ mod tests {
     #[test]
     fn an_allowance_without_an_amendment_or_a_release_fails() {
         let bare = [SpecAhead {
-            id: "ERR-CommandApprovalRequired",
             amendment: "",
             ends_with: "",
-            ends_at_generation: 1,
+            ..FIXTURE
         }];
-        let err = refusal_matches_catalogue(&cat(), &refusals(), &bare, 0).unwrap_err();
+        let list = refusals_without("ERR-CommandApprovalRequired");
+        let err = refusal_matches_catalogue(&cat(), &list, &bare, 1).unwrap_err();
         assert_eq!(err.len(), 1, "{err:?}");
     }
 
@@ -437,9 +448,9 @@ mod tests {
     fn the_allowance_covers_that_error_only() {
         let list: Vec<_> = refusals()
             .into_iter()
-            .filter(|(c, _)| *c != "ERR-QueryUnbounded")
+            .filter(|(c, _)| *c != "ERR-QueryUnbounded" && *c != "ERR-CommandApprovalRequired")
             .collect();
-        let err = refusal_matches_catalogue(&cat(), &list, SPEC_AHEAD_OF_PROGRAM, 0).unwrap_err();
+        let err = refusal_matches_catalogue(&cat(), &list, &[FIXTURE], 1).unwrap_err();
         assert_eq!(
             err,
             vec!["SPEC §10 names ERR-QueryUnbounded, which Refusal lacks".to_string()]
