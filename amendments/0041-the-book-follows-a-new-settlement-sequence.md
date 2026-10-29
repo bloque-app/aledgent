@@ -75,9 +75,9 @@ needed (decision 2).
    - **Instructions:** none can be in flight. Every test asset is `book_only`, so no withdrawal can be
      instructed at all.
 7. **Prod's core has never seen settlement.** `p2` holds no head, no final record and no instruction.
-8. **No real book has run generation 1.** The core Agent is still built as `GENERATION = 0`
+8. **No real book has run rules version 1.** The core Agent is still built as `GENERATION = 0`
    (`agents/core/src/lib.rs:36`), and both books run their genesis code. `CHAINED_SETTLEMENT` is 1
-   (`crates/ledger-core/src/settlement/mod.rs:83`). The `code-history` fixture's generation-1 and 2 ranges hold
+   (`crates/ledger-core/src/settlement/mod.rs:83`). The `code-history` fixture's rules version-1 and 2 ranges hold
    no adapter input (`Adapter` is in `NOT_YET_RECORDED`).
 
 ## The design
@@ -118,7 +118,7 @@ On the core's answer:
 | started the sequence, or already holds it | goes on; the confirmation is kept, so the sequence is not reported again |
 | refused it: the sequence names another book | raises `reset:<instance>`, as today, and reports nothing more until `refound` (the book was re-founded) |
 | refused it for any other reason, or refused the command with any code but `ERR-MalformedCommand` | raises `epoch:<instance>:<epoch>` (pages), reports nothing of the new chain, and reports the start again every ten minutes |
-| cannot take the input: `ERR-MalformedCommand` (a core before the generation of this amendment, or ingress's route closed) | in a live reset, raises `reset:` as today; otherwise raises `epoch-unsupported:<instance>:<epoch>`, which pages since the adapter is then held and withdrawals are off, and goes on |
+| cannot take the input: `ERR-MalformedCommand` (a core before the rules version of this amendment, or ingress's route closed) | in a live reset, raises `reset:` as today; otherwise raises `epoch-unsupported:<instance>:<epoch>`, which pages since the adapter is then held and withdrawals are off, and goes on |
 
 A start the core takes clears every `epoch:` and `epoch-unsupported:` alert of the instance, whatever sequence
 raised it.
@@ -127,7 +127,7 @@ raised it.
 `epoch-unsupported:` alert of the instance is open, the adapter declares to the core that it does not serve
 (`REQ-SA-2`), and declares again as soon as that changes. It keeps running: it retries the start and lifts the
 hold once the core takes it. So `withdraw` and `submit_outbound` are refused with
-`ERR-SettlementLayerUnavailable` at any generation, and no instruction is built from a head the adapter stopped
+`ERR-SettlementLayerUnavailable` at any rules version, and no instruction is built from a head the adapter stopped
 sending. The settlement comparison is refused too while held. This is what covers a reset when both switches are
 off (prod's planned reset), and a start the core refused or cannot take.
 
@@ -135,8 +135,8 @@ off (prod's planned reset), and a start the core refused or cannot take.
 
 ### What the core does with it
 
-From the generation `SETTLEMENT_EPOCHS` on (decision 1), the core takes the start as follows. Before that
-generation it refuses the input with `ERR-MalformedCommand` and writes nothing, so earlier inputs replay as they
+From the rules version `SETTLEMENT_EPOCHS` on (decision 1), the core takes the start as follows. Before that
+rules version it refuses the input with `ERR-MalformedCommand` and writes nothing, so earlier inputs replay as they
 were decided.
 
 1. **The same sequence again** (equal in every field) is `Recorded`, and nothing changes. **An earlier or equal
@@ -168,20 +168,20 @@ of a running book's incidents also moves the next ones to the audit trail.)
 **Left as they are:**
 - **The positions' tally.** It only passes final positions, and step 4 leaves none of an earlier sequence at or
   above `from_seq`.
-- **The index by position.** Nothing from generation 1 on reads it.
+- **The index by position.** Nothing from rules version 1 on reads it.
 
 ### The guard (a follow-up, `T-043-17`)
 
-From the same generation, when the core drops a head because its position is lower but its block is later, it
+From the same rules version, when the core drops a head because its position is lower but its block is later, it
 records that head as **reported and not taken**. Taking a later head, or a start, clears it. While one is
 recorded, `withdraw` and `submit_outbound` are refused with `ERR-SettlementLayerUnavailable`. It arms only when
 the adapter goes on sending heads of the new chain: a first start on it before the core took the start (test's
 case), from a core at `SETTLEMENT_EPOCHS`. When the adapter stops instead (`reset:`, or a start refused or not
 taken), it sends no head, and its declaration covers it ("While held", above). Two cases are covered by neither:
 an adapter built before this amendment, on a live reset; and a first start with both switches off and a core at
-generation 0 (test today, harmless only because every test asset is `book_only`).
+rules version 0 (test today, harmless only because every test asset is `book_only`).
 
-**Except during `T-043-08`'s move of a running book's incidents.** From the switch input to the generation and
+**Except during `T-043-08`'s move of a running book's incidents.** From the switch input to the rules version and
 for up to incidents / 32 adapter inputs after it, the core records no head reported and not taken, so the guard
 does not arm: proving its leaf absent while the incidents leaf is still full would take the move's input past
 the guest's arena (`f043_incidents_heap`). A book upgraded in place is covered once its old incidents are moved.
@@ -247,7 +247,7 @@ sequence (`REQ-SL-1`); one book's record MAY run over several sequences".
     a start only when its own says `report_resets` (both off by default). They are turned on in a deployment
     template once that deployment's core runs a build with `T-043-14` at `SETTLEMENT_EPOCHS`.
   - A core host or Agent package built before this amendment refuses the whole feed, as above (test's `r10`
-    runs its genesis package). A core host and package built with it, still at generation 0, refuse the input
+    runs its genesis package). A core host and package built with it, still at rules version 0, refuse the input
     cleanly (`ERR-MalformedCommand`); so does ingress with its route closed. The adapter then raises
     `epoch-unsupported:` (it pages) and declares itself not serving.
   - An ingress built before `T-043-14` has no epoch route and answers the adapter's report
@@ -260,11 +260,11 @@ sequence (`REQ-SL-1`); one book's record MAY run over several sequences".
   - A core at `SETTLEMENT_EPOCHS` with the switches off is never told. On a live reset the adapter stops
     (`reset:`) and declares itself not serving; after a first start on the new chain, the guard refuses
     withdrawals while the head is stale.
-  - The core changes of `T-043-14` and `T-043-17` both decide generation-1 inputs. No generation-1 core
+  - The core changes of `T-043-14` and `T-043-17` both decide rules version-1 inputs. No rules version-1 core
     package may be built or applied before both are on `develop` (decision 1).
 - **Test.** Before the upgrade, read `r10`'s settlement incident count: above 32, the guard is blind for more
   than the switch input (incidents / 32 adapter inputs, about two seconds each) while they are moved.
-  1. The core's in-place upgrade to the package built as generation 1 (`T-037-19`'s path, the same upgrade that
+  1. The core's in-place upgrade to the package built as rules version 1 (`T-037-19`'s path, the same upgrade that
      takes `T-043-06` to `T-043-08`).
   2. Then `settlement_epochs: true` in test's ingress template and `report_resets: true` in its settle template
      (bloque-ledgent). The adapter reports epoch 2 once. Before turning them on, read `r10`'s chainspec digest
@@ -297,10 +297,10 @@ sequence (`REQ-SL-1`); one book's record MAY run over several sequences".
 
 ## Decisions for the owner
 
-1. **The generation.** *Ruled as built (q28).* `SETTLEMENT_EPOCHS = CHAINED_SETTLEMENT = 1`, so test needs one core upgrade,
-   0 to 1, the same one `T-043-06` to `T-043-08` need. *Alternative:* a new generation 2, which costs a second
-   in-place upgrade (1 to 2) on each book. Generation 1 is safe only because no book has decided an input at
-   generation 1 yet (fact 8). Once one has, the rule needs 2. So no generation-1 package may be built or
+1. **The rules version.** *Ruled as built (q28).* `SETTLEMENT_EPOCHS = CHAINED_SETTLEMENT = 1`, so test needs one core upgrade,
+   0 to 1, the same one `T-043-06` to `T-043-08` need. *Alternative:* a new rules version 2, which costs a second
+   in-place upgrade (1 to 2) on each book. Rules version 1 is safe only because no book has decided an input at
+   rules version 1 yet (fact 8). Once one has, the rule needs 2. So no rules version-1 package may be built or
    applied before `T-043-14` and `T-043-17` are both on `develop`.
 2. **Instructions in flight at a start.** *Ruled as built (Pablo, 28 Oct):* the start is refused while any instruction is not yet
    decided. Such an instruction then cannot be decided by proof, so the operator resolves it through review
@@ -335,7 +335,7 @@ sequence (`REQ-SL-1`); one book's record MAY run over several sequences".
      withdrawal to review.
    - Clearing is safe because a start is refused while any instruction is live (decision 2), so `proof` has
      nothing of the earlier sequence left to decide.
-   - Rules version (generation) 1 only. Generation 0 refuses the new input and decides and replays as before.
+   - Rules version 1 only. Rules version 0 refuses the new input and decides and replays as before.
 7. **The guard's error.** *Ruled as built (q28):* `ERR-SettlementLayerUnavailable`, with its meaning extended. *Alternative:*
    a new error condition.
 8. **Who reads the head route.** *Ruled as built (q28):* the operator's principals, read-only, with no justification, like

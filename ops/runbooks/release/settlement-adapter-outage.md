@@ -131,7 +131,7 @@ settlement-operations.
    exits. The steps and their checks are in [gap-filling](../gap-filling.md).
 
 10. **A reset the core cannot take yet** (`AledgentSettlementEpochUnsupported`, which pages): the core runs
-    code before amendment 0041's generation (or ingress's `settlement_epochs` is off), so its finalised head
+    code before amendment 0041's rules version (or ingress's `settlement_epochs` is off), so its finalised head
     stays on the chain before the reset. The adapter goes on stepping, held: withdrawals are refused. Upgrade the core; the adapter reports
     the reset again within ten minutes and the warning clears. See [gap-filling](../gap-filling.md),
     "After a reset".

@@ -11,7 +11,7 @@ and tasks, in the same pass (text only; the code identifiers follow, see "Not re
 term of amendment 0033, which stays as written.
 **Target:** `SPEC.md` v0.4.29 as on `develop` (at `9c12b11`); amendment 0033 (where the term was introduced).
 **Date:** 2026-10-28
-**Number:** 0040 is the last on `develop`. PR #95 claims 0041; no open PR or remote branch claims 0042.
+**Number:** 0041 is the last on `develop` (PR #95); no open PR or remote branch claims 0042.
 **Amends:** `SPEC.md` §2 (the glossary entry, renamed and extended; two other rows name it); `REQ-RT-19` and
 `REQ-RT-20` (the term only); `AC-K7.9`, `AC-K7.13`, `AC-K7.16`, `AC-K7.17`, `AC-K7.18` (the term only);
 `CLAUDE.md` (one row in the vocabulary table, so the old name does not slip back in). No
@@ -162,9 +162,22 @@ No replaced sentence speaks of a non-core writer: those that name a writer say "
 core (the runbook, `CONTRIBUTING.md`, `agents/README.md`, the `Dockerfile` comments, `T-037-19`, `T-037-23`) are
 about the core only.
 
-## Rebase after amendment 0041
+## Rebased onto amendment 0041
 
-The 0041 stack (PRs #95 to #99) uses the term and is under review. This amendment is based on `develop`
-now and does not touch those branches. After the stack merges, this branch is rebased and the rename is applied
-to 0041's text, `SPEC.md` text and plan sites as well, in this PR. `SPEC.md` v0.4.30 is taken here; if 0041
-applies to `SPEC.md` first, the version is taken again at the rebase.
+The 0041 stack (PRs #95 to #99) and the grant-choice fix (#101) merged into `develop` using the term, so this
+amendment was rebased onto them and the rename applied to the prose they added. `SPEC.md` is untouched by that
+stack, so v0.4.30 stands. Amendment 0041 was revised through 2026-10-29, after this rename was ruled on
+2026-10-28, so its own text is updated as well (the one case where an amendment's prose is
+changed); no requirement, decision or ruling in it changes meaning. The replaced sites:
+
+- `amendments/0041-the-book-follows-a-new-settlement-sequence.md`: fact 8, the adapter's table row, the
+  paragraphs "What the core does with it" and "The guard", the rollout notes, decision 1 ("The rules version") and
+  decision 6's rules version line.
+- `features/F-043-chained-settlement/plan.md` and `tasks.md` (`T-043-14`, `T-043-17`, `T-043-18` and the order
+  paragraph).
+- `features/F-003-identities-accounts-assets-authority/plan.md` and `tasks.md` (`T-003-11`, from #101).
+- `ops/runbooks/gap-filling.md`, `ops/runbooks/release/settlement-adapter-outage.md` and
+  `services/settle/README.md` (one phrase each: "before amendment 0041's rules version").
+
+Identifiers keep the old word, as in "Not renamed here": `GENERATION`, `core_generation`, `set_generation`,
+`f043_generations.rs` and the comments of the sources and `ops/prometheus/rules/aledgent.yml`.
