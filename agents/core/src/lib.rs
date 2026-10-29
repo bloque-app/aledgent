@@ -33,7 +33,7 @@ use core_binding::envelope::BlobKey;
 
 /// The code generation this package is built as (module documentation). Private: only the record
 /// the macro defines from it is read.
-const GENERATION: u64 = 0;
+const GENERATION: u64 = 1;
 
 core_binding::ledger_core::code_generation!(GENERATION);
 use core_binding::transition::{Invocation, Rows, transition};

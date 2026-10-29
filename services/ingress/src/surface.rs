@@ -828,9 +828,13 @@ pub fn status_of(r: Refusal) -> StatusCode {
     use Refusal::*;
     match r {
         CredentialInvalid => StatusCode::UNAUTHORIZED,
-        NotAuthorised | AuthorityRevoked | IdentityRestricted | NotDisclosable => {
-            StatusCode::FORBIDDEN
-        }
+        // `ERR-CommandApprovalRequired` has the status of `ERR-NotAuthorised` (owner's answer to
+        // Q-D, amendment 0037, R2; `T-041-06` moved the refusal into the core's list).
+        NotAuthorised
+        | AuthorityRevoked
+        | IdentityRestricted
+        | NotDisclosable
+        | CommandApprovalRequired => StatusCode::FORBIDDEN,
         UnknownAccount | UnknownAsset | UnknownOperation => StatusCode::NOT_FOUND,
         ClientKeyReused
         | OperationTerminal
@@ -1824,7 +1828,9 @@ async fn approve<S: Store, C: Core>(
     };
     match (mode, outcome) {
         (_, Ok(_credential)) => None,
-        (approval::ApprovalMode::Enforce, Err(None)) => Some(approval::approval_required()),
+        (approval::ApprovalMode::Enforce, Err(None)) => {
+            Some(refusal(Refusal::CommandApprovalRequired))
+        }
         (approval::ApprovalMode::Enforce, Err(Some(r))) => Some(refusal(r)),
         (_, Err(why)) => {
             approval::report(kind, who.proof, why.is_some());
