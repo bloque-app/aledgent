@@ -46,7 +46,8 @@ name: Images
 # none). From `main` or `develop` it is pushed as `host-<commit>-on-genesis-<the genesis digest's
 # first 12 hex>` only, never `sha-<commit>`, so it cannot be taken for a core built from source.
 # On a pull request the same job is the test: the current release's core image is the genesis
-# (its manifest written by its own host's `code-manifest`), whose build must pass, and a copy of it
+# (its manifest written by its own host's `code-manifest`, which must say generation 0: a release
+# built as a later generation is not a genesis, and the job fails rather than pass it), whose build must pass, and a copy of it
 # with one byte of `core.vos` changed (in a registry on the runner), and a genesis named by tag,
 # must each fail it. A release from before amendment 0033 (`T-037-01`: no platform in its manifest
 # and no code generation compiled into its package) cannot be a genesis for this host: then the test
@@ -611,6 +612,16 @@ jobs:
               echo "refusal=not a code manifest of amendment 0033's format" >> "$GITHUB_OUTPUT"
               echo "::notice::release $tag's genesis predates amendment 0033 (no code generation): this host must refuse it" | tee -a "$GITHUB_STEP_SUMMARY"
             else
+              # A genesis is code generation 0 (amendment 0033, D1; the chainspec path of `check-code`
+              # refuses any other). `check-code --manifest` checks only that the package's compiled
+              # generation is the manifest's, and this manifest is written by the image's own host, so
+              # a release built as a later generation would pass it and be taken for a genesis. Fail
+              # instead, naming the way out: a generation-0 core image to stand in as the genesis.
+              generation=$(jq -er .generation "$RUNNER_TEMP/manifest.json")
+              if [ "$generation" != 0 ]; then
+                echo "::error::release $tag's core is code generation $generation, and a genesis is generation 0 (amendment 0033, D1): this test needs a generation-0 core image as its genesis (a pinned digest in place of the latest release)"
+                exit 1
+              fi
               # T-037-19: this host drives the platform revision it pins (the VOS in agents/Cargo.toml),
               # and refuses a manifest naming another (`code::check_platform`). A release built before
               # the pin moved is another platform's code, so it is refused like a genesis from before
