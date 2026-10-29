@@ -169,7 +169,8 @@ positions written before the chain's start and never read raise `unreadable:` un
 them as a gap. The adapter reports the new sequence to the core (amendment 0041,
 `[PENDING AMENDMENT 0041]`): live, when it reads the reset past its verified head with nothing of the
 chain before left unreported (it reports first any entry it verified before the reset that the core had
-not taken in), and once per sequence it moved to on a first start. The core follows it,
+not taken in), and once per sequence it moved to on a first start. With `report_resets` on, an operator's gap names the sequence of the chain it is of, so
+a start of that sequence keeps it (amendment 0041, decision 6). The core follows it,
 and the adapter goes on; or the core refuses it (`epoch:<instance>:<epoch>`, which pages) and nothing of
 the new chain is reported, the start being asked again every ten minutes; or it cannot take it yet
 (`epoch-unsupported:`, which only `ERR-MalformedCommand` means: a core before the amendment's generation,

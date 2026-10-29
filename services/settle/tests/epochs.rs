@@ -507,3 +507,49 @@ async fn t043_15_a_taken_start_clears_every_epoch_alert() {
     assert_eq!(open(&k, &format!("{EPOCH_ALERT}:")).await, 0);
     assert_eq!(open(&k, EPOCH_UNSUPPORTED_ALERT).await, 0);
 }
+
+/// Decision 6 made exact: with `report_resets` on, the operator's gap names the sequence of the
+/// chain it is of (the instance's at the head), so a start of that sequence keeps it; off, it
+/// names none, as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t043_15_the_operators_gap_names_its_sequence() {
+    for report in [true, false] {
+        let mut k = kit_with(SETTLEMENT_EPOCHS, report).await;
+        k.chain.reset_for(INSTANCE, 0, k.book());
+        k.chain.advance(1);
+        let _ = k.step().await;
+        if !report {
+            k.adapter.refound().await.unwrap();
+            k.step().await.unwrap();
+        }
+        deposits(&k, 3, 1);
+        k.chain.advance(300);
+        k.step().await.unwrap();
+        assert_eq!(open(&k, "unreadable:").await, 1, "report_resets {report}");
+        let (from, to) = k.adapter.record_operator_gap(0, 3).await.unwrap();
+        let body = k
+            .store
+            .report(&format!("settle/gap/{INSTANCE}/{from}/{to}"))
+            .await
+            .unwrap()
+            .unwrap()
+            .body;
+        let sequence = reset_sequence(&k).await;
+        if report {
+            assert_eq!(body["sequence"], sequence, "{body}");
+        } else {
+            assert!(body.get("sequence").is_none(), "{body}");
+        }
+    }
+}
+
+/// The sequence of the instance's last reset.
+async fn reset_sequence(k: &Kit) -> u32 {
+    let fin = k.chain.finalized().await.unwrap();
+    k.chain
+        .chain_epoch(&fin, INSTANCE)
+        .await
+        .unwrap()
+        .unwrap()
+        .epoch
+}

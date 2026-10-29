@@ -2648,7 +2648,13 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
         Ok(a)
     }
 
-    async fn record_gap(&mut self, from: u64, to: u64, reason: GapReasonBody) -> StepResult<()> {
+    async fn record_gap(
+        &mut self,
+        from: u64,
+        to: u64,
+        reason: GapReasonBody,
+        sequence: Option<u32>,
+    ) -> StepResult<()> {
         tracing::warn!(
             from,
             to,
@@ -2679,7 +2685,7 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             from,
             to,
             reason,
-            sequence: None,
+            sequence,
         };
         let key = format!("settle/gap/{}/{from}/{to}", self.config.instance);
         self.report_start(&key, "gap", serde_json::to_value(&body).unwrap_or_default())
@@ -3673,7 +3679,16 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
         if reset_cursor {
             self.store.reset_chain(instance, 0).await?;
         }
-        self.record_gap(from, to, GapReasonBody::Unreadable).await?;
+        // Amendment 0041, decision 6 made exact: the gap is of the chain at the head, whose
+        // sequence the core keeps it under, so a start of that sequence does not clear it. Named
+        // only with `report_resets` on (ingress drops it with its own switch off).
+        let sequence = self
+            .config
+            .report_resets
+            .then(|| epoch.map(|e| e.epoch))
+            .flatten();
+        self.record_gap(from, to, GapReasonBody::Unreadable, sequence)
+            .await?;
         self.cleared(from).await?;
         let now = self.now();
         self.store
