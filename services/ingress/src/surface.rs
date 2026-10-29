@@ -2031,6 +2031,15 @@ async fn ask<S: Store, C: Core>(
     who: &Authenticated,
     query: &Query,
 ) -> QueryReply {
+    // `T-043-19`: a query the deployment has not said its core host decodes is not sent. A host
+    // built before it cannot read the request, and drops the stream it came on, with every call
+    // in flight on it; so the read is answered as a core that cannot decide now answers it
+    // (`REQ-CS-8`), without a call.
+    if matches!(query, Query::SettlementHead) && !shared.config.settlement_head {
+        return QueryReply::Refused {
+            error: Refusal::DecisionUnavailable,
+        };
+    }
     let caller = who.caller(None);
     let mut wait = shared.config.retry_base;
     let until = tokio::time::Instant::now() + crate::answering::NFR_16;
