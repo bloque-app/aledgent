@@ -390,6 +390,13 @@ pub struct DeploymentConfig {
     /// `--batch`). Absent: [`crate::service::DEFAULT_CORE_BATCH`]. 1 is one input at a time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub core_batch: Option<usize>,
+    /// Whether ingress takes the settlement adapter's report of a new settlement sequence
+    /// (`POST /v1/settlement/epochs`, amendment 0041). **Off by default**: a core host built before
+    /// `T-043-14` cannot decode the input and refuses the whole feed it arrives in, so the book's
+    /// inputs would wait behind it. Turned on only once the core runs a build that knows it; off,
+    /// the route is refused `ERR-MalformedCommand` and nothing is logged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub settlement_epochs: bool,
     /// How long ingress reuses what the core answered for an API key's credential, milliseconds
     /// (`T-031-13`, [`crate::credentials::VerifierCache`]). A revoked key stops authenticating
     /// within it. Absent: 500; 0 reads the core on every request; above 1 000 (`NFR-20`'s bound)
@@ -1395,6 +1402,7 @@ impl DeploymentConfig {
                 .max(1),
             // T-036-25: a chainspec book takes commands only once its core says so.
             genesis_gate: self.genesis.chainspec.is_some(),
+            settlement_epochs: self.settlement_epochs,
             link: self.forward_link(),
             ..Config::default()
         }
@@ -1433,6 +1441,21 @@ mod tests {
 
     fn deployment(v: serde_json::Value) -> DeploymentConfig {
         serde_json::from_value(v).unwrap()
+    }
+
+    /// Amendment 0041 (`T-043-14`): the epoch route is closed unless the deployment opens it. A
+    /// file that does not name `settlement_epochs` (the template) leaves it off, and so does the
+    /// running configuration's default; naming it `true` opens it.
+    #[test]
+    fn t043_14_settlement_epochs_is_off_by_default() {
+        assert!(!crate::service::Config::default().settlement_epochs);
+        let v = template();
+        assert!(v.get("settlement_epochs").is_none());
+        assert!(!deployment(v.clone()).settlement_epochs);
+        assert!(!deployment(v.clone()).service().settlement_epochs);
+        let mut on = v;
+        on["settlement_epochs"] = serde_json::Value::Bool(true);
+        assert!(deployment(on).service().settlement_epochs);
     }
 
     /// `F-042`: the feed key on an engine. The example (`ingress-feed-key-transit.json`) put in the

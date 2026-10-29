@@ -2506,7 +2506,12 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                 now,
             )
             .await?;
-        let body = GapBody { from, to, reason };
+        let body = GapBody {
+            from,
+            to,
+            reason,
+            sequence: None,
+        };
         let key = format!("settle/gap/{}/{from}/{to}", self.config.instance);
         self.report_start(&key, "gap", serde_json::to_value(&body).unwrap_or_default())
             .await?;

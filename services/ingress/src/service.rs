@@ -117,6 +117,10 @@ pub struct Config {
     /// core to say the book is open ([`Core::genesis_open`], `T-036-25`) and is refused
     /// `ERR-InitialStateNotSealed` until it does. `false`: no command asks.
     pub genesis_gate: bool,
+    /// Whether the settlement adapter's report of a new settlement sequence is taken
+    /// (`POST /v1/settlement/epochs`, amendment 0041). Off by default: a core host built before
+    /// `T-043-14` refuses the whole feed such an input arrives in.
+    pub settlement_epochs: bool,
     /// The prior system's identifiers the initial state left out (`REQ-RC-7`): a request naming
     /// one is answered `ERR-IdentifierArchived` ([`crate::archived`]). Empty: none.
     pub archived: Arc<crate::archived::ArchivedIds>,
@@ -175,6 +179,7 @@ impl Default for Config {
             decision_wait: Duration::from_secs(30),
             core_batch: DEFAULT_CORE_BATCH,
             genesis_gate: false,
+            settlement_epochs: false,
             archived: Arc::default(),
             feed_signer: None,
             link: ForwardLink::Legacy,

@@ -652,6 +652,12 @@ pub const ROUTES: &[Route] = &[
         "Settlement adapter: what the settlement layer's metadata states about an asset location it binds, at a finalised height (DEC-20). Registration reads it; a difference from the registry holds the asset. The adapter's principal only.",
     ),
     command(
+        "/v1/settlement/epochs",
+        CommandRoute::Settlement(SettlementRoute::Epoch),
+        "start_epoch",
+        "Settlement adapter: a new sequence of the settlement layer's record started under the book (amendment 0041); the core restarts its finalised head at its start, or refuses it. The adapter's principal only.",
+    ),
+    command(
         "/v1/settlement/anchor-acknowledgements",
         CommandRoute::Settlement(SettlementRoute::AcknowledgeAnchor),
         "ack_anchor",
@@ -1355,6 +1361,13 @@ async fn handle_command<S: Store, C: Core>(
     if !crate::service::takes_commands(&shared).await {
         return logged(refusal(Refusal::InitialStateNotSealed), Some(&who), name);
     }
+    // Amendment 0041: a new settlement sequence is taken only once the deployment says its core
+    // knows the input; a core host built before it would refuse the whole feed it arrives in.
+    // Nothing of a refused one is logged.
+    if route == CommandRoute::Settlement(SettlementRoute::Epoch) && !shared.config.settlement_epochs
+    {
+        return logged(refusal(Refusal::MalformedCommand), Some(&who), name);
+    }
     let arrival = Arrival {
         at: started,
         clock: arrived_at,
@@ -1414,6 +1427,9 @@ fn prepare_request<S: Store, C: Core>(
         .archived
         .check(param.as_deref(), None, bytes)?;
     let (mut body, pending) = build(route, param, bytes)?;
+    if !shared.config.settlement_epochs {
+        crate::settlement::drop_gap_sequence(&mut body);
+    }
     // REQ-PO-5: the caller's pass-through data comes off the command here. It is part of the
     // request (its digest) and of the row, never of the canonical body the core receives.
     let pass_through = take_pass_through(&mut body);

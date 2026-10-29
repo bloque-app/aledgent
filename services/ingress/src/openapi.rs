@@ -496,6 +496,7 @@ fn schemas() -> Map<String, Value> {
     add::<crate::settlement::AnchorFailureBody>(&mut g);
     add::<crate::settlement::PositionsBody>(&mut g);
     add::<crate::settlement::AttestationBody>(&mut g);
+    add::<crate::settlement::EpochBody>(&mut g);
     add::<crate::settlement::AnchorReadBody>(&mut g);
     add::<crate::anchoring::DisclosureBody>(&mut g);
     add::<crate::anchoring::AnchoringJustifiedBody>(&mut g);

@@ -526,6 +526,13 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
         self.generation() >= crate::settlement::CHAINED_SETTLEMENT
     }
 
+    /// Whether the book follows a new sequence of the settlement layer's record (amendment 0041):
+    /// from [`crate::settlement::SETTLEMENT_EPOCHS`] on. Before it, the adapter's report of one is
+    /// refused and nothing is written.
+    pub(crate) fn epochs(&self) -> bool {
+        self.generation() >= crate::settlement::SETTLEMENT_EPOCHS
+    }
+
     /// The upgrade the writer has scheduled, as its hot row holds it, before the input that
     /// follows (`T-037-05`, owner ruling w6): the code version and the input number it applies
     /// from. A move of it ([`Ledger::reschedule_upgrade`]) must go strictly later than that input

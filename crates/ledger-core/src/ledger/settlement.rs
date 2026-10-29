@@ -78,9 +78,10 @@ use crate::refusal::Refusal;
 use crate::reservation::{CHOSEN, ReservationBook, ReservationHandle, UnitBuilder};
 use crate::settlement::store::{Ingested, SettlementStore, SettlementWrite, Standing};
 use crate::settlement::{
-    CanonicalCheck, Coordinate, Destination, EventKind, FinalisedHead, Gap, HeadReport, Incident,
-    KeyNonce, NonceFact, Observation, OutboundInstruction, RescanReport, SettlementConfig,
-    SettlementPort, SigningRecord, SourceId, SupportDeclaration, Verdict, Verified,
+    CanonicalCheck, Coordinate, Destination, EpochOutcome, EpochRefusal, EventKind, FinalisedHead,
+    Gap, HeadReport, Incident, KeyNonce, NonceFact, Observation, OutboundInstruction, RescanReport,
+    SettlementConfig, SettlementEpoch, SettlementPort, SigningRecord, SourceId, SupportDeclaration,
+    Verdict, Verified,
 };
 use crate::state::{Command, OperationRecord, Write};
 
@@ -1949,6 +1950,107 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
         }
     }
 
+    // ------------------------------------------------------------------ a new sequence
+
+    /// The start of a new sequence of the layer's record under the book (amendment 0041,
+    /// `REQ-SA-10` as proposed, `T-043-14`, `[PENDING AMENDMENT 0041]`): governance reset the
+    /// instance, and its positions restart at `epoch.from_seq` from block `epoch.at`. Reached
+    /// through the adapter's input only ([`crate::ledger::settle_adapter::AdapterInput::Epoch`]),
+    /// from [`crate::settlement::SETTLEMENT_EPOCHS`] on; the caller gates the generation.
+    ///
+    /// In order:
+    ///
+    /// 1. The sequence the book holds, again and equal in every field: `Recorded`, nothing
+    ///    written. Any other sequence not later than it: refused ([`EpochRefusal::NotLater`]).
+    /// 2. Another book: refused. The sequence must name this book's genesis digest (its
+    ///    chainspec's seed digest, [`Ledger::code_binding`]); a book founded without one has the
+    ///    zero digest and can never match (decision 4).
+    /// 3. An outbound instruction not yet decided: refused. Its first position and expiry come
+    ///    from an earlier sequence, and the new one's records prove nothing about it (decision 2).
+    /// 4. A final record of the instance at or above `from_seq` observed at or before the reset's
+    ///    block: refused. It is an earlier sequence's, at a position the new one reuses, and
+    ///    `proof` would count it as the new one's (decision 5: one in the reset's own block cannot
+    ///    be told apart by block, so it counts as earlier). A record observed after the reset's
+    ///    block is the new sequence's, and stays.
+    /// 5. Otherwise the sequence is recorded and the head restarts at its start,
+    ///    `{ at, from_seq }`, unless the book holds a head at a later block: that one is already
+    ///    the new sequence's, and stays. Later heads compare against it as before.
+    ///
+    /// A refusal writes one audit record ([`Incident::EpochRefused`]) and nothing in the book's
+    /// state. A restart of the head also clears the gap end (ruling q28): every position below it
+    /// was the chain before's; a start that keeps a later head keeps it, as that head, and a gap
+    /// recorded since, may be the new sequence's. The positions' tally and the index by position
+    /// are left as they are (amendment 0041). This reads the instructions in flight and the instance's final
+    /// positions from `from_seq` whole: it comes once per reset.
+    pub(super) fn start_epoch(
+        &mut self,
+        source: SourceId,
+        epoch: SettlementEpoch,
+        now: Time,
+    ) -> Result<EpochOutcome, Refusal> {
+        let config = self.authoritative(&source).ok_or(Refusal::NotAuthorised)?;
+        let refusal = (|| {
+            let store = self.state.settlement();
+            let held = store.epoch();
+            if held == Some(epoch) {
+                return Ok(None);
+            }
+            // Another book first, whatever its number: it is the adapter's `reset:`, not a page.
+            let genesis = self.code_binding().genesis;
+            if genesis == [0; 32] || epoch.book != genesis {
+                return Err(EpochRefusal::OtherBook);
+            }
+            if let Some(held) = held.filter(|h| epoch.epoch <= h.epoch) {
+                return Err(EpochRefusal::NotLater {
+                    recorded: held.epoch,
+                });
+            }
+            if let Some(op) = store.any_live() {
+                return Err(EpochRefusal::InFlight { op });
+            }
+            if let Some(c) = store
+                .finals_from(config.instance, epoch.from_seq)
+                .find(|c| {
+                    // A final record is always ingested; one that were not would be counted as
+                    // earlier, defensively.
+                    store
+                        .ingested(c)
+                        .is_none_or(|i| i.observation.at <= epoch.at)
+                })
+            {
+                return Err(EpochRefusal::EarlierFinal { seq: c.seq });
+            }
+            Ok(Some(()))
+        })();
+        match refusal {
+            Ok(None) => Ok(EpochOutcome::Recorded),
+            Ok(Some(())) => {
+                let start = epoch.start();
+                let head = match self.state.settlement().head() {
+                    Some(h) if h.height > epoch.at => None,
+                    _ => Some(start),
+                };
+                let writes = [Write::Settlement(SettlementWrite::Epoch { epoch, head })];
+                self.check(&writes)?;
+                self.commit(&writes)?;
+                Ok(EpochOutcome::Started(
+                    self.state.settlement().head().unwrap_or(start),
+                ))
+            }
+            Err(refusal) => {
+                let writes = [self.incident(
+                    Incident::EpochRefused {
+                        epoch: epoch.epoch,
+                        refusal,
+                    },
+                    now,
+                )];
+                self.commit(&writes)?;
+                Ok(EpochOutcome::Refused(refusal))
+            }
+        }
+    }
+
     // ------------------------------------------------------------------ completeness
 
     /// A range of inbox positions the adapter was forced to skip (`REQ-SA-7`, `AC-D2.2`):
@@ -1958,6 +2060,21 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
     /// the gap is an audit record, and the book keeps only the end of the highest gap, which
     /// `proof` reads; before it, the gap and its incident were appended to the book's state.
     pub fn record_gap(&mut self, source: SourceId, gap: Gap, now: Time) -> Result<(), Refusal> {
+        self.record_gap_of(source, gap, None, now)
+    }
+
+    /// [`Ledger::record_gap`], of the chain of `sequence` if the adapter named it (amendment 0041,
+    /// decision 6 made exact, from [`crate::settlement::SETTLEMENT_EPOCHS`] on). A gap of a
+    /// sequence later than the one the book holds raises that sequence's gap end, which the next
+    /// start keeps if it is of that sequence or an earlier one; any other gap (none named, or of the
+    /// sequence held or earlier) raises the untagged gap end, which every start clears.
+    pub(super) fn record_gap_of(
+        &mut self,
+        source: SourceId,
+        gap: Gap,
+        sequence: Option<u32>,
+        now: Time,
+    ) -> Result<(), Refusal> {
         let top = self.enter(|| crate::call::Call::RecordGap { source, gap, now });
         #[allow(clippy::redundant_closure_call)]
         let r: Result<(), Refusal> = (|| {
@@ -1967,10 +2084,17 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             if gap.to <= gap.from {
                 return Err(Refusal::EvidenceInsufficient);
             }
-            let record = if self.chained() {
-                Write::Settlement(SettlementWrite::GapEnd(gap.to))
-            } else {
-                Write::Settlement(SettlementWrite::Gap(gap))
+            // The sequence held is read only for a gap that names one: a generation-0 input reads
+            // no leaf the code before amendment 0041 did not know.
+            let later =
+                sequence.filter(|s| *s > self.state.settlement().epoch().map_or(0, |e| e.epoch));
+            let record = match later {
+                Some(sequence) => Write::Settlement(SettlementWrite::SequenceGapEnd {
+                    sequence,
+                    to: gap.to,
+                }),
+                None if self.chained() => Write::Settlement(SettlementWrite::GapEnd(gap.to)),
+                None => Write::Settlement(SettlementWrite::Gap(gap)),
             };
             self.commit(&[record, self.incident(Incident::Gap(gap), now)])
         })();

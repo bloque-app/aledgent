@@ -82,6 +82,18 @@ const INSTRUCTION_DOMAIN: &[u8] = b"aledgent/instruction/v1";
 /// this build, or one founded on this build at generation 0, needs another ruling.
 pub const CHAINED_SETTLEMENT: u64 = 1;
 
+/// The code generation from which the book follows a new sequence of the settlement layer's record
+/// under it, without a re-founding (amendment 0041, `T-043-14`, `[PENDING AMENDMENT 0041]`): the
+/// settlement adapter reports the start ([`SettlementEpoch`], [`crate::ledger::settle_adapter::AdapterInput::Epoch`]),
+/// and the core restarts its finalised head there, or refuses it ([`EpochRefusal`]). Before it,
+/// the input is refused with `ERR-MalformedCommand` and writes nothing (the generation rule, as
+/// for [`CHAINED_SETTLEMENT`]).
+///
+/// It is [`CHAINED_SETTLEMENT`] (amendment 0041, decision 1): no book has decided an input at that
+/// generation yet, so one in-place upgrade takes both. Once a book has, a change here needs a new
+/// generation.
+pub const SETTLEMENT_EPOCHS: u64 = CHAINED_SETTLEMENT;
+
 /// Who submitted an observation: an opaque identity of an observing source. Exactly one source
 /// is authoritative for the book ([`SettlementConfig::authoritative`], `REQ-IN-6`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -329,6 +341,84 @@ impl FinalisedHead {
         c.u64(self.height).u64(self.next_seq);
         Evidence(c.digest().0)
     }
+}
+
+/// The latest anchor of the sequence before a new one started, as the settlement layer keeps it
+/// (amendment 0039's `previous`): recorded with the start, never compared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct PreviousAnchor {
+    /// Its number.
+    pub number: u64,
+    /// Its commitment.
+    pub commitment: [u8; 32],
+}
+
+/// A new sequence of the settlement layer's record started under the book (amendment 0041,
+/// `REQ-SA-10` as proposed): governance reset the instance, so its positions restart at
+/// `from_seq` from block `at`. The adapter reports it as the layer holds it (amendment 0039's
+/// `anchor_epoch()`); the core restarts its finalised head at [`SettlementEpoch::start`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct SettlementEpoch {
+    /// The sequence's number: 1 for the first one governance starts, one more for each later one.
+    pub epoch: u32,
+    /// The anchor number the sequence starts after (not a position).
+    pub base: u64,
+    /// The position of the sequence's first entry: 0 for every reset of the current contract.
+    pub from_seq: u64,
+    /// The block of the reset.
+    pub at: u64,
+    /// The book the sequence names: its chainspec (seed) digest, as governance gave it.
+    pub book: [u8; 32],
+    /// The latest anchor of the sequence before, if it had one.
+    pub previous: Option<PreviousAnchor>,
+}
+
+impl SettlementEpoch {
+    /// The finalised head the sequence starts at: its block, and its first position.
+    pub fn start(&self) -> FinalisedHead {
+        FinalisedHead {
+            height: self.at,
+            next_seq: self.from_seq,
+        }
+    }
+}
+
+/// Why the core refused a new sequence (amendment 0041): each leaves the book where it was. The
+/// refusal is one audit record ([`Incident::EpochRefused`]) and the adapter's alert.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EpochRefusal {
+    /// The sequence names another book than this one's genesis digest, or this book has none.
+    OtherBook,
+    /// The book holds this sequence number or a later one already, and this is not it.
+    NotLater {
+        /// The sequence the book holds.
+        recorded: u32,
+    },
+    /// An outbound instruction is not yet decided: its first position and expiry come from an
+    /// earlier sequence, and the new one's records prove nothing about it.
+    InFlight {
+        /// The first such operation.
+        op: OperationId,
+    },
+    /// The book holds a final record of an earlier sequence at a position the new one reuses
+    /// (observed at or before the reset's block).
+    EarlierFinal {
+        /// The first such position.
+        seq: u64,
+    },
+}
+
+/// What the core made of a new sequence (amendment 0041).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EpochOutcome {
+    /// Taken: the sequence is recorded and the finalised head is now this one.
+    Started(FinalisedHead),
+    /// The same sequence again: nothing changed.
+    Recorded,
+    /// Refused, and recorded as an incident.
+    Refused(EpochRefusal),
 }
 
 /// A signing key's account nonce at a finalised head: how many of the key's transactions the
@@ -757,6 +847,14 @@ pub enum Incident {
         asset: AssetId,
         /// The layer's final record.
         coordinate: Coordinate,
+    },
+    /// A new sequence of the layer's record was refused (amendment 0041): the book stays on the
+    /// head it holds, and the adapter alerts.
+    EpochRefused {
+        /// The sequence's number.
+        epoch: u32,
+        /// Why.
+        refusal: EpochRefusal,
     },
 }
 
