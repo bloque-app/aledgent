@@ -184,8 +184,13 @@ before the reset). Amendment 0041 has the adapter report the reset, and the core
   - otherwise one store write, `SettlementWrite::Epoch { epoch, head }`: the sequence (leaf kind 36, absent until
     set), and the head `{ at, from_seq }` unless the core holds a head at a later block. The store refuses a
     sequence that is not strictly later, and only this write moves the head back;
-  - with a head, which the store requires to be the sequence's start, the same write clears the gap end (ruling q28, decision 6), and its undo restores it; a start
-    that keeps a later head keeps it;
+  - the head, if given, must be the sequence's start; the same write clears the untagged gap end (kind 37: a
+    gap reported without its sequence, or moved by `T-043-08`) and every gap end tagged with an earlier sequence
+    (kind 34, the highest end per sequence), whether the head restarts or is kept, and keeps one tagged with the
+    started sequence or later (decision 6, made exact); its undo restores both;
+  - `AdapterInput::SequenceGap { gap, sequence }` (appended last; generation 0 refuses it) records a gap under
+    `sequence`; ingress forwards a gap body's `sequence` only with `settlement_epochs` on, else as a plain gap.
+    `proof` reads the highest end over the untagged slot and every tag;
   - the tally and the index by position are left as they are (amendment 0041, "left as they are").
   - The input reads the `live` index and the final positions whole: its witness holds the whole `finals` map,
     as `proof`'s does. It comes once per reset.

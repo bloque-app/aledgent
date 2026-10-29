@@ -6,8 +6,8 @@ SPDX-License-Identifier: CC-BY-4.0
 # Amendment 0041 — The book follows a new settlement sequence without a re-founding
 
 **Status:** **draft**, ruled by the owner on 2026-10-28 (form q28, and decision 2 the same day). Every
-decision is ruled as built but decision 6, ruled the other way (the start clears the gap end), and the build
-follows the ruling. Nothing here is applied to `SPEC.md` yet; the plan and the code cite it
+decision is ruled as built but decision 6, ruled the other way (the start clears the gap end) and then made
+exact (each gap end tagged with its sequence, Pablo, 28 Oct), and the build follows the ruling. Nothing here is applied to `SPEC.md` yet; the plan and the code cite it
 as `[PENDING AMENDMENT 0041]`. The implementation is built on top (`T-043-14` to `T-043-17`).
 **Target:** `SPEC.md` v0.4.29 as on `develop` (at `9c12b11`); amendments 0039 and 0040; `F-043`.
 **Date:** 2026-10-28
@@ -95,6 +95,10 @@ sequence's number, its base, its first position, its block, the book it names, a
   between the two). If any is still unreported, it does not follow the reset. Then it reports the start, and
   only then moves its cursor to the new chain's start and goes on. It reports no entry of the new chain before the core
   has taken the start in.
+- **A gap names its sequence.** From `SETTLEMENT_EPOCHS` on, with `report_resets` on, the adapter reports a gap
+  with the sequence of the chain it belongs to (the verified head's), as a new input (`AdapterInput::SequenceGap`),
+  which ingress forwards only with `settlement_epochs` on. A gap reported without it is the sequence the core
+  holds.
 - **Once per sequence, from state.** While the head it verified carries a sequence the core has not confirmed,
   it reads `anchor_epoch()` and reports it. That is test's case: the adapter already moved itself to the new
   chain on 28 Oct.
@@ -141,9 +145,10 @@ were decided.
    and 1). A record in the reset's own block cannot be placed by block alone, so it counts as earlier
    (decision 5).
 5. **Otherwise the start is taken.** The sequence is recorded, and the head becomes
-   `{ height: at, next_seq: from_seq }`, and the gap end is cleared (decision 6): every position below it was
-   the earlier sequence's. If the core already holds a head at a later block than `at`, that head is already
-   the new chain's and is kept, and so is the gap end, since a gap recorded since may be the new chain's. Later heads compare against it as before, so they are compared within
+   `{ height: at, next_seq: from_seq }`. If the core already holds a head at a later block than `at`, that head
+   is the new chain's (exact, by its block after the reset) and is kept. Either way, the end of every gap
+   recorded under an earlier sequence is cleared, and that of a gap recorded under the started sequence or a
+   later one is kept (decision 6). Later heads compare against the head as before, so they are compared within
    the sequence. The head moves back only here, only to a strictly later sequence, and only to its start; the store enforces all three
    (`REQ-AR-4`).
 
@@ -195,9 +200,11 @@ sequence (`REQ-SL-1`); one book's record MAY run over several sequences".
 > report an entry of the new sequence until aledgent has taken the start in. Before it reports the start, the
 > adapter MUST have shown the earlier sequence complete up to the start (`REQ-SA-7`); otherwise it MUST raise an
 > alert and report neither. aledgent MUST take the start as its finalised point, unless it holds a finalised
-> point at a later block, which it keeps, and MUST compare every later point within the new sequence. When it
-> takes the start as its finalised point, it MUST clear the end of the gaps it holds; when it keeps a later
-> point, it keeps that end. The same start again changes nothing. aledgent MUST refuse the start, as an incident
+> point at a later block, which it keeps, and MUST compare every later point within the new sequence. At a start
+> aledgent MUST clear the end of every gap recorded under an earlier sequence and keep that of one recorded under
+> the started sequence or a later one, whether or not it keeps its finalised point; the adapter MUST report each
+> gap with the sequence it belongs to, and a gap reported without one is the sequence aledgent holds. The same
+> start again changes nothing. aledgent MUST refuse the start, as an incident
 > (`REQ-AT-1`), if it names another book, if its sequence is not later than the one aledgent took (or is that
 > sequence with other values), while any external leg it instructed is not yet decided, or while it holds a
 > final record of an earlier sequence at a position the new sequence reuses. A refused start MUST change
@@ -286,14 +293,24 @@ sequence (`REQ-SL-1`); one book's record MAY run over several sequences".
    more field in the input.
 6. **The gap end across a start.** *Ruled (q28): the start clears it*, rather than keeping it (the proposal's
    cautious option, under which a withdrawal whose range starts below an earlier sequence's gap went to review).
-   Read as: a start that restarts the head clears the gap end; one that keeps a head at a later block keeps it,
-   because that head, and a gap recorded since, may be the new sequence's. Keeping it is the conservative side:
-   a gap end kept from the earlier sequence can only send a withdrawal to review, never prove it unexecuted
-   (a few new withdrawals could go to review when the earlier sequence's gap lies past the kept head). The
-   restart also clears a gap of the new sequence reported before it; a withdrawal over such a gap then waits
-   for its deadline and goes to review, rather than at once. Clearing is safe because a start is
-   refused while any instruction is live (decision 2), so `proof` has nothing of the earlier sequence left to
-   decide.
+   *Made exact (Pablo, 28 Oct: "a way to deduce whether that reading is stale").* Each gap end is tagged with the
+   sequence it was recorded under: the adapter names the chain a gap belongs to, which only it knows before the
+   core takes the start. At a start the core clears every gap end tagged with an earlier sequence and keeps one
+   tagged with the started sequence or a later one, whether the head restarts or is kept. The kept head is
+   already exact, by its block after the reset; the gap end is now exact by its tag. So a gap of the new chain
+   reported before the start survives it, and one of the chain before does not.
+   - **Untagged ends count as the earlier sequence's, and are cleared.** These are a gap end recorded before this
+     change (`T-043-08`'s move of a running book's gaps) and a gap reported without its sequence (an adapter
+     with `report_resets` off), which is the sequence the core holds and so always earlier than a start. This is
+     the cautious side because clearing never releases anything: `proof` still needs every position of a range
+     final, and a gap's position never is, so a withdrawal over a cleared gap waits for its deadline and goes to
+     review, rather than at once. A gap of the new chain reported untagged before the start loses only that
+     early signal.
+   - **Before a start,** `proof` reads the highest end over every tag, so a later sequence's gap can only send a
+     withdrawal to review.
+   - Clearing is safe because a start is refused while any instruction is live (decision 2), so `proof` has
+     nothing of the earlier sequence left to decide.
+   - Rules version (generation) 1 only. Generation 0 refuses the new input and decides and replays as before.
 7. **The guard's error.** *Ruled as built (q28):* `ERR-SettlementLayerUnavailable`, with its meaning extended. *Alternative:*
    a new error condition.
 8. **Who reads the head route.** *Ruled as built (q28):* the operator's principals, read-only, with no justification, like
