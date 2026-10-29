@@ -173,7 +173,7 @@ not taken in), and once per sequence it moved to on a first start. With `report_
 a start of that sequence keeps it (amendment 0041, decision 6). The core follows it,
 and the adapter goes on; or the core refuses it (`epoch:<instance>:<epoch>`, which pages) and nothing of
 the new chain is reported, the start being asked again every ten minutes; or it cannot take it yet
-(`epoch-unsupported:`, which only `ERR-MalformedCommand` means: a core before the amendment's generation,
+(`epoch-unsupported:`, which only `ERR-MalformedCommand` means: a core before the amendment's rules version,
 or ingress's route closed). **While `reset:`, `epoch:` or `epoch-unsupported:` is open the adapter is
 held**: it keeps stepping, but declares to the core that it does not serve, so new withdrawals (and the
 settlement comparison) are refused with `ERR-SettlementLayerUnavailable` rather than built from a head it

@@ -233,7 +233,7 @@ CMD ["serve", "--config", "/etc/aledgent/ingress.json", \
      "--state", "/var/lib/aledgent/core"]
 
 # A core upgrade's package (the target `core-upgrade`; #285, F-037, REQ-RT-16): only `core.vos`, as a
-# later generation of the code a book already runs, built from this source, and nothing else. It is
+# later rules version of the code a book already runs, built from this source, and nothing else. It is
 # not an image anyone runs: build it with `--output type=local` (.github/workflows/core-release.yml
 # does), and it never touches the `core` target below, whose bytes it does not change.
 #
@@ -251,12 +251,12 @@ CMD ["serve", "--config", "/etc/aledgent/ingress.json", \
 # was founded on, byte for byte (a new runtime is the continuation, T-037-17); the workflow copies it
 # from the code in force. `GENERATION` is the source's (`agents/core/src/lib.rs`): bumping it is a
 # change to the source, reviewed with the change that needs the upgrade, and the workflow refuses
-# a package whose generation is not the predecessor's plus one.
+# a package whose rules version is not the predecessor's plus one.
 #
 # Nothing comes out of this target unless the new package passes `check-upgrade` (T-037-12,
 # T-037-19's precondition, owner ruling of 2026-10-27): the recorded book of the code-history gate
 # is run through the real packages under the code in force's runtime, the predecessor's package
-# deciding its generation's inputs, the new one installed in place over that state at the recorded
+# deciding its rules version's inputs, the new one installed in place over that state at the recorded
 # upgrade and deciding the rest, every input at its archived log hash; and every way out at an
 # upgrade's input is decided by the new package as the predecessor decided it (D18). So the
 # `previous-code` context holds the runtime too (`agent_runtime.pvm`), and the report is

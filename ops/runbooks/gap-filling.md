@@ -158,7 +158,7 @@ By the core's answer:
   re-founding window: follow "Another book's reset" with the owner, or turn the switches on once the core
   can take the start.
 - **A core that cannot take it yet** (`AledgentSettlementEpochUnsupported`, which pages, since withdrawals are off,
-  `epoch-unsupported:<instance>:<epoch>`): the core runs code before amendment 0041's generation. On a first
+  `epoch-unsupported:<instance>:<epoch>`): the core runs code before amendment 0041's rules version. On a first
   start the adapter goes on, and the core's head stays where it was; the adapter is held, so withdrawals are
   refused: upgrade the core, or open ingress's `settlement_epochs` if it is the route that is closed (the release order is the core first, then the adapter). On a live reset the
   adapter also stops (`reset:`) until the upgrade; it then goes on by itself.

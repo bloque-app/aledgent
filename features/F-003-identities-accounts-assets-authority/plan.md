@@ -150,21 +150,21 @@ runs in a fixed order:
 4. Asset → `ERR-UnknownAsset` or `ERR-AssetDeprecated`.
 5. Candidates. **Proposal:** prefer owner (credential in scope), then the delegated grant with the
    narrowest effective scope, then operator. None left → `ERR-NotAuthorised`. Only revoked ones
-   left → `ERR-AuthorityRevoked`. From code generation 1 (`T-003-11`), a grant whose effective
+   left → `ERR-AuthorityRevoked`. From rules version 1 (`T-003-11`), a grant whose effective
    assets exclude the operation's asset is **not preferred**: the first grant, in the same order,
    whose effective assets include it is chosen. Only when none does is the first of them all
    chosen, and its asset bound refuses at step 6 with `ERR-BoundExceeded`, as before (`REQ-AG-2`).
    So a principal's per-asset grants over one account each decide their own asset (`AC-G1.2`).
-   Generation 0 chose by narrowness alone, so those grants shadowed each other; its inputs are
-   still decided that way (the generation rule, amendment 0033).
+   Rules version 0 chose by narrowness alone, so those grants shadowed each other; its inputs are
+   still decided that way (the rules version rule, amendment 0033).
 
    > **Trade-off, stated plainly.** Only the asset bound is looked at before the choice. The
-   > other bounds still shadow at generation 1: of two grants over the same asset, the one with
+   > other bounds still shadow at rules version 1: of two grants over the same asset, the one with
    > the smaller per-operation bound is chosen and refuses an amount the other would allow, and
    > the same holds for a window already spent or a counterparty bound. A revoked grant that
    > listed the asset, beside a live one that does not, still answers `ERR-BoundExceeded`, not
    > `ERR-AuthorityRevoked`. Choosing by those bounds too is not decided; it would need its own
-   > ruling and, once a book has decided an input at generation 1, a new generation.
+   > ruling and, once a book has decided an input at rules version 1, a new rules version.
 6. Bounds → `ERR-BoundExceeded`.
 
 Any internal error counts as "no authority" (fail closed). The result, `AuthorityUsed { kind,

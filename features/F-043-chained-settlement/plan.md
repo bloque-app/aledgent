@@ -136,7 +136,7 @@ community moves funds out of its account. The referendum's route ran only as a `
   as audit records, sets the gap end from the gaps, and drops the leaves.
 - The leaf kinds are keys in the actor's one map of rows (`agents/core/src/lib.rs:68-73`), so the runtime's
   state-layout check passes (`agents/core-host/src/switch.rs:373-375`).
-- It needs the release gate that replays the previous generation's state under the new core, which
+- It needs the release gate that replays the previous rules version's state under the new core, which
   `T-037-19` names as still to be ruled.
 
 ### 5. Readers and operations
@@ -174,7 +174,7 @@ before the reset). Amendment 0041 has the adapter report the reset, and the core
 
 - **The core** (`crates/ledger-core`), from `SETTLEMENT_EPOCHS` (decision 1: equal to `CHAINED_SETTLEMENT`, 1):
   - a new adapter input, `AdapterInput::Epoch(SettlementEpoch)`, appended last: the sequence's number, base, first
-    position, block, book and previous anchor, as `anchor_epoch()` holds them. Before the generation it is
+    position, block, book and previous anchor, as `anchor_epoch()` holds them. Before that rules version it is
     refused with `ERR-MalformedCommand` and writes nothing;
   - the answer `AdapterReply::Epoch(EpochOutcome)`: `Started(head)`, `Recorded` (the same sequence again), or
     `Refused(EpochRefusal)`, which is also one audit record (`Incident::EpochRefused`);
@@ -188,7 +188,7 @@ before the reset). Amendment 0041 has the adapter report the reset, and the core
     gap reported without its sequence, or moved by `T-043-08`) and every gap end tagged with an earlier sequence
     (kind 34, the highest end per sequence), whether the head restarts or is kept, and keeps one tagged with the
     started sequence or later (decision 6, made exact); its undo restores both;
-  - `AdapterInput::SequenceGap { gap, sequence }` (appended last; generation 0 refuses it) records a gap under
+  - `AdapterInput::SequenceGap { gap, sequence }` (appended last; rules version 0 refuses it) records a gap under
     `sequence`; ingress forwards a gap body's `sequence` only with `settlement_epochs` on, else as a plain gap.
     `proof` reads the highest end over the untagged slot and every tag;
   - the tally and the index by position are left as they are (amendment 0041, "left as they are").
@@ -204,7 +204,7 @@ before the reset). Amendment 0041 has the adapter report the reset, and the core
   - once per sequence, for the sequence its verified head carries, until the core confirms it (the confirmation is
     the report's stored verdict, `settle/epoch/<instance>/<epoch>`);
   - a refusal raises `epoch:<instance>:<epoch>`, which pages, and the start is reported again every ten minutes;
-    a core before the generation raises the same alert, non-paging, and the adapter goes on.
+    a core before that rules version raises the same alert, non-paging, and the adapter goes on.
 - **Ops:** the alert `AledgentSettlementEpochRefused`; `gap-filling.md` "After a reset" and
   `release/settlement-adapter-outage.md` rewritten; the settle README.
 - **Follow-ups:**
@@ -221,7 +221,7 @@ Tests:
 - refusals: an instruction in flight, a final record of the earlier chain at 0, another book, an earlier
   sequence;
 - a second start after an idle sequence is taken; one after a sequence with finals is refused;
-- generation 0 refuses the input and the generation-0 fixtures replay unchanged (`f043_generations.rs`, the
+- rules version 0 refuses the input and the rules version-0 fixtures replay unchanged (`f043_generations.rs`, the
   `code-history` gate);
 - the ingress body round-trips; the adapter reports a live reset and a first-start sequence, and stops on a
   refusal.
