@@ -8,6 +8,39 @@ SPDX-License-Identifier: CC-BY-4.0
 Releases are cut by release-please from the conventional-commit titles of the pull requests merged
 into `main` (`release-please-config.json`). Each entry below is written by its release pull request.
 
+## [0.4.0](https://github.com/bloque-app/aledgent/compare/v0.3.1...v0.4.0) (2026-10-29)
+
+
+### Features
+
+* **contract:** T-043-02 chained settlement entries, one release with a full reset ([#78](https://github.com/bloque-app/aledgent/issues/78)) ([d76deef](https://github.com/bloque-app/aledgent/commit/d76deeff23da3e38ae9cef464d7ce6f0c2eb44c1))
+* **core-archive:** read short-lived S3 credentials from a file an agent keeps fresh ([#70](https://github.com/bloque-app/aledgent/issues/70)) ([4fef3ad](https://github.com/bloque-app/aledgent/commit/4fef3ad9080e4beadbfa91ec9cae9ec8d879cb15))
+* **core-archive:** the archive sealed by aledgent, Vault Transit and an offline recovery key (F-044) ([#82](https://github.com/bloque-app/aledgent/issues/82)) ([622dd6a](https://github.com/bloque-app/aledgent/commit/622dd6a097289d3286ac2bcceb5ade0c6c04150a))
+* **core-host:** T-037-09 restore across upgrades, staging every version the archive names ([#86](https://github.com/bloque-app/aledgent/issues/86)) ([25b0f96](https://github.com/bloque-app/aledgent/commit/25b0f96827c112e756f9fda2c1e1e902e5f1cc0f))
+* **core:** rules version 1, the refusal line, amendment 0041 and the grant-choice fix (T-041-06) ([#102](https://github.com/bloque-app/aledgent/issues/102)) ([eee7c4d](https://github.com/bloque-app/aledgent/commit/eee7c4d8aae229fe08bce9fbcfff5571749ea848))
+* **core:** T-037-09 restore and replay per range, under the code map read from the inputs ([#85](https://github.com/bloque-app/aledgent/issues/85)) ([7e23ac3](https://github.com/bloque-app/aledgent/commit/7e23ac32546f0f29e20ea54242a624221f6ccecb))
+* **core:** T-043-06 the re-scan refused from the chained generation ([#91](https://github.com/bloque-app/aledgent/issues/91)) ([77831be](https://github.com/bloque-app/aledgent/commit/77831be0de4462027312a7ff736c72af8e4c2cd2))
+* **core:** T-043-07 settlement incidents and gaps to the audit trail ([#92](https://github.com/bloque-app/aledgent/issues/92)) ([1788745](https://github.com/bloque-app/aledgent/commit/1788745bbe82d132ea12cf6045fccd8c3ecd0335))
+* **core:** T-043-08 running books move their incidents and gaps to the audit trail in place ([#93](https://github.com/bloque-app/aledgent/issues/93)) ([9c12b11](https://github.com/bloque-app/aledgent/commit/9c12b11ab5b0ccef26f52cd7439869a94ed11f84))
+* **core:** T-043-14 the core follows a new settlement sequence (amendment 0041) ([#96](https://github.com/bloque-app/aledgent/issues/96)) ([65a0871](https://github.com/bloque-app/aledgent/commit/65a08715e6867fd558d7979cf1f760c5e572dc1e))
+* **core:** T-043-17 no withdrawal from a stale settlement head (amendment 0041) ([#99](https://github.com/bloque-app/aledgent/issues/99)) ([1ad067b](https://github.com/bloque-app/aledgent/commit/1ad067ba3e5bb6fd07d85ec211ede4536b8f4444))
+* **ingress:** T-043-16 GET /v1/ops/settlement/head (amendment 0041) ([#98](https://github.com/bloque-app/aledgent/issues/98)) ([1bdb26e](https://github.com/bloque-app/aledgent/commit/1bdb26e1913055da7111bc4d04cdabdaf5fa6308))
+* promote develop to main (rules version 1, amendment 0041, chained settlement, signature engines) ([c286c7c](https://github.com/bloque-app/aledgent/commit/c286c7cd53d142e51a74e24e24bd60d2940848ef))
+* **settle:** F-045 lanes and the anchor key as native ed25519 accounts, keys in Vault Transit ([#81](https://github.com/bloque-app/aledgent/issues/81)) ([f91ca4d](https://github.com/bloque-app/aledgent/commit/f91ca4d7c95d45153cf208d056972bd3d101b62e))
+* **settle:** T-027-12 sign on Kreivo 0.18.1 (spec 136, transaction_version 14) ([#89](https://github.com/bloque-app/aledgent/issues/89)) ([54274b7](https://github.com/bloque-app/aledgent/commit/54274b7a3a2d2006ae147c4cfbb7bf85f2759ff5))
+* **settle:** T-043-04/05 verify the chain of entries at sync; re-scan removed ([#79](https://github.com/bloque-app/aledgent/issues/79)) ([fb93f28](https://github.com/bloque-app/aledgent/commit/fb93f2818d433c05811fb9cb874906804b39b6f0))
+* **settle:** T-043-15 the adapter reports a new settlement sequence (amendment 0041) ([#97](https://github.com/bloque-app/aledgent/issues/97)) ([6a17392](https://github.com/bloque-app/aledgent/commit/6a1739293f1eae3dcb85a62884cccef17ae8b5ab))
+* **signer:** signature engines, Vault Transit first (F-042) ([#71](https://github.com/bloque-app/aledgent/issues/71)) ([56c5273](https://github.com/bloque-app/aledgent/commit/56c52734bc1f20fc12af8c1fa72d27aa13afb007))
+* **verify:** T-043-09 chained-design readers, alerts and runbooks ([#84](https://github.com/bloque-app/aledgent/issues/84)) ([df6b1e5](https://github.com/bloque-app/aledgent/commit/df6b1e5d30103e4cdfcddecec1704db7f0070f95))
+
+
+### Bug Fixes
+
+* **core:** T-003-11 choose among the grants that list the operation's asset, from generation 1 ([#101](https://github.com/bloque-app/aledgent/issues/101)) ([fdde2fd](https://github.com/bloque-app/aledgent/commit/fdde2fd427ab4540688b6bdc0eb89788aad962cd))
+* **ingress:** T-043-19 do not send the settlement head read to a core that cannot decode it ([#103](https://github.com/bloque-app/aledgent/issues/103)) ([f6168e4](https://github.com/bloque-app/aledgent/commit/f6168e47e2fa2c718554a38b379978e1b00f1bc1))
+* **ingress:** T-043-19 the settlement head read is not sent to a core that cannot decode it ([f6168e4](https://github.com/bloque-app/aledgent/commit/f6168e47e2fa2c718554a38b379978e1b00f1bc1))
+* **settlement:** record a re-scan's difference once, however often it is found (T-032-25) ([#73](https://github.com/bloque-app/aledgent/issues/73)) ([c79d12d](https://github.com/bloque-app/aledgent/commit/c79d12db82b8ff05e8f975ed7bd8b9ad445b573d))
+
 ## [0.3.1](https://github.com/bloque-app/aledgent/compare/v0.3.0...v0.3.1) (2026-10-25)
 
 
