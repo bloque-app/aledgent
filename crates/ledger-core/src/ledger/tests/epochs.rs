@@ -692,9 +692,17 @@ fn t043_14_the_store_clears_earlier_gap_ends_at_a_start() {
             s.apply(&SettlementWrite::SequenceGapEnd { sequence, to })
                 .unwrap();
         }
-        // A lower end of a sequence already held changes nothing.
+        // A lower end of a sequence already held changes nothing; a higher one raises it.
         s.apply(&SettlementWrite::SequenceGapEnd { sequence: 2, to: 4 })
             .unwrap();
+        assert_eq!(s.gap_ends(), &[(1, 11), (2, 5), (3, 6)]);
+        s.apply(&SettlementWrite::SequenceGapEnd { sequence: 2, to: 3 })
+            .unwrap();
+        s.apply(&SettlementWrite::SequenceGapEnd { sequence: 3, to: 7 })
+            .unwrap();
+        s.apply(&SettlementWrite::SequenceGapEnd { sequence: 3, to: 6 })
+            .unwrap();
+        assert_eq!(s.gap_ends(), &[(1, 11), (2, 5), (3, 7)]);
         assert_eq!(s.gap_end(), 11);
         let u = s
             .apply(&SettlementWrite::Epoch {
@@ -705,12 +713,12 @@ fn t043_14_the_store_clears_earlier_gap_ends_at_a_start() {
         // Untagged and sequence 1 cleared; 2 (the started one) and 3 (later) kept.
         assert_eq!(
             (s.untagged_gap_end(), s.gap_ends(), s.gap_end()),
-            (0, &[(2, 5), (3, 6)][..], 6)
+            (0, &[(2, 5), (3, 7)][..], 7)
         );
         s.undo(u);
         assert_eq!(
             (s.untagged_gap_end(), s.gap_ends(), s.head(), s.epoch()),
-            (9, &[(1, 11), (2, 5), (3, 6)][..], Some(h(142, 13)), None)
+            (9, &[(1, 11), (2, 5), (3, 7)][..], Some(h(142, 13)), None)
         );
     }
 }

@@ -1343,3 +1343,31 @@ async fn t043_14_the_epoch_route_is_closed_until_the_core_knows_it() {
         .await;
     assert_eq!(v["error"], "ERR-NotAuthorised", "{v}");
 }
+
+/// Amendment 0041, decision 6 made exact: a gap body's `sequence` reaches the logged command only
+/// while the deployment's `settlement_epochs` is on; closed, the gap is logged and forwarded plain
+/// (a core host built before it could not decode the input that carries it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t043_14_a_gap_s_sequence_is_dropped_while_the_route_is_closed() {
+    let body = json!({ "from": 3, "to": 5, "reason": "unreadable", "sequence": 2 });
+    for open in [false, true] {
+        let mut config = ingress::testkit::fast_config("ingress-0");
+        config.settlement_epochs = open;
+        let d = Deployment::start_with(config).await;
+        let op = d.operator.token.clone();
+        let before = d.store.rows().await.unwrap().len();
+        let _ = d
+            .call(
+                "POST",
+                "/v1/settlement/gaps",
+                Some(&op),
+                &[],
+                Some(body.clone()),
+            )
+            .await;
+        let rows = d.store.rows().await.unwrap();
+        assert_eq!(rows.len(), before + 1, "the gap is logged (open {open})");
+        let logged = String::from_utf8_lossy(&rows.last().unwrap().new.body).into_owned();
+        assert_eq!(logged.contains("sequence"), open, "{logged}");
+    }
+}

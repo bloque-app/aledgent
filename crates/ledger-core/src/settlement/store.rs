@@ -1138,8 +1138,8 @@ impl SettlementStore {
     /// The end of the highest gap recorded from [`super::CHAINED_SETTLEMENT`] on; 0 for none
     /// (`T-043-07`).
     pub fn gap_end(&self) -> u64 {
-        // The untagged end alone while no sequence named one: an input that names none reads no
-        // other leaf.
+        // The highest over the untagged end and every sequence's (kind 34, read every time:
+        // `proof` calls this only from `CHAINED_SETTLEMENT` on, where kind 34 is known).
         let ends = self.gap_ends.get();
         ends.iter()
             .map(|(_, end)| *end)
