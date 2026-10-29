@@ -116,7 +116,8 @@ By the core's answer:
     owner; do not record a gap for it.
   - `not_later`: the reset is not later than one the core holds. Treat it as step 3's second case.
   - an `ERR-` code (the adapter's authority lost, a limit): the command was refused before the core could
-    decide it. Fix the cause; the next attempt is taken.
+    decide it. Fix the cause; the next attempt is taken. `ERR-NotAuthorised` can also mean that ingress is
+    older than amendment 0041 and has no epoch route: check its version before the adapter's grant.
 - **Another book's reset** (`reset:<instance>`, the reason `other_book`): the reset names another book, as
   a re-founding does. (A book re-founded after a reset that named the book before it stays here: `refound`
   cannot help while the chain names the earlier book. Turn `report_resets` off, and escalate.) Only with the
@@ -133,13 +134,19 @@ By the core's answer:
   the owner: the book needs a re-founding (as above), and the operations those entries settled are
   resolved as in step 6.
 - **Entries verified and not taken in** (`reset:<instance>`, "verified ... were not taken in by the core"):
-  with `report_resets` on the adapter reports them first, every step, and follows the reset once the core
-  takes them; the `report:` alerts say why it does not. With it off, the reset stops as before. `refound`
+  with `report_resets` on the adapter reports them first, every step; the `report:` alerts say why the core
+  does not take them. Once taken they are final records at positions the new chain reuses, so the start is
+  then refused (`earlier_final`): the book needs a re-founding, as for `earlier_final` above. With it off, the reset stops as before. `refound`
   drops them: only with the owner, as for entries never read.
+- **A reset found too late** (`reset:<instance>`, "the chain before it could not be read up to the reset"):
+  the adapter fell behind the node's events (no history endpoint) across a reset. Do **not** record a gap:
+  the adapter refuses one that spans a reset, since it would take the new chain's head as the old one's and
+  lose the new chain's entries. The reset is never followed by the adapter. Give it a history endpoint that
+  reaches back to the position named, or escalate to the owner for a re-founding.
 - **Switch off** (`reset:<instance>`, "`report_resets` is off"): the core was not told. A reset belongs to a
   re-founding window: follow "Another book's reset" with the owner, or turn the switches on once the core
   can take the start.
-- **A core that cannot take it yet** (`AledgentSettlementEpochUnsupported`, a warning,
+- **A core that cannot take it yet** (`AledgentSettlementEpochUnsupported`, which pages, since withdrawals are off,
   `epoch-unsupported:<instance>:<epoch>`): the core runs code before amendment 0041's generation. On a first
   start the adapter goes on, and the core's head stays where it was; the adapter is held, so withdrawals are
   refused: upgrade the core, or open ingress's `settlement_epochs` if it is the route that is closed (the release order is the core first, then the adapter). On a live reset the

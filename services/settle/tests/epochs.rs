@@ -348,10 +348,16 @@ async fn t043_15_a_first_start_reports_the_sequence_once() {
     );
     assert_eq!(open(&k, EPOCH_UNSUPPORTED_ALERT).await, 1);
     assert_eq!(open(&k, "reset:").await, 0);
-    // It goes on: the new chain's entries reach the core.
+    // It goes on: the new chain's entries reach the core. The adapter is held by
+    // `epoch-unsupported:` alone (no `reset:`), so withdrawals are refused meanwhile.
     deposits(&k, 1, 9);
     k.chain.finalize_all();
-    assert_eq!(k.step().await.unwrap().observed, 1);
+    let step = k.step().await.unwrap();
+    assert_eq!(step.observed, 1);
+    assert!(step.held);
+    assert!(!declared_available(&k));
+    let (_, v, _) = try_withdrawal(&k, "unsupported").await;
+    assert_eq!(v["error"], "ERR-SettlementLayerUnavailable");
     // The core's in-place upgrade.
     k.d.core
         .checkpoint(|l, _| l.set_generation(SETTLEMENT_EPOCHS, false))
@@ -540,6 +546,8 @@ async fn t043_15_the_operators_gap_names_its_sequence() {
         } else {
             assert!(body.get("sequence").is_none(), "{body}");
         }
+        // The core holds it (here under the sequence it took, so as the untagged end).
+        assert_eq!(k.core_settlement(|s| s.gap_end()).unwrap(), to);
     }
 }
 
@@ -552,4 +560,175 @@ async fn reset_sequence(k: &Kit) -> u32 {
         .unwrap()
         .unwrap()
         .epoch
+}
+
+/// The delta review's finding 1: a reset found only after the adapter fell behind the node's
+/// events (no history endpoint) is not a range to record as a gap, which would take the new chain's
+/// head as the old one's and drop the new chain's entries below it. The sync stops as a reset that
+/// is never followed (`reset:`, held), the operator's gap is refused, and nothing of the new chain
+/// reaches the core, with either switch position.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t043_15_a_reset_found_too_late_is_not_a_gap() {
+    for report in [true, false] {
+        let mut k = kit_with(SETTLEMENT_EPOCHS, report).await;
+        deposits(&k, 2, 1);
+        k.chain.finalize_all();
+        k.step().await.unwrap();
+        // The reset, and the new chain's own deposits, while the adapter is not stepping.
+        k.chain.reset_for(INSTANCE, 0, k.book());
+        deposits(&k, 5, 7);
+        k.chain.advance(300);
+        k.chain.finalize_all();
+        let step = k.step().await.unwrap();
+        assert_eq!(
+            open(&k, &format!("reset:{INSTANCE}")).await,
+            1,
+            "[{report}]"
+        );
+        assert_eq!(open(&k, "unreadable:").await, 0, "[{report}]");
+        let reset = k
+            .store
+            .alerts()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|a| a.key == format!("reset:{INSTANCE}"))
+            .unwrap();
+        assert!(
+            reset.detail.contains("could not be read"),
+            "{}",
+            reset.detail
+        );
+        assert!(
+            k.adapter.record_operator_gap(2, 5).await.is_err(),
+            "[{report}]"
+        );
+        for _ in 0..3 {
+            k.d.clock.advance(EPOCH_RETRY);
+            k.chain.advance(1);
+            k.step().await.unwrap();
+        }
+        assert!(step.held || k.step().await.unwrap().held);
+        assert_eq!(
+            core_amounts(&k),
+            vec![1, 1],
+            "[{report}] nothing of the new chain"
+        );
+        assert_eq!(
+            k.core_settlement(|s| s.epoch()).unwrap(),
+            None,
+            "[{report}] not followed"
+        );
+        assert_eq!(sent(&k, "epoch").await, 0, "[{report}] never reported");
+        let (_, v, _) = try_withdrawal(&k, &format!("late-{report}")).await;
+        assert_eq!(v["error"], "ERR-SettlementLayerUnavailable");
+    }
+}
+
+/// The delta review's finding 2: a gap that names its sequence, refused by a core before the
+/// amendment's generation (`ERR-MalformedCommand`), is sent again without it and recorded; at the
+/// generation it is recorded as sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t043_15_a_tagged_gap_a_core_cannot_take_is_sent_plain() {
+    for generation in [0, SETTLEMENT_EPOCHS] {
+        let mut k = kit_with(generation, true).await;
+        k.chain.reset_for(INSTANCE, 0, k.book());
+        k.chain.advance(1);
+        let _ = k.step().await;
+        if open(&k, "reset:").await > 0 {
+            k.adapter.refound().await.unwrap();
+        }
+        k.step().await.unwrap();
+        deposits(&k, 3, 1);
+        k.chain.advance(300);
+        k.step().await.unwrap();
+        assert_eq!(open(&k, "unreadable:").await, 1, "gen {generation}");
+        let (from, to) = k.adapter.record_operator_gap(0, 3).await.unwrap();
+        let verdict = |key: String| {
+            let s = k.store.clone();
+            async move { s.report(&key).await.unwrap().and_then(|r| r.verdict) }
+        };
+        let tagged = verdict(format!("settle/gap/{INSTANCE}/{from}/{to}")).await;
+        let plain = verdict(format!("settle/gap/{INSTANCE}/{from}/{to}/untagged")).await;
+        let recorded = k
+            .core_settlement(|s| s.gaps().len() as u64 + s.gap_end())
+            .unwrap();
+        if generation == 0 {
+            assert_eq!(tagged.as_deref(), Some("refused:ERR-MalformedCommand"));
+            assert!(plain.is_some_and(|v| !v.starts_with("refused")));
+            assert_eq!(
+                k.core_settlement(|s| s.gaps().len()).unwrap(),
+                1,
+                "recorded"
+            );
+        } else {
+            assert!(tagged.is_some_and(|v| !v.starts_with("refused")));
+            assert_eq!(plain, None);
+            assert!(recorded >= to);
+        }
+        assert_eq!(open(&k, "gap:").await, 0);
+    }
+}
+
+/// The delta review's finding 7: a reset stopped for verified entries the core had not taken in
+/// is retried (`retry_epoch`) once the switch is on: they are reported first. Here the switch is
+/// off when the reset is found, so it stops; turned on, the retry reports the entry (and the start
+/// is then refused `earlier_final`, decision 3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t043_15_a_reset_stopped_for_unreported_entries_is_retried() {
+    let mut k = kit_with(SETTLEMENT_EPOCHS, false).await;
+    k.chain.advance(1);
+    k.step().await.unwrap();
+    deposits(&k, 1, 4);
+    k.chain.finalize_all();
+    k.adapter.crash_at(CrashPoint::AfterObserve);
+    assert!(k.step().await.is_err());
+    k.chain.reset_for(INSTANCE, 0, k.book());
+    k.chain.advance(1);
+    k.restart();
+    k.step().await.unwrap();
+    assert_eq!(open(&k, &format!("reset:{INSTANCE}")).await, 1);
+    assert!(core_amounts(&k).is_empty(), "not reported yet");
+    k.reconfigure(|c| c.report_resets = true);
+    k.chain.advance(1);
+    k.step().await.unwrap();
+    assert_eq!(core_amounts(&k), vec![4], "reported by the retry");
+    assert_eq!(kept(&k).await.as_deref(), Some("refused:earlier_final"));
+}
+
+/// The delta review's finding 6: the retry follows only a stop the core may still lift. A reset
+/// found too late to read the chain before it is never followed, even with an epoch alert open
+/// that would otherwise send it to the retry (here a stale page of an earlier sequence, on a book
+/// with no final record a start would be refused for).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t043_15_the_retry_never_follows_a_reset_it_could_not_read() {
+    let mut k = kit(SETTLEMENT_EPOCHS).await;
+    k.chain.advance(1);
+    k.step().await.unwrap();
+    let now = k.now();
+    k.store
+        .raise(
+            &format!("{EPOCH_ALERT}:{INSTANCE}:9"),
+            "an earlier page",
+            now,
+        )
+        .await
+        .unwrap();
+    k.chain.reset_for(INSTANCE, 0, k.book());
+    deposits(&k, 2, 7);
+    k.chain.advance(300);
+    k.chain.finalize_all();
+    k.step().await.unwrap();
+    assert_eq!(open(&k, &format!("reset:{INSTANCE}")).await, 1);
+    for _ in 0..3 {
+        k.d.clock.advance(EPOCH_RETRY);
+        k.chain.advance(1);
+        k.step().await.unwrap();
+    }
+    assert_eq!(
+        k.core_settlement(|s| s.epoch()).unwrap(),
+        None,
+        "not followed"
+    );
+    assert_eq!(open(&k, &format!("reset:{INSTANCE}")).await, 1);
 }

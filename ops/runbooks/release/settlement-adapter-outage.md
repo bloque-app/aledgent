@@ -129,7 +129,7 @@ settlement-operations.
    Both commands take the adapter's lease, so the running adapter is stopped first; each runs once and
    exits. The steps and their checks are in [gap-filling](../gap-filling.md).
 
-10. **A reset the core cannot take yet** (`AledgentSettlementEpochUnsupported`, a warning): the core runs
+10. **A reset the core cannot take yet** (`AledgentSettlementEpochUnsupported`, which pages): the core runs
     code before amendment 0041's generation (or ingress's `settlement_epochs` is off), so its finalised head
     stays on the chain before the reset. The adapter goes on stepping, held: withdrawals are refused. Upgrade the core; the adapter reports
     the reset again within ten minutes and the warning clears. See [gap-filling](../gap-filling.md),

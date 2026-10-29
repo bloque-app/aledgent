@@ -422,11 +422,10 @@ groups:
           runbook: ops/runbooks/release/settlement-adapter-outage.md
       # Amendment 0041: a reset the core cannot take yet (its code is before the amendment's
       # generation, or ingress's route is closed). The adapter declares that it does not serve, so
-      # new withdrawals are refused; the core's head stays where it was until its upgrade.
+      # new withdrawals are refused: it pages, as a withdrawal outage does.
       - alert: AledgentSettlementEpochUnsupported
         expr: aledgent_adapter_alerts{kind="epoch-unsupported"} > 0
-        for: 10m
-        labels: { severity: warning, owner: settlement-operations, signal: settlement-adapter }
+        labels: { severity: page, owner: settlement-operations, signal: settlement-adapter }
         annotations:
           summary: The core cannot take a reset of the settlement layer's instance until it is upgraded; withdrawals are refused meanwhile.
           runbook: ops/runbooks/release/settlement-adapter-outage.md
