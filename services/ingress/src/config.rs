@@ -397,6 +397,14 @@ pub struct DeploymentConfig {
     /// the route is refused `ERR-MalformedCommand` and nothing is logged.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub settlement_epochs: bool,
+    /// Whether ingress asks the core for the book's settlement head (`GET /v1/ops/settlement/head`,
+    /// amendment 0041, `T-043-16`). **Off by default**: a core host built before `T-043-16` cannot
+    /// decode the query, and a request it cannot decode closes the core stream, with every call in
+    /// flight on it (`T-043-19`). Turned on only once the deployment's core host runs a build that
+    /// knows it (rules version 0 is enough: the host's binary decodes, not the rules version); off,
+    /// the route is answered `ERR-DecisionUnavailable` (503) and nothing is sent to the core.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub settlement_head: bool,
     /// How long ingress reuses what the core answered for an API key's credential, milliseconds
     /// (`T-031-13`, [`crate::credentials::VerifierCache`]). A revoked key stops authenticating
     /// within it. Absent: 500; 0 reads the core on every request; above 1 000 (`NFR-20`'s bound)
@@ -1403,6 +1411,7 @@ impl DeploymentConfig {
             // T-036-25: a chainspec book takes commands only once its core says so.
             genesis_gate: self.genesis.chainspec.is_some(),
             settlement_epochs: self.settlement_epochs,
+            settlement_head: self.settlement_head,
             link: self.forward_link(),
             ..Config::default()
         }
@@ -1456,6 +1465,21 @@ mod tests {
         let mut on = v;
         on["settlement_epochs"] = serde_json::Value::Bool(true);
         assert!(deployment(on).service().settlement_epochs);
+    }
+
+    /// Amendment 0041 (`T-043-19`): the head query is not sent unless the deployment says its core
+    /// host decodes it. A file that does not name `settlement_head` (the template) leaves it off,
+    /// and so does the running configuration's default; naming it `true` turns it on.
+    #[test]
+    fn t043_19_settlement_head_is_off_by_default() {
+        assert!(!crate::service::Config::default().settlement_head);
+        let v = template();
+        assert!(v.get("settlement_head").is_none());
+        assert!(!deployment(v.clone()).settlement_head);
+        assert!(!deployment(v.clone()).service().settlement_head);
+        let mut on = v;
+        on["settlement_head"] = serde_json::Value::Bool(true);
+        assert!(deployment(on).service().settlement_head);
     }
 
     /// `F-042`: the feed key on an engine. The example (`ingress-feed-key-transit.json`) put in the

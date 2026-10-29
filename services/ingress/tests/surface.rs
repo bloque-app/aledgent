@@ -1341,6 +1341,174 @@ async fn t043_14_the_epoch_route_is_closed_until_the_core_knows_it() {
     assert_eq!(v["error"], "ERR-NotAuthorised", "{v}");
 }
 
+/// A core host built before `T-043-16`, as ingress meets it: it cannot decode
+/// [`Query::SettlementHead`], so the request is never answered (a stream drops, a read is
+/// unavailable). Every other call goes to the real core. Counts the head queries it was sent.
+#[derive(Clone)]
+struct HostBeforeHead {
+    inner: ingress::testkit::TestCore,
+    head_queries: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Core for HostBeforeHead {
+    async fn apply(
+        &self,
+        input: &CoreInput,
+    ) -> Result<ingress::boundary::CoreReply, ingress::boundary::CoreError> {
+        self.inner.apply(input).await
+    }
+
+    async fn apply_batch(
+        &self,
+        inputs: &[CoreInput],
+    ) -> Vec<Result<ingress::boundary::CoreReply, ingress::boundary::CoreError>> {
+        self.inner.apply_batch(inputs).await
+    }
+
+    async fn outbox(
+        &self,
+        cursor: Option<&str>,
+        undelivered: bool,
+        now: ledger_core::account::Time,
+    ) -> Result<ingress::boundary::OutboxPage, ingress::boundary::CoreError> {
+        self.inner.outbox(cursor, undelivered, now).await
+    }
+
+    async fn last_tick(
+        &self,
+    ) -> Result<Option<ledger_core::account::Time>, ingress::boundary::CoreError> {
+        self.inner.last_tick().await
+    }
+
+    async fn query(
+        &self,
+        caller: &ingress::boundary::CallerBody,
+        query: &ingress::boundary::Query,
+        now: ledger_core::account::Time,
+    ) -> Result<ingress::boundary::QueryReply, ingress::boundary::CoreError> {
+        if matches!(query, ingress::boundary::Query::SettlementHead) {
+            self.head_queries
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(ingress::boundary::CoreError::Unavailable);
+        }
+        self.inner.query(caller, query, now).await
+    }
+
+    async fn credential(
+        &self,
+        credential: &str,
+    ) -> Result<Option<ingress::boundary::CredentialBody>, ingress::boundary::CoreError> {
+        self.inner.credential(credential).await
+    }
+
+    async fn party_of(
+        &self,
+        principal: &str,
+    ) -> Result<Option<String>, ingress::boundary::CoreError> {
+        self.inner.party_of(principal).await
+    }
+}
+
+/// A deployment over [`HostBeforeHead`], its `settlement_head` switch as given.
+async fn host_before_head(
+    switch: bool,
+) -> (
+    Deployment<ingress::store::mem::MemStore, HostBeforeHead>,
+    Arc<std::sync::atomic::AtomicU64>,
+) {
+    use ingress::inprocess::{InProcessCore, MemJournal};
+    use ingress::testkit::{T0, fast_config, genesis, test_clerk};
+    let journal = MemJournal::new();
+    let inner = InProcessCore::in_memory(genesis(T0), journal.clone()).with_clerk(test_clerk());
+    inner.start().unwrap();
+    let founded = inner.founded().unwrap();
+    let head_queries = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let core = HostBeforeHead {
+        inner,
+        head_queries: Arc::clone(&head_queries),
+    };
+    let mut config = fast_config("ingress-0");
+    config.settlement_head = switch;
+    let store = ingress::store::mem::MemStore::new(config.lease);
+    let d = Deployment::assemble(store, config, core, founded, journal).await;
+    (d, head_queries)
+}
+
+/// Amendment 0041 (`T-043-16`, `T-043-19`; `REQ-CS-8`, `REQ-AR-7`): unless the deployment says its
+/// core host decodes the head query (`settlement_head`), `GET /v1/ops/settlement/head` is answered
+/// `ERR-DecisionUnavailable` (503) by ingress itself, whoever asks, and the core is sent no head
+/// query: a host built before it cannot read the request and drops the stream it came on. An
+/// unauthenticated request is still 401, and a malformed one still 400.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t043_19_the_head_route_is_not_sent_to_a_core_that_cannot_decode_it() {
+    let (d, head_queries) = host_before_head(false).await;
+    let op = d.operator.token.clone();
+    let alice = d.party("alice", 0).await;
+    let started = std::time::Instant::now();
+    for token in [&op, &alice.token] {
+        let (s, v) = d
+            .call("GET", "/v1/ops/settlement/head", Some(token), &[], None)
+            .await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+        assert!(is_refusal(&v, Refusal::DecisionUnavailable), "{v}");
+    }
+    assert!(
+        started.elapsed() < ingress::answering::NFR_16,
+        "answered at once, not after the core's retries"
+    );
+    let (s, v) = d
+        .call("GET", "/v1/ops/settlement/head", None, &[], None)
+        .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "{v}");
+    let (s, v) = d
+        .call("GET", "/v1/ops/settlement/head?x=1", Some(&op), &[], None)
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(
+        head_queries.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no head query reached the core"
+    );
+    // The other reads are untouched.
+    let (s, v) = d.call("GET", "/v1/assets", Some(&op), &[], None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+}
+
+/// The same host with the switch on is sent the query (so the switch, not the host, is what
+/// protects it), and a core that decodes it answers the route: the operator reads the head, and
+/// the core still decides who may.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t043_19_the_head_route_reaches_a_core_once_the_switch_is_on() {
+    let (d, head_queries) = host_before_head(true).await;
+    let op = d.operator.token.clone();
+    let (s, v) = d
+        .call("GET", "/v1/ops/settlement/head", Some(&op), &[], None)
+        .await;
+    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+    assert!(
+        head_queries.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "the query was sent"
+    );
+    let d = Deployment::start().await;
+    let op = d.operator.token.clone();
+    let (s, v) = d
+        .call("GET", "/v1/ops/settlement/head", Some(&op), &[], None)
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let alice = d.party("alice", 0).await;
+    let (s, v) = d
+        .call(
+            "GET",
+            "/v1/ops/settlement/head",
+            Some(&alice.token),
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{v}");
+    assert_eq!(v["error"], "ERR-NotAuthorised");
+}
+
 /// Amendment 0041, decision 6 made exact: a gap body's `sequence` reaches the logged command only
 /// while the deployment's `settlement_epochs` is on; closed, the gap is logged and forwarded plain
 /// (a core host built before it could not decode the input that carries it).
