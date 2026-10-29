@@ -38,7 +38,7 @@ exclude = ["tools/ci/fixtures", "spikes", "agents", "contracts", "services/settl
 [workspace.package]
 # The release version (release-please bumps it: release-please-config.json), every member's but
 # those compiled into a guest program, which keep a fixed one (tools/release/check-config.py).
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0 OR MIT"
