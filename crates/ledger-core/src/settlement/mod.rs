@@ -420,6 +420,9 @@ pub struct SettlementHeadView {
     pub head: Option<FinalisedHead>,
     /// The last sequence of the layer's record whose start the book took.
     pub epoch: Option<SettlementEpoch>,
+    /// The first head the adapter reported at a later block with a lower position, not taken
+    /// (amendment 0041's guard): while set, withdrawals are refused.
+    pub reported: Option<FinalisedHead>,
 }
 
 /// What the core made of a new sequence (amendment 0041).

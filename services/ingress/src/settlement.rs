@@ -612,6 +612,11 @@ pub struct SettlementHeadBody {
     /// the sequence the instance began with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epoch: Option<EpochBody>,
+    /// The first head the adapter reported at a later block with a lower position that the book
+    /// did not take (amendment 0041's guard): while present, withdrawals are refused with
+    /// `ERR-SettlementLayerUnavailable`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported: Option<FinalisedHeadBody>,
 }
 
 /// The settlement head on the wire (amendment 0041).
@@ -620,6 +625,7 @@ pub fn settlement_head_body(v: &ledger_core::settlement::SettlementHeadView) -> 
         instance: v.instance,
         head: v.head.as_ref().map(finalised_head_body),
         epoch: v.epoch.as_ref().map(epoch_body),
+        reported: v.reported.as_ref().map(finalised_head_body),
     }
 }
 

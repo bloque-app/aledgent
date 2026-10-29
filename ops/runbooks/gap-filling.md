@@ -98,6 +98,15 @@ the adapter keeps stepping but declares to the core that it does not serve (`ale
 `ERR-SettlementLayerUnavailable`: this is not an adapter outage. It lifts when a start is taken (every
 `epoch` alert of the instance clears) or with `refound`.
 
+**A head reported and not taken** (amendment 0041's guard, `T-043-17`, a core at `SETTLEMENT_EPOCHS`). When
+the adapter goes on sending heads of a new chain the core has not followed (a first start on it, test's
+case), the core records the first such head and refuses new withdrawals with the same error while it is
+set, though the adapter declares itself serving. Read it on `GET /v1/ops/settlement/head`: `reported` is
+that head, `head` the stale one the core holds. It clears only when the core takes a head again: when a
+start is taken, or when the new chain's position passes the stale head's by itself (on test, 11 positions).
+Nothing clears it on a timer. While it is set and a start is refused `in_flight`, the instruction in flight
+cannot expire (no head of the new chain is taken): resolve it through `CTR-OPS` (below) to get out.
+
 By the core's answer:
 
 - **It follows it** (`started`, or `recorded`): the core's finalised head restarts at the reset's block

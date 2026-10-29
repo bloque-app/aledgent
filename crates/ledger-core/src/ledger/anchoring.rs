@@ -361,6 +361,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             instance: store.config().map(|c| c.instance),
             head: store.head(),
             epoch: store.epoch(),
+            reported: store.reported(),
         })
     }
 

@@ -196,6 +196,9 @@ pub enum SettlementWrite {
         /// The final record.
         coordinate: Coordinate,
     },
+    /// Record a head the adapter reported at a later block than the one held, with a lower
+    /// position, which the book did not take (amendment 0041's guard, `T-043-17`), or clear it.
+    Reported(Option<FinalisedHead>),
     /// Advance the positions' tally (`REQ-PR-5`) over every inbox position below `through`, all
     /// final: `counted` are the operations with a final deposit or withdrawal record in the
     /// positions passed, and `held` the tally afterwards. Refused if it would go back or count an
@@ -271,6 +274,7 @@ pub(crate) enum SettlementUndo {
         Vec<(u32, u64)>,
     ),
     GapEnds(Vec<(u32, u64)>),
+    Reported(Option<FinalisedHead>),
     PopGap,
     GapEnd(u64),
     Gaps(Vec<Gap>),
@@ -321,6 +325,10 @@ pub struct SettlementStore {
     /// The last sequence of the layer's record whose start the book took (amendment 0041), from
     /// [`super::SETTLEMENT_EPOCHS`] on. Absent until one is taken.
     epoch: Slot<Option<SettlementEpoch>, { kind::SETTLEMENT_EPOCH }>,
+    /// The first head the adapter reported at a later block with a lower position that the book
+    /// did not take, since the last head it took (amendment 0041's guard, `T-043-17`): while set,
+    /// `withdraw` and `submit_outbound` are refused. Absent otherwise.
+    reported: Slot<Option<FinalisedHead>, { kind::HEAD_REPORTED }>,
     status: Slot<Option<AdapterStatus>, { kind::ADAPTER_STATUS }>,
     /// The latest attestation of each location (`DEC-20`).
     attestations: Leaves<AssetLocation, Attested, { kind::ASSET_ATTESTATION }>,
@@ -453,6 +461,9 @@ impl SettlementStore {
             }
             SettlementUndo::GapEnds(before) => {
                 self.gap_ends.set(before);
+            }
+            SettlementUndo::Reported(r) => {
+                self.reported.set(r);
             }
             SettlementUndo::PopGap => {
                 self.gaps.get_mut().pop();
@@ -691,6 +702,10 @@ impl SettlementStore {
                 }
                 let before = self.head.set(Some(*h));
                 Ok(SettlementUndo::Head(before))
+            }
+            SettlementWrite::Reported(r) => {
+                let before = self.reported.set(*r);
+                Ok(SettlementUndo::Reported(before))
             }
             SettlementWrite::Epoch { epoch, head } => {
                 if self
@@ -1111,6 +1126,11 @@ impl SettlementStore {
         *self.epoch.get()
     }
 
+    /// The head the adapter reported and the book did not take, if any (amendment 0041's guard).
+    pub fn reported(&self) -> Option<FinalisedHead> {
+        *self.reported.get()
+    }
+
     /// Whether any outbound instruction is not yet decided (amendment 0041): a read of the
     /// instructions in flight, whole.
     pub fn any_live(&self) -> Option<OperationId> {
@@ -1223,6 +1243,7 @@ impl LeafHost for SettlementStore {
         out.push(&self.gap_end);
         out.push(&self.gap_ends);
         out.push(&self.epoch);
+        out.push(&self.reported);
         out.push(&self.status);
         out.push(&self.attestations);
         out.push(&self.binds);
@@ -1250,6 +1271,7 @@ impl LeafHost for SettlementStore {
         out.push(&mut self.gap_end);
         out.push(&mut self.gap_ends);
         out.push(&mut self.epoch);
+        out.push(&mut self.reported);
         out.push(&mut self.status);
         out.push(&mut self.attestations);
         out.push(&mut self.binds);

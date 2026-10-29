@@ -5117,6 +5117,17 @@
               "integer",
               "null"
             ]
+          },
+          "reported": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FinalisedHeadBody"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The first head the adapter reported at a later block with a lower position that the book\ndid not take (amendment 0041's guard): while present, withdrawals are refused with\n`ERR-SettlementLayerUnavailable`."
           }
         },
         "type": "object"

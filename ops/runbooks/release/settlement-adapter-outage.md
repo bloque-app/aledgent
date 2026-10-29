@@ -17,7 +17,8 @@ settlement-operations.
 - **Internal transfers, reservations and queries carry on.** They never touch the settlement layer
   (guardrail 9).
 - **New external legs are refused** with `ERR-SettlementLayerUnavailable` once its status lease lapses.
-  The same error while the adapter runs and serves is its hold after a reset (amendment 0041): see
+  The same error while the adapter runs and serves is its hold after a reset, or the core's guard against
+  a stale head (`reported` set on `GET /v1/ops/settlement/head`) (amendment 0041): see
   [gap-filling](../gap-filling.md), "After a reset".
 - **In-flight batches** land or expire on chain, and are decided when the adapter returns.
 - **Nothing is released on a timer** (`REQ-OP-9`). An operation past its deadline goes to `Needs-Review`.

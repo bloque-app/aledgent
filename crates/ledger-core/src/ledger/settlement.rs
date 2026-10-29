@@ -1686,8 +1686,28 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                     return Err(Refusal::EvidenceInsufficient);
                 }
             }
+            // Amendment 0041's guard (`T-043-17`), from `SETTLEMENT_EPOCHS` on: a head at a later
+            // block with a lower position (a reset the book has not followed) is recorded as
+            // reported and not taken, once, and a head taken clears it.
+            //
+            // Not while `T-043-08`'s move of a running book's incidents is under way: the leaf is
+            // absent until set, and proving it absent then reads the incidents leaf's whole value
+            // into the witness, which takes the move's input past the guest's arena (30 KB on a
+            // book of 520). The move reads that leaf on every adapter input anyway (it ran before
+            // this arm), so asking whether it is empty reads nothing more; the move ends within
+            // incidents / `MOVE_PER_INPUT` adapter inputs of the switch, and the guard arms on the
+            // next dropped head after it.
+            let guard = self.epochs() && self.state.settlement().incidents().is_empty();
+            let reported = if guard {
+                self.state.settlement().reported()
+            } else {
+                None
+            };
             if let Some(last) = self.state.settlement().head() {
                 if head.height < last.height || head.next_seq < last.next_seq {
+                    if guard && head.height > last.height && reported.is_none() {
+                        self.commit(&[Write::Settlement(SettlementWrite::Reported(Some(head)))])?;
+                    }
                     return Ok(report);
                 }
                 if head != last {
@@ -1695,6 +1715,9 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                 }
             } else {
                 self.commit(&[Write::Settlement(SettlementWrite::Head(head))])?;
+            }
+            if reported.is_some() {
+                self.commit(&[Write::Settlement(SettlementWrite::Reported(None))])?;
             }
             let store = self.state.settlement();
             let facts: Vec<Write> = work
@@ -2030,7 +2053,11 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                     Some(h) if h.height > epoch.at => None,
                     _ => Some(start),
                 };
-                let writes = [Write::Settlement(SettlementWrite::Epoch { epoch, head })];
+                let mut writes = vec![Write::Settlement(SettlementWrite::Epoch { epoch, head })];
+                // The guard's head reported and not taken was this reset's (`T-043-17`).
+                if self.state.settlement().reported().is_some() {
+                    writes.push(Write::Settlement(SettlementWrite::Reported(None)));
+                }
                 self.check(&writes)?;
                 self.commit(&writes)?;
                 Ok(EpochOutcome::Started(
