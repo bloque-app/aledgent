@@ -97,8 +97,10 @@ sequence's number, its base, its first position, its block, the book it names, a
   has taken the start in.
 - **A reset found too late** (the adapter fell behind the node's events across it, with no history endpoint):
   when the range since the verified head cannot be read and the chain's sequence differs from the verified
-  head's, the adapter stops as a reset it never follows (`reset:`), and refuses an operator's gap that would
-  span it. A gap there would take the new chain's head as the old one's and lose the new chain's entries.
+  head's, the adapter stops (`reset:`, held) and does not follow the reset while the range cannot be read; it
+  reads the range again each step, and once it reads takes the reset as a live one. It refuses an operator's
+  gap that would span the reset: a gap there would take the new chain's head as the old one's and lose the new
+  chain's entries.
 - **A gap names its sequence.** From `SETTLEMENT_EPOCHS` on, with `report_resets` on, the adapter reports a gap
   with the sequence of the chain it is of (the chain's at the head, which is the verified head's, since no gap
   spans a reset), as a new input (`AdapterInput::SequenceGap`), which ingress forwards only with
@@ -251,9 +253,10 @@ sequence (`REQ-SL-1`); one book's record MAY run over several sequences".
   - An ingress built before `T-043-14` has no epoch route and answers the adapter's report
     `ERR-NotAuthorised`. The adapter reads that as a refusal: it pages (`epoch:`) and holds. That fails closed,
     but the page names the adapter's authority, not the cause; the runbook says to check ingress's version
-    first. Such an ingress also refuses a gap that names its sequence (its body denies unknown fields); the
-    adapter then fails the operator's command and records nothing. So deploy ingress with `T-043-14` before
-    turning `report_resets` on.
+    first. Such an ingress also refuses a gap that names its sequence (its body denies unknown fields, which it
+    answers `ERR-MalformedCommand`); the adapter then sends the gap again without its sequence, and it is
+    recorded untagged, so the next start clears it. So deploy ingress with `T-043-14` before turning
+    `report_resets` on.
   - A core at `SETTLEMENT_EPOCHS` with the switches off is never told. On a live reset the adapter stops
     (`reset:`) and declares itself not serving; after a first start on the new chain, the guard refuses
     withdrawals while the head is stale.
