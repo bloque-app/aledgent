@@ -5,10 +5,11 @@ SPDX-License-Identifier: CC-BY-4.0
 
 # Runbook: a chain mismatch, an unreadable range, a reset, and a gap
 
-`F-018` T-018-08, `F-043` T-043-09 · `REQ-IN-5`, `REQ-SA-7`, `REQ-SL-9`, `AC-D2.2`, `NFR-9`
+`F-018` T-018-08, `F-043` T-043-09 and T-043-15 · `REQ-IN-5`, `REQ-SA-7`, `REQ-SL-9`, `REQ-SA-10`
+(amendment 0041, `[PENDING AMENDMENT 0041]`), `AC-D2.2`, `NFR-9`
 
 **Pages that lead here:** `AledgentSettlementChainMismatch`, `AledgentObservationStopped`,
-`AledgentObservationGap`, `AledgentObservationLag`. **Owner:** settlement-operations. **Rule that does not bend:** nothing here
+`AledgentObservationGap`, `AledgentObservationLag`, `AledgentSettlementEpochRefused`. **Owner:** settlement-operations. **Rule that does not bend:** nothing here
 writes the book or a store by hand. What the settlement layer recorded reaches the book only as the
 adapter's observations through the core's surface; an operation that cannot settle is resolved with
 evidence through `CTR-OPS` (`resolve_operation`), never by an edit (`REQ-AT-3`, `INV-11`).
@@ -31,9 +32,9 @@ sync:
 A full node keeps about 256 blocks of events, so routine settlement needs no archive node. An adapter
 further behind catches up from a node that keeps history. If none can serve a block, the position is
 unreadable: the adapter raises `unreadable:<instance>:<position>` and does not advance, until a reader
-serves it or the operator records a gap (below). A reset of the instance under a running adapter raises
-`reset:<instance>`: from then on nothing reaches the book it serves, until the operator re-founds it
-(below). A chain mismatch pages as `AledgentSettlementChainMismatch` (alert kind `chain:<instance>:<position>`;
+serves it or the operator records a gap (below). A reset of the instance (a new sequence of the record,
+from position 0) is reported to the core, which follows it unless it refuses (amendment 0041, "After a
+reset" below); while it does not, nothing of the new chain reaches the book. A chain mismatch pages as `AledgentSettlementChainMismatch` (alert kind `chain:<instance>:<position>`;
 also a first-start cursor past the chain's start). `unreadable` and `reset` page as
 `AledgentObservationStopped`: all three need an operator.
 
@@ -54,11 +55,10 @@ Incidents and gaps are written to the audit trail (`NFR-6`, `REQ-AT-1`), not to 
    point the primary at the second, or replace the first (`release/replace-node.md`). If it also differs,
    treat it as a divergence of the layer's record: page security and follow
    [divergence](release/divergence.md). Do not accept the head.
-4. **A reset by governance** (`AnchorHeadSet`) starts a new chain at position 0, and comes only with its
-   book's re-founding. A running adapter that sees one raises `reset:<instance>` and stops reporting
-   anything to the book it serves (no observation, head, anchor or position cut). Follow
-   "After a reset" below. If nobody announced the reset, do not re-found: treat it as step 3's second
-   case and page security.
+4. **A reset by governance** (`AnchorHeadSet`) starts a new chain at position 0. The adapter reports it to
+   the core, which follows it when nothing of the chain before can be confused with the new one; then no
+   alert is raised. Otherwise follow "After a reset" below. If nobody announced the reset, treat it as
+   step 3's second case and page security, whatever the core did.
 5. **If no node can serve the range**, choose, and write the choice on the incident:
    - **Wait**, for a node that keeps the range. The rest of the book goes on.
    - **Record a gap.** Have the adapter record the range as a gap through its own authoritative source
@@ -83,15 +83,79 @@ Incidents and gaps are written to the audit trail (`NFR-6`, `REQ-AT-1`), not to 
 
 ## After a reset
 
-Only with the owner's announcement of the book's re-founding (`F-043`, amendment 0040):
+A reset of the instance starts a new sequence of its record (`anchor_epoch()`: its number, the block, and
+the book it names). With `adapter.report_resets` and ingress's `settlement_epochs` on (both off by default;
+on only once the core runs a build that knows the input, see the settle README), the adapter reports it
+to the core (amendment 0041): live, when it reads the reset past the head it verified and nothing of the
+chain before it was left unreported (it first reports any entry it verified before the reset that the core
+had not taken in); and once per sequence,
+when it moved to the new chain on its own at a first start. The core's answer is kept in the adapter's
+store (`settle/epoch/<instance>`).
 
-1. The book has been re-founded and the adapter's configuration points at it. Stop the running adapter.
-2. Run once `aledgent-settle <config> refound`. It takes the lease, resets the instance's cursor and
-   accepted head, and exits.
-3. Start the adapter. It starts on the new chain at position 0 (a cursor kept from before the reset is
-   never read on it), and nothing of the old chain is reported.
-4. Verify that `reset:` closes and `AledgentObservationStopped` clears, then that
-   `aledgent_observation_cursor_lag` is about 0 and the next anchor goes final.
+**While held, withdrawals are refused.** While `reset:<instance>`, `epoch:` or `epoch-unsupported:` is open,
+the adapter keeps stepping but declares to the core that it does not serve (`aledgent_adapter_serving` stays
+1; the core's status shows it unavailable). New withdrawals, and the settlement comparison, are refused with
+`ERR-SettlementLayerUnavailable`: this is not an adapter outage. It lifts when a start is taken (every
+`epoch` alert of the instance clears) or with `refound`.
+
+By the core's answer:
+
+- **It follows it** (`started`, or `recorded`): the core's finalised head restarts at the reset's block
+  and position 0, and the new chain's entries and heads reach it. Nothing to do. Check it with
+  `GET /v1/ops/settlement/head`: the sequence and a head on the new chain.
+- **It refused it** (`AledgentSettlementEpochRefused`, `epoch:<instance>:<epoch>`, with the reason). Nothing
+  of the new chain reaches the core, and new withdrawals are refused (the adapter is held). The alert names
+  the operation in flight or the position of the final record. The adapter reports the start again every
+  ten minutes, and goes on by itself once the core takes it. By reason:
+  - `in_flight`: a withdrawal instructed before the reset is not decided. It cannot be proven against the
+    new chain: resolve it with evidence through `CTR-OPS` (`POST /v1/ops/operations/{reference}/resolve`,
+    with the layer's record or its absence from the chain before the reset as evidence). Once nothing is in
+    flight, the next attempt is taken.
+  - `earlier_final`: the core holds final records of the chain before at positions the new one reuses. The
+    book cannot follow this reset (amendment 0041's trade-off): it needs a re-founding. Escalate to the
+    owner; do not record a gap for it.
+  - `not_later`: the reset is not later than one the core holds. Treat it as step 3's second case.
+  - an `ERR-` code (the adapter's authority lost, a limit): the command was refused before the core could
+    decide it. Fix the cause; the next attempt is taken. `ERR-NotAuthorised` can also mean that ingress is
+    older than amendment 0041 and has no epoch route: check its version before the adapter's grant.
+- **Another book's reset** (`reset:<instance>`, the reason `other_book`): the reset names another book, as
+  a re-founding does. (A book re-founded after a reset that named the book before it stays here: `refound`
+  cannot help while the chain names the earlier book. Turn `report_resets` off, and escalate.) Only with the
+  owner's announcement of the book's re-founding:
+  1. The book has been re-founded and the adapter's configuration points at it. Stop the running adapter.
+  2. Run once `aledgent-settle <config> refound`. It takes the lease, resets the instance's cursor and
+     accepted head, forgets the core's answer, and exits.
+  3. Start the adapter. It starts on the new chain at position 0, reports the sequence to the new book's
+     core, and nothing of the old chain is reported.
+  4. Verify that `reset:` closes and `AledgentObservationStopped` clears, then that
+     `aledgent_observation_cursor_lag` is about 0 and the next anchor goes final.
+- **Entries never read** (`reset:<instance>`, "entries of the chain before it past the verified head were
+  never read"): the reset is not followed, and the adapter takes no gap while `reset:` is open. Escalate to
+  the owner: the book needs a re-founding (as above), and the operations those entries settled are
+  resolved as in step 6.
+- **Entries verified and not taken in** (`reset:<instance>`, "verified ... were not taken in by the core"):
+  with `report_resets` on the adapter reports them first, every step; the `report:` alerts say why the core
+  does not take them. Once taken they are final records at positions the new chain reuses, so the start is
+  then refused (`earlier_final`): the book needs a re-founding, as for `earlier_final` above. With it off, the reset stops as before. `refound`
+  drops them: only with the owner, as for entries never read.
+- **A reset found too late** (`reset:<instance>`, "the chain before it could not be read up to the reset"):
+  the adapter could not read the blocks since its verified head across a reset (no history endpoint, or a
+  node that failed a read). It is held, reports nothing more, and reads the range again every step; once
+  the range reads, it takes the reset as a live one (above) and the alert closes. Do **not** record a gap:
+  the adapter refuses one that spans a reset, since it would take the new chain's head as the old one's and
+  lose the new chain's entries. If the range stays unreadable, give the adapter a history endpoint that
+  reaches back to the position named, or escalate to the owner for a re-founding.
+- **Switch off** (`reset:<instance>`, "`report_resets` is off"): the core was not told. A reset belongs to a
+  re-founding window: follow "Another book's reset" with the owner, or turn the switches on once the core
+  can take the start.
+- **A core that cannot take it yet** (`AledgentSettlementEpochUnsupported`, which pages, since withdrawals are off,
+  `epoch-unsupported:<instance>:<epoch>`): the core runs code before amendment 0041's generation. On a first
+  start the adapter goes on, and the core's head stays where it was; the adapter is held, so withdrawals are
+  refused: upgrade the core, or open ingress's `settlement_epochs` if it is the route that is closed (the release order is the core first, then the adapter). On a live reset the
+  adapter also stops (`reset:`) until the upgrade; it then goes on by itself.
+
+With `report_resets` off, every reset under a running adapter is `reset:<instance>`, as before: follow
+"Another book's reset" above.
 
 A reset the owner did not announce is not re-founded: the adapter stays stopped for the book, and the
 case goes to security ([divergence](release/divergence.md)).
@@ -101,6 +165,9 @@ case goes to security ([divergence](release/divergence.md)).
 In CI: `services/settle/tests` (`F-043`'s test plan: an idle sync is one read; an entry hidden, added or
 altered by a reader stub stops the adapter at the first new position, with an alert; behind more than 256
 blocks is unreadable without a history endpoint and caught up with one; a gap recorded for the named range
-lets it accept the head; a reset under a running adapter stops its reports until `refound`), `ops/tests/restore.rs` (a
+lets it accept the head; a reset under a running adapter stops its reports until `refound`; and, for amendment
+0041, `services/settle/tests/epochs.rs`: a live reset followed, a refused start stopping the adapter and asked
+again every ten minutes, a core upgraded later following the reset, another book's reset stopping until
+`refound`, unreported entries keeping a reset from being followed, and test's first-start case), `ops/tests/restore.rs` (a
 restored adapter resumes from its accepted head), and `ops/tests/alerts.rs` (a gap, a chain mismatch, a stopped
-observation of either kind and a lag each page). The second-node step needs a live node and runs in staging: deferred.
+observation of either kind, a refused sequence and a lag each page; a sequence the core cannot take yet warns). The second-node step needs a live node and runs in staging: deferred.

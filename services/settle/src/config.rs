@@ -156,6 +156,15 @@ pub struct AdapterConfig {
     /// unsigned before it ends as never signed. 0 is taken as 1.
     #[serde(default = "default_not_now_alert_after")]
     pub not_now_alert_after: u32,
+    /// Whether the adapter reports a reset of its instance (a new settlement sequence) to the core
+    /// (amendment 0041, `T-043-15`). **Off by default**, and turned on only once the core runs a
+    /// build that knows the input (`T-043-14`) at `SETTLEMENT_EPOCHS`: a core host built before it
+    /// cannot decode the input, refuses the whole feed it arrives in, and the book's inputs wait
+    /// behind it. Off, a reset stops the adapter as before amendment 0041 (`reset:` until
+    /// `refound`; a first start moves to the new chain without telling the core), and the adapter
+    /// is held while `reset:` is open: it declares that it does not serve.
+    #[serde(default)]
+    pub report_resets: bool,
 }
 
 /// [`ProcessConfig::wake_poll`]'s default, in milliseconds.
@@ -689,6 +698,19 @@ mod tests {
         m.remove("chain_spec");
         m.remove("relay_chain_spec");
         m.insert("endpoint".into(), "ws://127.0.0.1:9944".into());
+    }
+
+    /// Amendment 0041 (`T-043-15`): reporting a reset is off unless the file turns it on. The
+    /// README's example does not name it.
+    #[test]
+    fn t043_15_report_resets_is_off_by_default() {
+        let v = readme_example();
+        assert!(v["adapter"].get("report_resets").is_none());
+        assert!(!with(|_| {}).adapter.report_resets);
+        let on = with(|m| {
+            m.get_mut("adapter").unwrap()["report_resets"] = true.into();
+        });
+        assert!(on.adapter.report_resets);
     }
 
     #[test]

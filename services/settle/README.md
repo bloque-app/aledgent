@@ -162,13 +162,29 @@ aledgent-settle settle.json gap <from> <to>
 Both `gap` and `refound` (below) hold the adapter's lease, so the running adapter is stopped first;
 each runs once and exits.
 
-A reset of the instance (governance's `set_anchor_head`) comes only with its book's re-founding. The
-first start on a reset instance folds from the reset, and a cursor kept from the chain before it is
-reset to the chain's start. No other cursor is moved: one past the start of a chain never reset
-raises `chain:`, and one behind it (positions the contract's earlier code wrote and nobody read)
-raises `unreadable:` until the operator records them as a gap. A reset under a running adapter raises `reset:<instance>`, and from then on nothing reaches the book
-it serves: no observation, head, anchor or position cut; once the adapter is pointed at the re-founded book, `aledgent-settle settle.json
-refound` resets its cursor and accepted head, and the next run starts on the new chain.
+A reset of the instance (governance's `set_anchor_head`) starts a new sequence of its record. The first
+start on a reset instance folds from the reset, and a cursor kept from the chain before it is reset to the
+chain's start. No other cursor is moved: one past the start of a chain never reset raises `chain:`, and
+positions written before the chain's start and never read raise `unreadable:` until the operator records
+them as a gap. The adapter reports the new sequence to the core (amendment 0041,
+`[PENDING AMENDMENT 0041]`): live, when it reads the reset past its verified head with nothing of the
+chain before left unreported (it reports first any entry it verified before the reset that the core had
+not taken in), and once per sequence it moved to on a first start. With `report_resets` on, an operator's gap names the sequence of the chain it is of, so
+a start of that sequence keeps it (amendment 0041, decision 6). The core follows it,
+and the adapter goes on; or the core refuses it (`epoch:<instance>:<epoch>`, which pages) and nothing of
+the new chain is reported, the start being asked again every ten minutes; or it cannot take it yet
+(`epoch-unsupported:`, which only `ERR-MalformedCommand` means: a core before the amendment's generation,
+or ingress's route closed). **While `reset:`, `epoch:` or `epoch-unsupported:` is open the adapter is
+held**: it keeps stepping, but declares to the core that it does not serve, so new withdrawals (and the
+settlement comparison) are refused with `ERR-SettlementLayerUnavailable` rather than built from a head it
+stopped sending; a start taken lifts it. A reset for another book, or one with
+entries of the chain before it left unreported, raises `reset:<instance>`, and from then on nothing reaches
+the book it serves; once the adapter is pointed at the re-founded book, `aledgent-settle settle.json
+refound` resets its cursor and accepted head, and the next run starts on the new chain. Reporting a reset is behind `adapter.report_resets`, and ingress takes the report only with its own
+`settlement_epochs`; both are **off by default**: turn them on only once the
+core runs a build with `T-043-14` at `SETTLEMENT_EPOCHS`. A core host built before it cannot decode the
+input and refuses the whole feed it arrives in, so the book's inputs would wait behind it. Off, a reset
+stops the adapter as before amendment 0041 (`reset:`), and the adapter is held.
 
 **There is no periodic re-scan** (`T-043-05`): nothing re-reads a range on a timer.
 `adapter.rescan_every` and `adapter.rescan_window`, in a file that still sets them, are accepted
