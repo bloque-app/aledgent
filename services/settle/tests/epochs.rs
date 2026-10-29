@@ -827,3 +827,58 @@ async fn t043_15_a_refused_gap_is_not_recorded() {
             .unwrap()
     );
 }
+
+async fn read(k: &Kit, token: &str) -> ingress::testkit::Reply {
+    k.d.call("GET", "/v1/ops/settlement/head", Some(token), &[], None)
+        .await
+}
+
+/// `T-043-16`: `GET /v1/ops/settlement/head` shows the operator the core's head and the sequence
+/// it follows, before and after a reset it follows; the adapter's principal cannot read it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t043_16_the_head_route_shows_the_sequence() {
+    let mut k = kit(SETTLEMENT_EPOCHS).await;
+    let op = k.d.operator.token.clone();
+    let (status, v) = read(&k, &op).await;
+    assert!(status.is_success(), "{status} {v}");
+    assert_eq!(v["instance"], INSTANCE);
+    assert!(v.get("epoch").is_none(), "{v}");
+    k.chain.advance(1);
+    k.step().await.unwrap();
+    k.chain.reset_for(INSTANCE, 0, k.book());
+    k.chain.advance(1);
+    k.step().await.unwrap();
+    let at = reset_block(&k).await;
+    let (_, v) = read(&k, &op).await;
+    assert_eq!(v["epoch"]["epoch"], 1);
+    assert_eq!(v["epoch"]["at"], at);
+    assert_eq!(v["epoch"]["book"], hex::encode(k.book()));
+    assert_eq!(v["head"]["next_seq"], 0);
+    let (status, v) = read(&k, settle::testkit::ADAPTER_TOKEN).await;
+    assert!(!status.is_success(), "{status} {v}");
+    assert_eq!(v["error"], "ERR-NotAuthorised");
+    // A customer is refused; a principal holding the anchoring authority reads it (decision 8, as
+    // `GET /v1/ops/anchors`).
+    let alice = k.d.party("alice", 0).await;
+    let (status, v) = read(&k, &alice.token).await;
+    assert_eq!(status.as_u16(), 403, "{v}");
+    assert_eq!(v["error"], "ERR-NotAuthorised");
+    let auditor = k.d.party("auditor", 0).await;
+    let (status, v) =
+        k.d.call(
+            "POST",
+            "/v1/ops/operator-grants",
+            Some(&op),
+            &[("client-key", "t043-16-auditor")],
+            Some(serde_json::json!({
+                "principal": auditor.identity,
+                "kinds": ["anchor_checkpoint"],
+                "justification": "the auditor anchors on request",
+            })),
+        )
+        .await;
+    assert!(status.is_success(), "{status} {v}");
+    let (status, v) = read(&k, &auditor.token).await;
+    assert!(status.is_success(), "{status} {v}");
+    assert_eq!(v["epoch"]["epoch"], 1);
+}

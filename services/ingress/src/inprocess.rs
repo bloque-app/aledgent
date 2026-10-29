@@ -1556,6 +1556,9 @@ impl<S: LeafStore, V: VaultBackend> Running<S, V> {
                 return crate::anchoring::verify(&self.ledger, &caller, disclosure, clerk);
             }
             Query::Anchoring => return crate::anchoring::anchoring(&self.ledger, &caller, now),
+            Query::SettlementHead => {
+                return crate::settlement::settlement_head(&self.ledger, &caller, now);
+            }
             _ => {}
         }
         let state = self.ledger.state();
@@ -1603,6 +1606,7 @@ impl<S: LeafStore, V: VaultBackend> Running<S, V> {
                 | Query::Anchor
                 | Query::VerifyDisclosure { .. }
                 | Query::Anchoring
+                | Query::SettlementHead
                 | Query::Signals
                 | Query::IntegratingParties
                 | Query::Alias { .. }

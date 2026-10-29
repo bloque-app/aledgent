@@ -367,6 +367,8 @@ pub enum Query {
         /// Which input: `upgrade`, or `way_out`.
         input: String,
     },
+    /// The book's settlement head and the sequence it follows (amendment 0041): the operator's.
+    SettlementHead,
 }
 
 /// A query's answer.
@@ -442,6 +444,8 @@ pub enum QueryReply {
         /// It may.
         authorised: bool,
     },
+    /// The book's settlement head and the sequence it follows (amendment 0041).
+    SettlementHead(crate::settlement::SettlementHeadBody),
 }
 
 /// One working credential, as ingress needs it to authenticate a caller (`F-028`): the identity it

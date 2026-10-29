@@ -410,6 +410,18 @@ pub enum EpochRefusal {
     },
 }
 
+/// Where the book stands on the settlement layer's record (amendment 0041, `T-043-16`): what an
+/// operator reads to see whether the core follows the layer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SettlementHeadView {
+    /// The instance the book settles on, once configured.
+    pub instance: Option<u32>,
+    /// The finalised head the book holds.
+    pub head: Option<FinalisedHead>,
+    /// The last sequence of the layer's record whose start the book took.
+    pub epoch: Option<SettlementEpoch>,
+}
+
 /// What the core made of a new sequence (amendment 0041).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EpochOutcome {
