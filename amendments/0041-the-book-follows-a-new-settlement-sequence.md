@@ -95,10 +95,16 @@ sequence's number, its base, its first position, its block, the book it names, a
   between the two). If any is still unreported, it does not follow the reset. Then it reports the start, and
   only then moves its cursor to the new chain's start and goes on. It reports no entry of the new chain before the core
   has taken the start in.
+- **A reset found too late** (the adapter fell behind the node's events across it, with no history endpoint):
+  when the range since the verified head cannot be read and the chain's sequence differs from the verified
+  head's, the adapter stops as a reset it never follows (`reset:`), and refuses an operator's gap that would
+  span it. A gap there would take the new chain's head as the old one's and lose the new chain's entries.
 - **A gap names its sequence.** From `SETTLEMENT_EPOCHS` on, with `report_resets` on, the adapter reports a gap
-  with the sequence of the chain it belongs to (the verified head's), as a new input (`AdapterInput::SequenceGap`),
-  which ingress forwards only with `settlement_epochs` on. A gap reported without it is the sequence the core
-  holds.
+  with the sequence of the chain it is of (the chain's at the head, which is the verified head's, since no gap
+  spans a reset), as a new input (`AdapterInput::SequenceGap`), which ingress forwards only with
+  `settlement_epochs` on. A gap reported without it is the sequence the core holds. A tagged gap the core
+  cannot take (`ERR-MalformedCommand`) is sent again plain; one it refuses otherwise is not recorded, and the
+  operator's command fails with `gap:` still open.
 - **Once per sequence, from state.** While the head it verified carries a sequence the core has not confirmed,
   it reads `anchor_epoch()` and reports it. That is test's case: the adapter already moved itself to the new
   chain on 28 Oct.
@@ -110,7 +116,7 @@ On the core's answer:
 | started the sequence, or already holds it | goes on; the confirmation is kept, so the sequence is not reported again |
 | refused it: the sequence names another book | raises `reset:<instance>`, as today, and reports nothing more until `refound` (the book was re-founded) |
 | refused it for any other reason, or refused the command with any code but `ERR-MalformedCommand` | raises `epoch:<instance>:<epoch>` (pages), reports nothing of the new chain, and reports the start again every ten minutes |
-| cannot take the input: `ERR-MalformedCommand` (a core before the generation of this amendment, or ingress's route closed) | in a live reset, raises `reset:` as today; otherwise raises `epoch-unsupported:<instance>:<epoch>` (a warning, not a page), and goes on |
+| cannot take the input: `ERR-MalformedCommand` (a core before the generation of this amendment, or ingress's route closed) | in a live reset, raises `reset:` as today; otherwise raises `epoch-unsupported:<instance>:<epoch>`, which pages since the adapter is then held and withdrawals are off, and goes on |
 
 A start the core takes clears every `epoch:` and `epoch-unsupported:` alert of the instance, whatever sequence
 raised it.
@@ -173,6 +179,12 @@ taken), it sends no head, and its declaration covers it ("While held", above). T
 an adapter built before this amendment, on a live reset; and a first start with both switches off and a core at
 generation 0 (test today, harmless only because every test asset is `book_only`).
 
+**Except during `T-043-08`'s move of a running book's incidents.** From the switch input to the generation and
+for up to incidents / 32 adapter inputs after it, the core records no head reported and not taken, so the guard
+does not arm: proving its leaf absent while the incidents leaf is still full would take the move's input past
+the guest's arena (`f043_incidents_heap`). A book upgraded in place is covered once its old incidents are moved.
+On test that is the switch input alone if it holds 32 incidents or fewer (13 on 27 Oct); prod holds none.
+
 ### A read of the head (a follow-up, `T-043-16`)
 
 `GET /v1/ops/settlement/head`, for the operator's principals, read-only. Per instance, it shows the core's
@@ -191,7 +203,9 @@ sequence (`REQ-SL-1`); one book's record MAY run over several sequences".
 
 > An expiry MUST be computed from the latest finalised point of the settlement layer that aledgent holds. While
 > the adapter has reported a later point that aledgent did not take, aledgent MUST NOT instruct an external leg
-> that can expire, and refuses it with `ERR-SettlementLayerUnavailable`. *Amendment 0041.*
+> that can expire, and refuses it with `ERR-SettlementLayerUnavailable`. A book upgraded in place is covered
+> once the settlement incidents it held before the upgrade are moved to the audit trail (`NFR-22`). *Amendment
+> 0041.*
 
 **`REQ-SA-10` (new):**
 
@@ -202,15 +216,15 @@ sequence (`REQ-SL-1`); one book's record MAY run over several sequences".
 > alert and report neither. aledgent MUST take the start as its finalised point, unless it holds a finalised
 > point at a later block, which it keeps, and MUST compare every later point within the new sequence. At a start
 > aledgent MUST clear the end of every gap recorded under an earlier sequence and keep that of one recorded under
-> the started sequence or a later one, whether or not it keeps its finalised point; the adapter MUST report each
+> the started sequence or a later one, whether or not it keeps its finalised point; the adapter SHOULD report each
 > gap with the sequence it belongs to, and a gap reported without one is the sequence aledgent holds. The same
 > start again changes nothing. aledgent MUST refuse the start, as an incident
 > (`REQ-AT-1`), if it names another book, if its sequence is not later than the one aledgent took (or is that
 > sequence with other values), while any external leg it instructed is not yet decided, or while it holds a
 > final record of an earlier sequence at a position the new sequence reuses. A refused start MUST change
-> nothing else, and the adapter MUST raise an alert an operator sees. While a start is refused or not taken, or
-> the adapter stops at a reset, the adapter MUST declare that it does not serve (`REQ-SA-2`). *Amendment
-> 0041.*
+> nothing else, and the adapter MUST raise an alert an operator sees. While the adapter stops at a reset, or a
+> start it reported is refused or cannot be taken, it MUST declare that it does not serve (`REQ-SA-2`).
+> *Amendment 0041.*
 
 **`ERR-SettlementLayerUnavailable`:** "The settlement adapter cannot be reached, or refuses to serve
 (`REQ-SA-2`)" gains ", or aledgent's finalised point is behind one the adapter reported (`REQ-SL-4`)".
@@ -233,13 +247,20 @@ sequence (`REQ-SL-1`); one book's record MAY run over several sequences".
   - A core host or Agent package built before this amendment refuses the whole feed, as above (test's `r10`
     runs its genesis package). A core host and package built with it, still at generation 0, refuse the input
     cleanly (`ERR-MalformedCommand`); so does ingress with its route closed. The adapter then raises
-    `epoch-unsupported:` (a warning) and declares itself not serving.
+    `epoch-unsupported:` (it pages) and declares itself not serving.
+  - An ingress built before `T-043-14` has no epoch route and answers the adapter's report
+    `ERR-NotAuthorised`. The adapter reads that as a refusal: it pages (`epoch:`) and holds. That fails closed,
+    but the page names the adapter's authority, not the cause; the runbook says to check ingress's version
+    first. Such an ingress also refuses a gap that names its sequence (its body denies unknown fields); the
+    adapter then fails the operator's command and records nothing. So deploy ingress with `T-043-14` before
+    turning `report_resets` on.
   - A core at `SETTLEMENT_EPOCHS` with the switches off is never told. On a live reset the adapter stops
     (`reset:`) and declares itself not serving; after a first start on the new chain, the guard refuses
     withdrawals while the head is stale.
   - The core changes of `T-043-14` and `T-043-17` both decide generation-1 inputs. No generation-1 core
     package may be built or applied before both are on `develop` (decision 1).
-- **Test.**
+- **Test.** Before the upgrade, read `r10`'s settlement incident count: above 32, the guard is blind for more
+  than the switch input (incidents / 32 adapter inputs, about two seconds each) while they are moved.
   1. The core's in-place upgrade to the package built as generation 1 (`T-037-19`'s path, the same upgrade that
      takes `T-043-06` to `T-043-08`).
   2. Then `settlement_epochs: true` in test's ingress template and `report_resets: true` in its settle template
@@ -297,7 +318,8 @@ sequence (`REQ-SL-1`); one book's record MAY run over several sequences".
    sequence it was recorded under: the adapter names the chain a gap belongs to, which only it knows before the
    core takes the start. At a start the core clears every gap end tagged with an earlier sequence and keeps one
    tagged with the started sequence or a later one, whether the head restarts or is kept. The kept head is
-   already exact, by its block after the reset; the gap end is now exact by its tag. So a gap of the new chain
+   already exact, by its block after the reset; the gap end is now exact by its tag, since the adapter tags a gap
+   with its chain's sequence and refuses one that spans a reset. So a gap of the new chain
    reported before the start survives it, and one of the chain before does not.
    - **Untagged ends count as the earlier sequence's, and are cleared.** These are a gap end recorded before this
      change (`T-043-08`'s move of a running book's gaps) and a gap reported without its sequence (an adapter
