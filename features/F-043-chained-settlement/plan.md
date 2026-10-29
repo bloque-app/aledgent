@@ -30,7 +30,8 @@ and finalises.
   `d_n = blake2b-256("aledgent/settlement-entry/v1" ‖ d_(n-1) ‖ n ‖ e_n)`, with `n` as 8 bytes big-endian. A chain
   starts at `(0, 32 zero bytes)`.
 - A reset (`set_anchor_head`) is a full reset: it removes what v2 stored, sets `next_seq` and `pruned_to` to 0, and
-  starts a new chain at position 0. Resets come only with a book re-founding.
+  starts a new chain at position 0. A reset may come with a book re-founding, or under a running book, which then
+  follows the new chain (amendment 0041, `[PENDING AMENDMENT 0041]`, section 7).
 - `Deposited` gains `from` and `Refused` gains `call`. With those, every entry can be rebuilt from its event
   and the event's block number. No new event, and no digest in events.
 - One release: `prune_inbox` and the stored entries go now, with no intermediate version.
@@ -95,7 +96,8 @@ community moves funds out of its account. The referendum's route ran only as a `
   `ops`, the reconcile cut (`ops/src/reconcile.rs:154`) and the cursor-lag signal (`ops/src/signals.rs:772`)
   read it as they do. What changes is the read of entries: `inbox_entry` (`chain/rpc.rs:609-631`, `kreivo.rs`
   `INBOX_ENTRY`) no longer exists, and the entries come from the events.
-- The cursor kept for an instance from before its reset (test's is at 13) is reset with the re-founding.
+- The cursor kept for an instance from before its reset (test's is at 13) is moved back to the chain's start at the
+  adapter's first start; a reset under a running adapter is reported to the core (section 7).
 - `observe` (`adapter.rs:2403`):
   - the read by position becomes: read the head; done if unchanged; otherwise fold the new entries from the
     accepted digest and compare;
@@ -163,6 +165,66 @@ community moves funds out of its account. The referendum's route ran only as a `
 `contracts/settlement/scripts/drive.mjs` (`read`) and `e2e.mjs` (`check`, the faults that read the inbox) read
 stored entries. They fold the events and compare with `chain_head` instead (`T-043-03`); until then the
 zombienet gate fails against this code.
+
+### 7. A new sequence under a running book (amendment 0041, `[PENDING AMENDMENT 0041]`)
+
+The core keeps the highest head it has seen, so after a reset it drops every head of the new chain until that chain
+passes the old position, and a withdrawal created meanwhile is born expired (test, 28 Oct: head 13 from the chain
+before the reset). Amendment 0041 has the adapter report the reset, and the core follow it.
+
+- **The core** (`crates/ledger-core`), from `SETTLEMENT_EPOCHS` (decision 1: equal to `CHAINED_SETTLEMENT`, 1):
+  - a new adapter input, `AdapterInput::Epoch(SettlementEpoch)`, appended last: the sequence's number, base, first
+    position, block, book and previous anchor, as `anchor_epoch()` holds them. Before the generation it is
+    refused with `ERR-MalformedCommand` and writes nothing;
+  - the answer `AdapterReply::Epoch(EpochOutcome)`: `Started(head)`, `Recorded` (the same sequence again), or
+    `Refused(EpochRefusal)`, which is also one audit record (`Incident::EpochRefused`);
+  - refused for another book (the book's chainspec digest; zero never matches), an earlier or conflicting
+    sequence, an instruction in flight (the `live` index not empty), or a final record at or above `from_seq`
+    observed at or before the reset's block;
+  - otherwise one store write, `SettlementWrite::Epoch { epoch, head }`: the sequence (leaf kind 36, absent until
+    set), and the head `{ at, from_seq }` unless the core holds a head at a later block. The store refuses a
+    sequence that is not strictly later, and only this write moves the head back;
+  - the head, if given, must be the sequence's start; the same write clears the untagged gap end (kind 37: a
+    gap reported without its sequence, or moved by `T-043-08`) and every gap end tagged with an earlier sequence
+    (kind 34, the highest end per sequence), whether the head restarts or is kept, and keeps one tagged with the
+    started sequence or later (decision 6, made exact); its undo restores both;
+  - `AdapterInput::SequenceGap { gap, sequence }` (appended last; generation 0 refuses it) records a gap under
+    `sequence`; ingress forwards a gap body's `sequence` only with `settlement_epochs` on, else as a plain gap.
+    `proof` reads the highest end over the untagged slot and every tag;
+  - the tally and the index by position are left as they are (amendment 0041, "left as they are").
+  - The input reads the `live` index and the final positions whole: its witness holds the whole `finals` map,
+    as `proof`'s does. It comes once per reset.
+- **Ingress:** the adapter's route `POST /v1/settlement/epochs` (one route per adapter input, as today), its body
+  and OpenAPI schema, and the reply's `epoch` result.
+- **Settle:**
+  - `ChainEpoch` gains `base`, `book` and `previous`;
+  - the walk counts the entries a reset drops;
+  - on a live reset with none dropped, the adapter reports the start and moves its cursor to the new chain only
+    once the core has taken it; with entries dropped, or for another book, `reset:` as today;
+  - once per sequence, for the sequence its verified head carries, until the core confirms it (the confirmation is
+    the report's stored verdict, `settle/epoch/<instance>/<epoch>`);
+  - a refusal raises `epoch:<instance>:<epoch>`, which pages, and the start is reported again every ten minutes;
+    a core before the generation raises the same alert, non-paging, and the adapter goes on.
+- **Ops:** the alert `AledgentSettlementEpochRefused`; `gap-filling.md` "After a reset" and
+  `release/settlement-adapter-outage.md` rewritten; the settle README.
+- **Follow-ups:**
+  - `GET /v1/ops/settlement/head`, read-only for the operator's principals: per instance, the head, the sequence and
+    the head reported and not taken (`T-043-16`);
+  - the guard (`T-043-17`): a head dropped for a lower position at a later block is recorded as reported and not
+    taken (leaf kind 35); a later head or a start clears it; while it is set, `withdraw` and `submit_outbound`
+    are refused with `ERR-SettlementLayerUnavailable`.
+
+Tests:
+- test's case as it stands: core head `{40,142,088, 13}`, new-chain anchors at 0 and 1 already final, then the
+  start of sequence 2 (base 0, at 40,195,735), then heads from 2 taken at once, and a withdrawal right after with
+  its first position at the head and an expiry above the finalised height;
+- refusals: an instruction in flight, a final record of the earlier chain at 0, another book, an earlier
+  sequence;
+- a second start after an idle sequence is taken; one after a sequence with finals is refused;
+- generation 0 refuses the input and the generation-0 fixtures replay unchanged (`f043_generations.rs`, the
+  `code-history` gate);
+- the ingress body round-trips; the adapter reports a live reset and a first-start sequence, and stops on a
+  refusal.
 
 ## Test plan
 
