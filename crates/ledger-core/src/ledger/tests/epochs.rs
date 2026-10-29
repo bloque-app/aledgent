@@ -802,3 +802,41 @@ fn t043_17_generation_0_has_no_guard() {
         .value;
     assert_eq!(i.expiry(), 142 + 6, "born from the stale head, as before");
 }
+
+/// The guard waits for `T-043-08`'s move: while a running book's incidents are still being moved
+/// to the audit trail, a dropped head is not recorded (proving the guard's leaf absent would read
+/// the incidents leaf whole, past the guest's arena: `f043_incidents_heap`); on the input that ends
+/// the move it is.
+#[test]
+fn t043_17_the_guard_waits_for_the_incident_move() {
+    let (mut fx, adapter) = book(SETTLEMENT_EPOCHS);
+    head(&mut fx, adapter, 142, 13);
+    let n = crate::ledger::settlement::MOVE_PER_INPUT + 8;
+    let writes: alloc::vec::Vec<Write> = (0..n as u64)
+        .map(|i| {
+            Write::Settlement(SettlementWrite::Incident(Incident::Gap(Gap {
+                from: i,
+                to: i + 1,
+                reason: GapReason::Unreadable,
+            })))
+        })
+        .collect();
+    fx.ledger.commit(&writes).unwrap();
+    // Each input is numbered, as the core numbers them: the move is one chunk an input.
+    fx.ledger.set_input(100);
+    head(&mut fx, adapter, 207, 2);
+    let store = fx.ledger.state().settlement();
+    assert_eq!(store.incidents().len(), 8, "one chunk moved");
+    assert_eq!(store.reported(), None, "not during the move");
+    fx.ledger.set_input(101);
+    head(&mut fx, adapter, 208, 2);
+    let store = fx.ledger.state().settlement();
+    assert!(store.incidents().is_empty());
+    assert_eq!(
+        store.reported(),
+        Some(FinalisedHead {
+            height: 208,
+            next_seq: 2
+        })
+    );
+}
