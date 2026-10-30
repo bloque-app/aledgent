@@ -292,6 +292,8 @@ jobs:
       # Which images are the pre-release's, in the release's own notes (release-please wrote them).
       - name: Say so in the release notes
         if: env.PROMOTED == 'true' && env.PRERELEASE != 'true'
+        # A note, not the release: a failed edit must not hold back images.json and the dispatch.
+        continue-on-error: true
         run: |
           set -euo pipefail
           marker='<!-- images-promoted -->'

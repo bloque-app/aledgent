@@ -252,14 +252,23 @@ def promote(source: Source, release: str, version: str, env: Env) -> dict[str, s
 # --------------------------------------------------------------------------------------------------
 # Entry point.
 # --------------------------------------------------------------------------------------------------
+def clean(value: str) -> str:
+    """One line that is no workflow command: a value can carry text from outside (a tag, an error
+    message), and the runner reads any stdout line that starts with `::` as a command, and any
+    line of $GITHUB_OUTPUT as another output."""
+    one = " ".join(value.split())
+    return " " + one if one.startswith("::") else one
+
+
 def emit(values: dict[str, str]) -> None:
+    values = {k: clean(v) for k, v in values.items()}
     for k, v in values.items():
         print(f"{k}={v}")
     path = os.environ.get("GITHUB_OUTPUT")
     if path:
         with open(path, "a") as f:
             for k, v in values.items():
-                f.write(f"{k}={v.replace(chr(10), ' ')}\n")
+                f.write(f"{k}={v}\n")
 
 
 def decide(args: argparse.Namespace, env: Env) -> dict[str, str]:
