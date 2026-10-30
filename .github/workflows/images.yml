@@ -17,7 +17,9 @@ name: Images
 # shell, so a binary that does not link fails here), checks the baked chain specs, and reports the
 # sizes; it pushes nothing.
 #
-# A release or a pre-release (.github/workflows/release.yml) calls this workflow with its version:
+# A release or a pre-release (.github/workflows/release.yml) calls this workflow with its version
+# (a release whose tree is a develop pre-release's but for versions takes that pre-release's images
+# by digest instead, and does not call it: release.yml, job `promote`):
 # the same builds and checks, then every image pushed as `sha-<commit>` and `v<version>` (a
 # pre-release's `+` becomes `_`, which a tag allows), labelled with the commit and the version
 # (`org.opencontainers.image.revision`, `.version`). The workflow's outputs are each image's

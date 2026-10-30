@@ -111,6 +111,17 @@ are protected alike (one approving review, code owners, the required checks, sig
 - **Images.** A release or a pre-release publishes every image to `ghcr.io/bloque-app/aledgent-<name>`
   (ingress, settle, ops, signer, core, sidecar) as `sha-<commit>` and `v<version>` (`+` becomes `_`
   in an image tag), and attaches `images.json`, each image by digest (`.github/workflows/release.yml`).
+  A release does not build them again when it can take the pre-release's: if the release commit's
+  tree is a `develop` commit's tree but for versions and the changelog (`tools/ci/tested-tree.py`'s
+  rule), that commit's pre-release has passed its own checks and its labels agree with its
+  `images.json`, `tools/release/promote-images.py` copies its six images by digest to the release's
+  tags (about a minute instead of 18), with the buildx provenance attestation they were built with,
+  and `images.json` records `promoted_from`. Anything else, a hotfix on `main` included, builds as
+  before; the repository variable `RELEASE_REBUILD=true` forces it. A promoted image says what the
+  pre-release said: its labels name the pre-release, and `ingress` (`/openapi.json`'s
+  `info.version`) and `settle` report the workspace version of the `develop` commit they were built
+  from, which is behind the release's until `main` is merged back into `develop`. The release's tag
+  and `images.json` identify it, and its notes say so.
 - **Core releases.** A change to the core (`core.vos`) can ship without a new image and without
   restarting the host: `.github/workflows/core-release.yml` builds it as the next rules version of the
   code a book already runs, has the node's host write the code manifest, and publishes the three
