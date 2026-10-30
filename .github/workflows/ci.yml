@@ -340,10 +340,14 @@ jobs:
         run: |
           cargo test -p ledger-core --test privileged_reads
           cargo test -p core-binding --test upgrade_authority
-      # The conformance suite (crates/conformance/tests/suite.rs: 1,167 of this run's tests, four
-      # targets) is the `conformance` job's, a required check of its own that runs it once and judges
-      # it against the gate profile, and is not repeated here. The crate's library tests (among them
-      # the re-derivation run, INV-6) and its binaries' still run. Audit 6.1 C.
+      # The conformance suite's cases (crates/conformance/tests/suite.rs: 1,344 of this run's tests,
+      # on four targets) are the `conformance` job's, a required check of its own that runs them once
+      # and judges them against the gate profile; they are not repeated here. `--skip` takes the
+      # four targets' names (`in-process/...`, `through-agent/...`, which no other test's name
+      # contains); the suite's seven structural checks (catalogue, closure, gate) and the crate's
+      # library tests (among them the re-derivation run, INV-6) still run. It is a skip and not
+      # `--exclude conformance`, because excluding the package changes the features cargo resolves for
+      # the rest: that rebuilt 179 packages, three minutes, on the first run of this change. Audit 6.1 C.
       #
       # On a pull request the FileStore parts of the concurrency run (AC-B2.1, INV-3, INV-5, INV-6,
       # REQ-BA-6) are left to the push and the nightly: the MemStore parts keep the property, and
@@ -355,12 +359,11 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
         run: |
-          skip=()
+          skip=(--skip in-process/ --skip through-agent/)
           if [ "$EVENT" = pull_request ]; then
-            skip=(--skip ac_b2_1_random_schedules_never_overdraw__file_store)
+            skip+=(--skip ac_b2_1_random_schedules_never_overdraw__file_store)
           fi
-          cargo test --workspace --exclude conformance -- "${skip[@]}"
-          cargo test -p conformance --lib --bins
+          cargo test --workspace -- "${skip[@]}"
 
       # --- features shard ---
       # F-005, F-031: ingress over the core Agent (AgentCore) needs core-binding's `ingress`
