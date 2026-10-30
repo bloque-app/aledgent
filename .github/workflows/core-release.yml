@@ -110,8 +110,32 @@ env:
   CRANE_SHA256: 0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0
 
 jobs:
+  # Whether this pull request's tree has been tested already (tools/ci/tested-tree.py; ci.yml has the
+  # same job): then the jobs below run nothing. Only on a pull request, and with `contents: read`
+  # alone, because this workflow is also called by a release, whose jobs grant no more. A job that
+  # `needs` a skipped or failed gate still runs (`!cancelled()`): nothing here fails open.
+  gate:
+    name: gate (tested tree)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      mode: ${{ steps.tree.outputs.mode }}
+      reason: ${{ steps.tree.outputs.reason }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: tree
+        uses: ./.github/actions/tested-tree
+
   scripts:
     name: scripts
+    needs: gate
+    if: ${{ !cancelled() && needs.gate.outputs.mode != 'skip' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -142,6 +166,8 @@ jobs:
   code-history:
     name: code history
     uses: ./.github/workflows/code-history.yml
+    needs: gate
+    if: ${{ !cancelled() && needs.gate.outputs.mode != 'skip' }}
     permissions:
       contents: read
 

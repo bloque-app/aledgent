@@ -1,0 +1,28 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+name: Tested tree
+description: >-
+  Decides whether a pull request's heavy checks are redundant (tools/ci/tested-tree.py). The job
+  checks out the pull request's merge with its full history first; this step needs git, python3 and
+  the job's token, which only has to read workflow runs. Outputs `skip` or `full`; it never fails
+  the job on a doubt, it says `full`.
+
+outputs:
+  mode:
+    description: "skip: the heavy checks run no step and report success. full: they run."
+    value: ${{ steps.decide.outputs.mode }}
+  reason:
+    description: Why, on one line.
+    value: ${{ steps.decide.outputs.reason }}
+
+runs:
+  using: composite
+  steps:
+    - name: The classification's own tests
+      shell: bash
+      run: python3 tools/ci/test-tested-tree.py
+    - id: decide
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: python3 tools/ci/tested-tree.py
