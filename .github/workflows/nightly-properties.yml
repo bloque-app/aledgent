@@ -67,6 +67,8 @@ jobs:
           [[ "$seed" =~ ^(0x[0-9a-fA-F]+|[0-9]+)$ ]] || { echo "::error::the seed must be a number, not '$seed'"; exit 1; }
           n="${CASES:-10000}"
           [[ "$n" =~ ^[0-9]+$ ]] || { echo "::error::the cases must be a number, not '$n'"; exit 1; }
+          # The kernel's differential never runs below 100 cases (its coverage check needs them).
+          [ "$n" -ge 400 ] || { echo "::error::the cases must be at least 400 (the differential runs a quarter of them in each of four parts, and never fewer than 100)"; exit 1; }
           {
             echo "LEDGER_KERNEL_DIFF_SEED=$seed"
             echo "F004_CONCURRENCY_SEED=$seed"
