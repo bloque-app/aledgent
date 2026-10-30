@@ -87,6 +87,11 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: semver
+          # Restored, never saved: this workflow runs on pull requests only, and a cache saved by a
+          # pull request is a 1 GB copy that no other run can read (it is what filled the
+          # repository's cache budget). Nothing else saves this key, so it is cold until a run on
+          # develop or main does.
+          save-if: false
       - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
         with:
           tool: cargo-semver-checks@0.51.0

@@ -271,6 +271,7 @@ jobs:
         if: ${{ !startsWith(matrix.run.core, 'shards-') && matrix.run.runner != 'zombienet' }}
         with:
           shared-key: stress
+          save-if: ${{ github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main' }}
       - name: build ingress and the harness
         if: ${{ !startsWith(matrix.run.core, 'shards-') && matrix.run.runner != 'zombienet' && matrix.run.core_measure == '' && matrix.run.core_measure_k == '' }}
         run: cargo build --release --locked --bin aledgent-ingress --bin aledgent-e2e-driver --bin opsctl --bin aledgent-signer

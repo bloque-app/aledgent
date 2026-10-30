@@ -147,7 +147,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: code-history
+          # The restore drill's cache (ci.yml: the same crates and features, the same environment),
+          # restored here and never saved: a copy of its own was 0.6 GB of the repository's cache budget.
+          shared-key: restore-drill
+          save-if: false
 
       - name: This build replays the recorded history, and decides each way out the same by either generation
         run: |

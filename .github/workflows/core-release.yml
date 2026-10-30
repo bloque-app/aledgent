@@ -425,8 +425,8 @@ jobs:
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
         if: steps.gen.outputs.proceed == 'true'
 
-      # core.vos only: the target core-upgrade. The build cache is read, never written, so this
-      # workflow cannot change what the image build finds there.
+      # core.vos only: the target core-upgrade. The build cache (images.yml's registry cache on GHCR) is
+      # read, never written, so this workflow cannot change what the image build finds there.
       - name: Build the upgrade's package
         if: steps.gen.outputs.proceed == 'true'
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
@@ -439,7 +439,7 @@ jobs:
             ROOTS=${{ steps.pred.outputs.roots }}
             CHECK_MUST_PASS=${{ matrix.case == 'diverge' && '0' || '1' }}
           build-contexts: previous-code=${{ steps.in.outputs.w }}/pred-pkg
-          cache-from: type=gha,scope=core${{ steps.pred.outputs.roots == 'v1' && '-roots-v1' || '' }}
+          cache-from: type=registry,ref=ghcr.io/bloque-app/aledgent-cache:core${{ steps.pred.outputs.roots == 'v1' && '-roots-v1' || '' }}
           outputs: type=local,dest=${{ steps.in.outputs.w }}/upgrade
           push: false
 
