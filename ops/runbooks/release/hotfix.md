@@ -112,13 +112,17 @@ changes to the judge take effect only after they are there.
    production deploy are bloque-ledgent's.
 
    **Do not wait for step 6 unless you can afford to** (the suite takes about 40 minutes, and the lane
-   exists to save them). The release pull request skips its heavy checks only when `main`'s tip has a
-   finished, passed push run, and refuses to while the latest finished one is red; while the tip's run
-   is still going the pull request runs everything. Waiting for green therefore makes the release
-   pull request merge in minutes, with no `--admin`. Not waiting means merging the release pull
-   request with `--admin` once its cheap checks are green, **and releasing before the suite has
-   judged the fix** (below). If step 6 goes red after that, stop the deploy and revert the way step 6
-   says.
+   exists to save them). The release pull request skips its heavy checks only when `main`'s tip, or an
+   ancestor with its tree but for versions (the develop tip a promotion merged), has a finished, passed
+   push run, and it refuses to while the latest finished push run on `main` is red. After a hotfix the
+   tip is the hotfix's commit, and its run is still going when release-please opens the pull request,
+   so the gate answers `full` at that moment and **does not look again by itself**.
+   - Waiting: once `main`'s run is green, re-run the release pull request's checks (close and reopen
+     it, or "Re-run all jobs" on its CI run). The gate asks the API again and skips; the pull request
+     merges in minutes, with no `--admin`.
+   - Not waiting: merge the release pull request with `--admin` once its cheap checks are green, and
+     **release before the suite has judged the fix** (below). If step 6 goes red after that, stop the
+     deploy and revert the way step 6 says.
 8. **Bring the fix to `develop`, the same day.** Until then the next promotion either conflicts on it
    or ships a `develop` without it.
    - Preferred: after the release, merge `main` back into `develop` (CONTRIBUTING, "Releases"). That
