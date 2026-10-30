@@ -340,9 +340,10 @@ jobs:
         run: |
           cargo test -p ledger-core --test privileged_reads
           cargo test -p core-binding --test upgrade_authority
-      # The conformance suite's cases (crates/conformance/tests/suite.rs: 1,344 of this run's tests,
-      # on four targets) are the `conformance` job's, a required check of its own that runs them once
-      # and judges them against the gate profile; they are not repeated here. `--skip` takes the
+      # On a pull request, the conformance suite's cases (crates/conformance/tests/suite.rs: 1,344 of this run's tests,
+      # on four targets) are left to the `conformance` job, a required check of its own that runs them once
+      # and judges them against the gate profile; they are not repeated here. A push still runs them here as
+      # well, under the workspace's feature unification. `--skip` takes the
       # four targets' names (`in-process/...`, `through-agent/...`, which no other test's name
       # contains); the suite's seven structural checks (catalogue, closure, gate) and the crate's
       # library tests (among them the re-derivation run, INV-6) still run. It is a skip and not
@@ -359,8 +360,9 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
         run: |
-          skip=(--skip in-process/ --skip through-agent/)
+          skip=()
           if [ "$EVENT" = pull_request ]; then
+            skip+=(--skip in-process/ --skip through-agent/)
             skip+=(--skip ac_b2_1_random_schedules_never_overdraw__file_store)
           fi
           cargo test --workspace -- "${skip[@]}"

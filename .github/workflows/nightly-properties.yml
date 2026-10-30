@@ -98,6 +98,8 @@ jobs:
       - run: cargo test -p ledger-kernel --lib -- inv_1_and_inv_3_differential_against_the_kernel_reference req_ker_10_chain_by_chain
       # The reservation engine (AC-B2.1, INV-3, INV-5, INV-6), the transfer model (AC-B3.1, INV-1)
       # and the settlement simulator (INV-10 to INV-13, INV-23).
-      - run: cargo test -p ledger-core --features sim --test concurrency --test transfer_units --test settlement_sim
+      - if: ${{ !cancelled() }}
+        run: cargo test -p ledger-core --features sim --test concurrency --test transfer_units --test settlement_sim
       # The re-derivation run (INV-6, INV-5).
-      - run: cargo test -p conformance --lib -- inv_6_rederive_matches_stored_balances_on_random_units
+      - if: ${{ !cancelled() }}
+        run: cargo test -p conformance --lib -- inv_6_rederive_matches_stored_balances_on_random_units

@@ -325,7 +325,7 @@ fn inv_7_a_net_of_exactly_u64_max_is_an_oracle_fault_and_one_more_is_out_of_rang
 /// A book that holds none wrong passes; one opening corrupted in the vault is
 /// `OpeningMismatch` for exactly that row, whichever side or layer it is on.
 #[test]
-fn inv_6_a_corrupted_vault_opening_is_an_opening_mismatch() {
+fn req_ker_3_a_corrupted_vault_opening_is_an_opening_mismatch() {
     let mut book = mem_book();
     fund(&mut book, 100);
     assert_eq!(
@@ -355,9 +355,9 @@ fn inv_6_a_corrupted_vault_opening_is_an_opening_mismatch() {
     }
 }
 
-/// `INV-6`: a vault row for an account the store does not hold cannot open anything.
+/// `INV-6`, `REQ-KER-3`: a vault row for an account the store does not hold cannot open anything.
 #[test]
-fn inv_6_a_vault_row_for_an_unknown_account_is_an_opening_mismatch() {
+fn req_ker_3_a_vault_row_for_an_unknown_account_is_an_opening_mismatch() {
     let mut book = mem_book();
     fund(&mut book, 100);
     let row = RowKey::new(customer(9, 1).id(), Layer::Settled.as_byte());
