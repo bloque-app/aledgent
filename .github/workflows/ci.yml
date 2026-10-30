@@ -238,7 +238,7 @@ jobs:
       - name: property-test strength
         if: steps.plan.outputs.run == 'true'
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then n=1000; else n=10000; fi
+          n=10000 # TEMPORARY: main strength on a pull request, to measure
           # F007_WALKS is not reduced: it asserts that the walks reach every edge, and runs in seconds.
           for v in F010_RUNS F004_CONCURRENCY_CASES F008_UNITS LEDGER_KERNEL_DIFF_CASES CONFORMANCE_REDERIVE_UNITS; do
             echo "$v=$n" >> "$GITHUB_ENV"
