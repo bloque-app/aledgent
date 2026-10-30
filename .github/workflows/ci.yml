@@ -24,12 +24,21 @@ on:
         type: string
         default: "-p compact-smt"
 
-# A newer push to develop supersedes the run still going on the older one: the evidence of a tested
-# tree (tools/ci/tested-tree.py) is the tip's, and a promotion is judged against the tip. Everything
-# else has a group of its own and is never cancelled.
+# The token reads the repository and nothing else; the one job that needs more (`gate`) says so.
+permissions:
+  contents: read
+
+# A run that is going is never cancelled. The push run of a develop commit is the evidence of a
+# tested tree (tools/ci/tested-tree.py reads only finished push runs): cancelled by the next merge
+# (3 of the last 6 were), it proved nothing, and the promotion pull request ran the whole suite.
+# Pushes to develop share one group, so they run one at a time and the newest tip is not starved of
+# runner slots by older runs (a run is 22 jobs, the plan allows 20 at once). GitHub keeps one
+# pending run per group, and a newer one replaces an older pending run; that older commit is no
+# longer the tip, which is the commit a promotion is judged on. Everything else (pull requests,
+# main, dispatches, the nightly) has a group of its own.
 concurrency:
   group: ci-${{ github.event_name == 'push' && github.ref == 'refs/heads/develop' && 'develop' || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/develop' }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -153,6 +162,8 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         if: needs.gate.outputs.mode != 'skip'
+        with:
+          save-if: ${{ github.ref == 'refs/heads/develop' }}
       - run: cargo clippy --workspace --all-targets -- -D warnings
         if: needs.gate.outputs.mode != 'skip'
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -204,7 +215,8 @@ jobs:
       # The runner is 4 vCPU, 15 GB of memory and a 145 GB disk with 86 GB free (measured 2026-10-30, the
       # run of #110); the workspace's build and tests peak under 40 GB. Freeing the toolchains the image
       # ships (dotnet, android, ghc, CodeQL; #59, when the disk was 14 GB) took 45 to 120 s of every
-      # run and is no longer needed. The `df` after the tests below shows the margin.
+      # run and is no longer needed, here and in the agents, restore drill, stateful upgrade and
+      # conformance jobs below. The `df` after the tests below shows the margin.
       - name: runner
         if: steps.plan.outputs.run == 'true'
         run: nproc; free -g | head -2; df -h /
@@ -214,16 +226,23 @@ jobs:
           components: rustfmt, clippy
       # Two caches: the workspace shard's (the features shard restores it, and builds what it lacks) and
       # the v1 shard's, whose dependencies are built with other features (4 minutes more without it).
-      # Saved only on main (the push and the nightly run): a cache saved on the default branch is the
-      # one every branch and pull request restores. Saved by pull requests and develop it was a
-      # 1 GB copy per pull request, the repository's cache budget is 10 GB and was over (10.7 GB on
-      # 2026-10-30), and the entry main had saved was evicted within hours, so most main pushes and
-      # the first run of a pull request built every dependency (13 to 16 minutes).
+      # Saved by the push to develop and the push to main (and the nightly), never by a pull request,
+      # and by a dispatch on develop or main (which seeds them): a run restores its own branch's
+      # cache, its base branch's and main's, so a pull request into develop restores develop's and a
+      # push to main restores main's. Saved by pull requests it was a 1 GB copy per pull request,
+      # which nothing else could read, in a repository budget of 10 GB that was over (11.3 GB on
+      # 2026-10-30); saved only by main, the entry was evicted within hours and then did not exist
+      # (every run built every dependency, 13 to 16 minutes). `cache-on-failure`: a late test failure
+      # keeps the dependency build it paid for. The features shard restores the workspace key and
+      # builds what it lacks. A run that fails mid-compile can save a partial entry, and rust-cache
+      # never overwrites an exact key: if every run on one Cargo.lock rebuilds dependencies, delete
+      # that `tests`/`tests-v1` entry (`gh cache delete`) and run this workflow by dispatch on develop.
       - uses: Swatinem/rust-cache@v2
         if: steps.plan.outputs.run == 'true'
         with:
           shared-key: ${{ matrix.shard == 'v1-roots' && 'tests-v1' || 'tests' }}
-          save-if: ${{ matrix.shard != 'features' && github.ref == 'refs/heads/main' }}
+          save-if: ${{ matrix.shard != 'features' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main') }}
+          cache-on-failure: ${{ matrix.shard != 'features' }}
       # The v1 shard runs on cargo-nextest, which runs the tests of all binaries in one pool instead of
       # one binary after another (cargo test): its test phase went from about 8 to about 3 minutes.
       # The workspace shard stays on `cargo test`: nextest there failed 2 runs of 6, each on another
@@ -355,14 +374,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: free runner disk
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
-          df -h /
       - uses: dtolnay/rust-toolchain@stable
+      # One cache for the jobs that build the archive and the core binding (restore drill, S3, and the
+      # code-history gate): this job saves it, the others restore it. Vault transit keeps its own.
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: restore-drill
+          save-if: ${{ github.ref == 'refs/heads/develop' }}
       - run: cargo test -p core-binding --features ingress --test roll_forward
       - run: cargo test -p core-archive --lib --test stream
       - run: cargo test -p ops --test agent_drill -- --nocapture
@@ -382,7 +400,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: archive-s3
+          shared-key: restore-drill
+          save-if: false
       # MinIO no longer publishes images or binaries of its own; Chainguard's build is the same
       # server. The bucket is created with Object Lock by the runner's AWS CLI.
       - name: MinIO with Object Lock and a KMS key
@@ -423,9 +442,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # Its own cache: the signer and its Vault dependencies are not in the restore drill's build.
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: vault-transit
+          save-if: ${{ github.ref == 'refs/heads/develop' }}
       - name: Vault in dev mode, with Transit and a non-exportable Ed25519 key
         run: |
           set -eu
@@ -639,11 +660,6 @@ jobs:
         run: echo "::notice::$REASON"
       - uses: actions/checkout@v4
         if: needs.gate.outputs.mode != 'skip' && (needs.gate.outputs.mode != 'hotfix' || needs.gate.outputs.agents == 'true')
-      - name: free runner disk
-        if: needs.gate.outputs.mode != 'skip' && (needs.gate.outputs.mode != 'hotfix' || needs.gate.outputs.agents == 'true')
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
-          df -h /
       - uses: dtolnay/rust-toolchain@master
         if: needs.gate.outputs.mode != 'skip' && (needs.gate.outputs.mode != 'hotfix' || needs.gate.outputs.agents == 'true')
         with:
@@ -653,6 +669,7 @@ jobs:
         if: needs.gate.outputs.mode != 'skip' && (needs.gate.outputs.mode != 'hotfix' || needs.gate.outputs.agents == 'true')
         with:
           workspaces: agents
+          save-if: ${{ github.ref == 'refs/heads/develop' }}
       - run: ../tools/cipherclerk-patched.sh
         if: needs.gate.outputs.mode != 'skip' && (needs.gate.outputs.mode != 'hotfix' || needs.gate.outputs.agents == 'true')
       # T-036-34: no core host or guest links the guest-heap model.
@@ -681,17 +698,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: free runner disk
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
-          df -h /
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-03-20
           components: rust-src
+      # The agents job's cache (the same workspace, the same toolchain): restored here, saved there.
       - uses: Swatinem/rust-cache@v2
         with:
+          shared-key: agents
           workspaces: agents
+          save-if: false
       - run: tools/cipherclerk-patched.sh
       # VOS at the commit agents/Cargo.toml pins, fetched by commit as the image does.
       - name: VOS at the pin
@@ -736,29 +752,21 @@ jobs:
   # spec 136 (release 0.18.1, live on mainnet from 2026-10-27, kreivo-pin-136; same format as 133)
   # and spec 132 (release 0.16.9, kreivo-pin-132). Each is a workspace of its own, built from its
   # committed lock file; services/settle's own tests check its encoder against the same vectors.
-  kreivo-pin:
-    name: kreivo pin (${{ matrix.crate }})
-    needs: gate
-    if: ${{ !cancelled() && !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        crate: [kreivo-pin, kreivo-pin-136, kreivo-pin-132]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: services/settle/${{ matrix.crate }}
-      - run: cargo fmt --manifest-path services/settle/${{ matrix.crate }}/Cargo.toml -- --check
-      - run: cargo clippy --locked --manifest-path services/settle/${{ matrix.crate }}/Cargo.toml --all-targets -- -D warnings
-      - run: cargo test --locked --manifest-path services/settle/${{ matrix.crate }}/Cargo.toml
-
-  spikes:
-    name: spikes (F-002 measurement code, never shipped)
+  #
+  # And the spikes (F-002 measurement code, never shipped): spikes/ is its own workspace, outside the
+  # root one (spikes/README.md). The VOS guest and host crates under it need the pinned VOS checkout
+  # and a nightly toolchain; they are built by hand, as the README says.
+  #
+  # One job for the four workspaces, none of them a required check: they were four jobs, four of the
+  # 25 runner slots a run held (the plan allows 20 at once), and are one of the 22 it holds now. A
+  # workspace that fails does not stop the next one (`!cancelled()`), and the job fails at the end.
+  # No rust-cache: the four built cold in 5.4 minutes in one job (#116, the first run), under the
+  # tests shards, and their cache would be 1.6 GB of the repository's 10 GB budget. The seven
+  # small jobs that are required by name (rustfmt, no floating point, kernel feature graph,
+  # conformance ports, VOS boundary, pass-import, licences) stay jobs of their own: a fold would
+  # rename a required check.
+  standalone-workspaces:
+    name: standalone workspaces (kreivo pins, spikes)
     needs: gate
     if: ${{ !cancelled() && !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
     runs-on: ubuntu-latest
@@ -767,15 +775,32 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: spikes
-      # spikes/ is its own workspace, outside the root one (spikes/README.md).
-      # The VOS guest and host crates under it need the pinned VOS checkout and
-      # a nightly toolchain; they are built by hand, as the README says.
-      - run: cargo fmt --manifest-path spikes/Cargo.toml --all -- --check
-      - run: cargo clippy --manifest-path spikes/Cargo.toml --all-targets -- -D warnings
-      - run: cargo test --manifest-path spikes/Cargo.toml --release
+      - name: kreivo pin (kreivo-pin)
+        run: |
+          m=services/settle/kreivo-pin/Cargo.toml
+          cargo fmt --manifest-path "$m" -- --check
+          cargo clippy --locked --manifest-path "$m" --all-targets -- -D warnings
+          cargo test --locked --manifest-path "$m"
+      - name: kreivo pin (kreivo-pin-136)
+        if: ${{ !cancelled() }}
+        run: |
+          m=services/settle/kreivo-pin-136/Cargo.toml
+          cargo fmt --manifest-path "$m" -- --check
+          cargo clippy --locked --manifest-path "$m" --all-targets -- -D warnings
+          cargo test --locked --manifest-path "$m"
+      - name: kreivo pin (kreivo-pin-132)
+        if: ${{ !cancelled() }}
+        run: |
+          m=services/settle/kreivo-pin-132/Cargo.toml
+          cargo fmt --manifest-path "$m" -- --check
+          cargo clippy --locked --manifest-path "$m" --all-targets -- -D warnings
+          cargo test --locked --manifest-path "$m"
+      - name: spikes (F-002 measurement code, never shipped)
+        if: ${{ !cancelled() }}
+        run: |
+          cargo fmt --manifest-path spikes/Cargo.toml --all -- --check
+          cargo clippy --manifest-path spikes/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path spikes/Cargo.toml --release
 
   # F-028: the Kreivo Pass import tool (TypeScript, polkadot-api). Its conversion is tested offline,
   # against the vector crates/authn decodes too; it never reaches a chain here.
@@ -813,19 +838,16 @@ jobs:
         with:
           # The commit message is read for an amendment citation.
           fetch-depth: 0
-      # Toolchains the runner image ships and this workspace never uses (#59).
-      - name: free runner disk
-        if: ${{ !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
-        run: |
-          df -h /
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
-          df -h /
       - uses: dtolnay/rust-toolchain@stable
         if: ${{ !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
         with:
           components: rustfmt, clippy
+      # One cache for the three conformance jobs: this one saves it, the others restore it.
       - uses: Swatinem/rust-cache@v2
         if: ${{ !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
+        with:
+          shared-key: conformance
+          save-if: ${{ github.ref == 'refs/heads/develop' }}
       # F-015 §1: the spec catalogue is current with SPEC.md.
       - run: cargo xtask spec-ids --check
         if: ${{ !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
@@ -884,14 +906,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      # Toolchains the runner image ships and this workspace never uses (#59).
-      - name: free runner disk
-        run: |
-          df -h /
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
-          df -h /
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: conformance
+          save-if: false
       - run: cargo test -p conformance --features smt-v1 --test suite
       - uses: actions/upload-artifact@v4
         if: always()
@@ -912,16 +931,13 @@ jobs:
       CONFORMANCE_REPORT: ${{ github.workspace }}/target/conformance/full/report.json
     steps:
       - uses: actions/checkout@v4
-      # Toolchains the runner image ships and this workspace never uses (#59).
-      - name: free runner disk
-        run: |
-          df -h /
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
-          df -h /
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: conformance
+          save-if: false
       - name: full run
         run: cargo test -p conformance --test suite -- --format terse | tee target-full.log
       - name: declaration of the full run
