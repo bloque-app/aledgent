@@ -11,3 +11,17 @@
 [[profile.default.overrides]]
 filter = 'package(ledger-kernel) & test(/book::cost_tests::/)'
 threads-required = "num-cpus"
+
+# The longest tests start first (measured on the run of 2026-10-30: 123 s, 56 s, 44 s, 33 s, 27 s and
+# 25 s, the next is 20 s). The pool otherwise reached the 123 s one in the middle of the run, and the
+# job waited for it alone. A list, not a rule: a test that grows past these belongs on it.
+[[profile.default.overrides]]
+filter = '''
+test(=f_036_a_seed_chunk_in_the_guests_heap)
+| test(=req_rt_1_a_grant_costs_the_same_however_many_grants_its_principal_holds)
+| test(=inv_10_to_13_ten_thousand_seeded_histories_against_the_simulated_layer)
+| test(=t043_07_the_heap_stays_flat_over_ten_thousand_incidents)
+| test(=inv_18_ten_thousand_walks_applied_twice_change_nothing)
+| test(=nfr_10_the_drill_restores_postgres_from_base_backup_and_wal_to_the_pre_failure_root)
+'''
+priority = 100
