@@ -82,6 +82,6 @@ regenerated; conformance catalogue regenerated. Tests:
 `ledger/tests/identities.rs`), `amendment_0026_the_grants_over_an_identity_are_read_by_who_may_and_refused_to_anyone_else`
 (ingress, `tests/identity_grants.rs`: the identity, the operator and the identities principal read both
 grants over it, neither made by the identity; a holder reads its own; a stranger is refused),
-`amendment_0026_the_custodian_reads_its_grant_over_an_identity_and_names_it_as_parent`
+`req_rc_7_amendment_0026_the_custodian_reads_its_grant_over_an_identity_and_names_it_as_parent`
 (sidecar, through the surface). The core actor (`core.vos`) does not serve queries and does not call
 the new read: its program is unchanged in behaviour.

@@ -230,7 +230,7 @@ through the adapter; `Anchored` records mean something), and `F-010`'s `TODO(F-0
 
 | Test | Covers |
 |---|---|
-| `crates/verify` (16, 1 ignored): `the_commitment_*`, `every_shape_is_cipher_clerks_wire_form`, `a_cipher_clerk_signature_verifies_here…`, `ac_i2_1_…`, `t_017_06_a_tampered_disclosure_fails`, `ac_j1_3_…`, `ac_i2_3_…`, `every_shape_is_checked_for_consistency`, `t_017_06_the_cli_passes…`, the RPC key and record encodings | `REQ-DS-3`, `REQ-PR-4`, `AC-I2.1`, `AC-I2.3`, `AC-J1.3`, T-017-06 |
+| `crates/verify` (16, 1 ignored): `the_commitment_*`, `req_ds_3_every_shape_is_cipher_clerks_wire_form`, `req_ds_3_a_cipher_clerk_signature_verifies_here…`, `ac_i2_1_…`, `t_017_06_a_tampered_disclosure_fails`, `ac_j1_3_…`, `ac_i2_3_…`, `every_shape_is_checked_for_consistency`, `t_017_06_the_cli_passes…`, the RPC key and record encodings | `REQ-DS-3`, `REQ-PR-4`, `AC-I2.1`, `AC-I2.3`, `AC-J1.3`, T-017-06 |
 | `ledger-core` `anchor::tests` (5), `anchor::clerk::tests` (2) | the store's rules; the build gate; the clerk's signature and hygiene (`NFR-8`) |
 | `ledger-core` `ledger::tests::anchoring` (20): `inv_19_…` (property, 16 random books), `ac_j1_1_…`, `req_pr_1_…`, `ac_j1_4_…`, `ac_j1_3_…` (2), `t_017_03_…`, `req_ds_1_…`, `req_ds_4_…`, `err_disclosure_unsupported_…`, `err_anchor_not_final_…`, `req_ds_5_…` (2), `ac_i2_2_…`, `req_op_10_…`, `t_017_06_…`, `ac_j3_2_…`, `ac_j3_1_…` | T-017-01 to T-017-07 at the service layer |
 | `conformance` `f017.rs` (13 cases × 2 targets) | `INV-17` (build gate), `INV-19`, `ERR-DisclosureUnsupported`, `ERR-DisclosureFalse`, `ERR-NotDisclosable`, `ERR-AnchorNotFinal`, `AC-I1.1`, `AC-J1.1`–`AC-J1.4`, `AC-J3.1`, `AC-J3.2` |

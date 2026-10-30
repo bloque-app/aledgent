@@ -135,7 +135,7 @@ import).
 **Code.** `Ledger::register_credential` takes the managed set when a principal that is not an agent
 names another identity in `on-behalf-of` (`managed_set` in `ledger/custody.rs`); everything else about
 the command is unchanged. Tests: `req_au_20_the_identities_principal_registers_a_credential_for_a_
-managed_identity` (core), `amendment_0025_r2_onboarding_registers_a_users_passkey_and_the_user_signs_in`
+managed_identity` (core), `req_au_20_amendment_0025_r2_onboarding_registers_a_users_passkey_and_the_user_signs_in`
 (sidecar, the ceremony end to end).
 
 ## Clause R3 — broad grants never reach the operator's own accounts (ruling `au4-q2`)

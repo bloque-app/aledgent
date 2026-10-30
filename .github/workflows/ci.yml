@@ -253,12 +253,42 @@ jobs:
         if: steps.plan.outputs.full == 'true' && matrix.shard == 'v1-roots'
         with:
           tool: nextest
-      # Property tests run 1,000 cases on pull requests and their full 10,000 on main and nightly.
-      - name: property-test strength
+      # Strength of the randomised and the scaling tests (the test-surface audit of 2026-10-30,
+      # handovers/2026-10-30-test-surface-audit.md). A pull request runs them cheaper; a push to
+      # main or develop and the nightly run them in full.
+      #
+      # The five harnesses behind F010_RUNS, F004_CONCURRENCY_CASES, F008_UNITS,
+      # LEDGER_KERNEL_DIFF_CASES and CONFORMANCE_REDERIVE_UNITS draw from fixed seeds, so case 257 is
+      # always the same input and 256 pull request cases are a regression check on 256 fixed
+      # inputs, as 1,000 were on 1,000 (the kill set of the kernel's mutants is the same from 4 cases
+      # to 10,000, audit section 4.2). The depth is the nightly's, with a seed that changes every
+      # night (nightly-properties.yml). Push stays at 10,000 until that run has been seen.
+      # F007_WALKS is not reduced: it asserts that the walks reach every edge, and runs in seconds.
+      #
+      # The scaling tests (heap and memory) run at a smaller book on a pull request, through the
+      # knobs they already read: the assertions are the same, the book is smaller. The floors are
+      # the tests' own: the tick test samples every 300 reservations and compares the first with the
+      # last (600 is its smallest meaningful book); the grants test asserts 2,000 at least. The
+      # per-input fit tests (t043_08, a full batch, a batch of full packs, a seed of grants over one
+      # owner's accounts) have no knob here and run at full size.
+      - name: test strength
         if: steps.plan.outputs.run == 'true'
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then n=1000; else n=10000; fi
-          # F007_WALKS is not reduced: it asserts that the walks reach every edge, and runs in seconds.
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            n=256
+            {
+              # The default chunk size (ChunkLimits::DEFAULT, 6) is the only size f_036 asserts on; the
+              # sweep of six more sizes is the calibration that sets it.
+              echo ALEDGENT_SEED_HEAP_SIZES=6
+              echo ALEDGENT_HEAP_OPERATIONS=400
+              echo ALEDGENT_HEAP_OPEN=600
+              echo ALEDGENT_HEAP_GROW=300
+              echo ALEDGENT_GUEST_HEAP_GRANTS=2000
+              echo ALEDGENT_MEMORY_ROUNDS=8
+            } >> "$GITHUB_ENV"
+          else
+            n=10000
+          fi
           for v in F010_RUNS F004_CONCURRENCY_CASES F008_UNITS LEDGER_KERNEL_DIFF_CASES CONFORMANCE_REDERIVE_UNITS; do
             echo "$v=$n" >> "$GITHUB_ENV"
           done
@@ -310,8 +340,32 @@ jobs:
         run: |
           cargo test -p ledger-core --test privileged_reads
           cargo test -p core-binding --test upgrade_authority
-      - run: cargo test --workspace
+      # On a pull request, the conformance suite's cases (crates/conformance/tests/suite.rs: 1,344 of this run's tests,
+      # on four targets) are left to the `conformance` job, a required check of its own that runs them once
+      # and judges them against the gate profile; they are not repeated here. A push still runs them here as
+      # well, under the workspace's feature unification. `--skip` takes the
+      # four targets' names (`in-process/...`, `through-agent/...`, which no other test's name
+      # contains); the suite's seven structural checks (catalogue, closure, gate) and the crate's
+      # library tests (among them the re-derivation run, INV-6) still run. It is a skip and not
+      # `--exclude conformance`, because excluding the package changes the features cargo resolves for
+      # the rest: that rebuilt 179 packages, three minutes, on the first run of this change. Audit 6.1 C.
+      #
+      # On a pull request the FileStore parts of the concurrency run (AC-B2.1, INV-3, INV-5, INV-6,
+      # REQ-BA-6) are left to the push and the nightly: the MemStore parts keep the property, and
+      # FileStore against MemStore is compared unit by unit by the kernel's differential and by the
+      # suite's file-store target. The prefix is that test's own: `--skip` matches substrings in every
+      # binary, and transfer_units has file-store parts too. Audit 6.2 D.
+      - name: workspace tests
         if: steps.plan.outputs.full == 'true' && matrix.shard == 'workspace'
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          skip=()
+          if [ "$EVENT" = pull_request ]; then
+            skip+=(--skip in-process/ --skip through-agent/)
+            skip+=(--skip ac_b2_1_random_schedules_never_overdraw__file_store)
+          fi
+          cargo test --workspace -- "${skip[@]}"
 
       # --- features shard ---
       # F-005, F-031: ingress over the core Agent (AgentCore) needs core-binding's `ingress`
@@ -331,15 +385,46 @@ jobs:
       # under both versions). The conformance suite from a v1 genesis is its own job below. The
       # code-history gate (T-037-12) is skipped by name: its recorded book is a v2 book, which a v1
       # build founds differently, and it fails loudly if run here (code-history.yml runs it, in v2).
+      #
+      # On a pull request this shard skips what does not depend on the root version, which the
+      # workspace shard runs already (audit 6.2 E): the reservation engine's, the transfer model's and
+      # the settlement simulator's random runs, the lifecycle walks, the four parts of the kernel's
+      # differential (which applies every unit to a book of the other root version as well), and the
+      # scaling tests of the Agent's heap and memory (v2 witnesses are the larger, so the v2 run is
+      # the binding one). It keeps the root-dependent tests: the golden vectors (REQ-RT-3) and the
+      # chain-by-chain run of the kernel, the leaf store's trie and witnesses, compact-smt, the
+      # Agent's paths, and the per-input heap-fit tests. A push and the nightly run all of it.
       - name: v1 roots (supported opt-in)
         if: steps.plan.outputs.full == 'true' && matrix.shard == 'v1-roots'
         env:
-          LEDGER_KERNEL_DIFF_CASES: "1000"
+          # 1,000 on a push, as before; the differential's parts are skipped on a pull request, and
+          # the chain-by-chain run (a tenth of the cases) keeps the 256.
+          LEDGER_KERNEL_DIFF_CASES: ${{ github.event_name == 'pull_request' && '256' || '1000' }}
+          EVENT: ${{ github.event_name }}
           V1_PACKAGES: -p compact-smt -p ledger-kernel -p ledger-core -p leaf-store -p core-binding -p shards
           V1_FEATURES: compact-smt/v1,ledger-kernel/smt-v1,ledger-core/smt-v1,leaf-store/smt-v1,core-binding/smt-v1,core-binding/ingress,shards/smt-v1
+          # nextest filterset: what a pull request leaves out of this shard. Binaries by id; the
+          # heap binary keeps its two `..._fits_the_guests_heap` tests (a fit, not a scaling), the rest
+          # of it and the tests below it are the scaling ones: the book grows, the heap must not.
+          V1_PR_SKIPS: >-
+            binary_id(ledger-core::settlement_sim)
+            | binary_id(ledger-core::concurrency)
+            | binary_id(ledger-core::transfer_units)
+            | binary_id(ledger-core::lifecycle_walks)
+            | (package(ledger-kernel) & test(/inv_1_and_inv_3_differential_against_the_kernel_reference_part_/))
+            | (binary_id(core-binding::heap) & not test(/_fits_the_guests_heap$/))
+            | (binary_id(core-binding::guest_heap) & test(/however_many_grants/))
+            | (binary_id(core-binding::f043_incidents_heap) & test(/^t043_07_the_heap_stays_flat/))
+            | binary_id(core-binding::memory)
+            | binary_id(core-binding::audit_memory)
+            | (binary_id(core-binding::chainspec) & test(/f_036_the_hosts_side_of_a_seeding/))
         run: |
+          filter='not test(/t037_12_/)'
+          if [ "$EVENT" = pull_request ]; then
+            filter="$filter and not ($V1_PR_SKIPS)"
+          fi
           # shellcheck disable=SC2086
-          cargo nextest run $V1_PACKAGES --features "$V1_FEATURES" --no-fail-fast -E 'not test(/t037_12_/)'
+          cargo nextest run $V1_PACKAGES --features "$V1_FEATURES" --no-fail-fast -E "$filter"
           # shellcheck disable=SC2086
           cargo test $V1_PACKAGES --features "$V1_FEATURES" --doc -- --skip t037_12_
       - name: disk left after the tests

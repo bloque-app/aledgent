@@ -91,6 +91,6 @@ through it.
 `amendment_0028_an_accounts_owner_is_read_by_who_may_and_refused_to_anyone_else` (ingress: the owner, the
 operator, the identities principal, a holder of a grant over the owner and one over the account read it; a
 stranger is refused, and the grant over the owner reaches no other owner's account), and
-`amendment_0028_the_custodian_reads_the_owner_of_an_account_opened_for_its_user` (sidecar: the custody
+`req_rc_7_amendment_0028_the_custodian_reads_the_owner_of_an_account_opened_for_its_user` (sidecar: the custody
 service, with its grant over the user, reads the account the onboarding service opened for the user and
 sees the user as owner; it is refused on the issuing service's fee account).

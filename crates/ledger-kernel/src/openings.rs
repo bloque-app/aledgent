@@ -231,6 +231,7 @@ fn layer_of(index: u8) -> Option<Layer> {
 mod tests {
     use super::*;
     use crate::account::{AssetTag, BalanceRule, KernelAccountSpec, Role};
+    use crate::build::BuiltTransfer;
     use crate::build::{build_creation, build_transfer};
     use crate::keys::KeyRing;
     use crate::posting::{EntryDraft, OperationRef, PostingDraft, PostingKind, PostingMeta};
@@ -238,7 +239,8 @@ mod tests {
     use crate::vault::MemVault;
     use alloc::vec;
     use cipher_clerk::{
-        EventResult, EventStatus, Journal, JournalId, apply_account_creations, apply_batch,
+        Direction, EventResult, EventStatus, Journal, JournalId, apply_account_creations,
+        apply_batch,
     };
     use core::num::NonZeroU64;
 
@@ -362,5 +364,283 @@ mod tests {
             crate::store::codec::encode_delta(&a.1),
             crate::store::codec::encode_delta(&c.1)
         );
+    }
+    /// A transfer of `value` from `from` to `to`, with every entry on `layer` and `flags` set,
+    /// signed again: the binding builds Settled-layer postings only, and these are the
+    /// kernel's own pending and encumbrance moves, which the simulation must follow.
+    fn on_layer(
+        keys: &KeyRing,
+        ordinal: u32,
+        from: KernelAccountSpec,
+        to: KernelAccountSpec,
+        value: u64,
+        layer: Layer,
+        flags: TransferFlags,
+    ) -> crate::build::BuiltTransfer {
+        let mut built = build_transfer(keys, JOURNAL, &draft(ordinal, from, to, value), false);
+        for e in &mut built.transfer.entries {
+            e.layer = layer;
+        }
+        built.transfer.flags = flags;
+        built.transfer.signatures = crate::build::sign_debits(keys, &built.transfer);
+        built
+    }
+
+    /// A finalisation of the pending transfer `of`: no entries, signed by `payer`.
+    fn finalize(
+        keys: &KeyRing,
+        id: u8,
+        of: &Transfer,
+        payer: &KernelAccountSpec,
+        flag: TransferFlags,
+    ) -> Transfer {
+        let mut t = Transfer::draft(TransferId([id; 16]), JOURNAL, Vec::new())
+            .with_flags(flag)
+            .finalizing(of.id);
+        t.signatures = vec![keys.sign_account(&payer.id(), &t.signing_payload())];
+        t
+    }
+
+    /// What the simulation of `chain` found, what the kernel did with it, and the working set
+    /// and overlay both left behind.
+    struct Followed {
+        plan: ChainPlan,
+        results: Vec<EventResult>,
+        ws: WorkingSet,
+        overlay: Overlay,
+    }
+
+    /// Create `issuer` (unchecked) and `holder` (flagged), then simulate `chain` as the book
+    /// does (the openings registered first), then apply it to the kernel.
+    fn follow(keys: &KeyRing, chain: &[crate::build::BuiltTransfer]) -> Followed {
+        let mut store = MemStore::new();
+        let mut boot = BookDelta::default();
+        boot.journals
+            .insert(JOURNAL, Journal::new(JOURNAL, keys.registrar_key(), 0));
+        store.commit(0, &boot).unwrap();
+        let vault = OpeningVault::open(MemVault::new()).unwrap();
+        let creations: Vec<_> = [
+            spec(1, BalanceRule::Unchecked),
+            spec(2, BalanceRule::NeverNegative),
+        ]
+        .iter()
+        .map(|s| build_creation(keys, JOURNAL, s))
+        .collect();
+        let transfers: Vec<Transfer> = chain.iter().map(|b| b.transfer.clone()).collect();
+        let mut ws = WorkingSet::load_for(&store, &creations, &transfers).unwrap();
+        let mut book = OpeningBook::new();
+        let created = apply_account_creations(&mut ws, &creations, &mut book, 10);
+        assert!(created.iter().all(|r| r.status == EventStatus::Created));
+        for b in chain {
+            for o in &b.openings {
+                book.register_opening(o);
+            }
+        }
+        let mut overlay = Overlay::default();
+        let plan = simulate_chain(&ws, &vault, &mut overlay, &mut book, &transfers);
+        let results = apply_batch(&mut ws, &transfers, &mut book, 20);
+        Followed {
+            plan,
+            results,
+            ws,
+            overlay,
+        }
+    }
+
+    /// Every row the simulation changed opens the commitments the kernel stored for it.
+    fn assert_overlay_opens_the_kernels_balances(f: &Followed) {
+        assert!(!f.overlay.changed.is_empty());
+        for (row, sums) in &f.overlay.changed {
+            let account =
+                f.ws.peek_account(&row.account)
+                    .expect("the account is loaded");
+            let pair = account.balances[usize::from(row.layer)];
+            assert!(
+                sums.opens(&pair),
+                "row {row:?} does not open the kernel's balance"
+            );
+        }
+    }
+
+    fn created(f: &Followed) {
+        let statuses: Vec<EventStatus> = f.results.iter().map(|r| r.status).collect();
+        assert!(
+            statuses.iter().all(|s| *s == EventStatus::Created),
+            "the kernel took every event: {statuses:?}"
+        );
+    }
+
+    /// `REQ-KER-3`: a pending transfer posted is released from Pending and applied to
+    /// Settled, and the vault's openings, followed through the simulation alone, open exactly
+    /// the commitments the kernel then holds on both layers (the blinding taken off, not added).
+    #[test]
+    fn req_ker_3_a_posted_pending_transfer_leaves_openings_that_open_the_kernels_balances() {
+        let keys = KeyRing::from_root([0x61; 32]);
+        let (issuer, holder) = (
+            spec(1, BalanceRule::Unchecked),
+            spec(2, BalanceRule::NeverNegative),
+        );
+        let funding = on_layer(
+            &keys,
+            0,
+            issuer,
+            holder,
+            100,
+            Layer::Settled,
+            TransferFlags::NONE,
+        );
+        let pending = on_layer(
+            &keys,
+            1,
+            issuer,
+            holder,
+            30,
+            Layer::Pending,
+            TransferFlags::PENDING,
+        );
+        let post = finalize(
+            &keys,
+            0x71,
+            &pending.transfer,
+            &issuer,
+            TransferFlags::POST_PENDING_TRANSFER,
+        );
+        let chain = [
+            funding,
+            pending.clone(),
+            BuiltTransfer {
+                transfer: post,
+                openings: Vec::new(),
+            },
+        ];
+        let f = follow(&keys, &chain);
+        created(&f);
+        assert_eq!(f.plan.unknown_from, None, "the finalisation is computable");
+        assert_overlay_opens_the_kernels_balances(&f);
+        // The Pending row of the holder is empty again, and its Settled row holds both credits.
+        let (pending_row, settled_row) = (
+            f.overlay.changed[&RowKey::new(holder.id(), Layer::Pending.as_byte())],
+            f.overlay.changed[&RowKey::new(holder.id(), Layer::Settled.as_byte())],
+        );
+        assert_eq!(pending_row.net(Direction::Credit).unwrap().0, 0);
+        assert_eq!(settled_row.net(Direction::Credit).unwrap().0, 130);
+    }
+
+    /// `REQ-KER-3`: a pending transfer voided is released from Pending and nothing is
+    /// applied to Settled.
+    #[test]
+    fn req_ker_3_a_voided_pending_transfer_leaves_openings_that_open_the_kernels_balances() {
+        let keys = KeyRing::from_root([0x62; 32]);
+        let (issuer, holder) = (
+            spec(1, BalanceRule::Unchecked),
+            spec(2, BalanceRule::NeverNegative),
+        );
+        let funding = on_layer(
+            &keys,
+            0,
+            issuer,
+            holder,
+            100,
+            Layer::Settled,
+            TransferFlags::NONE,
+        );
+        let pending = on_layer(
+            &keys,
+            1,
+            issuer,
+            holder,
+            25,
+            Layer::Pending,
+            TransferFlags::PENDING,
+        );
+        let void = finalize(
+            &keys,
+            0x72,
+            &pending.transfer,
+            &issuer,
+            TransferFlags::VOID_PENDING_TRANSFER,
+        );
+        let chain = [
+            funding,
+            pending.clone(),
+            BuiltTransfer {
+                transfer: void,
+                openings: Vec::new(),
+            },
+        ];
+        let f = follow(&keys, &chain);
+        created(&f);
+        assert_eq!(f.plan.unknown_from, None);
+        assert_overlay_opens_the_kernels_balances(&f);
+        let pending_row = f.overlay.changed[&RowKey::new(holder.id(), Layer::Pending.as_byte())];
+        let settled_row = f.overlay.changed[&RowKey::new(holder.id(), Layer::Settled.as_byte())];
+        assert_eq!(pending_row.net(Direction::Credit).unwrap().0, 0);
+        assert_eq!(settled_row.net(Direction::Credit).unwrap().0, 100);
+    }
+
+    /// `REQ-KER-4`, `ERR-InsufficientAvailable`: the nets the simulation expects name the layer
+    /// they are on, for each of the three layers; an entry on a layer the simulation cannot name
+    /// would leave the chain uncomputable.
+    #[test]
+    fn req_ker_4_the_simulated_nets_name_the_settled_pending_and_encumbrance_layers() {
+        let keys = KeyRing::from_root([0x63; 32]);
+        let (issuer, holder) = (
+            spec(1, BalanceRule::Unchecked),
+            spec(2, BalanceRule::NeverNegative),
+        );
+        let chain = [
+            on_layer(
+                &keys,
+                0,
+                issuer,
+                holder,
+                100,
+                Layer::Settled,
+                TransferFlags::NONE,
+            ),
+            on_layer(
+                &keys,
+                1,
+                issuer,
+                holder,
+                30,
+                Layer::Pending,
+                TransferFlags::PENDING,
+            ),
+            on_layer(
+                &keys,
+                2,
+                issuer,
+                holder,
+                20,
+                Layer::Encumbrance,
+                TransferFlags::NONE,
+            ),
+        ];
+        let f = follow(&keys, &chain);
+        created(&f);
+        assert_eq!(f.plan.unknown_from, None);
+        let id = holder.id();
+        assert_eq!(
+            f.plan.nets,
+            vec![
+                vec![NetCheck {
+                    account: id,
+                    layer: Layer::Settled,
+                    net: 100
+                }],
+                vec![NetCheck {
+                    account: id,
+                    layer: Layer::Pending,
+                    net: 30
+                }],
+                vec![NetCheck {
+                    account: id,
+                    layer: Layer::Encumbrance,
+                    net: 20
+                }],
+            ]
+        );
+        assert_overlay_opens_the_kernels_balances(&f);
     }
 }

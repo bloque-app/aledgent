@@ -30,7 +30,9 @@
 //!
 //! It runs on both in-process stores: `MemStore` and `FileStore` (redb's in-memory backend, the
 //! same code without the fsync, as `F-001`'s differential test does). `F004_CONCURRENCY_CASES`
-//! sets the number of cases per store (default 10 000), split in parts that run in parallel.
+//! sets the number of cases per store (default 10 000), split in parts that run in parallel, from
+//! fixed seeds that `F004_CONCURRENCY_SEED` replaces (a number; the nightly run rotates it, and a
+//! failure prints it with the command that repeats it).
 
 // Test names end in `__<store>_part_<n>`, after the criterion they verify.
 #![allow(non_snake_case)]
@@ -42,6 +44,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use cipher_clerk::{Account, AccountFlags, AccountId as KernelAccountId, Direction, Layer};
 use conformance::harness::delta_log;
 use conformance::tools::ShadowBook;
+use conformance::tools::seed::{Replay, Rotation};
 use ledger_core::asset::{AssetId, Minor, NonZeroMinor};
 use ledger_core::id::{AccountId, OperationId};
 use ledger_core::reservation::{
@@ -491,6 +494,7 @@ const PARTS: u32 = 4;
 
 fn run(file: bool, part: u8) {
     let tally = Tally::default();
+    let seed = Rotation::from_env("F004_CONCURRENCY_SEED");
     let mut runner = TestRunner::new_with_rng(
         Config {
             cases: cases().div_ceil(PARTS).max(1),
@@ -499,7 +503,7 @@ fn run(file: bool, part: u8) {
         },
         TestRng::from_seed(
             RngAlgorithm::ChaCha,
-            &[part + if file { 16 } else { 0 }; 32],
+            &seed.key(part + if file { 16 } else { 0 }),
         ),
     );
     runner
@@ -519,7 +523,16 @@ fn run(file: bool, part: u8) {
             }
             Ok(())
         })
-        .unwrap();
+        .unwrap_or_else(|e| {
+            seed.fail(
+                e,
+                Replay {
+                    target: "-p ledger-core --test concurrency",
+                    size_var: "F004_CONCURRENCY_CASES",
+                    size: u64::from(cases()),
+                },
+            )
+        });
     // Both outcomes of a reserve occur, and most steps apply.
     let applied = tally.reserves_applied.into_inner();
     let refused = tally.reserves_refused_by_kernel.into_inner();

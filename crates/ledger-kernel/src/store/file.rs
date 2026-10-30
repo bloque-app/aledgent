@@ -878,4 +878,82 @@ mod tests {
         assert_eq!(s.subroots().unwrap(), before);
         assert_eq!(s.last_committed().unwrap(), Some(1));
     }
+    /// Overwrite the stored leaf at `key` of `tree`, behind the store's back: the node table is
+    /// left as committed, as a corrupted file would be.
+    fn overwrite_leaf(s: &FileStore, tree: SubTree, key: &[u8], bytes: &[u8]) {
+        let txn = s.db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(leaf_table(tree)).unwrap();
+            table.insert(key, bytes).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    /// `REQ-KER-6`: a slot holding another external id than the one asked about is fatal on a
+    /// file, as on `MemStore`; the id the slot does hold reads as seen. The slot is written
+    /// directly: a 64-bit birthday collision cannot be found in a test.
+    #[test]
+    fn req_ker_6_a_file_slot_holding_another_external_id_is_fatal() {
+        let mut s = FileStore::in_memory().unwrap();
+        suite::bootstrap(&mut s);
+        let eid = ExternalId([5; 32]);
+        let slot = external_id_key(&eid.0);
+        let mut d = BookDelta::default();
+        d.external_ids.insert(eid);
+        s.commit(1, &d).unwrap();
+        let mut keys = KeySet::default();
+        keys.external_ids.insert(eid);
+        assert!(
+            s.load(&keys).unwrap().external_ids[&eid],
+            "the stored id is seen"
+        );
+        let absent = ExternalId([6; 32]);
+        let mut other = KeySet::default();
+        other.external_ids.insert(absent);
+        assert!(!s.load(&other).unwrap().external_ids[&absent]);
+
+        // Another id is now in the slot.
+        overwrite_leaf(&s, SubTree::ExternalIds, &slot, &[6; 32]);
+        assert_eq!(s.load(&keys), Err(StoreError::ExternalIdCollision { slot }));
+        let mut again = BookDelta::default();
+        again.external_ids.insert(eid);
+        assert_eq!(
+            s.commit(2, &again),
+            Err(StoreError::ExternalIdCollision { slot })
+        );
+    }
+
+    /// `INV-2`, `REQ-KER-5`: a leaf whose bytes no longer hash to the node committed for it is
+    /// refused on load as corrupt, for every kind of leaf that is verified (an account here). The
+    /// same bytes, untouched, load.
+    #[test]
+    fn inv_2_a_file_leaf_that_does_not_match_its_node_is_refused_on_load() {
+        let mut s = FileStore::in_memory().unwrap();
+        suite::bootstrap(&mut s);
+        let account = suite::account(1);
+        let mut d = BookDelta::default();
+        d.accounts.insert(account.id, account.clone());
+        s.commit(1, &d).unwrap();
+        let mut keys = KeySet::default();
+        keys.accounts.insert(account.id);
+        assert_eq!(
+            s.load(&keys).unwrap().accounts[&account.id].as_ref(),
+            Some(&account),
+            "the committed leaf loads"
+        );
+
+        // A different, well-formed account in its place: it decodes, and does not match.
+        let mut forged = account.clone();
+        forged.code = account.code + 1;
+        overwrite_leaf(
+            &s,
+            SubTree::Accounts,
+            &account.id.0,
+            &encode_account(&forged),
+        );
+        assert!(matches!(
+            s.load(&keys),
+            Err(StoreError::Corrupt(m)) if m.contains("does not match its node")
+        ));
+    }
 }
