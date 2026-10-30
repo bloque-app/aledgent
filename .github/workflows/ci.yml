@@ -32,7 +32,7 @@ permissions:
 # tested tree (tools/ci/tested-tree.py reads only finished push runs): cancelled by the next merge
 # (3 of the last 6 were), it proved nothing, and the promotion pull request ran the whole suite.
 # Pushes to develop share one group, so they run one at a time and the newest tip is not starved of
-# runner slots by older runs (a run is 25 jobs, the plan allows 20 at once). GitHub keeps one
+# runner slots by older runs (a run is 22 jobs, the plan allows 20 at once). GitHub keeps one
 # pending run per group, and a newer one replaces an older pending run; that older commit is no
 # longer the tip, which is the commit a promotion is judged on. Everything else (pull requests,
 # main, dispatches, the nightly) has a group of its own.
@@ -754,9 +754,11 @@ jobs:
   # root one (spikes/README.md). The VOS guest and host crates under it need the pinned VOS checkout
   # and a nightly toolchain; they are built by hand, as the README says.
   #
-  # One job for the four workspaces, none of them a required check: they were four jobs of 0.3 to 2.5
-  # minutes each, four of the 25 runner slots a run holds (the plan allows 20 at once). A workspace
-  # that fails does not stop the next one (`!cancelled()`), and the job fails at the end. The seven
+  # One job for the four workspaces, none of them a required check: they were four jobs, four of the
+  # 25 runner slots a run held (the plan allows 20 at once), and are one of the 22 it holds now. A
+  # workspace that fails does not stop the next one (`!cancelled()`), and the job fails at the end.
+  # No rust-cache: the four built cold in 5.4 minutes in one job (#116, the first run), under the
+  # tests shards, and their cache would be 1.6 GB of the repository's 10 GB budget. The seven
   # small jobs that are required by name (rustfmt, no floating point, kernel feature graph,
   # conformance ports, VOS boundary, pass-import, licences) stay jobs of their own: a fold would
   # rename a required check.
@@ -770,14 +772,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            services/settle/kreivo-pin
-            services/settle/kreivo-pin-136
-            services/settle/kreivo-pin-132
-            spikes
-          save-if: ${{ github.ref == 'refs/heads/develop' }}
       - name: kreivo pin (kreivo-pin)
         run: |
           m=services/settle/kreivo-pin/Cargo.toml
