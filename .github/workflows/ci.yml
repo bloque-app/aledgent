@@ -234,7 +234,9 @@ jobs:
       # 2026-10-30); saved only by main, the entry was evicted within hours and then did not exist
       # (every run built every dependency, 13 to 16 minutes). `cache-on-failure`: a late test failure
       # keeps the dependency build it paid for. The features shard restores the workspace key and
-      # builds what it lacks.
+      # builds what it lacks. A run that fails mid-compile can save a partial entry, and rust-cache
+      # never overwrites an exact key: if every run on one Cargo.lock rebuilds dependencies, delete
+      # that `tests`/`tests-v1` entry (`gh cache delete`) and run this workflow by dispatch on develop.
       - uses: Swatinem/rust-cache@v2
         if: steps.plan.outputs.run == 'true'
         with:
@@ -373,8 +375,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      # One cache for the four jobs that build the archive and the core binding (restore drill, S3,
-      # Vault transit, and the code-history gate): this job saves it, the others restore it.
+      # One cache for the jobs that build the archive and the core binding (restore drill, S3, and the
+      # code-history gate): this job saves it, the others restore it. Vault transit keeps its own.
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: restore-drill
@@ -440,10 +442,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # Its own cache: the signer and its Vault dependencies are not in the restore drill's build.
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: restore-drill
-          save-if: false
+          shared-key: vault-transit
+          save-if: ${{ github.ref == 'refs/heads/develop' }}
       - name: Vault in dev mode, with Transit and a non-exportable Ed25519 key
         run: |
           set -eu

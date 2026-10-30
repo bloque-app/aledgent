@@ -230,11 +230,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       # One builder for the four targets: the Rust build stage is shared, so the workspace
-      # compiles once. The build cache is a registry cache on GHCR (ghcr.io/bloque-app/aledgent-cache,
-      # one tag per scope), not the Actions cache: that one shares the repository's 10 GB budget with
-      # the Rust caches (the buildx blobs were 3.4 GB of it). It is read by every build and written
-      # only by a release, a pre-release or a dispatch from main or develop (MODE is not `check`),
-      # never by a pull request: a fork's build cannot put layers into the cache that a release reads.
+      # compiles once. build-push-action hands the builder the Actions cache's credentials. The cache
+      # is the Actions cache, scoped by ref: a pull request's build reads its base branch's entries but
+      # writes only its own, which develop and main never read, so no pull request (a same-repository
+      # one with an edited workflow included) can put layers into what a release or core-release
+      # builds from. A registry cache on GHCR has no such scope and was rejected for that reason.
+      # Only a release, a pre-release or a dispatch writes (MODE is not `check`): pull requests' own
+      # entries were most of the buildx share of the 10 GB budget.
       - name: Build ingress
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
@@ -244,8 +246,8 @@ jobs:
           platforms: linux/amd64
           labels: ${{ env.LABELS }}
           build-args: ROOTS=${{ env.ROOTS }}
-          cache-from: type=registry,ref=ghcr.io/bloque-app/aledgent-cache:services${{ env.ROOTS_TAG }}
-          cache-to: ${{ env.MODE != 'check' && format('type=registry,ref=ghcr.io/bloque-app/aledgent-cache:services{0},mode=max,ignore-error=true', env.ROOTS_TAG) || '' }}
+          cache-from: type=gha,scope=services${{ env.ROOTS_TAG }}
+          cache-to: ${{ env.MODE != 'check' && format('type=gha,scope=services{0},mode=max', env.ROOTS_TAG) || '' }}
           load: true
           tags: aledgent-ingress:ci
       - name: Build settle
@@ -257,7 +259,7 @@ jobs:
           platforms: linux/amd64
           labels: ${{ env.LABELS }}
           build-args: ROOTS=${{ env.ROOTS }}
-          cache-from: type=registry,ref=ghcr.io/bloque-app/aledgent-cache:services${{ env.ROOTS_TAG }}
+          cache-from: type=gha,scope=services${{ env.ROOTS_TAG }}
           load: true
           tags: aledgent-settle:ci
       - name: Build ops
@@ -269,7 +271,7 @@ jobs:
           platforms: linux/amd64
           labels: ${{ env.LABELS }}
           build-args: ROOTS=${{ env.ROOTS }}
-          cache-from: type=registry,ref=ghcr.io/bloque-app/aledgent-cache:services${{ env.ROOTS_TAG }}
+          cache-from: type=gha,scope=services${{ env.ROOTS_TAG }}
           load: true
           tags: aledgent-ops:ci
       # F-035: the key boundary.
@@ -282,7 +284,7 @@ jobs:
           platforms: linux/amd64
           labels: ${{ env.LABELS }}
           build-args: ROOTS=${{ env.ROOTS }}
-          cache-from: type=registry,ref=ghcr.io/bloque-app/aledgent-cache:services${{ env.ROOTS_TAG }}
+          cache-from: type=gha,scope=services${{ env.ROOTS_TAG }}
           load: true
           tags: aledgent-signer:ci
 
@@ -372,7 +374,7 @@ jobs:
           platforms: linux/amd64
           labels: ${{ env.LABELS }}
           build-args: ROOTS=${{ env.ROOTS }}
-          cache-from: type=registry,ref=ghcr.io/bloque-app/aledgent-cache:services${{ env.ROOTS_TAG }}
+          cache-from: type=gha,scope=services${{ env.ROOTS_TAG }}
           push: true
           tags: ${{ steps.meta.outputs.ingress }}
       - name: Push settle
@@ -386,7 +388,7 @@ jobs:
           platforms: linux/amd64
           labels: ${{ env.LABELS }}
           build-args: ROOTS=${{ env.ROOTS }}
-          cache-from: type=registry,ref=ghcr.io/bloque-app/aledgent-cache:services${{ env.ROOTS_TAG }}
+          cache-from: type=gha,scope=services${{ env.ROOTS_TAG }}
           push: true
           tags: ${{ steps.meta.outputs.settle }}
       - name: Push ops
@@ -400,7 +402,7 @@ jobs:
           platforms: linux/amd64
           labels: ${{ env.LABELS }}
           build-args: ROOTS=${{ env.ROOTS }}
-          cache-from: type=registry,ref=ghcr.io/bloque-app/aledgent-cache:services${{ env.ROOTS_TAG }}
+          cache-from: type=gha,scope=services${{ env.ROOTS_TAG }}
           push: true
           tags: ${{ steps.meta.outputs.ops }}
       - name: Push signer
@@ -414,7 +416,7 @@ jobs:
           platforms: linux/amd64
           labels: ${{ env.LABELS }}
           build-args: ROOTS=${{ env.ROOTS }}
-          cache-from: type=registry,ref=ghcr.io/bloque-app/aledgent-cache:services${{ env.ROOTS_TAG }}
+          cache-from: type=gha,scope=services${{ env.ROOTS_TAG }}
           push: true
           tags: ${{ steps.meta.outputs.signer }}
       # Each image's digest, read back from the registry, and its reference with that digest: the
@@ -482,8 +484,8 @@ jobs:
           platforms: linux/amd64
           labels: ${{ env.LABELS }}
           build-args: ROOTS=${{ env.ROOTS }}
-          cache-from: type=registry,ref=ghcr.io/bloque-app/aledgent-cache:core${{ env.ROOTS_TAG }}
-          cache-to: ${{ env.MODE != 'check' && format('type=registry,ref=ghcr.io/bloque-app/aledgent-cache:core{0},mode=max,ignore-error=true', env.ROOTS_TAG) || '' }}
+          cache-from: type=gha,scope=core${{ env.ROOTS_TAG }}
+          cache-to: ${{ env.MODE != 'check' && format('type=gha,scope=core{0},mode=max', env.ROOTS_TAG) || '' }}
           load: true
           tags: aledgent-core:ci
 
@@ -556,7 +558,7 @@ jobs:
           platforms: linux/amd64
           labels: ${{ env.LABELS }}
           build-args: ROOTS=${{ env.ROOTS }}
-          cache-from: type=registry,ref=ghcr.io/bloque-app/aledgent-cache:core${{ env.ROOTS_TAG }}
+          cache-from: type=gha,scope=core${{ env.ROOTS_TAG }}
           push: true
           tags: ${{ steps.meta.outputs.core }}
       # Each image's digest, read back from the registry, and its reference with that digest: the
@@ -797,9 +799,9 @@ jobs:
             GENESIS_CODE=${{ steps.genesis.outputs.code }}
           build-contexts: genesis-code=${{ steps.genesis.outputs.context }}
           cache-from: |
-            type=registry,ref=ghcr.io/bloque-app/aledgent-cache:core-on-genesis-${{ steps.genesis.outputs.roots }}
-            type=registry,ref=ghcr.io/bloque-app/aledgent-cache:core${{ steps.genesis.outputs.roots == 'v1' && '-roots-v1' || '' }}
-          cache-to: ${{ env.MODE != 'check' && format('type=registry,ref=ghcr.io/bloque-app/aledgent-cache:core-on-genesis-{0},mode=max,ignore-error=true', steps.genesis.outputs.roots) || '' }}
+            type=gha,scope=core-on-genesis-${{ steps.genesis.outputs.roots }}
+            type=gha,scope=core${{ steps.genesis.outputs.roots == 'v1' && '-roots-v1' || '' }}
+          cache-to: ${{ env.MODE != 'check' && format('type=gha,scope=core-on-genesis-{0},mode=max', steps.genesis.outputs.roots) || '' }}
           load: true
           tags: aledgent-core-on-genesis:ci
 
@@ -920,7 +922,7 @@ jobs:
             GENESIS_IMAGE=${{ steps.genesis.outputs.image }}
             GENESIS_CODE=${{ steps.genesis.outputs.code }}
           build-contexts: genesis-code=${{ steps.genesis.outputs.context }}
-          cache-from: type=registry,ref=ghcr.io/bloque-app/aledgent-cache:core-on-genesis-${{ steps.genesis.outputs.roots }}
+          cache-from: type=gha,scope=core-on-genesis-${{ steps.genesis.outputs.roots }}
           push: true
           tags: ghcr.io/bloque-app/aledgent-core:host-${{ env.COMMIT }}-on-genesis-${{ steps.genesis.outputs.short }}
       - name: Pushed
@@ -973,9 +975,9 @@ jobs:
           platforms: linux/amd64
           labels: ${{ env.LABELS }}
           cache-from: |
-            type=registry,ref=ghcr.io/bloque-app/aledgent-cache:sidecar
-            type=registry,ref=ghcr.io/bloque-app/aledgent-cache:services
-          cache-to: ${{ env.MODE != 'check' && 'type=registry,ref=ghcr.io/bloque-app/aledgent-cache:sidecar,mode=max,ignore-error=true' || '' }}
+            type=gha,scope=sidecar
+            type=gha,scope=services
+          cache-to: ${{ env.MODE != 'check' && 'type=gha,scope=sidecar,mode=max' || '' }}
           load: true
           tags: aledgent-sidecar:ci
 
@@ -1082,7 +1084,7 @@ jobs:
           target: sidecar
           platforms: linux/amd64
           labels: ${{ env.LABELS }}
-          cache-from: type=registry,ref=ghcr.io/bloque-app/aledgent-cache:sidecar
+          cache-from: type=gha,scope=sidecar
           push: true
           tags: ${{ steps.meta.outputs.sidecar }}
       # Each image's digest, read back from the registry, and its reference with that digest: the
