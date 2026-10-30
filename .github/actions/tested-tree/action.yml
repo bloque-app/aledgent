@@ -3,9 +3,16 @@
 name: Tested tree
 description: >-
   Decides whether a pull request's heavy checks are redundant (tools/ci/tested-tree.py). The job
-  checks out the pull request's merge with its full history first; this step needs git, python3 and
-  the job's token, which only has to read workflow runs. Outputs `skip` or `full`; it never fails
+  checks out the BASE as the workspace (this action and the script are the base's: a pull request
+  does not judge itself) and the pull request's merge, with its full history, beside it; this step
+  needs git, python3 and the job's token, which only has to read workflow runs. Outputs `skip` or `full`; it never fails
   the job on a doubt, it says `full`.
+
+inputs:
+  repo:
+    description: "The directory holding the pull request's merge checkout (the workspace is the BASE: this action and tools/ci/ are the base's, never the pull request's)."
+    required: false
+    default: pr
 
 outputs:
   mode:
@@ -25,4 +32,5 @@ runs:
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
-      run: python3 tools/ci/tested-tree.py
+        PR_CHECKOUT: ${{ inputs.repo }}
+      run: python3 tools/ci/tested-tree.py --repo "$PR_CHECKOUT"

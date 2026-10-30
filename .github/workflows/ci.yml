@@ -13,6 +13,19 @@ on:
   schedule:
     - cron: "17 5 * * *"
   workflow_dispatch:
+    inputs:
+      rehearse:
+        description: "Rehearsal of the gate's modes, only on a branch rehearsal/* whose head is no pull request's: `skip` runs the skip path of the heavy required checks (their steps are skipped and they report success) without judging any tree. `none`: a normal run"
+        type: choice
+        options: [none, skip]
+        default: none
+
+# A newer push to develop supersedes the run still going on the older one: the evidence of a tested
+# tree (tools/ci/tested-tree.py) is the tip's, and a promotion is judged against the tip. Everything
+# else has a group of its own and is never cancelled.
+concurrency:
+  group: ci-${{ github.event_name == 'push' && github.ref == 'refs/heads/develop' && 'develop' || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/develop' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -25,29 +38,66 @@ env:
 
 jobs:
   # Whether this pull request's tree has been tested already (tools/ci/tested-tree.py): a
-  # release-please pull request that changes versions only, or a promotion of a develop tree whose
-  # push run passed. Then the heavy checks below (the required ones among them: tests, clippy, agents,
-  # conformance) run no step and report success; every other event and pull request runs in full.
+  # release-please pull request that changes versions only, on a main whose tip passed, or a
+  # promotion of a develop tree whose push run passed. Then the heavy checks below (the required
+  # ones among them: tests, clippy, agents, conformance) run no step and report success; every other
+  # event and pull request runs in full.
+  # The judge is the BASE's: the workspace is the base's checkout, so the script and the action are
+  # the base's copy, and the pull request's merge is checked out beside it (`pr/`) to be judged. A
+  # pull request cannot edit its own judge (this file, which it can edit, is guarded by CODEOWNERS).
+  # A base without the gate has no judge: the step is skipped and the mode is empty.
   # Nothing here may fail open: a job that `needs` a failed or skipped gate still runs
   # (`!cancelled()`), and sees an empty mode, which is not `skip`.
   gate:
     name: gate (tested tree)
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.rehearse != 'none')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
       actions: read
+      pull-requests: read
     outputs:
-      mode: ${{ steps.tree.outputs.mode }}
-      reason: ${{ steps.tree.outputs.reason }}
+      mode: ${{ steps.tree.outputs.mode || steps.rehearsal.outputs.mode }}
+      reason: ${{ steps.tree.outputs.reason || steps.rehearsal.outputs.reason }}
     steps:
       - uses: actions/checkout@v4
         with:
-          # The merge of the pull request, and the history below it.
+          # The base, for a pull request.
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        if: github.event_name == 'pull_request'
+        with:
+          # The merge of the pull request, and the history below it: what is judged.
+          path: pr
           fetch-depth: 0
+          persist-credentials: false
       - id: tree
+        if: github.event_name == 'pull_request' && hashFiles('.github/actions/tested-tree/action.yml') != '' && hashFiles('tools/ci/tested-tree.py') != ''
         uses: ./.github/actions/tested-tree
+      # A rehearsal (workflow_dispatch) judges nothing: it forces a mode so that the paths the modes
+      # open in the jobs below run for real, on a throwaway branch. Its checks prove nothing about the
+      # commit, so it is refused unless the branch is rehearsal/* and the commit is no pull request's.
+      - id: rehearsal
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODE: ${{ inputs.rehearse }}
+        run: |
+          set -euo pipefail
+          case "$GITHUB_REF" in
+            refs/heads/rehearsal/*) ;;
+            *) echo "::error::a rehearsal runs only on a branch rehearsal/*, not on $GITHUB_REF"; exit 1 ;;
+          esac
+          n=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" --jq length)
+          if [ "$n" != 0 ]; then
+            echo "::error::$GITHUB_SHA belongs to a pull request: its checks would stand for the pull request's"
+            exit 1
+          fi
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "reason=REHEARSAL of the $MODE path on $GITHUB_REF: no tree was judged, and this run proves nothing about the code" >> "$GITHUB_OUTPUT"
+          echo "::warning::REHEARSAL of the $MODE path: the checks of this run prove nothing about the code"
 
   fmt:
     name: rustfmt
@@ -467,6 +517,8 @@ jobs:
         if: needs.gate.outputs.mode == 'skip'
         env:
           REASON: ${{ needs.gate.outputs.reason }}
+        # No checkout ran, and this job's default directory is agents/: stay out of it.
+        working-directory: ${{ github.workspace }}
         run: echo "::notice::$REASON"
       - uses: actions/checkout@v4
         if: needs.gate.outputs.mode != 'skip'

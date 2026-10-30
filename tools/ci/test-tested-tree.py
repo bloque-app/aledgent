@@ -17,6 +17,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
@@ -31,6 +32,7 @@ members = ["crates/a"]
 version = "{v}"
 edition = "2024"
 """
+# `a` is a released member; `guest` is compiled into a guest program and keeps a version of its own.
 CARGO_LOCK = """version = 4
 
 [[package]]
@@ -39,12 +41,30 @@ version = "{v}"
 dependencies = ["serde"]
 
 [[package]]
+name = "guest"
+version = "0.0.1"
+
+[[package]]
 name = "serde"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "abc"
 """
-OPENAPI = {"info": {"title": "t", "description": "d", "version": "{v}"}, "paths": {}}
+OPENAPI = {"info": {"title": "t", "description": "d", "version": "{v}"}, "paths": {}, "n": 1}
+RELEASE_CONFIG = {
+    "packages": {
+        ".": {
+            "release-type": "simple",
+            "extra-files": [
+                {"type": "toml", "path": "Cargo.toml", "jsonpath": "$.workspace.package.version"},
+                {"type": "toml", "path": "Cargo.lock",
+                 "jsonpath": "$.package[?(!@.source && (@.name.value=='a'))].version"},
+                {"type": "toml", "path": "agents/Cargo.lock",
+                 "jsonpath": "$.package[?(!@.source && (@.name.value=='a'))].version"},
+            ],
+        }
+    }
+}
 
 
 def files(v: str = "0.1.0") -> dict[str, str]:
@@ -55,6 +75,7 @@ def files(v: str = "0.1.0") -> dict[str, str]:
         "agents/Cargo.lock": CARGO_LOCK.format(v=v),
         "services/ingress/openapi.json": json.dumps(openapi, indent=2) + "\n",
         ".release-please-manifest.json": json.dumps({".": v}) + "\n",
+        "release-please-config.json": json.dumps(RELEASE_CONFIG) + "\n",
         "CHANGELOG.md": f"# Changelog\n\n## {v}\n",
         "crates/a/src/lib.rs": "pub fn f() {}\n",
         ".github/workflows/ci.yml": "name: CI\n",
@@ -115,9 +136,19 @@ def event(head_ref: str, head_sha: str, base_ref: str = "main", fork: bool = Fal
     }
 
 
-def fake_api(passed: set[str], failing: dict[str, str] | None = None, calls: list | None = None):
-    """A CI API in which the push runs of the commits in `passed` succeeded."""
+def fake_api(
+    passed: set[str],
+    failing: dict[str, str] | None = None,
+    main_latest: str | None = None,
+    calls: list | None = None,
+):
+    """A CI API in which the push runs of the commits in `passed` succeeded, those in `failing` failed
+    in the job named (or lack the job, for "missing"), and `main_latest` is the commit of the latest
+    finished push run on main."""
     failing = failing or {}
+
+    def run_of(sha: str) -> dict:
+        return {"id": int(sha[:6], 16), "head_sha": sha, "event": "push", "html_url": f"https://run/{sha[:7]}"}
 
     def api(path: str) -> dict:
         if calls is not None:
@@ -125,10 +156,9 @@ def fake_api(passed: set[str], failing: dict[str, str] | None = None, calls: lis
         m = re.search(r"workflows/ci\.yml/runs\?head_sha=(\w+)&event=push", path)
         if m:
             sha = m.group(1)
-            if sha in passed or sha in failing:
-                return {"workflow_runs": [{"id": int(sha[:6], 16), "head_sha": sha, "event": "push",
-                                           "html_url": f"https://run/{sha[:7]}"}]}
-            return {"workflow_runs": []}
+            return {"workflow_runs": [run_of(sha)] if sha in passed or sha in failing else []}
+        if "workflows/ci.yml/runs?branch=main&event=push" in path:
+            return {"workflow_runs": [run_of(main_latest)] if main_latest else []}
         m = re.search(r"actions/runs/(\d+)/jobs", path)
         if m:
             for sha in list(passed) + list(failing):
@@ -148,11 +178,14 @@ class Base(unittest.TestCase):
         self.r = Repo(Path(self._tmp.name))
         self.base = self.r.commit(files("0.1.0"), "base")
 
+    def vo(self, a: str, b: str) -> tuple[bool, str]:
+        return tt.version_only(self.r.root, a, b, tt.released_members(self.r.root, self.base))
+
 
 class VersionOnly(Base):
     def check(self, changes: dict[str, str | None]) -> bool:
         tip = self.r.commit(changes)
-        return tt.version_only(self.r.root, self.base, tip)[0]
+        return self.vo(self.base, tip)[0]
 
     def test_a_release_bump_is_version_only(self):
         self.assertTrue(self.check(release_bump("0.1.0", "0.2.0")))
@@ -160,9 +193,16 @@ class VersionOnly(Base):
     def test_identical_trees(self):
         self.assertTrue(self.check({}))
 
-    def test_changelog_alone_and_removed(self):
+    def test_changelog_edited(self):
         self.assertTrue(self.check({"CHANGELOG.md": "other\n"}))
-        self.assertTrue(self.check({"CHANGELOG.md": None}))
+
+    def test_changelog_removed_or_mode_changed_is_not_an_edit(self):
+        self.assertFalse(self.check({"CHANGELOG.md": None}))
+
+    def test_changelog_mode_change_is_not(self):
+        self.r.git("update-index", "--chmod=+x", "CHANGELOG.md")
+        self.r.git("commit", "-q", "-m", "mode")
+        self.assertFalse(self.vo(self.base, "HEAD")[0])
 
     def test_a_source_change_with_the_bump_is_not(self):
         self.assertFalse(self.check({**release_bump("0.1.0", "0.2.0"), "crates/a/src/lib.rs": "pub fn g() {}\n"}))
@@ -182,16 +222,27 @@ class VersionOnly(Base):
     def test_a_crates_own_manifest_is_not_a_version_file(self):
         self.assertFalse(self.check({"crates/a/Cargo.toml": '[package]\nversion = "0.2.0"\n'}))
 
-    def test_lock_only_the_workspace_versions(self):
-        ok = files("0.2.0")["Cargo.lock"]
-        self.assertTrue(self.check({"Cargo.lock": ok}))
+    def test_lock_only_the_released_members_versions(self):
+        self.assertTrue(self.check({"Cargo.lock": files("0.2.0")["Cargo.lock"]}))
         # a registry package moving is a dependency change, not a release
         bumped = files("0.1.0")["Cargo.lock"].replace('version = "1.0.0"', 'version = "1.0.1"')
         self.assertFalse(self.check({"Cargo.lock": bumped}))
-        # nor a workspace member's dependency list
+        # nor a source-less package release-please does not bump (a guest program's crate)
+        guest = files("0.1.0")["Cargo.lock"].replace('version = "0.0.1"', 'version = "0.0.2"')
+        self.assertFalse(self.check({"Cargo.lock": guest}))
+        self.assertFalse(self.check({"agents/Cargo.lock": guest}))
+        # nor a released member's dependency list
         deps = files("0.2.0")["Cargo.lock"].replace('dependencies = ["serde"]', "dependencies = []")
         self.assertFalse(self.check({"Cargo.lock": deps}))
         self.assertFalse(self.check({"agents/Cargo.lock": deps}))
+
+    def test_a_lock_file_the_config_does_not_name_blanks_nothing(self):
+        config = json.loads(files()["release-please-config.json"])
+        config["packages"]["."]["extra-files"] = config["packages"]["."]["extra-files"][:2]  # no agents lock
+        self.r.commit({"release-please-config.json": json.dumps(config)})
+        base = self.r.git("rev-parse", "HEAD")
+        tip = self.r.commit({"agents/Cargo.lock": files("0.2.0")["agents/Cargo.lock"]})
+        self.assertFalse(tt.version_only(self.r.root, base, tip, tt.released_members(self.r.root, base))[0])
 
     def test_openapi_only_info_version(self):
         self.assertTrue(self.check({"services/ingress/openapi.json": files("0.2.0")["services/ingress/openapi.json"]}))
@@ -202,6 +253,12 @@ class VersionOnly(Base):
         doc["paths"]["/new"] = {}
         self.assertFalse(self.check({"services/ingress/openapi.json": json.dumps(doc)}))
 
+    def test_values_are_compared_with_their_types(self):
+        # Python: 1 == 1.0 and 1 == True. A document where one became the other is not unchanged.
+        for other in ("1.0", "true"):
+            text = files("0.1.0")["services/ingress/openapi.json"].replace('"n": 1', f'"n": {other}')
+            self.assertFalse(self.check({"services/ingress/openapi.json": text}), other)
+
     def test_manifest_only_the_root_value(self):
         self.assertTrue(self.check({".release-please-manifest.json": json.dumps({".": "9.9.9"})}))
         self.assertFalse(self.check({".release-please-manifest.json": json.dumps({".": "0.1.0", "x": "1"})}))
@@ -209,12 +266,31 @@ class VersionOnly(Base):
     def test_a_mode_change_is_not(self):
         self.r.git("update-index", "--chmod=+x", "Cargo.toml")
         self.r.git("commit", "-q", "-m", "mode")
-        self.assertFalse(tt.version_only(self.r.root, self.base, "HEAD")[0])
+        self.assertFalse(self.vo(self.base, "HEAD")[0])
 
-    def test_malformed_content_raises_and_decide_fails_closed(self):
+    def test_malformed_content_raises(self):
         tip = self.r.commit({"Cargo.toml": "not = [toml"})
         with self.assertRaises(Exception):
-            tt.version_only(self.r.root, self.base, tip)
+            self.vo(self.base, tip)
+
+    def test_a_diff_that_is_not_fully_understood_raises(self):
+        junk = ":100644 100644 aaa bbb M\0Cargo.toml\0trailing\0"
+        with mock.patch.object(tt, "git", return_value=junk):
+            with self.assertRaises(ValueError):
+                tt.changed(self.r.root, "a", "b")
+
+
+class Versions(Base):
+    def test_agreeing_versions(self):
+        self.assertTrue(tt.versions_agree(self.r.root, self.base))
+
+    def test_a_manifest_that_lags(self):
+        tip = self.r.commit({**release_bump("0.1.0", "0.2.0"), ".release-please-manifest.json": json.dumps({".": "0.1.0"})})
+        self.assertFalse(tt.versions_agree(self.r.root, tip))
+
+    def test_an_openapi_that_lags(self):
+        tip = self.r.commit({"Cargo.toml": files("0.2.0")["Cargo.toml"]})
+        self.assertFalse(tt.versions_agree(self.r.root, tip))
 
 
 class Classify(Base):
@@ -225,25 +301,62 @@ class Classify(Base):
         main_tip, head = self.r.merge("pr")
         path = self.r.root / "event.json"
         path.write_text(json.dumps(event(head_ref, head, **ev)))
-        return tt.decide(self.r.root, "pull_request", str(path), "o/r", api or fake_api(set()))[0]
+        # by default, main's tip has a passed push run, and it is main's latest
+        api = api or fake_api({self.base}, main_latest=self.base)
+        return tt.decide(self.r.root, "pull_request", str(path), "o/r", api)
+
+    def mode(self, *a, **kw) -> str:
+        return self.run_pr(*a, **kw).__getitem__(0)
 
     # (a) release-please
-    def test_release_please_version_only_skips(self):
-        self.assertEqual(self.run_pr("release-please--branches--main--components--aledgent",
-                                     release_bump("0.1.0", "0.2.0")), "skip")
+    def test_release_please_version_only_on_a_proven_main_skips(self):
+        mode, why = self.run_pr("release-please--branches--main--components--aledgent", release_bump("0.1.0", "0.2.0"))
+        self.assertEqual(mode, "skip", why)
 
     def test_release_please_branch_with_other_changes_runs_everything(self):
-        self.assertEqual(self.run_pr("release-please--branches--main",
-                                     {**release_bump("0.1.0", "0.2.0"), "crates/a/src/lib.rs": "pub fn g() {}\n"}), "full")
+        self.assertEqual(self.mode("release-please--branches--main",
+                                   {**release_bump("0.1.0", "0.2.0"), "crates/a/src/lib.rs": "pub fn g() {}\n"}), "full")
+
+    def test_release_please_with_versions_that_disagree_runs_everything(self):
+        changes = release_bump("0.1.0", "0.2.0")
+        del changes[".release-please-manifest.json"]
+        self.assertEqual(self.mode("release-please--x", changes), "full")
+
+    def test_main_tip_without_a_finished_passed_run_is_not_proven(self):
+        # a hotfix just merged: its push run is still going
+        self.assertEqual(self.mode("release-please--x", release_bump("0.1.0", "0.2.0"), api=fake_api(set())), "full")
+
+    def test_main_tip_whose_run_failed_is_not_proven(self):
+        api = fake_api(set(), failing={self.base: "clippy"}, main_latest=self.base)
+        self.assertEqual(self.mode("release-please--x", release_bump("0.1.0", "0.2.0"), api=api), "full")
+
+    def test_a_failed_latest_run_on_main_refuses_even_if_the_tip_passed(self):
+        newer = "f" * 40
+        api = fake_api({self.base}, failing={newer: "tests"}, main_latest=newer)
+        self.assertEqual(self.mode("release-please--x", release_bump("0.1.0", "0.2.0"), api=api), "full")
+
+    def test_an_ancestor_equal_but_for_versions_is_proof_of_the_tip(self):
+        # main moved by a changelog edit since its tested commit
+        self.r.commit({"CHANGELOG.md": "# Changelog\n\nedited\n"}, "docs on main")
+        self.base_before = self.base
+        tested = self.r.git("rev-parse", "HEAD~1")
+        self.r.git("checkout", "-q", "-b", "pr", "HEAD")
+        self.r.commit(release_bump("0.1.0", "0.2.0") | {"CHANGELOG.md": "# Changelog\n\nedited\n\n## 0.2.0\n"})
+        self.r.git("checkout", "-q", "main")
+        main_tip, head = self.r.merge("pr")
+        path = self.r.root / "event.json"
+        path.write_text(json.dumps(event("release-please--x", head)))
+        d = tt.decide(self.r.root, "pull_request", str(path), "o/r", fake_api({tested}, main_latest=tested))
+        self.assertEqual(d[0], "skip", d[1])
 
     def test_the_name_is_not_the_proof_and_a_version_only_diff_is_not_enough_on_another_branch(self):
-        self.assertEqual(self.run_pr("feat/bump", release_bump("0.1.0", "0.2.0")), "full")
+        self.assertEqual(self.mode("feat/bump", release_bump("0.1.0", "0.2.0")), "full")
 
-    def test_release_please_from_a_fork_or_into_develop_runs_everything(self):
-        self.assertEqual(self.run_pr("release-please--x", release_bump("0.1.0", "0.2.0"), fork=True), "full")
+    def test_release_please_from_a_fork_or_into_another_base_runs_everything(self):
+        self.assertEqual(self.mode("release-please--x", release_bump("0.1.0", "0.2.0"), fork=True), "full")
 
     def test_release_please_into_another_base_runs_everything(self):
-        self.assertEqual(self.run_pr("release-please--x", release_bump("0.1.0", "0.2.0"), base_ref="develop"), "full")
+        self.assertEqual(self.mode("release-please--x", release_bump("0.1.0", "0.2.0"), base_ref="develop"), "full")
 
     def test_a_checkout_that_is_not_the_merge_runs_everything(self):
         self.r.commit(release_bump("0.1.0", "0.2.0"))
@@ -259,7 +372,17 @@ class Classify(Base):
         self.assertEqual(tt.decide(self.r.root, "pull_request", "/nonexistent", "o/r", fake_api(set()))[0], "full")
 
     def test_malformed_manifest_in_the_pull_request_runs_everything(self):
-        self.assertEqual(self.run_pr("release-please--x", {"Cargo.toml": "not = [toml"}), "full")
+        self.assertEqual(self.mode("release-please--x", {"Cargo.toml": "not = [toml"}), "full")
+
+    def test_a_pull_request_cannot_widen_what_is_released(self):
+        # it edits the config to name `guest` too, and bumps it: the config read is main's, not its own
+        config = json.loads(files()["release-please-config.json"])
+        for e in config["packages"]["."]["extra-files"][1:]:
+            e["jsonpath"] = e["jsonpath"].replace("=='a'", "=='a' || @.name.value=='guest'")
+        changes = {**release_bump("0.1.0", "0.2.0"),
+                   "release-please-config.json": json.dumps(config),
+                   "Cargo.lock": files("0.2.0")["Cargo.lock"].replace('version = "0.0.1"', 'version = "0.0.2"')}
+        self.assertEqual(self.mode("release-please--x", changes), "full")
 
 
 class Promotion(Base):
@@ -283,8 +406,8 @@ class Promotion(Base):
 
     def test_tested_tree_skips_even_though_main_carries_a_release(self):
         self.build()
-        mode, why = self.promote(fake_api({self.tested}))
-        self.assertEqual(mode, "skip", why)
+        d = self.promote(fake_api({self.tested}))
+        self.assertEqual(d[0], "skip", d[1])
 
     def test_a_failed_required_job_does_not(self):
         self.build()
@@ -304,9 +427,9 @@ class Promotion(Base):
         def boom(path: str) -> dict:
             raise OSError("rate limited")
 
-        mode, why = self.promote(boom)
-        self.assertEqual(mode, "full")
-        self.assertIn("rate limited", why)
+        d = self.promote(boom)
+        self.assertEqual(d[0], "full")
+        self.assertIn("rate limited", d[1])
 
     def test_a_newer_untested_change_does_not(self):
         self.build({"crates/a/src/lib.rs": "pub fn h() {}\n"})

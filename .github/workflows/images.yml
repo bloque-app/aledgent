@@ -159,9 +159,13 @@ env:
 
 jobs:
   # Whether this pull request's tree has been tested already (tools/ci/tested-tree.py; ci.yml has the
-  # same job): then the jobs below run nothing. Only on a pull request, and with `contents: read`
-  # alone, because this workflow is also called by a release, whose jobs grant no more. A job that
-  # `needs` a skipped or failed gate still runs (`!cancelled()`): nothing here fails open.
+  # same job): then the jobs below run nothing. The judge is the BASE's copy of the script and the
+  # action (the workspace is the base's checkout, the merge is judged beside it in pr/): a pull
+  # request does not judge itself, and a base without the gate gets no skip. Only on a pull request,
+  # and with `contents: read` alone, because this workflow is also called by a release, whose jobs
+  # grant no more: case (a) of the script needs only git, case (b) needs the Actions API, which this
+  # token may not reach (then the mode is `full`). A job that `needs` a skipped or failed gate still
+  # runs (`!cancelled()`): nothing here fails open.
   gate:
     name: gate (tested tree)
     if: github.event_name == 'pull_request'
@@ -175,9 +179,15 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: pr
           fetch-depth: 0
           persist-credentials: false
       - id: tree
+        if: hashFiles('.github/actions/tested-tree/action.yml') != '' && hashFiles('tools/ci/tested-tree.py') != ''
         uses: ./.github/actions/tested-tree
 
   services:
