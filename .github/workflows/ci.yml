@@ -238,7 +238,7 @@ jobs:
       - name: property-test strength
         if: steps.plan.outputs.run == 'true'
         run: |
-          n=10000 # TEMPORARY: main strength on a pull request, to measure
+          if [ "${{ github.event_name }}" = "pull_request" ]; then n=1000; else n=10000; fi
           # F007_WALKS is not reduced: it asserts that the walks reach every edge, and runs in seconds.
           for v in F010_RUNS F004_CONCURRENCY_CASES F008_UNITS LEDGER_KERNEL_DIFF_CASES CONFORMANCE_REDERIVE_UNITS; do
             echo "$v=$n" >> "$GITHUB_ENV"
@@ -308,7 +308,7 @@ jobs:
 
       # --- v1-roots shard ---
       # DEC-25, owner ruling cs-q04: v1 roots are a supported opt-in. The crates with a root version,
-      # built with v1 (the default run above is v2, and its differential already runs every unit
+      # built with v1 (the workspace shard runs v2, and its differential already runs every unit
       # under both versions). The conformance suite from a v1 genesis is its own job below. The
       # code-history gate (T-037-12) is skipped by name: its recorded book is a v2 book, which a v1
       # build founds differently, and it fails loudly if run here (code-history.yml runs it, in v2).
