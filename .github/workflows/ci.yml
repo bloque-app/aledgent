@@ -212,13 +212,13 @@ jobs:
         if: steps.plan.outputs.run == 'true'
         with:
           components: rustfmt, clippy
-      # One cache for the shards, saved by the workspace shard (the others restore it and build what
-      # it lacks): the repository's cache budget is 10 GB, and a cache each is what evicted it.
+      # Two caches: the workspace shard's (the features shard restores it, and builds what it lacks) and
+      # the v1 shard's, whose dependencies are built with other features (4 minutes more without it).
       - uses: Swatinem/rust-cache@v2
         if: steps.plan.outputs.run == 'true'
         with:
-          shared-key: tests
-          save-if: ${{ matrix.shard == 'workspace' }}
+          shared-key: ${{ matrix.shard == 'v1-roots' && 'tests-v1' || 'tests' }}
+          save-if: ${{ matrix.shard != 'features' }}
       # cargo-nextest runs the test binaries' tests in one pool, instead of one binary after another
       # (cargo test: 157 binaries, most of them far from filling four cores). It runs every test that
       # `cargo test` runs but the doctests, which it cannot run: `cargo test --doc` follows it.
