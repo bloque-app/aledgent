@@ -201,17 +201,13 @@ jobs:
           { echo "run=$run"; echo "full=$full"; echo "hotfix=$hotfix"; } >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         if: steps.plan.outputs.run == 'true'
-      # Toolchains the runner image ships and this workspace never uses (#59). Removed in parallel:
-      # a directory of many small files takes about a minute alone.
-      - name: free runner disk
+      # The runner is 4 vCPU, 15 GB of memory and a 145 GB disk with 86 GB free (measured 2026-10-30, the
+      # run of #110); the workspace's build and tests peak under 40 GB. Freeing the toolchains the image
+      # ships (dotnet, android, ghc, CodeQL; #59, when the disk was 14 GB) took 45 to 120 s of every
+      # run and is no longer needed. The `df` after the tests below shows the margin.
+      - name: runner
         if: steps.plan.outputs.run == 'true'
-        run: |
-          nproc; free -g | head -2; df -h /
-          for d in /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL; do
-            sudo rm -rf "$d" &
-          done
-          wait
-          df -h /
+        run: nproc; free -g | head -2; df -h /
       - uses: dtolnay/rust-toolchain@stable
         if: steps.plan.outputs.run == 'true'
         with:
@@ -223,6 +219,13 @@ jobs:
         with:
           shared-key: tests
           save-if: ${{ matrix.shard == 'workspace' }}
+      # cargo-nextest runs the test binaries' tests in one pool, instead of one binary after another
+      # (cargo test: 157 binaries, most of them far from filling four cores). It runs every test that
+      # `cargo test` runs but the doctests, which it cannot run: `cargo test --doc` follows it.
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        if: steps.plan.outputs.full == 'true' && matrix.shard != 'features'
+        with:
+          tool: nextest
       # Property tests run 1,000 cases on pull requests and their full 10,000 on main and nightly.
       - name: property-test strength
         if: steps.plan.outputs.run == 'true'
@@ -280,7 +283,9 @@ jobs:
         run: |
           cargo test -p ledger-core --test privileged_reads
           cargo test -p core-binding --test upgrade_authority
-      - run: cargo test --workspace
+      - run: cargo nextest run --workspace --no-fail-fast
+        if: steps.plan.outputs.full == 'true' && matrix.shard == 'workspace'
+      - run: cargo test --workspace --doc
         if: steps.plan.outputs.full == 'true' && matrix.shard == 'workspace'
 
       # --- features shard ---
@@ -305,10 +310,13 @@ jobs:
         if: steps.plan.outputs.full == 'true' && matrix.shard == 'v1-roots'
         env:
           LEDGER_KERNEL_DIFF_CASES: "1000"
-        run: >-
-          cargo test -p compact-smt -p ledger-kernel -p ledger-core -p leaf-store -p core-binding -p shards
-          --features compact-smt/v1,ledger-kernel/smt-v1,ledger-core/smt-v1,leaf-store/smt-v1,core-binding/smt-v1,core-binding/ingress,shards/smt-v1
-          -- --skip t037_12_
+          V1_PACKAGES: -p compact-smt -p ledger-kernel -p ledger-core -p leaf-store -p core-binding -p shards
+          V1_FEATURES: compact-smt/v1,ledger-kernel/smt-v1,ledger-core/smt-v1,leaf-store/smt-v1,core-binding/smt-v1,core-binding/ingress,shards/smt-v1
+        run: |
+          # shellcheck disable=SC2086
+          cargo nextest run $V1_PACKAGES --features "$V1_FEATURES" --no-fail-fast -E 'not test(/t037_12_/)'
+          # shellcheck disable=SC2086
+          cargo test $V1_PACKAGES --features "$V1_FEATURES" --doc -- --skip t037_12_
       - name: disk left after the tests
         if: ${{ always() && steps.plan.outputs.run == 'true' }}
         run: df -h /
