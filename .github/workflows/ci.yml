@@ -3,14 +3,29 @@
 name: CI
 
 on:
-  # Pushes to main and every pull request; a PR branch is not also run as a plain push.
+  # Pushes to main and develop, and every pull request; a PR branch is not also run as a plain push.
+  # The push to develop is the evidence of a tested tree (tools/ci/tested-tree.py): a promotion
+  # pull request skips its heavy checks only for a tree a push run here has already passed.
   push:
-    branches: [main]
+    branches: [main, develop]
   pull_request:
   # Nightly full-strength property tests.
   schedule:
     - cron: "17 5 * * *"
   workflow_dispatch:
+    inputs:
+      rehearse:
+        description: "Rehearsal of the gate's modes, only on a branch rehearsal/* whose head is no pull request's: `skip` runs the skip path of the heavy required checks (their steps are skipped and they report success) without judging any tree. `none`: a normal run"
+        type: choice
+        options: [none, skip]
+        default: none
+
+# A newer push to develop supersedes the run still going on the older one: the evidence of a tested
+# tree (tools/ci/tested-tree.py) is the tip's, and a promotion is judged against the tip. Everything
+# else has a group of its own and is never cancelled.
+concurrency:
+  group: ci-${{ github.event_name == 'push' && github.ref == 'refs/heads/develop' && 'develop' || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/develop' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -22,6 +37,68 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  # Whether this pull request's tree has been tested already (tools/ci/tested-tree.py): a
+  # release-please pull request that changes versions only, on a main whose tip passed, or a
+  # promotion of a develop tree whose push run passed. Then the heavy checks below (the required
+  # ones among them: tests, clippy, agents, conformance) run no step and report success; every other
+  # event and pull request runs in full.
+  # The judge is the BASE's: the workspace is the base's checkout, so the script and the action are
+  # the base's copy, and the pull request's merge is checked out beside it (`pr/`) to be judged. A
+  # pull request cannot edit its own judge (this file, which it can edit, is guarded by CODEOWNERS).
+  # A base without the gate has no judge: the step is skipped and the mode is empty.
+  # Nothing here may fail open: a job that `needs` a failed or skipped gate still runs
+  # (`!cancelled()`), and sees an empty mode, which is not `skip`.
+  gate:
+    name: gate (tested tree)
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.rehearse != 'none')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    outputs:
+      mode: ${{ steps.tree.outputs.mode || steps.rehearsal.outputs.mode }}
+      reason: ${{ steps.tree.outputs.reason || steps.rehearsal.outputs.reason }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The base, for a pull request.
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        if: github.event_name == 'pull_request'
+        with:
+          # The merge of the pull request, and the history below it: what is judged.
+          path: pr
+          fetch-depth: 0
+          persist-credentials: false
+      - id: tree
+        if: github.event_name == 'pull_request' && hashFiles('.github/actions/tested-tree/action.yml') != '' && hashFiles('tools/ci/tested-tree.py') != ''
+        uses: ./.github/actions/tested-tree
+      # A rehearsal (workflow_dispatch) judges nothing: it forces a mode so that the paths the modes
+      # open in the jobs below run for real, on a throwaway branch. Its checks prove nothing about the
+      # commit, so it is refused unless the branch is rehearsal/* and the commit is no pull request's.
+      - id: rehearsal
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODE: ${{ inputs.rehearse }}
+        run: |
+          set -euo pipefail
+          case "$GITHUB_REF" in
+            refs/heads/rehearsal/*) ;;
+            *) echo "::error::a rehearsal runs only on a branch rehearsal/*, not on $GITHUB_REF"; exit 1 ;;
+          esac
+          n=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" --jq length)
+          if [ "$n" != 0 ]; then
+            echo "::error::$GITHUB_SHA belongs to a pull request: its checks would stand for the pull request's"
+            exit 1
+          fi
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "reason=REHEARSAL of the $MODE path on $GITHUB_REF: no tree was judged, and this run proves nothing about the code" >> "$GITHUB_OUTPUT"
+          echo "::warning::REHEARSAL of the $MODE path: the checks of this run prove nothing about the code"
+
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
@@ -34,39 +111,65 @@ jobs:
 
   clippy:
     name: clippy
+    needs: gate
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
+      - name: skipped, the tree is already tested
+        if: needs.gate.outputs.mode == 'skip'
+        env:
+          REASON: ${{ needs.gate.outputs.reason }}
+        run: echo "::notice::$REASON"
       - uses: actions/checkout@v4
+        if: needs.gate.outputs.mode != 'skip'
       - uses: dtolnay/rust-toolchain@stable
+        if: needs.gate.outputs.mode != 'skip'
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        if: needs.gate.outputs.mode != 'skip'
       - run: cargo clippy --workspace --all-targets -- -D warnings
+        if: needs.gate.outputs.mode != 'skip'
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        if: needs.gate.outputs.mode != 'skip'
       # The kernel binding must stay no_std + alloc for the core's guest.
       - run: cargo clippy -p ledger-kernel --no-default-features --all-targets -- -D warnings
+        if: needs.gate.outputs.mode != 'skip'
       # Every public item is documented (missing_docs is denied); links must resolve.
       - run: cargo doc --workspace --no-deps --all-features
+        if: needs.gate.outputs.mode != 'skip'
         env:
           RUSTDOCFLAGS: -D warnings
 
   test:
     name: tests
+    needs: gate
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
+      - name: skipped, the tree is already tested
+        if: needs.gate.outputs.mode == 'skip'
+        env:
+          REASON: ${{ needs.gate.outputs.reason }}
+        run: echo "::notice::$REASON"
       - uses: actions/checkout@v4
+        if: needs.gate.outputs.mode != 'skip'
       # Toolchains the runner image ships and this workspace never uses (#59).
       - name: free runner disk
+        if: needs.gate.outputs.mode != 'skip'
         run: |
           df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
           df -h /
       - uses: dtolnay/rust-toolchain@stable
+        if: needs.gate.outputs.mode != 'skip'
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        if: needs.gate.outputs.mode != 'skip'
       # Property tests run 1,000 cases on pull requests and their full 10,000 on main and nightly.
       - name: property-test strength
+        if: needs.gate.outputs.mode != 'skip'
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then n=1000; else n=10000; fi
           # F007_WALKS is not reduced: it asserts that the walks reach every edge, and runs in seconds.
@@ -78,10 +181,12 @@ jobs:
       # (testcontainers): the runner's Docker must be up. Under CI a missing Docker fails those
       # tests rather than skipping them.
       - run: docker info --format '{{.ServerVersion}}'
+        if: needs.gate.outputs.mode != 'skip'
       # The test containers' Postgres images come from ECR Public's mirror of the official image,
       # tagged under the names testcontainers asks for, so it never pulls from Docker Hub: GitHub's
       # runners share IPs and hit Docker Hub's anonymous pull limit (`toomanyrequests`, 2026-10-09).
       - name: Postgres images from ECR Public
+        if: needs.gate.outputs.mode != 'skip'
         run: |
           # Retries, then leaves the image to testcontainers (Docker Hub) if ECR Public is down, so a
           # mirror glitch never fails the job by itself.
@@ -93,17 +198,21 @@ jobs:
             done
           done
       - run: cargo test --workspace
+        if: needs.gate.outputs.mode != 'skip'
       # F-005, F-031: ingress over the core Agent (AgentCore) needs core-binding's `ingress`
       # feature, which nothing in the workspace enables, so `--workspace` skips these tests.
       - run: cargo test -p core-binding --features ingress --test agent_core
+        if: needs.gate.outputs.mode != 'skip'
       # F-034 (an experiment): native decide, VOS verify, behind the shards crate's flag.
       - run: cargo test -p shards --features native-decide --test native_decide
+        if: needs.gate.outputs.mode != 'skip'
       # DEC-25, owner ruling cs-q04: v1 roots are a supported opt-in. The crates with a root version,
       # built with v1 (the default run above is v2, and its differential already runs every unit
       # under both versions). The conformance suite from a v1 genesis is its own job below. The
       # code-history gate (T-037-12) is skipped by name: its recorded book is a v2 book, which a v1
       # build founds differently, and it fails loudly if run here (code-history.yml runs it, in v2).
       - name: v1 roots (supported opt-in)
+        if: needs.gate.outputs.mode != 'skip'
         env:
           LEDGER_KERNEL_DIFF_CASES: "1000"
         run: >-
@@ -112,8 +221,9 @@ jobs:
           -- --skip t037_12_
       # The cross-host relay (an experiment, feature net): hosts in threads and as processes.
       - run: cargo test -p shards --features net --test multihost
+        if: needs.gate.outputs.mode != 'skip'
       - name: disk left after the tests
-        if: always()
+        if: ${{ always() && needs.gate.outputs.mode != 'skip' }}
         run: df -h /
 
   # NFR-10, T-005-17: the restore drill of the core Agent, on every change. A deployment whose core
@@ -123,6 +233,8 @@ jobs:
   # over VOS in the stress workflow (`drill`), and monthly there.
   restore-drill:
     name: restore drill (NFR-10, Agent core)
+    needs: gate
+    if: ${{ !cancelled() && needs.gate.outputs.mode != 'skip' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -142,6 +254,8 @@ jobs:
   # built-in KMS key): every object written once, encrypted under the key and locked.
   archive-s3:
     name: core archive on S3 (Object Lock, KMS)
+    needs: gate
+    if: ${{ !cancelled() && needs.gate.outputs.mode != 'skip' }}
     runs-on: ubuntu-latest
     env:
       AWS_ACCESS_KEY_ID: aledgent-ci
@@ -180,6 +294,8 @@ jobs:
   # Docker Hub's (#220), pinned by digest: a missing image fails the job, it does not change what it tests.
   vault-transit:
     name: vault transit (F-042)
+    needs: gate
+    if: ${{ !cancelled() && needs.gate.outputs.mode != 'skip' }}
     runs-on: ubuntu-latest
     env:
       VAULT_IMAGE: public.ecr.aws/hashicorp/vault:2.0.3@sha256:a296a888b118615dc01d5f1a6846e6d4a7277946caaed5b447008fff5fe06b54
@@ -390,31 +506,50 @@ jobs:
   # `cargo actor` and is built by hand (agents/README.md).
   agents:
     name: agents workspace (core host)
+    needs: gate
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: agents
     steps:
+      - name: skipped, the tree is already tested
+        if: needs.gate.outputs.mode == 'skip'
+        env:
+          REASON: ${{ needs.gate.outputs.reason }}
+        # No checkout ran, and this job's default directory is agents/: stay out of it.
+        working-directory: ${{ github.workspace }}
+        run: echo "::notice::$REASON"
       - uses: actions/checkout@v4
+        if: needs.gate.outputs.mode != 'skip'
       - name: free runner disk
+        if: needs.gate.outputs.mode != 'skip'
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
           df -h /
       - uses: dtolnay/rust-toolchain@master
+        if: needs.gate.outputs.mode != 'skip'
         with:
           toolchain: nightly-2026-03-20
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        if: needs.gate.outputs.mode != 'skip'
         with:
           workspaces: agents
       - run: ../tools/cipherclerk-patched.sh
+        if: needs.gate.outputs.mode != 'skip'
       # T-036-34: no core host or guest links the guest-heap model.
       - run: ../tools/ci/check-guest-heap-dev-only.sh
+        if: needs.gate.outputs.mode != 'skip'
       - run: cargo fmt --all -- --check
+        if: needs.gate.outputs.mode != 'skip'
       - run: cargo clippy --locked --all-targets -- -D warnings
+        if: needs.gate.outputs.mode != 'skip'
       - run: cargo test --locked
+        if: needs.gate.outputs.mode != 'skip'
       # cs-q04: a v1 deployment builds its core host with v1 roots (deploy/docker/core.Dockerfile).
       - run: cargo check --locked -p core-host --features smt-v1
+        if: needs.gate.outputs.mode != 'skip'
 
   # F-037 (T-037-19): the core host changes a stateful actor's program in place on the producer's
   # claim, through the runtime built from the VOS the host pins (the fork's stateful program
@@ -424,6 +559,8 @@ jobs:
   # runtime's digest goes to the summary: the genesis that ships the patched runtime has the same.
   stateful-upgrade:
     name: stateful upgrade through the built runtime (T-037-19)
+    needs: gate
+    if: ${{ !cancelled() && needs.gate.outputs.mode != 'skip' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -484,6 +621,8 @@ jobs:
   # committed lock file; services/settle's own tests check its encoder against the same vectors.
   kreivo-pin:
     name: kreivo pin (${{ matrix.crate }})
+    needs: gate
+    if: ${{ !cancelled() && needs.gate.outputs.mode != 'skip' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -503,6 +642,8 @@ jobs:
 
   spikes:
     name: spikes (F-002 measurement code, never shipped)
+    needs: gate
+    if: ${{ !cancelled() && needs.gate.outputs.mode != 'skip' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -539,32 +680,46 @@ jobs:
   # The conformance suite's gate (F-015 §10, NFR-14). Required on crates/.
   conformance:
     name: conformance (current gate profile)
+    needs: gate
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     env:
       CONFORMANCE_REPORT: ${{ github.workspace }}/target/conformance/report.json
     steps:
+      - name: skipped, the tree is already tested
+        if: needs.gate.outputs.mode == 'skip'
+        env:
+          REASON: ${{ needs.gate.outputs.reason }}
+        run: echo "::notice::$REASON"
       - uses: actions/checkout@v4
+        if: needs.gate.outputs.mode != 'skip'
         with:
           # The commit message is read for an amendment citation.
           fetch-depth: 0
       # Toolchains the runner image ships and this workspace never uses (#59).
       - name: free runner disk
+        if: needs.gate.outputs.mode != 'skip'
         run: |
           df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
           df -h /
       - uses: dtolnay/rust-toolchain@stable
+        if: needs.gate.outputs.mode != 'skip'
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        if: needs.gate.outputs.mode != 'skip'
       # F-015 §1: the spec catalogue is current with SPEC.md.
       - run: cargo xtask spec-ids --check
+        if: needs.gate.outputs.mode != 'skip'
       # The closure checks, the catalogue check, and every case the current
       # profile of crates/conformance/gates.toml requires, on both stores.
       - run: cargo test -p conformance --test suite
+        if: needs.gate.outputs.mode != 'skip'
       # F-031 (T-031-03): the suite through the native Agent again, eight inputs per invocation.
       # Its report is kept apart: the declaration below is generated from the run above.
       - name: through the Agent, batched
+        if: needs.gate.outputs.mode != 'skip'
         run: cargo test -p conformance --test suite
         env:
           CONFORMANCE_TARGETS: through-agent/native
@@ -576,6 +731,7 @@ jobs:
       # against the last released declaration fails unless the commit cites a
       # file in amendments/ (REQ-AR-4).
       - name: assurance declaration
+        if: needs.gate.outputs.mode != 'skip'
         run: |
           set -euo pipefail
           args=(--report "$CONFORMANCE_REPORT" --target in-process --out target/conformance/assurance.json)
@@ -591,7 +747,7 @@ jobs:
           cargo run -q -p conformance --bin assurance -- verify \
             --declaration target/conformance/assurance.json --report "$CONFORMANCE_REPORT"
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: ${{ always() && needs.gate.outputs.mode != 'skip' }}
         with:
           name: conformance-gate
           path: target/conformance/
@@ -602,6 +758,8 @@ jobs:
   # apart; the assurance declaration is the v2 run's.
   conformance-v1:
     name: conformance (v1 roots at genesis)
+    needs: gate
+    if: ${{ !cancelled() && needs.gate.outputs.mode != 'skip' }}
     runs-on: ubuntu-latest
     env:
       CONFORMANCE_REPORT: ${{ github.workspace }}/target/conformance/v1/report.json
@@ -628,6 +786,8 @@ jobs:
   # feature lands, so it is published as a report and never fails the build.
   conformance-full:
     name: conformance full run (report)
+    needs: gate
+    if: ${{ !cancelled() && needs.gate.outputs.mode != 'skip' }}
     runs-on: ubuntu-latest
     env:
       CONFORMANCE_PROFILE: full

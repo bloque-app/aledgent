@@ -22,3 +22,11 @@
 /crates/core-binding/tests/code_history.rs        @bloque-app/aledgent-spec-owner
 /tools/ci/check-code-history-fixture.sh           @bloque-app/aledgent-spec-owner
 /.github/workflows/code-history.yml               @bloque-app/aledgent-spec-owner
+
+# The judge of what CI skips (bloque-app/bloque-ledgent#312): the gate decides which required checks
+# report success without running. The script and the action are read from the BASE, so a change here
+# takes effect only once it is on the base; ci.yml carries the gate job and every check's skip path.
+/tools/ci/tested-tree.py                 @bloque-app/aledgent-spec-owner
+/tools/ci/test-tested-tree.py            @bloque-app/aledgent-spec-owner
+/.github/actions/tested-tree/            @bloque-app/aledgent-spec-owner
+/.github/workflows/ci.yml                @bloque-app/aledgent-spec-owner
