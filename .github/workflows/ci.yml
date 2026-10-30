@@ -224,11 +224,14 @@ jobs:
         with:
           shared-key: ${{ matrix.shard == 'v1-roots' && 'tests-v1' || 'tests' }}
           save-if: ${{ matrix.shard != 'features' && github.ref == 'refs/heads/main' }}
-      # cargo-nextest runs the test binaries' tests in one pool, instead of one binary after another
-      # (cargo test: 157 binaries, most of them far from filling four cores). It runs every test that
-      # `cargo test` runs but the doctests, which it cannot run: `cargo test --doc` follows it.
+      # The v1 shard runs on cargo-nextest, which runs the tests of all binaries in one pool instead of
+      # one binary after another (cargo test): its test phase went from about 8 to about 3 minutes.
+      # The workspace shard stays on `cargo test`: nextest there failed 2 runs of 6, each on another
+      # timer-driven test of the services (a ratio of wall times, a race against a background task),
+      # which `cargo test` never had to share the machine for. .config/nextest.toml has the details.
+      # nextest cannot run doctests, so `cargo test --doc` follows it.
       - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
-        if: steps.plan.outputs.full == 'true' && matrix.shard != 'features'
+        if: steps.plan.outputs.full == 'true' && matrix.shard == 'v1-roots'
         with:
           tool: nextest
       # Property tests run 1,000 cases on pull requests and their full 10,000 on main and nightly.
@@ -288,9 +291,7 @@ jobs:
         run: |
           cargo test -p ledger-core --test privileged_reads
           cargo test -p core-binding --test upgrade_authority
-      - run: cargo nextest run --workspace --no-fail-fast
-        if: steps.plan.outputs.full == 'true' && matrix.shard == 'workspace'
-      - run: cargo test --workspace --doc
+      - run: cargo test --workspace
         if: steps.plan.outputs.full == 'true' && matrix.shard == 'workspace'
 
       # --- features shard ---
