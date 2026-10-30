@@ -214,11 +214,16 @@ jobs:
           components: rustfmt, clippy
       # Two caches: the workspace shard's (the features shard restores it, and builds what it lacks) and
       # the v1 shard's, whose dependencies are built with other features (4 minutes more without it).
+      # Saved only on main (the push and the nightly run): a cache saved on the default branch is the
+      # one every branch and pull request restores. Saved by pull requests and develop it was a
+      # 1 GB copy per pull request, the repository's cache budget is 10 GB and was over (10.7 GB on
+      # 2026-10-30), and the entry main had saved was evicted within hours, so most main pushes and
+      # the first run of a pull request built every dependency (13 to 16 minutes).
       - uses: Swatinem/rust-cache@v2
         if: steps.plan.outputs.run == 'true'
         with:
           shared-key: ${{ matrix.shard == 'v1-roots' && 'tests-v1' || 'tests' }}
-          save-if: ${{ matrix.shard != 'features' }}
+          save-if: ${{ matrix.shard != 'features' && github.ref == 'refs/heads/main' }}
       # cargo-nextest runs the test binaries' tests in one pool, instead of one binary after another
       # (cargo test: 157 binaries, most of them far from filling four cores). It runs every test that
       # `cargo test` runs but the doctests, which it cannot run: `cargo test --doc` follows it.
