@@ -43,12 +43,15 @@ precondition, never the proof: the diff decides.
 
 - `hotfix`: the hotfix lane (ops/runbooks/release/hotfix.md). A pull request into `main` from a
   branch `hotfix/*` of this repository, opened by an author AND pushed (the event's sender) by a
-  login listed in the repository variable HOTFIX_AUTHORS, and labelled `hotfix` (read from the API at
+  login listed in the repository variable HOTFIX_AUTHORS, every commit of it authored and committed
+  by such a login, and labelled `hotfix` (read from the API at
   run time, not from the event). Then CI runs the fast subset: rustfmt, the first clippy, and
   `cargo test` of the crates the diff touches (output `test_args`: `-p a -p b`, or `--workspace` when
   the diff touches the workspace's own manifest, the lock file, the toolchain or the workflows), and
   the agents workspace only when the diff touches it (`agents`). The full suite runs on the push to
-  `main`. Every path of the diff must be owned: one that no crate's tests are known to cover (a path
+  `main`. The two scanners that walk other crates' sources (ledger-core's privileged_reads,
+  core-binding's upgrade_authority) always run in the lane, whatever the diff: the workflow does it.
+  Every path of the diff must be owned: one that no crate's tests are known to cover (a path
   outside the crates and the prose, SPEC.md, amendments/, the core's source) leaves the lane for
   `full`. Any condition missing: `full`.
 
@@ -338,21 +341,27 @@ PROSE_DIRS = ("docs/", "notes/")
 PACKAGE_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
-def workspace_members(repo: Path, rev: str) -> dict[str, str]:
-    """{member directory: package name} of the root workspace at `rev`."""
+def workspace_members(repo: Path, rev: str) -> tuple[dict[str, str], list[str]]:
+    """({member directory: package name}, excluded directories) of the root workspace at `rev`."""
     ws = tomllib.loads(_blob(repo, rev, "Cargo.toml"))["workspace"]
-    return {d: tomllib.loads(_blob(repo, rev, f"{d}/Cargo.toml"))["package"]["name"] for d in ws["members"]}
+    members = {d: tomllib.loads(_blob(repo, rev, f"{d}/Cargo.toml"))["package"]["name"] for d in ws["members"]}
+    return members, list(ws.get("exclude", []))
 
 
 def under(path: str, directory: str) -> bool:
     return path == directory or path.startswith(directory.rstrip("/") + "/")
 
 
-def hotfix_scope(paths: list[str], members: dict[str, str]) -> tuple[str, bool, list[str]]:
+def hotfix_scope(
+    paths: list[str], members: dict[str, str], excluded: list[str] | None = None
+) -> tuple[str, bool, list[str]]:
     """(arguments for `cargo test`, whether the agents workspace is touched, the paths no check owns).
 
     Fails closed: a path is owned only by a rule above; any other is returned for the caller to
-    refuse."""
+    refuse. A path in a workspace the root one excludes (a nested one such as
+    services/settle/kreivo-pin, with a job of its own that the lane skips) is not its enclosing
+    member's: `-p settle` does not build it."""
+    excluded = excluded or []
     names = set(members.values())
     for _, crates in EXTERNAL_READERS:
         if not set(crates) <= names:
@@ -375,7 +384,7 @@ def hotfix_scope(paths: list[str], members: dict[str, str]) -> tuple[str, bool, 
                 crates.update(readers)
                 owned = True
         member = max((d for d in members if under(path, d)), key=len, default=None)
-        if member is not None:
+        if member is not None and not any(under(path, d) for d in excluded):
             crates.add(members[member])
             owned = True
         if path.startswith(PROSE_DIRS):
@@ -402,8 +411,20 @@ def hotfix(repo: Path, event: dict, repository: str, api: Api, authors: str, mai
     labels = {label["name"] for label in api(f"repos/{repository}/issues/{pr['number']}/labels?per_page=100")}
     if "hotfix" not in labels:
         return Decision(FULL, "hotfix/ branch without the `hotfix` label (add it, then close and reopen the pull request)")
+    # Every commit's author and committer too: closing and reopening a pull request (the runbook's
+    # advice when the label went on late) makes the reopener the sender, and a commit of someone else's
+    # would ride in on it. A commit whose email GitHub cannot map to a login fails the lane.
+    commits = api(f"repos/{repository}/pulls/{pr['number']}/commits?per_page=100")
+    if not commits or len(commits) >= 100:
+        return Decision(FULL, "hotfix/ branch, but its commits could not be listed (none, or 100 or more)")
+    for c in commits:
+        for role in ("author", "committer"):
+            login = (c.get(role) or {}).get("login")
+            if login not in allowed:
+                return Decision(FULL, f"hotfix/ branch, but the {role} of {c['sha'][:12]} is {login or 'no GitHub user'}, who is not in HOTFIX_AUTHORS")
     paths = [p for p in git(repo, "diff", "--name-only", "--no-renames", "-z", main_tip, "HEAD").split("\0") if p]
-    args, agents, unowned = hotfix_scope(paths, workspace_members(repo, "HEAD"))
+    members, excluded = workspace_members(repo, "HEAD")
+    args, agents, unowned = hotfix_scope(paths, members, excluded)
     if unowned:
         return Decision(
             FULL,

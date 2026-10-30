@@ -15,7 +15,7 @@ on:
   workflow_dispatch:
     inputs:
       rehearse:
-        description: "Rehearsal of the gate's modes, only on a branch rehearsal/* whose head is no pull request's: `skip` and `hotfix` run that mode's path of the heavy required checks for real, without judging any tree (skip: their steps are skipped and they report success). `none`: a normal run"
+        description: "Rehearsal of the gate's modes, only on a branch rehearsal/* whose head is no pull request's and whose tree is develop's or main's: `skip` and `hotfix` run that mode's path of the heavy required checks for real, without judging any tree (skip: their steps are skipped and they report success). `none`: a normal run"
         type: choice
         options: [none, skip, hotfix]
         default: none
@@ -102,6 +102,15 @@ jobs:
           n=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" --jq length)
           if [ "$n" != 0 ]; then
             echo "::error::$GITHUB_SHA belongs to a pull request: its checks would stand for the pull request's"
+            exit 1
+          fi
+          # The tree must be develop's or main's, byte for byte: a rehearsal's green checks sit on this
+          # commit by name, and must never stand for code nobody merged.
+          git fetch -q --depth=1 origin develop:refs/remotes/origin/develop main:refs/remotes/origin/main
+          here=$(git rev-parse 'HEAD^{tree}')
+          if [ "$here" != "$(git rev-parse 'refs/remotes/origin/develop^{tree}')" ] \
+            && [ "$here" != "$(git rev-parse 'refs/remotes/origin/main^{tree}')" ]; then
+            echo "::error::the tree of $GITHUB_SHA is neither develop's nor main's: a rehearsal runs on an empty commit on top of one of them"
             exit 1
           fi
           echo "mode=$MODE" >> "$GITHUB_OUTPUT"
@@ -223,6 +232,15 @@ jobs:
           # Package names or --workspace, from tools/ci/tested-tree.py: split on purpose.
           # shellcheck disable=SC2086
           cargo test $TEST_ARGS
+      # Two tests walk the sources of other crates, so a change anywhere can break them: the lane always
+      # runs them. ledger-core's privileged_reads (REQ-PV-4) walks every .rs file under crates, agents,
+      # services and ops; core-binding's upgrade_authority (T-037-05) reads ledger-core, core-binding
+      # and agents/core-host, and the runbooks.
+      - name: cross-crate policy scanners (hotfix lane)
+        if: needs.gate.outputs.mode == 'hotfix'
+        run: |
+          cargo test -p ledger-core --test privileged_reads
+          cargo test -p core-binding --test upgrade_authority
       - run: cargo test --workspace
         if: ${{ !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
       # F-005, F-031: ingress over the core Agent (AgentCore) needs core-binding's `ingress`

@@ -427,8 +427,16 @@ class HotfixScope(unittest.TestCase):
     members = {"crates/a": "a", "crates/b": "b", "crates/core-binding": "core-binding", "crates/verify": "verify",
                "services/signer": "signer", "services/ingress": "ingress", "services/settle": "settle", "ops": "ops"}
 
+    excluded = ["agents", "contracts", "spikes", "services/settle/kreivo-pin", "e2e/network"]
+
     def scope(self, *paths: str):
-        return tt.hotfix_scope(list(paths), self.members)
+        return tt.hotfix_scope(list(paths), self.members, self.excluded)
+
+    def test_a_nested_excluded_workspace_is_not_its_enclosing_members(self):
+        # `-p settle` does not build services/settle/kreivo-pin, which has a job of its own
+        args, agents, unowned = self.scope("services/settle/kreivo-pin/src/lib.rs")
+        self.assertEqual((args, unowned), ("", ["services/settle/kreivo-pin/src/lib.rs"]))
+        self.assertEqual(self.scope("services/settle/src/lib.rs")[:3], ("-p settle", False, []))
 
     def test_the_crates_the_diff_touches_sorted(self):
         self.assertEqual(self.scope("crates/b/src/x.rs", "crates/a/src/y.rs", "crates/a/tests/z.rs")[:2], ("-p a -p b", False))
@@ -480,12 +488,23 @@ class HotfixScope(unittest.TestCase):
             tt.hotfix_scope(["crates/a/src/x.rs"], {"crates/a": "a"})
 
 
-def labels_api(*names: str, fail: bool = False):
+def commit(author: str | None = "pablo", committer: str | None = "pablo", sha: str = "a" * 40) -> dict:
+    return {"sha": sha, "author": {"login": author} if author else None,
+            "committer": {"login": committer} if committer else None}
+
+
+def labels_api(*names: str, fail: bool = False, commits: list | None = None):
+    """The hotfix lane's API: the labels of pull request 7 and its commits (one, by pablo, by default)."""
+    commits = [commit()] if commits is None else commits
+
     def api(path: str):
         if fail:
             raise OSError("down")
-        assert path.startswith("repos/o/r/issues/7/labels"), path
-        return [{"name": n} for n in names]
+        if path.startswith("repos/o/r/issues/7/labels"):
+            return [{"name": n} for n in names]
+        if path.startswith("repos/o/r/pulls/7/commits"):
+            return commits
+        raise AssertionError(f"unexpected API call {path}")
 
     return api
 
@@ -537,6 +556,21 @@ class Hotfix(Classify):
         path = self.r.root / "event.json"
         path.write_text(json.dumps(ev))
         self.assertEqual(tt.decide(self.r.root, "pull_request", str(path), "o/r", labels_api("hotfix"), "pablo").mode, "full")
+
+    def test_a_commit_of_someone_else_runs_everything(self):
+        # reopening a pull request makes the reopener the sender: the commits are checked too
+        for bad in (commit(author="mallory"), commit(committer="mallory"), commit(committer="web-flow"),
+                    commit(author=None), commit(committer=None)):
+            api = labels_api("hotfix", commits=[commit(), bad])
+            self.r.git("checkout", "-q", "main")
+            self.r.git("reset", "-q", "--hard", self.base)
+            self.r.git("branch", "-q", "-D", "pr") if "pr" in self.r.git("branch", "--format=%(refname:short)").split() else None
+            d = self.hotfix({"crates/a/src/lib.rs": "\n"}, api=api)
+            self.assertEqual(d.mode, "full", (bad, d.reason))
+            self.assertIn("HOTFIX_AUTHORS", d.reason)
+
+    def test_no_commits_or_too_many_to_list_runs_everything(self):
+        self.assertEqual(self.hotfix({"crates/a/src/lib.rs": "\n"}, api=labels_api("hotfix", commits=[])).mode, "full")
 
     def test_an_empty_allow_list_closes_the_lane(self):
         self.assertEqual(self.hotfix({"crates/a/src/lib.rs": "\n"}, authors="").mode, "full")
@@ -636,6 +670,16 @@ class Promotion(Base):
 
 
 class Contract(unittest.TestCase):
+    def test_the_lane_always_runs_the_two_cross_crate_scanners(self):
+        # ledger-core's privileged_reads (REQ-PV-4) and core-binding's upgrade_authority (T-037-05) read
+        # the sources of other crates, so a diff elsewhere can break them: the lane runs them whatever
+        # the diff touches.
+        ci = (ROOT / ".github/workflows/ci.yml").read_text()
+        for cmd, file in (("cargo test -p ledger-core --test privileged_reads", "crates/ledger-core/tests/privileged_reads.rs"),
+                          ("cargo test -p core-binding --test upgrade_authority", "crates/core-binding/tests/upgrade_authority.rs")):
+            self.assertIn(cmd, ci)
+            self.assertTrue((ROOT / file).is_file(), file)
+
     def test_every_required_job_is_a_job_of_ci_yml(self):
         ci = (ROOT / ".github/workflows/ci.yml").read_text()
         names = set(re.findall(r"^    name: (.+)$", ci, re.M))

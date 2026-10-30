@@ -25,9 +25,11 @@ workflow, and **it ships a fix that the full suite has not yet judged** (see "Wh
 
 The owner, or the owner's agent **on the owner's go**, given in the incident's thread before the pull
 request is opened. The lane enforces part of it itself: it applies only when the pull request's
-**author and the pusher of the commit being checked** (the event's sender) are both listed in the
-repository variable `HOTFIX_AUTHORS` (comma-separated logins). Anyone else, or an empty variable, gets
-the full suite, whatever the label says.
+**author, the pusher of the commit being checked** (the event's sender, who is also the reopener of a
+reopened pull request) **and the author and committer of every commit in it** are all listed in the
+repository variable `HOTFIX_AUTHORS` (comma-separated GitHub logins). Anyone else, a commit whose
+email GitHub cannot map to a login, a commit made in GitHub's web editor, or an empty variable, gets
+the full suite, whatever the label says. Push your own commits from your machine.
 
 What nothing enforces: **`--admin`**. Any repository admin can merge past the review and the checks,
 with or without this lane, and **removing the `hotfix` label after the checks are green leaves them
@@ -51,6 +53,7 @@ logins in `HOTFIX_AUTHORS`, with the label `hotfix` (read from the API when the 
 | rustfmt | runs |
 | clippy | runs the workspace's (`--all-targets`); the all-features, `no_std` kernel and `cargo doc` runs are left to `main` |
 | tests | `cargo test -p <crate> ...` for the crates the diff touches (workspace members, plus the crates whose tests read a path outside them: `deploy/templates/` → signer, ingress, settle, ops; `ops/runbooks/` → core-binding, ops; `contracts/settlement/` → verify). A diff that touches the root `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/` or `.github/` runs `--workspace`; one that touches only `docs/` or `notes/` runs none |
+| two cross-crate scanners | **always** run, whatever the diff touches: `cargo test -p ledger-core --test privileged_reads` (REQ-PV-4, walks every `.rs` under crates, agents, services and ops) and `cargo test -p core-binding --test upgrade_authority` (T-037-05, reads ledger-core, core-binding and agents/core-host, and the runbooks) |
 | agents workspace (core host) | runs only when the diff touches `agents/`, `proposals/cipherclerk/` or `tools/cipherclerk-patched.sh` |
 | conformance (current gate profile) | reports success without running |
 | code history | runs on a Rust-touching diff, as always (it is the spec owner's) |
@@ -58,7 +61,9 @@ logins in `HOTFIX_AUTHORS`, with the label `hotfix` (read from the API when the 
 | DCO sign-off, conventional PR title | run |
 
 **Every path of the diff must be owned** by one of those rules. One that is not (the `tools/` and
-`deploy/` files besides the templates, `e2e/`, `spikes/`, a crate-less README, and `SPEC.md`,
+`deploy/` files besides the templates, `e2e/`, `spikes/`, a crate-less README, a workspace the root one
+excludes (`services/settle/kreivo-pin`, which `-p settle` does not build, and `contracts/` besides the
+settlement contract), and `SPEC.md`,
 `amendments/` and `agents/core/src/lib.rs`, which conformance reads) sends the whole pull request to the
 full suite, and the gate's summary names the path. The list of readers outside the crates is grep's, in
 `tools/ci/tested-tree.py` (`EXTERNAL_READERS`): add to it when a test starts reading a new path.
@@ -89,7 +94,8 @@ changes to the judge take effect only after they are there.
           --title "fix(<scope>): <what it fixes>" --body "<the incident, the fix, the check you ran>"
 
    The title is the squash merge's subject and release-please reads it: `fix` is a patch release.
-   `labeled` is not a trigger: if the label went on later, close and reopen the pull request. Open the
+   `labeled` is not a trigger: if the label went on later, close and reopen the pull request (the
+   reopener must be in `HOTFIX_AUTHORS`, like every commit's author and committer). Open the
    `gate (tested tree)` job's summary: it must say `hotfix lane for <you>`. If it says anything else it
    ran everything, and the reason is the line next to it (author or pusher not listed, no label, a
    path the lane does not cover, a fork).
@@ -111,8 +117,8 @@ changes to the judge take effect only after they are there.
    (`.github/workflows/release.yml`, whose own checks the lane leaves as they are). Intake and the
    production deploy are bloque-ledgent's.
 
-   **Do not wait for step 6 unless you can afford to** (the suite takes about 40 minutes, and the lane
-   exists to save them). The release pull request skips its heavy checks only when `main`'s tip, or an
+   **Do not wait for step 6 unless you can afford to** (the suite takes 52 to 61 minutes on `main`, and
+   the lane exists to save them). The release pull request skips its heavy checks only when `main`'s tip, or an
    ancestor with its tree but for versions (the develop tip a promotion merged), has a finished, passed
    push run, and it refuses to while the latest finished push run on `main` is red. After a hotfix the
    tip is the hotfix's commit, and its run is still going when release-please opens the pull request,
@@ -156,14 +162,18 @@ fix itself) and reopen, or wait for the full suite.
 ## Rehearsing the modes
 
 The skip and hotfix paths of the required checks can be run for real, on a throwaway branch, without a
-pull request into `main` (whose judge would be `main`'s):
+pull request into `main` (whose judge would be `main`'s). A rehearsal never vouches for new code: it is
+refused unless the branch is `rehearsal/*`, its head belongs to no pull request, **and its tree is
+exactly `origin/develop`'s or `origin/main`'s**. So it rehearses what is already merged, on an empty
+commit:
 
-    git switch -c rehearsal/<name> <your branch>
-    git commit --allow-empty -s -S -m "chore: rehearsal"       # a head that is no pull request's
+    git fetch origin
+    git switch -c rehearsal/<name> origin/develop            # or origin/main
+    git commit --allow-empty -s -S -m "chore: rehearsal"     # a head that is no pull request's
     git push -u origin rehearsal/<name>
     gh workflow run ci.yml -R bloque-app/aledgent --ref rehearsal/<name> -f rehearse=skip
     gh workflow run ci.yml -R bloque-app/aledgent --ref rehearsal/<name> -f rehearse=hotfix \
       -f rehearse_test_args="-p compact-smt"
 
-The run is refused unless the branch is `rehearsal/*` and its head belongs to no pull request. It judges
-no tree: it forces the mode, so its green checks prove nothing about the code. Delete the branch after.
+It judges no tree: it forces the mode, so its green checks prove nothing about the code. Delete the
+branch after (`git push origin --delete rehearsal/<name>`).
