@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::account::{AssetTag, BalanceRule, Role};
-use crate::posting::PostingKind;
+use crate::posting::{EntryDraft, OperationRef, PostingDraft, PostingKind, PostingMeta};
 use crate::store::{KeySet, Loaded, MemStore, SubRoots};
 use crate::testkit::*;
 use crate::vault::{LayerSums, MemVault};
@@ -213,6 +213,159 @@ fn fault_oracle_when_the_kernel_refuses_a_net_the_vault_says_is_not_negative() {
     assert_eq!(r, Err(BindingFault::Oracle { step: 0, event: 0 }));
     assert_eq!(root(&book), before);
     assert_eq!(book.last_committed().unwrap(), Some(1));
+}
+
+/// `ERR-InsufficientAvailable` (`INV-3`): the refusal names the account that went negative, not
+/// one that netted exactly zero before it in the same posting. A debit that empties an account
+/// is allowed; it is not the failing account.
+#[test]
+fn err_insufficient_available_names_the_negative_account_not_one_netting_exactly_zero() {
+    let mut book = mem_book();
+    fund(&mut book, 100);
+    let before = root(&book);
+    // Customer 1 pays its whole 100 (nets 0), customer 2 pays 5 it does not have (nets -5),
+    // customer 3 receives both. One posting, so one event: the entry order puts the zero first.
+    let posting = PostingDraft::balanced(
+        PostingMeta::new(PostingKind::Transfer, OperationRef([0x31; 16]), 0),
+        vec![
+            EntryDraft::debit(customer(1, 1), v(100)),
+            EntryDraft::debit(customer(2, 1), v(5)),
+            EntryDraft::credit(customer(3, 1), v(105)),
+        ],
+    )
+    .unwrap();
+    let applied = book
+        .apply(
+            &unit(vec![Step {
+                creations: vec![customer(3, 1)],
+                chain: vec![posting],
+            }]),
+            2_000,
+        )
+        .unwrap();
+    assert_eq!(
+        applied.steps[0].events,
+        vec![EventClass::Insufficient {
+            account: customer(2, 1).id()
+        }]
+    );
+    assert!(!applied.steps[0].applied);
+    assert_eq!(root(&book), before);
+}
+
+/// `ERR-InsufficientAvailable`, at the classifier: the first net below zero is named, and a
+/// net of exactly zero is not below zero.
+#[test]
+fn err_insufficient_available_classifier_skips_a_zero_net_and_names_the_first_negative() {
+    let (zero, short, shorter) = (
+        customer(1, 1).id(),
+        customer(2, 1).id(),
+        customer(3, 1).id(),
+    );
+    let check = |account, net| NetCheck {
+        account,
+        layer: Layer::Settled,
+        net,
+    };
+    let nets = [check(zero, 0), check(short, -5), check(shorter, -9)];
+    assert_eq!(
+        classify_refusal(EventStatus::BalanceMustNotBeNegative, &nets, 0),
+        Some(EventClass::Insufficient { account: short })
+    );
+    // Nothing below zero: the kernel refused something the plaintext says it should not have.
+    assert_eq!(
+        classify_refusal(EventStatus::BalanceMustNotBeNegative, &[check(zero, 0)], 0),
+        None
+    );
+}
+
+/// `REQ-KER-10`: a linked event that failed only because another event of its chain did is
+/// classified as the chain's abort, naming its cause.
+#[test]
+fn req_ker_10_a_linked_event_failed_status_is_classified_as_the_chains_abort() {
+    assert_eq!(
+        classify_refusal(EventStatus::LinkedEventFailed, &[], 3),
+        Some(EventClass::ChainAborted { cause: 3 })
+    );
+}
+
+/// `INV-7`, `F-001` §8: a refused chain whose negative net is exactly `u64::MAX` is a fault of
+/// the oracle (the plaintext says it is representable and the kernel refused), and one unit more
+/// is out of range. The boundary is exact.
+#[test]
+fn inv_7_a_net_of_exactly_u64_max_is_an_oracle_fault_and_one_more_is_out_of_range() {
+    let account = customer(1, 1).id();
+    let refused = [EventResult {
+        timestamp: 1,
+        status: EventStatus::BalanceMustNotBeNegative,
+    }];
+    let plan = |net: i128| ChainPlan {
+        nets: vec![vec![NetCheck {
+            account,
+            layer: Layer::Settled,
+            net,
+        }]],
+        unknown_from: None,
+    };
+    assert_eq!(
+        label_chain(2, &refused, &plan(i128::from(u64::MAX))),
+        Err(BindingFault::Oracle { step: 2, event: 0 })
+    );
+    assert_eq!(
+        label_chain(2, &refused, &plan(i128::from(u64::MAX) + 1)),
+        Err(BindingFault::OutOfRange {
+            step: 2,
+            event: 0,
+            account
+        })
+    );
+}
+
+/// `INV-6`, `REQ-KER-3`: the vault's openings are checked against the store's commitments.
+/// A book that holds none wrong passes; one opening corrupted in the vault is
+/// `OpeningMismatch` for exactly that row, whichever side or layer it is on.
+#[test]
+fn inv_6_a_corrupted_vault_opening_is_an_opening_mismatch() {
+    let mut book = mem_book();
+    fund(&mut book, 100);
+    assert_eq!(
+        book.verify_openings(),
+        Ok(()),
+        "an honest vault opens the store"
+    );
+
+    let row = RowKey::new(customer(1, 1).id(), Layer::Settled.as_byte());
+    let honest: LayerSums = book.vault().sums(&row);
+    // The value, then the blinding, of each side in turn.
+    for corrupt in [
+        |s: &mut LayerSums| s.cr.value += 1,
+        |s: &mut LayerSums| s.cr.blinding += curve25519_dalek::scalar::Scalar::ONE,
+        |s: &mut LayerSums| s.dr.value += 1,
+        |s: &mut LayerSums| s.dr.blinding += curve25519_dalek::scalar::Scalar::ONE,
+    ] {
+        let mut lie = honest;
+        corrupt(&mut lie);
+        book.vault.tamper(row, lie);
+        assert_eq!(
+            book.verify_openings(),
+            Err(BindingFault::OpeningMismatch { row })
+        );
+        book.vault.tamper(row, honest);
+        assert_eq!(book.verify_openings(), Ok(()), "restored");
+    }
+}
+
+/// `INV-6`: a vault row for an account the store does not hold cannot open anything.
+#[test]
+fn inv_6_a_vault_row_for_an_unknown_account_is_an_opening_mismatch() {
+    let mut book = mem_book();
+    fund(&mut book, 100);
+    let row = RowKey::new(customer(9, 1).id(), Layer::Settled.as_byte());
+    book.vault.tamper(row, LayerSums::default());
+    assert_eq!(
+        book.verify_openings(),
+        Err(BindingFault::OpeningMismatch { row })
+    );
 }
 
 #[test]

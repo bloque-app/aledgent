@@ -69,9 +69,7 @@ pub fn check(view: &impl RuleView, seq: u64, delta: &BookDelta) -> Result<(), St
     let mut slots: BTreeMap<[u8; 16], [u8; 32]> = BTreeMap::new();
     for eid in &delta.external_ids {
         let slot = external_id_key(&eid.0);
-        if let Some(other) = slots.insert(slot, eid.0)
-            && other != eid.0
-        {
+        if shares_slot(&mut slots, slot, eid.0) {
             return Err(StoreError::ExternalIdCollision { slot });
         }
         match view.external_id_in_slot(&slot)? {
@@ -135,6 +133,17 @@ pub fn check(view: &impl RuleView, seq: u64, delta: &BookDelta) -> Result<(), St
     Ok(())
 }
 
+/// Record `id` as the occupant of `slot` among a delta's external ids, and say whether a
+/// different id was already there. A slot is a 128-bit hash of the id, so two ids sharing one
+/// is a 2^64 search: no test can build the pair through [`external_id_key`], and this is
+/// the step that a test reaches with hand-made slots (`REQ-KER-6`).
+fn shares_slot(slots: &mut BTreeMap<[u8; 16], [u8; 32]>, slot: [u8; 16], id: [u8; 32]) -> bool {
+    match slots.insert(slot, id) {
+        Some(other) => other != id,
+        None => false,
+    }
+}
+
 /// Whether `new` only rolls `old` forward: the same identity, asset, key,
 /// code, normal balance and user data; flags unchanged or gaining `CLOSED`.
 fn is_roll_of(old: &Account, new: &Account) -> bool {
@@ -146,4 +155,37 @@ fn is_roll_of(old: &Account, new: &Account) -> bool {
         && old.normal_balance == new.normal_balance
         && old.user_data == new.user_data
         && (new.flags == old.flags || new.flags == (old.flags | AccountFlags::CLOSED))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `REQ-KER-6`: two different ids in one slot of one delta are a collision. The slots are
+    /// made by hand, because the real derivation cannot be made to collide in a test.
+    #[test]
+    fn req_ker_6_two_different_ids_in_one_slot_of_a_delta_are_a_collision() {
+        let mut slots = BTreeMap::new();
+        let slot = [7u8; 16];
+        assert!(
+            !shares_slot(&mut slots, slot, [1; 32]),
+            "the first id owns the slot"
+        );
+        assert!(
+            shares_slot(&mut slots, slot, [2; 32]),
+            "a different id in the same slot is a collision"
+        );
+        // Another slot is not affected.
+        assert!(!shares_slot(&mut slots, [8; 16], [2; 32]));
+    }
+
+    /// `REQ-KER-6`: the same id seen again is no collision of slots; the stored-id check
+    /// refuses it as already used, a different error.
+    #[test]
+    fn req_ker_6_the_same_id_twice_in_one_slot_is_not_a_slot_collision() {
+        let mut slots = BTreeMap::new();
+        let slot = [7u8; 16];
+        assert!(!shares_slot(&mut slots, slot, [1; 32]));
+        assert!(!shares_slot(&mut slots, slot, [1; 32]));
+    }
 }
