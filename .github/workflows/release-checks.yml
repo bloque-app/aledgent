@@ -25,6 +25,12 @@ name: Release checks
 #   break: before 1.0.0 this job therefore refuses a breaking change only when the pending release is
 #   a patch release. The versions released are unchanged (`--print version`).
 #
+# - image promotion: tools/release/promote-images.py (the release takes a develop pre-release's
+#   core image by digest instead of building it: .github/workflows/release.yml, job `promote`) passes its own
+#   tests, which run it against synthetic repositories and a fake registry, and a dry run of it for
+#   the latest release, against the real history and registry, shows in the summary what a release
+#   would do today (nothing is copied; the dry run informs and never fails the check).
+#
 # It reads the title, the code and the history; it holds no secret and writes nothing, so it runs
 # on pull requests from forks as on any other.
 
@@ -105,3 +111,43 @@ jobs:
           cargo semver-checks check-release
           --package verify --package compact-smt --package ledger-core
           --baseline-rev "$BASELINE" --release-type "$TYPE" --default-features
+
+  promotion:
+    name: image promotion
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    env:
+      CRANE_VERSION: v0.22.1
+      CRANE_SHA256: 0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # develop's history and every tag: what the script walks.
+          fetch-depth: 0
+          persist-credentials: false
+      - run: python3 tools/release/test-promote-images.py
+      - name: A dry run for the latest release
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 5 -o /tmp/crane.tar.gz \
+            "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz"
+          echo "${CRANE_SHA256}  /tmp/crane.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin" && tar -xzf /tmp/crane.tar.gz -C "$RUNNER_TEMP/bin" crane
+          export PATH="$RUNNER_TEMP/bin:$PATH"
+          tag="$(git tag --list 'v[0-9]*' | grep -Ev -- '[-+]' | sort -V | tail -n 1)"
+          if [ -z "$tag" ]; then echo "no release yet"; exit 0; fi
+          # Never fails: a doubt is `promoted=false` and a reason.
+          {
+            echo "### Dry run: would \`$tag\` take a pre-release's images?"
+            echo
+            echo '```'
+            python3 tools/release/promote-images.py --dry-run --commit "$(git rev-list -n 1 "$tag")" \
+              --version "${tag#v}" --repository "$GITHUB_REPOSITORY"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"

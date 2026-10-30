@@ -17,7 +17,10 @@ name: Images
 # shell, so a binary that does not link fails here), checks the baked chain specs, and reports the
 # sizes; it pushes nothing.
 #
-# A release or a pre-release (.github/workflows/release.yml) calls this workflow with its version:
+# A release or a pre-release (.github/workflows/release.yml) calls this workflow with its version
+# (a release whose tree is a develop pre-release's but for versions passes `promoted`: `core`, the
+# core is then the pre-release's, by digest (release.yml, job `promote`), and is not built here; every
+# other image is built, because ingress, settle and the sidecar report the version):
 # the same builds and checks, then every image pushed as `sha-<commit>` and `v<version>` (a
 # pre-release's `+` becomes `_`, which a tag allows), labelled with the commit and the version
 # (`org.opencontainers.image.revision`, `.version`). The workflow's outputs are each image's
@@ -100,6 +103,11 @@ on:
         required: true
       commit:
         description: "The commit to build: the release's (release-please's `sha`); the event's by default"
+        type: string
+        required: false
+        default: ""
+      promoted:
+        description: "Space-separated image names a release takes from a pre-release by digest (release.yml, job `promote`); only `core` is skipped here (not built, not pushed). Empty: every image is built and pushed"
         type: string
         required: false
         default: ""
@@ -432,7 +440,8 @@ jobs:
   core:
     name: core (VOS Agent)
     needs: gate
-    if: ${{ !cancelled() && !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) && (inputs.version != '' || github.event_name != 'push') && inputs.genesis_image == '' }}
+    # Not built when a release takes the pre-release's (`promoted`, release.yml): the 17-minute job.
+    if: ${{ !cancelled() && !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) && (inputs.version != '' || github.event_name != 'push') && inputs.genesis_image == '' && !contains(format(' {0} ', inputs.promoted), ' core ') }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:

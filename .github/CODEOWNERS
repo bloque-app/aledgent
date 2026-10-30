@@ -30,3 +30,8 @@
 /tools/ci/test-tested-tree.py            @bloque-app/aledgent-spec-owner
 /.github/actions/tested-tree/            @bloque-app/aledgent-spec-owner
 /.github/workflows/ci.yml                @bloque-app/aledgent-spec-owner
+
+# What a release takes from a pre-release instead of building (bloque-app/bloque-ledgent#312, step
+# 3): the judge of which images are promoted by digest to the release's tags.
+/tools/release/promote-images.py         @bloque-app/aledgent-spec-owner
+/tools/release/test-promote-images.py    @bloque-app/aledgent-spec-owner

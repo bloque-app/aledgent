@@ -21,7 +21,21 @@ name: Release
 #
 # Either way, every image (.github/workflows/images.yml: ingress, settle, ops, signer, core,
 # sidecar) is built and pushed to ghcr.io/bloque-app/aledgent-<name> as `sha-<commit>` and
-# `v<version>` (`+` made `_`), and the release gets images.json:
+# `v<version>` (`+` made `_`), and the release gets images.json. The one exception is a release whose
+# source is a develop commit that already has a pre-release (bloque-app/bloque-ledgent#312, step 3):
+# the job `promote` (tools/release/promote-images.py) takes that pre-release's core image by digest,
+# tagging it `sha-<release commit>` and `v<version>`, and the core, the 17-minute job, is not built.
+# It does so only when the release commit's tree is a develop commit's tree but for versions and the
+# changelog (the rule of tools/ci/tested-tree.py), that commit's release.yml run succeeded and the
+# core image's labels and tags agree with its images.json; otherwise, or on any error, every image is
+# built as above. The other five are always built: ingress, settle and the sidecar report the crate
+# version (ingress' and the sidecar's `/openapi.json` `info.version`, settle's network name), a
+# release must report its own, and ops and signer, which do not, are compiled in the same job as
+# ingress and settle, so taking them would save no time. A copy keeps the index and its buildx
+# provenance attestation as the pre-release's build made them, and relabels nothing, so the promoted
+# core's `org.opencontainers.image.version` and `.revision` labels name the pre-release and its
+# commit; the tag and images.json (`promoted_from`) identify the release. Set the repository
+# variable RELEASE_REBUILD to `true` to build every release's images as before.
 #
 #   {"version": "v0.2.0", "commit": "<40 hex>",
 #    "images": {"ingress": "ghcr.io/bloque-app/aledgent-ingress@sha256:…", …}}
@@ -133,11 +147,81 @@ jobs:
           echo "tag=v$version" >> "$GITHUB_OUTPUT"
           echo "Pre-release \`v$version\` (the next release: $next)" >> "$GITHUB_STEP_SUMMARY"
 
+  # The release's images are the pre-release's, when its source is the release's (the header; the
+  # script says why not, and never fails). Not a job that can hold the release up: `images` builds
+  # unless this job says `promoted` (a crash here leaves that output empty, and the images are built).
+  promote:
+    name: promote the pre-release's images (main)
+    needs: release-please
+    if: >-
+      github.repository == 'bloque-app/aledgent' && needs.release-please.outputs.created == 'true'
+      && vars.RELEASE_REBUILD != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # A tooling failure here (crane's download, say) builds the images and does not mark the run
+    # failed: `images` keys off the `promoted` output, which a failed job leaves empty. The
+    # script's tests run on every pull request (release-checks.yml), not here, to keep a hotfix's
+    # release, which always builds, from waiting on them.
+    continue-on-error: true
+    permissions:
+      contents: read
+      # The release workflow's run on develop at the source commit is the evidence of a pre-release.
+      actions: read
+      packages: write
+    env:
+      CRANE_VERSION: v0.22.1
+      CRANE_SHA256: 0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0
+    outputs:
+      promoted: ${{ steps.promote.outputs.promoted }}
+      promoted_images: ${{ steps.promote.outputs.promoted_images }}
+      reason: ${{ steps.promote.outputs.reason }}
+      source_tag: ${{ steps.promote.outputs.source_tag }}
+      source_commit: ${{ steps.promote.outputs.source_commit }}
+      core: ${{ steps.promote.outputs.core }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # The released commit, and develop's history and tags below it.
+          ref: ${{ needs.release-please.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: crane
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 5 -o /tmp/crane.tar.gz \
+            "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz"
+          echo "${CRANE_SHA256}  /tmp/crane.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin" && tar -xzf /tmp/crane.tar.gz -C "$RUNNER_TEMP/bin" crane
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: promote
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT: ${{ needs.release-please.outputs.sha }}
+          VERSION: ${{ needs.release-please.outputs.version }}
+        run: |
+          python3 tools/release/promote-images.py --commit "$COMMIT" --version "$VERSION" --repository "$GITHUB_REPOSITORY" \
+            | tee "$RUNNER_TEMP/promote.out"
+          {
+            echo "### Images"
+            echo
+            sed -n 's/^reason=//p' "$RUNNER_TEMP/promote.out"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   images:
     name: images
-    needs: [release-please, prerelease]
+    needs: [release-please, prerelease, promote]
+    # Always run: everything is built but the core, when `promote` took it.
+    # `failure()` is not used: it would also skip the build when `promote` crashed, and a release
+    # would get no images; a crashed `promote` leaves `promoted_images` empty, and everything is
+    # built. An upstream failure still stops it.
     if: >-
-      !cancelled() && !failure()
+      !cancelled() && needs.release-please.result != 'failure' && needs.prerelease.result != 'failure'
       && (needs.release-please.outputs.created == 'true' || needs.prerelease.outputs.version != '')
     permissions:
       contents: read
@@ -146,12 +230,14 @@ jobs:
     with:
       version: ${{ needs.release-please.outputs.version || needs.prerelease.outputs.version }}
       commit: ${{ needs.release-please.outputs.sha || github.sha }}
+      promoted: ${{ needs.promote.outputs.promoted == 'true' && needs.promote.outputs.promoted_images || '' }}
 
   publish:
     name: images.json and dispatch
-    needs: [release-please, prerelease, images]
+    needs: [release-please, prerelease, promote, images]
     if: >-
-      !cancelled() && !failure() && needs.images.result == 'success'
+      !cancelled() && needs.release-please.result != 'failure' && needs.prerelease.result != 'failure'
+      && needs.images.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: release
@@ -165,14 +251,20 @@ jobs:
       TAG: ${{ needs.release-please.outputs.tag || needs.prerelease.outputs.tag }}
       COMMIT: ${{ needs.release-please.outputs.sha || github.sha }}
       HAS_APP: ${{ secrets.ALEDGENT_RELEASE_APP_ID != '' && secrets.ALEDGENT_RELEASE_APP_KEY != '' }}
+      PROMOTED: ${{ needs.promote.outputs.promoted == 'true' }}
+      PROMOTED_IMAGES: ${{ needs.promote.outputs.promoted == 'true' && needs.promote.outputs.promoted_images || '' }}
+      SOURCE_TAG: ${{ needs.promote.outputs.source_tag }}
+      SOURCE_COMMIT: ${{ needs.promote.outputs.source_commit }}
     steps:
       - name: images.json
         env:
+          # Built here, except the core when it is promoted from a pre-release (`promote`'s output is
+          # empty otherwise).
           INGRESS: ${{ needs.images.outputs.ingress }}
           SETTLE: ${{ needs.images.outputs.settle }}
           OPS: ${{ needs.images.outputs.ops }}
           SIGNER: ${{ needs.images.outputs.signer }}
-          CORE: ${{ needs.images.outputs.core }}
+          CORE: ${{ needs.promote.outputs.core || needs.images.outputs.core }}
           SIDECAR: ${{ needs.images.outputs.sidecar }}
         run: |
           set -euo pipefail
@@ -182,13 +274,38 @@ jobs:
             grep -Eq "^ghcr\.io/bloque-app/aledgent-${n,,}@sha256:[0-9a-f]{64}$" <<<"$ref" \
               || { echo "::error::no digest for ${n,,}: '$ref'"; exit 1; }
           done
+          # `commit` is the release's, which the dispatch names. A promoted release adds, for each
+          # image taken from a pre-release, where it came from (the intake reads `version`, `commit`
+          # and `images` only).
           jq -n --arg version "$TAG" --arg commit "$COMMIT" \
                 --arg ingress "$INGRESS" --arg settle "$SETTLE" --arg ops "$OPS" \
                 --arg signer "$SIGNER" --arg core "$CORE" --arg sidecar "$SIDECAR" \
+                --arg promoted "$PROMOTED_IMAGES" --arg stag "$SOURCE_TAG" --arg scommit "$SOURCE_COMMIT" \
             '{version: $version, commit: $commit,
               images: {ingress: $ingress, settle: $settle, ops: $ops, signer: $signer,
-                       core: $core, sidecar: $sidecar}}' > images.json
+                       core: $core, sidecar: $sidecar}} as $doc
+             | $doc + (if $promoted == "" then {} else
+                 {promoted_from: ($promoted | split(" ") | map({key: ., value: {version: $stag, commit: $scommit, image: $doc.images[.]}}) | from_entries)}
+               end)' > images.json
           cat images.json
+
+      # Which images are the pre-release's, in the release's own notes (release-please wrote them).
+      - name: Say so in the release notes
+        if: env.PROMOTED == 'true' && env.PRERELEASE != 'true'
+        run: |
+          set -euo pipefail
+          marker='<!-- images-promoted -->'
+          gh release view "$TAG" --json body --jq .body > body.md
+          if ! grep -qF "$marker" body.md; then
+            {
+              echo
+              echo "$marker"
+              echo "### Images"
+              echo
+              echo "Promoted, not rebuilt: the \`core\` image is that of the pre-release \`$SOURCE_TAG\` (commit \`$SOURCE_COMMIT\`), whose tree is this release's but for versions and the changelog; it reports no version. Its labels (\`org.opencontainers.image.version\`, \`.revision\`) name that pre-release. The other images were built for this release. images.json records \`promoted_from\`."
+            } >> body.md
+            gh release edit "$TAG" --notes-file body.md
+          fi
 
       # A release exists already (release-please made it); a pre-release is made here, at the commit
       # its images were built from.
