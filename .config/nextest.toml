@@ -5,11 +5,18 @@
 # binary at a time; nextest runs the tests of every binary in one pool, so a test that measures wall
 # time now competes with tests of other binaries too.
 
-# NFR-1: apply cost is flat to 1,000 postings. It asserts a ratio of two measured times (at 1,000
-# postings against 100, within 3x), which a busy neighbour can break: it failed once, 4.4 ms against
-# 1.4 ms, with the pool full. It takes every slot, so it runs alone.
+# Tests that race a clock, and lose when the pool is full. Each takes every slot, so it runs alone,
+# as a binary of its own ran under `cargo test`.
+# - NFR-1, apply cost flat to 1,000 postings: it asserts a ratio of two measured times (1,000
+#   postings against 100, within 3x), and failed once, 4.4 ms against 1.4 ms, with the pool full.
+# - REQ-RT-3, an on-disk core rebuilds from its journal: it reads the core's input count, stops
+#   and restarts the core, and expects the same count, while the deployment's tasks run on; with
+#   the pool full they journaled two inputs in between (9 against 7). The race is in the test.
 [[profile.default.overrides]]
-filter = 'package(ledger-kernel) & test(/book::cost_tests::/)'
+filter = '''
+(package(ledger-kernel) & test(/book::cost_tests::/))
+| (package(ingress) & binary(book_on_disk))
+'''
 threads-required = "num-cpus"
 
 # The longest tests start first (measured on the run of 2026-10-30: 123 s, 56 s, 44 s, 33 s, 27 s and
