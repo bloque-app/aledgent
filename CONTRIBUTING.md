@@ -111,18 +111,19 @@ are protected alike (one approving review, code owners, the required checks, sig
 - **Images.** A release or a pre-release publishes every image to `ghcr.io/bloque-app/aledgent-<name>`
   (ingress, settle, ops, signer, core, sidecar) as `sha-<commit>` and `v<version>` (`+` becomes `_`
   in an image tag), and attaches `images.json`, each image by digest (`.github/workflows/release.yml`).
-  A release does not build the core, ops and signer images again when it can take the pre-release's:
-  if the release commit's tree is a `develop` commit's tree but for versions and the changelog
+  A release does not build the core image again when it can take the pre-release's: if the release
+  commit's tree is a `develop` commit's tree but for versions and the changelog
   (`tools/ci/tested-tree.py`'s rule), that commit's pre-release has passed its own checks and its
-  labels agree with its `images.json`, `tools/release/promote-images.py` copies those three images by
-  digest to the release's tags, with the buildx provenance attestation they were built with, and the
-  17-minute core build is skipped; `images.json` records `promoted_from`, per image. ingress, settle
-  and the sidecar are always built: they are the images that report the crate version (`ingress`' and
-  the sidecar's `/openapi.json` `info.version`, `settle`'s network name), and a release must report
-  its own. Anything that does not match, a hotfix on `main` included, builds everything as before;
-  the repository variable `RELEASE_REBUILD=true` forces it. A promoted image's labels
-  (`org.opencontainers.image.version`, `.revision`) name the pre-release, which a copy does not
-  change; the release's tag and `images.json` identify it.
+  labels agree with its `images.json`, `tools/release/promote-images.py` copies the core image by
+  digest to the release's tags, with the buildx provenance attestation it was built with, and the
+  17-minute core build is skipped; `images.json` records `promoted_from`. The other five are always
+  built: ingress, settle and the sidecar report the crate version (`ingress`' and the sidecar's
+  `/openapi.json` `info.version`, `settle`'s network name), and a release must report its own; ops
+  and signer are compiled in the same job, so taking them would save nothing. Anything that does not
+  match, a hotfix on `main` included, builds everything as before; the repository variable
+  `RELEASE_REBUILD=true` forces it. The promoted core's labels (`org.opencontainers.image.version`,
+  `.revision`) name the pre-release, which a copy does not change; the release's tag and
+  `images.json` identify it.
 - **Core releases.** A change to the core (`core.vos`) can ship without a new image and without
   restarting the host: `.github/workflows/core-release.yml` builds it as the next rules version of the
   code a book already runs, has the node's host write the code manifest, and publishes the three

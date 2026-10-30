@@ -15,12 +15,15 @@ from, through CARGO_PKG_VERSION, in exactly two places: `ingress`' OpenAPI docum
 - REBUILT (ingress, settle, sidecar): always built, so that they report the release's version. The
   sidecar is ingress' HTTP surface in one process, `/openapi.json` included: measured, the v0.4.0
   sidecar reports 0.4.0 and the 067cffd pre-release's reports 0.1.2.
-- PROMOTED (ops, signer, core): none of that code is in them (no `/openapi.json` route, none of the
-  two source files in their panic locations, and the functions' only callers are ingress' router and
-  settle's binary), so a copy of the pre-release's image says nothing wrong. `core.vos` keeps a fixed
-  crate version by design (CONTRIBUTING.md, "Versions"). The core is the 17-minute job.
+- REBUILT too (ops, signer): they carry no version, but they are compiled in the same job as ingress
+  and settle (the shared workspace build is what costs the ~13 minutes), so taking them from the
+  pre-release would save no time and only give a release two images whose labels name a pre-release.
+- PROMOTED (core): none of that code is in it (no `/openapi.json` route, none of the two source files
+  in its panic locations, and the functions' only callers are ingress' router and settle's binary),
+  so a copy of the pre-release's image says nothing wrong. `core.vos` keeps a fixed crate version by
+  design (CONTRIBUTING.md, "Versions"). The core is the 17-minute job.
 
-The promoted images are the pre-release's, by digest, when and only when:
+The promoted image is the pre-release's, by digest, when and only when:
 
 1. a commit D on `develop` has a tree that differs from the release commit's in versions and the
    changelog only, by the rule of tools/ci/tested-tree.py (`version_only`, the same function: what
@@ -30,15 +33,15 @@ The promoted images are the pre-release's, by digest, when and only when:
    can push one);
 3. the pre-release's images.json names D as its commit and its own tag as its version, and lists
    exactly the six images, each `ghcr.io/bloque-app/aledgent-<name>@sha256:<64 hex>`;
-4. for each promoted image, `:sha-<D>` resolves to that digest, and the image's config carries
+4. the core's `:sha-<D>` resolves to that digest, and its config carries
    `org.opencontainers.image.revision` = D, `org.opencontainers.image.version` = the pre-release's,
-   and, for ops and core, `app.aledgent.roots` = v2 (the roots every release is built with).
+   and `app.aledgent.roots` = v2 (the roots every release is built with).
 
-Then each is copied by digest (`crane copy <repo>@<digest> <repo>:<tag>`: the manifest is copied byte
+Then it is copied by digest (`crane copy <repo>@<digest> <repo>:<tag>`: the manifest is copied byte
 for byte, the index with its buildx provenance attestation, so the digest does not change) to
 `sha-<release commit>` and `v<version>`, and each new tag is read back and must resolve to the digest.
 Nothing is relabelled: any change to the config would change the digest and orphan the attestation
-that names it. The labels `org.opencontainers.image.revision` and `.version` of a promoted image are
+that names it. The labels `org.opencontainers.image.revision` and `.version` of the promoted core are
 therefore the pre-release's; nothing reads them (bloque-ledgent's intake checks images.json's version
 and commit and that each digest resolves).
 
@@ -48,7 +51,7 @@ overwritten). A mismatch is a reason, printed; it is never a failure, and the re
 
 Writes to $GITHUB_OUTPUT (and prints): `promoted` (true|false), `reason`, `source_tag`,
 `source_commit`, and, when promoted, `promoted_images` (the names, space-separated) and one
-`ghcr.io/…@sha256:…` output per promoted image (`ops`, `signer`, `core`).
+`ghcr.io/…@sha256:…` output per promoted image (`core`).
 """
 from __future__ import annotations
 
@@ -70,8 +73,8 @@ tt = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(tt)
 
 NAMES = ("ingress", "settle", "ops", "signer", "core", "sidecar")
-# Promoted by digest: the version is not in them (the header). Everything else is built for the release.
-PROMOTED = ("ops", "signer", "core")
+# Promoted by digest: the version is not in it (the header). Everything else is built for the release.
+PROMOTED = ("core",)
 REBUILT = tuple(n for n in NAMES if n not in PROMOTED)
 # The images built with the book's roots (images.yml): their config says which. The sidecar is always v2.
 WITH_ROOTS = ("ingress", "settle", "ops", "core")

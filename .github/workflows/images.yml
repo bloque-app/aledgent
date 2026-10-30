@@ -18,9 +18,9 @@ name: Images
 # sizes; it pushes nothing.
 #
 # A release or a pre-release (.github/workflows/release.yml) calls this workflow with its version
-# (a release whose tree is a develop pre-release's but for versions passes `promoted`: ops, signer and
-# core are then the pre-release's, by digest (release.yml, job `promote`); they are not pushed here and
-# the core is not built. ingress, settle and the sidecar report the version, so they are always built):
+# (a release whose tree is a develop pre-release's but for versions passes `promoted`: `core`, the
+# core is then the pre-release's, by digest (release.yml, job `promote`), and is not built here; every
+# other image is built, because ingress, settle and the sidecar report the version):
 # the same builds and checks, then every image pushed as `sha-<commit>` and `v<version>` (a
 # pre-release's `+` becomes `_`, which a tag allows), labelled with the commit and the version
 # (`org.opencontainers.image.revision`, `.version`). The workflow's outputs are each image's
@@ -107,7 +107,7 @@ on:
         required: false
         default: ""
       promoted:
-        description: "Space-separated image names a release takes from a pre-release by digest (release.yml, job `promote`): ops, signer, core. Not pushed, and the core is not built; the rest as always. Empty: every image is built and pushed"
+        description: "Space-separated image names a release takes from a pre-release by digest (release.yml, job `promote`); only `core` is skipped here (not built, not pushed). Empty: every image is built and pushed"
         type: string
         required: false
         default: ""
@@ -153,8 +153,6 @@ env:
      || github.event_name == 'push' && 'edge'
      || 'check' }}
   VERSION: ${{ inputs.version }}
-  # Images a release takes from a pre-release (release.yml): built here for the checks, never pushed.
-  PROMOTED: ${{ inputs.promoted }}
   # The commit built, labelled and tagged: a release's own, which a run queued behind another may
   # no longer have as its event's commit.
   COMMIT: ${{ inputs.commit || github.sha }}
@@ -389,7 +387,7 @@ jobs:
           tags: ${{ steps.meta.outputs.settle }}
       - name: Push ops
         id: push-ops
-        if: (env.MODE == 'release' || env.MODE == 'dispatch') && !contains(format(' {0} ', env.PROMOTED), ' ops ')
+        if: env.MODE == 'release' || env.MODE == 'dispatch'
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
@@ -403,7 +401,7 @@ jobs:
           tags: ${{ steps.meta.outputs.ops }}
       - name: Push signer
         id: push-signer
-        if: (env.MODE == 'release' || env.MODE == 'dispatch') && !contains(format(' {0} ', env.PROMOTED), ' signer ')
+        if: env.MODE == 'release' || env.MODE == 'dispatch'
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
@@ -429,8 +427,6 @@ jobs:
           set -euo pipefail
           echo "Pushed:" >> "$GITHUB_STEP_SUMMARY"
           for t in ingress settle ops signer; do
-            # Taken from a pre-release by the caller: built above for the checks, not pushed.
-            case " ${PROMOTED:-} " in *" $t "*) continue ;; esac
             var="${t^^}"
             digest="${!var}"
             repo="ghcr.io/bloque-app/aledgent-$t"
