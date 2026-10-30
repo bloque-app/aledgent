@@ -15,10 +15,14 @@ on:
   workflow_dispatch:
     inputs:
       rehearse:
-        description: "Rehearsal of the gate's modes, only on a branch rehearsal/* whose head is no pull request's: `skip` runs the skip path of the heavy required checks (their steps are skipped and they report success) without judging any tree. `none`: a normal run"
+        description: "Rehearsal of the gate's modes, only on a branch rehearsal/* whose head is no pull request's: `skip` and `hotfix` run that mode's path of the heavy required checks for real, without judging any tree (skip: their steps are skipped and they report success). `none`: a normal run"
         type: choice
-        options: [none, skip]
+        options: [none, skip, hotfix]
         default: none
+      rehearse_test_args:
+        description: "With `hotfix`: the arguments of the lane's `cargo test` (a small crate keeps the rehearsal short)"
+        type: string
+        default: "-p compact-smt"
 
 # A newer push to develop supersedes the run still going on the older one: the evidence of a tested
 # tree (tools/ci/tested-tree.py) is the tip's, and a promotion is judged against the tip. Everything
@@ -60,6 +64,8 @@ jobs:
     outputs:
       mode: ${{ steps.tree.outputs.mode || steps.rehearsal.outputs.mode }}
       reason: ${{ steps.tree.outputs.reason || steps.rehearsal.outputs.reason }}
+      test_args: ${{ steps.tree.outputs.test_args || steps.rehearsal.outputs.test_args }}
+      agents: ${{ steps.tree.outputs.agents || steps.rehearsal.outputs.agents }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -76,6 +82,8 @@ jobs:
       - id: tree
         if: github.event_name == 'pull_request' && hashFiles('.github/actions/tested-tree/action.yml') != '' && hashFiles('tools/ci/tested-tree.py') != ''
         uses: ./.github/actions/tested-tree
+        with:
+          hotfix-authors: ${{ vars.HOTFIX_AUTHORS }}
       # A rehearsal (workflow_dispatch) judges nothing: it forces a mode so that the paths the modes
       # open in the jobs below run for real, on a throwaway branch. Its checks prove nothing about the
       # commit, so it is refused unless the branch is rehearsal/* and the commit is no pull request's.
@@ -84,6 +92,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           MODE: ${{ inputs.rehearse }}
+          TEST_ARGS: ${{ inputs.rehearse_test_args }}
         run: |
           set -euo pipefail
           case "$GITHUB_REF" in
@@ -96,6 +105,13 @@ jobs:
             exit 1
           fi
           echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          if [ "$MODE" = hotfix ]; then
+            # Package names only: the same shape the script produces.
+            [[ "$TEST_ARGS" =~ ^(-p\ [A-Za-z0-9_-]+)(\ -p\ [A-Za-z0-9_-]+)*$|^--workspace$ ]] \
+              || { echo "::error::rehearse_test_args must be -p <crate> ... or --workspace"; exit 1; }
+            echo "test_args=$TEST_ARGS" >> "$GITHUB_OUTPUT"
+            echo "agents=false" >> "$GITHUB_OUTPUT"
+          fi
           echo "reason=REHEARSAL of the $MODE path on $GITHUB_REF: no tree was judged, and this run proves nothing about the code" >> "$GITHUB_OUTPUT"
           echo "::warning::REHEARSAL of the $MODE path: the checks of this run prove nothing about the code"
 
@@ -131,13 +147,13 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
         if: needs.gate.outputs.mode != 'skip'
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-        if: needs.gate.outputs.mode != 'skip'
+        if: ${{ !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
       # The kernel binding must stay no_std + alloc for the core's guest.
       - run: cargo clippy -p ledger-kernel --no-default-features --all-targets -- -D warnings
-        if: needs.gate.outputs.mode != 'skip'
+        if: ${{ !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
       # Every public item is documented (missing_docs is denied); links must resolve.
       - run: cargo doc --workspace --no-deps --all-features
-        if: needs.gate.outputs.mode != 'skip'
+        if: ${{ !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
         env:
           RUSTDOCFLAGS: -D warnings
 
@@ -197,22 +213,32 @@ jobs:
               echo "::warning::ECR Public pull of postgres:$t failed (attempt $i)"; sleep $((i * 10))
             done
           done
+      # The hotfix lane (ops/runbooks/release/hotfix.md): only the crates the diff touches, instead of
+      # the workspace and the feature runs below; the full suite runs on the push to main.
+      - name: tests of the crates the diff touches (hotfix lane)
+        if: needs.gate.outputs.mode == 'hotfix' && needs.gate.outputs.test_args != ''
+        env:
+          TEST_ARGS: ${{ needs.gate.outputs.test_args }}
+        run: |
+          # Package names or --workspace, from tools/ci/tested-tree.py: split on purpose.
+          # shellcheck disable=SC2086
+          cargo test $TEST_ARGS
       - run: cargo test --workspace
-        if: needs.gate.outputs.mode != 'skip'
+        if: ${{ !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
       # F-005, F-031: ingress over the core Agent (AgentCore) needs core-binding's `ingress`
       # feature, which nothing in the workspace enables, so `--workspace` skips these tests.
       - run: cargo test -p core-binding --features ingress --test agent_core
-        if: needs.gate.outputs.mode != 'skip'
+        if: ${{ !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
       # F-034 (an experiment): native decide, VOS verify, behind the shards crate's flag.
       - run: cargo test -p shards --features native-decide --test native_decide
-        if: needs.gate.outputs.mode != 'skip'
+        if: ${{ !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
       # DEC-25, owner ruling cs-q04: v1 roots are a supported opt-in. The crates with a root version,
       # built with v1 (the default run above is v2, and its differential already runs every unit
       # under both versions). The conformance suite from a v1 genesis is its own job below. The
       # code-history gate (T-037-12) is skipped by name: its recorded book is a v2 book, which a v1
       # build founds differently, and it fails loudly if run here (code-history.yml runs it, in v2).
       - name: v1 roots (supported opt-in)
-        if: needs.gate.outputs.mode != 'skip'
+        if: ${{ !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
         env:
           LEDGER_KERNEL_DIFF_CASES: "1000"
         run: >-
@@ -221,7 +247,7 @@ jobs:
           -- --skip t037_12_
       # The cross-host relay (an experiment, feature net): hosts in threads and as processes.
       - run: cargo test -p shards --features net --test multihost
-        if: needs.gate.outputs.mode != 'skip'
+        if: ${{ !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
       - name: disk left after the tests
         if: ${{ always() && needs.gate.outputs.mode != 'skip' }}
         run: df -h /
@@ -234,7 +260,7 @@ jobs:
   restore-drill:
     name: restore drill (NFR-10, Agent core)
     needs: gate
-    if: ${{ !cancelled() && needs.gate.outputs.mode != 'skip' }}
+    if: ${{ !cancelled() && !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -255,7 +281,7 @@ jobs:
   archive-s3:
     name: core archive on S3 (Object Lock, KMS)
     needs: gate
-    if: ${{ !cancelled() && needs.gate.outputs.mode != 'skip' }}
+    if: ${{ !cancelled() && !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
     runs-on: ubuntu-latest
     env:
       AWS_ACCESS_KEY_ID: aledgent-ci
@@ -295,7 +321,7 @@ jobs:
   vault-transit:
     name: vault transit (F-042)
     needs: gate
-    if: ${{ !cancelled() && needs.gate.outputs.mode != 'skip' }}
+    if: ${{ !cancelled() && !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
     runs-on: ubuntu-latest
     env:
       VAULT_IMAGE: public.ecr.aws/hashicorp/vault:2.0.3@sha256:a296a888b118615dc01d5f1a6846e6d4a7277946caaed5b447008fff5fe06b54
@@ -514,42 +540,42 @@ jobs:
         working-directory: agents
     steps:
       - name: skipped, the tree is already tested
-        if: needs.gate.outputs.mode == 'skip'
+        if: needs.gate.outputs.mode == 'skip' || (needs.gate.outputs.mode == 'hotfix' && needs.gate.outputs.agents != 'true')
         env:
           REASON: ${{ needs.gate.outputs.reason }}
         # No checkout ran, and this job's default directory is agents/: stay out of it.
         working-directory: ${{ github.workspace }}
         run: echo "::notice::$REASON"
       - uses: actions/checkout@v4
-        if: needs.gate.outputs.mode != 'skip'
+        if: needs.gate.outputs.mode != 'skip' && (needs.gate.outputs.mode != 'hotfix' || needs.gate.outputs.agents == 'true')
       - name: free runner disk
-        if: needs.gate.outputs.mode != 'skip'
+        if: needs.gate.outputs.mode != 'skip' && (needs.gate.outputs.mode != 'hotfix' || needs.gate.outputs.agents == 'true')
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
           df -h /
       - uses: dtolnay/rust-toolchain@master
-        if: needs.gate.outputs.mode != 'skip'
+        if: needs.gate.outputs.mode != 'skip' && (needs.gate.outputs.mode != 'hotfix' || needs.gate.outputs.agents == 'true')
         with:
           toolchain: nightly-2026-03-20
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-        if: needs.gate.outputs.mode != 'skip'
+        if: needs.gate.outputs.mode != 'skip' && (needs.gate.outputs.mode != 'hotfix' || needs.gate.outputs.agents == 'true')
         with:
           workspaces: agents
       - run: ../tools/cipherclerk-patched.sh
-        if: needs.gate.outputs.mode != 'skip'
+        if: needs.gate.outputs.mode != 'skip' && (needs.gate.outputs.mode != 'hotfix' || needs.gate.outputs.agents == 'true')
       # T-036-34: no core host or guest links the guest-heap model.
       - run: ../tools/ci/check-guest-heap-dev-only.sh
-        if: needs.gate.outputs.mode != 'skip'
+        if: needs.gate.outputs.mode != 'skip' && (needs.gate.outputs.mode != 'hotfix' || needs.gate.outputs.agents == 'true')
       - run: cargo fmt --all -- --check
-        if: needs.gate.outputs.mode != 'skip'
+        if: needs.gate.outputs.mode != 'skip' && (needs.gate.outputs.mode != 'hotfix' || needs.gate.outputs.agents == 'true')
       - run: cargo clippy --locked --all-targets -- -D warnings
-        if: needs.gate.outputs.mode != 'skip'
+        if: needs.gate.outputs.mode != 'skip' && (needs.gate.outputs.mode != 'hotfix' || needs.gate.outputs.agents == 'true')
       - run: cargo test --locked
-        if: needs.gate.outputs.mode != 'skip'
+        if: needs.gate.outputs.mode != 'skip' && (needs.gate.outputs.mode != 'hotfix' || needs.gate.outputs.agents == 'true')
       # cs-q04: a v1 deployment builds its core host with v1 roots (deploy/docker/core.Dockerfile).
       - run: cargo check --locked -p core-host --features smt-v1
-        if: needs.gate.outputs.mode != 'skip'
+        if: needs.gate.outputs.mode != 'skip' && (needs.gate.outputs.mode != 'hotfix' || needs.gate.outputs.agents == 'true')
 
   # F-037 (T-037-19): the core host changes a stateful actor's program in place on the producer's
   # claim, through the runtime built from the VOS the host pins (the fork's stateful program
@@ -560,7 +586,7 @@ jobs:
   stateful-upgrade:
     name: stateful upgrade through the built runtime (T-037-19)
     needs: gate
-    if: ${{ !cancelled() && needs.gate.outputs.mode != 'skip' }}
+    if: ${{ !cancelled() && !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -622,7 +648,7 @@ jobs:
   kreivo-pin:
     name: kreivo pin (${{ matrix.crate }})
     needs: gate
-    if: ${{ !cancelled() && needs.gate.outputs.mode != 'skip' }}
+    if: ${{ !cancelled() && !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -643,7 +669,7 @@ jobs:
   spikes:
     name: spikes (F-002 measurement code, never shipped)
     needs: gate
-    if: ${{ !cancelled() && needs.gate.outputs.mode != 'skip' }}
+    if: ${{ !cancelled() && !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -687,39 +713,39 @@ jobs:
       CONFORMANCE_REPORT: ${{ github.workspace }}/target/conformance/report.json
     steps:
       - name: skipped, the tree is already tested
-        if: needs.gate.outputs.mode == 'skip'
+        if: needs.gate.outputs.mode == 'skip' || needs.gate.outputs.mode == 'hotfix'
         env:
           REASON: ${{ needs.gate.outputs.reason }}
         run: echo "::notice::$REASON"
       - uses: actions/checkout@v4
-        if: needs.gate.outputs.mode != 'skip'
+        if: ${{ !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
         with:
           # The commit message is read for an amendment citation.
           fetch-depth: 0
       # Toolchains the runner image ships and this workspace never uses (#59).
       - name: free runner disk
-        if: needs.gate.outputs.mode != 'skip'
+        if: ${{ !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
         run: |
           df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
           df -h /
       - uses: dtolnay/rust-toolchain@stable
-        if: needs.gate.outputs.mode != 'skip'
+        if: ${{ !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-        if: needs.gate.outputs.mode != 'skip'
+        if: ${{ !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
       # F-015 §1: the spec catalogue is current with SPEC.md.
       - run: cargo xtask spec-ids --check
-        if: needs.gate.outputs.mode != 'skip'
+        if: ${{ !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
       # The closure checks, the catalogue check, and every case the current
       # profile of crates/conformance/gates.toml requires, on both stores.
       - run: cargo test -p conformance --test suite
-        if: needs.gate.outputs.mode != 'skip'
+        if: ${{ !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
       # F-031 (T-031-03): the suite through the native Agent again, eight inputs per invocation.
       # Its report is kept apart: the declaration below is generated from the run above.
       - name: through the Agent, batched
-        if: needs.gate.outputs.mode != 'skip'
+        if: ${{ !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
         run: cargo test -p conformance --test suite
         env:
           CONFORMANCE_TARGETS: through-agent/native
@@ -731,7 +757,7 @@ jobs:
       # against the last released declaration fails unless the commit cites a
       # file in amendments/ (REQ-AR-4).
       - name: assurance declaration
-        if: needs.gate.outputs.mode != 'skip'
+        if: ${{ !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
         run: |
           set -euo pipefail
           args=(--report "$CONFORMANCE_REPORT" --target in-process --out target/conformance/assurance.json)
@@ -747,7 +773,7 @@ jobs:
           cargo run -q -p conformance --bin assurance -- verify \
             --declaration target/conformance/assurance.json --report "$CONFORMANCE_REPORT"
       - uses: actions/upload-artifact@v4
-        if: ${{ always() && needs.gate.outputs.mode != 'skip' }}
+        if: ${{ always() && !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
         with:
           name: conformance-gate
           path: target/conformance/
@@ -759,7 +785,7 @@ jobs:
   conformance-v1:
     name: conformance (v1 roots at genesis)
     needs: gate
-    if: ${{ !cancelled() && needs.gate.outputs.mode != 'skip' }}
+    if: ${{ !cancelled() && !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
     runs-on: ubuntu-latest
     env:
       CONFORMANCE_REPORT: ${{ github.workspace }}/target/conformance/v1/report.json
@@ -787,7 +813,7 @@ jobs:
   conformance-full:
     name: conformance full run (report)
     needs: gate
-    if: ${{ !cancelled() && needs.gate.outputs.mode != 'skip' }}
+    if: ${{ !cancelled() && !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
     runs-on: ubuntu-latest
     env:
       CONFORMANCE_PROFILE: full

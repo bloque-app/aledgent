@@ -5,7 +5,7 @@
 
     tools/ci/tested-tree.py [--repo DIR]    # DIR: a pull request's merge checkout (default: here)
 
-Prints and writes to $GITHUB_OUTPUT one of two modes:
+Prints and writes to $GITHUB_OUTPUT one of three modes:
 
 - `full`: run every check. The answer for everything that is not provably redundant, and the answer
   whenever anything goes wrong (an API error, an unexpected checkout): the script never fails, and
@@ -41,6 +41,17 @@ true) and not on lines:
 Any other path, an added or removed file, a mode change: not version-only. The branch name is a
 precondition, never the proof: the diff decides.
 
+- `hotfix`: the hotfix lane (ops/runbooks/release/hotfix.md). A pull request into `main` from a
+  branch `hotfix/*` of this repository, opened by an author AND pushed (the event's sender) by a
+  login listed in the repository variable HOTFIX_AUTHORS, and labelled `hotfix` (read from the API at
+  run time, not from the event). Then CI runs the fast subset: rustfmt, the first clippy, and
+  `cargo test` of the crates the diff touches (output `test_args`: `-p a -p b`, or `--workspace` when
+  the diff touches the workspace's own manifest, the lock file, the toolchain or the workflows), and
+  the agents workspace only when the diff touches it (`agents`). The full suite runs on the push to
+  `main`. Every path of the diff must be owned: one that no crate's tests are known to cover (a path
+  outside the crates and the prose, SPEC.md, amendments/, the core's source) leaves the lane for
+  `full`. Any condition missing: `full`.
+
 Who judges. This script and the action that runs it are the BASE's copy, never the pull request's
 (the gate job checks the base out and the merge beside it): a pull request cannot supply its own
 judge. A base without them means no gate, so `full`. The release-please configuration is read from
@@ -60,9 +71,16 @@ import sys
 import tomllib
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
-FULL, SKIP = "full", "skip"
+FULL, SKIP, HOTFIX = "full", "skip", "hotfix"
+
+
+class Decision(NamedTuple):
+    mode: str
+    reason: str
+    test_args: str = ""  # hotfix: what follows `cargo test`
+    agents: str = "false"  # hotfix: whether the agents workspace's checks run
 
 # The required checks of `main` that ci.yml produces (branch protection, `gh api
 # repos/bloque-app/aledgent/branches/main/protection/required_status_checks`), by job name. DCO and
@@ -293,10 +311,128 @@ def tested_commit(
 
 
 # --------------------------------------------------------------------------------------------------
+# The hotfix lane: which crates does the diff touch, and is every path of it owned?
+# --------------------------------------------------------------------------------------------------
+# A change to any of these can change every crate's build or tests.
+WORKSPACE_WIDE_FILES = {"Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "deny.toml"}
+WORKSPACE_WIDE_DIRS = (".cargo/", ".github/")
+# Files outside a crate that crates' tests read (include_str!, CARGO_MANIFEST_DIR/../..): the crates
+# whose tests they are. Found by grep; a new reader of a new path is the lane's blind spot until it is
+# listed here, which is why a path that is in neither list leaves the lane.
+EXTERNAL_READERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    # config templates parsed by the services' config tests, and ops' exporter template
+    ("deploy/templates/", ("signer", "ingress", "settle", "ops")),
+    # core-binding's t037_05 reads every runbook; ops/tests/alerts.rs checks the ones alerts name exist
+    ("ops/runbooks/", ("core-binding", "ops")),
+    # verify/src/rpc.rs reads contracts/settlement/src/lib.rs
+    ("contracts/settlement/", ("verify",)),
+)
+# Where the agents workspace's checks are the only ones that read: tools/cipherclerk-patched.sh builds
+# from proposals/cipherclerk.
+AGENTS_PREFIXES = ("agents/", "proposals/cipherclerk/")
+AGENTS_FILES = {"tools/cipherclerk-patched.sh"}
+# Paths whose tests are the whole suite or the conformance gate, not a crate's: not for the lane.
+OUT_OF_LANE = ("SPEC.md", "amendments/", "agents/core/src/lib.rs")
+# Prose that nothing reads.
+PROSE_DIRS = ("docs/", "notes/")
+PACKAGE_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def workspace_members(repo: Path, rev: str) -> dict[str, str]:
+    """{member directory: package name} of the root workspace at `rev`."""
+    ws = tomllib.loads(_blob(repo, rev, "Cargo.toml"))["workspace"]
+    return {d: tomllib.loads(_blob(repo, rev, f"{d}/Cargo.toml"))["package"]["name"] for d in ws["members"]}
+
+
+def under(path: str, directory: str) -> bool:
+    return path == directory or path.startswith(directory.rstrip("/") + "/")
+
+
+def hotfix_scope(paths: list[str], members: dict[str, str]) -> tuple[str, bool, list[str]]:
+    """(arguments for `cargo test`, whether the agents workspace is touched, the paths no check owns).
+
+    Fails closed: a path is owned only by a rule above; any other is returned for the caller to
+    refuse."""
+    names = set(members.values())
+    for _, crates in EXTERNAL_READERS:
+        if not set(crates) <= names:
+            raise ValueError(f"EXTERNAL_READERS names a crate the workspace does not have: {crates}")
+    crates: set[str] = set()
+    agents = False
+    wide = False
+    unowned: list[str] = []
+    for path in paths:
+        if any(under(path, d) for d in OUT_OF_LANE):
+            unowned.append(path)
+            continue
+        owned = False
+        if path in WORKSPACE_WIDE_FILES or path.startswith(WORKSPACE_WIDE_DIRS):
+            wide = owned = True
+        if path in AGENTS_FILES or path.startswith(AGENTS_PREFIXES):
+            agents = owned = True
+        for prefix, readers in EXTERNAL_READERS:
+            if under(path, prefix):
+                crates.update(readers)
+                owned = True
+        member = max((d for d in members if under(path, d)), key=len, default=None)
+        if member is not None:
+            crates.add(members[member])
+            owned = True
+        if path.startswith(PROSE_DIRS):
+            owned = True
+        if not owned:
+            unowned.append(path)
+    if wide or any(not PACKAGE_NAME.fullmatch(c) for c in crates):
+        args = "--workspace"
+    else:
+        args = " ".join(f"-p {c}" for c in sorted(crates))
+    return args, agents, unowned
+
+
+def hotfix(repo: Path, event: dict, repository: str, api: Api, authors: str, main_tip: str) -> Decision:
+    pr = event["pull_request"]
+    allowed = {a.strip() for a in authors.split(",") if a.strip()}
+    if not allowed:
+        return Decision(FULL, "hotfix/ branch, but the variable HOTFIX_AUTHORS is empty: the lane is closed")
+    # The opener AND whoever pushed this run's commit: a later push by someone else is not the owner's go.
+    sender = (event.get("sender") or {}).get("login")
+    for who, login in (("opened by", pr["user"]["login"]), ("pushed by", sender)):
+        if login not in allowed:
+            return Decision(FULL, f"hotfix/ branch {who} {login}, who is not in HOTFIX_AUTHORS")
+    labels = {label["name"] for label in api(f"repos/{repository}/issues/{pr['number']}/labels?per_page=100")}
+    if "hotfix" not in labels:
+        return Decision(FULL, "hotfix/ branch without the `hotfix` label (add it, then close and reopen the pull request)")
+    paths = [p for p in git(repo, "diff", "--name-only", "--no-renames", "-z", main_tip, "HEAD").split("\0") if p]
+    args, agents, unowned = hotfix_scope(paths, workspace_members(repo, "HEAD"))
+    if unowned:
+        return Decision(
+            FULL,
+            f"hotfix/ branch, but the lane does not cover {len(unowned)} path(s), e.g. {unowned[0]}: "
+            "no test of a named crate is known to read them",
+        )
+    return Decision(
+        HOTFIX,
+        f"hotfix lane for {sender}: rustfmt, clippy, cargo test ({args or 'no crate'})"
+        f"{', agents workspace' if agents else ''}. The full suite runs on the push to main",
+        test_args=args,
+        agents="true" if agents else "false",
+    )
+
+
+# --------------------------------------------------------------------------------------------------
 # The decision.
 # --------------------------------------------------------------------------------------------------
-def classify(repo: Path, event_name: str, event: dict, repository: str, api: Api) -> tuple[str, str]:
-    """(mode, reason). Raises on anything unexpected: `decide` turns that into `full`."""
+def classify(
+    repo: Path, event_name: str, event: dict, repository: str, api: Api, hotfix_authors: str = ""
+) -> Decision:
+    """Raises on anything unexpected: `decide` turns that into `full`."""
+    r = _classify(repo, event_name, event, repository, api, hotfix_authors)
+    return r if isinstance(r, Decision) else Decision(*r)
+
+
+def _classify(
+    repo: Path, event_name: str, event: dict, repository: str, api: Api, hotfix_authors: str
+) -> Decision | tuple[str, str]:
     if event_name != "pull_request":
         return FULL, f"{event_name} is not a pull request: nothing is skipped"
     pr = event["pull_request"]
@@ -337,6 +473,9 @@ def classify(repo: Path, event_name: str, event: dict, repository: str, api: Api
             f"{commit[:12]} but for versions, and that commit's push run passed ({url})"
         )
 
+    if head_ref.startswith("hotfix/"):
+        return hotfix(repo, event, repository, api, hotfix_authors, main_tip)
+
     if head_ref == "develop":
         if not versions_agree(repo, "HEAD"):
             return FULL, "promotion: Cargo.toml, openapi.json and the manifest do not agree on the version"
@@ -353,36 +492,40 @@ def classify(repo: Path, event_name: str, event: dict, repository: str, api: Api
             f"run ({asked} candidate(s) asked)"
         )
 
-    return FULL, f"{head_ref} is neither a release-please branch nor develop"
+    return FULL, f"{head_ref} is neither a release-please branch, a hotfix branch nor develop"
 
 
-def decide(repo: Path, event_name: str, event_path: str | None, repository: str, api: Api) -> tuple[str, str]:
+def decide(
+    repo: Path, event_name: str, event_path: str | None, repository: str, api: Api, hotfix_authors: str = ""
+) -> Decision:
     try:
         event = json.loads(Path(event_path).read_text()) if event_path else {}
-        return classify(repo, event_name, event, repository, api)
+        return classify(repo, event_name, event, repository, api, hotfix_authors)
     except Exception as e:  # noqa: BLE001 - fail closed on anything at all
-        return FULL, f"could not decide ({type(e).__name__}: {e}): nothing is skipped"
+        return Decision(FULL, f"could not decide ({type(e).__name__}: {e}): nothing is skipped")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--repo", type=Path, default=Path.cwd(), help="the pull request's merge checkout")
     args = parser.parse_args()
-    mode, reason = decide(
+    d = decide(
         args.repo,
         os.environ.get("GITHUB_EVENT_NAME", ""),
         os.environ.get("GITHUB_EVENT_PATH"),
         os.environ.get("GITHUB_REPOSITORY", ""),
         gh_api,
+        os.environ.get("HOTFIX_AUTHORS", ""),
     )
-    reason = " ".join(reason.split())  # one line: it is written to $GITHUB_OUTPUT
-    print(f"mode={mode}\nreason={reason}")
+    reason = " ".join(d.reason.split())  # one line: it is written to $GITHUB_OUTPUT
+    lines = f"mode={d.mode}\nreason={reason}\ntest_args={d.test_args}\nagents={d.agents}\n"
+    print(lines, end="")
     if out := os.environ.get("GITHUB_OUTPUT"):
         with open(out, "a") as f:
-            f.write(f"mode={mode}\nreason={reason}\n")
+            f.write(lines)
     if summary := os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(summary, "a") as f:
-            f.write(f"### Tested tree: `{mode}`\n\n{reason}\n")
+            f.write(f"### Tested tree: `{d.mode}`\n\n{reason}\n")
     return 0
 
 

@@ -159,7 +159,7 @@ env:
 
 jobs:
   # Whether this pull request's tree has been tested already (tools/ci/tested-tree.py; ci.yml has the
-  # same job): then the jobs below run nothing. The judge is the BASE's copy of the script and the
+  # same job): then the jobs below run nothing (the same in the hotfix lane, whose fast subset is ci.yml's). The judge is the BASE's copy of the script and the
   # action (the workspace is the base's checkout, the merge is judged beside it in pr/): a pull
   # request does not judge itself, and a base without the gate gets no skip. Only on a pull request,
   # and with `contents: read` alone, because this workflow is also called by a release, whose jobs
@@ -189,13 +189,15 @@ jobs:
       - id: tree
         if: hashFiles('.github/actions/tested-tree/action.yml') != '' && hashFiles('tools/ci/tested-tree.py') != ''
         uses: ./.github/actions/tested-tree
+        with:
+          hotfix-authors: ${{ vars.HOTFIX_AUTHORS }}
 
   services:
     name: ingress, settle, ops, signer
     # Pull requests, releases and dispatches; never a plain push to main (only the sidecar's), and
     # never a dispatch for a core on a genesis.
     needs: gate
-    if: ${{ !cancelled() && needs.gate.outputs.mode != 'skip' && (inputs.version != '' || github.event_name != 'push') && inputs.genesis_image == '' }}
+    if: ${{ !cancelled() && !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) && (inputs.version != '' || github.event_name != 'push') && inputs.genesis_image == '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -430,7 +432,7 @@ jobs:
   core:
     name: core (VOS Agent)
     needs: gate
-    if: ${{ !cancelled() && needs.gate.outputs.mode != 'skip' && (inputs.version != '' || github.event_name != 'push') && inputs.genesis_image == '' }}
+    if: ${{ !cancelled() && !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) && (inputs.version != '' || github.event_name != 'push') && inputs.genesis_image == '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
@@ -559,7 +561,7 @@ jobs:
     name: core on genesis
     needs: gate
     if: >-
-      ${{ !cancelled() && needs.gate.outputs.mode != 'skip' && (github.event_name == 'pull_request'
+      ${{ !cancelled() && !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) && (github.event_name == 'pull_request'
       || github.event_name == 'workflow_dispatch' && inputs.genesis_image != '') }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -909,7 +911,7 @@ jobs:
   sidecar:
     name: sidecar (GHCR)
     needs: gate
-    if: ${{ !cancelled() && needs.gate.outputs.mode != 'skip' && inputs.genesis_image == '' }}
+    if: ${{ !cancelled() && !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) && inputs.genesis_image == '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
