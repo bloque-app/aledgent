@@ -157,6 +157,11 @@ jobs:
       && vars.RELEASE_REBUILD != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # A tooling failure here (crane's download, say) builds the images and does not mark the run
+    # failed: `images` keys off the `promoted` output, which a failed job leaves empty. The
+    # script's tests run on every pull request (release-checks.yml), not here, to keep a hotfix's
+    # release, which always builds, from waiting on them.
+    continue-on-error: true
     permissions:
       contents: read
       # The release workflow's run on develop at the source commit is the evidence of a pre-release.
@@ -198,8 +203,6 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: The tests of the promotion
-        run: python3 tools/release/test-promote-images.py
       - id: promote
         env:
           GH_TOKEN: ${{ github.token }}

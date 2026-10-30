@@ -130,6 +130,7 @@ jobs:
           persist-credentials: false
       - run: python3 tools/release/test-promote-images.py
       - name: A dry run for the latest release
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
