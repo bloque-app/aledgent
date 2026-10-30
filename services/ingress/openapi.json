@@ -6168,7 +6168,7 @@
   "info": {
     "description": "The command and query surfaces of aledgent (CTR-CMD, CTR-QRY) and its notifications (CTR-EVT). Amounts are decimal-integer strings of minor units. Identifiers are did:aledgent strings. Times are milliseconds since the Unix epoch. Every route requires a bearer credential, except the two under /v1/auth, which check what their body carries (F-028).",
     "title": "aledgent-ingress",
-    "version": "0.1.2"
+    "version": "0.4.0"
   },
   "openapi": "3.1.0",
   "paths": {

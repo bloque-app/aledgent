@@ -112,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "aledgent-e2e-driver"
-version = "0.1.2"
+version = "0.4.0"
 dependencies = [
  "authn",
  "axum",
@@ -131,7 +131,7 @@ dependencies = [
 
 [[package]]
 name = "aledgent-sidecar"
-version = "0.1.2"
+version = "0.4.0"
 dependencies = [
  "authn",
  "axum",
@@ -569,7 +569,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "audit-store"
-version = "0.1.2"
+version = "0.4.0"
 dependencies = [
  "cipher-clerk",
  "ledger-core",
@@ -579,7 +579,7 @@ dependencies = [
 
 [[package]]
 name = "authn"
-version = "0.1.2"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "blake2",
@@ -1562,7 +1562,7 @@ dependencies = [
 
 [[package]]
 name = "conformance"
-version = "0.1.2"
+version = "0.4.0"
 dependencies = [
  "cipher-clerk",
  "core-binding",
@@ -1649,7 +1649,7 @@ dependencies = [
 
 [[package]]
 name = "core-archive"
-version = "0.1.2"
+version = "0.4.0"
 dependencies = [
  "age",
  "base64 0.22.1",
@@ -2885,7 +2885,7 @@ dependencies = [
 
 [[package]]
 name = "guest-heap"
-version = "0.1.2"
+version = "0.4.0"
 
 [[package]]
 name = "h2"
@@ -3470,7 +3470,7 @@ dependencies = [
 
 [[package]]
 name = "ingress"
-version = "0.1.2"
+version = "0.4.0"
 dependencies = [
  "audit-store",
  "authn",
@@ -4324,7 +4324,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "ops"
-version = "0.1.2"
+version = "0.4.0"
 dependencies = [
  "audit-store",
  "axum",
@@ -5033,7 +5033,7 @@ dependencies = [
 
 [[package]]
 name = "recovery"
-version = "0.1.2"
+version = "0.4.0"
 dependencies = [
  "cipher-clerk",
  "ledger-core",
@@ -5880,7 +5880,7 @@ dependencies = [
 
 [[package]]
 name = "settle"
-version = "0.1.2"
+version = "0.4.0"
 dependencies = [
  "axum",
  "blake2",
@@ -6024,7 +6024,7 @@ dependencies = [
 
 [[package]]
 name = "signer"
-version = "0.1.2"
+version = "0.4.0"
 dependencies = [
  "aws-config",
  "aws-credential-types",
