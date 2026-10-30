@@ -334,7 +334,7 @@ mod tests {
     }
 
     #[test]
-    fn every_shape_is_cipher_clerks_wire_form() {
+    fn req_ds_3_every_shape_is_cipher_clerks_wire_form() {
         let (sk, pk) = clerk();
         let root = [5u8; 32];
         let p =

@@ -17,7 +17,7 @@ fn root(book: &Book<MemStore, MemVault>) -> [u8; 32] {
 }
 
 #[test]
-fn bootstrap_writes_one_journal_as_commit_zero() {
+fn inv_25_bootstrap_writes_one_journal_as_commit_zero() {
     let book = mem_book();
     assert_eq!(book.last_committed().unwrap(), Some(0));
     assert_eq!(book.vault().last_committed(), Some(0));
@@ -35,7 +35,7 @@ fn inv_25_a_second_bootstrap_is_refused() {
 }
 
 #[test]
-fn applied_postings_commit_with_gapless_posting_sequence() {
+fn req_po_2_applied_postings_commit_with_gapless_posting_sequence() {
     let mut book = mem_book();
     fund(&mut book, 100);
     let applied = book
@@ -161,7 +161,7 @@ fn req_rt_3_stamps_equal_one_batch_over_the_whole_unit() {
 }
 
 #[test]
-fn class_insufficient_when_the_plaintext_net_goes_below_zero() {
+fn inv_3_class_insufficient_when_the_plaintext_net_goes_below_zero() {
     let mut book = mem_book();
     fund(&mut book, 100);
     let before = root(&book);
@@ -190,7 +190,7 @@ fn class_insufficient_when_the_plaintext_net_goes_below_zero() {
 }
 
 #[test]
-fn fault_oracle_when_the_kernel_refuses_a_net_the_vault_says_is_not_negative() {
+fn req_er_2_fault_oracle_when_the_kernel_refuses_a_net_the_vault_says_is_not_negative() {
     let mut book = mem_book();
     fund(&mut book, 100);
     let before = root(&book);
@@ -395,7 +395,7 @@ fn class_duplicate_and_req_ker_6_a_repeated_posting_is_refused_for_ever() {
 }
 
 #[test]
-fn class_duplicate_covers_both_kernel_statuses() {
+fn req_ker_6_class_duplicate_covers_both_kernel_statuses() {
     for status in [
         EventStatus::ExternalIdAlreadyUsed,
         EventStatus::TransferIdAlreadyExists,
@@ -476,7 +476,7 @@ fn req_po_3_a_mirror_voids_its_original_once() {
 }
 
 #[test]
-fn class_closed_for_a_closed_debit_or_credit_account() {
+fn err_account_closed_class_closed_for_a_closed_debit_or_credit_account() {
     let mut book = mem_book();
     fund(&mut book, 100);
     let h = holding(9, 1);
@@ -563,7 +563,7 @@ fn req_ker_10_a_failed_chain_aborts_every_posting_and_drops_its_creations() {
 }
 
 #[test]
-fn fault_kernel_for_any_other_status() {
+fn req_er_2_fault_kernel_for_any_other_status() {
     let mut book = mem_book();
     fund(&mut book, 100);
     let before = root(&book);

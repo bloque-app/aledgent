@@ -459,22 +459,22 @@ fn run_differential(part: u32) {
 }
 
 #[test]
-fn differential_against_the_kernel_reference_part_1() {
+fn inv_1_and_inv_3_differential_against_the_kernel_reference_part_1() {
     run_differential(1);
 }
 
 #[test]
-fn differential_against_the_kernel_reference_part_2() {
+fn inv_1_and_inv_3_differential_against_the_kernel_reference_part_2() {
     run_differential(2);
 }
 
 #[test]
-fn differential_against_the_kernel_reference_part_3() {
+fn inv_1_and_inv_3_differential_against_the_kernel_reference_part_3() {
     run_differential(3);
 }
 
 #[test]
-fn differential_against_the_kernel_reference_part_4() {
+fn inv_1_and_inv_3_differential_against_the_kernel_reference_part_4() {
     run_differential(4);
 }
 

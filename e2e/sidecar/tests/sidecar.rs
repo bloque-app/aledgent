@@ -772,7 +772,7 @@ fn the_sample_configuration_names_one_principal_of_each_role() {
 /// A configuration is checked before anything starts, and every fault names the principal and the
 /// field; no error repeats a token or a `token_env` value.
 #[test]
-fn a_principals_configuration_is_validated_with_clear_errors() {
+fn req_au_8_a_principals_configuration_is_validated_with_clear_errors() {
     let err = |c: &str| parse_principals(c).unwrap_err();
     let one = |p: &str| format!(r#"{{"principals": [{p}]}}"#);
     // A principal of `role` with a test token and `extra` fields.
@@ -1756,7 +1756,8 @@ async fn req_id_6_req_au_5_each_service_acts_within_its_grants_and_is_refused_ou
 /// issuer, holding no grant over the identity, is refused; onboarding, the identities principal,
 /// sees every one.
 #[tokio::test(flavor = "multi_thread")]
-async fn amendment_0026_the_custodian_reads_its_grant_over_an_identity_and_names_it_as_parent() {
+async fn req_rc_7_amendment_0026_the_custodian_reads_its_grant_over_an_identity_and_names_it_as_parent()
+ {
     let s = with_services().await;
     let d = s.describe();
     let custodian = d["service_principals"]["custodian"]["principal"]
@@ -2005,7 +2006,7 @@ async fn f_028_the_sidecar_accepts_passkeys_of_its_relying_party() {
 /// authorises adding the passkey to the user's set, acting for the user. The user then signs in
 /// with it and answers as itself. The custodian, without the role, cannot do the same.
 #[tokio::test(flavor = "multi_thread")]
-async fn amendment_0025_r2_onboarding_registers_a_users_passkey_and_the_user_signs_in() {
+async fn req_au_20_amendment_0025_r2_onboarding_registers_a_users_passkey_and_the_user_signs_in() {
     use authn::webauthn::testing::Soft;
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -2127,7 +2128,7 @@ async fn amendment_0025_r2_onboarding_registers_a_users_passkey_and_the_user_sig
 /// Amendment 0027 over clause R2: a `register` challenge issued for one user serves onboarding's
 /// registration into that user's set only, and once. Bound to user A, it is refused for user B.
 #[tokio::test(flavor = "multi_thread")]
-async fn amendment_0027_a_challenge_bound_to_one_user_does_not_register_on_another() {
+async fn req_au_20_amendment_0027_a_challenge_bound_to_one_user_does_not_register_on_another() {
     use authn::webauthn::testing::Soft;
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -2217,7 +2218,7 @@ async fn amendment_0027_a_challenge_bound_to_one_user_does_not_register_on_anoth
 /// custody, which reaches both users' accounts; ingress's own test isolates the grant over the
 /// identity.
 #[tokio::test(flavor = "multi_thread")]
-async fn amendment_0028_the_custodian_reads_the_owner_of_an_account_opened_for_its_user() {
+async fn req_rc_7_amendment_0028_the_custodian_reads_the_owner_of_an_account_opened_for_its_user() {
     let s = with_services().await;
     let d = s.describe();
     let custodian = d["service_principals"]["custodian"]["principal"]
