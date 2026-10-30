@@ -349,6 +349,35 @@ class Classify(Base):
         d = tt.decide(self.r.root, "pull_request", str(path), "o/r", fake_api({tested}, main_latest=tested))
         self.assertEqual(d[0], "skip", d[1])
 
+    def promoted_main(self):
+        """main = base + a promotion merge of a develop branch with one tested commit, as after a promotion."""
+        self.r.git("checkout", "-q", "-b", "develop")
+        tested = self.r.commit({"crates/a/src/lib.rs": "pub fn g() {}\n"}, "tested feature")
+        self.r.git("checkout", "-q", "main")
+        self.r.git("merge", "-q", "--no-ff", "-m", "promote develop", "develop")
+        return tested
+
+    def release_pr_on(self, api):
+        self.r.git("checkout", "-q", "-b", "pr", "main")
+        self.r.commit(release_bump("0.1.0", "0.2.0"))
+        self.r.git("checkout", "-q", "main")
+        _, head = self.r.merge("pr")
+        path = self.r.root / "event.json"
+        path.write_text(json.dumps(event("release-please--x", head)))
+        return tt.decide(self.r.root, "pull_request", str(path), "o/r", api)
+
+    def test_after_a_promotion_the_tested_develop_tip_is_the_proof(self):
+        # main's tip is the merge commit and has no run yet; its second parent had one
+        tested = self.promoted_main()
+        d = self.release_pr_on(fake_api({tested}, main_latest=tested))
+        self.assertEqual(d[0], "skip", d[1])
+
+    def test_a_hotfix_on_top_of_a_promotion_is_not_proven_by_it(self):
+        tested = self.promoted_main()
+        self.r.commit({"crates/a/src/hotfix.rs": "pub fn hotfix() {}\n"}, "hotfix on main")
+        d = self.release_pr_on(fake_api({tested}, main_latest=tested))
+        self.assertEqual(d[0], "full", d[1])
+
     def test_the_name_is_not_the_proof_and_a_version_only_diff_is_not_enough_on_another_branch(self):
         self.assertEqual(self.mode("feat/bump", release_bump("0.1.0", "0.2.0")), "full")
 

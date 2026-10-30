@@ -16,8 +16,10 @@ Prints and writes to $GITHUB_OUTPUT one of two modes:
   (a) a release-please pull request (head branch `release-please--*`) whose merge changes nothing
       but versions and the changelog (version-only, below), on a `main` whose tip is proven: a push
       run of `.github/workflows/ci.yml` finished with every required job successful on the tip, or
-      on an ancestor whose tree is the tip's but for versions, and the latest finished push run on
-      `main` did not fail. A tip whose run is still going, or red, is not proven: `full`.
+      on an ancestor (the develop tip a promotion merged, say) whose tree is the tip's but for
+      versions, and the latest finished push run on `main` did not fail. A tip whose run is still
+      going, or red, and no such ancestor: not proven, `full`. The gate decides when its run starts:
+      after a hotfix, re-run the release pull request's checks once `main`'s run is green.
   (b) the promotion `develop` -> `main` whose merge result is, but for version-only differences, the
       tree of a `develop` commit D whose own push run of ci.yml finished with every required job
       successful. A pull request's own run is not evidence: a skipped run reports success, and a skip
@@ -320,7 +322,10 @@ def classify(repo: Path, event_name: str, event: dict, repository: str, api: Api
             return FULL, f"{head_ref}: Cargo.toml, openapi.json and the manifest do not agree on the version"
         if latest_main_run_failed(api, repository):
             return FULL, "the latest finished push run of ci.yml on main did not pass: main is not proven"
-        walk = git(repo, "rev-list", "--first-parent", f"-n{MAX_WALK}", main_tip).split()
+        # Every ancestor, not the first-parent line: main's tip is usually the promotion's merge
+        # commit, whose second parent is the develop tip that was tested. Whatever ancestor is
+        # accepted must have main's tree but for versions, and a passed push run of its own.
+        walk = git(repo, "rev-list", f"-n{MAX_WALK}", main_tip).split()
         commit, url, asked = tested_commit(repo, api, repository, walk, main_tip, released)
         if commit is None:
             return FULL, (
