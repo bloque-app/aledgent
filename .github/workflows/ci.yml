@@ -166,35 +166,77 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
-  test:
-    name: tests
+  # The required check `tests` is the aggregate below; the work is split in shards that run in
+  # parallel, each on a runner of its own. They were one serial job, 40 to 60 minutes. A shard is a
+  # group of the cargo invocations that job ran, unchanged: the workspace run (the default roots, v2),
+  # the v1 roots run, and the three feature runs. Every shard has the same skip and hotfix paths: a
+  # shard that has nothing to do in the mode reports success.
+  test-shards:
+    name: tests (${{ matrix.shard }})
     needs: gate
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [workspace, v1-roots, features]
     steps:
-      - name: skipped, the tree is already tested
-        if: needs.gate.outputs.mode == 'skip'
+      # What this shard does in the gate's mode: `skip` nothing; `hotfix` the workspace shard alone
+      # (the lane's crates and scanners, below); anything else, empty included, everything. An empty
+      # mode (the gate failed or was skipped) is a full run, never a skip.
+      - name: plan
+        id: plan
         env:
+          MODE: ${{ needs.gate.outputs.mode }}
           REASON: ${{ needs.gate.outputs.reason }}
-        run: echo "::notice::$REASON"
-      - uses: actions/checkout@v4
-        if: needs.gate.outputs.mode != 'skip'
-      # Toolchains the runner image ships and this workspace never uses (#59).
-      - name: free runner disk
-        if: needs.gate.outputs.mode != 'skip'
+          SHARD: ${{ matrix.shard }}
         run: |
-          df -h /
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
-          df -h /
+          run=true; full=true; hotfix=false
+          case "$MODE" in
+            skip) run=false; full=false; echo "::notice::skipped, the tree is already tested: $REASON" ;;
+            hotfix)
+              full=false
+              if [ "$SHARD" = workspace ]; then hotfix=true; else run=false; fi ;;
+          esac
+          { echo "run=$run"; echo "full=$full"; echo "hotfix=$hotfix"; } >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        if: steps.plan.outputs.run == 'true'
+      # The runner is 4 vCPU, 15 GB of memory and a 145 GB disk with 86 GB free (measured 2026-10-30, the
+      # run of #110); the workspace's build and tests peak under 40 GB. Freeing the toolchains the image
+      # ships (dotnet, android, ghc, CodeQL; #59, when the disk was 14 GB) took 45 to 120 s of every
+      # run and is no longer needed. The `df` after the tests below shows the margin.
+      - name: runner
+        if: steps.plan.outputs.run == 'true'
+        run: nproc; free -g | head -2; df -h /
       - uses: dtolnay/rust-toolchain@stable
-        if: needs.gate.outputs.mode != 'skip'
+        if: steps.plan.outputs.run == 'true'
         with:
           components: rustfmt, clippy
+      # Two caches: the workspace shard's (the features shard restores it, and builds what it lacks) and
+      # the v1 shard's, whose dependencies are built with other features (4 minutes more without it).
+      # Saved only on main (the push and the nightly run): a cache saved on the default branch is the
+      # one every branch and pull request restores. Saved by pull requests and develop it was a
+      # 1 GB copy per pull request, the repository's cache budget is 10 GB and was over (10.7 GB on
+      # 2026-10-30), and the entry main had saved was evicted within hours, so most main pushes and
+      # the first run of a pull request built every dependency (13 to 16 minutes).
       - uses: Swatinem/rust-cache@v2
-        if: needs.gate.outputs.mode != 'skip'
+        if: steps.plan.outputs.run == 'true'
+        with:
+          shared-key: ${{ matrix.shard == 'v1-roots' && 'tests-v1' || 'tests' }}
+          save-if: ${{ matrix.shard != 'features' && github.ref == 'refs/heads/main' }}
+      # The v1 shard runs on cargo-nextest, which runs the tests of all binaries in one pool instead of
+      # one binary after another (cargo test): its test phase went from about 8 to about 3 minutes.
+      # The workspace shard stays on `cargo test`: nextest there failed 2 runs of 6, each on another
+      # timer-driven test of the services (a ratio of wall times, a race against a background task),
+      # which `cargo test` never had to share the machine for. .config/nextest.toml has the details.
+      # nextest cannot run doctests, so `cargo test --doc` follows it.
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        if: steps.plan.outputs.full == 'true' && matrix.shard == 'v1-roots'
+        with:
+          tool: nextest
       # Property tests run 1,000 cases on pull requests and their full 10,000 on main and nightly.
       - name: property-test strength
-        if: needs.gate.outputs.mode != 'skip'
+        if: steps.plan.outputs.run == 'true'
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then n=1000; else n=10000; fi
           # F007_WALKS is not reduced: it asserts that the walks reach every edge, and runs in seconds.
@@ -202,30 +244,38 @@ jobs:
             echo "$v=$n" >> "$GITHUB_ENV"
           done
           echo "property tests at $n cases"
+
+      # --- workspace shard ---
       # F-009's PostgreSQL received-log is tested against a real server in a container
       # (testcontainers): the runner's Docker must be up. Under CI a missing Docker fails those
-      # tests rather than skipping them.
+      # tests rather than skipping them. Only the workspace run has such tests (ops, ingress and
+      # settle); the other shards need neither Docker nor the images.
       - run: docker info --format '{{.ServerVersion}}'
-        if: needs.gate.outputs.mode != 'skip'
+        if: steps.plan.outputs.run == 'true' && matrix.shard == 'workspace'
       # The test containers' Postgres images come from ECR Public's mirror of the official image,
       # tagged under the names testcontainers asks for, so it never pulls from Docker Hub: GitHub's
       # runners share IPs and hit Docker Hub's anonymous pull limit (`toomanyrequests`, 2026-10-09).
       - name: Postgres images from ECR Public
-        if: needs.gate.outputs.mode != 'skip'
+        if: steps.plan.outputs.run == 'true' && matrix.shard == 'workspace'
         run: |
-          # Retries, then leaves the image to testcontainers (Docker Hub) if ECR Public is down, so a
+          # In parallel, one retry: ECR Public's own limit (`toomanyrequests: Data limit exceeded`) is
+          # a quota, so waiting longer does not lift it (it cost two minutes of sleeps on half the
+          # runs). Then the image is left to testcontainers (Docker Hub) if ECR Public is down, so a
           # mirror glitch never fails the job by itself.
           for t in 11-alpine 16-alpine; do
-            for i in 1 2 3; do
-              docker pull -q public.ecr.aws/docker/library/postgres:$t \
-                && docker tag public.ecr.aws/docker/library/postgres:$t postgres:$t && break
-              echo "::warning::ECR Public pull of postgres:$t failed (attempt $i)"; sleep $((i * 10))
-            done
+            (
+              for i in 1 2; do
+                docker pull -q public.ecr.aws/docker/library/postgres:$t \
+                  && docker tag public.ecr.aws/docker/library/postgres:$t postgres:$t && exit 0
+                echo "::warning::ECR Public pull of postgres:$t failed (attempt $i)"; sleep 5
+              done
+            ) &
           done
+          wait
       # The hotfix lane (ops/runbooks/release/hotfix.md): only the crates the diff touches, instead of
       # the workspace and the feature runs below; the full suite runs on the push to main.
       - name: tests of the crates the diff touches (hotfix lane)
-        if: needs.gate.outputs.mode == 'hotfix' && needs.gate.outputs.test_args != ''
+        if: steps.plan.outputs.hotfix == 'true' && needs.gate.outputs.test_args != ''
         env:
           TEST_ARGS: ${{ needs.gate.outputs.test_args }}
         run: |
@@ -237,38 +287,61 @@ jobs:
       # services and ops; core-binding's upgrade_authority (T-037-05) reads ledger-core, core-binding
       # and agents/core-host, and the runbooks.
       - name: cross-crate policy scanners (hotfix lane)
-        if: needs.gate.outputs.mode == 'hotfix'
+        if: steps.plan.outputs.hotfix == 'true'
         run: |
           cargo test -p ledger-core --test privileged_reads
           cargo test -p core-binding --test upgrade_authority
       - run: cargo test --workspace
-        if: ${{ !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
+        if: steps.plan.outputs.full == 'true' && matrix.shard == 'workspace'
+
+      # --- features shard ---
       # F-005, F-031: ingress over the core Agent (AgentCore) needs core-binding's `ingress`
       # feature, which nothing in the workspace enables, so `--workspace` skips these tests.
       - run: cargo test -p core-binding --features ingress --test agent_core
-        if: ${{ !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
+        if: steps.plan.outputs.full == 'true' && matrix.shard == 'features'
       # F-034 (an experiment): native decide, VOS verify, behind the shards crate's flag.
       - run: cargo test -p shards --features native-decide --test native_decide
-        if: ${{ !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
+        if: steps.plan.outputs.full == 'true' && matrix.shard == 'features'
+      # The cross-host relay (an experiment, feature net): hosts in threads and as processes.
+      - run: cargo test -p shards --features net --test multihost
+        if: steps.plan.outputs.full == 'true' && matrix.shard == 'features'
+
+      # --- v1-roots shard ---
       # DEC-25, owner ruling cs-q04: v1 roots are a supported opt-in. The crates with a root version,
-      # built with v1 (the default run above is v2, and its differential already runs every unit
+      # built with v1 (the workspace shard runs v2, and its differential already runs every unit
       # under both versions). The conformance suite from a v1 genesis is its own job below. The
       # code-history gate (T-037-12) is skipped by name: its recorded book is a v2 book, which a v1
       # build founds differently, and it fails loudly if run here (code-history.yml runs it, in v2).
       - name: v1 roots (supported opt-in)
-        if: ${{ !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
+        if: steps.plan.outputs.full == 'true' && matrix.shard == 'v1-roots'
         env:
           LEDGER_KERNEL_DIFF_CASES: "1000"
-        run: >-
-          cargo test -p compact-smt -p ledger-kernel -p ledger-core -p leaf-store -p core-binding -p shards
-          --features compact-smt/v1,ledger-kernel/smt-v1,ledger-core/smt-v1,leaf-store/smt-v1,core-binding/smt-v1,core-binding/ingress,shards/smt-v1
-          -- --skip t037_12_
-      # The cross-host relay (an experiment, feature net): hosts in threads and as processes.
-      - run: cargo test -p shards --features net --test multihost
-        if: ${{ !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
+          V1_PACKAGES: -p compact-smt -p ledger-kernel -p ledger-core -p leaf-store -p core-binding -p shards
+          V1_FEATURES: compact-smt/v1,ledger-kernel/smt-v1,ledger-core/smt-v1,leaf-store/smt-v1,core-binding/smt-v1,core-binding/ingress,shards/smt-v1
+        run: |
+          # shellcheck disable=SC2086
+          cargo nextest run $V1_PACKAGES --features "$V1_FEATURES" --no-fail-fast -E 'not test(/t037_12_/)'
+          # shellcheck disable=SC2086
+          cargo test $V1_PACKAGES --features "$V1_FEATURES" --doc -- --skip t037_12_
       - name: disk left after the tests
-        if: ${{ always() && needs.gate.outputs.mode != 'skip' }}
+        if: ${{ always() && steps.plan.outputs.run == 'true' }}
         run: df -h /
+
+  # The required check. It passes only if every shard succeeded; a shard that was skipped, cancelled
+  # or failed fails it. `always()`, not `!cancelled()`: an aggregate that is skipped counts as
+  # passing for a required check, and this one must never be.
+  test:
+    name: tests
+    needs: test-shards
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: every shard succeeded
+        env:
+          RESULT: ${{ needs.test-shards.result }}
+        run: |
+          echo "shards: $RESULT"
+          [ "$RESULT" = success ]
 
   # NFR-10, T-005-17: the restore drill of the core Agent, on every change. A deployment whose core
   # Agent (the native transition) streams every decision to its off-node archive is backed up,
