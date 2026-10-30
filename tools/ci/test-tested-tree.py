@@ -26,7 +26,7 @@ tt = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(tt)
 
 CARGO_TOML = """[workspace]
-members = ["crates/a"]
+members = ["crates/a", "crates/b", "crates/core-binding", "crates/verify", "services/signer", "services/ingress", "services/settle", "ops"]
 
 [workspace.package]
 version = "{v}"
@@ -67,6 +67,10 @@ RELEASE_CONFIG = {
 }
 
 
+MEMBERS = ["crates/a", "crates/b", "crates/core-binding", "crates/verify", "services/signer",
+           "services/ingress", "services/settle", "ops"]
+
+
 def files(v: str = "0.1.0") -> dict[str, str]:
     openapi = json.loads(json.dumps(OPENAPI).replace("{v}", v))
     return {
@@ -79,6 +83,7 @@ def files(v: str = "0.1.0") -> dict[str, str]:
         "CHANGELOG.md": f"# Changelog\n\n## {v}\n",
         "crates/a/src/lib.rs": "pub fn f() {}\n",
         ".github/workflows/ci.yml": "name: CI\n",
+        **{f"{d}/Cargo.toml": f'[package]\nname = "{d.rsplit("/", 1)[-1]}"\nversion.workspace = true\n' for d in MEMBERS},
     }
 
 
@@ -123,9 +128,13 @@ def release_bump(v_old: str, v_new: str) -> dict[str, str]:
     return out
 
 
-def event(head_ref: str, head_sha: str, base_ref: str = "main", fork: bool = False) -> dict:
+def event(head_ref: str, head_sha: str, base_ref: str = "main", fork: bool = False,
+          user: str = "pablo", sender: str | None = None) -> dict:
     return {
+        "sender": {"login": sender or user},
         "pull_request": {
+            "number": 7,
+            "user": {"login": user},
             "base": {"ref": base_ref, "repo": {"full_name": "o/r"}},
             "head": {
                 "ref": head_ref,
@@ -294,7 +303,7 @@ class Versions(Base):
 
 
 class Classify(Base):
-    def run_pr(self, head_ref: str, changes: dict, api=None, **ev):
+    def run_pr(self, head_ref: str, changes: dict, api=None, authors: str = "", **ev):
         self.r.git("checkout", "-q", "-b", "pr", self.base)
         self.r.commit(changes)
         self.r.git("checkout", "-q", "main")
@@ -303,15 +312,15 @@ class Classify(Base):
         path.write_text(json.dumps(event(head_ref, head, **ev)))
         # by default, main's tip has a passed push run, and it is main's latest
         api = api or fake_api({self.base}, main_latest=self.base)
-        return tt.decide(self.r.root, "pull_request", str(path), "o/r", api)
+        return tt.decide(self.r.root, "pull_request", str(path), "o/r", api, authors)
 
     def mode(self, *a, **kw) -> str:
-        return self.run_pr(*a, **kw).__getitem__(0)
+        return self.run_pr(*a, **kw).mode
 
     # (a) release-please
     def test_release_please_version_only_on_a_proven_main_skips(self):
-        mode, why = self.run_pr("release-please--branches--main--components--aledgent", release_bump("0.1.0", "0.2.0"))
-        self.assertEqual(mode, "skip", why)
+        d = self.run_pr("release-please--branches--main--components--aledgent", release_bump("0.1.0", "0.2.0"))
+        self.assertEqual(d.mode, "skip", d.reason)
 
     def test_release_please_branch_with_other_changes_runs_everything(self):
         self.assertEqual(self.mode("release-please--branches--main",
@@ -347,7 +356,7 @@ class Classify(Base):
         path = self.r.root / "event.json"
         path.write_text(json.dumps(event("release-please--x", head)))
         d = tt.decide(self.r.root, "pull_request", str(path), "o/r", fake_api({tested}, main_latest=tested))
-        self.assertEqual(d[0], "skip", d[1])
+        self.assertEqual(d.mode, "skip", d.reason)
 
     def promoted_main(self):
         """main = base + a promotion merge of a develop branch with one tested commit, as after a promotion."""
@@ -414,6 +423,178 @@ class Classify(Base):
         self.assertEqual(self.mode("release-please--x", changes), "full")
 
 
+class HotfixScope(unittest.TestCase):
+    members = {"crates/a": "a", "crates/b": "b", "crates/core-binding": "core-binding", "crates/verify": "verify",
+               "services/signer": "signer", "services/ingress": "ingress", "services/settle": "settle", "ops": "ops"}
+
+    excluded = ["agents", "contracts", "spikes", "services/settle/kreivo-pin", "e2e/network"]
+
+    def scope(self, *paths: str):
+        return tt.hotfix_scope(list(paths), self.members, self.excluded)
+
+    def test_a_nested_excluded_workspace_is_not_its_enclosing_members(self):
+        # `-p settle` does not build services/settle/kreivo-pin, which has a job of its own
+        args, agents, unowned = self.scope("services/settle/kreivo-pin/src/lib.rs")
+        self.assertEqual((args, unowned), ("", ["services/settle/kreivo-pin/src/lib.rs"]))
+        self.assertEqual(self.scope("services/settle/src/lib.rs")[:3], ("-p settle", False, []))
+
+    def test_the_crates_the_diff_touches_sorted(self):
+        self.assertEqual(self.scope("crates/b/src/x.rs", "crates/a/src/y.rs", "crates/a/tests/z.rs")[:2], ("-p a -p b", False))
+
+    def test_the_deepest_member_owns_a_path(self):
+        members = {**self.members, "services/settle/inner": "inner"}
+        self.assertEqual(tt.hotfix_scope(["services/settle/inner/src/lib.rs"], members)[0], "-p inner")
+
+    def test_a_readme_in_a_crate_is_that_crates(self):
+        self.assertEqual(self.scope("services/settle/README.md")[0], "-p settle")
+
+    def test_templates_belong_to_the_services_that_include_them(self):
+        self.assertEqual(self.scope("deploy/templates/signer.json")[0], "-p ingress -p ops -p settle -p signer")
+
+    def test_runbooks_belong_to_core_binding_and_ops(self):
+        self.assertEqual(self.scope("ops/runbooks/release/hotfix.md")[0], "-p core-binding -p ops")
+
+    def test_workspace_wide_files_run_the_workspace(self):
+        for path in ("Cargo.lock", "Cargo.toml", "rust-toolchain.toml", ".github/workflows/ci.yml", ".cargo/config.toml"):
+            self.assertEqual(self.scope("crates/a/src/x.rs", path)[0], "--workspace", path)
+
+    def test_prose_runs_no_test_and_is_owned(self):
+        args, agents, unowned = self.scope("docs/x.md", "notes/y.md")
+        self.assertEqual((args, agents, unowned), ("", False, []))
+
+    def test_agents_and_the_patched_cipherclerk_are_the_agents_workspaces(self):
+        for path in ("agents/shard/src/lib.rs", "proposals/cipherclerk/x.patch", "tools/cipherclerk-patched.sh"):
+            args, agents, unowned = self.scope(path)
+            self.assertEqual((args, agents, unowned), ("", True, []), path)
+        self.assertFalse(self.scope("crates/a/src/x.rs")[1])
+
+    def test_unknown_paths_are_unowned(self):
+        for path in ("deploy/docker/core.Dockerfile", "tools/ci/x.sh", "e2e/network/x.rs", "services/settle/kreivo-pin/a.rs".replace("services/settle", "services/other"),
+                     "README.md", "CONTRIBUTING.md", "spikes/x.rs", "contracts/other/x.rs"):
+            self.assertEqual(self.scope(path)[2], [path], path)
+
+    def test_the_spec_the_amendments_and_the_cores_generation_leave_the_lane(self):
+        for path in ("SPEC.md", "amendments/0042-x.md", "agents/core/src/lib.rs"):
+            self.assertEqual(self.scope(path)[2], [path], path)
+
+    def test_the_settlement_contract_belongs_to_verify(self):
+        self.assertEqual(self.scope("contracts/settlement/src/lib.rs")[0], "-p verify")
+
+    def test_a_package_name_that_is_not_plain_runs_the_workspace(self):
+        self.assertEqual(tt.hotfix_scope(["x/a.rs"], {**self.members, "x": "a; rm -rf /"})[0], "--workspace")
+
+    def test_a_rule_naming_a_crate_the_workspace_lacks_raises(self):
+        with self.assertRaises(ValueError):
+            tt.hotfix_scope(["crates/a/src/x.rs"], {"crates/a": "a"})
+
+
+def commit(author: str | None = "pablo", committer: str | None = "pablo", sha: str = "a" * 40) -> dict:
+    return {"sha": sha, "author": {"login": author} if author else None,
+            "committer": {"login": committer} if committer else None}
+
+
+def labels_api(*names: str, fail: bool = False, commits: list | None = None):
+    """The hotfix lane's API: the labels of pull request 7 and its commits (one, by pablo, by default)."""
+    commits = [commit()] if commits is None else commits
+
+    def api(path: str):
+        if fail:
+            raise OSError("down")
+        if path.startswith("repos/o/r/issues/7/labels"):
+            return [{"name": n} for n in names]
+        if path.startswith("repos/o/r/pulls/7/commits"):
+            return commits
+        raise AssertionError(f"unexpected API call {path}")
+
+    return api
+
+
+class Hotfix(Classify):
+    def hotfix(self, changes, api=None, head_ref="hotfix/fix-it", authors="pablo, agent", **ev):
+        return self.run_pr(head_ref, changes, api or labels_api("hotfix"), authors, **ev)
+
+    def test_a_labelled_hotfix_by_an_allowed_author_runs_the_crates_it_touches(self):
+        d = self.hotfix({"crates/a/src/lib.rs": "pub fn g() {}\n", "services/settle/src/x.rs": "\n"})
+        self.assertEqual((d.mode, d.test_args, d.agents), ("hotfix", "-p a -p settle", "false"), d.reason)
+
+    def test_the_agents_workspace_is_asked_for_only_when_touched(self):
+        d = self.hotfix({"agents/shard/src/lib.rs": "\n"})
+        self.assertEqual((d.mode, d.test_args, d.agents), ("hotfix", "", "true"))
+
+    def test_a_lock_file_change_runs_the_workspace(self):
+        d = self.hotfix({"Cargo.lock": files()["Cargo.lock"] + "\n# x\n"})
+        self.assertEqual((d.mode, d.test_args), ("hotfix", "--workspace"))
+
+    def test_one_unowned_path_leaves_the_lane(self):
+        d = self.hotfix({"crates/a/src/lib.rs": "\n", "SPEC.md": "x\n"})
+        self.assertEqual(d.mode, "full")
+        self.assertIn("SPEC.md", d.reason)
+        self.assertEqual(self.hotfix_fresh({"crates/a/src/lib.rs": "\n", "tools/ci/x.sh": "x\n"}).mode, "full")
+
+    def hotfix_fresh(self, changes):
+        # a second pull request in the same repository
+        self.r.git("checkout", "-q", "main")
+        self.r.git("reset", "-q", "--hard", self.base)
+        self.r.git("branch", "-q", "-D", "pr")
+        return self.hotfix(changes)
+
+    def test_another_author_runs_everything(self):
+        self.assertEqual(self.hotfix({"crates/a/src/lib.rs": "\n"}, user="mallory").mode, "full")
+
+    def test_another_pusher_runs_everything(self):
+        d = self.hotfix({"crates/a/src/lib.rs": "\n"}, user="pablo", sender="mallory")
+        self.assertEqual(d.mode, "full")
+        self.assertIn("pushed by mallory", d.reason)
+
+    def test_an_event_without_a_sender_runs_everything(self):
+        self.r.git("checkout", "-q", "-b", "pr", self.base)
+        self.r.commit({"crates/a/src/lib.rs": "\n"})
+        self.r.git("checkout", "-q", "main")
+        _, head = self.r.merge("pr")
+        ev = event("hotfix/x", head)
+        del ev["sender"]
+        path = self.r.root / "event.json"
+        path.write_text(json.dumps(ev))
+        self.assertEqual(tt.decide(self.r.root, "pull_request", str(path), "o/r", labels_api("hotfix"), "pablo").mode, "full")
+
+    def test_a_commit_of_someone_else_runs_everything(self):
+        # reopening a pull request makes the reopener the sender: the commits are checked too
+        for bad in (commit(author="mallory"), commit(committer="mallory"), commit(committer="web-flow"),
+                    commit(author=None), commit(committer=None)):
+            api = labels_api("hotfix", commits=[commit(), bad])
+            self.r.git("checkout", "-q", "main")
+            self.r.git("reset", "-q", "--hard", self.base)
+            self.r.git("branch", "-q", "-D", "pr") if "pr" in self.r.git("branch", "--format=%(refname:short)").split() else None
+            d = self.hotfix({"crates/a/src/lib.rs": "\n"}, api=api)
+            self.assertEqual(d.mode, "full", (bad, d.reason))
+            self.assertIn("HOTFIX_AUTHORS", d.reason)
+
+    def test_no_commits_or_too_many_to_list_runs_everything(self):
+        self.assertEqual(self.hotfix({"crates/a/src/lib.rs": "\n"}, api=labels_api("hotfix", commits=[])).mode, "full")
+
+    def test_an_empty_allow_list_closes_the_lane(self):
+        self.assertEqual(self.hotfix({"crates/a/src/lib.rs": "\n"}, authors="").mode, "full")
+
+    def test_no_label_runs_everything(self):
+        self.assertEqual(self.hotfix({"crates/a/src/lib.rs": "\n"}, api=labels_api("bug")).mode, "full")
+
+    def test_the_label_on_another_branch_does_nothing(self):
+        self.assertEqual(self.hotfix({"crates/a/src/lib.rs": "\n"}, head_ref="fix/x").mode, "full")
+
+    def test_a_label_lookup_that_fails_runs_everything(self):
+        self.assertEqual(self.hotfix({"crates/a/src/lib.rs": "\n"}, api=labels_api(fail=True)).mode, "full")
+
+    def test_a_fork_runs_everything(self):
+        self.assertEqual(self.hotfix({"crates/a/src/lib.rs": "\n"}, fork=True).mode, "full")
+
+    def test_another_base_runs_everything(self):
+        self.assertEqual(self.hotfix({"crates/a/src/lib.rs": "\n"}, base_ref="develop").mode, "full")
+
+    def test_the_other_modes_ask_for_nothing_to_test(self):
+        d = self.run_pr("release-please--x", release_bump("0.1.0", "0.2.0"))
+        self.assertEqual((d.mode, d.test_args, d.agents), ("skip", "", "false"))
+
+
 class Promotion(Base):
     """develop -> main. main = base + a release (versions); develop = base + features, one tested."""
 
@@ -436,7 +617,7 @@ class Promotion(Base):
     def test_tested_tree_skips_even_though_main_carries_a_release(self):
         self.build()
         d = self.promote(fake_api({self.tested}))
-        self.assertEqual(d[0], "skip", d[1])
+        self.assertEqual(d.mode, "skip", d.reason)
 
     def test_a_failed_required_job_does_not(self):
         self.build()
@@ -457,8 +638,8 @@ class Promotion(Base):
             raise OSError("rate limited")
 
         d = self.promote(boom)
-        self.assertEqual(d[0], "full")
-        self.assertIn("rate limited", d[1])
+        self.assertEqual(d.mode, "full")
+        self.assertIn("rate limited", d.reason)
 
     def test_a_newer_untested_change_does_not(self):
         self.build({"crates/a/src/lib.rs": "pub fn h() {}\n"})
@@ -489,6 +670,16 @@ class Promotion(Base):
 
 
 class Contract(unittest.TestCase):
+    def test_the_lane_always_runs_the_two_cross_crate_scanners(self):
+        # ledger-core's privileged_reads (REQ-PV-4) and core-binding's upgrade_authority (T-037-05) read
+        # the sources of other crates, so a diff elsewhere can break them: the lane runs them whatever
+        # the diff touches.
+        ci = (ROOT / ".github/workflows/ci.yml").read_text()
+        for cmd, file in (("cargo test -p ledger-core --test privileged_reads", "crates/ledger-core/tests/privileged_reads.rs"),
+                          ("cargo test -p core-binding --test upgrade_authority", "crates/core-binding/tests/upgrade_authority.rs")):
+            self.assertIn(cmd, ci)
+            self.assertTrue((ROOT / file).is_file(), file)
+
     def test_every_required_job_is_a_job_of_ci_yml(self):
         ci = (ROOT / ".github/workflows/ci.yml").read_text()
         names = set(re.findall(r"^    name: (.+)$", ci, re.M))

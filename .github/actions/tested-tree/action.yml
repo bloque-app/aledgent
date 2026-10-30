@@ -5,10 +5,14 @@ description: >-
   Decides whether a pull request's heavy checks are redundant (tools/ci/tested-tree.py). The job
   checks out the BASE as the workspace (this action and the script are the base's: a pull request
   does not judge itself) and the pull request's merge, with its full history, beside it; this step
-  needs git, python3 and the job's token, which only has to read workflow runs. Outputs `skip` or `full`; it never fails
+  needs git, python3 and the job's token, which only has to read workflow runs. Outputs `skip`, `hotfix` or `full`; it never fails
   the job on a doubt, it says `full`.
 
 inputs:
+  hotfix-authors:
+    description: "Logins (comma-separated) who may open and push hotfix/* pull requests of the hotfix lane: the repository variable HOTFIX_AUTHORS. Empty: the lane is closed."
+    required: false
+    default: ""
   repo:
     description: "The directory holding the pull request's merge checkout (the workspace is the BASE: this action and tools/ci/ are the base's, never the pull request's)."
     required: false
@@ -16,8 +20,14 @@ inputs:
 
 outputs:
   mode:
-    description: "skip: the heavy checks run no step and report success. full: they run."
+    description: "skip: the heavy checks run no step and report success. hotfix: the fast subset runs. full: they run."
     value: ${{ steps.decide.outputs.mode }}
+  test_args:
+    description: "hotfix only: the arguments of `cargo test` (-p crate ..., --workspace, or empty for none)."
+    value: ${{ steps.decide.outputs.test_args }}
+  agents:
+    description: "hotfix only: true when the diff touches the agents workspace, whose checks then run."
+    value: ${{ steps.decide.outputs.agents }}
   reason:
     description: Why, on one line.
     value: ${{ steps.decide.outputs.reason }}
@@ -33,4 +43,5 @@ runs:
       env:
         GH_TOKEN: ${{ github.token }}
         PR_CHECKOUT: ${{ inputs.repo }}
+        HOTFIX_AUTHORS: ${{ inputs.hotfix-authors }}
       run: python3 tools/ci/tested-tree.py --repo "$PR_CHECKOUT"
