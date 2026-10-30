@@ -162,12 +162,26 @@ class Finding(Base):
         self.w.develop_commit({"crates/a/src/lib.rs": "pub fn h() {}\n"})  # not promoted yet
         self.promoted(d, upto=d)
 
-    def test_the_source_reports_develops_workspace_version(self):
+    def test_only_the_images_without_the_version_are_taken(self):
+        # ingress and settle report CARGO_PKG_VERSION, and so does the sidecar (ingress' surface in
+        # one process): they are built for the release, never taken from the pre-release.
+        self.assertEqual(pi.PROMOTED, ("ops", "signer", "core"))
+        self.assertEqual(set(pi.REBUILT), {"ingress", "settle", "sidecar"})
         d = self.w.develop_commit({"crates/a/src/lib.rs": "pub fn g() {}\n"})
         self.w.release_sha = self.w.release(v_new="0.5.0")
         source, _ = self.w.find()
         self.assertEqual(source.commit, d)
-        self.assertEqual(source.embedded_version, "0.1.0")  # the pre-release was built before the bump
+        self.assertEqual(set(source.images), {"ops", "signer", "core"})
+
+    def test_a_rebuilt_images_labels_are_not_read(self):
+        # Nothing of ingress, settle or the sidecar is taken, so a pre-release whose sidecar is odd
+        # still serves the rest.
+        d = self.w.develop_commit({"crates/a/src/lib.rs": "pub fn g() {}\n"})
+        tag = f"v0.2.0-dev+{d[:7]}"
+        ref = json.loads(self.w.images_json[tag])["images"]["sidecar"]
+        self.w.configs[ref]["config"]["Labels"]["org.opencontainers.image.revision"] = "c" * 40
+        self.w.tags[f"{pi.REGISTRY}/aledgent-sidecar:sha-{d}"] = "sha256:" + "b" * 64
+        self.promoted(d)
 
     def test_a_commit_only_on_main_means_no_match(self):
         # A hotfix, or the signoff fix of #42: main has a change develop has not.
@@ -261,9 +275,9 @@ class Finding(Base):
             with self.subTest(name):
                 d = self.fresh()
                 tag = f"v0.2.0-dev+{d[:7]}"
-                ref = json.loads(self.w.images_json[tag])["images"]["settle"]
+                ref = json.loads(self.w.images_json[tag])["images"]["ops"]
                 self.w.configs[ref]["config"]["Labels"][label] = value
-                self.refused("settle:")
+                self.refused("ops:")
 
     def test_the_sidecar_has_no_roots_label(self):
         d = self.w.develop_commit({"crates/a/src/lib.rs": "pub fn g() {}\n"})
@@ -324,8 +338,12 @@ class Promoting(Base):
         rc, out = self.run_main()
         self.assertEqual(rc, 0)
         self.assertEqual(out["promoted"], "true", out)
-        self.assertEqual(len(self.w.copies), 2 * len(pi.NAMES))
-        for n in pi.NAMES:
+        self.assertEqual(len(self.w.copies), 2 * len(pi.PROMOTED))
+        self.assertEqual(out["promoted_images"], "ops signer core")
+        for n in pi.REBUILT:  # built for the release: nothing copied, no digest handed on
+            self.assertNotIn(n, out)
+            self.assertFalse([c for c in self.w.copies if f"aledgent-{n}" in c[1]])
+        for n in pi.PROMOTED:
             ref = out[n]
             self.assertRegex(ref, rf"^{re.escape(pi.REGISTRY)}/aledgent-{n}@sha256:[0-9a-f]{{64}}$")
             dsts = {d for s, d in self.w.copies if s == ref}
@@ -334,7 +352,6 @@ class Promoting(Base):
             self.assertEqual(self.w.tags[f"{pi.REGISTRY}/aledgent-{n}:v0.2.0"], ref.split("@")[1])
         self.assertEqual(out["source_commit"], self.d)
         self.assertEqual(out["source_tag"], f"v0.2.0-dev+{self.d[:7]}")
-        self.assertEqual(out["embedded_version"], "0.1.0")
 
     def test_a_dry_run_copies_nothing(self):
         rc, out = self.run_main("--dry-run")
@@ -395,22 +412,27 @@ class Promoting(Base):
 
 
 class Wiring(unittest.TestCase):
-    """The workflow still says what this script's contract needs."""
+    """The workflows still say what this script's contract needs."""
 
     @classmethod
     def setUpClass(cls):
-        cls.release = (HERE.parents[1] / ".github" / "workflows" / "release.yml").read_text()
+        wf = HERE.parents[1] / ".github" / "workflows"
+        cls.release = (wf / "release.yml").read_text()
+        cls.images = (wf / "images.yml").read_text()
 
-    def test_the_images_are_built_unless_promoted(self):
+    def test_images_always_run_and_are_told_what_is_promoted(self):
         images = re.search(r"\n  images:\n(.*?)\n  publish:", self.release, re.S).group(1)
-        self.assertIn("needs.promote.outputs.promoted != 'true'", images)
         self.assertNotIn("!failure()", images)  # a crashed promote must not skip the build
+        self.assertNotIn("promoted != 'true'", images)  # ingress, settle and the sidecar are always built
         self.assertIn("promote", re.search(r"needs: \[(.*?)\]", images).group(1))
+        self.assertIn("needs.promote.outputs.promoted == 'true' && needs.promote.outputs.promoted_images || ''", images)
 
-    def test_publish_takes_either_set_of_digests(self):
+    def test_publish_takes_promoted_digests_for_those_images_only(self):
         publish = self.release.split("\n  publish:\n", 1)[1]
-        for n in pi.NAMES:
-            self.assertIn(f"needs.promote.outputs.{n}", publish)
+        for n in pi.PROMOTED:
+            self.assertIn(f"needs.promote.outputs.{n} || needs.images.outputs.{n}", publish)
+        for n in pi.REBUILT:
+            self.assertNotIn(f"needs.promote.outputs.{n}", publish)
             self.assertIn(f"needs.images.outputs.{n}", publish)
 
     def test_promote_reads_the_actions_api_and_writes_packages(self):
@@ -419,6 +441,22 @@ class Wiring(unittest.TestCase):
             self.assertIn(perm, promote)
         self.assertNotIn("contents: write", promote)  # nothing here may touch a release or a tag
         self.assertIn("RELEASE_REBUILD", promote)  # the off switch
+        self.assertIn("continue-on-error: true", promote)
+        for n in pi.PROMOTED:
+            self.assertIn(f"{n}: ${{{{ steps.promote.outputs.{n} }}}}", promote)
+
+    def test_the_images_workflow_skips_exactly_the_promoted(self):
+        self.assertIn("promoted:", self.images)
+        self.assertIn("PROMOTED: ${{ inputs.promoted }}", self.images)
+        for n in ("ops", "signer"):
+            step = re.search(rf"- name: Push {n}\n(.*?)uses:", self.images, re.S).group(1)
+            self.assertIn(f"!contains(format(' {{0}} ', env.PROMOTED), ' {n} ')", step)
+        core = re.search(r"\n  core:\n(.*?)runs-on", self.images, re.S).group(1)
+        self.assertIn("!contains(format(' {0} ', inputs.promoted), ' core ')", core)
+        for n in pi.REBUILT:  # ingress, settle and the sidecar are never skipped
+            if n != "sidecar":
+                step = re.search(rf"- name: Push {n}\n(.*?)uses:", self.images, re.S).group(1)
+                self.assertNotIn("PROMOTED", step)
 
 
 if __name__ == "__main__":

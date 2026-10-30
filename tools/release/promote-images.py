@@ -1,13 +1,26 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 Pagos Cube LLC
 # SPDX-License-Identifier: Apache-2.0 OR MIT
-"""Promote the images a develop pre-release built, instead of building them again. (bloque-app/bloque-ledgent#312, step 3)
+"""Promote the images a develop pre-release built, where the version is not in them. (bloque-app/bloque-ledgent#312, step 3)
 
     tools/release/promote-images.py --commit <release commit> --version X.Y.Z [--dry-run]
         [--repository bloque-app/aledgent] [--repo DIR] [--develop origin/develop]
 
 Run by `.github/workflows/release.yml`, in the job `promote`, when release-please has created a
-release. The release's images are the pre-release's, by digest, when and only when:
+release. Which images, and why only those. A binary reports the version of the tree it was built
+from, through CARGO_PKG_VERSION, in exactly two places: `ingress`' OpenAPI document
+(`/openapi.json`, `info.version`: services/ingress/src/openapi.rs) and `settle`'s network name
+(`aledgent-settle/<version>`: services/settle/src/chain/light.rs). So:
+
+- REBUILT (ingress, settle, sidecar): always built, so that they report the release's version. The
+  sidecar is ingress' HTTP surface in one process, `/openapi.json` included: measured, the v0.4.0
+  sidecar reports 0.4.0 and the 067cffd pre-release's reports 0.1.2.
+- PROMOTED (ops, signer, core): none of that code is in them (no `/openapi.json` route, none of the
+  two source files in their panic locations, and the functions' only callers are ingress' router and
+  settle's binary), so a copy of the pre-release's image says nothing wrong. `core.vos` keeps a fixed
+  crate version by design (CONTRIBUTING.md, "Versions"). The core is the 17-minute job.
+
+The promoted images are the pre-release's, by digest, when and only when:
 
 1. a commit D on `develop` has a tree that differs from the release commit's in versions and the
    changelog only, by the rule of tools/ci/tested-tree.py (`version_only`, the same function: what
@@ -17,33 +30,25 @@ release. The release's images are the pre-release's, by digest, when and only wh
    can push one);
 3. the pre-release's images.json names D as its commit and its own tag as its version, and lists
    exactly the six images, each `ghcr.io/bloque-app/aledgent-<name>@sha256:<64 hex>`;
-4. for each image, `:sha-<D>` resolves to that digest, and the image's config carries
-   `org.opencontainers.image.revision` = D, `org.opencontainers.image.version` = the pre-release's
-   version, and, for ingress, settle, ops and core, `app.aledgent.roots` = v2 (the roots every
-   release is built with).
+4. for each promoted image, `:sha-<D>` resolves to that digest, and the image's config carries
+   `org.opencontainers.image.revision` = D, `org.opencontainers.image.version` = the pre-release's,
+   and, for ops and core, `app.aledgent.roots` = v2 (the roots every release is built with).
 
-Then each image is copied by digest (`crane copy <repo>@<digest> <repo>:<tag>`: the manifest is
-copied byte for byte, the index with its buildx provenance attestation, so the digest does not change)
-to `sha-<release commit>` and `v<version>`, and each new tag is read back and must resolve to the
-digest. Nothing is relabelled: any change to the config would change the digest and orphan the
-attestation that names it.
+Then each is copied by digest (`crane copy <repo>@<digest> <repo>:<tag>`: the manifest is copied byte
+for byte, the index with its buildx provenance attestation, so the digest does not change) to
+`sha-<release commit>` and `v<version>`, and each new tag is read back and must resolve to the digest.
+Nothing is relabelled: any change to the config would change the digest and orphan the attestation
+that names it. The labels `org.opencontainers.image.revision` and `.version` of a promoted image are
+therefore the pre-release's; nothing reads them (bloque-ledgent's intake checks images.json's version
+and commit and that each digest resolves).
 
 It fails closed. It never exits non-zero: any doubt, error or exception is `promoted=false` and the
 caller builds every image as before (the build pushes the same tags, so a half-done promotion is
 overwritten). A mismatch is a reason, printed; it is never a failure, and the release is never held up.
 
 Writes to $GITHUB_OUTPUT (and prints): `promoted` (true|false), `reason`, `source_tag`,
-`source_commit`, `embedded_version` (what the promoted binaries report: see below), and, when
-promoted, `ingress`, `settle`, `ops`, `signer`, `core`, `sidecar` (`ghcr.io/…@sha256:…`).
-
-The version the binaries report. `ingress` serves `/openapi.json` with `info.version`, and `settle`
-names itself `aledgent-settle/<version>` to the network, both from CARGO_PKG_VERSION, which is the
-workspace version of the tree they were built from: D's. A promoted release therefore reports D's
-workspace version, not the release's. The other images embed no version (the guest programs keep a
-fixed one by design, CONTRIBUTING.md "Versions"). Nothing in bloque-ledgent's intake or deploy reads
-it (intake checks images.json's version and commit, and that each digest resolves). The image labels
-`org.opencontainers.image.revision` and `.version` are the pre-release's, too. What identifies the
-release is its tag and its images.json (which records `promoted_from`).
+`source_commit`, and, when promoted, `promoted_images` (the names, space-separated) and one
+`ghcr.io/…@sha256:…` output per promoted image (`ops`, `signer`, `core`).
 """
 from __future__ import annotations
 
@@ -54,7 +59,6 @@ import os
 import re
 import subprocess
 import sys
-import tomllib
 import traceback
 from collections.abc import Callable
 from pathlib import Path
@@ -66,6 +70,9 @@ tt = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(tt)
 
 NAMES = ("ingress", "settle", "ops", "signer", "core", "sidecar")
+# Promoted by digest: the version is not in them (the header). Everything else is built for the release.
+PROMOTED = ("ops", "signer", "core")
+REBUILT = tuple(n for n in NAMES if n not in PROMOTED)
 # The images built with the book's roots (images.yml): their config says which. The sidecar is always v2.
 WITH_ROOTS = ("ingress", "settle", "ops", "core")
 ROOTS = "v2"
@@ -98,8 +105,7 @@ class Refusal(Exception):
 class Source(NamedTuple):
     commit: str
     tag: str
-    images: dict[str, str]  # name -> ghcr.io/…@sha256:…
-    embedded_version: str
+    images: dict[str, str]  # the promoted ones: name -> ghcr.io/…@sha256:…
 
 
 # --------------------------------------------------------------------------------------------------
@@ -132,10 +138,6 @@ def git(repo: Path, *args: str) -> str:
 def develop_walk(repo: Path, develop: str) -> list[str]:
     """develop's first-parent history, newest first: every pull request lands as one commit on it."""
     return git(repo, "rev-list", "--first-parent", f"--max-count={MAX_WALK}", develop).split()
-
-
-def workspace_version(repo: Path, rev: str) -> str:
-    return tomllib.loads(git(repo, "show", f"{rev}:Cargo.toml"))["workspace"]["package"]["version"]
 
 
 def check_candidate(repo: Path, repository: str, commit: str, env: Env) -> Source:
@@ -178,6 +180,8 @@ def check_candidate(repo: Path, repository: str, commit: str, env: Env) -> Sourc
         repo_name = f"{REGISTRY}/aledgent-{name}"
         if not isinstance(ref, str) or not ref.startswith(repo_name + "@") or not DIGEST.fullmatch(ref.split("@", 1)[1]):
             raise Refusal(f"{tag}: {name} is not {repo_name}@sha256:<64 hex>")
+        if name not in PROMOTED:
+            continue  # built for the release: nothing of the pre-release's is taken
         digest = ref.split("@", 1)[1]
         by_sha = env.digest(f"{repo_name}:sha-{commit}")
         if by_sha != digest:
@@ -189,7 +193,7 @@ def check_candidate(repo: Path, repository: str, commit: str, env: Env) -> Sourc
             raise Refusal(f"{name}: its version label is not {tag[1:]}")
         if name in WITH_ROOTS and labels.get("app.aledgent.roots") != ROOTS:
             raise Refusal(f"{name}: built with roots {labels.get('app.aledgent.roots')!r}, a release has {ROOTS}")
-    return Source(commit, tag, dict(images), workspace_version(repo, commit))
+    return Source(commit, tag, {n: images[n] for n in PROMOTED})
 
 
 def find_source(repo: Path, repository: str, release: str, develop: str, env: Env) -> tuple[Source | None, str]:
@@ -228,7 +232,7 @@ def promote(source: Source, release: str, version: str, env: Env) -> dict[str, s
     if not VERSION.fullmatch(version):
         raise Refusal(f"version {version!r} is not X.Y.Z")
     out: dict[str, str] = {}
-    for name in NAMES:
+    for name in PROMOTED:
         repo_name = f"{REGISTRY}/aledgent-{name}"
         ref = source.images[name]
         digest = ref.split("@", 1)[1]
@@ -260,14 +264,15 @@ def decide(args: argparse.Namespace, env: Env) -> dict[str, str]:
     source, reason = find_source(repo, args.repository, args.commit, args.develop, env)
     if source is None:
         return {"promoted": "false", "reason": reason}
-    info = {"source_tag": source.tag, "source_commit": source.commit, "embedded_version": source.embedded_version}
+    info = {"source_tag": source.tag, "source_commit": source.commit}
     if args.dry_run:
-        return {"promoted": "false", "reason": f"dry run: would promote {source.tag} ({reason})", **info}
+        return {"promoted": "false", "reason": f"dry run: would promote {' '.join(PROMOTED)} of {source.tag} ({reason})", **info}
     try:
         refs = promote(source, args.commit, args.version, env)
     except Refusal as e:
         return {"promoted": "false", "reason": f"the copy failed, the images are built: {e}", **info}
-    return {"promoted": "true", "reason": f"promoted {source.tag} ({reason})", **info, **refs}
+    return {"promoted": "true", "reason": f"promoted {' '.join(PROMOTED)} of {source.tag} ({reason})",
+            **info, "promoted_images": " ".join(PROMOTED), **refs}
 
 
 def main(argv: list[str] | None = None, env: Env | None = None) -> int:

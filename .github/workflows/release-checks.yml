@@ -25,8 +25,8 @@ name: Release checks
 #   break: before 1.0.0 this job therefore refuses a breaking change only when the pending release is
 #   a patch release. The versions released are unchanged (`--print version`).
 #
-# - image promotion: tools/release/promote-images.py (the release re-tags a develop pre-release's
-#   images instead of building them: .github/workflows/release.yml, job `promote`) passes its own
+# - image promotion: tools/release/promote-images.py (the release takes a develop pre-release's
+#   core, ops and signer images by digest instead of building them: .github/workflows/release.yml, job `promote`) passes its own
 #   tests, which run it against synthetic repositories and a fake registry, and a dry run of it for
 #   the latest release, against the real history and registry, shows in the summary what a release
 #   would do today (nothing is copied; the dry run informs and never fails the check).

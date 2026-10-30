@@ -23,18 +23,19 @@ name: Release
 # sidecar) is built and pushed to ghcr.io/bloque-app/aledgent-<name> as `sha-<commit>` and
 # `v<version>` (`+` made `_`), and the release gets images.json. The one exception is a release whose
 # source is a develop commit that already has a pre-release (bloque-app/bloque-ledgent#312, step 3):
-# the job `promote` (tools/release/promote-images.py) takes that pre-release's six images by digest,
-# tagging them `sha-<release commit>` and `v<version>`, instead of building them again (about 18
-# minutes). It does so only when the release commit's tree is a develop commit's tree but for
+# the job `promote` (tools/release/promote-images.py) takes that pre-release's ops, signer and core
+# images by digest, tagging them `sha-<release commit>` and `v<version>`, and the core, the 17-minute
+# job, is not built. It does so only when the release commit's tree is a develop commit's tree but for
 # versions and the changelog (the rule of tools/ci/tested-tree.py), that commit's release.yml run
-# succeeded and every image's labels and tags agree with its images.json; otherwise, or on any error,
-# the images are built as above. A copy keeps the index and its buildx provenance attestation as the
-# pre-release's build made them, and relabels nothing. What it costs, stated plainly: the binaries and
-# labels say what the pre-release said. `ingress` (`/openapi.json` `info.version`) and `settle` (its
-# network name) report the workspace version of the develop commit, `org.opencontainers.image.version`
-# and `.revision` are the pre-release's and its commit; the tag and images.json (`promoted_from`) are
-# what identify the release. Set the repository variable RELEASE_REBUILD to `true` to build every
-# release's images as before.
+# succeeded and every promoted image's labels and tags agree with its images.json; otherwise, or on
+# any error, every image is built as above. ingress, settle and the sidecar are always built: they
+# are the images whose binaries report the crate version (ingress' and the sidecar's
+# `/openapi.json` `info.version`, settle's network name), and a release must report its own. A copy
+# keeps the index and its buildx provenance attestation as the pre-release's build made them, and
+# relabels nothing, so a promoted image's `org.opencontainers.image.version` and `.revision` labels
+# name the pre-release and its commit; the tag and images.json (`promoted_from`, per image) identify
+# the release. Set the repository variable RELEASE_REBUILD to `true` to build every release's images
+# as before.
 #
 #   {"version": "v0.2.0", "commit": "<40 hex>",
 #    "images": {"ingress": "ghcr.io/bloque-app/aledgent-ingress@sha256:…", …}}
@@ -172,16 +173,13 @@ jobs:
       CRANE_SHA256: 0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0
     outputs:
       promoted: ${{ steps.promote.outputs.promoted }}
+      promoted_images: ${{ steps.promote.outputs.promoted_images }}
       reason: ${{ steps.promote.outputs.reason }}
       source_tag: ${{ steps.promote.outputs.source_tag }}
       source_commit: ${{ steps.promote.outputs.source_commit }}
-      embedded_version: ${{ steps.promote.outputs.embedded_version }}
-      ingress: ${{ steps.promote.outputs.ingress }}
-      settle: ${{ steps.promote.outputs.settle }}
       ops: ${{ steps.promote.outputs.ops }}
       signer: ${{ steps.promote.outputs.signer }}
       core: ${{ steps.promote.outputs.core }}
-      sidecar: ${{ steps.promote.outputs.sidecar }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -220,12 +218,13 @@ jobs:
   images:
     name: images
     needs: [release-please, prerelease, promote]
-    # Built unless promoted. `failure()` is not used: it would also skip the build when `promote`
-    # crashed, and a release would get no images. An upstream failure still stops it.
+    # Always built (ingress, settle and the sidecar report the version), less what `promote` took.
+    # `failure()` is not used: it would also skip the build when `promote` crashed, and a release
+    # would get no images; a crashed `promote` leaves `promoted_images` empty, and everything is
+    # built. An upstream failure still stops it.
     if: >-
       !cancelled() && needs.release-please.result != 'failure' && needs.prerelease.result != 'failure'
       && (needs.release-please.outputs.created == 'true' || needs.prerelease.outputs.version != '')
-      && needs.promote.outputs.promoted != 'true'
     permissions:
       contents: read
       packages: write
@@ -233,13 +232,14 @@ jobs:
     with:
       version: ${{ needs.release-please.outputs.version || needs.prerelease.outputs.version }}
       commit: ${{ needs.release-please.outputs.sha || github.sha }}
+      promoted: ${{ needs.promote.outputs.promoted == 'true' && needs.promote.outputs.promoted_images || '' }}
 
   publish:
     name: images.json and dispatch
     needs: [release-please, prerelease, promote, images]
     if: >-
       !cancelled() && needs.release-please.result != 'failure' && needs.prerelease.result != 'failure'
-      && (needs.images.result == 'success' || needs.promote.outputs.promoted == 'true')
+      && needs.images.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: release
@@ -254,19 +254,20 @@ jobs:
       COMMIT: ${{ needs.release-please.outputs.sha || github.sha }}
       HAS_APP: ${{ secrets.ALEDGENT_RELEASE_APP_ID != '' && secrets.ALEDGENT_RELEASE_APP_KEY != '' }}
       PROMOTED: ${{ needs.promote.outputs.promoted == 'true' }}
+      PROMOTED_IMAGES: ${{ needs.promote.outputs.promoted == 'true' && needs.promote.outputs.promoted_images || '' }}
       SOURCE_TAG: ${{ needs.promote.outputs.source_tag }}
       SOURCE_COMMIT: ${{ needs.promote.outputs.source_commit }}
-      EMBEDDED_VERSION: ${{ needs.promote.outputs.embedded_version }}
     steps:
       - name: images.json
         env:
-          # Promoted from a pre-release, or built here.
-          INGRESS: ${{ needs.promote.outputs.ingress || needs.images.outputs.ingress }}
-          SETTLE: ${{ needs.promote.outputs.settle || needs.images.outputs.settle }}
+          # Built here, except the ones promoted from a pre-release (`promote`'s outputs are empty
+          # for the others, and for all of them when nothing is promoted).
+          INGRESS: ${{ needs.images.outputs.ingress }}
+          SETTLE: ${{ needs.images.outputs.settle }}
           OPS: ${{ needs.promote.outputs.ops || needs.images.outputs.ops }}
           SIGNER: ${{ needs.promote.outputs.signer || needs.images.outputs.signer }}
           CORE: ${{ needs.promote.outputs.core || needs.images.outputs.core }}
-          SIDECAR: ${{ needs.promote.outputs.sidecar || needs.images.outputs.sidecar }}
+          SIDECAR: ${{ needs.images.outputs.sidecar }}
         run: |
           set -euo pipefail
           for n in INGRESS SETTLE OPS SIGNER CORE SIDECAR; do
@@ -275,20 +276,22 @@ jobs:
             grep -Eq "^ghcr\.io/bloque-app/aledgent-${n,,}@sha256:[0-9a-f]{64}$" <<<"$ref" \
               || { echo "::error::no digest for ${n,,}: '$ref'"; exit 1; }
           done
-          # `commit` is the release's, which the dispatch names. A promoted release adds where its
-          # images came from (the intake reads `version`, `commit` and `images` only).
+          # `commit` is the release's, which the dispatch names. A promoted release adds, for each
+          # image taken from a pre-release, where it came from (the intake reads `version`, `commit`
+          # and `images` only).
           jq -n --arg version "$TAG" --arg commit "$COMMIT" \
                 --arg ingress "$INGRESS" --arg settle "$SETTLE" --arg ops "$OPS" \
                 --arg signer "$SIGNER" --arg core "$CORE" --arg sidecar "$SIDECAR" \
-                --arg promoted "$PROMOTED" --arg stag "$SOURCE_TAG" --arg scommit "$SOURCE_COMMIT" \
+                --arg promoted "$PROMOTED_IMAGES" --arg stag "$SOURCE_TAG" --arg scommit "$SOURCE_COMMIT" \
             '{version: $version, commit: $commit,
               images: {ingress: $ingress, settle: $settle, ops: $ops, signer: $signer,
-                       core: $core, sidecar: $sidecar}}
-             + (if $promoted == "true"
-                then {promoted_from: {version: $stag, commit: $scommit}} else {} end)' > images.json
+                       core: $core, sidecar: $sidecar}} as $doc
+             | $doc + (if $promoted == "" then {} else
+                 {promoted_from: ($promoted | split(" ") | map({key: ., value: {version: $stag, commit: $scommit, image: $doc.images[.]}}) | from_entries)}
+               end)' > images.json
           cat images.json
 
-      # What a promoted release's binaries say, in the release's own notes (release-please wrote them).
+      # Which images are the pre-release's, in the release's own notes (release-please wrote them).
       - name: Say so in the release notes
         if: env.PROMOTED == 'true' && env.PRERELEASE != 'true'
         run: |
@@ -301,7 +304,7 @@ jobs:
               echo "$marker"
               echo "### Images"
               echo
-              echo "Promoted, not rebuilt: the images are those of the pre-release \`$SOURCE_TAG\` (commit \`$SOURCE_COMMIT\`), whose tree is this release's but for versions and the changelog. Their labels (\`org.opencontainers.image.version\`, \`.revision\`) name that pre-release, and \`ingress\` (\`/openapi.json\` \`info.version\`) and \`settle\` report the workspace version of that commit, \`$EMBEDDED_VERSION\`, not $VERSION. images.json records it as \`promoted_from\`."
+              echo "Promoted, not rebuilt: \`$PROMOTED_IMAGES\` are those of the pre-release \`$SOURCE_TAG\` (commit \`$SOURCE_COMMIT\`), whose tree is this release's but for versions and the changelog; none of them reports a version. Their labels (\`org.opencontainers.image.version\`, \`.revision\`) name that pre-release. The other images were built for this release. images.json records \`promoted_from\`, per image."
             } >> body.md
             gh release edit "$TAG" --notes-file body.md
           fi
