@@ -504,6 +504,20 @@ jobs:
           test -s "$RUNNER_TEMP/core/agent_runtime.pvm"
           test -s "$RUNNER_TEMP/core/core.vos"
 
+      # The core image's binaries report no crate version: a release takes this image from its
+      # develop pre-release (release.yml, job `promote`), so a binary that said a version would say
+      # the pre-release's. ingress and settle (and the sidecar) do; they are always built.
+      - name: The core image reports no crate version
+        run: |
+          set -euo pipefail
+          tools/ci/check-no-version-sites.sh --self-test
+          id=$(docker create aledgent-core:ci)
+          for b in aledgent-core-host opsctl; do
+            docker cp "$id:/usr/local/bin/$b" "$RUNNER_TEMP/core-$b"
+          done
+          docker rm "$id" > /dev/null
+          tools/ci/check-no-version-sites.sh "$RUNNER_TEMP/core-aledgent-core-host" "$RUNNER_TEMP/core-opsctl"
+
       - name: Size
         run: |
           size=$(docker image inspect -f '{{.Size}}' aledgent-core:ci)

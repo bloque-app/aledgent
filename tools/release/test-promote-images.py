@@ -410,6 +410,39 @@ class Promoting(Base):
         self.assertIn("promoted=false", out.getvalue())
 
 
+class Emitting(unittest.TestCase):
+    """What reaches stdout and $GITHUB_OUTPUT is one line per output and no workflow command."""
+
+    def emit(self, values: dict[str, str]) -> tuple[list[str], list[str]]:
+        import os
+        out = io.StringIO()
+        with tempfile.NamedTemporaryFile("r+") as gh_out, redirect_stdout(out):
+            os.environ["GITHUB_OUTPUT"] = gh_out.name
+            try:
+                pi.emit(values)
+            finally:
+                del os.environ["GITHUB_OUTPUT"]
+            gh_out.seek(0)
+            written = gh_out.read().splitlines()
+        return out.getvalue().splitlines(), written
+
+    def test_a_newline_cannot_start_a_line(self):
+        printed, written = self.emit({"promoted": "false", "reason": "bad tag\n::error::boom\r\n::set-output name=x::y"})
+        for lines in (printed, written):
+            self.assertEqual(len(lines), 2)
+            self.assertFalse([l for l in lines if l.startswith("::")], lines)
+            self.assertTrue(all(re.match(r"^[a-z_]+=", l) for l in lines), lines)
+
+    def test_a_leading_workflow_command_is_neutralised(self):
+        printed, written = self.emit({"reason": "::error::boom"})
+        self.assertEqual(printed, ["reason= ::error::boom"])
+        self.assertEqual(written, ["reason= ::error::boom"])
+
+    def test_ordinary_values_are_unchanged(self):
+        printed, _ = self.emit({"reason": "promoted core of v0.2.0-dev+abc1234 (abc1234 has the tree)"})
+        self.assertEqual(printed, ["reason=promoted core of v0.2.0-dev+abc1234 (abc1234 has the tree)"])
+
+
 class Wiring(unittest.TestCase):
     """The workflows still say what this script's contract needs."""
 
@@ -442,6 +475,23 @@ class Wiring(unittest.TestCase):
         self.assertIn("continue-on-error: true", promote)
         self.assertIn("core: ${{ steps.promote.outputs.core }}", promote)
         self.assertNotIn("steps.promote.outputs.ops", promote)
+
+    def test_a_failed_release_note_does_not_hold_back_the_dispatch(self):
+        step = re.search(r"- name: Say so in the release notes\n(.*?)run:", self.release, re.S).group(1)
+        self.assertIn("continue-on-error: true", step)
+
+    def test_the_core_image_is_checked_for_version_sites(self):
+        core = re.search(r"\n  core:\n(.*?)\n  # F-038", self.images, re.S).group(1)
+        self.assertIn("tools/ci/check-no-version-sites.sh --self-test", core)
+        self.assertIn("for b in aledgent-core-host opsctl; do", core)
+        self.assertIn('docker cp "$id:/usr/local/bin/$b"', core)
+        self.assertIn('check-no-version-sites.sh "$RUNNER_TEMP/core-aledgent-core-host" "$RUNNER_TEMP/core-opsctl"', core)
+
+    def test_the_workflows_that_build_and_promote_have_an_owner(self):
+        owners = (HERE.parents[1] / ".github" / "CODEOWNERS").read_text()
+        for path in ("/.github/workflows/release.yml", "/.github/workflows/images.yml",
+                     "/tools/release/promote-images.py"):
+            self.assertRegex(owners, rf"(?m)^{re.escape(path)}\s+@bloque-app/aledgent-spec-owner")
 
     def test_the_images_workflow_skips_the_core_only(self):
         self.assertIn("promoted:", self.images)

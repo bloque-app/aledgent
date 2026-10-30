@@ -32,6 +32,10 @@
 /.github/workflows/ci.yml                @bloque-app/aledgent-spec-owner
 
 # What a release takes from a pre-release instead of building (bloque-app/bloque-ledgent#312, step
-# 3): the judge of which images are promoted by digest to the release's tags.
+# 3): the judge of which images are promoted by digest to the release's tags, the workflows that
+# build and publish the images, and the guard that the core image reports no version.
 /tools/release/promote-images.py         @bloque-app/aledgent-spec-owner
 /tools/release/test-promote-images.py    @bloque-app/aledgent-spec-owner
+/.github/workflows/release.yml           @bloque-app/aledgent-spec-owner
+/.github/workflows/images.yml            @bloque-app/aledgent-spec-owner
+/tools/ci/check-no-version-sites.sh      @bloque-app/aledgent-spec-owner
