@@ -453,6 +453,14 @@ reservation_timing() {
   # The shard Agents (F-031 T-031-20) keep their books in their rows (layout 3 on a Local Agent):
   # every bound raised, as above.
   if [ "$MODE" = build-core ] && [ "${BUILD_SHARDS:-0}" = 1 ]; then raise_limits; fi
+  # The stress suite founds a new book, and a new book's writer state names code generation 0
+  # (amendment 0033, D1). The tree's core is the next generation once a rules version has shipped,
+  # and the fence refuses every input to it (no flag turns it off). So this copy is built as a
+  # genesis, as PR_GENESIS_IMAGE and PR_PREDECESSOR_IMAGE pin generation-0 cores for their checks.
+  if [ "$MODE" = build-core ]; then
+    sed -i -E 's/^const GENERATION: u64 = [0-9]+;$/const GENERATION: u64 = 0;/' "$A/agents/core/src/lib.rs"
+    grep -qx 'const GENERATION: u64 = 0;' "$A/agents/core/src/lib.rs"
+  fi
   # VOS before 2026-09-29 named the engine `RefineBackend` and the committed host had no engine
   # choice: patch it in. Later VOS selects it with `PvmBackend`, which the host reads from
   # F025_BACKEND itself.
