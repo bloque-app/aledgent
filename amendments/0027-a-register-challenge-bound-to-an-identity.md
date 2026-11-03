@@ -57,5 +57,5 @@ it; this amendment does not decide it.
   before it is used, so a misrouted attempt does not burn the right user's challenge; it is still single-use.
 - Tests: `amendment_0027_a_bound_challenge_admits_only_its_identity_and_cannot_be_unbound` (`authn`),
   `amendment_0027_a_bound_register_challenge_serves_only_its_identity` (ingress),
-  `amendment_0027_a_challenge_bound_to_one_user_does_not_register_on_another` (sidecar, the onboarding service acting for
+  `req_au_20_amendment_0027_a_challenge_bound_to_one_user_does_not_register_on_another` (sidecar, the onboarding service acting for
   two users).

@@ -7,11 +7,14 @@
 //! - [`ShadowBook`]: a plaintext model of every entry per (account, asset),
 //!   for `INV-5` and `INV-6`.
 //! - [`book`]: a random book driven through the command surface (`F-014`).
+//! - [`seed`]: the seed of each randomised harness, rotated from the environment, and the
+//!   replay of a failure.
 //! - [`rederive()`]: balances rebuilt from the committed delta log alone
 //!   (`NFR-4`, `INV-6`), and the per-asset commitment sum (`INV-5`).
 
 pub mod book;
 pub mod rederive;
+pub mod seed;
 pub mod shadow;
 pub mod strategies;
 

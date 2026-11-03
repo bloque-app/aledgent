@@ -23,7 +23,8 @@
 //! against each other rather than against themselves.
 //!
 //! The differential runs `LEDGER_KERNEL_DIFF_CASES` cases (10 000 by
-//! default), split across four tests so they run in parallel. `FileStore`
+//! default), split across four tests so they run in parallel, from fixed seeds that
+//! `LEDGER_KERNEL_DIFF_SEED` replaces (the nightly run rotates it; a failure prints it). `FileStore`
 //! and `FileVault` run on redb's in-memory backend here, which is the same
 //! code without the fsync; the file-backed tests cover the disk.
 
@@ -34,6 +35,8 @@ use crate::store::{FileStore, MemStore};
 use crate::testkit::{ROOT, v};
 use crate::vault::{FileVault, MemVault};
 use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::format;
+use alloc::string::String;
 use alloc::vec;
 use cipher_clerk::helpers::{MemLedger, MemOracle};
 use cipher_clerk::{AccountFlags, Direction};
@@ -434,6 +437,55 @@ fn cases() -> u32 {
         .unwrap_or(10_000)
 }
 
+/// The seed rotation: `LEDGER_KERNEL_DIFF_SEED` (a number, decimal or `0x` hex) replaces the
+/// fixed seed of every harness of this file. Unset, every key is the byte-for-byte constant it
+/// has always been, so local and push runs replay the same inputs; the nightly run sets a fresh
+/// seed. (The same rule as `conformance::tools::seed`, which this crate cannot depend on.)
+const SEED_VAR: &str = "LEDGER_KERNEL_DIFF_SEED";
+
+fn seed() -> Option<u64> {
+    std::env::var(SEED_VAR).ok().map(|raw| {
+        let t = raw.trim();
+        let parsed = match t.strip_prefix("0x") {
+            Some(hex) => u64::from_str_radix(hex, 16),
+            None => t.parse(),
+        };
+        parsed.unwrap_or_else(|_| panic!("{SEED_VAR}={raw:?} is not a number (decimal or 0x hex)"))
+    })
+}
+
+/// The ChaCha key of the part `byte` names: `[byte; 32]` unless a seed is set, which then fills
+/// the first eight bytes, so that the parts of one run still draw different inputs.
+fn key(byte: u8) -> [u8; 32] {
+    let mut key = [byte; 32];
+    if let Some(seed) = seed() {
+        key[..8].copy_from_slice(&seed.to_le_bytes());
+    }
+    key
+}
+
+/// Fail with the seed the run had and the command that repeats it.
+fn fail(failure: impl core::fmt::Display) -> ! {
+    let test = std::thread::current()
+        .name()
+        .map_or_else(String::new, |n| format!(" -- {n} --exact"));
+    let (seeded, env) = match seed() {
+        Some(s) => (
+            format!("seed {s} ({SEED_VAR}={s})"),
+            format!("{SEED_VAR}={s} "),
+        ),
+        None => (
+            format!("the default seed ({SEED_VAR} unset)"),
+            String::new(),
+        ),
+    };
+    panic!(
+        "{failure}\n\nrandomised harness failed under {seeded}, LEDGER_KERNEL_DIFF_CASES={n}.\n\
+         replay: {env}LEDGER_KERNEL_DIFF_CASES={n} cargo test -p ledger-kernel --lib{test}",
+        n = cases()
+    )
+}
+
 fn run_differential(part: u32) {
     let per = cases().div_ceil(4);
     let mut runner = TestRunner::new_with_rng(
@@ -444,10 +496,12 @@ fn run_differential(part: u32) {
         },
         proptest::test_runner::TestRng::from_seed(
             proptest::test_runner::RngAlgorithm::ChaCha,
-            &[part as u8; 32],
+            &key(part as u8),
         ),
     );
-    runner.run(&ops(), |script| differential(&script)).unwrap();
+    runner
+        .run(&ops(), |script| differential(&script))
+        .unwrap_or_else(|e| fail(e));
     if per >= 100 {
         for (i, n) in SEEN.iter().enumerate() {
             assert!(
@@ -459,22 +513,22 @@ fn run_differential(part: u32) {
 }
 
 #[test]
-fn differential_against_the_kernel_reference_part_1() {
+fn inv_1_and_inv_3_differential_against_the_kernel_reference_part_1() {
     run_differential(1);
 }
 
 #[test]
-fn differential_against_the_kernel_reference_part_2() {
+fn inv_1_and_inv_3_differential_against_the_kernel_reference_part_2() {
     run_differential(2);
 }
 
 #[test]
-fn differential_against_the_kernel_reference_part_3() {
+fn inv_1_and_inv_3_differential_against_the_kernel_reference_part_3() {
     run_differential(3);
 }
 
 #[test]
-fn differential_against_the_kernel_reference_part_4() {
+fn inv_1_and_inv_3_differential_against_the_kernel_reference_part_4() {
     run_differential(4);
 }
 
@@ -593,10 +647,12 @@ fn req_ker_10_chain_by_chain_equals_one_kernel_batch() {
         },
         proptest::test_runner::TestRng::from_seed(
             proptest::test_runner::RngAlgorithm::ChaCha,
-            &[0xCB; 32],
+            &key(0xCB),
         ),
     );
-    runner.run(&chains, |c| chain_by_chain(&c)).unwrap();
+    runner
+        .run(&chains, |c| chain_by_chain(&c))
+        .unwrap_or_else(|e| fail(e));
 }
 
 // ---------------------------------------------------------------------------

@@ -52,7 +52,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cipher_clerk_signature_verifies_here_and_a_tampered_one_does_not() {
+    fn req_ds_3_a_cipher_clerk_signature_verifies_here_and_a_tampered_one_does_not() {
         let sk = key();
         let pk = sk.public_key();
         let msg = b"a message";

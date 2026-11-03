@@ -1,0 +1,105 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+name: Nightly properties
+
+# The five randomised harnesses at 10,000 cases, from a seed that changes every night
+# (the test-surface audit of 2026-10-30, handovers/2026-10-30-test-surface-audit.md, section 5).
+#
+# Each harness draws from a fixed seed, so a run explores the first N inputs of one stream and
+# nothing else, whatever N is: the same 10,000 on every push, the same 256 on every pull request.
+# They read a seed from the environment, and unset use that constant. This run sets one, so that
+# the nightly gains inputs that no other run has seen. A failure prints the seed and the command
+# that repeats it, and the seed is in the summary of the run, so a red night is a reproducible bug
+# and not a flake.
+#
+# It builds only the three crates the harnesses live in, and saves no cache: it restores the
+# workspace cache of the tests job (a run restores its own branch's, its base's and main's) and
+# never writes one, so it cannot evict the entries the pull requests restore.
+#
+# A schedule runs only from the default branch (main), so this file does nothing until a promotion
+# puts it there; `workflow_dispatch` runs it from any branch that has it.
+on:
+  schedule:
+    - cron: "41 6 * * *"
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: "The seed, a number (decimal or 0x hex). Empty: a fresh one. A failed night's seed replays it."
+        type: string
+        default: ""
+      cases:
+        description: "Cases per harness"
+        type: string
+        default: "10000"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  properties:
+    name: properties (rotating seed)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: tests
+          save-if: false
+      - name: seed
+        env:
+          SEED: ${{ inputs.seed }}
+          CASES: ${{ inputs.cases }}
+        run: |
+          set -euo pipefail
+          case "${SEED:-}" in
+            "") seed=$(od -An -N6 -tu8 /dev/urandom | tr -d ' ') ;;
+            *) seed="$SEED" ;;
+          esac
+          [[ "$seed" =~ ^(0x[0-9a-fA-F]+|[0-9]+)$ ]] || { echo "::error::the seed must be a number, not '$seed'"; exit 1; }
+          n="${CASES:-10000}"
+          [[ "$n" =~ ^[0-9]+$ ]] || { echo "::error::the cases must be a number, not '$n'"; exit 1; }
+          # The kernel's differential never runs below 100 cases (its coverage check needs them).
+          [ "$n" -ge 400 ] || { echo "::error::the cases must be at least 400 (the differential runs a quarter of them in each of four parts, and never fewer than 100)"; exit 1; }
+          {
+            echo "LEDGER_KERNEL_DIFF_SEED=$seed"
+            echo "F004_CONCURRENCY_SEED=$seed"
+            echo "F008_SEED=$seed"
+            echo "F010_SEED=$seed"
+            echo "CONFORMANCE_REDERIVE_SEED=$seed"
+            echo "LEDGER_KERNEL_DIFF_CASES=$n"
+            echo "F004_CONCURRENCY_CASES=$n"
+            echo "F008_UNITS=$n"
+            echo "F008_UNITS_FILE=$n"
+            echo "F010_RUNS=$n"
+            echo "CONFORMANCE_REDERIVE_UNITS=$n"
+          } >> "$GITHUB_ENV"
+          {
+            echo "## Nightly properties"
+            echo
+            echo "Seed \`$seed\`, $n cases per harness. To repeat a failed night, run this workflow by dispatch"
+            echo "with that seed, or set the \`*_SEED\` variables below to it and run the failed harness's"
+            echo "replay line from its log."
+            echo
+            echo '```'
+            echo "LEDGER_KERNEL_DIFF_SEED=$seed F004_CONCURRENCY_SEED=$seed F008_SEED=$seed F010_SEED=$seed CONFORMANCE_REDERIVE_SEED=$seed"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "seed $seed, $n cases"
+      # The kernel's differential, in four parts and the chain-by-chain run (REQ-KER-10).
+      - run: cargo test -p ledger-kernel --lib -- inv_1_and_inv_3_differential_against_the_kernel_reference req_ker_10_chain_by_chain
+      # The reservation engine (AC-B2.1, INV-3, INV-5, INV-6), the transfer model (AC-B3.1, INV-1)
+      # and the settlement simulator (INV-10 to INV-13, INV-23).
+      - if: ${{ !cancelled() }}
+        run: cargo test -p ledger-core --features sim --test concurrency --test transfer_units --test settlement_sim
+      # The re-derivation run (INV-6, INV-5).
+      - if: ${{ !cancelled() }}
+        run: cargo test -p conformance --lib -- inv_6_rederive_matches_stored_balances_on_random_units

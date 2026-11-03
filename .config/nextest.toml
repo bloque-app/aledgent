@@ -1,0 +1,29 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+
+# cargo-nextest's settings. Only the v1 shard of the `tests` job in .github/workflows/ci.yml runs on
+# it. `cargo test` runs one binary at a time; nextest runs the tests of every binary in one pool, so a
+# test that races a clock now competes with tests of other binaries too. The workspace shard (which
+# has the timer-driven service suites) stays on `cargo test`: nextest there failed 2 runs of 6, each
+# on another test (ledger-kernel's cost_tests, then ingress's book_on_disk, a race between reading
+# the core's input count and restarting it: 9 inputs against 7 with the pool full).
+
+# NFR-1, apply cost flat to 1,000 postings: it asserts a ratio of two measured times (1,000 postings
+# against 100, within 3x), and failed once, 4.4 ms against 1.4 ms, with the pool full. It takes every
+# slot, so it runs alone, as a binary of its own ran under `cargo test`.
+[[profile.default.overrides]]
+filter = 'package(ledger-kernel) & test(/book::cost_tests::/)'
+threads-required = "num-cpus"
+
+# The longest tests start first (measured on the run of 2026-10-30: 123 s, 56 s, 44 s, 33 s and 27 s,
+# the next is 20 s). The pool otherwise reached the 123 s one in the middle of the run, and the
+# job waited for it alone. A list, not a rule: a test that grows past these belongs on it.
+[[profile.default.overrides]]
+filter = '''
+test(=f_036_a_seed_chunk_in_the_guests_heap)
+| test(=req_rt_1_a_grant_costs_the_same_however_many_grants_its_principal_holds)
+| test(=inv_10_to_13_ten_thousand_seeded_histories_against_the_simulated_layer)
+| test(=t043_07_the_heap_stays_flat_over_ten_thousand_incidents)
+| test(=inv_18_ten_thousand_walks_applied_twice_change_nothing)
+'''
+priority = 100

@@ -14,6 +14,9 @@ on:
       - "contracts/**"
       - ".github/workflows/contracts.yml"
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # Pinned. 5.0.3 builds ink! 5 contracts for `pallet-contracts`, which is what Kreivo runs.
@@ -39,6 +42,7 @@ jobs:
         with:
           workspaces: contracts/settlement
           key: test
+          save-if: ${{ github.ref == 'refs/heads/develop' }}
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
@@ -74,6 +78,7 @@ jobs:
           workspaces: contracts/settlement
           key: build
           cache-bin: true
+          save-if: ${{ github.ref == 'refs/heads/develop' }}
       - name: Install cargo-contract ${{ env.CARGO_CONTRACT_VERSION }}
         run: |
           if ! cargo contract --version 2>/dev/null | grep -q "$CARGO_CONTRACT_VERSION"; then

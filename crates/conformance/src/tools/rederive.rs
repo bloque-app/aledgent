@@ -166,6 +166,7 @@ mod tests {
     use super::*;
     use crate::harness::{BindingPort, delta_log};
     use crate::tools::ShadowBook;
+    use crate::tools::seed::{Replay, Rotation};
     use crate::tools::strategies::{BookShape, UnitMoves, a_schedule};
     use ledger_kernel::book::Book;
     use ledger_kernel::keys::KeyRing;
@@ -250,6 +251,7 @@ mod tests {
             customers: 5,
             assets: 2,
         };
+        let seed = Rotation::from_env("CONFORMANCE_REDERIVE_SEED");
         let books = units().div_ceil(4 * UNITS_PER_BOOK).max(1);
         let mut runner = TestRunner::new_with_rng(
             Config {
@@ -257,7 +259,7 @@ mod tests {
                 failure_persistence: None,
                 ..Config::default()
             },
-            TestRng::from_seed(RngAlgorithm::ChaCha, &[part; 32]),
+            TestRng::from_seed(RngAlgorithm::ChaCha, &seed.key(part)),
         );
         let (applied, total) = (AtomicUsize::new(0), AtomicUsize::new(0));
         runner
@@ -267,7 +269,16 @@ mod tests {
                 total.fetch_add(t, Ordering::Relaxed);
                 Ok(())
             })
-            .unwrap();
+            .unwrap_or_else(|e| {
+                seed.fail(
+                    e,
+                    Replay {
+                        target: "-p conformance --lib",
+                        size_var: "CONFORMANCE_REDERIVE_UNITS",
+                        size: units() as u64,
+                    },
+                )
+            });
         // Both kinds of step occur: most apply, and overdraws are refused.
         let (applied, total) = (applied.into_inner(), total.into_inner());
         assert!(
@@ -276,7 +287,8 @@ mod tests {
         );
     }
 
-    // 10 000 random units in total, in four parts that run in parallel.
+    // 10 000 random units in total, in four parts that run in parallel, from fixed seeds that
+    // `CONFORMANCE_REDERIVE_SEED` replaces (the nightly run rotates it).
     #[test]
     fn inv_6_rederive_matches_stored_balances_on_random_units_part_1() {
         run(1);

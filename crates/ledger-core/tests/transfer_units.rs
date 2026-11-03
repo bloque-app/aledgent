@@ -26,7 +26,8 @@
 //!
 //! `F008_UNITS` sets the number of units on `MemStore` (default 10 000), split in four parts that
 //! run in parallel; `F008_UNITS_FILE` those on `FileStore` (redb's in-memory backend, the same
-//! code without the fsync; default 1 000).
+//! code without the fsync; default 1 000). Their seeds are fixed; `F008_SEED` (a number) replaces
+//! them (the nightly run rotates it), and a failure prints the seed and the command that repeats it.
 
 // Test names end in `__<store>_part_<n>`, after the criterion they verify.
 #![allow(non_snake_case)]
@@ -37,6 +38,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use cipher_clerk::Direction;
 use conformance::harness::delta_log;
+use conformance::tools::seed::{Replay, Rotation};
 use ledger_core::Ledger;
 use ledger_core::Refusal;
 use ledger_core::account::{AccountKind, Custody};
@@ -339,6 +341,7 @@ const PARTS: u32 = 4;
 
 fn run(file: bool, part: u8, total: u32, parts: u32) {
     let tally = Tally::default();
+    let seed = Rotation::from_env("F008_SEED");
     let books = total.div_ceil(UNITS_PER_BOOK as u32).div_ceil(parts).max(1);
     let mut runner = TestRunner::new_with_rng(
         Config {
@@ -348,7 +351,7 @@ fn run(file: bool, part: u8, total: u32, parts: u32) {
         },
         TestRng::from_seed(
             RngAlgorithm::ChaCha,
-            &[part + if file { 0x80 } else { 0x08 }; 32],
+            &seed.key(part + if file { 0x80 } else { 0x08 }),
         ),
     );
     runner
@@ -368,7 +371,20 @@ fn run(file: bool, part: u8, total: u32, parts: u32) {
             }
             Ok(())
         })
-        .unwrap();
+        .unwrap_or_else(|e| {
+            seed.fail(
+                e,
+                Replay {
+                    target: "-p ledger-core --test transfer_units",
+                    size_var: if file {
+                        "F008_UNITS_FILE"
+                    } else {
+                        "F008_UNITS"
+                    },
+                    size: u64::from(total),
+                },
+            )
+        });
     // Both outcomes occur, for multi-leg units too.
     let (applied, refused) = (tally.applied.into_inner(), tally.refused.into_inner());
     let (multi_applied, multi_refused) = (

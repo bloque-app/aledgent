@@ -1008,6 +1008,15 @@ fn f_036_a_seed_chunk_in_the_guests_heap() {
         .ok()
         .map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect())
         .unwrap_or_else(|| vec![6, 10, 20, 30, 40, 60, 80]);
+    // The default size is the only one the test asserts on (the rest is the calibration that sets
+    // it), so a sweep without it would pass having checked nothing. CI's pull request run sweeps
+    // that one size alone (`ALEDGENT_SEED_HEAP_SIZES`); this keeps that from going vacuous if the
+    // default moves.
+    assert!(
+        sizes.contains(&ledger_core::chainspec::ChunkLimits::DEFAULT.max_records),
+        "ALEDGENT_SEED_HEAP_SIZES must include the default chunk size ({}), the one size asserted on",
+        ledger_core::chainspec::ChunkLimits::DEFAULT.max_records
+    );
     let mut worst_default = 0usize;
     for records in sizes {
         let limits = ledger_core::chainspec::ChunkLimits {

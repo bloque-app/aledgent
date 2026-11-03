@@ -622,6 +622,55 @@ mod tests {
         assert_eq!(r, Err(DraftError::SideOverflow { asset: AssetTag(1) }));
     }
 
+    /// `INV-7`, `INV-1`: a posting's side sums to `u64::MAX` exactly and is accepted, and one
+    /// minor unit more is `SideOverflow`. The boundary is the whole point: the check is `>`, and
+    /// no random generator reaches a side of exactly `u64::MAX`.
+    #[test]
+    fn inv_7_a_side_of_exactly_u64_max_is_accepted_and_one_more_is_side_overflow() {
+        // One entry a side, exactly the maximum.
+        let one = PostingDraft::balanced(
+            meta(),
+            vec![
+                EntryDraft::debit(acct(1, 1), v(u64::MAX)),
+                EntryDraft::credit(acct(2, 1), v(u64::MAX)),
+            ],
+        );
+        assert!(one.is_ok(), "a side of u64::MAX is representable: {one:?}");
+        // Two entries a side, summing to exactly the maximum.
+        let split = PostingDraft::balanced(
+            meta(),
+            vec![
+                EntryDraft::debit(acct(1, 1), v(u64::MAX - 1)),
+                EntryDraft::debit(acct(1, 1), v(1)),
+                EntryDraft::credit(acct(2, 1), v(u64::MAX - 1)),
+                EntryDraft::credit(acct(2, 1), v(1)),
+            ],
+        );
+        assert!(split.is_ok(), "a side summing to u64::MAX: {split:?}");
+        // One more: the sums do not wrap, they are refused, per asset.
+        let over = PostingDraft::balanced(
+            meta(),
+            vec![
+                EntryDraft::debit(acct(1, 1), v(u64::MAX)),
+                EntryDraft::debit(acct(1, 1), v(1)),
+                EntryDraft::credit(acct(2, 1), v(u64::MAX - 1)),
+                EntryDraft::credit(acct(2, 1), v(2)),
+            ],
+        );
+        assert_eq!(over, Err(DraftError::SideOverflow { asset: AssetTag(1) }));
+        // The check is per asset: a second asset at the maximum does not tip the first.
+        let two_assets = PostingDraft::balanced(
+            meta(),
+            vec![
+                EntryDraft::debit(acct(1, 1), v(u64::MAX)),
+                EntryDraft::credit(acct(2, 1), v(u64::MAX)),
+                EntryDraft::debit(acct(1, 2), v(u64::MAX)),
+                EntryDraft::credit(acct(2, 2), v(u64::MAX)),
+            ],
+        );
+        assert!(two_assets.is_ok(), "{two_assets:?}");
+    }
+
     #[test]
     fn inv_4_each_kernel_entry_takes_its_asset_from_its_account() {
         let d = PostingDraft::balanced(
