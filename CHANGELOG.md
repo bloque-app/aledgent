@@ -8,6 +8,13 @@ SPDX-License-Identifier: CC-BY-4.0
 Releases are cut by release-please from the conventional-commit titles of the pull requests merged
 into `main` (`release-please-config.json`). Each entry below is written by its release pull request.
 
+## [0.4.1](https://github.com/bloque-app/aledgent/compare/v0.4.0...v0.4.1) (2026-11-03)
+
+
+### Bug Fixes
+
+* **stress:** build the core as generation 0 for a new book ([#118](https://github.com/bloque-app/aledgent/issues/118)) ([6665d8c](https://github.com/bloque-app/aledgent/commit/6665d8c6635753451de8127f197e9680e614e99c))
+
 ## [0.4.0](https://github.com/bloque-app/aledgent/compare/v0.3.1...v0.4.0) (2026-10-29)
 
 
