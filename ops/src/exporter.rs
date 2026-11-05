@@ -223,7 +223,18 @@ impl ExporterConfig {
     /// [`ExporterConfig::token_env`] names, exactly one of them. No error carries its value
     /// (`REQ-AU-8`).
     pub fn token(&self) -> Result<zeroize::Zeroizing<String>, Error> {
-        let raw = match (&self.token_file, &self.token_env) {
+        read_token(self.token_file.as_deref(), self.token_env.as_deref())
+    }
+}
+
+/// A token from `file` or from the variable `env` names, exactly one of them; trimmed, never empty,
+/// and never in an error (`REQ-AU-8`).
+pub fn read_token(
+    file: Option<&std::path::Path>,
+    env: Option<&str>,
+) -> Result<zeroize::Zeroizing<String>, Error> {
+    {
+        let raw = match (file, env) {
             (Some(path), None) => zeroize::Zeroizing::new(
                 std::fs::read_to_string(path)
                     .map_err(|e| Error::Config(format!("the token file: {e}")))?,
@@ -305,11 +316,14 @@ impl<C: CoreSource, A: AdapterSource> Exporter<C, A> {
                 }
             }
         });
+        // The latest run that looked at `Suspense`: a later run that did not (`opsctl reconcile`)
+        // says nothing of it, and neither hides the last report nor stands for a zero. The age of
+        // the oldest non-zero balance keeps growing from that report.
         let suspense = self
             .records
             .reconciliation
             .as_deref()
-            .and_then(|d| crate::reconcile::latest_run(d).ok().flatten())
+            .and_then(|d| crate::reconcile::latest_suspense_run(d).ok().flatten())
             .map(|r| r.suspense_signal(now));
         let reconciliation = self
             .records
