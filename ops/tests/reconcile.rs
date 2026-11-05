@@ -491,3 +491,387 @@ fn exact_figure(k: &MemKit, pair: (AccountId, AssetId)) -> i128 {
         .unwrap()
         + 1
 }
+
+// ---------------------------------------------------------------------------------------------
+// `opsctl reconcile` (`T-018-07`, `T-018-12`): the daily job against a running deployment.
+// ---------------------------------------------------------------------------------------------
+
+use ops::drill::{Check, Verdict};
+use ops::reconcile::{ArchiveChecked, IngressLink};
+use serde_json::{Value, json};
+
+/// Ingress as canned answers, remembering every request made. Anything not canned answers 404.
+struct Canned {
+    answers: BTreeMap<String, (u16, Value)>,
+    calls: std::sync::Mutex<Vec<String>>,
+}
+
+impl Canned {
+    fn new(answers: &[(&str, u16, Value)]) -> Canned {
+        Canned {
+            answers: answers
+                .iter()
+                .map(|(k, s, v)| ((*k).to_owned(), (*s, v.clone())))
+                .collect(),
+            calls: Default::default(),
+        }
+    }
+
+    fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    /// Whether any request was a write.
+    fn wrote(&self) -> bool {
+        self.calls().iter().any(|c| !c.starts_with("GET "))
+    }
+}
+
+impl IngressLink for Canned {
+    async fn call(
+        &self,
+        method: &str,
+        path: &str,
+        _body: Option<Value>,
+    ) -> Result<(u16, Value), String> {
+        let key = format!("{method} {path}");
+        self.calls.lock().unwrap().push(key.clone());
+        Ok(self
+            .answers
+            .get(&key)
+            .cloned()
+            .unwrap_or((404, json!({ "error": "not canned" }))))
+    }
+}
+
+/// The operator's link: the trial balance is the operator's, and `read_signals` alone is refused.
+fn operator_link(k: &MemKit) -> RouterLink {
+    RouterLink {
+        router: k.d.router.clone(),
+        token: k.d.operator.token.clone(),
+    }
+}
+
+fn balanced() -> (&'static str, u16, Value) {
+    (
+        "GET /v1/trial-balance",
+        200,
+        json!({ "view": 7, "accounts": 12, "unbalanced": [],
+                "rows": [{ "asset": "COPM", "openings": "0" }] }),
+    )
+}
+
+fn assets(binding: &str) -> (&'static str, u16, Value) {
+    (
+        "GET /v1/assets",
+        200,
+        json!([{ "id": "COPM", "binding": binding, "precision": 2, "kind": "fiat",
+                 "status": "active" }]),
+    )
+}
+
+fn check(name: &str, verdict: Verdict) -> Check {
+    Check {
+        name: name.into(),
+        verdict,
+        detail: format!("{name} detail"),
+    }
+}
+
+fn archive(checks: Vec<Check>) -> ArchiveChecked {
+    ArchiveChecked {
+        archive: "fs:/archive".into(),
+        segments: 3,
+        inputs: 120,
+        postings: 80,
+        checks,
+    }
+}
+
+fn verified() -> ArchiveChecked {
+    archive(vec![check("a", Verdict::Passed)])
+}
+
+/// `NFR-9`, `INV-6`: axis 1 is the archive's verification. A failed check is a finding, whatever
+/// else did not run; an undecided one is not a pass (as `archive verify` has it) and is not run;
+/// an archive that could not be read is not run, with the reason; the inputs name what was read.
+#[test]
+fn nfr_9_axis_1_is_the_archives_verification() {
+    let (r, inputs) = reconcile::axis_1_archive(Ok(&verified()));
+    assert!(r.ran && r.findings.is_empty());
+    assert_eq!(inputs["archive_inputs"], "120");
+    assert_eq!(inputs["archive_segments"], "3");
+
+    let failed = archive(vec![
+        check("a", Verdict::Passed),
+        check("b", Verdict::Failed),
+        check("c", Verdict::Unknown),
+    ]);
+    let (r, _) = reconcile::axis_1_archive(Ok(&failed));
+    assert!(
+        r.ran && matches!(r.findings.as_slice(), [Finding::Archive { check, .. }] if check == "b"),
+        "{r:?}"
+    );
+
+    let undecided = archive(vec![
+        check("a", Verdict::Passed),
+        check("c", Verdict::Unknown),
+    ]);
+    let (r, _) = reconcile::axis_1_archive(Ok(&undecided));
+    assert!(
+        !r.ran && r.note.as_deref().unwrap().contains("not a pass"),
+        "{r:?}"
+    );
+
+    let (r, _) = reconcile::axis_1_archive(Ok(&archive(vec![check("a", Verdict::Deferred)])));
+    assert!(!r.ran, "nothing passed is not a pass");
+
+    let (r, inputs) = reconcile::axis_1_archive(Err("the archive is damaged"));
+    assert!(!r.ran && r.note.as_deref().unwrap().contains("damaged"));
+    assert!(inputs.is_empty());
+}
+
+/// `NFR-9`, `INV-5`, `AC-J3.2`: axis 2 reads the trial balance. A (currency, layer) that does not
+/// sum to zero, and openings off zero by one minor unit, are findings; an unparsable figure is
+/// not zero; a refusal is not run.
+#[tokio::test]
+async fn ac_j3_2_axis_2_through_ingress_finds_one_minor_unit() {
+    let clean = Canned::new(&[balanced()]);
+    let (r, inputs) = reconcile::axis_2_route(&clean).await;
+    assert!(r.ran && r.findings.is_empty());
+    assert_eq!(
+        (
+            inputs["trial_balance_view"].as_str(),
+            inputs["trial_balance_accounts"].as_str()
+        ),
+        ("7", "12")
+    );
+
+    let off = Canned::new(&[(
+        "GET /v1/trial-balance",
+        200,
+        json!({ "view": 8, "accounts": 12, "unbalanced": [{ "currency": 3, "layer": 1 }],
+                "rows": [{ "asset": "COPM", "openings": "-1" },
+                         { "asset": "DUSD", "openings": "0" },
+                         { "asset": "USD", "openings": "oops" }] }),
+    )]);
+    let (r, _) = reconcile::axis_2_route(&off).await;
+    assert!(r.ran);
+    assert_eq!(
+        r.findings,
+        vec![
+            Finding::Unbalanced {
+                currency: 3,
+                layer: 1,
+                over: "the trial balance route".into()
+            },
+            Finding::TrialBalance {
+                asset: "COPM".into()
+            },
+            Finding::TrialBalance {
+                asset: "USD".into()
+            },
+        ]
+    );
+
+    let refused = Canned::new(&[("GET /v1/trial-balance", 403, json!({ "error": "no" }))]);
+    let (r, _) = reconcile::axis_2_route(&refused).await;
+    assert!(!r.ran && r.note.as_deref().unwrap().contains("403"));
+}
+
+/// `NFR-9`, owner's ruling: with nothing bound axis 3 has no baseline. It is reported as such,
+/// counts as run with no difference, and writes nothing, flag or no flag. The run is clean and
+/// pages no one.
+#[tokio::test]
+async fn nfr_9_axis_3_with_nothing_bound_is_no_baseline_and_writes_nothing() {
+    for compare in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("runs");
+        let link = Canned::new(&[balanced(), assets("book_only")]);
+        let run = reconcile::job(&link, Ok(&verified()), compare, 5_000, &dir)
+            .await
+            .unwrap();
+        let three = axis(&run, 3);
+        assert!(three.ran && three.findings.is_empty(), "{three:?}");
+        assert_eq!(three.note.as_deref(), Some("no baseline (nothing bound)"));
+        assert!(run.clean() && run.audited.is_none());
+        assert!(!link.wrote(), "{:?}", link.calls());
+        assert!(pages(&dir, 5_000 + 3_600_000).delivered.is_empty());
+    }
+}
+
+/// `NFR-9`: a bound asset needs the comparison, and the comparison writes an audit record. Without
+/// `--compare-settlement` it is not made: axis 3 is not run (and pages as not run), the run is not
+/// clean, and no write reaches ingress. An asset still `binding` is not bound.
+#[tokio::test]
+async fn nfr_9_axis_3_with_a_bound_asset_is_not_compared_without_the_opt_in() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("runs");
+    let link = Canned::new(&[balanced(), assets("bound")]);
+    let run = reconcile::job(&link, Ok(&verified()), false, 5_000, &dir)
+        .await
+        .unwrap();
+    let three = axis(&run, 3);
+    assert!(
+        !three.ran
+            && three
+                .note
+                .as_deref()
+                .unwrap()
+                .contains("--compare-settlement")
+    );
+    assert!(!run.clean() && run.audited.is_none());
+    assert!(!link.wrote(), "{:?}", link.calls());
+    assert_eq!(run.inputs["assets_bound"], "1");
+    assert!(pages(&dir, 5_000 + 86_400_001).got("AledgentReconciliationNotRun"));
+
+    // The opt-in on an asset that is only `binding` still compares nothing.
+    let link = Canned::new(&[balanced(), assets("binding")]);
+    let run = reconcile::job(&link, Ok(&verified()), true, 5_000, &dir)
+        .await
+        .unwrap();
+    assert!(axis(&run, 3).ran && run.clean());
+    assert!(!link.wrote(), "{:?}", link.calls());
+}
+
+/// `AC-J3.1`: with a bound asset and the opt-in, and only then, the comparison is posted — once —
+/// and its operation reference is on the record. A difference in it is a finding.
+#[tokio::test]
+async fn ac_j3_1_the_opt_in_posts_the_comparison_once_for_a_bound_asset() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("runs");
+    let comparison = |difference: &str| {
+        json!({ "operation_reference": "did:op:1",
+                "result": { "anchoring": { "comparison": {
+                    "cut": 4, "height": 9, "at": 5_000, "anchors": [1], "differs": difference != "0",
+                    "rows": [{ "asset": "COPM", "book": "10", "layer": "10", "difference": difference }]
+                } } } })
+    };
+    for (difference, clean) in [("0", true), ("1", false)] {
+        let link = Canned::new(&[
+            balanced(),
+            assets("bound"),
+            (
+                "GET /v1/ops/anchors",
+                200,
+                json!({ "latest_comparison": { "at": 4_000 } }),
+            ),
+            (
+                "POST /v1/ops/settlement/comparisons",
+                200,
+                comparison(difference),
+            ),
+        ]);
+        let run = reconcile::job(&link, Ok(&verified()), true, 5_000, &dir)
+            .await
+            .unwrap();
+        let posts: Vec<_> = link
+            .calls()
+            .into_iter()
+            .filter(|c| c.starts_with("POST"))
+            .collect();
+        assert_eq!(posts, ["POST /v1/ops/settlement/comparisons"]);
+        assert_eq!(run.audited.as_deref(), Some("did:op:1"));
+        assert_eq!(run.clean(), clean, "{run:#?}");
+        if !clean {
+            assert!(matches!(
+                axis(&run, 3).findings.as_slice(),
+                [Finding::Settlement { difference, .. }] if difference == "1"
+            ));
+        }
+    }
+}
+
+/// `NFR-9`: the record is written even when an axis could not run, in the exporter's format; a
+/// run that did not look at `Suspense` says so, and the exporter publishes no `Suspense` signal
+/// from it rather than a zero. A record from before the new fields still reads.
+#[tokio::test]
+async fn nfr_9_the_record_says_what_it_covered_and_what_it_did_not() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("runs");
+    let link = Canned::new(&[("GET /v1/assets", 500, json!({ "error": "down" }))]);
+    let run = reconcile::job(&link, Err("no route to the archive"), true, 9_000, &dir)
+        .await
+        .unwrap();
+    assert!(!axis(&run, 1).ran && !axis(&run, 2).ran && !axis(&run, 3).ran);
+    assert!(!link.wrote());
+    let back = reconcile::latest_run(&dir).unwrap().unwrap();
+    assert_eq!(back, run);
+    assert!(!back.suspense_checked && back.suspense.is_empty());
+    assert!(axis(&back, 1).note.as_deref().unwrap().contains("no route"));
+    assert!(reconcile::latest_axes(&dir).unwrap().iter().all(|a| !a.ran));
+
+    // An old record: no `note`, `inputs` or `suspense_checked`.
+    let old = json!({ "at": 1, "axes": [{ "axis": 1, "ran": true, "findings": [] }] });
+    let old: Run = serde_json::from_value(old).unwrap();
+    assert!(old.suspense_checked && old.inputs.is_empty() && old.axes[0].note.is_none());
+}
+
+/// `NFR-9`, `AC-J3.1`, `AC-J3.2`: against a real deployment, through its HTTP surface and the
+/// operator's token. A clean book is clean on all three axes with the opt-in, the comparison is
+/// on the audit trail, and nothing pages; without the opt-in no comparison is requested of the
+/// core and axis 3 is not run, and a difference in the settlement layer is found with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ac_j3_1_the_job_against_a_deployment_writes_only_when_asked() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut k = kit(tmp.path()).await;
+    let dir = tmp.path().join("runs");
+    let now = k.d.clock.now();
+    let comparisons = |k: &MemKit| {
+        k.d.core
+            .with_ledger(|l| l.state().anchoring().comparisons().len())
+            .unwrap()
+    };
+    // The job's principal is the operator (the trial balance is the operator's) and holds the
+    // `compare_settlement` kind for the opt-in.
+    let op = k.d.operator.token.clone();
+    let (s, v) =
+        k.d.call(
+            "POST",
+            "/v1/ops/operator-grants",
+            Some(&op),
+            &[],
+            Some(json!({
+                "principal": k.d.operator.identity,
+                "kinds": ["compare_settlement"],
+                "justification": "T-018-12: the daily job's principal",
+            })),
+        )
+        .await;
+    assert!(s.is_success(), "{v}");
+    let before = comparisons(&k);
+
+    // No opt-in: the trial balance is read, and no comparison is made.
+    let run = reconcile::job(&operator_link(&k), Ok(&verified()), false, now, &dir)
+        .await
+        .unwrap();
+    assert!(
+        axis(&run, 2).ran && axis(&run, 2).findings.is_empty(),
+        "{run:#?}"
+    );
+    assert_eq!(comparisons(&k), before);
+    assert!(run.audited.is_none());
+
+    // The opt-in.
+    let run = reconcile::job(&operator_link(&k), Ok(&verified()), true, now, &dir)
+        .await
+        .unwrap();
+    assert!(run.clean(), "{run:#?}");
+    assert!(run.audited.is_some());
+    assert!(comparisons(&k) > before);
+    assert!(pages(&dir, now).delivered.is_empty());
+
+    // One minor unit at the settlement layer, with the opt-in.
+    k.chain
+        .top_up_position(settle::testkit::INSTANCE, &settle::testkit::chain_usd(), 1);
+    k.settle(3).await;
+    let run = reconcile::job(&operator_link(&k), Ok(&verified()), true, now + 1, &dir)
+        .await
+        .unwrap();
+    assert!(!run.clean());
+    assert!(matches!(
+        axis(&run, 3).findings.as_slice(),
+        [Finding::Settlement { asset, difference, .. }] if asset == "USD" && difference == "1"
+    ));
+    assert!(pages(&dir, now + 1).got("AledgentReconciliationDifference"));
+}

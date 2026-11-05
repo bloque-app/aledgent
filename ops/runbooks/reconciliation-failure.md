@@ -37,6 +37,24 @@ The run also carries the `Suspense` report (`REQ-LA-2`): each `Suspense` (accoun
 since when. `AledgentSuspenseNotReconciled` pages once one has not been zero for a day: its value is placed
 where it belongs by an operation through `CTR-OPS`, never by an edit.
 
+## The daily job
+
+`opsctl reconcile --exporter-config <exporter.toml> --from <archive> --config <deployment config>
+(--anchors-rpc <URL> | --no-anchors) (--token-file <file> | --token-env <VAR>) [--compare-settlement]` (`T-018-12`) is the daily run against a
+running deployment. Axis 1 is `opsctl archive verify` on the off-node archive; axis 2 is `GET
+/v1/trial-balance` with the operator's token (`--token-file` or `--token-env`, never an argument; the exporter's
+`read_signals` token is refused the trial balance, and the opt-in also needs the `compare_settlement` kind);
+axis 3 is `F-017`'s comparison. It writes one run record into the exporter configuration's
+`[records] reconciliation` and exits non-zero unless every axis ran and found nothing.
+
+- Axis 3 with **nothing bound** has no baseline: the record says `no baseline (nothing bound)`, the axis
+  counts as run with no difference, and nothing is written (owner's ruling).
+- Axis 3 with an asset **bound** needs `--compare-settlement`, because the comparison writes an operator
+  record on the audit trail and runs only with the owner's go. Without the flag it is recorded as not run
+  and pages as not run. No other flag implies it.
+- The command does not make the `Suspense` report; its records say `suspense_checked: false` and the
+  exporter publishes no `Suspense` signal from them.
+
 ## Procedure
 
 1. **Freeze the evidence.** Take a core backup and an audit backup now (`restore.md`, "Collect the

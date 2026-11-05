@@ -223,7 +223,18 @@ impl ExporterConfig {
     /// [`ExporterConfig::token_env`] names, exactly one of them. No error carries its value
     /// (`REQ-AU-8`).
     pub fn token(&self) -> Result<zeroize::Zeroizing<String>, Error> {
-        let raw = match (&self.token_file, &self.token_env) {
+        read_token(self.token_file.as_deref(), self.token_env.as_deref())
+    }
+}
+
+/// A token from `file` or from the variable `env` names, exactly one of them; trimmed, never empty,
+/// and never in an error (`REQ-AU-8`).
+pub fn read_token(
+    file: Option<&std::path::Path>,
+    env: Option<&str>,
+) -> Result<zeroize::Zeroizing<String>, Error> {
+    {
+        let raw = match (file, env) {
             (Some(path), None) => zeroize::Zeroizing::new(
                 std::fs::read_to_string(path)
                     .map_err(|e| Error::Config(format!("the token file: {e}")))?,
@@ -310,6 +321,8 @@ impl<C: CoreSource, A: AdapterSource> Exporter<C, A> {
             .reconciliation
             .as_deref()
             .and_then(|d| crate::reconcile::latest_run(d).ok().flatten())
+            // A run that did not look at `Suspense` says nothing of it: no signal, not a zero.
+            .filter(|r| r.suspense_checked)
             .map(|r| r.suspense_signal(now));
         let reconciliation = self
             .records
