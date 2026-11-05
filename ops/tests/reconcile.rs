@@ -875,3 +875,177 @@ async fn ac_j3_1_the_job_against_a_deployment_writes_only_when_asked() {
     ));
     assert!(pages(&dir, now + 1).got("AledgentReconciliationDifference"));
 }
+
+// ---------------------------------------------------------------------------------------------
+// Review of #122: the gaps that made a pass out of nothing.
+// ---------------------------------------------------------------------------------------------
+
+/// `INV-5`: a trial balance over no accounts, or no assets, is zero by construction and reconciles
+/// nothing: axis 2 is not run, and the run is not clean.
+#[tokio::test]
+async fn inv_5_an_empty_trial_balance_is_not_a_pass() {
+    for body in [
+        json!({ "view": 7, "accounts": 12, "unbalanced": [], "rows": [] }),
+        json!({ "view": 7, "accounts": 0, "unbalanced": [],
+                "rows": [{ "asset": "COPM", "openings": "0" }] }),
+    ] {
+        let link = Canned::new(&[("GET /v1/trial-balance", 200, body)]);
+        let (r, inputs) = reconcile::axis_2_route(&link).await;
+        assert!(
+            !r.ran && r.note.as_deref().unwrap().contains("covered nothing"),
+            "{r:?}"
+        );
+        assert_eq!(inputs["trial_balance_view"], "7");
+    }
+}
+
+/// `INV-19`, `NFR-9`: a deferred check (the anchor checks under `--no-anchors`) is not a pass, even
+/// beside passed ones: axis 1 is not run, and the note names the deferred checks.
+#[test]
+fn nfr_9_axis_1_with_a_deferred_check_is_not_run() {
+    let a = archive(vec![
+        check("book-rederives", Verdict::Passed),
+        check("inv-19-anchors", Verdict::Deferred),
+    ]);
+    let (r, _) = reconcile::axis_1_archive(Ok(&a));
+    assert!(!r.ran, "{r:?}");
+    let note = r.note.unwrap();
+    assert!(
+        note.contains("inv-19-anchors") && note.contains("deferred"),
+        "{note}"
+    );
+}
+
+/// `NFR-9`: an unknown binding value, or an asset without a text id, is not known to have no
+/// baseline: axis 3 is not run and writes nothing.
+#[tokio::test]
+async fn nfr_9_axis_3_with_an_unknown_binding_is_not_run() {
+    for list in [
+        json!([{ "id": "COPM", "binding": "unbinding" }]),
+        json!([{ "id": "COPM", "binding": "book_only" }, { "id": 7, "binding": "book_only" }]),
+        json!([{ "id": "COPM" }]),
+    ] {
+        let link = Canned::new(&[("GET /v1/assets", 200, list)]);
+        let (r, audited, _) = reconcile::axis_3_gated(&link, true, "s", 1).await;
+        assert!(!r.ran && audited.is_none(), "{r:?}");
+        assert!(!link.wrote());
+    }
+}
+
+fn comparison_reply(differs: bool, rows: Value) -> Value {
+    json!({ "operation_reference": "did:op:1",
+            "result": { "anchoring": { "comparison": {
+                "cut": 4, "height": 9, "at": 5_000, "anchors": [1], "differs": differs,
+                "rows": rows } } } })
+}
+
+fn zero_row(asset: &str) -> Value {
+    json!({ "asset": asset, "book": "10", "layer": "10", "difference": "0" })
+}
+
+/// `AC-J3.2`, `REQ-PR-5`: a comparison that says it differs is a finding even with no row to show
+/// it; a bound asset with no row is held by neither side (the rows are every asset either side
+/// holds), and is said in the note.
+#[tokio::test]
+async fn ac_j3_2_the_comparison_must_cover_every_bound_asset_and_agree() {
+    let anchors = (
+        "GET /v1/ops/anchors",
+        200,
+        json!({ "latest_comparison": { "at": 4_000 } }),
+    );
+    let two_bound = (
+        "GET /v1/assets",
+        200,
+        json!([{ "id": "COPM", "binding": "bound" }, { "id": "USD", "binding": "bound" }]),
+    );
+    let post = |differs, rows| {
+        (
+            "POST /v1/ops/settlement/comparisons",
+            200,
+            comparison_reply(differs, rows),
+        )
+    };
+
+    let link = Canned::new(&[
+        two_bound.clone(),
+        anchors.clone(),
+        post(true, json!([zero_row("COPM"), zero_row("USD")])),
+    ]);
+    let (r, _, _) = reconcile::axis_3_gated(&link, true, "s", 5_000).await;
+    assert!(
+        r.ran
+            && matches!(
+                r.findings.as_slice(),
+                [Finding::SettlementDiffers { cut: 4 }]
+            ),
+        "{r:?}"
+    );
+
+    let link = Canned::new(&[
+        two_bound.clone(),
+        anchors.clone(),
+        post(false, json!([zero_row("COPM")])),
+    ]);
+    let (r, _, _) = reconcile::axis_3_gated(&link, true, "s", 5_000).await;
+    // `ComparisonBody.rows` holds every asset either side holds: no row is zero on both sides, and
+    // the note says so rather than leaving it unsaid.
+    assert!(r.ran && r.findings.is_empty(), "{r:?}");
+    assert!(
+        r.note
+            .as_deref()
+            .unwrap()
+            .contains("no row for bound asset(s) USD"),
+        "{r:?}"
+    );
+
+    // Covered and agreeing: clean. The anchors unreadable: said in a note, not skipped silently.
+    let link = Canned::new(&[
+        two_bound.clone(),
+        ("GET /v1/ops/anchors", 500, json!({ "error": "down" })),
+        post(false, json!([zero_row("COPM"), zero_row("USD")])),
+    ]);
+    let (r, _, _) = reconcile::axis_3_gated(&link, true, "s", 5_000).await;
+    assert!(r.ran && r.findings.is_empty(), "{r:?}");
+    assert!(
+        r.note
+            .as_deref()
+            .unwrap()
+            .contains("stale-cut check was skipped"),
+        "{r:?}"
+    );
+}
+
+/// `REQ-LA-2`: a later run that did not look at `Suspense` neither hides the last report that did
+/// nor stands for a zero: the exporter keeps publishing that report, and its age keeps growing, so
+/// `AledgentSuspenseNotReconciled` still fires. With no run that looked, there is no signal.
+#[test]
+fn req_la_2_the_suspense_report_outlives_runs_that_did_not_make_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let mk = |at, suspense: Vec<reconcile::SuspenseRow>, checked| Run {
+        at,
+        axes: Vec::new(),
+        suspense,
+        audited: None,
+        inputs: Default::default(),
+        suspense_checked: checked,
+    };
+    mk(100, Vec::new(), false).record(dir).unwrap();
+    assert!(reconcile::latest_suspense_run(dir).unwrap().is_none());
+    mk(
+        200,
+        vec![reconcile::SuspenseRow {
+            account: "did:a".into(),
+            asset: "USD".into(),
+            since: 150,
+        }],
+        true,
+    )
+    .record(dir)
+    .unwrap();
+    mk(300, Vec::new(), false).record(dir).unwrap();
+    let r = reconcile::latest_suspense_run(dir).unwrap().unwrap();
+    assert_eq!(r.at, 200);
+    let s = r.suspense_signal(150 + 86_400_001);
+    assert_eq!((s.nonzero, s.oldest_age), (1, 86_400_001));
+}

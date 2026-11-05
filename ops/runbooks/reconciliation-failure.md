@@ -52,6 +52,27 @@ axis 3 is `F-017`'s comparison. It writes one run record into the exporter confi
 - Axis 3 with an asset **bound** needs `--compare-settlement`, because the comparison writes an operator
   record on the audit trail and runs only with the owner's go. Without the flag it is recorded as not run
   and pages as not run. No other flag implies it.
+- An axis 1 with a `Deferred` check (the anchor checks under `--no-anchors`) or an undecided one is
+  recorded as not run, with the checks named. An empty trial balance (no accounts or no assets) is axis 2
+  not run. An asset whose binding is not `book_only`, `binding` or `bound` makes axis 3 not run. A bound
+  asset with no row in the comparison is held by neither side; the note says so.
+
+What the job does not catch, and what does:
+
+- **Posted, but the record was not written.** If the comparison was posted and writing the run record
+  then failed, the audit trail has a `compare_settlement` record with no run record, and the command
+  exits non-zero. Re-run; do not treat the audit record as a run.
+- **Token or configuration errors** (unreadable token, no `[records] reconciliation`, bad arguments) fail
+  the command before any record is written. Nothing on the record says so; the exporter pages
+  `AledgentReconciliationNotRun` after 24 hours without a run.
+- **Axis 3 not run** (a bound asset without `--compare-settlement`, or a comparison that failed) pages
+  only 24 hours after the last run that did run that axis, not at once. The command's exit status shows
+  it at once.
+- **A stalled archive still verifies clean.** Axis 1 checks what the archive holds, not that it is
+  current. Only the archive-lag alert catches an archiver that stopped.
+- **Suspense.** This command does not make the report. The exporter keeps publishing the last run that
+  did (with its age growing), so `AledgentSuspenseNotReconciled` still fires from it. If no run has ever
+  made it, there is no signal and no page.
 - The command does not make the `Suspense` report; its records say `suspense_checked: false` and the
   exporter publishes no `Suspense` signal from them.
 

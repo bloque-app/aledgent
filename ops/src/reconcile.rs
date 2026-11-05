@@ -164,6 +164,11 @@ pub enum Finding {
         /// What it found.
         detail: String,
     },
+    /// Axis 3: the comparison says the book and the layer differ, with no row to show it.
+    SettlementDiffers {
+        /// The cut.
+        cut: u64,
+    },
     /// Axis 3: the latest cut the adapter reported is older than [`MAX_CUT_AGE_MS`].
     StaleCut {
         /// The cut.
@@ -386,6 +391,9 @@ impl SettlementComparator for Compared {
                 difference: r.difference.clone(),
             })
             .collect();
+        if c.differs && out.is_empty() {
+            out.push(Finding::SettlementDiffers { cut: c.cut });
+        }
         if let Some(at) = self.reported_at {
             let age = self.now.saturating_sub(at);
             if age > MAX_CUT_AGE_MS {
@@ -673,9 +681,45 @@ pub async fn compare_through<L: IngressLink>(
     summary: &str,
     now: u64,
 ) -> (Box<dyn SettlementComparator + Send + Sync>, Option<String>) {
+    let (c, audited, _) = compare_covering(link, summary, now, &[]).await;
+    (c, audited)
+}
+
+/// [`compare_through`], requiring a row for each of `required` (the bound assets), and saying what
+/// it could not check: the third item is the notes (the stale-cut check skipped when the anchors
+/// could not be read).
+pub async fn compare_covering<L: IngressLink>(
+    link: &L,
+    summary: &str,
+    now: u64,
+    required: &[String],
+) -> (
+    Box<dyn SettlementComparator + Send + Sync>,
+    Option<String>,
+    Vec<String>,
+) {
+    let mut notes = Vec::new();
     let reported_at = match link.call("GET", "/v1/ops/anchors", None).await {
-        Ok((200, v)) => v["latest_comparison"]["at"].as_u64(),
-        _ => None,
+        Ok((200, v)) => {
+            let at = v["latest_comparison"]["at"].as_u64();
+            if at.is_none() {
+                notes
+                    .push("the stale-cut check was skipped: no earlier comparison time".to_owned());
+            }
+            at
+        }
+        Ok((status, _)) => {
+            notes.push(format!(
+                "the stale-cut check was skipped: GET /v1/ops/anchors answered {status}"
+            ));
+            None
+        }
+        Err(e) => {
+            notes.push(format!(
+                "the stale-cut check was skipped: GET /v1/ops/anchors: {e}"
+            ));
+            None
+        }
     };
     let reply = link
         .call(
@@ -686,22 +730,46 @@ pub async fn compare_through<L: IngressLink>(
         .await;
     let (status, v) = match reply {
         Ok(r) => r,
-        Err(e) => return (Box::new(NotRun(format!("ingress: {e}"))), None),
+        Err(e) => return (Box::new(NotRun(format!("ingress: {e}"))), None, notes),
     };
     if status != 200 {
-        return (Box::new(NotRun(format!("{status}: {}", v["error"]))), None);
+        return (
+            Box::new(NotRun(format!("{status}: {}", v["error"]))),
+            None,
+            notes,
+        );
     }
     let audited = v["operation_reference"].as_str().map(str::to_owned);
     match serde_json::from_value::<ComparisonBody>(v["result"]["anchoring"]["comparison"].clone()) {
         Ok(comparison) => (
             Box::new(Compared {
-                comparison,
+                comparison: comparison.clone(),
                 reported_at,
                 now,
             }),
             audited,
+            {
+                // The comparison has a row for every asset either side holds, so a bound asset
+                // with none is held by neither: equal at zero. Said, not hidden.
+                let missing: Vec<&str> = required
+                    .iter()
+                    .filter(|a| !comparison.rows.iter().any(|r| &r.asset == *a))
+                    .map(String::as_str)
+                    .collect();
+                if !missing.is_empty() {
+                    notes.push(format!(
+                        "no row for bound asset(s) {}: neither side holds any",
+                        missing.join(", ")
+                    ));
+                }
+                notes
+            },
         ),
-        Err(e) => (Box::new(NotRun(format!("the comparison: {e}"))), audited),
+        Err(e) => (
+            Box::new(NotRun(format!("the comparison: {e}"))),
+            audited,
+            notes,
+        ),
     }
 }
 
@@ -762,6 +830,27 @@ pub fn latest_run(dir: &Path) -> Result<Option<Run>, Error> {
             .map_err(|e| Error::Config(format!("{}: {e}", p.display()))),
         None => Ok(None),
     }
+}
+
+/// The latest run recorded in `dir` that made the `Suspense` report: for the exporter, which keeps
+/// publishing it (with its age growing) while later runs do not look at `Suspense`.
+pub fn latest_suspense_run(dir: &Path) -> Result<Option<Run>, Error> {
+    if !dir.exists() {
+        return Ok(None);
+    }
+    let mut names: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect();
+    names.sort();
+    for p in names.iter().rev() {
+        if let Ok(run) = serde_json::from_slice::<Run>(&std::fs::read(p)?)
+            && run.suspense_checked
+        {
+            return Ok(Some(run));
+        }
+    }
+    Ok(None)
 }
 
 /// The latest run of each axis recorded in `dir`: for the exporter. An axis that has not run is
@@ -837,7 +926,8 @@ pub struct ArchiveChecked {
 ///
 /// - a check that failed is a finding, whatever else did not run;
 /// - no failure and a check that could not decide (`Unknown`, as `opsctl archive verify` treats it:
-///   not a pass) is *not run*, and the note says which;
+///   not a pass) or that is `Deferred` (the anchor checks under `--no-anchors`) is *not run*, and
+///   the note names them;
 /// - nothing that ran passed (no check at all, or every one deferred) is *not run*;
 /// - an archive that could not be read or is damaged is *not run*, with the reason.
 pub fn axis_1_archive(
@@ -884,21 +974,30 @@ pub fn axis_1_archive(
             inputs,
         );
     }
-    let undecided: Vec<&str> = a
-        .checks
-        .iter()
-        .filter(|c| c.verdict == Verdict::Unknown)
-        .map(|c| c.name.as_str())
-        .collect();
-    if !undecided.is_empty() {
-        return (
-            not_run(format!(
+    let named = |v: Verdict| -> Vec<&str> {
+        a.checks
+            .iter()
+            .filter(|c| c.verdict == v)
+            .map(|c| c.name.as_str())
+            .collect()
+    };
+    let (undecided, deferred) = (named(Verdict::Unknown), named(Verdict::Deferred));
+    if !undecided.is_empty() || !deferred.is_empty() {
+        let mut why = Vec::new();
+        if !undecided.is_empty() {
+            why.push(format!(
                 "undecided, which is not a pass: {} (read again from an archive node, \
                  --anchors-rpc)",
                 undecided.join(", ")
-            )),
-            inputs,
-        );
+            ));
+        }
+        if !deferred.is_empty() {
+            why.push(format!(
+                "deferred, so not checked: {} (--no-anchors leaves the anchor checks deferred)",
+                deferred.join(", ")
+            ));
+        }
+        return (not_run(why.join("; ")), inputs);
     }
     if !a.checks.iter().any(|c| c.verdict == Verdict::Passed) {
         return (not_run("no check passed".into()), inputs);
@@ -946,6 +1045,17 @@ pub async fn axis_2_route<L: IngressLink>(link: &L) -> (AxisResult, BTreeMap<Str
     inputs.insert("trial_balance_view".into(), body.view.to_string());
     inputs.insert("trial_balance_accounts".into(), body.accounts.to_string());
     inputs.insert("trial_balance_assets".into(), body.rows.len().to_string());
+    // A trial balance over nothing is zero by construction: it reconciles nothing.
+    if body.rows.is_empty() || body.accounts == 0 {
+        return (
+            not_run(format!(
+                "the trial balance covered nothing ({} accounts, {} assets)",
+                body.accounts,
+                body.rows.len()
+            )),
+            inputs,
+        );
+    }
     let mut findings: Vec<Finding> = body
         .unbalanced
         .iter()
@@ -975,15 +1085,22 @@ pub async fn axis_2_route<L: IngressLink>(link: &L) -> (AxisResult, BTreeMap<Str
 }
 
 /// The assets whose binding is `bound` (`REQ-AS-8`): the only ones the settlement layer holds
-/// something for. `binding` (asked for, not yet bound) and `book_only` have no baseline.
-fn bound_assets(assets: &serde_json::Value) -> Option<(usize, Vec<String>)> {
-    let items = assets.as_array()?;
-    let bound = items
-        .iter()
-        .filter(|a| a["binding"] == "bound")
-        .filter_map(|a| a["id"].as_str().map(str::to_owned))
-        .collect();
-    Some((items.len(), bound))
+/// something for. `binding` (asked for, not yet bound) and `book_only` have no baseline. Any other
+/// value, or an entry without a text id or binding, is not known to have none: `Err`.
+fn bound_assets(assets: &serde_json::Value) -> Result<(usize, Vec<String>), String> {
+    let items = assets.as_array().ok_or("not a list")?;
+    let mut bound = Vec::new();
+    for a in items {
+        let (Some(id), Some(binding)) = (a["id"].as_str(), a["binding"].as_str()) else {
+            return Err("an asset without a text id or binding".into());
+        };
+        match binding {
+            "bound" => bound.push(id.to_owned()),
+            "book_only" | "binding" => {}
+            other => return Err(format!("asset {id} has the binding {other:?}, not known")),
+        }
+    }
+    Ok((items.len(), bound))
 }
 
 /// Axis 3 for the daily job (`NFR-9` third axis, `REQ-PR-5`), with its one write behind two gates.
@@ -1026,8 +1143,9 @@ pub async fn axis_3_gated<L: IngressLink>(
         }
         Err(e) => return (not_run(format!("GET /v1/assets: {e}")), None, inputs),
     };
-    let Some((total, bound)) = bound_assets(&assets) else {
-        return (not_run("GET /v1/assets: not a list".into()), None, inputs);
+    let (total, bound) = match bound_assets(&assets) {
+        Ok(x) => x,
+        Err(why) => return (not_run(format!("GET /v1/assets: {why}")), None, inputs),
     };
     inputs.insert("assets".into(), total.to_string());
     inputs.insert("assets_bound".into(), bound.len().to_string());
@@ -1056,10 +1174,12 @@ pub async fn axis_3_gated<L: IngressLink>(
             inputs,
         );
     }
-    let (comparator, audited) = compare_through(link, summary, now).await;
+    let (comparator, audited, notes) = compare_covering(link, summary, now, &bound).await;
     let mut axis = axis_3(comparator.as_ref());
     if !axis.ran {
         axis.note = Some("the comparison could not be made".into());
+    } else if !notes.is_empty() {
+        axis.note = Some(notes.join("; "));
     }
     (axis, audited, inputs)
 }

@@ -316,13 +316,14 @@ impl<C: CoreSource, A: AdapterSource> Exporter<C, A> {
                 }
             }
         });
+        // The latest run that looked at `Suspense`: a later run that did not (`opsctl reconcile`)
+        // says nothing of it, and neither hides the last report nor stands for a zero. The age of
+        // the oldest non-zero balance keeps growing from that report.
         let suspense = self
             .records
             .reconciliation
             .as_deref()
-            .and_then(|d| crate::reconcile::latest_run(d).ok().flatten())
-            // A run that did not look at `Suspense` says nothing of it: no signal, not a zero.
-            .filter(|r| r.suspense_checked)
+            .and_then(|d| crate::reconcile::latest_suspense_run(d).ok().flatten())
             .map(|r| r.suspense_signal(now));
         let reconciliation = self
             .records
