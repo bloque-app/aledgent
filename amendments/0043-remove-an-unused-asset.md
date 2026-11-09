@@ -48,7 +48,10 @@ short:
    - **never used:** nothing was ever posted in it, in any account. A balance that is zero now but was not always
      zero is used;
    - **no Treasury limit in it:** no Treasury account declares a limit in it;
-   - **no unrevoked issuance authority over it.** The operator revokes it first (`revoke_issuance`).
+   - **no unrevoked issuance authority over it.** The operator revokes it first (`revoke_issuance`);
+   - **no grant that is not revoked bounds the assets it covers with this one in the list:** such a bound counts
+     minor units of the precision being replaced;
+   - **the indexes behind the last three checks are known complete** (below).
 3. An asset that is not registered is `ERR-UnknownAsset`. A review reference of zeroes names no review
    (`ERR-NotAuthorised`), as for `register_asset`; a missing justification is `ERR-JustificationRequired`.
 4. The designation the book gave the asset in its own records (its tag, below) is retired with it and never given to
@@ -75,9 +78,9 @@ Suspense account is never negative, so it holds only what it received. The accou
   exported, like the index of owned custody. An asset it names is refused;
 - nothing else.
 
-An asset none of them has touched has had no first posting, so it has had none. The check is five point reads
+An asset none of them has touched has had no first posting, so it has had none. The check is point reads
 (registry binding, the binding record, the opening position, the journal sums of the issuance counterparty and of each
-position, the Treasury index) and one index of grants by asset.
+position, the Treasury index) and two indexes of grants by asset: by subject, and by the assets a bound names.
 
 ### Tags
 
@@ -95,7 +98,7 @@ asset's tag or identifier, and what was done about it:
 | Anchors and checkpoints | the kernel root | History. A checkpoint taken before the removal commits to what the kernel held then, which never held the asset. |
 | Settlement | a binding record per asset, a support declaration of (kind, asset) pairs, an attestation per location | A binding record, including a refused one, keeps the asset. A support declaration names the identifier only, no tag and no amount, and stays; an external leg in a book-only asset is refused anyway (`REQ-AS-7`). |
 | Partitions | the tag, on messages between writers and in the issuance members | See the next section. |
-| Grants and Treasury limits | an identifier, and minor-unit amounts | An issuance grant over the asset keeps it until revoked. A Treasury limit keeps it. A bound on another grant that names the asset is not checked (below). |
+| Grants and Treasury limits | an identifier, and minor-unit amounts | An issuance grant over the asset keeps it until revoked. A Treasury limit keeps it. A bound on another grant that names the asset keeps it until that grant is revoked (an index by asset). |
 | The audit trail | the identifier, in the subject of a record | History. The removal is itself a record that names the asset and the review. |
 
 ### Partitions
@@ -115,28 +118,51 @@ amendment.
 
 ### Rules version
 
-`remove_asset` is a new input, so a log holds none before it. The Treasury index is new state, written when an account
-is put, and an input of an earlier rules version must write exactly the leaves its code wrote (the rules version rule,
-amendment 0033). The operation and the index therefore take effect at the rules version that carries them
-(`ASSET_REMOVAL`, which is `CHAINED_SETTLEMENT`: no book has decided an input at that version, so one in-place upgrade
-takes both). Before it, `remove_asset` is `ERR-MalformedCommand` and writes nothing, and an account put writes no index
-leaf.
+`remove_asset` is a new input, so a log holds none before it. The two indexes (the Treasury accounts that declare a
+limit in each asset, and the grants whose bounds name each asset) are new state, written when an account or a grant is
+put, and an input of an earlier rules version must write exactly the leaves its code wrote (the rules version rule,
+amendment 0033; `REQ-RT-19`, `REQ-RT-20`).
+
+**The number is 4** (`ASSET_REMOVAL`). It is the next after the highest rules version the released code names, found
+in the code and its history, not assumed:
+
+- the core package is compiled as rules version 1 in every release (`GENERATION` in the core package at `v0.4.0`,
+  `v0.4.1` and `develop`), and `CHAINED_SETTLEMENT`, `SETTLEMENT_EPOCHS` and `ASSET_CANDIDATES` are all 1;
+- a deployed book has decided inputs at 1, so version 1 cannot take the indexes without changing what replaying its
+  history writes;
+- the code-history fixture of the `code-history` gate (`T-037-12`), present in `v0.4.0` and replayed by every build,
+  records a book's history through versions 0, 1, 2 and 3. A first attempt at version 2 failed the gate: a grant put
+  under version 2 writes an index leaf and the replay diverges at its input. The fixture is append-only, and the gate
+  exists so that a pull request cannot pass by re-recording what it breaks.
+
+So 4 is the first version no recorded history is decided under. This change does not raise the core package's
+`GENERATION`: that is the release's step, and a book reaches version 4 one upgrade at a time, each upgrade a package
+one rules version above the last. The feature turns on only through an upgrade to a build at 4.
+
+Before version 4, `remove_asset` is `ERR-MalformedCommand` and writes nothing, and an account or grant put writes no
+index leaf and reads none.
+
+### Entering version 4: no backfill, so removal fails closed
+
+Building the two indexes for the accounts and grants a book already holds is a scan of every account and every grant.
+The writer may not make one (`REQ-RT-1`), the guest's arena bounds an input, and the core has no ordered, bounded read of
+those collections to do it a chunk at a time, as the move of settlement incidents does for a small list. A backfill
+as part of entering the version is therefore not feasible in this design, and the amendment does not pretend it is.
+
+It fails closed instead. A leaf records whether the indexes are known to hold every account and grant of the book. It is
+absent in a book that entered version 4 by an upgrade, and `remove_asset` then refuses every removal with
+`ERR-NotAuthorised` whatever the asset, so no asset used only through an account or grant the index missed is ever
+removed. An import builds both indexes from every record and sets the leaf, so a book restored from an export can remove.
+A backfill in bounded batches, which sets the leaf when it finishes, is the way to enable removal on a book in place, and
+is not part of this amendment.
 
 ## Trade-offs, stated plainly
 
-- **A book that ran an earlier rules version has no index of the Treasury accounts it opened then, and for such a
-  book the core can wrongly accept the removal of a used asset.** The check cannot see a Treasury limit on such an
-  account, and a Treasury account with a limit can move the asset with no issuance at all, so an asset used only
-  through one of them looks unused. No scan of accounts is allowed inside the writer. This contradicts the
-  unconditional wording of `REQ-AS-10` on exactly the books that need the operation, and the amendment does not
-  hide it. For such a book, until a backfill exists, the operator must establish by a query over its accounts and
-  postings that nothing was ever posted in the asset and that no Treasury account declares a limit in it, and the
-  review that `remove_asset` requires records that. The owner chooses between that and failing closed (refusing every
-  removal on a book that ran an earlier rules version until a backfill, in bounded batches, has built the index).
-  A book founded on this rules version or later, or rebuilt by an import, has the index complete.
-- **A grant's bound that names the asset is not checked.** A grant over an account can bound the assets it covers and
-  an amount per operation or window. A removed identifier that such a bound names applies, once registered again, at the
-  new precision. The operator reviews those grants before removing the asset.
+- **In a book that entered version 4 by an upgrade, removal is unavailable until its indexes are built.** See above. The
+  alternative, accepting a removal on the operator's word that nothing in the book names the asset, would let the core
+  remove a used asset, which `REQ-AS-10` forbids.
+- **A book founded at version 4 does not set the leaf either, yet.** The genesis path does not know the rules version
+  it runs under, so only an import marks a book complete. This is conservative, not unsound.
 - **Removal is not undo.** An asset removed is gone from the registry; registering it again is a new asset with a new
   tag. Any integration that cached the old tag, or the old precision, must be refreshed.
 

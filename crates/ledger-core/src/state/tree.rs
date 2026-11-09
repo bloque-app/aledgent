@@ -38,6 +38,8 @@ impl LeafHost for State {
         out.push(&self.by_owner);
         out.push(&self.owned_custody);
         out.push(&self.treasury_by_asset);
+        out.push(&self.grants_by_bound_asset);
+        out.push(&self.removal_indexes_complete);
         out.push(&self.credentials);
         out.push(&self.sets);
         out.push(&self.grants);
@@ -68,6 +70,8 @@ impl LeafHost for State {
         out.push(&mut self.by_owner);
         out.push(&mut self.owned_custody);
         out.push(&mut self.treasury_by_asset);
+        out.push(&mut self.grants_by_bound_asset);
+        out.push(&mut self.removal_indexes_complete);
         out.push(&mut self.credentials);
         out.push(&mut self.sets);
         out.push(&mut self.grants);

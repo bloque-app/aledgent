@@ -900,12 +900,13 @@ fn t043_14_generation_0_reads_no_sequence() {
     );
 }
 
-/// Amendment 0043 (`REQ-AS-10`): an asset registered book-only and never used is removed, and its
-/// id registered again at another precision with a fresh tag, from the rules version that carries
-/// the operation. Before the upgrade the same book answers `ERR-MalformedCommand`, in the replica
-/// and in the Agent, and writes nothing.
+/// Amendment 0043 (`REQ-AS-10`): `remove_asset` is taken from rules version 4 and from no earlier
+/// one. Before it the replica and the Agent answer `ERR-MalformedCommand` and write nothing. At
+/// version 4, reached by upgrades, the book refuses every removal with `ERR-NotAuthorised`: its
+/// indexes were not built for what it held before, and nothing builds them in place, so it fails
+/// closed rather than guess (`ASSET_REMOVAL`).
 #[test]
-fn req_as_10_the_removal_is_taken_from_its_rules_version() {
+fn req_as_10_the_removal_is_taken_from_its_rules_version_and_fails_closed_after_an_upgrade() {
     use ledger_core::asset::{ASSET_REMOVAL, AssetId, AssetKind};
     use ledger_core::ledger::operator::{RegisterAsset, ReviewRef};
     use ledger_core::operator::OperatorOpKind;
@@ -926,47 +927,39 @@ fn req_as_10_the_removal_is_taken_from_its_rules_version() {
         )
         .unwrap();
     fx.synced();
-    let register = |fx: &mut Fx<NativePort>, precision: u8, n: u8| {
-        let ctx = fx.ctx(op);
-        fx.replica
-            .register_asset(
-                &ctx,
-                RegisterAsset {
-                    id: tstx,
-                    precision,
-                    kind: AssetKind::Other,
-                    review: ReviewRef([n; 32]),
-                },
-                b"listing",
-            )
-            .unwrap();
-        fx.synced();
-        *fx.replica.state().registry().get(&tstx).unwrap()
-    };
-    let wrong = register(&mut fx, 8, 1);
-    let ctx = fx.ctx(op);
-    assert_eq!(
-        fx.replica
-            .remove_asset(&ctx, tstx, ReviewRef([2; 32]), b"wrong precision")
-            .unwrap_err(),
-        Refusal::MalformedCommand
-    );
-    fx.synced();
-    assert_eq!(fx.replica.state().registry().get(&tstx), Ok(&wrong));
-
-    assert_eq!(upgrade(&mut fx), ASSET_REMOVAL);
     let ctx = fx.ctx(op);
     fx.replica
-        .remove_asset(
+        .register_asset(
             &ctx,
-            tstx,
-            ReviewRef([2; 32]),
-            b"wrong precision, never used",
+            RegisterAsset {
+                id: tstx,
+                precision: 8,
+                kind: AssetKind::Other,
+                review: ReviewRef([1; 32]),
+            },
+            b"listing",
         )
         .unwrap();
     fx.synced();
-    assert!(fx.replica.state().registry().get(&tstx).is_err());
-    let right = register(&mut fx, 6, 3);
-    assert_eq!(right.precision(), 6);
-    assert!(right.tag().0 > wrong.tag().0);
+    let wrong = *fx.replica.state().registry().get(&tstx).unwrap();
+    let remove = |fx: &mut Fx<NativePort>| {
+        let ctx = fx.ctx(op);
+        let r = fx
+            .replica
+            .remove_asset(&ctx, tstx, ReviewRef([2; 32]), b"wrong precision")
+            .map(|a| a.value);
+        fx.synced();
+        r
+    };
+    // Rules versions 0 to 3, the highest the released code names: not known.
+    assert_eq!(remove(&mut fx), Err(Refusal::MalformedCommand));
+    assert_eq!(upgrade(&mut fx), CHAINED_SETTLEMENT);
+    for version in 2..=ASSET_REMOVAL {
+        assert_eq!(remove(&mut fx), Err(Refusal::MalformedCommand));
+        assert_eq!(upgrade(&mut fx), version);
+    }
+    // Rules version 4: known, and refused while the indexes are not known complete.
+    assert_eq!(fx.driver.writer().generation, ASSET_REMOVAL);
+    assert_eq!(remove(&mut fx), Err(Refusal::NotAuthorised));
+    assert_eq!(fx.replica.state().registry().get(&tstx), Ok(&wrong));
 }

@@ -105,15 +105,15 @@ fn ac_k5_2_export_and_reimport_give_identical_observable_state() {
 
 /// Amendment 0043: a book that removed an asset exports the tag it retired and imports it back,
 /// so the same id registers again with the same fresh tag in the original and in the import, and
-/// no tag is ever given twice. A book that never removed one writes no such section.
+/// no tag is ever given twice. A book that never removed one writes no such section. The removal
+/// is made in an imported book: an import builds the indexes the removal reads from every record,
+/// so they are known complete there.
 #[test]
 fn req_as_10_a_retired_tag_crosses_an_export_and_an_import() {
     use ledger_core::asset::{AssetId, AssetKind};
     use ledger_core::ledger::operator::{RegisterAsset, ReviewRef};
 
     let mut b = random(0x543, 200);
-    b.ledger
-        .set_generation(ledger_core::asset::ASSET_REMOVAL, false);
     let mut anchors = Checkpoints::new();
     let plain = export(&mut b, &mut anchors);
     assert!(
@@ -122,12 +122,14 @@ fn req_as_10_a_retired_tag_crosses_an_export_and_an_import() {
             .iter()
             .all(|s| s.name() != "service.retired-tags")
     );
+    let mut first = import(&mut b, &plain, &anchors);
+    first.set_generation(ledger_core::asset::ASSET_REMOVAL, false);
 
     let tstx = AssetId::parse("TSTX").unwrap();
     // The random book's operator holds a fixed list of kinds; add the two this needs.
     let op = b.operator();
     let ctx = b.ctx(op);
-    b.ledger
+    first
         .grant_operator(
             &ctx,
             op.principal,
@@ -143,26 +145,25 @@ fn req_as_10_a_retired_tag_crosses_an_export_and_an_import() {
             b"asset staff",
         )
         .expect("granted");
-    let register = |b: &mut Mem, precision: u8, n: u8| {
+    let register = |l: &mut Ledger<MemStore, MemVault>, b: &mut Mem, precision: u8, n: u8| {
         let ctx = b.ctx(b.operator());
-        b.ledger
-            .register_asset(
-                &ctx,
-                RegisterAsset {
-                    id: tstx,
-                    precision,
-                    kind: AssetKind::Other,
-                    review: ReviewRef([n; 32]),
-                },
-                b"listing",
-            )
-            .expect("registered");
-        b.ledger.state().registry().get(&tstx).unwrap().tag()
+        l.register_asset(
+            &ctx,
+            RegisterAsset {
+                id: tstx,
+                precision,
+                kind: AssetKind::Other,
+                review: ReviewRef([n; 32]),
+            },
+            b"listing",
+        )
+        .expect("registered");
+        l.state().registry().get(&tstx).unwrap().tag()
     };
     // The highest tag is the one retired, so only the next tag remembers it.
-    let wrong = register(&mut b, 8, 1);
+    let wrong = register(&mut first, &mut b, 8, 1);
     let ctx = b.ctx(b.operator());
-    b.ledger
+    first
         .remove_asset(
             &ctx,
             tstx,
@@ -170,39 +171,38 @@ fn req_as_10_a_retired_tag_crosses_an_export_and_an_import() {
             b"wrong precision, never used",
         )
         .expect("removed");
-    let mut anchors = Checkpoints::new();
-    let e = export(&mut b, &mut anchors);
+    // Export the book that removed it, and import that.
+    let mut again = Checkpoints::new();
+    again.anchor(&first).expect("a checkpoint");
+    let ctx = b.ctx(b.operator());
+    let e = first
+        .export_book(&ctx, &again, b"export after a removal", &mut b.audit)
+        .expect("the export");
     assert_eq!(
         e.sections.last().map(|s| s.name()),
         Some("service.retired-tags")
     );
     let bytes = e.to_bytes();
     let e = Export::from_bytes(&bytes).expect("the bytes read back");
-    let mut imported = import(&mut b, &e, &anchors);
-    imported.set_generation(ledger_core::asset::ASSET_REMOVAL, false);
-    assert_eq!(
-        imported.state().registry().digest(),
-        b.ledger.state().registry().digest()
-    );
     let ctx = b.ctx(b.operator());
-    imported
-        .register_asset(
-            &ctx,
-            RegisterAsset {
-                id: tstx,
-                precision: 6,
-                kind: AssetKind::Other,
-                review: ReviewRef([3; 32]),
-            },
-            b"relisting",
-        )
-        .expect("registered again in the import");
-    let fresh = imported.state().registry().get(&tstx).unwrap().tag();
-    assert!(fresh.0 > wrong.0, "{fresh:?} reuses {wrong:?}");
-    assert_eq!(register(&mut b, 6, 3), fresh);
+    let t = target(&b);
+    let (mut second, _) = Ledger::import_book(&e, t, &again, &ctx, b"restore drill", &mut b.audit)
+        .expect("the import");
+    second.set_generation(ledger_core::asset::ASSET_REMOVAL, false);
     assert_eq!(
-        imported.state().registry().digest(),
-        b.ledger.state().registry().digest()
+        second.state().registry().digest(),
+        first.state().registry().digest()
+    );
+    let fresh_second = register(&mut second, &mut b, 6, 3);
+    let fresh_first = register(&mut first, &mut b, 6, 3);
+    assert!(
+        fresh_second.0 > wrong.0,
+        "{fresh_second:?} reuses {wrong:?}"
+    );
+    assert_eq!(fresh_second, fresh_first);
+    assert_eq!(
+        second.state().registry().digest(),
+        first.state().registry().digest()
     );
 }
 
@@ -223,6 +223,16 @@ fn inv_6_an_imported_book_holds_the_same_service_leaves() {
         .filter(|l| !after.contains(l))
         .chain(after.iter().filter(|l| !before.contains(l)))
         .map(|(kind, _, _)| *kind)
+        // Whether the removal indexes are known complete depends on how the book came to be: an
+        // import builds them from every record and says so (amendment 0043).
+        .filter(|kind| {
+            ![
+                ledger_core::leaves::kind::REMOVAL_INDEXES_COMPLETE,
+                ledger_core::leaves::kind::TREASURY_LIMITS_BY_ASSET,
+                ledger_core::leaves::kind::GRANTS_BY_BOUND_ASSET,
+            ]
+            .contains(kind)
+        })
         .collect();
     assert!(differ.is_empty(), "leaves of kinds {differ:?} differ");
 }

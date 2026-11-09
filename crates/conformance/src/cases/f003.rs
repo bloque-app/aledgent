@@ -627,6 +627,8 @@ fn inv_24_an_unused_asset_is_removed_and_registered_again_with_a_fresh_tag__stor
     h: &mut dyn Harness,
 ) -> Outcome {
     let s = store(h);
+    // The indexes are known complete, as an import's are.
+    s.force_removal_indexes_complete();
     let tstx = AssetId::parse("TSTX").unwrap();
     s.commit(&[Write::RegisterAsset {
         id: tstx,

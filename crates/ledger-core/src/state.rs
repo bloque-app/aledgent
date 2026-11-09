@@ -382,6 +382,11 @@ pub enum AssetInUse {
     TreasuryLimit,
     /// An issuance grant over it has not been revoked.
     LiveGrant,
+    /// A grant that is not revoked bounds the assets it covers, and names this one.
+    GrantBound,
+    /// The indexes above are not known to hold every account and grant of the book: it entered
+    /// the rules version that keeps them by an upgrade, and nothing has built them.
+    IndexesIncomplete,
 }
 
 /// How to undo one applied write.
@@ -464,6 +469,13 @@ pub struct State {
     /// from `accounts`, never exported, absent for an asset none names. Whether an asset can be
     /// removed (amendment 0043) is one point read of it, not a read of every account.
     treasury_by_asset: Leaves<AssetId, BTreeSet<AccountId>, { kind::TREASURY_LIMITS_BY_ASSET }>,
+    /// The grants whose bounds name each asset, revoked ones included: derived from `grants`,
+    /// never exported (amendment 0043).
+    grants_by_bound_asset: Leaves<AssetId, BTreeSet<GrantId>, { kind::GRANTS_BY_BOUND_ASSET }>,
+    /// Whether `treasury_by_asset` and `grants_by_bound_asset` hold every account and grant
+    /// (amendment 0043). Never exported: an import sets it, because it builds both from the
+    /// records; a book that entered the rules version that keeps them by an upgrade has it unset.
+    removal_indexes_complete: Slot<bool, { kind::REMOVAL_INDEXES_COMPLETE }>,
     credentials: Leaves<CredentialId, Credential, { kind::CREDENTIAL }>,
     /// Each identity's credential set, by id: derived from `credentials`, changed in the same
     /// write, never exported (`F-012` follow-up, issue #50).
@@ -507,7 +519,8 @@ pub struct State {
         Slot<Option<crate::code::authority::AuthorityRecord>, { kind::UPGRADE_AUTHORITY }>,
     /// Whether the Treasury-limit index is kept as accounts are put (amendment 0043,
     /// [`crate::asset::ASSET_REMOVAL`]). Never stored: the ledger sets it from the rules version of
-    /// each input. A store no ledger told keeps the index, as the import's rebuild does.
+    /// each input. A ledger never told decides as rules version 0, so it keeps no index; the import's
+    /// rebuild builds them from the records.
     treasury_indexing: bool,
     /// While a seed chunk is being applied: the operator's seeding passes the seal's guard
     /// (`crate::principal`). Never stored: it is set and cleared inside one call.
@@ -569,6 +582,8 @@ impl State {
             by_owner: Leaves::new(),
             owned_custody: Leaves::new(),
             treasury_by_asset: Leaves::new(),
+            grants_by_bound_asset: Leaves::new(),
+            removal_indexes_complete: Slot::default(),
             credentials: Leaves::new(),
             sets: Leaves::new(),
             grants: Leaves::new(),
@@ -591,7 +606,7 @@ impl State {
             anchoring: crate::anchor::AnchorStore::new(),
             chainspec: crate::chainspec::SpecState::new(),
             upgrade_authority: Slot::default(),
-            treasury_indexing: true,
+            treasury_indexing: false,
             applying_spec: false,
             spec_undo: None,
         }
@@ -762,6 +777,9 @@ impl State {
                         }
                         if let Some(key) = asset_or_identity_key(&g) {
                             self.by_asset_or_identity.remove_from(&key, &id);
+                        }
+                        if self.treasury_indexing {
+                            self.unindex_grant_bounds(&g);
                         }
                     }
                 }
@@ -995,6 +1013,9 @@ impl State {
                     self.by_asset_or_identity
                         .entry_or_default(key)
                         .insert(g.id());
+                }
+                if self.treasury_indexing {
+                    self.index_grant_bounds(g);
                 }
                 self.grants.insert(g.id(), g.clone());
                 Ok(Undo::RemoveGrant(g.id()))
@@ -1326,6 +1347,39 @@ impl State {
         }
     }
 
+    /// Put a grant in the index of the assets its bounds name.
+    pub(crate) fn index_grant_bounds(&mut self, grant: &Grant) {
+        if let Some(assets) = grant.bounds().assets() {
+            for asset in assets.iter() {
+                self.grants_by_bound_asset
+                    .entry_or_default(*asset)
+                    .insert(grant.id());
+            }
+        }
+    }
+
+    /// Take a grant out of the index of the assets its bounds name.
+    fn unindex_grant_bounds(&mut self, grant: &Grant) {
+        if let Some(assets) = grant.bounds().assets() {
+            for asset in assets.iter() {
+                self.grants_by_bound_asset.remove_from(asset, &grant.id());
+            }
+        }
+    }
+
+    /// Say that both indexes hold every account and grant of the book: an import builds them from
+    /// the records (amendment 0043).
+    pub(crate) fn set_removal_indexes_complete(&mut self) {
+        self.removal_indexes_complete.set(true);
+    }
+
+    /// For the conformance suite's store cases: a store whose indexes are known complete, as an
+    /// import's are (feature `conformance-ports`, `REQ-CS-5`).
+    #[cfg(feature = "conformance-ports")]
+    pub fn force_removal_indexes_complete(&mut self) {
+        self.set_removal_indexes_complete();
+    }
+
     /// Take a Treasury account out of the index of the assets it declares a limit in.
     fn unindex_treasury(&mut self, account: &LedgerAccount) {
         if account.kind() != AccountKind::Treasury {
@@ -1344,7 +1398,9 @@ impl State {
     /// - no opening position was opened for it;
     /// - no posting ever touched the issuance counterparty, or an opening position, in it;
     /// - no Treasury account declares a limit in it;
-    /// - no issuance grant over it is unrevoked.
+    /// - no issuance grant over it is unrevoked, and no grant that is not revoked bounds the assets
+    ///   it covers with this one in the list (the bound counts minor units of its precision);
+    /// - the indexes behind the last two checks are known to hold everything the book holds.
     ///
     /// Value can only enter an asset at an account that may go below zero. A Customer or Suspense
     /// account is never negative, so it holds only what it received. The ones that may be negative
@@ -1362,6 +1418,11 @@ impl State {
             return Err(StoreRefusal::Registry(RegistryError::NotBookOnly(*id)));
         }
         let used = |why| Err(StoreRefusal::AssetInUse(why));
+        // Fail closed: an index that may lack an account or a grant the book holds from before it
+        // was kept cannot show that nothing names the asset.
+        if !*self.removal_indexes_complete.get() {
+            return used(AssetInUse::IndexesIncomplete);
+        }
         if self.settlement.asset_bind(id).is_some() {
             return used(AssetInUse::Binding);
         }
@@ -1392,6 +1453,16 @@ impl State {
             .any(|g| g.revoked().is_none());
         if live {
             return used(AssetInUse::LiveGrant);
+        }
+        let bound = self
+            .grants_by_bound_asset
+            .get(id)
+            .into_iter()
+            .flatten()
+            .filter_map(|g| self.grants.get(g))
+            .any(|g| g.revoked().is_none());
+        if bound {
+            return used(AssetInUse::GrantBound);
         }
         Ok(())
     }
@@ -1917,6 +1988,8 @@ mod tests {
     #[test]
     fn req_as_10_the_store_removes_an_unused_asset_and_retires_its_tag() {
         let (mut s, _, _) = seeded();
+        s.set_removal_indexes_complete();
+        s.set_treasury_indexing(true);
         let tag = s.registry().get(&usd()).unwrap().tag();
         let before = s.registry().digest();
         let unknown = AssetId::parse("NOPE").unwrap();
@@ -1966,6 +2039,8 @@ mod tests {
     #[test]
     fn req_as_10_the_store_names_what_keeps_an_asset() {
         let (mut s, person, _) = seeded();
+        s.set_removal_indexes_complete();
+        s.set_treasury_indexing(true);
         // A Treasury account that declares a limit in the asset: it could be driven below zero
         // with no issuance at all, and the limit counts the old precision's minor units.
         let treasury = LedgerAccount::new(
@@ -2022,6 +2097,8 @@ mod tests {
     fn req_as_10_an_unrevoked_issuance_grant_or_an_opening_position_keeps_an_asset() {
         use crate::authority::GrantKind;
         let (mut s, person, _) = seeded();
+        s.set_removal_indexes_complete();
+        s.set_treasury_indexing(true);
         let w = Window {
             length: NonZeroU64::new(10).unwrap(),
             limit: NonZeroMinor::new(Minor::new(5)).unwrap(),

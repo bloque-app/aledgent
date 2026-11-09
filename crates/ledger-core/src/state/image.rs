@@ -197,6 +197,8 @@ impl State {
             by_owner: _,
             owned_custody: _,
             treasury_by_asset: _,
+            grants_by_bound_asset: _,
+            removal_indexes_complete: _,
             credentials,
             sets: _,
             grants,
@@ -418,6 +420,11 @@ impl State {
             }
         }
         state.grants = keyed(s(5), |g: &Grant| g.id())?.into();
+        for g in state.grants.values().cloned().collect::<Vec<_>>() {
+            state.index_grant_bounds(&g);
+        }
+        // Both indexes are built from every record, so they are complete (amendment 0043).
+        state.set_removal_indexes_complete();
         for g in state.grants.values() {
             state
                 .by_principal

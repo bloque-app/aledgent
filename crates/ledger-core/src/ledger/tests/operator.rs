@@ -649,6 +649,8 @@ fn issuance_over(asset: AssetId, to: IdentityId) -> GrantRequest {
 /// A member of staff who registers and removes assets, and one who grants issuance authority.
 fn registry_staff(fx: &mut Fx) -> (Caller, Caller) {
     fx.ledger.set_generation(crate::asset::ASSET_REMOVAL, false);
+    // A book whose indexes are known complete, as an import's are.
+    fx.ledger.state.set_removal_indexes_complete();
     let registrar = staff(
         fx,
         &[OperatorOpKind::RegisterAsset, OperatorOpKind::RemoveAsset],
@@ -843,6 +845,158 @@ fn req_as_10_an_input_of_an_earlier_rules_version_does_not_know_the_removal() {
     // The rules version that introduced it takes it.
     fx.ledger.set_generation(crate::asset::ASSET_REMOVAL, false);
     remove_tstx(&mut fx, registrar).unwrap();
+}
+
+#[test]
+fn req_as_10_a_book_that_entered_the_version_by_an_upgrade_refuses_every_removal() {
+    // Fail closed: its indexes may lack an account or a grant it held before they were kept, and
+    // nothing builds them in place (`ASSET_REMOVAL`). Registering is unaffected.
+    let mut fx = Fx::new();
+    fx.ledger.set_generation(crate::asset::ASSET_REMOVAL, false);
+    let registrar = staff(
+        &mut fx,
+        &[OperatorOpKind::RegisterAsset, OperatorOpKind::RemoveAsset],
+    );
+    let asset = register_tstx(&mut fx, registrar, 8, 1);
+    assert_eq!(remove_tstx(&mut fx, registrar), Err(Refusal::NotAuthorised));
+    still_registered(&fx, &asset);
+    assert_eq!(
+        fx.ledger.state().asset_removable(&tstx()),
+        Err(StoreRefusal::AssetInUse(
+            crate::state::AssetInUse::IndexesIncomplete
+        ))
+    );
+    // Once the indexes are known complete, the same asset goes.
+    fx.ledger.state.set_removal_indexes_complete();
+    remove_tstx(&mut fx, registrar).unwrap();
+}
+
+#[test]
+fn req_as_10_a_grant_bound_naming_the_asset_keeps_it_until_that_grant_is_revoked() {
+    let mut fx = Fx::new();
+    let (registrar, _) = registry_staff(&mut fx);
+    let asset = register_tstx(&mut fx, registrar, 8, 1);
+    // Another holder's grant over an account, bounding the assets it covers.
+    let alice = fx.person();
+    let acct = fx.account(&alice, Custody::Owned);
+    let bob = fx.person();
+    let ctx = fx.ctx(alice);
+    let grant = fx
+        .ledger
+        .grant_authority(
+            &ctx,
+            GrantRequest {
+                kind: GrantKind::Delegated,
+                principal: bob.principal,
+                subject: Subject::Account(acct),
+                ops: NonEmptySet::one(OperationKind::Transfer),
+                per_operation: Some(nz(1_000)),
+                per_window: None,
+                assets: Some(NonEmptySet::one(tstx())),
+                counterparties: None,
+                parent: None,
+                expires: None,
+            },
+        )
+        .unwrap()
+        .value;
+    assert_eq!(remove_tstx(&mut fx, registrar), Err(Refusal::NotAuthorised));
+    still_registered(&fx, &asset);
+    assert_eq!(
+        fx.ledger.state().asset_removable(&tstx()),
+        Err(StoreRefusal::AssetInUse(
+            crate::state::AssetInUse::GrantBound
+        ))
+    );
+    let ctx = fx.ctx(alice);
+    fx.ledger.revoke_authority(&ctx, grant).unwrap();
+    remove_tstx(&mut fx, registrar).unwrap();
+}
+
+/// What an input of an earlier rules version writes does not change: the indexes of amendment 0043
+/// are written from `ASSET_REMOVAL` on and by no earlier version, so replaying version 1 history
+/// reproduces its leaves exactly (`REQ-RT-19`, `REQ-RT-20`).
+#[test]
+fn req_rt_20_an_earlier_rules_version_writes_no_leaf_of_the_new_indexes() {
+    use crate::leaves::kind;
+    let new_kinds = [
+        kind::TREASURY_LIMITS_BY_ASSET,
+        kind::GRANTS_BY_BOUND_ASSET,
+        kind::REMOVAL_INDEXES_COMPLETE,
+    ];
+    let leaves_of_new_kinds = |fx: &Fx| {
+        fx.ledger
+            .state()
+            .all_leaves()
+            .iter()
+            .filter(|(k, _, _)| new_kinds.contains(k))
+            .count()
+    };
+    let drive = |fx: &mut Fx| {
+        let org = fx.person();
+        let ctx = fx.ctx(fx.operator());
+        fx.ledger
+            .open_account(
+                &ctx,
+                OpenAccount {
+                    owner: org.principal,
+                    kind: AccountKind::Treasury,
+                    custody: Custody::Delegated,
+                    treasury_limits: BTreeMap::from([(usd(), Minor::new(30))]),
+                    acknowledged: None,
+                },
+            )
+            .unwrap();
+        let alice = fx.person();
+        let acct = fx.account(&alice, Custody::Owned);
+        let bob = fx.person();
+        let ctx = fx.ctx(alice);
+        fx.ledger
+            .grant_authority(
+                &ctx,
+                GrantRequest {
+                    kind: GrantKind::Delegated,
+                    principal: bob.principal,
+                    subject: Subject::Account(acct),
+                    ops: NonEmptySet::one(OperationKind::Transfer),
+                    per_operation: Some(nz(1_000)),
+                    per_window: None,
+                    assets: Some(NonEmptySet::one(usd())),
+                    counterparties: None,
+                    parent: None,
+                    expires: None,
+                },
+            )
+            .unwrap();
+    };
+    // Every rules version before it, up to the highest the released code names (3): no leaf of the
+    // new kinds, and the leaves it does write are the same as a book that never heard of them.
+    let mut v1 = Fx::new();
+    v1.ledger
+        .set_generation(crate::asset::ASSET_REMOVAL - 1, false);
+    drive(&mut v1);
+    assert_eq!(leaves_of_new_kinds(&v1), 0);
+    // From the rules version that keeps them, the indexes are written.
+    let mut v2 = Fx::new();
+    v2.ledger.set_generation(crate::asset::ASSET_REMOVAL, false);
+    drive(&mut v2);
+    assert_eq!(leaves_of_new_kinds(&v2), 2);
+    // Everything else the two versions wrote is the same shape: removing the new kinds' leaves
+    // leaves the same set of kinds.
+    let rest = |fx: &Fx| {
+        let mut kinds: Vec<u8> = fx
+            .ledger
+            .state()
+            .all_leaves()
+            .iter()
+            .map(|(k, _, _)| *k)
+            .filter(|k| !new_kinds.contains(k))
+            .collect();
+        kinds.sort_unstable();
+        kinds.dedup();
+        kinds
+    };
+    assert_eq!(rest(&v1), rest(&v2));
 }
 
 #[test]

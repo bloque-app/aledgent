@@ -1308,7 +1308,9 @@ these hold:
   never removed;
 - no Treasury account declares a limit in it (`REQ-LA-2`), because such an account could be driven below zero
   in it with no issuance at all, and the limit counts minor units of the precision being replaced;
-- no issuance authority over it is unrevoked (`REQ-AU-10`). The operator revokes it first.
+- no issuance authority over it is unrevoked (`REQ-AU-10`). The operator revokes it first;
+- no grant that is not revoked bounds the assets it covers with this one in the list (`REQ-AU-2`), because the bound
+  counts minor units of the precision being replaced.
 
 An asset that is not registered is `ERR-UnknownAsset`. A removal that is refused changes nothing and is
 audited like any other refusal.
@@ -1324,15 +1326,9 @@ postings (`REQ-RT-13`). The removal is then decided at a consistent cut (`REQ-RT
 has applied the revocation of every issuance authority over the asset and reports no posting in it, and a
 partition that sees the removal refuses anything that names the asset's old designation.
 
-> **Trade-off, stated plainly.** The book cannot see every record that names an asset by its identity. A
-> grant held by a holder over an account may bound the assets it covers and the amount per operation or per
-> window, in minor units. Such a bound is not an authority over the asset and is not checked, so a removal does
-> not wait for it, and a bound that names a removed identity applies to the next registration of that identity
-> at its new precision. The operator reviews those grants before the removal, which is what the review is
-> for. The refusal above covers the records the book can read without scanning accounts. A book that
-> began before the book kept the Treasury limits by asset cannot see those on its older Treasury accounts, so for
-> such a book the operator establishes by a query that no Treasury account declares a limit in the asset and that
-> nothing was posted in it, and the review records it.
+> **Trade-off, stated plainly.** The book decides this from indexes it keeps as accounts and grants are put. A
+> book that began before it kept them does not have them for what it already held, and cannot build them in one
+> input. Such a book refuses every removal until they are built, rather than accept one it cannot check.
 
 ### 5.4 Balance kinds
 
@@ -3161,7 +3157,7 @@ to:
 | `issue_disclosure` | The subject authorises it, or a legal obligation applies. The assertion is locally true | Disclosure issued, verifiable against a checkpoint (`REQ-DS-3`, `REQ-DS-4`) |
 | `anchor_checkpoint` | Entries exist since the last checkpoint | Checkpoint committed and submitted. Cited only once final (`REQ-PR-8`) |
 | `register_asset` | Operator authority; reviewed change | Asset registered with exactly one precision, book-only (`REQ-AS-1`, `REQ-AS-7`) |
-| `remove_asset` | Operator authority for the removal; reviewed change; a justification; the asset registered, book-only, never posted in, with no Treasury limit in it and no unrevoked issuance authority over it | Asset removed from the registry and its designation retired; the same identity can be registered again (`REQ-AS-10`). Audit record. Otherwise `ERR-NotAuthorised`, `ERR-UnknownAsset` or `ERR-JustificationRequired` |
+| `remove_asset` | Operator authority for the removal; reviewed change; a justification; the asset registered, book-only, never posted in, with no Treasury limit in it, no unrevoked issuance authority over it and no unrevoked grant bounding it | Asset removed from the registry and its designation retired; the same identity can be registered again (`REQ-AS-10`). Audit record. Otherwise `ERR-NotAuthorised`, `ERR-UnknownAsset` or `ERR-JustificationRequired` |
 | `bind_asset` | Issuance authority for the asset; a justification; the asset book-only; its identity on the settlement layer named | Asset `Binding`; the settlement layer asked to record the binding against the book's outstanding balance. Once that is final, `Bound` (`REQ-AS-8`). Otherwise `ERR-NotAuthorised`, `ERR-UnsupportedLeg`, `ERR-SettlementLayerUnavailable` or `ERR-JustificationRequired`; a binding the layer refuses returns the asset to book-only |
 | `register_integrating_party` | Operator authority; a justification; a party identifier not registered before; principals tied to no party | Party registered with its principals (`REQ-ID-7`). Audit record. Otherwise `ERR-NotAuthorised` or `ERR-JustificationRequired` |
 | `register_alias` | Operator authority; a justification; the account held and not closed; an alias not registered before; a name that is not an archived identifier | The alias names the account, for good (`REQ-RC-7`). Audit record. Otherwise `ERR-NotAuthorised`, `ERR-UnknownAccount`, `ERR-AccountClosed`, `ERR-IdentifierArchived` or `ERR-JustificationRequired` |
