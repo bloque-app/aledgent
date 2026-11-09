@@ -295,7 +295,7 @@ RUN --mount=type=bind,from=previous-code,target=/previous \
       exit 1; \
     fi \
  && earlier="" \
- && for e in /previous/earlier/*.vos; do [ -s "$e" ] && earlier="$earlier --earlier $e"; done \
+ && for e in /previous/earlier/*.vos; do if [ -s "$e" ]; then earlier="$earlier --earlier $e"; fi; done \
  && if /out/bin/aledgent-core-host check-upgrade --runtime /previous/agent_runtime.pvm \
       --previous /previous/core.vos --package /out/share/core.vos $earlier \
       --history /w/aledgent/crates/core-binding/tests/fixtures/code-history \
