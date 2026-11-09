@@ -188,6 +188,10 @@ jobs:
     # The scripts and the code history first: a bad layout, or a tree that no longer replays its
     # history, should not cost a core build.
     needs: [scripts, code-history]
+    # Explicit: `gate` runs only on a pull request, so on a dispatch it is skipped, and a job whose
+    # ancestry holds a skipped job is itself skipped under the implicit success(). Without this the
+    # release build never ran on a dispatch (since #108).
+    if: ${{ !cancelled() && needs.scripts.result == 'success' && needs.code-history.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
     # Read only: nothing here writes a package or signs anything (the job publish below does).
@@ -569,6 +573,7 @@ jobs:
     name: publish
     needs: core-code
     if: >-
+      !cancelled() && needs.core-code.result == 'success' &&
       github.event_name == 'workflow_dispatch' && inputs.publish &&
       (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop') &&
       needs.core-code.outputs.proceed == 'true'
