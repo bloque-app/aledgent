@@ -32,8 +32,9 @@ use crate::surface::{
 use crate::wire::{
     AdapterSupportBody, CaptureBody, CommandReply, DeprecateAssetBody, EmptyBody, GrantBody,
     GrantIssuanceBody, GrantOperatorBody, IssueBody, JustifiedBody, NotificationBody,
-    OpenAccountBody, OpenIdentityBody, OperationReply, RedeemBody, RegisterAssetBody, ReserveBody,
-    ResolveBody, SubmitEvidenceBody, TransferBody, UndeliveredBody, WithdrawBody,
+    OpenAccountBody, OpenIdentityBody, OperationReply, RedeemBody, RegisterAssetBody,
+    RemoveAssetBody, ReserveBody, ResolveBody, SubmitEvidenceBody, TransferBody, UndeliveredBody,
+    WithdrawBody,
 };
 use crate::wire::{
     CompleteRecoveryBody, CustodyViewBody, InitiateRecoveryBody, NameSuccessorBody,
@@ -124,6 +125,7 @@ fn request_schema(route: CommandRoute) -> &'static str {
         CommandRoute::SubmitEvidence => "SubmitEvidenceBody",
         CommandRoute::RegisterAsset => "RegisterAssetBody",
         CommandRoute::DeprecateAsset => "DeprecateAssetBody",
+        CommandRoute::RemoveAsset => "RemoveAssetBody",
         CommandRoute::BindAsset => "BindAssetBody",
         CommandRoute::GrantIssuance => "GrantIssuanceBody",
         CommandRoute::GrantOperator => "GrantOperatorBody",
@@ -431,6 +433,7 @@ fn schemas() -> Map<String, Value> {
     add::<SubmitEvidenceBody>(&mut g);
     add::<RegisterAssetBody>(&mut g);
     add::<DeprecateAssetBody>(&mut g);
+    add::<RemoveAssetBody>(&mut g);
     add::<crate::wire::BindAssetBody>(&mut g);
     add::<GrantIssuanceBody>(&mut g);
     add::<GrantOperatorBody>(&mut g);

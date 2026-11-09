@@ -630,6 +630,264 @@ fn req_as_2_deprecating_an_asset_is_a_reviewed_change() {
     );
 }
 
+// ---------------------------------------------------------------- amendment 0043: remove an asset
+
+fn tstx() -> AssetId {
+    AssetId::parse("TSTX").unwrap()
+}
+
+/// An issuance grant over `asset`, bounded per window and per asset.
+fn issuance_over(asset: AssetId, to: IdentityId) -> GrantRequest {
+    GrantRequest {
+        subject: Subject::Asset(asset),
+        assets: Some(NonEmptySet::one(asset)),
+        ops: NonEmptySet::new([OperationKind::Issue, OperationKind::Redeem].into()).unwrap(),
+        ..issuance_request(to, Some(1_000))
+    }
+}
+
+/// A member of staff who registers and removes assets, and one who grants issuance authority.
+fn registry_staff(fx: &mut Fx) -> (Caller, Caller) {
+    fx.ledger.set_generation(crate::asset::ASSET_REMOVAL, false);
+    let registrar = staff(
+        fx,
+        &[OperatorOpKind::RegisterAsset, OperatorOpKind::RemoveAsset],
+    );
+    let admin = staff(fx, &[OperatorOpKind::IssuanceAuthority]);
+    (registrar, admin)
+}
+
+fn register_tstx(fx: &mut Fx, registrar: Caller, precision: u8, n: u8) -> crate::asset::Asset {
+    let ctx = fx.ctx(registrar);
+    fx.ledger
+        .register_asset(&ctx, register("TSTX", precision, n), b"listing")
+        .unwrap();
+    *fx.ledger.state().registry().get(&tstx()).unwrap()
+}
+
+fn remove_tstx(fx: &mut Fx, who: Caller) -> Result<(), Refusal> {
+    let ctx = fx.ctx(who);
+    fx.ledger
+        .remove_asset(&ctx, tstx(), review(9), b"wrong precision, never used")
+        .map(|a| a.value)
+}
+
+fn still_registered(fx: &Fx, asset: &crate::asset::Asset) {
+    assert_eq!(fx.ledger.state().registry().get(&asset.id()), Ok(asset));
+}
+
+#[test]
+fn req_as_10_an_unused_asset_is_removed_and_its_id_registers_again_at_the_right_precision() {
+    let mut fx = Fx::new();
+    let (registrar, _) = registry_staff(&mut fx);
+    let wrong = register_tstx(&mut fx, registrar, 8, 1);
+    let digest = fx.ledger.state().registry().digest();
+    // No review, nothing to remove, no justification, no authority: each refused, nothing changes.
+    let ctx = fx.ctx(registrar);
+    assert_eq!(
+        fx.ledger
+            .remove_asset(&ctx, tstx(), review(0), b"x")
+            .map(|a| a.value),
+        Err(Refusal::NotAuthorised)
+    );
+    let ctx = fx.ctx(registrar);
+    assert_eq!(
+        fx.ledger
+            .remove_asset(&ctx, AssetId::parse("NOPE").unwrap(), review(9), b"x")
+            .map(|a| a.value),
+        Err(Refusal::UnknownAsset)
+    );
+    let ctx = fx.ctx(registrar);
+    assert_eq!(
+        fx.ledger
+            .remove_asset(&ctx, tstx(), review(9), b"")
+            .map(|a| a.value),
+        Err(Refusal::JustificationRequired)
+    );
+    let registerer = staff(&mut fx, &[OperatorOpKind::RegisterAsset]);
+    assert_eq!(
+        remove_tstx(&mut fx, registerer),
+        Err(Refusal::NotAuthorised)
+    );
+    still_registered(&fx, &wrong);
+    assert_eq!(fx.ledger.state().registry().digest(), digest);
+
+    // Removed: recorded as an operator intervention, naming the asset and the review.
+    remove_tstx(&mut fx, registrar).unwrap();
+    let r = last_audit(&fx);
+    assert_eq!(r.class, AuditClass::OperatorIntervention);
+    assert!(r.subject.contains(&AuditSubject::Asset(tstx())));
+    assert!(r.subject.contains(&AuditSubject::Review([9; 32])));
+    assert!(fx.ledger.state().registry().get(&tstx()).is_err());
+    assert_ne!(fx.ledger.state().registry().digest(), digest);
+    // Gone: an operation naming it is an unknown asset, and removing it twice is too.
+    assert_eq!(remove_tstx(&mut fx, registrar), Err(Refusal::UnknownAsset));
+
+    // Registered again at the right precision: a fresh tag, never the retired one.
+    let ctx = fx.ctx(registrar);
+    fx.ledger
+        .register_asset(&ctx, register("TSTX", 6, 2), b"relisting")
+        .unwrap();
+    let right = *fx.ledger.state().registry().get(&tstx()).unwrap();
+    assert_eq!(right.precision(), 6);
+    assert!(right.tag().0 > wrong.tag().0);
+    assert!(fx.ledger.state().registry().by_tag(wrong.tag()).is_none());
+    // And once registered at the right precision it still takes its one precision (`INV-24`).
+    let ctx = fx.ctx(registrar);
+    assert_eq!(
+        fx.ledger
+            .register_asset(&ctx, register("TSTX", 8, 3), b"again")
+            .map(|a| a.value),
+        Err(Refusal::NotAuthorised)
+    );
+}
+
+#[test]
+fn req_as_10_an_asset_that_was_ever_issued_is_never_removed() {
+    let mut fx = Fx::new();
+    let (registrar, admin) = registry_staff(&mut fx);
+    let asset = register_tstx(&mut fx, registrar, 8, 1);
+    let holder = fx.person();
+    let acct = fx.account(&holder, Custody::Owned);
+    let treasurer = fx.person();
+    let ctx = fx.ctx(admin);
+    let grant = fx
+        .ledger
+        .grant_issuance(
+            &ctx,
+            issuance_over(tstx(), treasurer.principal),
+            b"desk, CR-12",
+        )
+        .unwrap()
+        .value;
+    // A live issuance grant over it: revoke first.
+    assert_eq!(remove_tstx(&mut fx, registrar), Err(Refusal::NotAuthorised));
+    // Issued once: the asset is used, whatever the balance is afterwards.
+    let ctx = fx.ctx(treasurer);
+    fx.ledger.issue(&ctx, tstx(), acct, Minor::new(5)).unwrap();
+    // And issued then redeemed down to nothing, in an account the treasurer may redeem from: the
+    // balance is zero again, and the asset is still used.
+    let desk = fx.account(&holder, Custody::Delegated);
+    let ctx = fx.ctx(fx.operator());
+    fx.ledger
+        .grant_authority(
+            &ctx,
+            GrantRequest {
+                kind: GrantKind::Operator,
+                principal: treasurer.principal,
+                subject: Subject::Account(desk),
+                ops: NonEmptySet::one(OperationKind::Redeem),
+                per_operation: Some(nz(1_000)),
+                per_window: None,
+                assets: None,
+                counterparties: None,
+                parent: None,
+                expires: None,
+            },
+        )
+        .unwrap();
+    let ctx = fx.ctx(treasurer);
+    fx.ledger.issue(&ctx, tstx(), desk, Minor::new(7)).unwrap();
+    let ctx = fx.ctx(treasurer);
+    fx.ledger.redeem(&ctx, tstx(), desk, Minor::new(7)).unwrap();
+    assert_eq!(fx.ledger.available(&holder, &desk, &tstx(), 10), Ok(0));
+    let ctx = fx.ctx(admin);
+    fx.ledger
+        .revoke_issuance(&ctx, grant, b"desk closed")
+        .unwrap();
+    let digest = fx.ledger.state().registry().digest();
+    assert_eq!(remove_tstx(&mut fx, registrar), Err(Refusal::NotAuthorised));
+    still_registered(&fx, &asset);
+    assert_eq!(fx.ledger.state().registry().digest(), digest);
+    // The refusal is audited like any other.
+    assert_eq!(last_audit(&fx).class, AuditClass::OperatorIntervention);
+    assert_eq!(fx.ledger.trial_balance(&tstx()), Ok(0));
+}
+
+#[test]
+fn req_as_10_a_live_issuance_grant_is_revoked_before_an_unused_asset_is_removed() {
+    let mut fx = Fx::new();
+    let (registrar, admin) = registry_staff(&mut fx);
+    let asset = register_tstx(&mut fx, registrar, 8, 1);
+    let treasurer = fx.person();
+    let ctx = fx.ctx(admin);
+    let grant = fx
+        .ledger
+        .grant_issuance(&ctx, issuance_over(tstx(), treasurer.principal), b"desk")
+        .unwrap()
+        .value;
+    assert_eq!(remove_tstx(&mut fx, registrar), Err(Refusal::NotAuthorised));
+    still_registered(&fx, &asset);
+    let ctx = fx.ctx(admin);
+    fx.ledger
+        .revoke_issuance(&ctx, grant, b"not needed")
+        .unwrap();
+    remove_tstx(&mut fx, registrar).unwrap();
+    assert!(fx.ledger.state().registry().get(&tstx()).is_err());
+}
+
+#[test]
+fn req_as_10_an_input_of_an_earlier_rules_version_does_not_know_the_removal() {
+    let mut fx = Fx::new();
+    let (registrar, _) = registry_staff(&mut fx);
+    let asset = register_tstx(&mut fx, registrar, 8, 1);
+    // Decided as the code of rules version 0 decided it: refused, and nothing is written.
+    fx.ledger.set_generation(0, false);
+    let audited = fx.ledger.state().audit().outbox().count();
+    assert_eq!(
+        remove_tstx(&mut fx, registrar),
+        Err(Refusal::MalformedCommand)
+    );
+    assert_eq!(fx.ledger.state().audit().outbox().count(), audited);
+    still_registered(&fx, &asset);
+    // The rules version that introduced it takes it.
+    fx.ledger.set_generation(crate::asset::ASSET_REMOVAL, false);
+    remove_tstx(&mut fx, registrar).unwrap();
+}
+
+#[test]
+fn req_as_10_a_bound_asset_is_never_removed() {
+    let mut fx = Fx::new();
+    fx.ledger.set_generation(crate::asset::ASSET_REMOVAL, false);
+    let registrar = staff(&mut fx, &[OperatorOpKind::RemoveAsset]);
+    // The genesis assets are bound to a location on the settlement layer; one is deprecated.
+    for asset in [usd(), old()] {
+        let before = *fx.ledger.state().registry().get(&asset).unwrap();
+        let ctx = fx.ctx(registrar);
+        assert_eq!(
+            fx.ledger
+                .remove_asset(&ctx, asset, review(9), b"x")
+                .map(|a| a.value),
+            Err(Refusal::NotAuthorised)
+        );
+        still_registered(&fx, &before);
+    }
+}
+
+#[test]
+fn req_as_10_an_asset_a_treasury_account_declares_a_limit_in_is_never_removed() {
+    let mut fx = Fx::new();
+    let (registrar, _) = registry_staff(&mut fx);
+    let asset = register_tstx(&mut fx, registrar, 8, 1);
+    let org = fx.person();
+    let ctx = fx.ctx(fx.operator());
+    fx.ledger
+        .open_account(
+            &ctx,
+            OpenAccount {
+                owner: org.principal,
+                kind: AccountKind::Treasury,
+                custody: Custody::Delegated,
+                treasury_limits: BTreeMap::from([(tstx(), Minor::new(1_000))]),
+                acknowledged: None,
+            },
+        )
+        .unwrap();
+    // No issuance, no posting: the limit alone keeps it.
+    assert_eq!(remove_tstx(&mut fx, registrar), Err(Refusal::NotAuthorised));
+    still_registered(&fx, &asset);
+}
+
 fn issuance_request(to: IdentityId, per_window: Option<u64>) -> GrantRequest {
     GrantRequest {
         kind: GrantKind::Issuance,

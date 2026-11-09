@@ -1,9 +1,9 @@
 ---
 name: aledgent
 summary: A private, provable ledger of record — identities that own accounts, value that moves between them instantly and confidentially, and one settlement layer through which value enters, leaves, and is anchored.
-spec_version: 0.4.30
+spec_version: 0.4.31
 status: draft
-date: 2026-10-28
+date: 2026-11-08
 ---
 
 # aledgent — System Specification
@@ -579,7 +579,9 @@ Before a debit commits, the payer's partition checks that the payee exists and c
 account's existence and an asset's registration only ever become true and stay true (`REQ-LA-4`,
 `REQ-AS-1`), so a partition MAY check them against a copy of the book's directory that lags behind it: a
 lagging copy can refuse a transfer to an account just opened (`ERR-UnknownAccount`), and can never accept a
-transfer whose credit will fail. An asset's deprecation and an account's closure take effect in a partition
+transfer whose credit will fail. (An asset's registration stays true once the asset has been used. The one
+asset that leaves the registry is one that was never used, so no partition holds a balance in it and no credit
+to it can be in transit (`REQ-AS-10`).) An asset's deprecation and an account's closure take effect in a partition
 when its copy shows them; a credit already enqueued still applies (`INV-9`). An account in `Closing` refuses
 debits and new transfers to it and still accepts credits in transit; it reaches `Closed` only when every
 partition has confirmed that it holds no credit to it in transit.
@@ -1223,8 +1225,8 @@ Asset {
 derivable from, or carried by, an asset's name, an account, a settlement-layer configuration or a caller's
 input.
 
-**`REQ-AS-2`** Adding or changing an asset MUST be a reviewed, recorded change, never a side effect at
-runtime. The settlement layer's view of an asset MUST be checked against the registry when the asset is
+**`REQ-AS-2`** Adding, changing or removing an asset (`REQ-AS-10`) MUST be a reviewed, recorded change,
+never a side effect at runtime. The settlement layer's view of an asset MUST be checked against the registry when the asset is
 bound (`REQ-AS-8`), and a mismatch MUST refuse the binding, never become a silent divergence. After the
 binding, the registry is the only authority on the asset (`REQ-AS-9`).
 
@@ -1291,6 +1293,46 @@ point, the binding's amount its starting position. A binding is never undone.
 **`REQ-AS-9`** **After binding.** Once an asset is bound, its record in the registry MUST NOT change
 because the settlement layer's description of the asset changed. Such a change is ignored: it holds
 nothing, refuses nothing, and is not a divergence. The precision stays the registry's (`REQ-AS-1`).
+
+**`REQ-AS-10`** **Removing an asset that was registered wrongly and never used.** An asset's precision never
+changes (`REQ-AS-1`, `INV-24`). An asset registered with the wrong precision and never used MAY be removed from
+the registry, so that the same identity can be registered again with the right one. Removal is a reviewed,
+recorded change with a justification and an audit record (`REQ-AT-1`), under its own operator authority
+(`REQ-OS-1`). The book decides it from its own state, and refuses it with `ERR-NotAuthorised` unless **all** of
+these hold:
+
+- the asset is registered and book-only: it was never bound, no binding of it was ever asked for (a refused
+  one counts), and none is in progress (`REQ-AS-8`);
+- nothing has ever been posted in it, by anyone, in any account: no issuance, redemption, opening, transfer,
+  reservation or hold. An asset whose balances are all zero now but which was used once is used, and is
+  never removed;
+- no Treasury account declares a limit in it (`REQ-LA-2`), because such an account could be driven below zero
+  in it with no issuance at all, and the limit counts minor units of the precision being replaced;
+- no issuance authority over it is unrevoked (`REQ-AU-10`). The operator revokes it first.
+
+An asset that is not registered is `ERR-UnknownAsset`. A removal that is refused changes nothing and is
+audited like any other refusal.
+
+A removed asset leaves nothing behind that a later registration of the same identity could be mistaken for.
+The designation the book gave the removed asset in its own records is retired with it and is never given to
+another asset, so registering the same identity again is a new registration with a new designation (`INV-24`),
+and the registry's digest differs from that of a registry that never held the asset. An export carries what
+it takes for an import to retire the same designation.
+
+When the book is held in partitions (`REQ-RT-9`), the writer of the registry cannot see a partition's
+postings (`REQ-RT-13`). The removal is then decided at a consistent cut (`REQ-RT-14`) at which every partition
+has applied the revocation of every issuance authority over the asset and reports no posting in it, and a
+partition that sees the removal refuses anything that names the asset's old designation.
+
+> **Trade-off, stated plainly.** The book cannot see every record that names an asset by its identity. A
+> grant held by a holder over an account may bound the assets it covers and the amount per operation or per
+> window, in minor units. Such a bound is not an authority over the asset and is not checked, so a removal does
+> not wait for it, and a bound that names a removed identity applies to the next registration of that identity
+> at its new precision. The operator reviews those grants before the removal, which is what the review is
+> for. The refusal above covers the records the book can read without scanning accounts. A book that
+> began before the book kept the Treasury limits by asset cannot see those on its older Treasury accounts, so for
+> such a book the operator establishes by a query that no Treasury account declares a limit in the asset and that
+> nothing was posted in it, and the review records it.
 
 ### 5.4 Balance kinds
 
@@ -2819,7 +2861,7 @@ audit record and a required justification. There MUST be no "all of the above" o
   verify (`REQ-RC-5`);
 - propose and approve a reversal;
 - freeze and unfreeze an account;
-- register an asset;
+- register an asset, and remove one that was registered wrongly and never used (`REQ-AS-10`);
 - bind a book-only asset to the settlement layer, under issuance authority for it (`REQ-AS-8`);
 - register an integrating party, and tie a principal to it (`REQ-ID-7`);
 - grant and revoke the identities principal's role (`REQ-ID-6`);
@@ -3119,6 +3161,7 @@ to:
 | `issue_disclosure` | The subject authorises it, or a legal obligation applies. The assertion is locally true | Disclosure issued, verifiable against a checkpoint (`REQ-DS-3`, `REQ-DS-4`) |
 | `anchor_checkpoint` | Entries exist since the last checkpoint | Checkpoint committed and submitted. Cited only once final (`REQ-PR-8`) |
 | `register_asset` | Operator authority; reviewed change | Asset registered with exactly one precision, book-only (`REQ-AS-1`, `REQ-AS-7`) |
+| `remove_asset` | Operator authority for the removal; reviewed change; a justification; the asset registered, book-only, never posted in, with no Treasury limit in it and no unrevoked issuance authority over it | Asset removed from the registry and its designation retired; the same identity can be registered again (`REQ-AS-10`). Audit record. Otherwise `ERR-NotAuthorised`, `ERR-UnknownAsset` or `ERR-JustificationRequired` |
 | `bind_asset` | Issuance authority for the asset; a justification; the asset book-only; its identity on the settlement layer named | Asset `Binding`; the settlement layer asked to record the binding against the book's outstanding balance. Once that is final, `Bound` (`REQ-AS-8`). Otherwise `ERR-NotAuthorised`, `ERR-UnsupportedLeg`, `ERR-SettlementLayerUnavailable` or `ERR-JustificationRequired`; a binding the layer refuses returns the asset to book-only |
 | `register_integrating_party` | Operator authority; a justification; a party identifier not registered before; principals tied to no party | Party registered with its principals (`REQ-ID-7`). Audit record. Otherwise `ERR-NotAuthorised` or `ERR-JustificationRequired` |
 | `register_alias` | Operator authority; a justification; the account held and not closed; an alias not registered before; a name that is not an archived identifier | The alias names the account, for good (`REQ-RC-7`). Audit record. Otherwise `ERR-NotAuthorised`, `ERR-UnknownAccount`, `ERR-AccountClosed`, `ERR-IdentifierArchived` or `ERR-JustificationRequired` |
@@ -3202,7 +3245,7 @@ The **Enforced by** column is the target. The **V0** column is where the first r
 | `INV-21` | Terminal operation states are absorbing. An operation never leaves a terminal state. | Store | Store |
 | `INV-22` | A credential cannot widen its own scope or change its own kind. | Credential | Service |
 | `INV-23` | A refusal by the accounting core is never, on its own, a terminal outcome for an operation whose external leg can be observed independently. | Service | Service |
-| `INV-24` | There is exactly one asset registry. An asset's precision is recorded only there. | Store | Store |
+| `INV-24` | There is exactly one asset registry. An asset's precision is recorded only there, and never changes: an asset registered with the wrong precision and never used is removed (`REQ-AS-10`) and registered again, and the designation the book gave the removed asset is never given to another. | Store | Store |
 | `INV-25` | A deployment has exactly one book. It is not split by asset, by account kind or by integrating party. Holding its state in partitions of accounts (`REQ-RT-9`) does not split it: one registry, one trial balance, one sequence of anchors. | Architecture | Architecture |
 
 `INV-10`, `INV-11`, `INV-12`, `INV-13`, `INV-14` and `INV-23` exist together so that the settlement layer
@@ -3453,7 +3496,7 @@ invalid. This specification MUST NOT contain a requirement that serves no story.
 | C — Reservations | `US-C1`–`US-C6` | `REQ-BA-1`–`REQ-BA-4`, `REQ-OP-2`, `REQ-OP-5`, `REQ-OP-9`, `REQ-QR-7`, `REQ-EV-8` | `INV-14`, `INV-15`, `INV-21` |
 | D — Inbound | `US-D1`–`US-D3` | `REQ-IN-1`–`REQ-IN-7`, `REQ-SA-7`, `REQ-SI-*` | `INV-10`, `INV-11`, `INV-12` |
 | E — Outbound | `US-E1`, `US-E3`, `US-E4` | `REQ-SO-1`–`REQ-SO-8`, `REQ-SA-1`–`REQ-SA-9`, `REQ-SL-2`–`REQ-SL-4`, `REQ-SL-6`–`REQ-SL-10`, `REQ-SN-2` | `INV-10`, `INV-13`, `INV-23` |
-| F — Multi-asset | `US-F1`–`US-F5` | `REQ-AS-1`–`REQ-AS-9`, `REQ-AU-10`, `REQ-KER-2` | `INV-4`, `INV-5`, `INV-7`, `INV-24` |
+| F — Multi-asset | `US-F1`–`US-F5` | `REQ-AS-1`–`REQ-AS-10`, `REQ-AU-10`, `REQ-KER-2` | `INV-4`, `INV-5`, `INV-7`, `INV-24` |
 | G — Agents | `US-G1`–`US-G4` | `REQ-AG-1`–`REQ-AG-4`, `REQ-AU-1`–`REQ-AU-4`, `REQ-AU-7`, `REQ-AU-21`, `REQ-EV-7` | `INV-22` |
 | H — Querying | `US-H1`–`US-H5` | `REQ-QR-1`–`REQ-QR-7`, `REQ-BA-5`, `REQ-PO-1`–`REQ-PO-5` | `INV-6`, `INV-20` |
 | I — Privacy and disclosure | `US-I1`–`US-I4` | `REQ-PV-1`–`REQ-PV-7`, `REQ-DS-1`–`REQ-DS-5` | `INV-16`, `INV-17` |

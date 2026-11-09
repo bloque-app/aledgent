@@ -199,6 +199,9 @@ pub enum Command {
     /// `upgrade`: the writer's code is to change to a code version from an input
     /// (`REQ-RT-16`, `T-037-04`).
     Upgrade,
+    /// `remove_asset`: an asset registered book-only and never used, removed (amendment 0043,
+    /// `REQ-AS-10`).
+    RemoveAsset,
 }
 
 /// The attribution of one accepted command (`REQ-AU-7`, `REQ-PN-1`, `INV-20`). For an operation
@@ -252,6 +255,9 @@ pub enum Write {
     },
     /// Deprecate an asset.
     DeprecateAsset(AssetId),
+    /// Remove an asset that was registered book-only and never used, and retire its tag
+    /// (amendment 0043, `REQ-AS-10`). The store refuses it unless [`State::asset_removable`].
+    RemoveAsset(AssetId),
     /// Insert an identity.
     PutIdentity(Identity),
     /// Change an identity's status.
@@ -356,6 +362,26 @@ pub enum StoreRefusal {
     Anchor(crate::anchor::AnchorRefusal),
     /// The seed's record refused the change (`F-036`).
     ChainSpec(crate::chainspec::SpecRefusal),
+    /// The asset cannot be removed: something in the book already names it (amendment 0043).
+    AssetInUse(AssetInUse),
+}
+
+/// Why an asset cannot be removed (amendment 0043, `REQ-AS-10`): the first thing the store finds
+/// that makes it more than a registry entry. Each is a point read of a permanent record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AssetInUse {
+    /// A binding was asked for at some time: its record stays, even when the layer refused it.
+    Binding,
+    /// An opening position was opened for it (`F-014`).
+    Opening,
+    /// A posting touched the issuance counterparty, or an opening position, in it: value was
+    /// issued, redeemed or opened.
+    Issuance,
+    /// A Treasury account declares a limit in it, so its balance could be driven below zero with
+    /// no issuance at all, and the limit is a count of the old precision's minor units.
+    TreasuryLimit,
+    /// An issuance grant over it has not been revoked.
+    LiveGrant,
 }
 
 /// How to undo one applied write.
@@ -380,6 +406,8 @@ fn held_by(lines: &[journal::Line], issuance: &AccountId) -> Vec<(AssetId, i128)
 
 enum Undo {
     Unregister(AssetId),
+    /// Put a removed asset back, with its tag; the next tag was never lowered.
+    RestoreAsset(Asset),
     AssetBinding(AssetId, AssetBinding),
     AssetStatus(AssetId, AssetStatus),
     RemoveIdentity(IdentityId),
@@ -432,6 +460,10 @@ pub struct State {
     /// read of every account the identity owns: an identity may own hundreds of accounts, each a
     /// leaf the Agent would be given (`REQ-RT-1`; a verify-genesis halt of 2026-10-11).
     owned_custody: Leaves<IdentityId, BTreeSet<AccountId>, { kind::OWNED_CUSTODY_BY_OWNER }>,
+    /// The Treasury accounts that declare a limit in each asset, closed ones included: derived
+    /// from `accounts`, never exported, absent for an asset none names. Whether an asset can be
+    /// removed (amendment 0043) is one point read of it, not a read of every account.
+    treasury_by_asset: Leaves<AssetId, BTreeSet<AccountId>, { kind::TREASURY_LIMITS_BY_ASSET }>,
     credentials: Leaves<CredentialId, Credential, { kind::CREDENTIAL }>,
     /// Each identity's credential set, by id: derived from `credentials`, changed in the same
     /// write, never exported (`F-012` follow-up, issue #50).
@@ -473,6 +505,10 @@ pub struct State {
     /// genesis mode.
     upgrade_authority:
         Slot<Option<crate::code::authority::AuthorityRecord>, { kind::UPGRADE_AUTHORITY }>,
+    /// Whether the Treasury-limit index is kept as accounts are put (amendment 0043,
+    /// [`crate::asset::ASSET_REMOVAL`]). Never stored: the ledger sets it from the rules version of
+    /// each input. A store no ledger told keeps the index, as the import's rebuild does.
+    treasury_indexing: bool,
     /// While a seed chunk is being applied: the operator's seeding passes the seal's guard
     /// (`crate::principal`). Never stored: it is set and cleared inside one call.
     applying_spec: bool,
@@ -532,6 +568,7 @@ impl State {
             accounts: Leaves::new(),
             by_owner: Leaves::new(),
             owned_custody: Leaves::new(),
+            treasury_by_asset: Leaves::new(),
             credentials: Leaves::new(),
             sets: Leaves::new(),
             grants: Leaves::new(),
@@ -554,9 +591,16 @@ impl State {
             anchoring: crate::anchor::AnchorStore::new(),
             chainspec: crate::chainspec::SpecState::new(),
             upgrade_authority: Slot::default(),
+            treasury_indexing: true,
             applying_spec: false,
             spec_undo: None,
         }
+    }
+
+    /// Keep the Treasury-limit index as accounts are put, or do not (the rules version of the
+    /// input being decided, [`crate::asset::ASSET_REMOVAL`]).
+    pub(crate) fn set_treasury_indexing(&mut self, on: bool) {
+        self.treasury_indexing = on;
     }
 
     /// Apply a batch, all or nothing.
@@ -671,6 +715,7 @@ impl State {
                 Undo::AssetBinding(id, before) => {
                     self.registry.get_mut().restore_binding(&id, before)
                 }
+                Undo::RestoreAsset(a) => self.registry.get_mut().restore_removed(a),
                 Undo::AssetStatus(id, s) => self.registry.get_mut().restore_status(&id, s),
                 Undo::RemoveIdentity(id) => {
                     self.identities.remove(&id);
@@ -683,6 +728,9 @@ impl State {
                         self.by_owner.remove_from(&a.owner(), &id);
                         if a.custody() == Custody::Owned {
                             self.owned_custody.remove_from(&a.owner(), &id);
+                        }
+                        if self.treasury_indexing {
+                            self.unindex_treasury(&a);
                         }
                     }
                 }
@@ -805,6 +853,15 @@ impl State {
                     .map_err(StoreRefusal::Registry)?;
                 Ok(Undo::AssetStatus(*id, before))
             }
+            Write::RemoveAsset(id) => {
+                self.asset_removable(id)?;
+                let removed = self
+                    .registry
+                    .get_mut()
+                    .remove(id)
+                    .map_err(StoreRefusal::Registry)?;
+                Ok(Undo::RestoreAsset(removed))
+            }
             Write::PutIdentity(i) => {
                 if !check_mint(i.id(), i.minted(), IdentityId::mint) {
                     return Err(StoreRefusal::NotMinted);
@@ -857,6 +914,9 @@ impl State {
                     self.owned_custody
                         .entry_or_default(a.owner())
                         .insert(a.id());
+                }
+                if self.treasury_indexing {
+                    self.index_treasury(a);
                 }
                 self.accounts.insert(a.id(), a.clone());
                 if a.kind() != AccountKind::Issuance {
@@ -1254,6 +1314,88 @@ impl State {
         self.accounts.get(id)
     }
 
+    /// Put a Treasury account in the index of the assets it declares a limit in.
+    fn index_treasury(&mut self, account: &LedgerAccount) {
+        if account.kind() != AccountKind::Treasury {
+            return;
+        }
+        for asset in account.treasury_limits().keys() {
+            self.treasury_by_asset
+                .entry_or_default(*asset)
+                .insert(account.id());
+        }
+    }
+
+    /// Take a Treasury account out of the index of the assets it declares a limit in.
+    fn unindex_treasury(&mut self, account: &LedgerAccount) {
+        if account.kind() != AccountKind::Treasury {
+            return;
+        }
+        for asset in account.treasury_limits().keys() {
+            self.treasury_by_asset.remove_from(asset, &account.id());
+        }
+    }
+
+    /// Whether an asset can be removed (amendment 0043, `REQ-AS-10`), decided from the store's own
+    /// permanent records and by point reads only, never a scan of accounts or postings
+    /// (`REQ-RT-1`). It is registered, book-only, and nothing in the book has ever named it:
+    ///
+    /// - no binding was ever asked for (the record of a refused one stays);
+    /// - no opening position was opened for it;
+    /// - no posting ever touched the issuance counterparty, or an opening position, in it;
+    /// - no Treasury account declares a limit in it;
+    /// - no issuance grant over it is unrevoked.
+    ///
+    /// Value can only enter an asset at an account that may go below zero. A Customer or Suspense
+    /// account is never negative, so it holds only what it received. The ones that may be negative
+    /// are the issuance counterparty, the opening positions (both checked above) and Treasury
+    /// accounts, which go negative only down to a declared limit in the asset
+    /// ([`crate::account::check_treasury_limit`]; checked above). An asset none of them has
+    /// touched has had no first posting, so it has had none: no posting, issuance, redemption,
+    /// opening, reservation or hold, in any account.
+    pub fn asset_removable(&self, id: &AssetId) -> Result<(), StoreRefusal> {
+        let registry = self.registry.get();
+        let asset = registry
+            .get(id)
+            .map_err(|_| StoreRefusal::Registry(RegistryError::NotRegistered(*id)))?;
+        if asset.binding() != AssetBinding::BookOnly {
+            return Err(StoreRefusal::Registry(RegistryError::NotBookOnly(*id)));
+        }
+        let used = |why| Err(StoreRefusal::AssetInUse(why));
+        if self.settlement.asset_bind(id).is_some() {
+            return used(AssetInUse::Binding);
+        }
+        if self.openings.position(id).is_some() {
+            return used(AssetInUse::Opening);
+        }
+        let issuance = self.roles.get().as_ref().map(|r| r.issuance);
+        let touched = issuance
+            .into_iter()
+            .chain(self.openings.positions().map(|(_, a)| *a))
+            .any(|a| self.journal.touched(&a, id));
+        if touched {
+            return used(AssetInUse::Issuance);
+        }
+        if self
+            .treasury_by_asset
+            .get(id)
+            .is_some_and(|accounts| !accounts.is_empty())
+        {
+            return used(AssetInUse::TreasuryLimit);
+        }
+        let live = self
+            .by_asset_or_identity
+            .get(&Subject::Asset(*id))
+            .into_iter()
+            .flatten()
+            .filter_map(|g| self.grants.get(g))
+            .any(|g| g.revoked().is_none());
+        if live {
+            return used(AssetInUse::LiveGrant);
+        }
+        Ok(())
+    }
+
     /// Whether an identity owns an account in owned custody, closed or not: one point read
     /// ([`State`]'s `owned_custody`), however many accounts the identity owns.
     pub fn holds_owned_custody(&self, owner: &IdentityId) -> bool {
@@ -1342,6 +1484,21 @@ impl State {
             }
         }
         derived.iter().eq(self.owned_custody.iter())
+    }
+
+    /// Whether the Treasury-limit index is what a scan of the accounts derives (tests, and the
+    /// import's own check).
+    #[cfg(test)]
+    pub(crate) fn treasury_index_consistent(&self) -> bool {
+        let mut derived: BTreeMap<AssetId, BTreeSet<AccountId>> = BTreeMap::new();
+        for a in self.accounts.values() {
+            if a.kind() == AccountKind::Treasury {
+                for asset in a.treasury_limits().keys() {
+                    derived.entry(*asset).or_default().insert(a.id());
+                }
+            }
+        }
+        derived.iter().eq(self.treasury_by_asset.iter())
     }
 
     /// The custody records: pending recoveries and successions, named successors, and custody
@@ -1753,6 +1910,181 @@ mod tests {
             Some(position(Custody::Delegated).id())
         );
         assert!(s.owned_custody_consistent());
+    }
+
+    /// Amendment 0043, `REQ-AS-10`, `INV-24`: the store removes an asset only when nothing in the
+    /// book names it, retires its tag, and takes a fresh registration of the same id.
+    #[test]
+    fn req_as_10_the_store_removes_an_unused_asset_and_retires_its_tag() {
+        let (mut s, _, _) = seeded();
+        let tag = s.registry().get(&usd()).unwrap().tag();
+        let before = s.registry().digest();
+        let unknown = AssetId::parse("NOPE").unwrap();
+        assert_eq!(
+            s.asset_removable(&unknown),
+            Err(StoreRefusal::Registry(RegistryError::NotRegistered(
+                unknown
+            )))
+        );
+        assert_eq!(s.asset_removable(&usd()), Ok(()));
+        // A dry run changes nothing.
+        s.check(&[Write::RemoveAsset(usd())]).unwrap();
+        assert_eq!(s.registry().digest(), before);
+        s.commit(&[Write::RemoveAsset(usd())]).unwrap();
+        assert!(s.registry().get(&usd()).is_err());
+        assert_ne!(s.registry().digest(), before);
+        // Removing it twice, or what was never there, is refused.
+        assert_eq!(
+            s.commit(&[Write::RemoveAsset(usd())]),
+            Err(StoreRefusal::Registry(RegistryError::NotRegistered(usd())))
+        );
+        // The same id again, at the precision it should have had: a fresh tag.
+        s.commit(&[Write::RegisterAsset {
+            id: usd(),
+            precision: 6,
+            kind: AssetKind::Fiat,
+        }])
+        .unwrap();
+        let again = *s.registry().get(&usd()).unwrap();
+        assert_eq!(again.precision(), 6);
+        assert!(again.tag().0 > tag.0);
+        assert!(s.registry().by_tag(tag).is_none());
+        // A batch that fails after the removal puts the asset back, tag and all.
+        let kept = *s.registry().get(&usd()).unwrap();
+        let digest = s.registry().digest();
+        assert!(
+            s.commit(&[
+                Write::RemoveAsset(usd()),
+                Write::RemoveAsset(AssetId::parse("NOPE").unwrap()),
+            ])
+            .is_err()
+        );
+        assert_eq!(s.registry().get(&usd()), Ok(&kept));
+        assert_eq!(s.registry().digest(), digest);
+    }
+
+    #[test]
+    fn req_as_10_the_store_names_what_keeps_an_asset() {
+        let (mut s, person, _) = seeded();
+        // A Treasury account that declares a limit in the asset: it could be driven below zero
+        // with no issuance at all, and the limit counts the old precision's minor units.
+        let treasury = LedgerAccount::new(
+            mint(3, 0),
+            person.id(),
+            AccountKind::Treasury,
+            Custody::Delegated,
+            0,
+            BTreeMap::from([(usd(), Minor::new(500))]),
+        )
+        .unwrap();
+        s.commit(&[Write::PutAccount(treasury.clone())]).unwrap();
+        assert!(s.treasury_index_consistent());
+        let refused = Err(StoreRefusal::AssetInUse(AssetInUse::TreasuryLimit));
+        assert_eq!(s.asset_removable(&usd()), refused);
+        assert_eq!(s.commit(&[Write::RemoveAsset(usd())]), refused);
+        assert!(s.registry().get(&usd()).is_ok());
+        // An account that declares no limit in it does not keep it, and a rolled-back opening
+        // leaves no trace in the index.
+        let eur = AssetId::parse("EUR").unwrap();
+        s.commit(&[Write::RegisterAsset {
+            id: eur,
+            precision: 2,
+            kind: AssetKind::Fiat,
+        }])
+        .unwrap();
+        assert_eq!(s.asset_removable(&eur), Ok(()));
+        let other = LedgerAccount::new(
+            mint(4, 0),
+            person.id(),
+            AccountKind::Treasury,
+            Custody::Delegated,
+            0,
+            BTreeMap::from([(eur, Minor::new(1))]),
+        )
+        .unwrap();
+        s.check(&[Write::PutAccount(other)]).unwrap();
+        assert!(s.treasury_index_consistent());
+        assert_eq!(s.asset_removable(&eur), Ok(()));
+        // An asset that is being bound is not book-only.
+        let loc = crate::asset::AssetLocation::parse("Here(1)").unwrap();
+        s.commit(&[Write::AssetBinding {
+            id: eur,
+            binding: AssetBinding::Binding(loc),
+        }])
+        .unwrap();
+        assert_eq!(
+            s.asset_removable(&eur),
+            Err(StoreRefusal::Registry(RegistryError::NotBookOnly(eur)))
+        );
+    }
+
+    #[test]
+    fn req_as_10_an_unrevoked_issuance_grant_or_an_opening_position_keeps_an_asset() {
+        use crate::authority::GrantKind;
+        let (mut s, person, _) = seeded();
+        let w = Window {
+            length: NonZeroU64::new(10).unwrap(),
+            limit: NonZeroMinor::new(Minor::new(5)).unwrap(),
+        };
+        let grant = Grant::new(
+            mint(6, 0),
+            person.id(),
+            GrantTerms {
+                kind: GrantKind::Issuance,
+                principal: person.id(),
+                subject: Subject::Asset(usd()),
+                ops: NonEmptySet::one(OperationKind::Issue),
+                bounds: Bounds::new(None, Some(w), Some(NonEmptySet::one(usd())), None).unwrap(),
+                parent: None,
+                expires: None,
+            },
+            0,
+        );
+        s.commit(&[Write::PutGrant(grant.clone())]).unwrap();
+        let refused = Err(StoreRefusal::AssetInUse(AssetInUse::LiveGrant));
+        assert_eq!(s.asset_removable(&usd()), refused);
+        assert_eq!(s.commit(&[Write::RemoveAsset(usd())]), refused);
+        // Revoked, even though it has not expired: the asset can go.
+        s.commit(&[Write::Revoke(grant.id(), 1)]).unwrap();
+        assert_eq!(s.asset_removable(&usd()), Ok(()));
+
+        // An opening position opened for it keeps it for good.
+        let operator = Identity::new(mint(11, 0), IdentityKind::Organisation, None).unwrap();
+        let issuance = LedgerAccount::new(
+            mint(12, 0),
+            operator.id(),
+            AccountKind::Issuance,
+            Custody::Delegated,
+            0,
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let position = LedgerAccount::new(
+            mint(13, 0),
+            operator.id(),
+            AccountKind::Issuance,
+            Custody::Delegated,
+            0,
+            BTreeMap::new(),
+        )
+        .unwrap();
+        s.commit(&[
+            Write::PutIdentity(operator),
+            Write::PutAccount(issuance.clone()),
+            Write::SetRoles(Roles {
+                operator: operator.id(),
+                issuance: issuance.id(),
+            }),
+        ])
+        .unwrap();
+        s.commit(&[Write::OpeningPosition {
+            asset: usd(),
+            account: position,
+        }])
+        .unwrap();
+        let refused = Err(StoreRefusal::AssetInUse(AssetInUse::Opening));
+        assert_eq!(s.asset_removable(&usd()), refused);
+        assert_eq!(s.commit(&[Write::RemoveAsset(usd())]), refused);
     }
 
     #[test]

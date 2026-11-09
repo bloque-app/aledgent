@@ -497,6 +497,7 @@ tagged!(Command {
     ProposeMigration => 56,
     // 53 to 56 are `T-037-05`'s (`crate::audit::command_code`).
     Upgrade => 57,
+    RemoveAsset => 58,
 });
 
 impl Canonical for OperationRecord {

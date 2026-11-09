@@ -984,6 +984,17 @@ pub struct DeprecateAssetBody {
     pub justification: String,
 }
 
+/// `remove_asset` of the asset in the path (amendment 0043, `REQ-AS-10`): remove an asset that
+/// was registered book-only and never used, so its id can be registered again.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RemoveAssetBody {
+    /// The reviewed change it comes from, 32 bytes of hex.
+    pub review: String,
+    /// Why.
+    pub justification: String,
+}
+
 /// `bind_asset` of the asset in the path (amendment 0011, `REQ-AS-8`, `DEC-20`): bind a
 /// book-only asset to the settlement layer, under issuance authority over it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1050,6 +1061,8 @@ pub enum OperatorOpKindBody {
     /// Open identities, and ledger accounts for any identity: the identities principal's role
     /// (`REQ-ID-6`, amendment 0025).
     OpenIdentity,
+    /// Remove an asset registered book-only and never used (amendment 0043).
+    RemoveAsset,
 }
 
 /// `grant_operator` (`REQ-OS-1`, `F-013`).
@@ -1152,6 +1165,15 @@ pub enum OperatorCommand {
     RegisterAsset(RegisterAssetBody),
     /// Deprecate an asset.
     DeprecateAsset {
+        /// The asset.
+        asset: String,
+        /// The reviewed change, hex.
+        review: String,
+        /// Why.
+        justification: String,
+    },
+    /// Remove an asset registered book-only and never used (amendment 0043, `REQ-AS-10`).
+    RemoveAsset {
         /// The asset.
         asset: String,
         /// The reviewed change, hex.

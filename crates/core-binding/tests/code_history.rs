@@ -206,6 +206,7 @@ const NOT_YET_RECORDED: &[&str] = &[
     "PrivilegedRead",
     // Assets, issuance, openings and integrations.
     "DeprecateAsset",
+    "RemoveAsset",
     "ApplySpecChunk",
     "LoadOpeningBalances",
     "RegisterAsset",

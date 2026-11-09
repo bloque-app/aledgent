@@ -180,6 +180,7 @@ pub enum Kind {
     UnfreezeAccount,
     RegisterAsset,
     DeprecateAsset,
+    RemoveAsset,
     DeclareAdapterSupport,
     SubmitEvidence,
     IssueDisclosure,
@@ -234,6 +235,7 @@ impl Kind {
         Kind::UnfreezeAccount,
         Kind::RegisterAsset,
         Kind::DeprecateAsset,
+        Kind::RemoveAsset,
         Kind::DeclareAdapterSupport,
         Kind::SubmitEvidence,
         Kind::IssueDisclosure,
@@ -302,6 +304,7 @@ impl Kind {
             | Kind::UnfreezeAccount
             | Kind::RegisterAsset
             | Kind::DeprecateAsset
+            | Kind::RemoveAsset
             | Kind::DeclareAdapterSupport
             | Kind::SubmitEvidence
             | Kind::IssueDisclosure
@@ -359,6 +362,7 @@ impl Kind {
             Kind::UnfreezeAccount => "unfreeze_account",
             Kind::RegisterAsset => "register_asset",
             Kind::DeprecateAsset => "deprecate_asset",
+            Kind::RemoveAsset => "remove_asset",
             Kind::DeclareAdapterSupport => "declare_adapter_support",
             Kind::SubmitEvidence => "submit_evidence",
             Kind::IssueDisclosure => "issue_disclosure",
@@ -396,6 +400,7 @@ pub fn kind_of(c: &Command) -> Kind {
             OperatorOp::ApproveReversal(_) => Kind::ApproveReversal,
             OperatorOp::RegisterAsset(_) => Kind::RegisterAsset,
             OperatorOp::DeprecateAsset(..) => Kind::DeprecateAsset,
+            OperatorOp::RemoveAsset(..) => Kind::RemoveAsset,
             OperatorOp::BindAsset(..) => Kind::BindAsset,
             OperatorOp::GrantIssuance(_) => Kind::GrantIssuance,
             OperatorOp::RevokeIssuance(_) => Kind::RevokeIssuance,
@@ -717,6 +722,7 @@ mod tests {
             "unfreeze_account",
             "register_asset",
             "deprecate_asset",
+            "remove_asset",
             "declare_adapter_support",
             "submit_evidence",
             "issue_disclosure",

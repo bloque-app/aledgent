@@ -27,7 +27,9 @@
 //!   ```
 //!
 //! - **Kernel tags.** Registration assigns the asset its kernel tag (CipherClerk's `ledger` field,
-//!   [`AssetTag`]) once. Tags are never reused, because nothing is ever removed.
+//!   [`AssetTag`]) once. A tag is never given twice: an asset registered with the wrong precision
+//!   and never used can be removed (amendment 0043), and its tag is retired with it. The next tag
+//!   only ever goes up, so a later registration of the same id takes a fresh one.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -48,8 +50,22 @@ pub const ASSET_ID_MAX: usize = 12;
 /// 18.4 whole units at most: beyond it an asset could not hold even one whole unit exactly
 /// (`F-003` Open points: the owner sets the real threshold per expected supply).
 pub const MAX_PRECISION: u8 = 18;
+/// The rules version from which an asset registered book-only and never used can be removed
+/// (amendment 0043, `REQ-AS-10`). The input is new, so a log never holds one before it, but the
+/// store also keeps a new index from it on (the Treasury accounts that declare a limit in each
+/// asset), and an input of an earlier rules version is decided, and replays, exactly as the code
+/// of that version decided it: it writes no index leaf and reads none. Before it, `remove_asset`
+/// is refused with `ERR-MalformedCommand` and writes nothing, as the settlement adapter's inputs
+/// of amendment 0041 are.
+///
+/// It is [`crate::settlement::CHAINED_SETTLEMENT`]: no book has decided an input at that rules
+/// version yet, so one in-place upgrade takes it with the others.
+pub const ASSET_REMOVAL: u64 = crate::settlement::CHAINED_SETTLEMENT;
+
 /// Domain of the registry digest.
 const DIGEST_DOMAIN: &[u8] = b"aledgent/asset-registry/v1";
+/// Domain of the registry digest once a tag has been retired (amendment 0043).
+const DIGEST_DOMAIN_RETIRED: &[u8] = b"aledgent/asset-registry/v2";
 
 /// An asset's identity, normalised: upper-case ASCII `[A-Z0-9]{2,12}` (`REQ-AS-3`).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -372,6 +388,8 @@ pub enum RegistryError {
     NotBinding(AssetId),
     /// The precision is above [`MAX_PRECISION`].
     PrecisionOutOfRange(u8),
+    /// A record names a tag at or above the next tag to assign, or a tag already in use.
+    TagOutOfOrder(AssetTag),
     /// Every kernel tag has been assigned.
     TagsExhausted,
 }
@@ -558,6 +576,68 @@ impl AssetRegistry {
         }
     }
 
+    /// Remove an asset that is book-only (amendment 0043, `REQ-AS-10`). Its tag is retired: the
+    /// next tag is not lowered, so a later registration of the same id takes a fresh one
+    /// (`INV-24`). Whether the asset was ever used is the store's to decide, not the registry's:
+    /// the registry only refuses what its own record shows, an asset that is bound or being bound.
+    /// Returns the asset, for a store rollback.
+    pub(crate) fn remove(&mut self, id: &AssetId) -> Result<Asset, RegistryError> {
+        let asset = *self
+            .assets
+            .get(id)
+            .ok_or(RegistryError::NotRegistered(*id))?;
+        if asset.binding != AssetBinding::BookOnly {
+            return Err(RegistryError::NotBookOnly(*id));
+        }
+        self.assets.remove(id);
+        self.by_tag.remove(&asset.tag);
+        Ok(asset)
+    }
+
+    /// Undo [`AssetRegistry::remove`] made in the same store batch (store rollback only). The
+    /// next tag was never lowered, so it is not touched.
+    pub(crate) fn restore_removed(&mut self, asset: Asset) {
+        self.by_tag.insert(asset.tag, asset.id);
+        self.assets.insert(asset.id, asset);
+    }
+
+    /// Register an asset at the tag an export recorded for it, which may be above the next one
+    /// because tags were retired below it (amendment 0043). Only an import uses it, in tag order.
+    pub(crate) fn register_at(
+        &mut self,
+        tag: AssetTag,
+        id: AssetId,
+        precision: u8,
+        kind: AssetKind,
+    ) -> Result<Asset, RegistryError> {
+        if tag.0 < self.next_tag {
+            return Err(RegistryError::TagOutOfOrder(tag));
+        }
+        self.next_tag = tag.0;
+        self.register(id, precision, kind)
+    }
+
+    /// The next tag to assign, as an export records it (amendment 0043).
+    pub(crate) fn next_tag(&self) -> u32 {
+        self.next_tag
+    }
+
+    /// Retire every tag below `next`, as an import restores what an export recorded. The next tag
+    /// never goes down.
+    pub(crate) fn retire_below(&mut self, next: u32) -> Result<(), RegistryError> {
+        if next < self.next_tag {
+            return Err(RegistryError::TagOutOfOrder(AssetTag(next)));
+        }
+        self.next_tag = next;
+        Ok(())
+    }
+
+    /// Whether any tag has been retired: the next tag is not the one after the last assigned
+    /// without a gap (amendment 0043). Tags go 1, 2, 3 with no gap until an asset is removed.
+    pub fn has_retired_tags(&self) -> bool {
+        usize::try_from(self.next_tag).map_or(true, |n| n != self.assets.len() + 1)
+    }
+
     /// Undo a registration made in the same store batch (store rollback only).
     pub(crate) fn unregister_last(&mut self, id: &AssetId) {
         if let Some(a) = self.assets.remove(id) {
@@ -608,7 +688,9 @@ impl AssetRegistry {
     }
 
     /// A digest of the whole registry: id, tag, binding, precision, kind and status of every
-    /// asset, in id order.
+    /// asset, in id order. Once a tag has been retired (amendment 0043) it also commits to the
+    /// next tag, under another domain, so that "removed" and "never registered" differ; a registry
+    /// that never removed an asset digests exactly as before.
     pub fn digest(&self) -> [u8; 32] {
         let mut buf: Vec<u8> = Vec::with_capacity(self.assets.len() * 20);
         for a in self.assets.values() {
@@ -623,6 +705,9 @@ impl AssetRegistry {
             buf.push(a.precision);
             buf.push(a.kind.code());
             buf.push(a.status.code());
+        }
+        if self.has_retired_tags() {
+            return blake2b_256(DIGEST_DOMAIN_RETIRED, &[&buf, &self.next_tag.to_be_bytes()]);
         }
         blake2b_256(DIGEST_DOMAIN, &[&buf])
     }
@@ -906,6 +991,131 @@ pub(crate) mod tests {
             .register(AssetId::parse("ETH").unwrap(), 18, AssetKind::Native)
             .unwrap();
         assert_eq!(eth.tag(), AssetTag(3));
+    }
+
+    #[test]
+    fn inv_24_a_removed_asset_retires_its_tag_and_its_id_registers_again_with_a_fresh_one() {
+        let (mut r, usd, btc) = registry();
+        let digest_before = r.digest();
+        assert!(!r.has_retired_tags());
+        // Removed: gone from the registry and from the tag index, and the digest moves.
+        assert_eq!(r.remove(&btc.id()), Ok(btc));
+        assert_eq!(r.get(&btc.id()), Err(Refusal::UnknownAsset));
+        assert_eq!(r.by_tag(btc.tag()), None);
+        assert!(r.has_retired_tags());
+        assert_ne!(r.digest(), digest_before);
+        // "Removed" is not "never registered": the digest commits to the retirement.
+        let mut never = AssetRegistry::new();
+        never
+            .register(AssetId::parse("USD").unwrap(), 2, AssetKind::Fiat)
+            .unwrap();
+        assert_ne!(r.digest(), never.digest());
+        // The same id, at the precision it should have had, takes a fresh tag, not the old one.
+        let again = r
+            .register(AssetId::parse("btc").unwrap(), 6, AssetKind::Native)
+            .unwrap();
+        assert_eq!(again.precision(), 6);
+        assert_eq!(again.tag(), AssetTag(3));
+        assert_ne!(again.tag(), btc.tag());
+        assert_eq!(r.by_tag(AssetTag(2)), None, "a retired tag names nothing");
+        assert_eq!(r.get(&usd.id()).unwrap().tag(), AssetTag(1));
+        // Removing the asset holding the highest tag retires that tag too.
+        r.remove(&again.id()).unwrap();
+        let next = r
+            .register(AssetId::parse("ETH").unwrap(), 18, AssetKind::Native)
+            .unwrap();
+        assert_eq!(next.tag(), AssetTag(4));
+    }
+
+    #[test]
+    fn req_as_10_the_registry_removes_only_what_it_holds_and_only_book_only() {
+        let (mut r, usd, btc) = registry();
+        let eur = AssetId::parse("EUR").unwrap();
+        assert_eq!(r.remove(&eur), Err(RegistryError::NotRegistered(eur)));
+        // Binding, or being bound: never removed.
+        r.set_binding(&usd.id(), AssetBinding::Binding(loc(1)))
+            .unwrap();
+        assert_eq!(
+            r.remove(&usd.id()),
+            Err(RegistryError::NotBookOnly(usd.id()))
+        );
+        r.set_binding(&usd.id(), AssetBinding::Bound(loc(1)))
+            .unwrap();
+        assert_eq!(
+            r.remove(&usd.id()),
+            Err(RegistryError::NotBookOnly(usd.id()))
+        );
+        // A refused removal changed nothing.
+        assert!(!r.has_retired_tags());
+        // Store rollback: the same asset with the same tag, and the next tag untouched.
+        let digest = r.digest();
+        let removed = r.remove(&btc.id()).unwrap();
+        r.restore_removed(removed);
+        assert_eq!(r.digest(), digest);
+        assert_eq!(r.get(&btc.id()), Ok(&btc));
+        assert_eq!(r.by_tag(btc.tag()).map(|a| a.id()), Some(btc.id()));
+        assert!(!r.has_retired_tags());
+    }
+
+    #[test]
+    fn req_as_10_the_registry_round_trips_a_retired_tag() {
+        use crate::export::canon::Canonical;
+        let (mut r, usd, btc) = registry();
+        r.remove(&usd.id()).unwrap();
+        let eth = r
+            .register(AssetId::parse("ETH").unwrap(), 18, AssetKind::Native)
+            .unwrap();
+        assert_eq!((btc.tag(), eth.tag()), (AssetTag(2), AssetTag(3)));
+        let mut e = crate::export::canon::Enc::new();
+        r.encode(&mut e);
+        let bytes = e.into_bytes();
+        let mut d = crate::export::canon::Dec::new(&bytes);
+        let back = AssetRegistry::decode(&mut d).unwrap();
+        assert_eq!(back, r);
+        assert_eq!(back.digest(), r.digest());
+        // Retire the highest tag as well: the next tag, not the assets, remembers it.
+        let mut r = back;
+        r.remove(&eth.id()).unwrap();
+        let mut e = crate::export::canon::Enc::new();
+        r.encode(&mut e);
+        let bytes = e.into_bytes();
+        let mut back = AssetRegistry::decode(&mut crate::export::canon::Dec::new(&bytes)).unwrap();
+        assert_eq!(back, r);
+        let next = back
+            .register(AssetId::parse("DAI").unwrap(), 18, AssetKind::Stable)
+            .unwrap();
+        assert_eq!(next.tag(), AssetTag(4));
+    }
+
+    #[test]
+    fn req_as_10_an_import_restores_the_tags_an_export_recorded() {
+        let (mut r, _, btc) = registry();
+        r.remove(&btc.id()).unwrap();
+        // A gap below the next tag, restored as recorded; a tag that goes back is refused.
+        let mut back = AssetRegistry::new();
+        back.register_at(
+            AssetTag(2),
+            AssetId::parse("ETH").unwrap(),
+            18,
+            AssetKind::Native,
+        )
+        .unwrap();
+        assert_eq!(
+            back.register_at(
+                AssetTag(2),
+                AssetId::parse("DAI").unwrap(),
+                18,
+                AssetKind::Stable
+            ),
+            Err(RegistryError::TagOutOfOrder(AssetTag(2)))
+        );
+        assert_eq!(back.retire_below(5), Ok(()));
+        assert_eq!(
+            back.retire_below(4),
+            Err(RegistryError::TagOutOfOrder(AssetTag(4)))
+        );
+        assert_eq!(back.next_tag(), 5);
+        assert!(back.has_retired_tags());
     }
 
     #[test]

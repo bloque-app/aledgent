@@ -58,6 +58,8 @@ pub enum OperatorOp {
     RegisterAsset(RegisterAsset),
     /// Deprecate an asset.
     DeprecateAsset(AssetId, ReviewRef),
+    /// Remove an asset registered book-only and never used (amendment 0043).
+    RemoveAsset(AssetId, ReviewRef),
     /// `bind_asset` (amendment 0011, `REQ-AS-8`).
     BindAsset(AssetId, AssetLocation),
     /// Grant issuance authority.
@@ -213,7 +215,7 @@ fn asset_kind_name(k: AssetKind) -> &'static str {
     }
 }
 
-const KINDS: [(OperatorOpKindBody, OperatorOpKind); 19] = [
+const KINDS: [(OperatorOpKindBody, OperatorOpKind); 20] = [
     (
         OperatorOpKindBody::ResolveOperation,
         OperatorOpKind::ResolveOperation,
@@ -243,6 +245,7 @@ const KINDS: [(OperatorOpKindBody, OperatorOpKind); 19] = [
         OperatorOpKindBody::DeprecateAsset,
         OperatorOpKind::DeprecateAsset,
     ),
+    (OperatorOpKindBody::RemoveAsset, OperatorOpKind::RemoveAsset),
     (
         OperatorOpKindBody::IssuanceAuthority,
         OperatorOpKind::IssuanceAuthority,
@@ -397,6 +400,14 @@ impl Justified {
                 justification,
             } => (
                 OperatorOp::DeprecateAsset(AssetId::parse(asset)?, review(r)?),
+                j(justification),
+            ),
+            OperatorCommand::RemoveAsset {
+                asset,
+                review: r,
+                justification,
+            } => (
+                OperatorOp::RemoveAsset(AssetId::parse(asset)?, review(r)?),
                 j(justification),
             ),
             OperatorCommand::BindAsset {
@@ -617,6 +628,11 @@ impl Justified {
                 justification,
             }),
             OperatorOp::DeprecateAsset(a, r) => OperatorCommand::DeprecateAsset {
+                asset: a.as_str().to_owned(),
+                review: hex::encode(r.0),
+                justification,
+            },
+            OperatorOp::RemoveAsset(a, r) => OperatorCommand::RemoveAsset {
                 asset: a.as_str().to_owned(),
                 review: hex::encode(r.0),
                 justification,

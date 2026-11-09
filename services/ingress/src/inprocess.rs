@@ -1245,6 +1245,9 @@ impl<S: LeafStore, V: VaultBackend> Running<S, V> {
             OperatorOp::DeprecateAsset(a, r) => {
                 decided(&reference, l.deprecate_asset(ctx, a, r, why)?, nothing)
             }
+            OperatorOp::RemoveAsset(a, r) => {
+                decided(&reference, l.remove_asset(ctx, a, r, why)?, nothing)
+            }
             OperatorOp::BindAsset(a, loc) => {
                 decided(&reference, l.bind_asset(ctx, a, loc, why)?, |_| {
                     CommandResult::default()

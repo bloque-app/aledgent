@@ -312,7 +312,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                     return Err(Refusal::NotAuthorised);
                 }
                 let j = Justification::new(justification)?;
-                if kinds.len() >= OperatorOpKind::ALL.len() {
+                if OperatorOpKind::is_catch_all(&kinds) {
                     return Err(Refusal::UnboundedGrant);
                 }
                 // The identities principal's role is a grant of its own, held by one principal at

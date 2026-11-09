@@ -289,6 +289,13 @@ pub fn apply<S: LeafStore, V: VaultBackend>(
             justification,
         } => s(l.deprecate_asset(ctx, *asset, *review, justification)),
         #[cfg(feature = "operator")]
+        C::RemoveAsset {
+            ctx,
+            asset,
+            review,
+            justification,
+        } => s(l.remove_asset(ctx, *asset, *review, justification)),
+        #[cfg(feature = "operator")]
         C::BindAsset {
             ctx,
             asset,

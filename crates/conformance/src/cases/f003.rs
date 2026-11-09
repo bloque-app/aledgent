@@ -121,6 +121,11 @@ pub const CASES: &[Case] = &[
         inv_24_a_second_registry_or_a_precision_outside_it_cannot_be_formed__store,
         &["REQ-AS-1"]
     ),
+    store_case!(
+        "INV-24",
+        inv_24_an_unused_asset_is_removed_and_registered_again_with_a_fresh_tag__store,
+        &["REQ-AS-10"]
+    ),
     // Errors (SPEC §10).
     service_case!("ERR-NotAuthorised", err_not_authorised__service, &[]),
     service_case!("ERR-AuthorityRevoked", err_authority_revoked__service, &[]),
@@ -613,6 +618,50 @@ fn inv_24_a_second_registry_or_a_precision_outside_it_cannot_be_formed__store(
     let asset = s.registry().get(&usd()).unwrap();
     assert_eq!((asset.precision(), asset.tag()), (2, tag));
     assert_eq!(s.registry().len(), 1);
+    Outcome::Pass
+}
+
+/// `REQ-AS-10`: an asset registered book-only and never used is removed, its tag retired, and the
+/// same id registers again at another precision with a fresh tag. A bound one is refused.
+fn inv_24_an_unused_asset_is_removed_and_registered_again_with_a_fresh_tag__store(
+    h: &mut dyn Harness,
+) -> Outcome {
+    let s = store(h);
+    let tstx = AssetId::parse("TSTX").unwrap();
+    s.commit(&[Write::RegisterAsset {
+        id: tstx,
+        precision: 8,
+        kind: AssetKind::Other,
+    }])
+    .unwrap();
+    let wrong = *s.registry().get(&tstx).unwrap();
+    let before = s.registry().digest();
+    s.commit(&[Write::RemoveAsset(tstx)]).unwrap();
+    assert!(s.registry().get(&tstx).is_err());
+    assert_ne!(s.registry().digest(), before);
+    s.commit(&[Write::RegisterAsset {
+        id: tstx,
+        precision: 6,
+        kind: AssetKind::Other,
+    }])
+    .unwrap();
+    let right = *s.registry().get(&tstx).unwrap();
+    assert_eq!(right.precision(), 6);
+    assert!(right.tag().0 > wrong.tag().0);
+    assert!(s.registry().by_tag(wrong.tag()).is_none());
+    // Never removed once a binding was asked for.
+    let loc = ledger_core::asset::AssetLocation::parse("Here(7)").unwrap();
+    s.commit(&[Write::AssetBinding {
+        id: tstx,
+        binding: ledger_core::asset::AssetBinding::Binding(loc),
+    }])
+    .unwrap();
+    assert_eq!(
+        s.commit(&[Write::RemoveAsset(tstx)]),
+        Err(StoreRefusal::Registry(RegistryError::NotBookOnly(tstx)))
+    );
+    let kept = s.registry().get(&tstx).unwrap();
+    assert_eq!((kept.tag(), kept.precision()), (right.tag(), 6));
     Outcome::Pass
 }
 

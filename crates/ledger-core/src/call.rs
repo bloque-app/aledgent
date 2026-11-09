@@ -429,6 +429,15 @@ pub enum Call {
         from: u64,
         justification: Vec<u8>,
     },
+    /// `remove_asset` (amendment 0043, `REQ-AS-10`): an asset registered book-only and never used,
+    /// removed. After `Upgrade` and before the conformance ports, so no production variant's tag
+    /// moves.
+    RemoveAsset {
+        ctx: Ctx,
+        asset: AssetId,
+        review: ReviewRef,
+        justification: Vec<u8>,
+    },
     // The conformance suite's raw ports come last, so that no production variant's index (its
     // postcard tag in the host's archive and in every envelope) depends on whether a build enables
     // `conformance-ports` (T-005-17: a workspace build unifies the feature into every binary, and an
@@ -514,6 +523,7 @@ impl Call {
             Call::LoadOpeningBalances { .. } => "load_opening_balances",
             Call::RegisterAsset { .. } => "register_asset",
             Call::DeprecateAsset { .. } => "deprecate_asset",
+            Call::RemoveAsset { .. } => "remove_asset",
             Call::BindAsset { .. } => "bind_asset",
             Call::GrantIssuance { .. } => "grant_issuance",
             Call::RevokeIssuance { .. } => "revoke_issuance",

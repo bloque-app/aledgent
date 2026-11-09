@@ -84,6 +84,11 @@ pub const SERVICE_SECTIONS: [&str; 37] = [
     "service.chainspec-openings",
 ];
 
+/// The section that records the next kernel tag of a registry that has retired one (amendment
+/// 0043), after the others. It is written only then, so the export of a book that never removed
+/// an asset is byte for byte what it was, and an export without it imports as before.
+const RETIRED_TAGS_SECTION: &str = "service.retired-tags";
+
 /// How many sections an export written before seeded genesis has (`F-036`): it imports as a book
 /// without a seed.
 const SECTIONS_BEFORE_SEED: usize = 34;
@@ -191,6 +196,7 @@ impl State {
             accounts,
             by_owner: _,
             owned_custody: _,
+            treasury_by_asset: _,
             credentials,
             sets: _,
             grants,
@@ -218,6 +224,7 @@ impl State {
             upgrade_authority: _,
             applying_spec: _,
             spec_undo: _,
+            treasury_indexing: _,
         } = self;
         let n = &SERVICE_SECTIONS;
         let mut assets: Vec<AssetRecord> = registry
@@ -276,7 +283,12 @@ impl State {
             .collect();
         let on_demand: Vec<(OperationId, Option<u64>)> =
             anchoring.all_on_demand().map(|(k, v)| (*k, *v)).collect();
-        alloc::vec![
+        let retired = registry.get().has_retired_tags().then(|| {
+            let mut s = Section::new(RETIRED_TAGS_SECTION);
+            s.push(&registry.get().next_tag());
+            s
+        });
+        let mut sections = alloc::vec![
             section(n[0], &assets),
             section(n[1], roles.get().iter()),
             section(n[2], identities.values()),
@@ -314,7 +326,9 @@ impl State {
             section(n[34], seed.progress()),
             section(n[35], &seed_aliases),
             section(n[36], &seeded_pairs),
-        ]
+        ];
+        sections.extend(retired);
+        sections
     }
 
     /// Rebuild the store from its sections, continuing the audit chain at `audit`.
@@ -322,6 +336,17 @@ impl State {
         sections: &[Section],
         audit: &AuditHead,
     ) -> Result<State, DecodeError> {
+        // The next kernel tag of a registry that retired one, after the others (amendment 0043).
+        let (sections, next_tag) = match sections.split_last() {
+            Some((last, rest)) if last.name() == RETIRED_TAGS_SECTION => {
+                let mut tags = last.decode_all::<u32>()?;
+                match (tags.pop(), tags.is_empty()) {
+                    (Some(t), true) => (rest, Some(t)),
+                    _ => return Err(DecodeError("retired tags")),
+                }
+            }
+            _ => (sections, None),
+        };
         if (sections.len() != SERVICE_SECTIONS.len() && sections.len() != SECTIONS_BEFORE_SEED)
             || sections
                 .iter()
@@ -336,7 +361,9 @@ impl State {
         // The registry, re-registered in tag order: each asset must get back its tag.
         let mut registry = AssetRegistry::new();
         for a in s(0).decode_all::<AssetRecord>()? {
-            let got = registry.register(a.id, a.precision, a.kind).map_err(bad)?;
+            let got = registry
+                .register_at(crate::asset::AssetTag(a.tag), a.id, a.precision, a.kind)
+                .map_err(bad)?;
             // Its binding, through the same moves a live registry makes (`REQ-AS-8`).
             if let Some(l) = a.binding.location() {
                 registry
@@ -352,6 +379,9 @@ impl State {
             if a.status == AssetStatus::Deprecated {
                 registry.deprecate(&a.id).map_err(bad)?;
             }
+        }
+        if let Some(next) = next_tag {
+            registry.retire_below(next).map_err(bad)?;
         }
         state.registry = Slot::new(registry);
 
@@ -371,6 +401,9 @@ impl State {
                     .entry_or_default(a.owner())
                     .insert(a.id());
             }
+        }
+        for a in state.accounts.values().cloned().collect::<Vec<_>>() {
+            state.index_treasury(&a);
         }
         state.credentials = keyed(s(4), |c: &Credential| c.id())?.into();
         for c in state.credentials.values() {

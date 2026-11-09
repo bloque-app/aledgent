@@ -2,7 +2,7 @@
 # CI regenerates this file and fails on any difference (F-015 §1).
 # 25 invariants (§9), 42 errors (§10), 195 V0 acceptance criteria (§6, §15).
 
-spec_version = "0.4.30"
+spec_version = "0.4.31"
 
 [[invariant]]
 id = "INV-1"
@@ -146,7 +146,7 @@ text = "A refusal by the accounting core is never, on its own, a terminal outcom
 id = "INV-24"
 layers = ["store"]
 v0 = ["store"]
-text = "There is exactly one asset registry. An asset's precision is recorded only there."
+text = "There is exactly one asset registry. An asset's precision is recorded only there, and never changes: an asset registered with the wrong precision and never used is removed (`REQ-AS-10`) and registered again, and the designation the book gave the removed asset is never given to another."
 
 [[invariant]]
 id = "INV-25"

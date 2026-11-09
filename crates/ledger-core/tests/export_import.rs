@@ -103,6 +103,109 @@ fn ac_k5_2_export_and_reimport_give_identical_observable_state() {
     assert_eq!(e2.manifest.audit.emitted, e.manifest.audit.emitted + 2);
 }
 
+/// Amendment 0043: a book that removed an asset exports the tag it retired and imports it back,
+/// so the same id registers again with the same fresh tag in the original and in the import, and
+/// no tag is ever given twice. A book that never removed one writes no such section.
+#[test]
+fn req_as_10_a_retired_tag_crosses_an_export_and_an_import() {
+    use ledger_core::asset::{AssetId, AssetKind};
+    use ledger_core::ledger::operator::{RegisterAsset, ReviewRef};
+
+    let mut b = random(0x543, 200);
+    b.ledger
+        .set_generation(ledger_core::asset::ASSET_REMOVAL, false);
+    let mut anchors = Checkpoints::new();
+    let plain = export(&mut b, &mut anchors);
+    assert!(
+        plain
+            .sections
+            .iter()
+            .all(|s| s.name() != "service.retired-tags")
+    );
+
+    let tstx = AssetId::parse("TSTX").unwrap();
+    // The random book's operator holds a fixed list of kinds; add the two this needs.
+    let op = b.operator();
+    let ctx = b.ctx(op);
+    b.ledger
+        .grant_operator(
+            &ctx,
+            op.principal,
+            ledger_core::set::NonEmptySet::new(
+                [
+                    ledger_core::operator::OperatorOpKind::RegisterAsset,
+                    ledger_core::operator::OperatorOpKind::RemoveAsset,
+                ]
+                .into(),
+            )
+            .unwrap(),
+            None,
+            b"asset staff",
+        )
+        .expect("granted");
+    let register = |b: &mut Mem, precision: u8, n: u8| {
+        let ctx = b.ctx(b.operator());
+        b.ledger
+            .register_asset(
+                &ctx,
+                RegisterAsset {
+                    id: tstx,
+                    precision,
+                    kind: AssetKind::Other,
+                    review: ReviewRef([n; 32]),
+                },
+                b"listing",
+            )
+            .expect("registered");
+        b.ledger.state().registry().get(&tstx).unwrap().tag()
+    };
+    // The highest tag is the one retired, so only the next tag remembers it.
+    let wrong = register(&mut b, 8, 1);
+    let ctx = b.ctx(b.operator());
+    b.ledger
+        .remove_asset(
+            &ctx,
+            tstx,
+            ReviewRef([2; 32]),
+            b"wrong precision, never used",
+        )
+        .expect("removed");
+    let mut anchors = Checkpoints::new();
+    let e = export(&mut b, &mut anchors);
+    assert_eq!(
+        e.sections.last().map(|s| s.name()),
+        Some("service.retired-tags")
+    );
+    let bytes = e.to_bytes();
+    let e = Export::from_bytes(&bytes).expect("the bytes read back");
+    let mut imported = import(&mut b, &e, &anchors);
+    imported.set_generation(ledger_core::asset::ASSET_REMOVAL, false);
+    assert_eq!(
+        imported.state().registry().digest(),
+        b.ledger.state().registry().digest()
+    );
+    let ctx = b.ctx(b.operator());
+    imported
+        .register_asset(
+            &ctx,
+            RegisterAsset {
+                id: tstx,
+                precision: 6,
+                kind: AssetKind::Other,
+                review: ReviewRef([3; 32]),
+            },
+            b"relisting",
+        )
+        .expect("registered again in the import");
+    let fresh = imported.state().registry().get(&tstx).unwrap().tag();
+    assert!(fresh.0 > wrong.0, "{fresh:?} reuses {wrong:?}");
+    assert_eq!(register(&mut b, 6, 3), fresh);
+    assert_eq!(
+        imported.state().registry().digest(),
+        b.ledger.state().registry().digest()
+    );
+}
+
 /// `F-005`: the service store's leaves are a function of what it holds, not of how it came to
 /// hold it: a book rebuilt from its export holds exactly the original's leaves, derived indexes
 /// included, so the core Agent's service root does not depend on the path.

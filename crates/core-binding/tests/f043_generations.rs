@@ -899,3 +899,74 @@ fn t043_14_generation_0_reads_no_sequence() {
         "a generation-0 input read the guard's head"
     );
 }
+
+/// Amendment 0043 (`REQ-AS-10`): an asset registered book-only and never used is removed, and its
+/// id registered again at another precision with a fresh tag, from the rules version that carries
+/// the operation. Before the upgrade the same book answers `ERR-MalformedCommand`, in the replica
+/// and in the Agent, and writes nothing.
+#[test]
+fn req_as_10_the_removal_is_taken_from_its_rules_version() {
+    use ledger_core::asset::{ASSET_REMOVAL, AssetId, AssetKind};
+    use ledger_core::ledger::operator::{RegisterAsset, ReviewRef};
+    use ledger_core::operator::OperatorOpKind;
+    use ledger_core::set::NonEmptySet;
+
+    let mut fx = Fx::native();
+    let op = fx.operator();
+    let tstx = AssetId::parse("TSTX").unwrap();
+    let ctx = fx.ctx(op);
+    fx.replica
+        .grant_operator(
+            &ctx,
+            op.principal,
+            NonEmptySet::new([OperatorOpKind::RegisterAsset, OperatorOpKind::RemoveAsset].into())
+                .unwrap(),
+            None,
+            b"asset staff",
+        )
+        .unwrap();
+    fx.synced();
+    let register = |fx: &mut Fx<NativePort>, precision: u8, n: u8| {
+        let ctx = fx.ctx(op);
+        fx.replica
+            .register_asset(
+                &ctx,
+                RegisterAsset {
+                    id: tstx,
+                    precision,
+                    kind: AssetKind::Other,
+                    review: ReviewRef([n; 32]),
+                },
+                b"listing",
+            )
+            .unwrap();
+        fx.synced();
+        *fx.replica.state().registry().get(&tstx).unwrap()
+    };
+    let wrong = register(&mut fx, 8, 1);
+    let ctx = fx.ctx(op);
+    assert_eq!(
+        fx.replica
+            .remove_asset(&ctx, tstx, ReviewRef([2; 32]), b"wrong precision")
+            .unwrap_err(),
+        Refusal::MalformedCommand
+    );
+    fx.synced();
+    assert_eq!(fx.replica.state().registry().get(&tstx), Ok(&wrong));
+
+    assert_eq!(upgrade(&mut fx), ASSET_REMOVAL);
+    let ctx = fx.ctx(op);
+    fx.replica
+        .remove_asset(
+            &ctx,
+            tstx,
+            ReviewRef([2; 32]),
+            b"wrong precision, never used",
+        )
+        .unwrap();
+    fx.synced();
+    assert!(fx.replica.state().registry().get(&tstx).is_err());
+    let right = register(&mut fx, 6, 3);
+    assert_eq!(right.precision(), 6);
+    assert!(right.tag().0 > wrong.tag().0);
+}

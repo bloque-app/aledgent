@@ -190,6 +190,81 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
         r
     }
 
+    /// Remove an asset (amendment 0043, `REQ-AS-10`): a reviewed change, recorded, for an asset
+    /// registered with the wrong precision and never used. The asset leaves the registry and its
+    /// tag is retired with it, so the same id can be registered again, at another precision, and
+    /// takes a fresh tag (`INV-24`).
+    ///
+    /// The core decides from its own state ([`crate::state::State::asset_removable`]) and refuses
+    /// with `ERR-NotAuthorised`, with an audit record, unless the asset is registered, book-only
+    /// and nothing in the book has ever named it: no binding asked for, no opening, no posting at
+    /// the issuance counterparty or an opening position, no Treasury limit in it, and no
+    /// issuance grant over it that is not revoked. An asset that is not registered is
+    /// `ERR-UnknownAsset`. A review reference of zeroes names no review: `ERR-NotAuthorised`.
+    pub fn remove_asset(
+        &mut self,
+        ctx: &Ctx,
+        asset: AssetId,
+        review: ReviewRef,
+        justification: &[u8],
+    ) -> Result<Accepted<()>, Refusal> {
+        let top = self.enter(|| crate::call::Call::RemoveAsset {
+            ctx: *ctx,
+            asset,
+            review,
+            justification: justification.to_vec(),
+        });
+        #[allow(clippy::redundant_closure_call)]
+        let r: Result<Accepted<()>, Refusal> = (|| {
+            // An input of an earlier rules version is refused and writes nothing: the code of that
+            // version did not know it ([`crate::asset::ASSET_REMOVAL`]).
+            if !self.removes_assets() {
+                return Err(Refusal::MalformedCommand);
+            }
+            let p = resolve(&self.state, &ctx.caller)?;
+            let d = digest("remove_asset", &p, justification, |c| {
+                c.bytes(asset.as_str().as_bytes());
+                c.bytes(&review.0);
+            });
+            if let Some(a) = self.replay(ctx, &p, &d, |_| ())? {
+                return Ok(a);
+            }
+            let command = Command::RemoveAsset;
+            let subjects = vec![AuditSubject::Asset(asset), AuditSubject::Review(review.0)];
+            let run = |l: &Self| -> Result<(AuthorityUsed, Justification), Refusal> {
+                let (used, j) = l.frame(&p, OperatorOpKind::RemoveAsset, justification, ctx.now)?;
+                if review.0 == [0; 32] {
+                    return Err(Refusal::NotAuthorised);
+                }
+                match l.state.asset_removable(&asset) {
+                    Ok(()) => Ok((used, j)),
+                    Err(StoreRefusal::Registry(RegistryError::NotRegistered(_))) => {
+                        Err(Refusal::UnknownAsset)
+                    }
+                    Err(_) => Err(Refusal::NotAuthorised),
+                }
+            };
+            let (used, j) = match run(self) {
+                Ok(x) => x,
+                Err(r) => return Err(self.refused(ctx, &p, command, subjects, r)),
+            };
+            self.commit_operator(
+                ctx,
+                &p,
+                d,
+                command,
+                used,
+                j,
+                Vec::new(),
+                subjects,
+                vec![Write::RemoveAsset(asset)],
+                (),
+            )
+        })();
+        self.leave(top, || crate::call::Summary::of(&r));
+        r
+    }
+
     /// `bind_asset` (amendment 0011, `REQ-AS-8`, `DEC-20`): ask the settlement layer to bind a
     /// book-only asset at `location`, for the book's outstanding balance of it. Under issuance
     /// authority over the asset (a live issuance grant), with a justification; audited

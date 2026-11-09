@@ -164,6 +164,7 @@ const SURFACE: &[(&str, &str)] = &[
     ("freeze_account", "operator command"),
     ("unfreeze_account", "operator command"),
     ("register_asset", "operator command"),
+    ("remove_asset", "operator command"),
     ("bind_asset", "issuance authority command"),
     ("deprecate_asset", "operator command"),
     ("grant_issuance", "operator command"),
