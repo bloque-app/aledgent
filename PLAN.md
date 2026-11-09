@@ -498,7 +498,9 @@ Traces: `REQ-AS-1`, `AS-2`, `AS-3`, `AS-6`–`AS-9`, `REQ-SA-1`, `SA-3`, `REQ-SL
 - **Sweep** (step `Sweep { start, level }`). The cursor is a 16-byte service-tree key (`library_key`), from the first
   key of kind 4 (ledger accounts) to the first key of kind 6, past the grants (kind 5). A page is the subtree at
   `level` bits that starts at the cursor (`8 <= level <= 128`, `start` aligned to it), with at most
-  `MAX_SWEEP_PAGE` = 64 leaves. The witness proves it whole: the page's subtree is a **claim** derived from the
+  `MAX_SWEEP_PAGE` = 64 leaves and, past the first, at most `MAX_SWEEP_PAGE_BYTES` = 24 KiB of canonical keys and
+  values. Only a page in kinds 4 and 5 claims its subtree; the host gives the leaf at each claim's probe, if one
+  stands there, so a page refused before it is read still verifies. The witness proves it whole: the page's subtree is a **claim** derived from the
   input's calls (`core_binding::service::claims_of`), by the host and by the Agent alike, so the witness's wire form
   does not change (no field, so an older Agent decodes every witness as before). The claim's probe (its first key)
   is proven like a whole kind's, and the Agent checks that no frontier node of the multiproof lies inside the
@@ -514,7 +516,7 @@ Traces: `REQ-AS-1`, `AS-2`, `AS-3`, `AS-6`–`AS-9`, `REQ-SA-1`, `SA-3`, `REQ-SL
   `Write::RemoveAsset` retires the tag and removes the retirement leaf. Cancel (step `Cancel`) restores the status.
 - **Rules version.** All three steps, `remove_asset`, and `grant_operator` naming `OperatorOpKind::RemoveAsset` (20)
   are taken from `ASSET_RETIREMENT` = 2, the rules version this release's core package is built as (the production
-  and test books run 1). Before it the replica answers `ERR-MalformedCommand` and **records no call**, so no input
+  and test books run 1; `agents/core` `GENERATION` = 2, with a compile-time check that it is not below the gate). Before it the replica answers `ERR-MalformedCommand` and **records no call**, so no input
   carrying a variant an older Agent cannot decode is ever sent. The gate reads the rules version alone.
 - **Export.** `service.asset-retirements`, written only while an asset is retiring, after `service.retired-tags`.
   Format version 12 is unchanged.

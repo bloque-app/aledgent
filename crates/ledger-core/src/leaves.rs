@@ -588,22 +588,31 @@ impl<K: Ord + Clone, V, const KIND: u8> Leaves<K, V, KIND> {
     }
 }
 
-impl<K: Ord + Clone + Canonical, V, const KIND: u8> Leaves<K, V, KIND> {
+impl<K: Ord + Clone + Canonical, V: Canonical, const KIND: u8> Leaves<K, V, KIND> {
     /// The service-tree key of the entry at `k`.
     fn tree_key(k: &K) -> [u8; 16] {
         crate::delta::library_key(KIND, &canon::to_bytes(k))
     }
 
-    /// The entries whose service-tree key lies in `sub`, in that key order, at most `limit + 1`
-    /// of them (amendment 0043, `DEC-28`): a page of a sweep, where more than `limit` is the
-    /// page's refusal. Never a read of the kind whole: a whole map hashes every key, keeps those
-    /// in `sub`, and records each one it returns by key. A partial map answers from the leaves it
-    /// was given: every one in `sub` when the witness proved `sub` whole; `limit + 1` of them when
-    /// it was given more than `limit` (the page is too large, provably, without the rest); and
-    /// otherwise it fails closed. A subtree of another kind holds nothing.
-    pub fn subtree(&self, sub: &Subtree, limit: usize) -> Vec<(&K, &V)> {
+    /// The entries whose service-tree key lies in `sub`, in that key order (amendment 0043,
+    /// `DEC-28`): a page of a sweep, and whether it is over its bounds, more than `limit` entries
+    /// or, past its first entry, more than `budget` bytes of canonical keys and values
+    /// ([`over_bounds`]). An entry alone is never over: it is what any read of it brings. Never a
+    /// read of the kind whole: a whole map hashes every key and keeps those in `sub`, in order, up
+    /// to and with the first entry that takes the page over a bound, and records each one it
+    /// returns by key. A partial map answers from the leaves it was given: every one in `sub` when
+    /// the witness proved `sub` whole; the same prefix when what it was given goes over a bound
+    /// (the page is too large, provably, without the rest); and otherwise it fails closed. A
+    /// subtree of another kind holds nothing.
+    ///
+    /// TODO(amendment 0043, review of ff2c0fd item 5a): a whole map hashes every key of the kind on
+    /// each call, and a sweep input calls this three times (the decision, the store's check and
+    /// commit) besides [`Leaves::tree_keys_unrecorded`] for the suggestion: at about 175 000
+    /// accounts, some tenths of a second of host time per input, and as much on replay. A host-side
+    /// index of tree keys would remove it; it changes no decision.
+    pub fn subtree(&self, sub: &Subtree, limit: usize, budget: usize) -> (Vec<(&K, &V)>, bool) {
         if sub.kind() != KIND {
-            return Vec::new();
+            return (Vec::new(), false);
         }
         let mut found: Vec<([u8; 16], &K, &V)> = self
             .map
@@ -612,32 +621,65 @@ impl<K: Ord + Clone + Canonical, V, const KIND: u8> Leaves<K, V, KIND> {
             .filter(|(t, _, _)| sub.contains(t))
             .collect();
         found.sort_by_key(|a| a.0);
-        found.truncate(limit.saturating_add(1));
+        let sizes: Vec<usize> = found
+            .iter()
+            .map(|(_, k, v)| canon::to_bytes(*k).len() + canon::to_bytes(*v).len())
+            .collect();
+        let over = over_bounds(&sizes, limit, budget);
+        if let Some(n) = over {
+            found.truncate(n);
+        }
         if let Some(p) = &self.partial
             && !p.complete
             && !p.subtrees.contains(sub)
-            && found.len() <= limit
+            && over.is_none()
         {
             self.track.missed.set(true);
         }
         for (_, k, _) in &found {
             self.point(k);
         }
-        found.into_iter().map(|(_, k, v)| (k, v)).collect()
+        (
+            found.into_iter().map(|(_, k, v)| (k, v)).collect(),
+            over.is_some(),
+        )
     }
 
-    /// Every entry's service-tree key, sorted, read without recording: for a choice the host
-    /// passes as data (the next page's suggested level, `DEC-28`). On a partial map it is empty
-    /// and fails nothing: the core Agent makes no such choice, and its caller asks only a whole
-    /// store.
-    pub fn tree_keys_unrecorded(&self) -> Vec<[u8; 16]> {
+    /// Every entry's service-tree key and its canonical size (key and value), sorted by key, read
+    /// without recording: for a choice the host passes as data (the next page's suggested level,
+    /// `DEC-28`). On a partial map it is empty and fails nothing: the core Agent makes no such
+    /// choice, and its caller asks only a whole store.
+    pub fn tree_keys_unrecorded(&self) -> Vec<([u8; 16], usize)> {
         if self.partial.is_some() {
             return Vec::new();
         }
-        let mut keys: Vec<[u8; 16]> = self.map.keys().map(Self::tree_key).collect();
+        let mut keys: Vec<([u8; 16], usize)> = self
+            .map
+            .iter()
+            .map(|(k, v)| {
+                (
+                    Self::tree_key(k),
+                    canon::to_bytes(k).len() + canon::to_bytes(v).len(),
+                )
+            })
+            .collect();
         keys.sort_unstable();
         keys
     }
+}
+
+/// Where a page of entries of these `sizes`, in key order, goes over its bounds (amendment 0043):
+/// the length of the prefix up to and with the first entry that takes it past `limit` entries,
+/// or, past the first entry, past `budget` bytes; `None` if it stays within both.
+pub fn over_bounds(sizes: &[usize], limit: usize, budget: usize) -> Option<usize> {
+    let mut bytes = 0usize;
+    for (i, size) in sizes.iter().enumerate() {
+        bytes = bytes.saturating_add(*size);
+        if i >= limit || (i > 0 && bytes > budget) {
+            return Some(i + 1);
+        }
+    }
+    None
 }
 
 impl<K: Ord + Clone, T: Ord, const KIND: u8> Leaves<K, BTreeSet<T>, KIND> {

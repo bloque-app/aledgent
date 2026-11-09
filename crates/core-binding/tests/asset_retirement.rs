@@ -149,6 +149,12 @@ fn assets() -> Vec<AssetDecl> {
 /// A seed of `n` identities, `n` delegated accounts and `n` grants, one over each account and
 /// bounded to USD, except grant `bound`, if any, which also lists `TSTX`.
 fn seed(n: u64, bound: Option<u64>) -> ChainSpec {
+    seed_with(n, bound, 0)
+}
+
+/// [`seed`], each grant also bounding the counterparties it may pay to `counterparties` of the
+/// seeded accounts: grants of a few kilobytes each.
+fn seed_with(n: u64, bound: Option<u64>, counterparties: u64) -> ChainSpec {
     let op = op(0);
     let mut records = Vec::new();
     for _ in 0..n {
@@ -177,7 +183,14 @@ fn seed(n: u64, bound: Option<u64>) -> ChainSpec {
             per_operation: Some(NonZeroMinor::new(Minor::new(1_000)).unwrap()),
             per_window: None,
             assets: Some(assets),
-            counterparties: None,
+            counterparties: (counterparties > 0).then(|| {
+                NonEmptySet::new(
+                    (0..counterparties.min(n))
+                        .map(|j| chainspec::account_of(&op, j))
+                        .collect(),
+                )
+                .unwrap()
+            }),
             parent: None,
             expires: None,
         }));
@@ -525,4 +538,113 @@ fn req_rt_20_the_removal_makes_no_input_before_its_rules_version() {
         fx.replica.state().registry().get(&tstx()).unwrap().status(),
         AssetStatus::Retiring
     );
+}
+
+/// The service-tree key of seeded account `i`.
+fn account_key(i: u64) -> [u8; 16] {
+    ledger_core::delta::library_key(
+        ledger_core::leaves::kind::LEDGER_ACCOUNT,
+        &ledger_core::export::canon::to_bytes(&chainspec::account_of(&op(0), i)),
+    )
+}
+
+/// `REQ-AS-10`, `DEC-28`, through the Agent: a page the ledger refuses before it reads anything is
+/// an ordinary refusal on the Agent as on the replica, and the writer goes on. (A) a page outside
+/// the accounts and grants, of a kind the store keeps no map of or of none at all, claims nothing;
+/// (B) a page whose first key is a live account's, at the deepest level, sent while the asset is
+/// not retiring and again while the cursor is elsewhere: its probe is proven with that account's
+/// leaf, so the witness verifies.
+#[test]
+fn req_as_10_a_page_refused_before_it_is_read_is_an_ordinary_refusal_in_the_agent() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let (_, mut fx) = founded(seed(40, None));
+    ready(&mut fx);
+    let live = SweepPage {
+        start: account_key(7),
+        level: 128,
+    };
+    // (B), not retiring.
+    assert_eq!(page(&mut fx, live), Err(Refusal::InvalidTransition));
+    let next = retire(&mut fx).unwrap();
+    // (A): no kind at all, a kind with no map, a kind that is not swept.
+    for start in [
+        [0u8; 16],
+        [24, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        {
+            let mut k = [0u8; 16];
+            k[0] = ledger_core::leaves::kind::IDENTITY;
+            k
+        },
+    ] {
+        let p = SweepPage { start, level: 8 };
+        assert_eq!(page(&mut fx, p), Err(Refusal::InvalidTransition));
+        bounded("a page outside the sweep", &last(&fx));
+    }
+    // (B), retiring, the cursor elsewhere.
+    assert_eq!(page(&mut fx, live), Err(Refusal::InvalidTransition));
+    // Not a subtree at all.
+    let crooked = SweepPage {
+        start: account_key(7),
+        level: 9,
+    };
+    assert_eq!(page(&mut fx, crooked), Err(Refusal::MalformedCommand));
+    // And the sweep goes on to the end, and the asset is removed.
+    sweep(&mut fx, next).unwrap();
+    remove(&mut fx).unwrap();
+}
+
+/// `REQ-AS-10`, `REQ-RT-1`: a page is bounded by bytes as well as by count. Grants of a few
+/// kilobytes each (150 counterparties) would put 64 of them past one pack; a page over 24 KiB is
+/// `ERR-BatchTooLarge` from a bounded witness, the host suggests pages that fit, and every page of
+/// the sweep stays within one pack.
+#[test]
+fn req_as_10_a_page_of_large_grants_is_bounded_by_bytes() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let (_, mut fx) = founded(seed_with(160, None, 150));
+    ready(&mut fx);
+    let mut next = retire(&mut fx).unwrap();
+    // Through the accounts, to the grants.
+    while let Some(n) = next.filter(|n| n.start[0] == ledger_core::leaves::kind::LEDGER_ACCOUNT) {
+        next = page(
+            &mut fx,
+            SweepPage {
+                start: n.start,
+                level: n.level.unwrap(),
+            },
+        )
+        .unwrap();
+    }
+    let at = next.expect("the grants");
+    assert_eq!(at.start[0], ledger_core::leaves::kind::GRANT);
+    // The grants whole, by count within 64 at this size of book only by luck: by bytes, too large.
+    let whole = SweepPage {
+        start: at.start,
+        level: 8,
+    };
+    assert_eq!(page(&mut fx, whole), Err(Refusal::BatchTooLarge));
+    bounded("a page over its bytes", &last(&fx));
+    let pages = sweep(&mut fx, next).unwrap();
+    for s in &pages {
+        bounded("a page of large grants", s);
+    }
+    assert!(pages.len() >= 160 * 2_400 / ledger_core::asset::MAX_SWEEP_PAGE_BYTES);
+    remove(&mut fx).unwrap();
+}
+
+/// The core package is built at a rules version that takes the removal (amendment 0043): its
+/// `GENERATION` is not below [`ASSET_RETIREMENT`], so the release that carries these calls takes
+/// them.
+#[test]
+fn req_rt_20_the_core_package_is_built_at_the_removals_rules_version() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../agents/core/src/lib.rs"),
+    )
+    .unwrap();
+    let generation: u64 = src
+        .lines()
+        .find_map(|l| l.strip_prefix("const GENERATION: u64 = "))
+        .and_then(|v| v.strip_suffix(';'))
+        .and_then(|v| v.parse().ok())
+        .expect("agents/core/src/lib.rs names its GENERATION");
+    assert!(generation >= ASSET_RETIREMENT, "{generation}");
 }

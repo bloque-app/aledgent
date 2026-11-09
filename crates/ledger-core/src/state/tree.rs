@@ -161,9 +161,11 @@ impl State {
             let i = by_kind[usize::from(*kind)].ok_or(DecodeError("no such leaf kind"))?;
             maps[i].set_complete();
         }
+        // A subtree of a kind the store does not keep holds nothing it could read: no claim.
         for sub in subtrees {
-            let i = by_kind[usize::from(sub.kind())].ok_or(DecodeError("no such leaf kind"))?;
-            maps[i].set_subtree_complete(*sub);
+            if let Some(i) = by_kind[usize::from(sub.kind())] {
+                maps[i].set_subtree_complete(*sub);
+            }
         }
         Ok(())
     }

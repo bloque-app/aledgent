@@ -69,6 +69,14 @@ pub const ASSET_RETIREMENT: u64 = 2;
 /// `REQ-AS-10`'s declared maximum): a page with more is `ERR-BatchTooLarge`.
 pub const MAX_SWEEP_PAGE: usize = 64;
 
+/// The most bytes of canonical keys and values one page of an asset's sweep may hold beyond its
+/// first record (amendment 0043, `REQ-AS-10`'s declared maximum): a page with more is
+/// `ERR-BatchTooLarge`. A record's size is not capped (a grant's counterparties), so a page is
+/// bounded by bytes as well as by count, well inside one pack of caller blobs (46 KiB) with its
+/// proof, the kernel witness and the private inputs. A page of one record is never refused for its
+/// size: any input that reads that record brings it.
+pub const MAX_SWEEP_PAGE_BYTES: usize = 24 * 1024;
+
 /// Where an asset's sweep starts (amendment 0043): the first service-tree key of the ledger
 /// accounts (`crate::leaves::kind::LEDGER_ACCOUNT`). The grants (`GRANT`) follow them.
 pub const SWEEP_START: [u8; 16] = [

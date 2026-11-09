@@ -71,10 +71,15 @@ pub struct ServiceWitness {
     pub claims: Vec<Subtree>,
 }
 
-/// The subtrees `calls` read whole: each page of an asset's sweep that is a subtree (amendment
-/// 0043, `DEC-28`). The host proves them in the witness it builds for those calls, and the Agent
-/// checks the proof against the same list.
+/// The subtrees `calls` read whole: each page of an asset's sweep that is a subtree inside the
+/// sweep's range, the ledger accounts and the grants (amendment 0043, `DEC-28`); any other page is
+/// refused by the ledger before it reads anything, and claims nothing. The host proves them in the
+/// witness it builds for those calls, the probe at each one's first key with the leaf that stands
+/// there if one does (`crate::host`), and the Agent checks the proof against the same list. A claim
+/// the proof does not show whole is no error: the page's read then fails closed or finds the page
+/// too large, as the replica does.
 pub fn claims_of(calls: &[Call]) -> Vec<Subtree> {
+    use ledger_core::leaves::kind;
     let mut out: Vec<Subtree> = calls
         .iter()
         .filter_map(|c| match c {
@@ -84,6 +89,7 @@ pub fn claims_of(calls: &[Call]) -> Vec<Subtree> {
             } => Subtree::new(page.start, page.level),
             _ => None,
         })
+        .filter(|s| matches!(s.kind(), kind::LEDGER_ACCOUNT | kind::GRANT))
         .collect();
     out.sort();
     out.dedup();

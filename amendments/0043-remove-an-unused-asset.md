@@ -46,8 +46,9 @@ Four facts make an asset unused. Two of them are point reads of what the book al
    the opening positions (all `Issuance` accounts), and Treasury accounts down to a declared limit (`REQ-LA-2`). The
    journal keeps, for each (account, asset), the running sums of its postings, and removes them only when an undo
    takes the last posting back, so once a posting is final they are permanent: a position that holds nothing now but
-   did once still has them. The check reads them for the issuance counterparty and each opening position, and reads
-   whether an opening position was ever opened for the asset.
+   did once still has them. The check reads them for the issuance counterparty and for each registered asset's
+   opening position (a point read by its asset, so the read is bounded by the registry), and reads whether an opening
+   position was ever opened for this asset.
 2. **Never bound.** The registry says book-only, and the settlement record of a binding, which stays even when the
    layer refused it, is absent.
 
@@ -58,8 +59,9 @@ The other two have no structure that covers them:
 4. **No Treasury account, closed ones included, has a limit in it.** A Treasury limit is set when the account opens,
    at any time, not only at genesis.
 
-The first draft read both whole, `grants.values()` and `accounts.values()`, and claimed that the host's witness gives
-the core Agent that read "like any other". It does, and that is the defect: a whole read ships every leaf of the kind.
+The first and third drafts (2acabc0, b09b58e) read both whole, `grants.values()` and `accounts.values()`, and claimed
+that the host's witness gives the core Agent that read "like any other". It does, and that is the defect: a whole read
+ships every leaf of the kind.
 The core Agent runs in a 256 KiB arena, takes at most 184 KiB of caller blobs per invocation and 46 KiB per pack. At
 the production book's size, about 175 000 ledger accounts and their grants, the read is about a hundred times too big.
 The Agent would refuse the removal, and the book could never remove an asset. A never-used asset that the book cannot
@@ -111,10 +113,15 @@ status it had before and the sweep's **cursor**: where the next page starts.
   depends only on its content, so the order is the same on the core, a replica, a replay and after an import.
 - **The page.** A page is one subtree of that order, named by where it starts and how many leading bits of the key it
   fixes (its level). It must start at the cursor, be aligned to its level, and lie inside one kind. It may hold at most
-  **64** records (`MAX_SWEEP_PAGE`). The cursor then moves to the end of the subtree; past the end of the accounts it
+  **64** records (`MAX_SWEEP_PAGE`), and, past its first record, at most **24 KiB** of their canonical keys and values
+  (`MAX_SWEEP_PAGE_BYTES`): a grant's counterparties and assets have no size cap, so a count alone would not keep a page
+  inside one pack. A page of one record is never refused for its size; any input that reads the record brings it. The cursor then moves to the end of the subtree; past the end of the accounts it
   enters the grants, and past the end of the grants the sweep is complete.
 - **Who picks the level.** The operator, in the input, so that the page is data the input carries and every node
-  decides it the same. The host's reply to each step suggests the next page's level, the largest that fits, from the
+  decides it the same. Only a page inside the accounts and the grants claims its subtree in the witness; any other is
+  refused before anything is read. The probe at a claimed subtree's first key is proven with the leaf that stands
+  there, if one does, so a page the ledger refuses before reading it (not at the cursor, not retiring, not authorised)
+  is an ordinary refusal on the core and the replica alike. The host's reply to each step suggests the next page's level, the largest that fits, from the
   whole state a replica holds; the suggestion is never part of the decision (the summary compared with the core Agent
   is the outcome's code only), and the core Agent, which has no whole state, suggests none.
 - **What a page checks.** Each ledger account in it: no Treasury limit in the asset, closed accounts included. Each
@@ -128,7 +135,7 @@ Refusals, each audited, each changing nothing:
 | The asset is not retiring | `ERR-InvalidTransition` | `NotRetiring` |
 | The page does not start at the cursor, or the sweep is complete | `ERR-InvalidTransition` | `NotAtCursor` |
 | The level is out of range, the start not aligned to it, or the page outside the two kinds | `ERR-MalformedCommand` | `MalformedPage` |
-| The page holds more than 64 records | `ERR-BatchTooLarge` | `PageTooLarge` |
+| The page holds more than 64 records, or more than one and over 24 KiB | `ERR-BatchTooLarge` | `PageTooLarge` |
 | A Treasury account in it has a limit in the asset | `ERR-NotAuthorised` | `TreasuryLimit` (the account in the audit record) |
 | An unrevoked grant in it is over the asset | `ERR-NotAuthorised` | `LiveGrant` (the grant in the audit record) |
 | An unrevoked grant in it bounds the asset | `ERR-NotAuthorised` | `GrantBound` (the grant in the audit record) |

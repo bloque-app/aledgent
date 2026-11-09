@@ -957,7 +957,26 @@ impl ServiceStore {
     /// The witness of `touched` for the Agent (`crate::service`), proving the subtrees `claims`
     /// whole besides (amendment 0043, [`crate::service::claims_of`]).
     fn witness(&self, touched: &Touches, claims: &[Subtree]) -> Result<ServiceWitness, DriveError> {
-        let (leaves, whole) = self.leaves(touched)?;
+        let (mut leaves, whole) = self.leaves(touched)?;
+        // Each claim's probe is a proven key (amendment 0043). Where a leaf stands at it, the
+        // witness gives that leaf, so the proof shows it as it is, whether or not the run read the
+        // page: a page the ledger refused before reading it claims a probe all the same.
+        if !claims.is_empty() {
+            let view = self.view()?;
+            let given: BTreeSet<[u8; 16]> = leaves
+                .iter()
+                .map(|(k, key, _)| ledger_core::delta::library_key(*k, key))
+                .collect();
+            for c in claims {
+                if given.contains(&c.start()) {
+                    continue;
+                }
+                if let Some(leaf) = view.service_leaf_at(&c.start()).map_err(rep)? {
+                    let (key, value) = library_parts(&leaf).map_err(rep)?;
+                    leaves.push((leaf.kind().code(), key, Some(value)));
+                }
+            }
+        }
         let keys = proven_keys_with(&leaves, &whole, claims);
         let (frontier, compact) = if Version::ACTIVE == Version::V2 {
             // The service tree removes leaves: node entries opened (`crate::service`).

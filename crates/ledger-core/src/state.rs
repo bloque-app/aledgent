@@ -55,7 +55,7 @@ use alloc::vec::Vec;
 use crate::account::{AccountKind, AccountStatus, Custody, LedgerAccount, Time};
 use crate::asset::{
     Asset, AssetBinding, AssetId, AssetKind, AssetRegistry, AssetRetirement, AssetStatus,
-    MAX_SWEEP_PAGE, Minor, RegistryError, SWEEP_END, SWEEP_START,
+    MAX_SWEEP_PAGE, MAX_SWEEP_PAGE_BYTES, Minor, RegistryError, SWEEP_END, SWEEP_START,
 };
 use crate::audit::emit::{self, AuditUndo};
 use crate::audit::{AuditLog, AuditNote};
@@ -403,7 +403,8 @@ pub enum RetirementRefusal {
     NotAtCursor,
     /// The page lies outside the ledger accounts and the grants.
     MalformedPage,
-    /// The page holds more than [`MAX_SWEEP_PAGE`] leaves.
+    /// The page holds more than [`MAX_SWEEP_PAGE`] leaves, or more than one and over
+    /// [`MAX_SWEEP_PAGE_BYTES`].
     PageTooLarge,
     /// The sweep has not covered every account and grant.
     SweepIncomplete,
@@ -1182,6 +1183,11 @@ impl State {
                 Ok(Undo::Op(u))
             }
             Write::Settlement(w) => {
+                // TODO(amendment 0043, review of ff2c0fd item 5b): a support declaration, an
+                // ingested observation or an attestation naming a retiring asset is not refused
+                // yet; a declaration that lists it would still list the identifier after it is
+                // registered again. Refusing them changes what the settlement adapter's inputs
+                // decide, and needs its own review.
                 if let crate::settlement::store::SettlementWrite::AssetBind(b) = w {
                     self.not_retiring([&b.asset])?;
                 }
@@ -1443,9 +1449,9 @@ impl State {
     }
 
     /// The point checks of an asset's removal (amendment 0043, `REQ-AS-10`, checks 1 and 2):
-    /// registered, book-only, never asked to bind, no opening position (an opening position holds
-    /// only its own asset), and never held by the issuance counterparty. "Never held" is read from
-    /// the position's
+    /// registered, book-only, never asked to bind, no opening position, and never held by the
+    /// issuance counterparty or any opening position (each registered asset's, a point read by its
+    /// asset). "Never held" is read from the position's
     /// running sums, which stay once a posting is final even when the position is back at zero
     /// ([`crate::query::journal::Journal::touched`]). Value can enter an asset only at an
     /// account that may go below zero: the issuance counterparty, an opening position, or a
@@ -1465,11 +1471,19 @@ impl State {
         if self.openings.position(id).is_some() {
             return used(AssetInUse::Opening);
         }
-        // An opening position holds only its own asset, and this one has none (above), so the
-        // issuance counterparty is the one position left to read: a point read, never the
-        // positions of every asset.
+        // The issuance counterparty and every opening position: each registered asset's position
+        // is a point read by its asset, so the read is bounded by the registry, never the
+        // positions' kind whole.
         let issuance = self.roles.get().as_ref().map(|r| r.issuance);
-        if issuance.is_some_and(|a| self.journal.touched(&a, id)) {
+        let positions: Vec<AccountId> = registry
+            .iter()
+            .filter_map(|a| self.openings.position(&a.id()))
+            .collect();
+        let touched = issuance
+            .into_iter()
+            .chain(positions)
+            .any(|a| self.journal.touched(&a, id));
+        if touched {
             return used(AssetInUse::Issuance);
         }
         Ok(())
@@ -1521,8 +1535,10 @@ impl State {
         };
         match page.kind() {
             kind::LEDGER_ACCOUNT => {
-                let accounts = self.accounts.subtree(page, MAX_SWEEP_PAGE);
-                if accounts.len() > MAX_SWEEP_PAGE {
+                let (accounts, over) =
+                    self.accounts
+                        .subtree(page, MAX_SWEEP_PAGE, MAX_SWEEP_PAGE_BYTES);
+                if over {
                     return refuse(RetirementRefusal::PageTooLarge);
                 }
                 if let Some((id, _)) = accounts
@@ -1533,8 +1549,10 @@ impl State {
                 }
             }
             kind::GRANT => {
-                let grants = self.grants.subtree(page, MAX_SWEEP_PAGE);
-                if grants.len() > MAX_SWEEP_PAGE {
+                let (grants, over) =
+                    self.grants
+                        .subtree(page, MAX_SWEEP_PAGE, MAX_SWEEP_PAGE_BYTES);
+                if over {
                     return refuse(RetirementRefusal::PageTooLarge);
                 }
                 for (id, g) in grants {
@@ -1569,15 +1587,16 @@ impl State {
             kind::GRANT if !self.grants.is_partial() => self.grants.tree_keys_unrecorded(),
             _ => return None,
         };
-        let from = keys.partition_point(|k| k < cursor);
+        let from = keys.partition_point(|(k, _)| k < cursor);
         (8..=128u16).find(|level| {
             Subtree::new(*cursor, *level).is_some_and(|sub| {
-                keys[from..]
+                let sizes: Vec<usize> = keys[from..]
                     .iter()
+                    .take_while(|(k, _)| sub.contains(k))
                     .take(MAX_SWEEP_PAGE + 1)
-                    .take_while(|k| sub.contains(k))
-                    .count()
-                    <= MAX_SWEEP_PAGE
+                    .map(|(_, n)| *n)
+                    .collect();
+                crate::leaves::over_bounds(&sizes, MAX_SWEEP_PAGE, MAX_SWEEP_PAGE_BYTES).is_none()
             })
         })
     }
