@@ -900,14 +900,13 @@ fn t043_14_generation_0_reads_no_sequence() {
     );
 }
 
-/// Amendment 0043 (`REQ-AS-10`): `remove_asset` is taken from rules version 4 and from no earlier
-/// one. Before it the replica and the Agent answer `ERR-MalformedCommand` and write nothing. At
-/// version 4, reached by upgrades, the book refuses every removal with `ERR-NotAuthorised`: its
-/// indexes were not built for what it held before, and nothing builds them in place, so it fails
-/// closed rather than guess (`ASSET_REMOVAL`).
+/// Amendment 0043 (`REQ-AS-10`): `remove_asset` decides from the book's records at the moment of
+/// the input, with no rules-version gate and no index. A book that has been upgraded through every
+/// rules version the released code names removes an unused asset all the same, in the replica and
+/// in the core Agent, which reads the grants and the accounts whole to decide.
 #[test]
-fn req_as_10_the_removal_is_taken_from_its_rules_version_and_fails_closed_after_an_upgrade() {
-    use ledger_core::asset::{ASSET_REMOVAL, AssetId, AssetKind};
+fn req_as_10_an_upgraded_book_removes_an_unused_asset() {
+    use ledger_core::asset::{AssetId, AssetKind};
     use ledger_core::ledger::operator::{RegisterAsset, ReviewRef};
     use ledger_core::operator::OperatorOpKind;
     use ledger_core::set::NonEmptySet;
@@ -941,7 +940,7 @@ fn req_as_10_the_removal_is_taken_from_its_rules_version_and_fails_closed_after_
         )
         .unwrap();
     fx.synced();
-    let wrong = *fx.replica.state().registry().get(&tstx).unwrap();
+    assert!(fx.replica.state().registry().get(&tstx).is_ok());
     let remove = |fx: &mut Fx<NativePort>| {
         let ctx = fx.ctx(op);
         let r = fx
@@ -951,15 +950,11 @@ fn req_as_10_the_removal_is_taken_from_its_rules_version_and_fails_closed_after_
         fx.synced();
         r
     };
-    // Rules versions 0 to 3, the highest the released code names: not known.
-    assert_eq!(remove(&mut fx), Err(Refusal::MalformedCommand));
+    // Upgraded through rules versions 1 to 3, the highest the released code names.
     assert_eq!(upgrade(&mut fx), CHAINED_SETTLEMENT);
-    for version in 2..=ASSET_REMOVAL {
-        assert_eq!(remove(&mut fx), Err(Refusal::MalformedCommand));
+    for version in 2..=3 {
         assert_eq!(upgrade(&mut fx), version);
     }
-    // Rules version 4: known, and refused while the indexes are not known complete.
-    assert_eq!(fx.driver.writer().generation, ASSET_REMOVAL);
-    assert_eq!(remove(&mut fx), Err(Refusal::NotAuthorised));
-    assert_eq!(fx.replica.state().registry().get(&tstx), Ok(&wrong));
+    assert_eq!(remove(&mut fx), Ok(()));
+    assert!(fx.replica.state().registry().get(&tstx).is_err());
 }

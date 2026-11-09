@@ -105,9 +105,7 @@ fn ac_k5_2_export_and_reimport_give_identical_observable_state() {
 
 /// Amendment 0043: a book that removed an asset exports the tag it retired and imports it back,
 /// so the same id registers again with the same fresh tag in the original and in the import, and
-/// no tag is ever given twice. A book that never removed one writes no such section. The removal
-/// is made in an imported book: an import builds the indexes the removal reads from every record,
-/// so they are known complete there.
+/// no tag is ever given twice. A book that never removed one writes no such section.
 #[test]
 fn req_as_10_a_retired_tag_crosses_an_export_and_an_import() {
     use ledger_core::asset::{AssetId, AssetKind};
@@ -123,7 +121,6 @@ fn req_as_10_a_retired_tag_crosses_an_export_and_an_import() {
             .all(|s| s.name() != "service.retired-tags")
     );
     let mut first = import(&mut b, &plain, &anchors);
-    first.set_generation(ledger_core::asset::ASSET_REMOVAL, false);
 
     let tstx = AssetId::parse("TSTX").unwrap();
     // The random book's operator holds a fixed list of kinds; add the two this needs.
@@ -188,7 +185,6 @@ fn req_as_10_a_retired_tag_crosses_an_export_and_an_import() {
     let t = target(&b);
     let (mut second, _) = Ledger::import_book(&e, t, &again, &ctx, b"restore drill", &mut b.audit)
         .expect("the import");
-    second.set_generation(ledger_core::asset::ASSET_REMOVAL, false);
     assert_eq!(
         second.state().registry().digest(),
         first.state().registry().digest()
@@ -223,16 +219,6 @@ fn inv_6_an_imported_book_holds_the_same_service_leaves() {
         .filter(|l| !after.contains(l))
         .chain(after.iter().filter(|l| !before.contains(l)))
         .map(|(kind, _, _)| *kind)
-        // Whether the removal indexes are known complete depends on how the book came to be: an
-        // import builds them from every record and says so (amendment 0043).
-        .filter(|kind| {
-            ![
-                ledger_core::leaves::kind::REMOVAL_INDEXES_COMPLETE,
-                ledger_core::leaves::kind::TREASURY_LIMITS_BY_ASSET,
-                ledger_core::leaves::kind::GRANTS_BY_BOUND_ASSET,
-            ]
-            .contains(kind)
-        })
         .collect();
     assert!(differ.is_empty(), "leaves of kinds {differ:?} differ");
 }

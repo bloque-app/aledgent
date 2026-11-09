@@ -150,14 +150,6 @@ pub mod kind {
     pub const GRANTS_BY_ASSET_OR_IDENTITY: u8 = 19;
     /// The accounts in owned custody each identity owns (`State::holds_owned_custody`).
     pub const OWNED_CUSTODY_BY_OWNER: u8 = 22;
-    /// The Treasury accounts that declare a limit in each asset (`State::asset_removable`,
-    /// amendment 0043): derived from the accounts, absent for an asset no account names.
-    pub const TREASURY_LIMITS_BY_ASSET: u8 = 23;
-    /// Whether the indexes of amendment 0043 are known to hold every account and grant of the
-    /// book (`State::asset_removable`): absent until an import rebuilds them.
-    pub const REMOVAL_INDEXES_COMPLETE: u8 = 24;
-    /// The grants whose bounds name each asset (`State::asset_removable`, amendment 0043).
-    pub const GRANTS_BY_BOUND_ASSET: u8 = 25;
     // The reservation index.
     pub const RESERVED_TOTAL: u8 = 20;
     pub const OPEN_RESERVATIONS: u8 = 21;

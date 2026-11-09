@@ -50,33 +50,6 @@ pub const ASSET_ID_MAX: usize = 12;
 /// 18.4 whole units at most: beyond it an asset could not hold even one whole unit exactly
 /// (`F-003` Open points: the owner sets the real threshold per expected supply).
 pub const MAX_PRECISION: u8 = 18;
-/// The rules version from which an asset registered book-only and never used can be removed
-/// (amendment 0043, `REQ-AS-10`): **4**, the next after the highest the released code names.
-///
-/// The released code names versions up to 3. The core package is compiled as version 1 (`GENERATION`
-/// of the core package, and `CHAINED_SETTLEMENT`, `SETTLEMENT_EPOCHS` and `ASSET_CANDIDATES` all
-/// 1), but the code-history fixture of the `code-history` gate (`T-037-12`), recorded by the
-/// released builds from `v0.4.0` on and only ever appended to, holds a book's history through
-/// versions 0, 1, 2 and 3, and every build must replay it byte for byte. A rule that changes what an
-/// input writes, as the two indexes below do, cannot take effect at a version the fixture records
-/// (the gate fails at input 72, a grant put under version 2). Nor can the fixture be re-recorded to
-/// let it. A deployed book has decided inputs at 1, so 1 is out for the same reason. Version 4 adds:
-///
-/// - the input `remove_asset`, refused with `ERR-MalformedCommand`, writing nothing, before it;
-/// - two indexes, written when an account or a grant is put (the Treasury accounts that declare a
-///   limit in each asset, and the grants whose bounds name each asset). An input of an earlier
-///   version writes and reads no leaf of either, so replaying it reproduces its roots exactly.
-///
-/// Entering version 4 does not build the indexes for what the book holds already: that is a scan
-/// of every account and grant, which the writer cannot make in one input (`REQ-RT-1`) and the
-/// core has no way to make in bounded batches. A book that entered version 4 by an upgrade
-/// therefore refuses every removal (`ERR-NotAuthorised`) until its indexes are known complete
-/// (`State::asset_removable`); an import rebuilds them and says so.
-///
-/// The feature turns on only through an upgrade to a build whose rules version is this one; this
-/// change does not raise the core package's `GENERATION`, which is the release's step.
-pub const ASSET_REMOVAL: u64 = 4;
-
 /// Domain of the registry digest.
 const DIGEST_DOMAIN: &[u8] = b"aledgent/asset-registry/v1";
 /// Domain of the registry digest once a tag has been retired (amendment 0043).

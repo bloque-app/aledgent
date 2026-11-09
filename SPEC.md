@@ -1326,9 +1326,12 @@ postings (`REQ-RT-13`). The removal is then decided at a consistent cut (`REQ-RT
 has applied the revocation of every issuance authority over the asset and reports no posting in it, and a
 partition that sees the removal refuses anything that names the asset's old designation.
 
-> **Trade-off, stated plainly.** The book decides this from indexes it keeps as accounts and grants are put. A
-> book that began before it kept them does not have them for what it already held, and cannot build them in one
-> input. Such a book refuses every removal until they are built, rather than accept one it cannot check.
+The book makes these checks from its records as they stand when the removal is decided, and from no state kept
+for the purpose, so a book gives the same answer whatever the version of the rules it entered by an upgrade.
+
+> **Trade-off, stated plainly.** The check that no Treasury account declares a limit in the asset, and the check
+> that no grant bounds it, read every account and every grant. That is acceptable for an operator's removal, which
+> is rare, and it is the price of not keeping an index that a book which began without it could never complete.
 
 ### 5.4 Balance kinds
 

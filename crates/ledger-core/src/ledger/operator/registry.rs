@@ -216,11 +216,6 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
         });
         #[allow(clippy::redundant_closure_call)]
         let r: Result<Accepted<()>, Refusal> = (|| {
-            // An input of an earlier rules version is refused and writes nothing: the code of that
-            // version did not know it ([`crate::asset::ASSET_REMOVAL`]).
-            if !self.removes_assets() {
-                return Err(Refusal::MalformedCommand);
-            }
             let p = resolve(&self.state, &ctx.caller)?;
             let d = digest("remove_asset", &p, justification, |c| {
                 c.bytes(asset.as_str().as_bytes());

@@ -504,15 +504,6 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
         self.generation = (in_force, next);
         let c = crate::settlement::CHAINED_SETTLEMENT;
         self.switching = next && in_force < c && c <= in_force.saturating_add(1);
-        // The Treasury-limit index is kept from the rules version that introduced it (amendment
-        // 0043); an earlier input writes and reads no leaf of it.
-        self.state
-            .set_treasury_indexing(self.generation() >= crate::asset::ASSET_REMOVAL);
-    }
-
-    /// Whether the book removes assets (amendment 0043): from [`crate::asset::ASSET_REMOVAL`] on.
-    pub(crate) fn removes_assets(&self) -> bool {
-        self.generation() >= crate::asset::ASSET_REMOVAL
     }
 
     /// Whether the current input, unless it is a way out, switches the writer to the chained
