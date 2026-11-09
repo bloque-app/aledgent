@@ -322,6 +322,7 @@ fn t037_12_every_way_out_at_n_is_decided_the_same_by_either_generation() {
     construction_of_the_fixture();
     let f = fixture();
     let mut checked = 0;
+    let mut generations = std::collections::BTreeSet::new();
     for (i, e) in f.entries.iter().enumerate() {
         if way_out_input(&e.calls, e.deliveries.len()) != Ok(true) {
             continue;
@@ -332,6 +333,7 @@ fn t037_12_every_way_out_at_n_is_decided_the_same_by_either_generation() {
             // Before *n*, only the generation in force decides it (the fence).
             continue;
         }
+        generations.insert(w.generation);
         let (mut old, _) = roll(&f, holding(&f.map), i + 1);
         // The next generation's code, the switch already made: nothing installs the old one.
         before.code_map.clear();
@@ -350,6 +352,14 @@ fn t037_12_every_way_out_at_n_is_decided_the_same_by_either_generation() {
         checked += 1;
     }
     assert!(checked >= 3, "only {checked} way-out inputs at n");
+    // `check-upgrade` (agents/core-host) runs D18 for the generation in force: the upgrades from 0
+    // to 1 and from 1 to 2 (amendment 0043's release) each need a way out at n of their own.
+    for g in [0, 1] {
+        assert!(
+            generations.contains(&g),
+            "no way out at an upgrade's input in generation {g}: {generations:?}"
+        );
+    }
 }
 
 /// `T-037-12`: every `Call` variant has a recorded input, but those [`NOT_YET_RECORDED`] names:

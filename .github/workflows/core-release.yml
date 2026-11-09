@@ -317,6 +317,13 @@ jobs:
             fi
             CODE=$from_set
             cp "$W/set-in/manifest.bin" "$W/set-in/core.vos" "$W/set-in/agent_runtime.pvm" "$W/pred/"
+            # The genesis package, which the host image is built on: check-upgrade replays the
+            # recorded book from generation 0, so it runs that range under it (`--earlier`). Its
+            # generation is read from its bytes there, and a wrong package fails the replay.
+            mkdir -p "$W/pred-pkg/earlier"
+            id=$(docker create --platform linux/amd64 "$HOST")
+            docker cp "$id:/usr/share/aledgent/core.vos" "$W/pred-pkg/earlier/0.vos"
+            docker rm "$id" >/dev/null
           else
             id=$(docker create --platform linux/amd64 "$HOST")
             docker cp "$id:/usr/share/aledgent/core.vos" "$W/pred/core.vos"

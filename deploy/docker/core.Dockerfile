@@ -260,7 +260,9 @@ CMD ["serve", "--config", "/etc/aledgent/ingress.json", \
 # upgrade and deciding the rest, every input at its archived log hash; and every way out at an
 # upgrade's input is decided by the new package as the predecessor decided it (D18). So the
 # `previous-code` context holds the runtime too (`agent_runtime.pvm`), and the report is
-# `upgrade-check.json`.
+# `upgrade-check.json`. Where the recorded book ran generations before the code in force's, the
+# context also holds their packages under `earlier/` (the genesis package, for an upgrade from 1 to
+# 2), each passed as `--earlier`.
 FROM scratch AS previous-code
 
 FROM host AS upgrade
@@ -292,8 +294,10 @@ RUN --mount=type=bind,from=previous-code,target=/previous \
       echo "core-upgrade: the recorded history (T-037-12) is a book in roots v2; there is none in roots $ROOTS to check the upgrade against" >&2; \
       exit 1; \
     fi \
+ && earlier="" \
+ && for e in /previous/earlier/*.vos; do [ -s "$e" ] && earlier="$earlier --earlier $e"; done \
  && if /out/bin/aledgent-core-host check-upgrade --runtime /previous/agent_runtime.pvm \
-      --previous /previous/core.vos --package /out/share/core.vos \
+      --previous /previous/core.vos --package /out/share/core.vos $earlier \
       --history /w/aledgent/crates/core-binding/tests/fixtures/code-history \
       --out /out/share/upgrade-check.json 2>/out/share/upgrade-check.log; then \
       cat /out/share/upgrade-check.log >&2; \
