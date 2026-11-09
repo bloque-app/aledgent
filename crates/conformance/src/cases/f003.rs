@@ -621,8 +621,9 @@ fn inv_24_a_second_registry_or_a_precision_outside_it_cannot_be_formed__store(
     Outcome::Pass
 }
 
-/// `REQ-AS-10`: an asset registered book-only and never used is removed, its tag retired, and the
-/// same id registers again at another precision with a fresh tag. A bound one is refused.
+/// `REQ-AS-10`: an asset registered book-only and never used is retired, swept and removed, its tag
+/// retired, and the same id registers again at another precision with a fresh tag. A bound one is
+/// never retired.
 fn inv_24_an_unused_asset_is_removed_and_registered_again_with_a_fresh_tag__store(
     h: &mut dyn Harness,
 ) -> Outcome {
@@ -636,6 +637,30 @@ fn inv_24_an_unused_asset_is_removed_and_registered_again_with_a_fresh_tag__stor
     .unwrap();
     let wrong = *s.registry().get(&tstx).unwrap();
     let before = s.registry().digest();
+    // Not before it is retiring and swept (amendment 0043, `REQ-AS-10`).
+    assert!(s.commit(&[Write::RemoveAsset(tstx)]).is_err());
+    s.commit(&[Write::RetireAsset(tstx)]).unwrap();
+    // While retiring, the store takes no binding of it.
+    let here = ledger_core::asset::AssetLocation::parse("Here(8)").unwrap();
+    assert!(
+        s.commit(&[Write::AssetBinding {
+            id: tstx,
+            binding: ledger_core::asset::AssetBinding::Binding(here),
+        }])
+        .is_err()
+    );
+    for kind in [
+        ledger_core::leaves::kind::LEDGER_ACCOUNT,
+        ledger_core::leaves::kind::GRANT,
+    ] {
+        let mut start = [0u8; 16];
+        start[0] = kind;
+        s.commit(&[Write::SweepPage {
+            asset: tstx,
+            page: ledger_core::leaves::Subtree::new(start, 8).unwrap(),
+        }])
+        .unwrap();
+    }
     s.commit(&[Write::RemoveAsset(tstx)]).unwrap();
     assert!(s.registry().get(&tstx).is_err());
     assert_ne!(s.registry().digest(), before);
@@ -657,7 +682,7 @@ fn inv_24_an_unused_asset_is_removed_and_registered_again_with_a_fresh_tag__stor
     }])
     .unwrap();
     assert_eq!(
-        s.commit(&[Write::RemoveAsset(tstx)]),
+        s.commit(&[Write::RetireAsset(tstx)]),
         Err(StoreRefusal::Registry(RegistryError::NotBookOnly(tstx)))
     );
     let kept = s.registry().get(&tstx).unwrap();

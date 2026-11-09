@@ -52,6 +52,100 @@ pub const ASSET_ID_MAX: usize = 12;
 pub const MAX_PRECISION: u8 = 18;
 /// Domain of the registry digest.
 const DIGEST_DOMAIN: &[u8] = b"aledgent/asset-registry/v1";
+
+/// The rules version from which the book takes the removal of an unused asset (amendment 0043,
+/// `REQ-AS-10`, `PLAN.md` `DEC-28`): `retire_asset`, `sweep_asset_uses`, `cancel_asset_retirement`,
+/// `remove_asset`, and a `grant_operator` naming [`crate::operator::OperatorOpKind::RemoveAsset`].
+/// Before it each is `ERR-MalformedCommand` and records no call, so no input that an older core
+/// Agent cannot decode is ever sent to one (`REQ-RT-16`, `REQ-RT-17`).
+///
+/// It is 2: the production and test books run rules version 1 ([`crate::settlement::CHAINED_SETTLEMENT`]),
+/// and the release that carries this code builds its core package as 2. The code-history fixture
+/// records inputs under 2 and 3, none of them these, so they decide as before. If another upgrade
+/// takes 2 first, this moves to the rules version of the first core package that carries it.
+pub const ASSET_RETIREMENT: u64 = 2;
+
+/// The most service-tree leaves one page of an asset's sweep may hold (amendment 0043,
+/// `REQ-AS-10`'s declared maximum): a page with more is `ERR-BatchTooLarge`.
+pub const MAX_SWEEP_PAGE: usize = 64;
+
+/// Where an asset's sweep starts (amendment 0043): the first service-tree key of the ledger
+/// accounts (`crate::leaves::kind::LEDGER_ACCOUNT`). The grants (`GRANT`) follow them.
+pub const SWEEP_START: [u8; 16] = [
+    crate::leaves::kind::LEDGER_ACCOUNT,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+];
+
+/// Where a complete sweep stands: the first key past the grants.
+pub const SWEEP_END: [u8; 16] = [
+    crate::leaves::kind::GRANT + 1,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+];
+
+/// An asset being removed (amendment 0043, `REQ-AS-10`): the status it had before it was
+/// retired, which a cancellation restores, and the sweep's cursor, the service-tree key the next
+/// page starts at ([`SWEEP_START`] to [`SWEEP_END`]). One leaf per retiring asset
+/// (`crate::leaves::kind::ASSET_RETIREMENT`), absent for any other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AssetRetirement {
+    /// The status before the retirement: active or deprecated.
+    pub before: AssetStatus,
+    /// Where the next page starts.
+    pub cursor: [u8; 16],
+}
+
+impl AssetRetirement {
+    /// Whether the sweep has covered every account and grant.
+    pub fn complete(&self) -> bool {
+        self.cursor == SWEEP_END
+    }
+}
+
+impl crate::export::canon::Canonical for AssetRetirement {
+    fn encode(&self, e: &mut crate::export::canon::Enc) {
+        e.put(&self.before).raw(&self.cursor);
+    }
+    fn decode(
+        d: &mut crate::export::canon::Dec<'_>,
+    ) -> Result<Self, crate::export::canon::DecodeError> {
+        let r = AssetRetirement {
+            before: d.get()?,
+            cursor: d.array()?,
+        };
+        if r.before == AssetStatus::Retiring || r.cursor < SWEEP_START || r.cursor > SWEEP_END {
+            return Err(crate::export::canon::DecodeError("asset retirement"));
+        }
+        Ok(r)
+    }
+}
 /// Domain of the registry digest once a tag has been retired (amendment 0043).
 const DIGEST_DOMAIN_RETIRED: &[u8] = b"aledgent/asset-registry/v2";
 
@@ -238,6 +332,11 @@ pub enum AssetStatus {
     Active,
     /// It is registered but accepts no new operations (`ERR-AssetDeprecated`).
     Deprecated,
+    /// It is being removed (amendment 0043, `REQ-AS-10`): retired, so that nothing new may name
+    /// it, and swept for what already does. It accepts no new operations (`ERR-AssetDeprecated`),
+    /// no grant, Treasury limit, binding or opening in it, and no deprecation. Written only from
+    /// [`ASSET_RETIREMENT`] on, so a registry with no retiring asset encodes as before.
+    Retiring,
 }
 
 impl AssetStatus {
@@ -245,6 +344,7 @@ impl AssetStatus {
         match self {
             AssetStatus::Active => 1,
             AssetStatus::Deprecated => 2,
+            AssetStatus::Retiring => 3,
         }
     }
 }
@@ -354,7 +454,7 @@ impl Asset {
     pub const fn require_active(&self) -> Result<&Asset, Refusal> {
         match self.status {
             AssetStatus::Active => Ok(self),
-            AssetStatus::Deprecated => Err(Refusal::AssetDeprecated),
+            AssetStatus::Deprecated | AssetStatus::Retiring => Err(Refusal::AssetDeprecated),
         }
     }
 }
@@ -374,6 +474,10 @@ pub enum RegistryError {
     NotBookOnly(AssetId),
     /// No binding of this asset is in flight.
     NotBinding(AssetId),
+    /// The asset is retiring (amendment 0043): it is not deprecated, and not retired again.
+    Retiring(AssetId),
+    /// The asset is not retiring (amendment 0043).
+    NotRetiring(AssetId),
     /// The precision is above [`MAX_PRECISION`].
     PrecisionOutOfRange(u8),
     /// A record names a tag at or above the next tag to assign, or a tag already in use.
@@ -512,6 +616,9 @@ impl AssetRegistry {
             .get(id)
             .ok_or(RegistryError::NotRegistered(*id))?;
         let from = asset.binding;
+        if asset.status == AssetStatus::Retiring && from == AssetBinding::BookOnly {
+            return Err(RegistryError::Retiring(*id));
+        }
         match (from, to) {
             (AssetBinding::BookOnly, AssetBinding::Binding(l)) => {
                 if self.by_location.contains_key(&l) {
@@ -546,15 +653,62 @@ impl AssetRegistry {
         }
     }
 
-    /// Mark an asset deprecated. Nothing else about it changes, and it is never removed.
+    /// Mark an asset deprecated. Nothing else about it changes. A retiring asset is not
+    /// deprecated (amendment 0043): the retirement holds the status it returns to.
     pub(crate) fn deprecate(&mut self, id: &AssetId) -> Result<AssetStatus, RegistryError> {
         let asset = self
             .assets
             .get_mut(id)
             .ok_or(RegistryError::NotRegistered(*id))?;
         let before = asset.status;
+        if before == AssetStatus::Retiring {
+            return Err(RegistryError::Retiring(*id));
+        }
         asset.status = AssetStatus::Deprecated;
         Ok(before)
+    }
+
+    /// Mark a book-only asset retiring (amendment 0043, `REQ-AS-10`). Returns the status it had,
+    /// which the store keeps beside the sweep, to restore on a cancellation.
+    pub(crate) fn retire(&mut self, id: &AssetId) -> Result<AssetStatus, RegistryError> {
+        let asset = self
+            .assets
+            .get_mut(id)
+            .ok_or(RegistryError::NotRegistered(*id))?;
+        if asset.binding != AssetBinding::BookOnly {
+            return Err(RegistryError::NotBookOnly(*id));
+        }
+        let before = asset.status;
+        if before == AssetStatus::Retiring {
+            return Err(RegistryError::Retiring(*id));
+        }
+        asset.status = AssetStatus::Retiring;
+        Ok(before)
+    }
+
+    /// End a retirement (amendment 0043): the asset has `status` again. Refused unless it is
+    /// retiring.
+    pub(crate) fn unretire(
+        &mut self,
+        id: &AssetId,
+        status: AssetStatus,
+    ) -> Result<(), RegistryError> {
+        let asset = self
+            .assets
+            .get_mut(id)
+            .ok_or(RegistryError::NotRegistered(*id))?;
+        if asset.status != AssetStatus::Retiring || status == AssetStatus::Retiring {
+            return Err(RegistryError::NotRetiring(*id));
+        }
+        asset.status = status;
+        Ok(())
+    }
+
+    /// Whether `id` is registered and retiring (amendment 0043). An unregistered asset is not.
+    pub fn retiring(&self, id: &AssetId) -> bool {
+        self.assets
+            .get(id)
+            .is_some_and(|a| a.status == AssetStatus::Retiring)
     }
 
     /// Undo a deprecation made in the same store batch (store rollback only).

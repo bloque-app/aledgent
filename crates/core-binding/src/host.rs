@@ -95,10 +95,11 @@ use crate::envelope::{
 use crate::fence::{CodeEvent, WriterCode};
 use crate::hot::{Hot, Limits, RingEntry};
 use crate::mapped::{Mapped, MappedGenesis, MappedInput, ServiceKeys};
-use crate::service::{Node, ServiceWitness, proven_keys};
+use crate::service::{Node, ServiceWitness, claims_of, proven_keys_with};
 use crate::transition::{Invocation, MemRows};
 use crate::vault::PrivateVault;
 use crate::witness::{KernelWitness, root_of};
+use ledger_core::leaves::Subtree;
 
 /// A leaf store that records every key loaded through it (step 1). Behind a mutex, not a cell, so
 /// the replica can answer reads from several threads at once (`T-031-12`).
@@ -953,10 +954,11 @@ impl ServiceStore {
         Ok((leaves, whole))
     }
 
-    /// The witness of `touched` for the Agent (`crate::service`).
-    fn witness(&self, touched: &Touches) -> Result<ServiceWitness, DriveError> {
+    /// The witness of `touched` for the Agent (`crate::service`), proving the subtrees `claims`
+    /// whole besides (amendment 0043, [`crate::service::claims_of`]).
+    fn witness(&self, touched: &Touches, claims: &[Subtree]) -> Result<ServiceWitness, DriveError> {
         let (leaves, whole) = self.leaves(touched)?;
-        let keys = proven_keys(&leaves, &whole);
+        let keys = proven_keys_with(&leaves, &whole, claims);
         let (frontier, compact) = if Version::ACTIVE == Version::V2 {
             // The service tree removes leaves: node entries opened (`crate::service`).
             let proof = self
@@ -983,6 +985,7 @@ impl ServiceStore {
             whole,
             frontier,
             compact,
+            claims: claims.to_vec(),
         })
     }
 
@@ -1734,7 +1737,7 @@ impl<P: AgentPort> Driver<P> {
             return Ok(Some(seq));
         }
         let witness = self.witness(&keys)?;
-        let service = self.service.witness(&touched)?;
+        let service = self.service.witness(&touched, &claims_of(&calls))?;
         let changes = changed(replica, &service.leaves, &deliveries)?;
         let service = encode(&service);
         // As if committed: the next input's witnesses stand where this one leaves the book.

@@ -248,7 +248,7 @@ condition = "The same client key was submitted with a different request (`REQ-OP
 
 [[error]]
 id = "ERR-BatchTooLarge"
-condition = "A multi-leg submission is larger than the declared maximum"
+condition = "A multi-leg submission, or a page of an asset's sweep (`REQ-AS-10`), is larger than the declared maximum"
 
 [[error]]
 id = "ERR-UnsupportedLeg"

@@ -20,7 +20,7 @@ use super::{Roles, State};
 use crate::account::{LedgerAccount, Time};
 use crate::anchor::{AnchorIncident, AnchorStore, Checkpoint, Comparison};
 use crate::asset::Minor;
-use crate::asset::{AssetBinding, AssetId, AssetKind, AssetRegistry, AssetStatus};
+use crate::asset::{AssetBinding, AssetId, AssetKind, AssetRegistry, AssetRetirement, AssetStatus};
 use crate::audit::AuditLog;
 use crate::authority::{Grant, WindowKey};
 use crate::custody::store::{CustodyState, Notice, PendingChange};
@@ -88,6 +88,12 @@ pub const SERVICE_SECTIONS: [&str; 37] = [
 /// 0043), after the others. It is written only then, so the export of a book that never removed
 /// an asset is byte for byte what it was, and an export without it imports as before.
 const RETIRED_TAGS_SECTION: &str = "service.retired-tags";
+
+/// The section that records each asset being removed (amendment 0043, `REQ-AS-10`): the status it
+/// had and where its sweep stands, after [`RETIRED_TAGS_SECTION`] if both are written. It is
+/// written only while an asset is retiring. Its cursor is a key of the service tree, which depends
+/// only on the records' content, so it means the same after the import.
+const RETIREMENTS_SECTION: &str = "service.asset-retirements";
 
 /// How many sections an export written before seeded genesis has (`F-036`): it imports as a book
 /// without a seed.
@@ -196,6 +202,7 @@ impl State {
             accounts,
             by_owner: _,
             owned_custody: _,
+            retirements,
             credentials,
             sets: _,
             grants,
@@ -286,6 +293,9 @@ impl State {
             s.push(&registry.get().next_tag());
             s
         });
+        let retiring: Vec<(AssetId, AssetRetirement)> =
+            retirements.iter().map(|(k, v)| (*k, *v)).collect();
+        let retiring = (!retiring.is_empty()).then(|| section(RETIREMENTS_SECTION, &retiring));
         let mut sections = alloc::vec![
             section(n[0], &assets),
             section(n[1], roles.get().iter()),
@@ -326,6 +336,7 @@ impl State {
             section(n[36], &seeded_pairs),
         ];
         sections.extend(retired);
+        sections.extend(retiring);
         sections
     }
 
@@ -334,6 +345,17 @@ impl State {
         sections: &[Section],
         audit: &AuditHead,
     ) -> Result<State, DecodeError> {
+        // Each asset being removed, last of all (amendment 0043).
+        let (sections, retiring) = match sections.split_last() {
+            Some((last, rest)) if last.name() == RETIREMENTS_SECTION => {
+                let r = last.decode_all::<(AssetId, AssetRetirement)>()?;
+                if r.is_empty() || r.windows(2).any(|w| w[0].0 >= w[1].0) {
+                    return Err(DecodeError("asset retirements"));
+                }
+                (rest, r)
+            }
+            _ => (sections, Vec::new()),
+        };
         // The next kernel tag of a registry that retired one, after the others (amendment 0043).
         let (sections, next_tag) = match sections.split_last() {
             Some((last, rest)) if last.name() == RETIRED_TAGS_SECTION => {
@@ -377,6 +399,22 @@ impl State {
             if a.status == AssetStatus::Deprecated {
                 registry.deprecate(&a.id).map_err(bad)?;
             }
+            // A retiring asset has its record, and a record its retiring asset (amendment 0043).
+            let record = retiring.iter().find(|(id, _)| *id == a.id).map(|(_, r)| *r);
+            match (a.status == AssetStatus::Retiring, record) {
+                (true, Some(r)) => {
+                    if r.before == AssetStatus::Deprecated {
+                        registry.deprecate(&a.id).map_err(bad)?;
+                    }
+                    registry.retire(&a.id).map_err(bad)?;
+                    state.retirements.insert(a.id, r);
+                }
+                (false, None) => {}
+                _ => return Err(DecodeError("asset retirements")),
+            }
+        }
+        if state.retirements.len() != retiring.len() {
+            return Err(DecodeError("asset retirements"));
         }
         if let Some(next) = next_tag {
             registry.retire_below(next).map_err(bad)?;

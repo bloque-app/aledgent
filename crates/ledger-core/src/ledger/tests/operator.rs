@@ -63,6 +63,9 @@ impl AuditSink for Down {
 #[test]
 fn req_os_1_a_catch_all_grant_cannot_be_constructed() {
     let mut fx = Fx::new();
+    // Every kind, the removal's included, which is taken from its rules version (amendment 0043).
+    fx.ledger
+        .set_generation(crate::asset::ASSET_RETIREMENT, false);
     let who = fx.person();
     let ctx = fx.ctx(fx.operator());
     // Every kind at once is a catch-all: refused at the command...
@@ -632,8 +635,19 @@ fn req_as_2_deprecating_an_asset_is_a_reviewed_change() {
 
 // ---------------------------------------------------------------- amendment 0043: remove an asset
 
+use crate::asset::{ASSET_RETIREMENT, AssetStatus, MAX_SWEEP_PAGE, SWEEP_END, SWEEP_START};
+use crate::ledger::operator::{SweepNext, SweepPage};
+use crate::state::{AssetInUse, RetirementRefusal};
+
 fn tstx() -> AssetId {
     AssetId::parse("TSTX").unwrap()
+}
+
+/// A fixture whose inputs are decided at the rules version that takes the removal.
+fn removal_fx() -> Fx {
+    let mut fx = Fx::new();
+    fx.ledger.set_generation(ASSET_RETIREMENT, false);
+    fx
 }
 
 /// An issuance grant over `asset`, bounded per window and per asset.
@@ -664,6 +678,39 @@ fn register_tstx(fx: &mut Fx, registrar: Caller, precision: u8, n: u8) -> crate:
     *fx.ledger.state().registry().get(&tstx()).unwrap()
 }
 
+fn retire_tstx(fx: &mut Fx, who: Caller) -> Result<Option<SweepNext>, Refusal> {
+    let ctx = fx.ctx(who);
+    fx.ledger
+        .retire_asset(
+            &ctx,
+            tstx(),
+            review(8),
+            b"registered at 8 decimals, never used",
+        )
+        .map(|a| a.value)
+}
+
+fn sweep(fx: &mut Fx, who: Caller, page: SweepPage) -> Result<Option<SweepNext>, Refusal> {
+    let ctx = fx.ctx(who);
+    fx.ledger
+        .sweep_asset_uses(&ctx, tstx(), page, b"sweep")
+        .map(|a| a.value)
+}
+
+/// Sweep to the end, each page at the level the host suggests: the number of pages.
+fn sweep_all(fx: &mut Fx, who: Caller, mut next: Option<SweepNext>) -> Result<usize, Refusal> {
+    let mut pages = 0;
+    while let Some(n) = next {
+        let page = SweepPage {
+            start: n.start,
+            level: n.level.expect("a whole store suggests a level"),
+        };
+        next = sweep(fx, who, page)?;
+        pages += 1;
+    }
+    Ok(pages)
+}
+
 fn remove_tstx(fx: &mut Fx, who: Caller) -> Result<(), Refusal> {
     let ctx = fx.ctx(who);
     fx.ledger
@@ -675,51 +722,129 @@ fn still_registered(fx: &Fx, asset: &crate::asset::Asset) {
     assert_eq!(fx.ledger.state().registry().get(&asset.id()), Ok(asset));
 }
 
+fn status(fx: &Fx) -> AssetStatus {
+    fx.ledger.state().registry().get(&tstx()).unwrap().status()
+}
+
+/// `REQ-AS-10`, `INV-24`: retire, sweep every account and grant, remove; the same id registers
+/// again at the right precision with a fresh tag. Each step's refusals change nothing.
 #[test]
-fn req_as_10_an_unused_asset_is_removed_and_its_id_registers_again_at_the_right_precision() {
-    let mut fx = Fx::new();
+fn req_as_10_an_unused_asset_is_retired_swept_removed_and_registers_again() {
+    let mut fx = removal_fx();
     let (registrar, _) = registry_staff(&mut fx);
     let wrong = register_tstx(&mut fx, registrar, 8, 1);
     let digest = fx.ledger.state().registry().digest();
-    // No review, nothing to remove, no justification, no authority: each refused, nothing changes.
+    // No review, nothing to retire, no justification, no authority: each refused.
     let ctx = fx.ctx(registrar);
     assert_eq!(
         fx.ledger
-            .remove_asset(&ctx, tstx(), review(0), b"x")
+            .retire_asset(&ctx, tstx(), review(0), b"x")
             .map(|a| a.value),
         Err(Refusal::NotAuthorised)
     );
     let ctx = fx.ctx(registrar);
     assert_eq!(
         fx.ledger
-            .remove_asset(&ctx, AssetId::parse("NOPE").unwrap(), review(9), b"x")
+            .retire_asset(&ctx, AssetId::parse("NOPE").unwrap(), review(9), b"x")
             .map(|a| a.value),
         Err(Refusal::UnknownAsset)
     );
     let ctx = fx.ctx(registrar);
     assert_eq!(
         fx.ledger
-            .remove_asset(&ctx, tstx(), review(9), b"")
+            .retire_asset(&ctx, tstx(), review(9), b"")
             .map(|a| a.value),
         Err(Refusal::JustificationRequired)
     );
     let registerer = staff(&mut fx, &[OperatorOpKind::RegisterAsset]);
     assert_eq!(
-        remove_tstx(&mut fx, registerer),
+        retire_tstx(&mut fx, registerer),
         Err(Refusal::NotAuthorised)
+    );
+    // Not retired: neither swept nor removed.
+    assert_eq!(remove_tstx(&mut fx, registrar), Err(Refusal::NotAuthorised));
+    let page = SweepPage {
+        start: SWEEP_START,
+        level: 8,
+    };
+    assert_eq!(
+        sweep(&mut fx, registrar, page),
+        Err(Refusal::InvalidTransition)
     );
     still_registered(&fx, &wrong);
     assert_eq!(fx.ledger.state().registry().digest(), digest);
 
-    // Removed: recorded as an operator intervention, naming the asset and the review.
-    remove_tstx(&mut fx, registrar).unwrap();
+    // Retired: audited, naming the asset and the review; the sweep starts at the accounts.
+    let next = retire_tstx(&mut fx, registrar).unwrap();
+    assert_eq!(next.map(|n| n.start), Some(SWEEP_START));
     let r = last_audit(&fx);
     assert_eq!(r.class, AuditClass::OperatorIntervention);
     assert!(r.subject.contains(&AuditSubject::Asset(tstx())));
+    assert!(r.subject.contains(&AuditSubject::Review([8; 32])));
+    assert_eq!(status(&fx), AssetStatus::Retiring);
+    assert_eq!(
+        retire_tstx(&mut fx, registrar),
+        Err(Refusal::InvalidTransition)
+    );
+    // Not removed before the sweep is complete.
+    assert_eq!(remove_tstx(&mut fx, registrar), Err(Refusal::NotAuthorised));
+    assert_eq!(
+        fx.ledger.state().asset_removable(&tstx()),
+        Err(StoreRefusal::Retirement(RetirementRefusal::SweepIncomplete))
+    );
+    // A page that is not at the cursor, or not a subtree.
+    let ahead = SweepPage {
+        start: [
+            crate::leaves::kind::GRANT,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ],
+        level: 8,
+    };
+    assert_eq!(
+        sweep(&mut fx, registrar, ahead),
+        Err(Refusal::InvalidTransition)
+    );
+    let misaligned = SweepPage {
+        start: SWEEP_START,
+        level: 7,
+    };
+    assert_eq!(
+        sweep(&mut fx, registrar, misaligned),
+        Err(Refusal::MalformedCommand)
+    );
+    let pages = sweep_all(&mut fx, registrar, next).unwrap();
+    assert!(pages >= 2, "at least the accounts and the grants");
+    assert_eq!(
+        fx.ledger.state().retirement(&tstx()).map(|r| r.cursor),
+        Some(SWEEP_END)
+    );
+    // Complete: no more pages.
+    assert_eq!(
+        sweep(&mut fx, registrar, page),
+        Err(Refusal::InvalidTransition)
+    );
+
+    // Removed: recorded as an operator intervention, naming the asset and the review.
+    remove_tstx(&mut fx, registrar).unwrap();
+    let r = last_audit(&fx);
     assert!(r.subject.contains(&AuditSubject::Review([9; 32])));
     assert!(fx.ledger.state().registry().get(&tstx()).is_err());
+    assert!(fx.ledger.state().retirement(&tstx()).is_none());
     assert_ne!(fx.ledger.state().registry().digest(), digest);
-    // Gone: an operation naming it is an unknown asset, and removing it twice is too.
     assert_eq!(remove_tstx(&mut fx, registrar), Err(Refusal::UnknownAsset));
 
     // Registered again at the right precision: a fresh tag, never the retired one.
@@ -729,108 +854,111 @@ fn req_as_10_an_unused_asset_is_removed_and_its_id_registers_again_at_the_right_
         .unwrap();
     let right = *fx.ledger.state().registry().get(&tstx()).unwrap();
     assert_eq!(right.precision(), 6);
+    assert_eq!(right.status(), AssetStatus::Active);
     assert!(right.tag().0 > wrong.tag().0);
     assert!(fx.ledger.state().registry().by_tag(wrong.tag()).is_none());
-    // And once registered at the right precision it still takes its one precision (`INV-24`).
+}
+
+/// `REQ-AS-10` step 1: from the retirement on, nothing new may name the asset, and a revocation
+/// is still taken. Cancelling returns it to the status it had.
+#[test]
+fn req_as_10_a_retiring_asset_takes_no_new_use_until_the_retirement_is_cancelled() {
+    let mut fx = removal_fx();
+    let (registrar, admin) = registry_staff(&mut fx);
+    register_tstx(&mut fx, registrar, 8, 1);
+    let alice = fx.person();
+    let acct = fx.account(&alice, Custody::Owned);
+    let bob = fx.person();
+    let bounded = |asset| GrantRequest {
+        kind: GrantKind::Delegated,
+        principal: bob.principal,
+        subject: Subject::Account(acct),
+        ops: NonEmptySet::one(OperationKind::Transfer),
+        per_operation: Some(nz(1_000)),
+        per_window: None,
+        assets: Some(NonEmptySet::one(asset)),
+        counterparties: None,
+        parent: None,
+        expires: None,
+    };
+    let ctx = fx.ctx(alice);
+    let before = fx
+        .ledger
+        .grant_authority(&ctx, bounded(tstx()))
+        .unwrap()
+        .value;
+    retire_tstx(&mut fx, registrar).unwrap();
+    // A grant bounding it, a grant over it, a Treasury limit in it, a deprecation: each refused.
+    let ctx = fx.ctx(alice);
+    assert_eq!(
+        fx.ledger
+            .grant_authority(&ctx, bounded(tstx()))
+            .map(|a| a.value),
+        Err(Refusal::AssetDeprecated)
+    );
+    let treasurer = fx.person();
+    let ctx = fx.ctx(admin);
+    assert_eq!(
+        fx.ledger
+            .grant_issuance(&ctx, issuance_over(tstx(), treasurer.principal), b"desk")
+            .map(|a| a.value),
+        Err(Refusal::AssetDeprecated)
+    );
+    let org = fx.person();
+    let treasury = |asset| OpenAccount {
+        owner: org.principal,
+        kind: AccountKind::Treasury,
+        custody: Custody::Delegated,
+        treasury_limits: BTreeMap::from([(asset, Minor::new(1_000))]),
+        acknowledged: None,
+    };
+    let ctx = fx.ctx(fx.operator());
+    assert_eq!(
+        fx.ledger
+            .open_account(&ctx, treasury(tstx()))
+            .map(|a| a.value),
+        Err(Refusal::AssetDeprecated)
+    );
+    let deprecator = staff(&mut fx, &[OperatorOpKind::DeprecateAsset]);
+    let ctx = fx.ctx(deprecator);
+    assert_eq!(
+        fx.ledger
+            .deprecate_asset(&ctx, tstx(), review(3), b"x")
+            .map(|a| a.value),
+        Err(Refusal::AssetDeprecated)
+    );
+    assert_eq!(
+        fx.ledger.state().registry().active(&tstx()).map(|a| a.id()),
+        Err(Refusal::AssetDeprecated)
+    );
+    // A revocation is no new use.
+    let ctx = fx.ctx(alice);
+    fx.ledger.revoke_authority(&ctx, before).unwrap();
+    // Cancelled: active again, and it takes new uses.
+    let ctx = fx.ctx(registrar);
+    fx.ledger
+        .cancel_asset_retirement(&ctx, tstx(), b"keep it")
+        .unwrap();
+    assert_eq!(status(&fx), AssetStatus::Active);
+    assert!(fx.ledger.state().retirement(&tstx()).is_none());
     let ctx = fx.ctx(registrar);
     assert_eq!(
         fx.ledger
-            .register_asset(&ctx, register("TSTX", 8, 3), b"again")
+            .cancel_asset_retirement(&ctx, tstx(), b"again")
             .map(|a| a.value),
-        Err(Refusal::NotAuthorised)
+        Err(Refusal::InvalidTransition)
     );
-}
-
-#[test]
-fn req_as_10_an_asset_that_was_ever_issued_is_never_removed() {
-    let mut fx = Fx::new();
-    let (registrar, admin) = registry_staff(&mut fx);
-    let asset = register_tstx(&mut fx, registrar, 8, 1);
-    let holder = fx.person();
-    let acct = fx.account(&holder, Custody::Owned);
-    let treasurer = fx.person();
-    let ctx = fx.ctx(admin);
-    let grant = fx
-        .ledger
-        .grant_issuance(
-            &ctx,
-            issuance_over(tstx(), treasurer.principal),
-            b"desk, CR-12",
-        )
-        .unwrap()
-        .value;
-    // A live issuance grant over it: revoke first.
-    assert_eq!(remove_tstx(&mut fx, registrar), Err(Refusal::NotAuthorised));
-    // Issued once: the asset is used, whatever the balance is afterwards.
-    let ctx = fx.ctx(treasurer);
-    fx.ledger.issue(&ctx, tstx(), acct, Minor::new(5)).unwrap();
-    // And issued then redeemed down to nothing, in an account the treasurer may redeem from: the
-    // balance is zero again, and the asset is still used.
-    let desk = fx.account(&holder, Custody::Delegated);
     let ctx = fx.ctx(fx.operator());
-    fx.ledger
-        .grant_authority(
-            &ctx,
-            GrantRequest {
-                kind: GrantKind::Operator,
-                principal: treasurer.principal,
-                subject: Subject::Account(desk),
-                ops: NonEmptySet::one(OperationKind::Redeem),
-                per_operation: Some(nz(1_000)),
-                per_window: None,
-                assets: None,
-                counterparties: None,
-                parent: None,
-                expires: None,
-            },
-        )
-        .unwrap();
-    let ctx = fx.ctx(treasurer);
-    fx.ledger.issue(&ctx, tstx(), desk, Minor::new(7)).unwrap();
-    let ctx = fx.ctx(treasurer);
-    fx.ledger.redeem(&ctx, tstx(), desk, Minor::new(7)).unwrap();
-    assert_eq!(fx.ledger.available(&holder, &desk, &tstx(), 10), Ok(0));
-    let ctx = fx.ctx(admin);
-    fx.ledger
-        .revoke_issuance(&ctx, grant, b"desk closed")
-        .unwrap();
-    let digest = fx.ledger.state().registry().digest();
-    assert_eq!(remove_tstx(&mut fx, registrar), Err(Refusal::NotAuthorised));
-    still_registered(&fx, &asset);
-    assert_eq!(fx.ledger.state().registry().digest(), digest);
-    // The refusal is audited like any other.
-    assert_eq!(last_audit(&fx).class, AuditClass::OperatorIntervention);
-    assert_eq!(fx.ledger.trial_balance(&tstx()), Ok(0));
+    fx.ledger.open_account(&ctx, treasury(tstx())).unwrap();
 }
 
+/// `REQ-AS-10` step 2: a grant that bounds the asset refuses its page, names the grant in the
+/// audit record, and leaves the cursor; once revoked, the same page goes through.
 #[test]
-fn req_as_10_a_live_issuance_grant_is_revoked_before_an_unused_asset_is_removed() {
-    let mut fx = Fx::new();
-    let (registrar, admin) = registry_staff(&mut fx);
-    let asset = register_tstx(&mut fx, registrar, 8, 1);
-    let treasurer = fx.person();
-    let ctx = fx.ctx(admin);
-    let grant = fx
-        .ledger
-        .grant_issuance(&ctx, issuance_over(tstx(), treasurer.principal), b"desk")
-        .unwrap()
-        .value;
-    assert_eq!(remove_tstx(&mut fx, registrar), Err(Refusal::NotAuthorised));
-    still_registered(&fx, &asset);
-    let ctx = fx.ctx(admin);
-    fx.ledger
-        .revoke_issuance(&ctx, grant, b"not needed")
-        .unwrap();
-    remove_tstx(&mut fx, registrar).unwrap();
-    assert!(fx.ledger.state().registry().get(&tstx()).is_err());
-}
-
-#[test]
-fn req_as_10_a_grant_bound_naming_the_asset_keeps_it_until_that_grant_is_revoked() {
-    let mut fx = Fx::new();
+fn req_as_10_a_page_with_a_grant_bound_is_refused_until_the_grant_is_revoked() {
+    let mut fx = removal_fx();
     let (registrar, _) = registry_staff(&mut fx);
     let asset = register_tstx(&mut fx, registrar, 8, 1);
-    // Another holder's grant over an account, bounding the assets it covers.
     let alice = fx.person();
     let acct = fx.account(&alice, Custody::Owned);
     let bob = fx.person();
@@ -854,97 +982,58 @@ fn req_as_10_a_grant_bound_naming_the_asset_keeps_it_until_that_grant_is_revoked
         )
         .unwrap()
         .value;
-    assert_eq!(remove_tstx(&mut fx, registrar), Err(Refusal::NotAuthorised));
-    still_registered(&fx, &asset);
-    assert_eq!(
-        fx.ledger.state().asset_removable(&tstx()),
-        Err(StoreRefusal::AssetInUse(
-            crate::state::AssetInUse::GrantBound
-        ))
+    let mut next = retire_tstx(&mut fx, registrar).unwrap();
+    // The accounts are clean; then the grants' page finds it.
+    let found = loop {
+        let n = next.expect("the sweep reaches the grant");
+        let page = SweepPage {
+            start: n.start,
+            level: n.level.unwrap(),
+        };
+        match sweep(&mut fx, registrar, page) {
+            Ok(after) => next = after,
+            Err(e) => break (e, page),
+        }
+    };
+    assert_eq!(found.0, Refusal::NotAuthorised);
+    assert!(
+        last_audit(&fx)
+            .subject
+            .contains(&AuditSubject::Grant(grant))
     );
+    let sub = crate::leaves::Subtree::new(found.1.start, found.1.level).unwrap();
+    assert_eq!(
+        fx.ledger.state().sweep_page(&tstx(), &sub),
+        Err(StoreRefusal::AssetInUse(AssetInUse::GrantBound(grant)))
+    );
+    assert_eq!(
+        fx.ledger.state().retirement(&tstx()).map(|r| r.cursor),
+        Some(found.1.start)
+    );
+    assert_eq!(remove_tstx(&mut fx, registrar), Err(Refusal::NotAuthorised));
+    still_registered(
+        &fx,
+        &crate::asset::Asset::clone(fx.ledger.state().registry().get(&asset.id()).unwrap()),
+    );
+    // Revoked while the asset is retiring; the same page again, and on to the end.
     let ctx = fx.ctx(alice);
     fx.ledger.revoke_authority(&ctx, grant).unwrap();
+    let next = sweep(&mut fx, registrar, found.1).unwrap();
+    sweep_all(&mut fx, registrar, next).unwrap();
     remove_tstx(&mut fx, registrar).unwrap();
 }
 
-/// Amendment 0043, `REQ-AS-10`: the four checks read the records themselves, so a book that
-/// entered the rules version by an upgrade, and holds accounts and grants written under earlier
-/// ones, removes an unused asset all the same, and refuses one those records name.
+/// `REQ-AS-10` step 2: a Treasury limit in the asset refuses its page for good; the operator
+/// cancels, and the asset stays, active again.
 #[test]
-fn req_as_10_a_book_that_entered_the_version_by_an_upgrade_removes_and_refuses_as_any_other() {
-    let mut fx = Fx::new();
-    // History under an earlier rules version: nothing is indexed for removal, because nothing is.
-    fx.ledger.set_generation(0, false);
-    let registrar = staff(
-        &mut fx,
-        &[OperatorOpKind::RegisterAsset, OperatorOpKind::RemoveAsset],
-    );
-    let wrong = register_tstx(&mut fx, registrar, 8, 1);
-    let ctx = fx.ctx(registrar);
-    fx.ledger
-        .register_asset(&ctx, register("TSTY", 8, 2), b"listing")
-        .unwrap();
-    let org = fx.person();
-    let ctx = fx.ctx(fx.operator());
-    fx.ledger
-        .open_account(
-            &ctx,
-            OpenAccount {
-                owner: org.principal,
-                kind: AccountKind::Treasury,
-                custody: Custody::Delegated,
-                treasury_limits: BTreeMap::from([(AssetId::parse("TSTY").unwrap(), Minor::new(9))]),
-                acknowledged: None,
-            },
-        )
-        .unwrap();
-    // The upgrade: the next input is decided under a later rules version.
-    fx.ledger.set_generation(3, false);
-    let ctx = fx.ctx(registrar);
-    assert_eq!(
-        fx.ledger
-            .remove_asset(&ctx, AssetId::parse("TSTY").unwrap(), review(9), b"x")
-            .map(|a| a.value),
-        Err(Refusal::NotAuthorised)
-    );
-    assert_eq!(
-        fx.ledger
-            .state()
-            .asset_removable(&AssetId::parse("TSTY").unwrap()),
-        Err(StoreRefusal::AssetInUse(
-            crate::state::AssetInUse::TreasuryLimit
-        ))
-    );
-    remove_tstx(&mut fx, registrar).unwrap();
-    assert!(fx.ledger.state().registry().get(&wrong.id()).is_err());
-}
-
-#[test]
-fn req_as_10_a_bound_asset_is_never_removed() {
-    let mut fx = Fx::new();
-    let registrar = staff(&mut fx, &[OperatorOpKind::RemoveAsset]);
-    // The genesis assets are bound to a location on the settlement layer; one is deprecated.
-    for asset in [usd(), old()] {
-        let before = *fx.ledger.state().registry().get(&asset).unwrap();
-        let ctx = fx.ctx(registrar);
-        assert_eq!(
-            fx.ledger
-                .remove_asset(&ctx, asset, review(9), b"x")
-                .map(|a| a.value),
-            Err(Refusal::NotAuthorised)
-        );
-        still_registered(&fx, &before);
-    }
-}
-
-#[test]
-fn req_as_10_an_asset_a_treasury_account_declares_a_limit_in_is_never_removed() {
-    let mut fx = Fx::new();
+fn req_as_10_a_treasury_limit_refuses_the_sweep_and_the_retirement_is_cancelled() {
+    let mut fx = removal_fx();
     let (registrar, _) = registry_staff(&mut fx);
-    let asset = register_tstx(&mut fx, registrar, 8, 1);
+    register_tstx(&mut fx, registrar, 8, 1);
     let org = fx.person();
     let ctx = fx.ctx(fx.operator());
-    fx.ledger
+    let treasury = fx
+        .ledger
         .open_account(
             &ctx,
             OpenAccount {
@@ -955,10 +1044,207 @@ fn req_as_10_an_asset_a_treasury_account_declares_a_limit_in_is_never_removed() 
                 acknowledged: None,
             },
         )
-        .unwrap();
-    // No issuance, no posting: the limit alone keeps it.
+        .unwrap()
+        .value;
+    let next = retire_tstx(&mut fx, registrar).unwrap();
+    assert_eq!(
+        sweep_all(&mut fx, registrar, next),
+        Err(Refusal::NotAuthorised)
+    );
+    assert!(
+        last_audit(&fx)
+            .subject
+            .contains(&AuditSubject::Account(treasury))
+    );
     assert_eq!(remove_tstx(&mut fx, registrar), Err(Refusal::NotAuthorised));
+    let ctx = fx.ctx(registrar);
+    fx.ledger
+        .cancel_asset_retirement(&ctx, tstx(), b"a Treasury limit names it")
+        .unwrap();
+    assert_eq!(status(&fx), AssetStatus::Active);
+}
+
+/// `REQ-AS-10` step 2: a page holds at most `MAX_SWEEP_PAGE` leaves; the host suggests one that
+/// fits, and the sweep takes several.
+#[test]
+fn req_as_10_a_page_over_the_maximum_is_refused_and_the_sweep_takes_several() {
+    let mut fx = removal_fx();
+    let (registrar, _) = registry_staff(&mut fx);
+    register_tstx(&mut fx, registrar, 8, 1);
+    let owner = fx.person();
+    for _ in 0..MAX_SWEEP_PAGE + 10 {
+        fx.account(&owner, Custody::Owned);
+    }
+    let next = retire_tstx(&mut fx, registrar).unwrap();
+    let whole = SweepPage {
+        start: SWEEP_START,
+        level: 8,
+    };
+    assert_eq!(
+        sweep(&mut fx, registrar, whole),
+        Err(Refusal::BatchTooLarge)
+    );
+    assert!(next.and_then(|n| n.level).is_some_and(|l| l > 8));
+    let pages = sweep_all(&mut fx, registrar, next).unwrap();
+    assert!(pages >= 3, "{pages} pages");
+    remove_tstx(&mut fx, registrar).unwrap();
+}
+
+#[test]
+fn req_as_10_an_asset_that_was_ever_issued_or_has_a_live_issuance_grant_is_never_retired() {
+    let mut fx = removal_fx();
+    let (registrar, admin) = registry_staff(&mut fx);
+    let asset = register_tstx(&mut fx, registrar, 8, 1);
+    let holder = fx.person();
+    let acct = fx.account(&holder, Custody::Owned);
+    let treasurer = fx.person();
+    let ctx = fx.ctx(admin);
+    let grant = fx
+        .ledger
+        .grant_issuance(
+            &ctx,
+            issuance_over(tstx(), treasurer.principal),
+            b"desk, CR-12",
+        )
+        .unwrap()
+        .value;
+    // A live issuance grant over it: revoke first.
+    assert_eq!(retire_tstx(&mut fx, registrar), Err(Refusal::NotAuthorised));
+    assert!(
+        last_audit(&fx)
+            .subject
+            .contains(&AuditSubject::Grant(grant))
+    );
+    // Issued once: the asset is used, whatever the balance is afterwards.
+    let ctx = fx.ctx(treasurer);
+    fx.ledger.issue(&ctx, tstx(), acct, Minor::new(5)).unwrap();
+    let ctx = fx.ctx(admin);
+    fx.ledger
+        .revoke_issuance(&ctx, grant, b"desk closed")
+        .unwrap();
+    let digest = fx.ledger.state().registry().digest();
+    assert_eq!(retire_tstx(&mut fx, registrar), Err(Refusal::NotAuthorised));
+    assert_eq!(
+        fx.ledger.state().asset_retirable(&tstx()),
+        Err(StoreRefusal::AssetInUse(AssetInUse::Issuance))
+    );
     still_registered(&fx, &asset);
+    assert_eq!(fx.ledger.state().registry().digest(), digest);
+    assert_eq!(last_audit(&fx).class, AuditClass::OperatorIntervention);
+}
+
+#[test]
+fn req_as_10_a_bound_asset_is_never_retired() {
+    let mut fx = removal_fx();
+    let registrar = staff(&mut fx, &[OperatorOpKind::RemoveAsset]);
+    // The genesis assets are bound to a location on the settlement layer; one is deprecated.
+    for asset in [usd(), old()] {
+        let before = *fx.ledger.state().registry().get(&asset).unwrap();
+        let ctx = fx.ctx(registrar);
+        assert_eq!(
+            fx.ledger
+                .retire_asset(&ctx, asset, review(9), b"x")
+                .map(|a| a.value),
+            Err(Refusal::NotAuthorised)
+        );
+        still_registered(&fx, &before);
+    }
+}
+
+/// `REQ-RT-16`, `REQ-RT-17`, `REQ-RT-20`: before the rules version that takes the removal, every
+/// step and a grant of its operator kind are `ERR-MalformedCommand`, write nothing and are not
+/// recorded as calls, so no input an older core Agent cannot decode is made.
+#[test]
+fn req_rt_20_the_removal_is_malformed_before_its_rules_version_and_records_no_call() {
+    let mut fx = Fx::new();
+    fx.ledger.set_generation(ASSET_RETIREMENT - 1, false);
+    let registrar = staff(&mut fx, &[OperatorOpKind::RegisterAsset]);
+    let asset = register_tstx(&mut fx, registrar, 8, 1);
+    fx.ledger.record_calls(true);
+    let _ = fx.ledger.take_calls();
+    let audit = fx.ledger.state().audit().outbox().count();
+    let ctx = fx.ctx(fx.operator());
+    assert_eq!(
+        fx.ledger
+            .grant_operator(
+                &ctx,
+                registrar.principal,
+                NonEmptySet::one(OperatorOpKind::RemoveAsset),
+                None,
+                b"x"
+            )
+            .map(|a| a.value),
+        Err(Refusal::MalformedCommand)
+    );
+    assert_eq!(
+        retire_tstx(&mut fx, registrar),
+        Err(Refusal::MalformedCommand)
+    );
+    let page = SweepPage {
+        start: SWEEP_START,
+        level: 8,
+    };
+    assert_eq!(
+        sweep(&mut fx, registrar, page),
+        Err(Refusal::MalformedCommand)
+    );
+    let ctx = fx.ctx(registrar);
+    assert_eq!(
+        fx.ledger
+            .cancel_asset_retirement(&ctx, tstx(), b"x")
+            .map(|a| a.value),
+        Err(Refusal::MalformedCommand)
+    );
+    assert_eq!(
+        remove_tstx(&mut fx, registrar),
+        Err(Refusal::MalformedCommand)
+    );
+    assert!(fx.ledger.take_calls().is_empty(), "no call recorded");
+    assert_eq!(fx.ledger.state().audit().outbox().count(), audit);
+    still_registered(&fx, &asset);
+}
+
+/// `REQ-AS-10`: a book that entered the rules version by an upgrade, with accounts and grants
+/// written under earlier ones, sweeps them like any other: nothing is indexed for the removal.
+#[test]
+fn req_as_10_a_book_that_entered_the_version_by_an_upgrade_sweeps_its_old_records() {
+    let mut fx = Fx::new();
+    fx.ledger.set_generation(ASSET_RETIREMENT - 1, false);
+    let registerer = staff(&mut fx, &[OperatorOpKind::RegisterAsset]);
+    register_tstx(&mut fx, registerer, 8, 1);
+    let org = fx.person();
+    let ctx = fx.ctx(fx.operator());
+    let treasury = fx
+        .ledger
+        .open_account(
+            &ctx,
+            OpenAccount {
+                owner: org.principal,
+                kind: AccountKind::Treasury,
+                custody: Custody::Delegated,
+                treasury_limits: BTreeMap::from([(tstx(), Minor::new(9))]),
+                acknowledged: None,
+            },
+        )
+        .unwrap()
+        .value;
+    // The upgrade: the inputs that follow are decided under the removal's rules version.
+    fx.ledger.set_generation(ASSET_RETIREMENT, false);
+    let registrar = staff(&mut fx, &[OperatorOpKind::RemoveAsset]);
+    let next = retire_tstx(&mut fx, registrar).unwrap();
+    assert_eq!(
+        sweep_all(&mut fx, registrar, next),
+        Err(Refusal::NotAuthorised)
+    );
+    assert!(
+        last_audit(&fx)
+            .subject
+            .contains(&AuditSubject::Account(treasury))
+    );
+    assert_eq!(
+        fx.ledger.state().registry().get(&tstx()).unwrap().status(),
+        AssetStatus::Retiring
+    );
 }
 
 fn issuance_request(to: IdentityId, per_window: Option<u64>) -> GrantRequest {

@@ -479,6 +479,56 @@ is never undone (`REQ-AS-8`); the mechanism is one more call kind.
 Traces: `REQ-AS-1`, `AS-2`, `AS-3`, `AS-6`–`AS-9`, `REQ-SA-1`, `SA-3`, `REQ-SL-3`, `INV-5`, `INV-11`,
 `INV-24`, `NFR-9`, `NFR-17`, `US-F5`.
 
+**`DEC-28` An unused asset is removed in three steps: retire, sweep in pages of the service tree, remove.**
+*Decision (owner's default `q09-123-sweep`, 2026-11-09, reversible; amendment 0043, `REQ-AS-10`):*
+
+- **Why not one input.** Two of the four checks of "never used" (no unrevoked grant names the asset, as subject or
+  in its bounds; no Treasury account has a limit in it) have no index that covers them, and an index added now is
+  incomplete for a book that entered its rules version by an upgrade, as the production book did. A whole read of
+  `grants` and `accounts` ships every leaf in the service witness (`crate::service`); at about 175 000 accounts it is
+  about a hundred times the core Agent's 256 KiB arena and 184 KiB of caller blobs.
+- **Retire** (`Call::RetireAsset`, step `Begin`). Point reads only: the registry (book-only), the settlement bind
+  record, the opening position, the journal's running sums for the issuance counterparty and each opening position,
+  and the index of grants by asset (an early refusal; the sweep does not rely on it). The asset's registry status
+  becomes `Retiring`; its status before and the sweep's cursor are a leaf of kind 23 (`ASSET_RETIREMENT`), so a page
+  rewrites that leaf, not the registry. The store refuses, for a retiring asset, `PutGrant` naming it as subject or in
+  its bounds, `PutAccount` adding a Treasury limit in it, a reservation opened in it, a posting line in it, an opening
+  position or an opening load row in it, a settlement bind of it, and its deprecation; the command paths refuse the
+  same first, with `ERR-AssetDeprecated` (`AssetRegistry::active`).
+- **Sweep** (step `Sweep { start, level }`). The cursor is a 16-byte service-tree key (`library_key`), from the first
+  key of kind 4 (ledger accounts) to the first key of kind 6, past the grants (kind 5). A page is the subtree at
+  `level` bits that starts at the cursor (`8 <= level <= 128`, `start` aligned to it), with at most
+  `MAX_SWEEP_PAGE` = 64 leaves. The witness proves it whole: the page's subtree is a **claim** derived from the
+  input's calls (`core_binding::service::claims_of`), by the host and by the Agent alike, so the witness's wire form
+  does not change (no field, so an older Agent decodes every witness as before). The claim's probe (its first key)
+  is proven like a whole kind's, and the Agent checks that no frontier node of the multiproof lies inside the
+  subtree, in v1 and v2 alike: the check a whole kind already makes, at any level. A claim that fails is not an
+  error: the partial store just does not hold the subtree whole, and a page read then needs more than 64 proven
+  leaves to answer `PageTooLarge`, or fails closed. On a whole store (`Leaves::subtree`) the page is found by hashing
+  every key of the kind; it records each leaf it returns by key, never the kind whole. A page larger than 64 records
+  only the first 65 in key order.
+- **The host's suggestion.** Each accepted step's value carries the next page's start and, from a whole store only,
+  the largest level whose subtree fits (`State::suggest_sweep_level`, an unrecorded read). The core Agent's summary
+  is the outcome's code alone, so the value is never compared; the Agent suggests none.
+- **Remove** (`Call::RemoveAsset`, unchanged form). Refused unless the retirement's cursor is past the grants; then
+  `Write::RemoveAsset` retires the tag and removes the retirement leaf. Cancel (step `Cancel`) restores the status.
+- **Rules version.** All three steps, `remove_asset`, and `grant_operator` naming `OperatorOpKind::RemoveAsset` (20)
+  are taken from `ASSET_RETIREMENT` = 2, the rules version this release's core package is built as (the production
+  and test books run 1). Before it the replica answers `ERR-MalformedCommand` and **records no call**, so no input
+  carrying a variant an older Agent cannot decode is ever sent. The gate reads the rules version alone.
+- **Export.** `service.asset-retirements`, written only while an asset is retiring, after `service.retired-tags`.
+  Format version 12 is unchanged.
+- **Layout 3** (`crate::mapped`) loads no claim, so a sweep page there is an unproven read. Layout 2 is production.
+
+*Alternatives:* an index of grants by bound asset and of Treasury accounts by limit asset, kept from a rules version
+on (a4aef92; incomplete on an upgraded book, so removal failed closed there); a whole read in one input (2acabc0,
+b09b58e; over the Agent's limits at the production book's size); pages in the records' own key order (not provable:
+the tree is keyed by hash). *Why:* the only bounded read that is provably complete. *Cost:* a removal of an asset in
+the production book takes some thousands of operator inputs, driven by a script that follows the host's
+suggestions; the asset is frozen meanwhile. *Reversibility:* the inputs are new; nothing else reads the retirement.
+Traces: `REQ-AS-2`, `AS-8`, `AS-10`, `REQ-LA-2`, `REQ-AU-2`, `AU-10`, `REQ-OS-1`, `OS-2`, `REQ-RT-1`, `RT-16`,
+`RT-17`, `RT-20`, `INV-24`.
+
 **`DEC-21` One stage, straight to Kreivo: one window, no daily shadow.**
 *Decision (owner, 2026-10-02 and 2026-10-03):* the rollout has one stage. It replaces `DEC-14`'s strangler
 and the two-stage canary of 2026-10-02 (stage A book-only with the prover, then stage B with the contract

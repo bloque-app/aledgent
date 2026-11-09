@@ -72,7 +72,8 @@ Asset { id: AssetId, tag: u32 /* kernel ledger tag */, precision: u8, kind, stat
   `[A-Z0-9]{2,12}` (`REQ-AS-3`). *Alternative:* case-folded Unicode with a stricter allow-list.
 - **One registry.** `AssetRegistry` is the only type that holds `precision`. The kernel tag is
   assigned once at registration and never reused. An asset registered wrongly and never used is
-  removed (amendment 0043, `REQ-AS-10`); its tag is retired, because the next tag only goes up.
+  removed (amendment 0043, `REQ-AS-10`, `PLAN.md` `DEC-28`): retired (frozen), swept page by page over
+  every ledger account and grant, then removed; its tag is retired, because the next tag only goes up.
 - **One boundary.** `Minor::from_decimal(&str, &Asset) -> Result<Minor, Refusal>` is the only
   decimal conversion in the workspace. More fractional digits than the precision gives
   `ERR-PrecisionExceeded`. It never rounds or truncates. Every internal API takes `Minor` (a `u64`

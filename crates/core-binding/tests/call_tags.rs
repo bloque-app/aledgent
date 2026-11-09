@@ -110,6 +110,8 @@ const PRODUCTION: &[&str] = &[
     "Upgrade",
     // Amendment 0043: an asset registered book-only and never used, removed.
     "RemoveAsset",
+    // Amendment 0043: its retirement, the pages of its sweep, and a cancellation.
+    "RetireAsset",
 ];
 
 /// The conformance suite's raw ports: only ever after every production variant.

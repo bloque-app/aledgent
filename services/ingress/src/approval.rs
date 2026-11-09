@@ -181,6 +181,9 @@ pub enum Kind {
     RegisterAsset,
     DeprecateAsset,
     RemoveAsset,
+    RetireAsset,
+    SweepAssetUses,
+    CancelAssetRetirement,
     DeclareAdapterSupport,
     SubmitEvidence,
     IssueDisclosure,
@@ -236,6 +239,9 @@ impl Kind {
         Kind::RegisterAsset,
         Kind::DeprecateAsset,
         Kind::RemoveAsset,
+        Kind::RetireAsset,
+        Kind::SweepAssetUses,
+        Kind::CancelAssetRetirement,
         Kind::DeclareAdapterSupport,
         Kind::SubmitEvidence,
         Kind::IssueDisclosure,
@@ -305,6 +311,9 @@ impl Kind {
             | Kind::RegisterAsset
             | Kind::DeprecateAsset
             | Kind::RemoveAsset
+            | Kind::RetireAsset
+            | Kind::SweepAssetUses
+            | Kind::CancelAssetRetirement
             | Kind::DeclareAdapterSupport
             | Kind::SubmitEvidence
             | Kind::IssueDisclosure
@@ -363,6 +372,9 @@ impl Kind {
             Kind::RegisterAsset => "register_asset",
             Kind::DeprecateAsset => "deprecate_asset",
             Kind::RemoveAsset => "remove_asset",
+            Kind::RetireAsset => "retire_asset",
+            Kind::SweepAssetUses => "sweep_asset_uses",
+            Kind::CancelAssetRetirement => "cancel_asset_retirement",
             Kind::DeclareAdapterSupport => "declare_adapter_support",
             Kind::SubmitEvidence => "submit_evidence",
             Kind::IssueDisclosure => "issue_disclosure",
@@ -401,6 +413,9 @@ pub fn kind_of(c: &Command) -> Kind {
             OperatorOp::RegisterAsset(_) => Kind::RegisterAsset,
             OperatorOp::DeprecateAsset(..) => Kind::DeprecateAsset,
             OperatorOp::RemoveAsset(..) => Kind::RemoveAsset,
+            OperatorOp::RetireAsset(..) => Kind::RetireAsset,
+            OperatorOp::SweepAssetUses(..) => Kind::SweepAssetUses,
+            OperatorOp::CancelAssetRetirement(..) => Kind::CancelAssetRetirement,
             OperatorOp::BindAsset(..) => Kind::BindAsset,
             OperatorOp::GrantIssuance(_) => Kind::GrantIssuance,
             OperatorOp::RevokeIssuance(_) => Kind::RevokeIssuance,
@@ -723,6 +738,9 @@ mod tests {
             "register_asset",
             "deprecate_asset",
             "remove_asset",
+            "retire_asset",
+            "sweep_asset_uses",
+            "cancel_asset_retirement",
             "declare_adapter_support",
             "submit_evidence",
             "issue_disclosure",

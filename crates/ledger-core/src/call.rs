@@ -43,7 +43,7 @@ use crate::custody::store::PendingId;
 use crate::id::{AccountId, CredentialId, GrantId, IdentityId, OperationId};
 use crate::identity::{IdentityKind, IdentityStatus};
 use crate::ledger::custody::{InitiateRecovery, ReclaimCustody, RegisterCredential};
-use crate::ledger::operator::{RegisterAsset, Resolve, ReviewRef};
+use crate::ledger::operator::{RegisterAsset, Resolve, RetireStep, ReviewRef};
 use crate::ledger::settle_adapter::AdapterInput;
 use crate::ledger::settlement::Withdrawal;
 use crate::ledger::{Ctx, GrantRequest, Ledger, OpenAccount, Transfer};
@@ -438,6 +438,17 @@ pub enum Call {
         review: ReviewRef,
         justification: Vec<u8>,
     },
+    /// A step of an asset's removal before `remove_asset` (amendment 0043, `REQ-AS-10`,
+    /// `DEC-28`): retire it, sweep one page, or cancel the retirement. After `RemoveAsset` and
+    /// before the conformance ports, so no production variant's tag moves. One variant for the
+    /// three, so that an older core Agent has one variant it cannot decode, never sent to it
+    /// (`crate::asset::ASSET_RETIREMENT`).
+    RetireAsset {
+        ctx: Ctx,
+        asset: AssetId,
+        step: RetireStep,
+        justification: Vec<u8>,
+    },
     // The conformance suite's raw ports come last, so that no production variant's index (its
     // postcard tag in the host's archive and in every envelope) depends on whether a build enables
     // `conformance-ports` (T-005-17: a workspace build unifies the feature into every binary, and an
@@ -524,6 +535,11 @@ impl Call {
             Call::RegisterAsset { .. } => "register_asset",
             Call::DeprecateAsset { .. } => "deprecate_asset",
             Call::RemoveAsset { .. } => "remove_asset",
+            Call::RetireAsset { step, .. } => match step {
+                RetireStep::Begin { .. } => "retire_asset",
+                RetireStep::Sweep(_) => "sweep_asset_uses",
+                RetireStep::Cancel => "cancel_asset_retirement",
+            },
             Call::BindAsset { .. } => "bind_asset",
             Call::GrantIssuance { .. } => "grant_issuance",
             Call::RevokeIssuance { .. } => "revoke_issuance",

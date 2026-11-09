@@ -1483,6 +1483,17 @@
               }
             ],
             "description": "What a settlement command produced (`F-016`)."
+          },
+          "sweep": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SweepNextBody"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Where an asset's sweep goes next, after its retirement or a page (amendment 0043); absent\nonce the sweep is complete."
           }
         },
         "type": "object"
@@ -4259,7 +4270,7 @@
             "additionalProperties": false,
             "properties": {
               "description": {
-                "const": "A multi-leg submission is larger than the declared maximum"
+                "const": "A multi-leg submission, or a page of an asset's sweep (`REQ-AS-10`), is larger than the declared maximum"
               },
               "error": {
                 "const": "ERR-BatchTooLarge"
@@ -4952,6 +4963,25 @@
         "required": [
           "target",
           "evidence",
+          "justification"
+        ],
+        "type": "object"
+      },
+      "RetireAssetBody": {
+        "additionalProperties": false,
+        "description": "`retire_asset` of the asset in the path (amendment 0043, `REQ-AS-10`): freeze an asset to be\nremoved, and start its sweep.",
+        "properties": {
+          "justification": {
+            "description": "Why.",
+            "type": "string"
+          },
+          "review": {
+            "description": "The reviewed change it comes from, 32 bytes of hex.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "review",
           "justification"
         ],
         "type": "object"
@@ -5768,6 +5798,56 @@
           "available",
           "reserved",
           "encumbered"
+        ],
+        "type": "object"
+      },
+      "SweepAssetBody": {
+        "additionalProperties": false,
+        "description": "`sweep_asset_uses` of the asset in the path (amendment 0043, `REQ-AS-10`): one page of its\nsweep, as the last step's `sweep` result named it.",
+        "properties": {
+          "justification": {
+            "description": "Why.",
+            "type": "string"
+          },
+          "level": {
+            "description": "How many leading bits of the key the page fixes, 8 to 128. A page with more than 64\nrecords is `ERR-BatchTooLarge`: send it again one level deeper.",
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "start": {
+            "description": "Where the page starts: the sweep's cursor, 16 bytes of hex.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "start",
+          "level",
+          "justification"
+        ],
+        "type": "object"
+      },
+      "SweepNextBody": {
+        "description": "Where an asset's sweep goes next (amendment 0043): the page start the book takes, and the\nlevel the host suggests for it.",
+        "properties": {
+          "level": {
+            "description": "The suggested level, when the host has one.",
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "start": {
+            "description": "The cursor, 16 bytes of hex.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "start"
         ],
         "type": "object"
       },
@@ -9185,7 +9265,256 @@
             }
           }
         },
-        "summary": "Operator: remove an asset that was registered book-only and never used, retiring its tag, so the same id can be registered again at the right precision (amendment 0043, REQ-AS-10)."
+        "summary": "Operator: remove an asset that was registered book-only and never used, once it is retiring and its sweep is complete, retiring its tag, so the same id can be registered again at the right precision (amendment 0043, REQ-AS-10)."
+      }
+    },
+    "/v1/ops/assets/{asset}/retire": {
+      "post": {
+        "operationId": "retire_asset",
+        "parameters": [
+          {
+            "description": "A did:aledgent identifier.",
+            "in": "path",
+            "name": "asset",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The client key (REQ-OP-10). Without one, a key is derived from the request and returned (REQ-OP-11).",
+            "in": "header",
+            "name": "client-key",
+            "required": false,
+            "schema": {
+              "maxLength": 256,
+              "type": "string"
+            }
+          },
+          {
+            "description": "The identity the caller acts for, where different (REQ-PN-1).",
+            "in": "header",
+            "name": "on-behalf-of",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RetireAssetBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandReply"
+                }
+              }
+            },
+            "description": "Decided. For a transfer or a reservation, the reply to a repeat once the core has decided (REQ-CS-3)."
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Refusal"
+                }
+              }
+            },
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Refusal"
+                }
+              }
+            },
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
+          }
+        },
+        "summary": "Operator: retire an asset registered book-only and never used, so that nothing new may name it, and start its sweep; the result names the first page (amendment 0043, REQ-AS-10)."
+      }
+    },
+    "/v1/ops/assets/{asset}/retire/cancel": {
+      "post": {
+        "operationId": "cancel_asset_retirement",
+        "parameters": [
+          {
+            "description": "A did:aledgent identifier.",
+            "in": "path",
+            "name": "asset",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The client key (REQ-OP-10). Without one, a key is derived from the request and returned (REQ-OP-11).",
+            "in": "header",
+            "name": "client-key",
+            "required": false,
+            "schema": {
+              "maxLength": 256,
+              "type": "string"
+            }
+          },
+          {
+            "description": "The identity the caller acts for, where different (REQ-PN-1).",
+            "in": "header",
+            "name": "on-behalf-of",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JustifiedBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandReply"
+                }
+              }
+            },
+            "description": "Decided. For a transfer or a reservation, the reply to a repeat once the core has decided (REQ-CS-3)."
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Refusal"
+                }
+              }
+            },
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Refusal"
+                }
+              }
+            },
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
+          }
+        },
+        "summary": "Operator: cancel an asset's retirement; the asset has the status it had before (amendment 0043, REQ-AS-10)."
+      }
+    },
+    "/v1/ops/assets/{asset}/retire/sweep": {
+      "post": {
+        "operationId": "sweep_asset_uses",
+        "parameters": [
+          {
+            "description": "A did:aledgent identifier.",
+            "in": "path",
+            "name": "asset",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The client key (REQ-OP-10). Without one, a key is derived from the request and returned (REQ-OP-11).",
+            "in": "header",
+            "name": "client-key",
+            "required": false,
+            "schema": {
+              "maxLength": 256,
+              "type": "string"
+            }
+          },
+          {
+            "description": "The identity the caller acts for, where different (REQ-PN-1).",
+            "in": "header",
+            "name": "on-behalf-of",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SweepAssetBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandReply"
+                }
+              }
+            },
+            "description": "Decided. For a transfer or a reservation, the reply to a repeat once the core has decided (REQ-CS-3)."
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Refusal"
+                }
+              }
+            },
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status."
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Refusal"
+                }
+              }
+            },
+            "description": "Refused, with the named condition. The status is the alternative's x-http-status.",
+            "headers": {
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            }
+          }
+        },
+        "summary": "Operator: check one page of a retiring asset's sweep over every ledger account and grant; the result names the next page, and none once the sweep is complete (amendment 0043, REQ-AS-10)."
       }
     },
     "/v1/ops/identities/{identity}/credentials": {

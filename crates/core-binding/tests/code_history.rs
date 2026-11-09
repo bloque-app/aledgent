@@ -206,7 +206,10 @@ const NOT_YET_RECORDED: &[&str] = &[
     "PrivilegedRead",
     // Assets, issuance, openings and integrations.
     "DeprecateAsset",
+    // Amendment 0043: taken from rules version 2 (`ASSET_RETIREMENT`), which no recorded range
+    // reaches with them; the next extension records them.
     "RemoveAsset",
+    "RetireAsset",
     "ApplySpecChunk",
     "LoadOpeningBalances",
     "RegisterAsset",

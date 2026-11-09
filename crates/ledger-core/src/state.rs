@@ -54,7 +54,8 @@ use alloc::vec::Vec;
 
 use crate::account::{AccountKind, AccountStatus, Custody, LedgerAccount, Time};
 use crate::asset::{
-    Asset, AssetBinding, AssetId, AssetKind, AssetRegistry, AssetStatus, Minor, RegistryError,
+    Asset, AssetBinding, AssetId, AssetKind, AssetRegistry, AssetRetirement, AssetStatus,
+    MAX_SWEEP_PAGE, Minor, RegistryError, SWEEP_END, SWEEP_START,
 };
 use crate::audit::emit::{self, AuditUndo};
 use crate::audit::{AuditLog, AuditNote};
@@ -64,7 +65,7 @@ use crate::authority::{
 use crate::custody::store::{CustodyRefusal, CustodyState, CustodyUndo, CustodyWrite};
 use crate::id::{AccountId, CredentialId, GrantId, IdentityId, Mint, OperationId};
 use crate::identity::{Identity, IdentityStatus};
-use crate::leaves::{Derived, Leaves, Slot, kind};
+use crate::leaves::{Derived, Leaves, Slot, Subtree, kind};
 use crate::lifecycle::keys::TransitionKey;
 use crate::lifecycle::store::{
     OpRefusal, OpUndo, OpWrite, Operation, Operations, TransitionRecord, TransitionWrite,
@@ -202,6 +203,14 @@ pub enum Command {
     /// `remove_asset`: an asset registered book-only and never used, removed (amendment 0043,
     /// `REQ-AS-10`).
     RemoveAsset,
+    /// `retire_asset`: an asset to be removed, frozen so that nothing new may name it
+    /// (amendment 0043).
+    RetireAsset,
+    /// `sweep_asset_uses`: one page of a retiring asset's sweep (amendment 0043).
+    SweepAssetUses,
+    /// `cancel_asset_retirement`: a retirement ended, the asset back to its status (amendment
+    /// 0043).
+    CancelAssetRetirement,
 }
 
 /// The attribution of one accepted command (`REQ-AU-7`, `REQ-PN-1`, `INV-20`). For an operation
@@ -256,8 +265,22 @@ pub enum Write {
     /// Deprecate an asset.
     DeprecateAsset(AssetId),
     /// Remove an asset that was registered book-only and never used, and retire its tag
-    /// (amendment 0043, `REQ-AS-10`). The store refuses it unless [`State::asset_removable`].
+    /// (amendment 0043, `REQ-AS-10`). The store refuses it unless [`State::asset_removable`]:
+    /// the asset is retiring and its sweep is complete.
     RemoveAsset(AssetId),
+    /// Retire an asset: freeze it, and start its sweep (amendment 0043). The store refuses it
+    /// unless [`State::asset_retirable`].
+    RetireAsset(AssetId),
+    /// One page of a retiring asset's sweep, which moves its cursor past the page (amendment
+    /// 0043). The store refuses it unless [`State::sweep_page`] finds the page clean.
+    SweepPage {
+        /// The asset.
+        asset: AssetId,
+        /// The page.
+        page: Subtree,
+    },
+    /// End a retirement: the asset has the status it had before (amendment 0043).
+    CancelRetirement(AssetId),
     /// Insert an identity.
     PutIdentity(Identity),
     /// Change an identity's status.
@@ -364,10 +387,32 @@ pub enum StoreRefusal {
     ChainSpec(crate::chainspec::SpecRefusal),
     /// The asset cannot be removed: something in the book already names it (amendment 0043).
     AssetInUse(AssetInUse),
+    /// The write names an asset that is retiring, as something new: a grant, a Treasury limit, a
+    /// reservation, a posting, an opening or a binding (amendment 0043, `REQ-AS-10`).
+    AssetRetiring(AssetId),
+    /// A step of an asset's removal is not one the retirement takes (amendment 0043).
+    Retirement(RetirementRefusal),
 }
 
-/// Why an asset cannot be removed (amendment 0043, `REQ-AS-10`): the first thing the store finds
-/// that makes it more than a registry entry. Each is a point read of a permanent record.
+/// Why a step of an asset's removal is refused, apart from a use found (amendment 0043).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetirementRefusal {
+    /// The asset is not retiring.
+    NotRetiring,
+    /// The page does not start at the sweep's cursor, or the sweep is complete.
+    NotAtCursor,
+    /// The page lies outside the ledger accounts and the grants.
+    MalformedPage,
+    /// The page holds more than [`MAX_SWEEP_PAGE`] leaves.
+    PageTooLarge,
+    /// The sweep has not covered every account and grant.
+    SweepIncomplete,
+}
+
+/// Why an asset cannot be retired or removed, or a page of its sweep is refused (amendment 0043,
+/// `REQ-AS-10`): the first thing the store finds that makes it more than a registry entry. The
+/// first three are point reads at the retirement; the last three are found by the sweep, and name
+/// the record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AssetInUse {
     /// A binding was asked for at some time: its record stays, even when the layer refused it.
@@ -379,11 +424,11 @@ pub enum AssetInUse {
     Issuance,
     /// A Treasury account declares a limit in it, so its balance could be driven below zero with
     /// no issuance at all, and the limit is a count of the old precision's minor units.
-    TreasuryLimit,
+    TreasuryLimit(AccountId),
     /// An issuance grant over it has not been revoked.
-    LiveGrant,
+    LiveGrant(GrantId),
     /// A grant that is not revoked bounds the assets it covers, and names this one.
-    GrantBound,
+    GrantBound(GrantId),
 }
 
 /// How to undo one applied write.
@@ -408,8 +453,12 @@ fn held_by(lines: &[journal::Line], issuance: &AccountId) -> Vec<(AssetId, i128)
 
 enum Undo {
     Unregister(AssetId),
-    /// Put a removed asset back, with its tag; the next tag was never lowered.
-    RestoreAsset(Asset),
+    /// Put a removed asset back, with its tag and its retirement; the next tag was never lowered.
+    RestoreAsset(Asset, Option<AssetRetirement>),
+    /// Take a retirement back: the asset has this status again, and no retirement record.
+    Unretire(AssetId, AssetStatus),
+    /// Put a retirement record back as it was: a page's cursor, or a cancelled retirement.
+    Retirement(AssetId, AssetRetirement),
     AssetBinding(AssetId, AssetBinding),
     AssetStatus(AssetId, AssetStatus),
     RemoveIdentity(IdentityId),
@@ -462,6 +511,10 @@ pub struct State {
     /// read of every account the identity owns: an identity may own hundreds of accounts, each a
     /// leaf the Agent would be given (`REQ-RT-1`; a verify-genesis halt of 2026-10-11).
     owned_custody: Leaves<IdentityId, BTreeSet<AccountId>, { kind::OWNED_CUSTODY_BY_OWNER }>,
+    /// Each asset being removed (amendment 0043, `REQ-AS-10`): the status it had and where its
+    /// sweep stands. Absent for every other asset, and for every asset before
+    /// [`crate::asset::ASSET_RETIREMENT`].
+    retirements: Leaves<AssetId, AssetRetirement, { kind::ASSET_RETIREMENT }>,
     credentials: Leaves<CredentialId, Credential, { kind::CREDENTIAL }>,
     /// Each identity's credential set, by id: derived from `credentials`, changed in the same
     /// write, never exported (`F-012` follow-up, issue #50).
@@ -562,6 +615,7 @@ impl State {
             accounts: Leaves::new(),
             by_owner: Leaves::new(),
             owned_custody: Leaves::new(),
+            retirements: Leaves::new(),
             credentials: Leaves::new(),
             sets: Leaves::new(),
             grants: Leaves::new(),
@@ -701,7 +755,23 @@ impl State {
                 Undo::AssetBinding(id, before) => {
                     self.registry.get_mut().restore_binding(&id, before)
                 }
-                Undo::RestoreAsset(a) => self.registry.get_mut().restore_removed(a),
+                Undo::RestoreAsset(a, r) => {
+                    let id = a.id();
+                    self.registry.get_mut().restore_removed(a);
+                    if let Some(r) = r {
+                        self.retirements.insert(id, r);
+                    }
+                }
+                Undo::Unretire(id, before) => {
+                    self.registry.get_mut().restore_status(&id, before);
+                    self.retirements.remove(&id);
+                }
+                Undo::Retirement(id, r) => {
+                    self.registry
+                        .get_mut()
+                        .restore_status(&id, AssetStatus::Retiring);
+                    self.retirements.insert(id, r);
+                }
                 Undo::AssetStatus(id, s) => self.registry.get_mut().restore_status(&id, s),
                 Undo::RemoveIdentity(id) => {
                     self.identities.remove(&id);
@@ -843,7 +913,46 @@ impl State {
                     .get_mut()
                     .remove(id)
                     .map_err(StoreRefusal::Registry)?;
-                Ok(Undo::RestoreAsset(removed))
+                let retirement = self.retirements.remove(id);
+                Ok(Undo::RestoreAsset(removed, retirement))
+            }
+            Write::RetireAsset(id) => {
+                self.asset_retirable(id)?;
+                let before = self
+                    .registry
+                    .get_mut()
+                    .retire(id)
+                    .map_err(StoreRefusal::Registry)?;
+                self.retirements.insert(
+                    *id,
+                    AssetRetirement {
+                        before,
+                        cursor: SWEEP_START,
+                    },
+                );
+                Ok(Undo::Unretire(*id, before))
+            }
+            Write::SweepPage { asset, page } => {
+                let next = self.sweep_page(asset, page)?;
+                let r = self
+                    .retirements
+                    .get_mut(asset)
+                    .ok_or(StoreRefusal::Retirement(RetirementRefusal::NotRetiring))?;
+                let before = *r;
+                r.cursor = next;
+                Ok(Undo::Retirement(*asset, before))
+            }
+            Write::CancelRetirement(id) => {
+                let r = *self
+                    .retirements
+                    .get(id)
+                    .ok_or(StoreRefusal::Retirement(RetirementRefusal::NotRetiring))?;
+                self.registry
+                    .get_mut()
+                    .unretire(id, r.before)
+                    .map_err(StoreRefusal::Registry)?;
+                self.retirements.remove(id);
+                Ok(Undo::Retirement(*id, r))
             }
             Write::PutIdentity(i) => {
                 if !check_mint(i.id(), i.minted(), IdentityId::mint) {
@@ -884,6 +993,7 @@ impl State {
                 if a.status() != AccountStatus::Active {
                     return Err(StoreRefusal::Absorbing);
                 }
+                self.not_retiring(a.treasury_limits().keys())?;
                 if a.kind() == AccountKind::Issuance
                     && self
                         .accounts
@@ -1038,6 +1148,7 @@ impl State {
                     if self.registry.get().get(&r.asset).is_err() {
                         return Err(StoreRefusal::Dangling);
                     }
+                    self.not_retiring([&r.asset])?;
                 }
                 let u = self
                     .reservations
@@ -1070,11 +1181,15 @@ impl State {
                 }
                 Ok(Undo::Op(u))
             }
-            Write::Settlement(w) => self
-                .settlement
-                .apply(w)
-                .map(Undo::Settlement)
-                .map_err(StoreRefusal::Settlement),
+            Write::Settlement(w) => {
+                if let crate::settlement::store::SettlementWrite::AssetBind(b) = w {
+                    self.not_retiring([&b.asset])?;
+                }
+                self.settlement
+                    .apply(w)
+                    .map(Undo::Settlement)
+                    .map_err(StoreRefusal::Settlement)
+            }
             Write::UpgradeAuthority(r) => Ok(Undo::UpgradeAuthority(Box::new(
                 self.upgrade_authority.set((**r).clone()),
             ))),
@@ -1105,6 +1220,7 @@ impl State {
                     &self.reservations,
                 )
                 .map_err(StoreRefusal::Journal)?;
+                self.not_retiring(lines.iter().map(|l| &l.asset))?;
                 // A settling posting of an operation the positions' tally already counts: added
                 // to the tally as it is written (finding F18's class, `REQ-PR-5`).
                 let held = if is_settling(p.draft.meta().kind)
@@ -1149,6 +1265,7 @@ impl State {
                 if self.registry.get().get(asset).is_err() {
                     return Err(StoreRefusal::Dangling);
                 }
+                self.not_retiring([asset])?;
                 let u = self
                     .openings
                     .put_position(*asset, account.id())
@@ -1179,6 +1296,7 @@ impl State {
                         {
                             return Err(StoreRefusal::Dangling);
                         }
+                        self.not_retiring([&r.asset])?;
                     }
                 }
                 self.openings
@@ -1203,6 +1321,13 @@ impl State {
         }
         if g.revoked().is_some() {
             return Err(StoreRefusal::MalformedGrant);
+        }
+        // Nothing new names a retiring asset (amendment 0043): neither as subject nor in bounds.
+        if let Subject::Asset(a) = g.subject() {
+            self.not_retiring([&a])?;
+        }
+        if let Some(assets) = g.bounds().assets() {
+            self.not_retiring(assets.iter())?;
         }
         // `OpenAccount` belongs to a grant over an identity alone (amendment 0025).
         if !matches!(g.subject(), Subject::Identity(_))
@@ -1294,30 +1419,38 @@ impl State {
         self.accounts.get(id)
     }
 
-    /// Whether an asset can be removed (amendment 0043, `REQ-AS-10`): it is registered, book-only,
-    /// and four direct checks, each read from the book's permanent records at the moment of the
-    /// decision and from no index kept for the purpose, all find that nothing has ever named it.
-    /// The first refusal found is returned, in this order:
-    ///
-    /// 1. [`AssetInUse::Binding`]: the asset was never asked to bind (the record of a refused ask
-    ///    stays).
-    /// 2. [`AssetInUse::Opening`] and [`AssetInUse::Issuance`]: no opening position was opened for
-    ///    it, and the issuance counterparty (and every opening position) never held it. "Never
-    ///    held" is read from the position's running sums, which stay once a posting is final even
-    ///    when the position is back at zero ([`crate::query::journal::Journal::touched`]).
-    /// 3. [`AssetInUse::LiveGrant`] and [`AssetInUse::GrantBound`]: no grant that is not revoked
-    ///    names the asset, either as its subject or in the assets its bounds cover. Grants keep
-    ///    the asset as an identifier, so a registered-again asset would inherit them.
-    /// 4. [`AssetInUse::TreasuryLimit`]: no Treasury account, closed ones included, has a limit in
-    ///    it. A scan of every account (a whole read, as a witness gives it): the operation is an
-    ///    operator's and rare.
-    ///
-    /// Every input is a record of the book, so a replay reads the same state at the same point and
-    /// answers the same. Value can only enter an asset at an account that may go below zero: the
-    /// issuance counterparty, an opening position (both checked in 2) or a Treasury account within
-    /// a declared limit (4). A Customer or Suspense account holds only what it received. An asset
-    /// none of them has touched has had no first posting, so it has had none.
-    pub fn asset_removable(&self, id: &AssetId) -> Result<(), StoreRefusal> {
+    /// Refuse a write that names a retiring asset as something new (amendment 0043, `REQ-AS-10`).
+    /// The registry is read only when the write names an asset at all, so a write that names none
+    /// reads nothing more than before.
+    fn not_retiring<'a>(
+        &self,
+        assets: impl IntoIterator<Item = &'a AssetId>,
+    ) -> Result<(), StoreRefusal> {
+        let mut assets = assets.into_iter().peekable();
+        if assets.peek().is_none() {
+            return Ok(());
+        }
+        let registry = self.registry.get();
+        match assets.find(|a| registry.retiring(a)) {
+            Some(a) => Err(StoreRefusal::AssetRetiring(*a)),
+            None => Ok(()),
+        }
+    }
+
+    /// The retirement of `asset`, if it is retiring (amendment 0043): one point read.
+    pub fn retirement(&self, asset: &AssetId) -> Option<AssetRetirement> {
+        self.retirements.get(asset).copied()
+    }
+
+    /// The point checks of an asset's removal (amendment 0043, `REQ-AS-10`, checks 1 and 2):
+    /// registered, book-only, never asked to bind, no opening position (an opening position holds
+    /// only its own asset), and never held by the issuance counterparty. "Never held" is read from
+    /// the position's
+    /// running sums, which stay once a posting is final even when the position is back at zero
+    /// ([`crate::query::journal::Journal::touched`]). Value can enter an asset only at an
+    /// account that may go below zero: the issuance counterparty, an opening position, or a
+    /// Treasury account within a declared limit, which the sweep looks for.
+    fn never_held(&self, id: &AssetId) -> Result<(), StoreRefusal> {
         let registry = self.registry.get();
         let asset = registry
             .get(id)
@@ -1332,13 +1465,24 @@ impl State {
         if self.openings.position(id).is_some() {
             return used(AssetInUse::Opening);
         }
+        // An opening position holds only its own asset, and this one has none (above), so the
+        // issuance counterparty is the one position left to read: a point read, never the
+        // positions of every asset.
         let issuance = self.roles.get().as_ref().map(|r| r.issuance);
-        let touched = issuance
-            .into_iter()
-            .chain(self.openings.positions().map(|(_, a)| *a))
-            .any(|a| self.journal.touched(&a, id));
-        if touched {
+        if issuance.is_some_and(|a| self.journal.touched(&a, id)) {
             return used(AssetInUse::Issuance);
+        }
+        Ok(())
+    }
+
+    /// Whether an asset can be retired (amendment 0043, `REQ-AS-10`, step 1): the point checks of
+    /// [`State::never_held`], it is not retiring already, and the index of grants over the asset
+    /// holds no unrevoked one (an early refusal: the sweep reads every grant, so the index's
+    /// completeness is not relied on). Point reads only.
+    pub fn asset_retirable(&self, id: &AssetId) -> Result<(), StoreRefusal> {
+        self.never_held(id)?;
+        if self.registry.get().retiring(id) {
+            return Err(StoreRefusal::Registry(RegistryError::Retiring(*id)));
         }
         let live = self
             .by_asset_or_identity
@@ -1346,27 +1490,109 @@ impl State {
             .into_iter()
             .flatten()
             .filter_map(|g| self.grants.get(g))
-            .any(|g| g.revoked().is_none());
-        if live {
-            return used(AssetInUse::LiveGrant);
-        }
-        let bound = self.grants.values().any(|g| {
-            g.revoked().is_none()
-                && g.bounds()
-                    .assets()
-                    .is_some_and(|a| a.iter().any(|x| x == id))
-        });
-        if bound {
-            return used(AssetInUse::GrantBound);
-        }
-        if self
-            .accounts
-            .values()
-            .any(|a| a.treasury_limits().contains_key(id))
-        {
-            return used(AssetInUse::TreasuryLimit);
+            .find(|g| g.revoked().is_none());
+        if let Some(g) = live {
+            return Err(StoreRefusal::AssetInUse(AssetInUse::LiveGrant(g.id())));
         }
         Ok(())
+    }
+
+    /// One page of a retiring asset's sweep (amendment 0043, `REQ-AS-10`, step 2, `DEC-28`): the
+    /// cursor after it if it is clean. The page must start at the sweep's cursor and lie in the
+    /// ledger accounts or the grants; it may hold at most [`MAX_SWEEP_PAGE`] leaves. It is refused
+    /// if a Treasury account in it, closed or not, declares a limit in the asset, or a grant in it
+    /// that is not revoked has the asset as its subject or lists it in its bounds. The page is
+    /// read as exactly its leaves ([`Leaves::subtree`]): a whole store records each by key, and a
+    /// witness proves it complete.
+    pub fn sweep_page(&self, asset: &AssetId, page: &Subtree) -> Result<[u8; 16], StoreRefusal> {
+        let refuse = |r| Err(StoreRefusal::Retirement(r));
+        if self.registry.get().get(asset).is_err() {
+            return Err(StoreRefusal::Registry(RegistryError::NotRegistered(*asset)));
+        }
+        let Some(r) = self.retirements.get(asset).copied() else {
+            return refuse(RetirementRefusal::NotRetiring);
+        };
+        if page.start() != r.cursor || r.complete() {
+            return refuse(RetirementRefusal::NotAtCursor);
+        }
+        let next = match page.end() {
+            Some(n) if n <= SWEEP_END => n,
+            _ => return refuse(RetirementRefusal::MalformedPage),
+        };
+        match page.kind() {
+            kind::LEDGER_ACCOUNT => {
+                let accounts = self.accounts.subtree(page, MAX_SWEEP_PAGE);
+                if accounts.len() > MAX_SWEEP_PAGE {
+                    return refuse(RetirementRefusal::PageTooLarge);
+                }
+                if let Some((id, _)) = accounts
+                    .iter()
+                    .find(|(_, a)| a.treasury_limits().contains_key(asset))
+                {
+                    return Err(StoreRefusal::AssetInUse(AssetInUse::TreasuryLimit(**id)));
+                }
+            }
+            kind::GRANT => {
+                let grants = self.grants.subtree(page, MAX_SWEEP_PAGE);
+                if grants.len() > MAX_SWEEP_PAGE {
+                    return refuse(RetirementRefusal::PageTooLarge);
+                }
+                for (id, g) in grants {
+                    if g.revoked().is_some() {
+                        continue;
+                    }
+                    if g.subject() == Subject::Asset(*asset) {
+                        return Err(StoreRefusal::AssetInUse(AssetInUse::LiveGrant(*id)));
+                    }
+                    if g.bounds()
+                        .assets()
+                        .is_some_and(|a| a.iter().any(|x| x == asset))
+                    {
+                        return Err(StoreRefusal::AssetInUse(AssetInUse::GrantBound(*id)));
+                    }
+                }
+            }
+            _ => return refuse(RetirementRefusal::MalformedPage),
+        }
+        Ok(next)
+    }
+
+    /// The level of the largest page that starts at `cursor` and holds at most
+    /// [`MAX_SWEEP_PAGE`] leaves, from a whole store (`DEC-28`): the host's suggestion for the next
+    /// page, passed as data in the next input and never part of a decision. Read without
+    /// recording; a partial store (the core Agent's) suggests none.
+    pub fn suggest_sweep_level(&self, cursor: &[u8; 16]) -> Option<u16> {
+        let keys = match cursor[0] {
+            kind::LEDGER_ACCOUNT if !self.accounts.is_partial() => {
+                self.accounts.tree_keys_unrecorded()
+            }
+            kind::GRANT if !self.grants.is_partial() => self.grants.tree_keys_unrecorded(),
+            _ => return None,
+        };
+        let from = keys.partition_point(|k| k < cursor);
+        (8..=128u16).find(|level| {
+            Subtree::new(*cursor, *level).is_some_and(|sub| {
+                keys[from..]
+                    .iter()
+                    .take(MAX_SWEEP_PAGE + 1)
+                    .take_while(|k| sub.contains(k))
+                    .count()
+                    <= MAX_SWEEP_PAGE
+            })
+        })
+    }
+
+    /// Whether an asset can be removed (amendment 0043, `REQ-AS-10`, step 3): it is retiring, its
+    /// sweep has covered every ledger account and grant with no finding, and the point checks of
+    /// the retirement still hold. Point reads only: the sweep did the rest, and while the asset is
+    /// retiring nothing new can name it, so what the sweep found clean is clean still.
+    pub fn asset_removable(&self, id: &AssetId) -> Result<(), StoreRefusal> {
+        self.never_held(id)?;
+        match self.retirements.get(id) {
+            Some(r) if r.complete() => Ok(()),
+            Some(_) => Err(StoreRefusal::Retirement(RetirementRefusal::SweepIncomplete)),
+            None => Err(StoreRefusal::Retirement(RetirementRefusal::NotRetiring)),
+        }
     }
 
     /// Whether an identity owns an account in owned custody, closed or not: one point read
@@ -1870,8 +2096,27 @@ mod tests {
         assert!(s.owned_custody_consistent());
     }
 
-    /// Amendment 0043, `REQ-AS-10`, `INV-24`: the store removes an asset only when nothing in the
-    /// book names it, retires its tag, and takes a fresh registration of the same id.
+    /// A page covering a whole kind: the store's tests hold few records.
+    fn whole_kind(kind: u8) -> Subtree {
+        let mut start = [0u8; 16];
+        start[0] = kind;
+        Subtree::new(start, 8).unwrap()
+    }
+
+    /// Retire `id` and sweep it in two pages, the accounts then the grants.
+    fn retire_and_sweep(s: &mut State, id: AssetId) {
+        s.commit(&[Write::RetireAsset(id)]).unwrap();
+        for k in [kind::LEDGER_ACCOUNT, kind::GRANT] {
+            s.commit(&[Write::SweepPage {
+                asset: id,
+                page: whole_kind(k),
+            }])
+            .unwrap();
+        }
+    }
+
+    /// Amendment 0043, `REQ-AS-10`, `INV-24`: the store removes an asset only once it is retiring
+    /// and swept, retires its tag, and takes a fresh registration of the same id.
     #[test]
     fn req_as_10_the_store_removes_an_unused_asset_and_retires_its_tag() {
         let (mut s, _, _) = seeded();
@@ -1879,19 +2124,53 @@ mod tests {
         let before = s.registry().digest();
         let unknown = AssetId::parse("NOPE").unwrap();
         assert_eq!(
-            s.asset_removable(&unknown),
+            s.asset_retirable(&unknown),
             Err(StoreRefusal::Registry(RegistryError::NotRegistered(
                 unknown
             )))
         );
-        assert_eq!(s.asset_removable(&usd()), Ok(()));
+        // Not retiring: not removed.
+        assert_eq!(
+            s.commit(&[Write::RemoveAsset(usd())]),
+            Err(StoreRefusal::Retirement(RetirementRefusal::NotRetiring))
+        );
+        assert_eq!(s.asset_retirable(&usd()), Ok(()));
         // A dry run changes nothing.
-        s.check(&[Write::RemoveAsset(usd())]).unwrap();
+        s.check(&[Write::RetireAsset(usd())]).unwrap();
         assert_eq!(s.registry().digest(), before);
+        s.commit(&[Write::RetireAsset(usd())]).unwrap();
+        assert_eq!(
+            s.retirement(&usd()),
+            Some(AssetRetirement {
+                before: AssetStatus::Active,
+                cursor: SWEEP_START
+            })
+        );
+        assert_eq!(
+            s.commit(&[Write::RemoveAsset(usd())]),
+            Err(StoreRefusal::Retirement(RetirementRefusal::SweepIncomplete))
+        );
+        // Out of order: the grants before the accounts.
+        assert_eq!(
+            s.commit(&[Write::SweepPage {
+                asset: usd(),
+                page: whole_kind(kind::GRANT)
+            }]),
+            Err(StoreRefusal::Retirement(RetirementRefusal::NotAtCursor))
+        );
+        for k in [kind::LEDGER_ACCOUNT, kind::GRANT] {
+            s.commit(&[Write::SweepPage {
+                asset: usd(),
+                page: whole_kind(k),
+            }])
+            .unwrap();
+        }
+        assert!(s.retirement(&usd()).unwrap().complete());
         s.commit(&[Write::RemoveAsset(usd())]).unwrap();
         assert!(s.registry().get(&usd()).is_err());
+        assert!(s.retirement(&usd()).is_none());
         assert_ne!(s.registry().digest(), before);
-        // Removing it twice, or what was never there, is refused.
+        // Removing it twice is refused.
         assert_eq!(
             s.commit(&[Write::RemoveAsset(usd())]),
             Err(StoreRefusal::Registry(RegistryError::NotRegistered(usd())))
@@ -1907,8 +2186,10 @@ mod tests {
         assert_eq!(again.precision(), 6);
         assert!(again.tag().0 > tag.0);
         assert!(s.registry().by_tag(tag).is_none());
-        // A batch that fails after the removal puts the asset back, tag and all.
+        // A batch that fails after the removal puts the asset back, tag, retirement and all.
+        retire_and_sweep(&mut s, usd());
         let kept = *s.registry().get(&usd()).unwrap();
+        let retirement = s.retirement(&usd());
         let digest = s.registry().digest();
         assert!(
             s.commit(&[
@@ -1918,14 +2199,122 @@ mod tests {
             .is_err()
         );
         assert_eq!(s.registry().get(&usd()), Ok(&kept));
+        assert_eq!(s.retirement(&usd()), retirement);
         assert_eq!(s.registry().digest(), digest);
     }
 
+    /// Amendment 0043, `REQ-AS-10` step 1, `INV-24` at the store: a retiring asset takes no new
+    /// grant, Treasury limit, reservation, opening position, binding or deprecation; a
+    /// cancellation restores the status it had, deprecated included.
     #[test]
-    fn req_as_10_the_store_names_what_keeps_an_asset() {
-        let (mut s, person, _) = seeded();
-        // A Treasury account that declares a limit in the asset: it could be driven below zero
-        // with no issuance at all, and the limit counts the old precision's minor units.
+    fn req_as_10_the_store_refuses_every_new_use_of_a_retiring_asset() {
+        use crate::authority::GrantKind;
+        let (mut s, person, acct) = seeded();
+        s.commit(&[Write::DeprecateAsset(usd())]).unwrap();
+        s.commit(&[Write::RetireAsset(usd())]).unwrap();
+        let retiring = Err(StoreRefusal::AssetRetiring(usd()));
+        let grant = |n, subject, assets| {
+            Grant::new(
+                mint(n, 0),
+                person.id(),
+                GrantTerms {
+                    kind: GrantKind::Delegated,
+                    principal: person.id(),
+                    subject,
+                    ops: NonEmptySet::one(OperationKind::Transfer),
+                    bounds: Bounds::new(
+                        Some(NonZeroMinor::new(Minor::new(5)).unwrap()),
+                        None,
+                        assets,
+                        None,
+                    )
+                    .unwrap(),
+                    parent: None,
+                    expires: None,
+                },
+                0,
+            )
+        };
+        assert_eq!(
+            s.commit(&[Write::PutGrant(grant(
+                20,
+                Subject::Account(acct.id()),
+                Some(NonEmptySet::one(usd()))
+            ))]),
+            retiring
+        );
+        let issuance = Grant::new(
+            mint(21, 0),
+            person.id(),
+            GrantTerms {
+                kind: GrantKind::Issuance,
+                principal: person.id(),
+                subject: Subject::Asset(usd()),
+                ops: NonEmptySet::one(OperationKind::Issue),
+                bounds: Bounds::new(
+                    Some(NonZeroMinor::new(Minor::new(5)).unwrap()),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+                parent: None,
+                expires: None,
+            },
+            0,
+        );
+        assert_eq!(s.commit(&[Write::PutGrant(issuance)]), retiring);
+        // A grant that names neither is taken.
+        s.commit(&[Write::PutGrant(grant(
+            22,
+            Subject::Account(acct.id()),
+            None,
+        ))])
+        .unwrap();
+        let treasury = LedgerAccount::new(
+            mint(23, 0),
+            person.id(),
+            AccountKind::Treasury,
+            Custody::Delegated,
+            0,
+            BTreeMap::from([(usd(), Minor::new(500))]),
+        )
+        .unwrap();
+        assert_eq!(s.commit(&[Write::PutAccount(treasury)]), retiring);
+        let loc = crate::asset::AssetLocation::parse("Here(9)").unwrap();
+        assert_eq!(
+            s.commit(&[Write::AssetBinding {
+                id: usd(),
+                binding: AssetBinding::Binding(loc),
+            }]),
+            Err(StoreRefusal::Registry(RegistryError::Retiring(usd())))
+        );
+        assert_eq!(
+            s.commit(&[Write::DeprecateAsset(usd())]),
+            Err(StoreRefusal::Registry(RegistryError::Retiring(usd())))
+        );
+        assert_eq!(
+            s.registry().active(&usd()).map(|a| a.id()),
+            Err(crate::Refusal::AssetDeprecated)
+        );
+        // Cancelled: deprecated again, as it was, and with no retirement record.
+        s.commit(&[Write::CancelRetirement(usd())]).unwrap();
+        assert_eq!(
+            s.registry().get(&usd()).unwrap().status(),
+            AssetStatus::Deprecated
+        );
+        assert!(s.retirement(&usd()).is_none());
+        assert_eq!(
+            s.commit(&[Write::CancelRetirement(usd())]),
+            Err(StoreRefusal::Retirement(RetirementRefusal::NotRetiring))
+        );
+    }
+
+    /// Amendment 0043, `REQ-AS-10` step 2: what a page finds, named, with the record.
+    #[test]
+    fn req_as_10_a_page_names_what_keeps_an_asset() {
+        use crate::authority::GrantKind;
+        let (mut s, person, acct) = seeded();
         let treasury = LedgerAccount::new(
             mint(3, 0),
             person.id(),
@@ -1936,12 +2325,26 @@ mod tests {
         )
         .unwrap();
         s.commit(&[Write::PutAccount(treasury.clone())]).unwrap();
-        let refused = Err(StoreRefusal::AssetInUse(AssetInUse::TreasuryLimit));
-        assert_eq!(s.asset_removable(&usd()), refused);
-        assert_eq!(s.commit(&[Write::RemoveAsset(usd())]), refused);
-        assert!(s.registry().get(&usd()).is_ok());
-        // An account that declares no limit in it does not keep it, and a rolled-back opening
-        // leaves no trace in the index.
+        s.commit(&[Write::RetireAsset(usd())]).unwrap();
+        let accounts = whole_kind(kind::LEDGER_ACCOUNT);
+        assert_eq!(
+            s.sweep_page(&usd(), &accounts),
+            Err(StoreRefusal::AssetInUse(AssetInUse::TreasuryLimit(
+                treasury.id()
+            )))
+        );
+        assert_eq!(
+            s.commit(&[Write::SweepPage {
+                asset: usd(),
+                page: accounts
+            }]),
+            Err(StoreRefusal::AssetInUse(AssetInUse::TreasuryLimit(
+                treasury.id()
+            )))
+        );
+        assert_eq!(s.retirement(&usd()).unwrap().cursor, SWEEP_START);
+
+        // Grants: one bounding the asset, one over it; revoked ones keep nothing.
         let eur = AssetId::parse("EUR").unwrap();
         s.commit(&[Write::RegisterAsset {
             id: eur,
@@ -1949,34 +2352,51 @@ mod tests {
             kind: AssetKind::Fiat,
         }])
         .unwrap();
-        assert_eq!(s.asset_removable(&eur), Ok(()));
-        let other = LedgerAccount::new(
-            mint(4, 0),
+        let bounded = Grant::new(
+            mint(7, 0),
             person.id(),
-            AccountKind::Treasury,
-            Custody::Delegated,
+            GrantTerms {
+                kind: GrantKind::Delegated,
+                principal: person.id(),
+                subject: Subject::Account(acct.id()),
+                ops: NonEmptySet::one(OperationKind::Transfer),
+                bounds: Bounds::new(None, None, Some(NonEmptySet::one(eur)), None).unwrap(),
+                parent: None,
+                expires: None,
+            },
             0,
-            BTreeMap::from([(eur, Minor::new(1))]),
-        )
-        .unwrap();
-        s.check(&[Write::PutAccount(other)]).unwrap();
-        assert_eq!(s.asset_removable(&eur), Ok(()));
-        // An asset that is being bound is not book-only.
-        let loc = crate::asset::AssetLocation::parse("Here(1)").unwrap();
-        s.commit(&[Write::AssetBinding {
-            id: eur,
-            binding: AssetBinding::Binding(loc),
+        );
+        s.commit(&[Write::PutGrant(bounded.clone())]).unwrap();
+        s.commit(&[Write::RetireAsset(eur)]).unwrap();
+        s.commit(&[Write::SweepPage {
+            asset: eur,
+            page: accounts,
         }])
         .unwrap();
+        let grants = whole_kind(kind::GRANT);
         assert_eq!(
-            s.asset_removable(&eur),
-            Err(StoreRefusal::Registry(RegistryError::NotBookOnly(eur)))
+            s.sweep_page(&eur, &grants),
+            Err(StoreRefusal::AssetInUse(AssetInUse::GrantBound(
+                bounded.id()
+            )))
         );
+        // The revocation is taken while it is retiring, and the page goes through.
+        s.commit(&[Write::Revoke(bounded.id(), 1)]).unwrap();
+        s.commit(&[Write::SweepPage {
+            asset: eur,
+            page: grants,
+        }])
+        .unwrap();
+        s.commit(&[Write::RemoveAsset(eur)]).unwrap();
     }
 
+    /// Amendment 0043, `REQ-AS-10` step 1: an asset with an opening position, a binding asked
+    /// for, or an unrevoked issuance grant in the index is never retired.
     #[test]
-    fn req_as_10_an_unrevoked_issuance_grant_or_an_opening_position_keeps_an_asset() {
+    fn req_as_10_an_opening_a_binding_or_a_live_issuance_grant_keeps_an_asset() {
         use crate::authority::GrantKind;
+        use crate::settlement::assets::{AssetBind, BindStatus};
+        use crate::settlement::store::SettlementWrite;
         let (mut s, person, _) = seeded();
         let w = Window {
             length: NonZeroU64::new(10).unwrap(),
@@ -1997,12 +2417,29 @@ mod tests {
             0,
         );
         s.commit(&[Write::PutGrant(grant.clone())]).unwrap();
-        let refused = Err(StoreRefusal::AssetInUse(AssetInUse::LiveGrant));
-        assert_eq!(s.asset_removable(&usd()), refused);
-        assert_eq!(s.commit(&[Write::RemoveAsset(usd())]), refused);
-        // Revoked, even though it has not expired: the asset can go.
+        let refused = Err(StoreRefusal::AssetInUse(AssetInUse::LiveGrant(grant.id())));
+        assert_eq!(s.asset_retirable(&usd()), refused);
+        assert_eq!(s.commit(&[Write::RetireAsset(usd())]), refused);
         s.commit(&[Write::Revoke(grant.id(), 1)]).unwrap();
-        assert_eq!(s.asset_removable(&usd()), Ok(()));
+        assert_eq!(s.asset_retirable(&usd()), Ok(()));
+
+        // A binding asked for, even one the layer refused, keeps it for good.
+        let bind = AssetBind {
+            reference: OperationId::from_ref(OperationRef([9; 16])),
+            asset: usd(),
+            location: crate::asset::tests::loc(1),
+            amount: Minor::new(0),
+            requested_at: 1,
+            status: BindStatus::Pending,
+            coordinate: None,
+        };
+        let (mut t, _, _) = seeded();
+        t.commit(&[Write::Settlement(SettlementWrite::AssetBind(bind))])
+            .unwrap();
+        assert_eq!(
+            t.asset_retirable(&usd()),
+            Err(StoreRefusal::AssetInUse(AssetInUse::Binding))
+        );
 
         // An opening position opened for it keeps it for good.
         let operator = Identity::new(mint(11, 0), IdentityKind::Organisation, None).unwrap();
@@ -2039,73 +2476,20 @@ mod tests {
         }])
         .unwrap();
         let refused = Err(StoreRefusal::AssetInUse(AssetInUse::Opening));
-        assert_eq!(s.asset_removable(&usd()), refused);
-        assert_eq!(s.commit(&[Write::RemoveAsset(usd())]), refused);
+        assert_eq!(s.asset_retirable(&usd()), refused);
+        assert_eq!(s.commit(&[Write::RetireAsset(usd())]), refused);
     }
 
-    /// Amendment 0043, `REQ-AS-10`, check 2: an asset that was ever asked to bind keeps its record,
-    /// even when the layer refused it and the registry says book-only again.
+    /// `DEC-28`: the host's suggestion is the largest page that fits at the cursor.
     #[test]
-    fn req_as_10_an_asset_that_was_ever_asked_to_bind_is_never_removed() {
-        use crate::settlement::assets::{AssetBind, BindStatus};
-        use crate::settlement::store::SettlementWrite;
+    fn dec_28_the_suggested_page_is_the_largest_that_fits() {
         let (mut s, _, _) = seeded();
-        let bind = AssetBind {
-            reference: OperationId::from_ref(OperationRef([9; 16])),
-            asset: usd(),
-            location: crate::asset::tests::loc(1),
-            amount: Minor::new(0),
-            requested_at: 1,
-            status: BindStatus::Pending,
-            coordinate: None,
-        };
-        s.commit(&[Write::Settlement(SettlementWrite::AssetBind(bind))])
-            .unwrap();
-        let refused = Err(StoreRefusal::AssetInUse(AssetInUse::Binding));
-        assert_eq!(s.asset_removable(&usd()), refused);
-        assert_eq!(s.commit(&[Write::RemoveAsset(usd())]), refused);
-        assert!(s.registry().get(&usd()).is_ok());
-    }
-
-    /// Amendment 0043, `REQ-AS-10`, checks 3 and 4: both are read from the grants and accounts
-    /// themselves, whatever order they were written in and whichever rules version wrote them.
-    #[test]
-    fn req_as_10_grants_and_treasury_limits_are_read_directly_from_the_records() {
-        use crate::authority::GrantKind;
-        let (mut s, person, acct) = seeded();
-        // A delegated grant over an account, bounding the assets it covers (not an asset subject).
-        let bounded = Grant::new(
-            mint(7, 0),
-            person.id(),
-            GrantTerms {
-                kind: GrantKind::Delegated,
-                principal: person.id(),
-                subject: Subject::Account(acct.id()),
-                ops: NonEmptySet::one(OperationKind::Transfer),
-                bounds: Bounds::new(None, None, Some(NonEmptySet::one(usd())), None).unwrap(),
-                parent: None,
-                expires: None,
-            },
-            0,
-        );
-        s.commit(&[Write::PutGrant(bounded.clone())]).unwrap();
-        let refused = Err(StoreRefusal::AssetInUse(AssetInUse::GrantBound));
-        assert_eq!(s.asset_removable(&usd()), refused);
-        s.commit(&[Write::Revoke(bounded.id(), 1)]).unwrap();
-        assert_eq!(s.asset_removable(&usd()), Ok(()));
-        // A closed Treasury account that declared a limit still keeps the asset.
-        let treasury = LedgerAccount::new(
-            mint(8, 0),
-            person.id(),
-            AccountKind::Treasury,
-            Custody::Delegated,
-            0,
-            BTreeMap::from([(usd(), Minor::new(1))]),
-        )
-        .unwrap();
-        s.commit(&[Write::PutAccount(treasury)]).unwrap();
-        let refused = Err(StoreRefusal::AssetInUse(AssetInUse::TreasuryLimit));
-        assert_eq!(s.asset_removable(&usd()), refused);
+        assert_eq!(s.suggest_sweep_level(&SWEEP_START), Some(8));
+        s.commit(&[Write::RetireAsset(usd())]).unwrap();
+        assert_eq!(s.suggest_sweep_level(&SWEEP_END), None);
+        let page = whole_kind(kind::LEDGER_ACCOUNT);
+        assert_eq!(page.end(), Some(whole_kind(kind::GRANT).start()));
+        assert_eq!(whole_kind(kind::GRANT).end(), Some(SWEEP_END));
     }
 
     #[test]

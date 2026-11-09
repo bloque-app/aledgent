@@ -720,6 +720,17 @@ fn decided<T>(
     }
 }
 
+/// Where an asset's sweep goes next (amendment 0043): absent once it is complete.
+fn sweep_next(n: Option<ledger_core::ledger::operator::SweepNext>) -> CommandResult {
+    CommandResult {
+        sweep: n.map(|n| crate::wire::SweepNextBody {
+            start: hex::encode(n.start),
+            level: n.level,
+        }),
+        ..CommandResult::default()
+    }
+}
+
 fn postings(v: Vec<u64>) -> CommandResult {
     CommandResult {
         postings: v,
@@ -1247,6 +1258,17 @@ impl<S: LeafStore, V: VaultBackend> Running<S, V> {
             }
             OperatorOp::RemoveAsset(a, r) => {
                 decided(&reference, l.remove_asset(ctx, a, r, why)?, nothing)
+            }
+            OperatorOp::RetireAsset(a, r) => {
+                decided(&reference, l.retire_asset(ctx, a, r, why)?, sweep_next)
+            }
+            OperatorOp::SweepAssetUses(a, page) => decided(
+                &reference,
+                l.sweep_asset_uses(ctx, a, page, why)?,
+                sweep_next,
+            ),
+            OperatorOp::CancelAssetRetirement(a) => {
+                decided(&reference, l.cancel_asset_retirement(ctx, a, why)?, nothing)
             }
             OperatorOp::BindAsset(a, loc) => {
                 decided(&reference, l.bind_asset(ctx, a, loc, why)?, |_| {

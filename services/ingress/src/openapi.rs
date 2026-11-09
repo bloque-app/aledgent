@@ -126,6 +126,9 @@ fn request_schema(route: CommandRoute) -> &'static str {
         CommandRoute::RegisterAsset => "RegisterAssetBody",
         CommandRoute::DeprecateAsset => "DeprecateAssetBody",
         CommandRoute::RemoveAsset => "RemoveAssetBody",
+        CommandRoute::RetireAsset => "RetireAssetBody",
+        CommandRoute::SweepAssetUses => "SweepAssetBody",
+        CommandRoute::CancelAssetRetirement => "JustifiedBody",
         CommandRoute::BindAsset => "BindAssetBody",
         CommandRoute::GrantIssuance => "GrantIssuanceBody",
         CommandRoute::GrantOperator => "GrantOperatorBody",
@@ -434,6 +437,8 @@ fn schemas() -> Map<String, Value> {
     add::<RegisterAssetBody>(&mut g);
     add::<DeprecateAssetBody>(&mut g);
     add::<RemoveAssetBody>(&mut g);
+    add::<crate::wire::RetireAssetBody>(&mut g);
+    add::<crate::wire::SweepAssetBody>(&mut g);
     add::<crate::wire::BindAssetBody>(&mut g);
     add::<GrantIssuanceBody>(&mut g);
     add::<GrantOperatorBody>(&mut g);
