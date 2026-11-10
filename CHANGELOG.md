@@ -8,6 +8,21 @@ SPDX-License-Identifier: CC-BY-4.0
 Releases are cut by release-please from the conventional-commit titles of the pull requests merged
 into `main` (`release-please-config.json`). Each entry below is written by its release pull request.
 
+## [0.5.0](https://github.com/bloque-app/aledgent/compare/v0.4.1...v0.5.0) (2026-11-10)
+
+
+### Features
+
+* **core:** T-003-12 remove a never-used asset: retire, sweep, remove; rules version 2 (amendment 0043) ([#123](https://github.com/bloque-app/aledgent/issues/123)) ([6c434a6](https://github.com/bloque-app/aledgent/commit/6c434a67262417dc7d3b2b5c659bd2843b6b1488))
+* **ops:** opsctl reconcile, the daily reconciliation run (T-018-12) ([#122](https://github.com/bloque-app/aledgent/issues/122)) ([71a19c1](https://github.com/bloque-app/aledgent/commit/71a19c1f63b683c7b74e401862eee8e881b5dd89))
+* promote develop to main (rules version 2, amendment 0043: remove a never-used asset) ([a82500e](https://github.com/bloque-app/aledgent/commit/a82500e935d32c7501fbd227089280fa2f11bf68))
+
+
+### Bug Fixes
+
+* **core:** decide each input at the writer's input number, not the executor's count (T-037-05) ([#126](https://github.com/bloque-app/aledgent/issues/126)) ([2ff081a](https://github.com/bloque-app/aledgent/commit/2ff081afdd3585dc3632132745bdb94c17a9788f))
+* promote develop to main (the host decides each input at the writer's input number) ([31663e4](https://github.com/bloque-app/aledgent/commit/31663e4a7a8bbaec934b7a937dc3136968ef4b9d))
+
 ## [0.4.1](https://github.com/bloque-app/aledgent/compare/v0.4.0...v0.4.1) (2026-11-03)
 
 
