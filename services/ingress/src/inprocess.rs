@@ -932,6 +932,18 @@ impl<S: LeafStore, V: VaultBackend> Running<S, V> {
         })
     }
 
+    /// Number the next input this executor decides `next` (`T-037-05`): what a writer that numbers
+    /// its inputs itself sets before each one, so that the input is decided as the writer's `next`th,
+    /// as its Agent decides it. The core Agent's host (`core_binding::core::AgentCore`) does: its
+    /// executor is made over a replica the driver has already brought to the Agent's input, so the
+    /// count from 1 that [`Running::new`] starts at is not the book's. Decided as input 1, an
+    /// `upgrade` whose `from` is within the lead of its real input was refused by the host and
+    /// accepted by the Agent, which then read a leaf its witness did not hold, and the core halted
+    /// (test r10, 2026-11-10).
+    pub fn set_next_seq(&mut self, next: u64) {
+        self.next_seq = next;
+    }
+
     /// Execute one input against the ledger: what [`Core::apply`] does, without the journal or
     /// the input numbering.
     pub fn execute(&mut self, input: &CoreInput) -> Outcome {
