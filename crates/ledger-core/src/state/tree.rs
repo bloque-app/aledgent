@@ -37,6 +37,7 @@ impl LeafHost for State {
         out.push(&self.accounts);
         out.push(&self.by_owner);
         out.push(&self.owned_custody);
+        out.push(&self.retirements);
         out.push(&self.credentials);
         out.push(&self.sets);
         out.push(&self.grants);
@@ -66,6 +67,7 @@ impl LeafHost for State {
         out.push(&mut self.accounts);
         out.push(&mut self.by_owner);
         out.push(&mut self.owned_custody);
+        out.push(&mut self.retirements);
         out.push(&mut self.credentials);
         out.push(&mut self.sets);
         out.push(&mut self.grants);
@@ -133,6 +135,17 @@ impl State {
     /// Load witnessed leaves into a partial store, and mark `whole` kinds as given whole. A leaf
     /// of no kind the store keeps, a key given twice, or a non-canonical key is refused.
     pub fn load_leaves(&mut self, leaves: &[LeafEntry], whole: &[u8]) -> Result<(), DecodeError> {
+        self.load_leaves_with(leaves, whole, &[])
+    }
+
+    /// [`State::load_leaves`], and mark each of `subtrees` as given whole in its kind's map: the
+    /// subtrees the witness proved complete (amendment 0043, `crate::leaves::Subtree`).
+    pub fn load_leaves_with(
+        &mut self,
+        leaves: &[LeafEntry],
+        whole: &[u8],
+        subtrees: &[crate::leaves::Subtree],
+    ) -> Result<(), DecodeError> {
         let mut maps = self.maps_mut();
         let mut by_kind: [Option<usize>; 256] = [None; 256];
         for (i, m) in maps.iter().enumerate() {
@@ -147,6 +160,12 @@ impl State {
         for kind in whole {
             let i = by_kind[usize::from(*kind)].ok_or(DecodeError("no such leaf kind"))?;
             maps[i].set_complete();
+        }
+        // A subtree of a kind the store does not keep holds nothing it could read: no claim.
+        for sub in subtrees {
+            if let Some(i) = by_kind[usize::from(sub.kind())] {
+                maps[i].set_subtree_complete(*sub);
+            }
         }
         Ok(())
     }

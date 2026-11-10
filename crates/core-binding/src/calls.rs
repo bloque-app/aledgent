@@ -289,6 +289,30 @@ pub fn apply<S: LeafStore, V: VaultBackend>(
             justification,
         } => s(l.deprecate_asset(ctx, *asset, *review, justification)),
         #[cfg(feature = "operator")]
+        C::RemoveAsset {
+            ctx,
+            asset,
+            review,
+            justification,
+        } => s(l.remove_asset(ctx, *asset, *review, justification)),
+        #[cfg(feature = "operator")]
+        C::RetireAsset {
+            ctx,
+            asset,
+            step,
+            justification,
+        } => match step {
+            ledger_core::ledger::operator::RetireStep::Begin { review } => {
+                s(l.retire_asset(ctx, *asset, *review, justification))
+            }
+            ledger_core::ledger::operator::RetireStep::Sweep(page) => {
+                s(l.sweep_asset_uses(ctx, *asset, *page, justification))
+            }
+            ledger_core::ledger::operator::RetireStep::Cancel => {
+                s(l.cancel_asset_retirement(ctx, *asset, justification))
+            }
+        },
+        #[cfg(feature = "operator")]
         C::BindAsset {
             ctx,
             asset,

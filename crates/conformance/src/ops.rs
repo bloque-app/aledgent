@@ -90,6 +90,14 @@ pub trait OperatorPort {
         review: ReviewRef,
         justification: &[u8],
     ) -> Result<Accepted<()>, Refusal>;
+    /// Remove an asset registered book-only and never used (amendment 0043).
+    fn remove_asset(
+        &mut self,
+        ctx: &Ctx,
+        asset: AssetId,
+        review: ReviewRef,
+        justification: &[u8],
+    ) -> Result<Accepted<()>, Refusal>;
     /// Grant issuance authority on the operator surface.
     fn grant_issuance(
         &mut self,
@@ -241,6 +249,16 @@ impl<S: LeafStore, V: VaultBackend> OperatorPort for Ledger<S, V> {
         justification: &[u8],
     ) -> Result<Accepted<()>, Refusal> {
         Ledger::deprecate_asset(self, ctx, asset, review, justification)
+    }
+
+    fn remove_asset(
+        &mut self,
+        ctx: &Ctx,
+        asset: AssetId,
+        review: ReviewRef,
+        justification: &[u8],
+    ) -> Result<Accepted<()>, Refusal> {
+        Ledger::remove_asset(self, ctx, asset, review, justification)
     }
 
     fn grant_issuance(

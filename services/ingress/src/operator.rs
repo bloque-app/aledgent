@@ -17,7 +17,7 @@ use ledger_core::authority::OperationKind;
 use ledger_core::id::{AccountId, GrantId, IdentityId, OperationId};
 use ledger_core::ledger::GrantRequest;
 use ledger_core::ledger::operator::{
-    RegisterAsset, ResolutionEvidence, Resolve, ReviewRef, SubmitEvidence,
+    RegisterAsset, ResolutionEvidence, Resolve, ReviewRef, SubmitEvidence, SweepPage,
 };
 use ledger_core::lifecycle::Resolution;
 use ledger_core::operator::OperatorOpKind;
@@ -58,6 +58,14 @@ pub enum OperatorOp {
     RegisterAsset(RegisterAsset),
     /// Deprecate an asset.
     DeprecateAsset(AssetId, ReviewRef),
+    /// Remove an asset registered book-only and never used (amendment 0043).
+    RemoveAsset(AssetId, ReviewRef),
+    /// Retire an asset to be removed (amendment 0043).
+    RetireAsset(AssetId, ReviewRef),
+    /// One page of a retiring asset's sweep (amendment 0043).
+    SweepAssetUses(AssetId, SweepPage),
+    /// Cancel an asset's retirement (amendment 0043).
+    CancelAssetRetirement(AssetId),
     /// `bind_asset` (amendment 0011, `REQ-AS-8`).
     BindAsset(AssetId, AssetLocation),
     /// Grant issuance authority.
@@ -186,6 +194,14 @@ fn grant(s: &str) -> Result<GrantId, Refusal> {
     GrantId::parse(s).map_err(|_| Refusal::MalformedCommand)
 }
 
+/// A sweep's cursor: 16 bytes of hex (amendment 0043).
+fn cursor(s: &str) -> Result<[u8; 16], Refusal> {
+    hex::decode(s)
+        .ok()
+        .and_then(|v| <[u8; 16]>::try_from(v).ok())
+        .ok_or(Refusal::MalformedCommand)
+}
+
 fn review(s: &str) -> Result<ReviewRef, Refusal> {
     hex::decode(s)
         .ok()
@@ -213,7 +229,7 @@ fn asset_kind_name(k: AssetKind) -> &'static str {
     }
 }
 
-const KINDS: [(OperatorOpKindBody, OperatorOpKind); 19] = [
+const KINDS: [(OperatorOpKindBody, OperatorOpKind); 20] = [
     (
         OperatorOpKindBody::ResolveOperation,
         OperatorOpKind::ResolveOperation,
@@ -243,6 +259,7 @@ const KINDS: [(OperatorOpKindBody, OperatorOpKind); 19] = [
         OperatorOpKindBody::DeprecateAsset,
         OperatorOpKind::DeprecateAsset,
     ),
+    (OperatorOpKindBody::RemoveAsset, OperatorOpKind::RemoveAsset),
     (
         OperatorOpKindBody::IssuanceAuthority,
         OperatorOpKind::IssuanceAuthority,
@@ -397,6 +414,44 @@ impl Justified {
                 justification,
             } => (
                 OperatorOp::DeprecateAsset(AssetId::parse(asset)?, review(r)?),
+                j(justification),
+            ),
+            OperatorCommand::RemoveAsset {
+                asset,
+                review: r,
+                justification,
+            } => (
+                OperatorOp::RemoveAsset(AssetId::parse(asset)?, review(r)?),
+                j(justification),
+            ),
+            OperatorCommand::RetireAsset {
+                asset,
+                review: r,
+                justification,
+            } => (
+                OperatorOp::RetireAsset(AssetId::parse(asset)?, review(r)?),
+                j(justification),
+            ),
+            OperatorCommand::SweepAssetUses {
+                asset,
+                start,
+                level,
+                justification,
+            } => (
+                OperatorOp::SweepAssetUses(
+                    AssetId::parse(asset)?,
+                    SweepPage {
+                        start: cursor(start)?,
+                        level: *level,
+                    },
+                ),
+                j(justification),
+            ),
+            OperatorCommand::CancelAssetRetirement {
+                asset,
+                justification,
+            } => (
+                OperatorOp::CancelAssetRetirement(AssetId::parse(asset)?),
                 j(justification),
             ),
             OperatorCommand::BindAsset {
@@ -619,6 +674,26 @@ impl Justified {
             OperatorOp::DeprecateAsset(a, r) => OperatorCommand::DeprecateAsset {
                 asset: a.as_str().to_owned(),
                 review: hex::encode(r.0),
+                justification,
+            },
+            OperatorOp::RemoveAsset(a, r) => OperatorCommand::RemoveAsset {
+                asset: a.as_str().to_owned(),
+                review: hex::encode(r.0),
+                justification,
+            },
+            OperatorOp::RetireAsset(a, r) => OperatorCommand::RetireAsset {
+                asset: a.as_str().to_owned(),
+                review: hex::encode(r.0),
+                justification,
+            },
+            OperatorOp::SweepAssetUses(a, p) => OperatorCommand::SweepAssetUses {
+                asset: a.as_str().to_owned(),
+                start: hex::encode(p.start),
+                level: p.level,
+                justification,
+            },
+            OperatorOp::CancelAssetRetirement(a) => OperatorCommand::CancelAssetRetirement {
+                asset: a.as_str().to_owned(),
                 justification,
             },
             OperatorOp::BindAsset(a, l) => OperatorCommand::BindAsset {

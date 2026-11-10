@@ -172,6 +172,9 @@ fn req_id_7_a_principal_is_tied_to_at_most_one_party() {
 #[test]
 fn err_not_authorised_only_the_operator_registers_and_ties() {
     let mut fx = Fx::new();
+    // Every kind, the removal's included, which is taken from its rules version (amendment 0043).
+    fx.ledger
+        .set_generation(crate::asset::ASSET_RETIREMENT, false);
     let alice = fx.person();
     let org = organisation(&mut fx);
     let party = PartyId::of(org);

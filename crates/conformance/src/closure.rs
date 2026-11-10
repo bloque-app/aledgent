@@ -384,8 +384,9 @@ mod tests {
     fn there_is_no_allowance_in_force_and_the_core_carries_the_line_t_041_06() {
         // Rules version 1 is the core's release that ended amendment 0037's allowance: the line is
         // in `Refusal`, nothing is allowed to be missing, and the closed list equals §10 exactly.
+        // The core is built at 2 since amendment 0043's release, which keeps it so.
         assert!(SPEC_AHEAD_OF_PROGRAM.is_empty());
-        assert_eq!(core_generation(), Ok(1));
+        assert_eq!(core_generation(), Ok(2));
         assert!(
             refusals()
                 .iter()

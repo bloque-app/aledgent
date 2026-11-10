@@ -11,13 +11,16 @@ use ledger_kernel::store::LeafStore;
 use ledger_kernel::vault::VaultBackend;
 
 use super::digest;
-use crate::asset::{AssetBinding, AssetId, AssetKind, AssetLocation, Minor, RegistryError};
+use crate::asset::{
+    ASSET_RETIREMENT, AssetBinding, AssetId, AssetKind, AssetLocation, Minor, RegistryError,
+};
 use crate::audit::{AuditSubject, Justification};
 use crate::authority::AuthorityUsed;
 use crate::authority::{Bounds, Grant, GrantKind, GrantTerms, OperationKind, Subject};
 use crate::eval;
 use crate::id::{GrantId, Mint};
 use crate::identity::IdentityStatus;
+use crate::leaves::Subtree;
 use crate::ledger::GrantRequest;
 use crate::ledger::{Accepted, Ctx, Ledger};
 use crate::operator::OperatorOpKind;
@@ -25,7 +28,7 @@ use crate::principal::resolve;
 use crate::refusal::Refusal;
 use crate::settlement::assets::{AssetBind, BindStatus, admit};
 use crate::settlement::store::SettlementWrite;
-use crate::state::StoreRefusal;
+use crate::state::{AssetInUse, RetirementRefusal, StoreRefusal};
 use crate::state::{Command, Write};
 
 /// The reference of the reviewed change a registry change carries (`REQ-AS-2`): the review's
@@ -33,6 +36,46 @@ use crate::state::{Command, Write};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ReviewRef(pub [u8; 32]);
+
+/// One page of an asset's sweep, as the operator names it (amendment 0043, `REQ-AS-10`,
+/// `DEC-28`): the service-tree key it starts at, which must be the sweep's cursor, and how many
+/// leading bits of the key it fixes. It holds every ledger account or grant whose key lies in
+/// that subtree ([`crate::leaves::Subtree`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct SweepPage {
+    /// Where it starts.
+    pub start: [u8; 16],
+    /// Its level: 8 to 128.
+    pub level: u16,
+}
+
+/// A step of an asset's removal before `remove_asset` (amendment 0043, `REQ-AS-10`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum RetireStep {
+    /// `retire_asset`: freeze the asset and start its sweep, under a reviewed change.
+    Begin {
+        /// The reviewed change it comes from.
+        review: ReviewRef,
+    },
+    /// `sweep_asset_uses`: check one page.
+    Sweep(SweepPage),
+    /// `cancel_asset_retirement`: end the retirement; the asset has its status again.
+    Cancel,
+}
+
+/// Where a sweep goes next (amendment 0043): the page start the book takes, and the level of the
+/// largest page that fits there, as a host suggests it from its whole state (`None` from the core
+/// Agent, which has none). Never part of a decision: the next input carries the page as data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct SweepNext {
+    /// The cursor: where the next page must start.
+    pub start: [u8; 16],
+    /// The suggested level.
+    pub level: Option<u16>,
+}
 
 /// `register_asset`'s request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -185,6 +228,259 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                 vec![Write::DeprecateAsset(asset)],
                 (),
             )
+        })();
+        self.leave(top, || crate::call::Summary::of(&r));
+        r
+    }
+
+    /// Remove an asset (amendment 0043, `REQ-AS-10`, step 3): a reviewed change, recorded, for an
+    /// asset registered with the wrong precision and never used. The asset leaves the registry and
+    /// its tag is retired with it, so the same id can be registered again, at another precision,
+    /// and takes a fresh tag (`INV-24`).
+    ///
+    /// The core decides from its own state ([`crate::state::State::asset_removable`]) and refuses
+    /// with `ERR-NotAuthorised`, with an audit record, unless the asset is retiring, its sweep has
+    /// covered every ledger account and grant with no finding, and it is still book-only, never
+    /// asked to bind, with no opening and never held. An asset that is not registered is
+    /// `ERR-UnknownAsset`. A review reference of zeroes names no review: `ERR-NotAuthorised`.
+    /// Before [`ASSET_RETIREMENT`] it is `ERR-MalformedCommand`, and records nothing.
+    pub fn remove_asset(
+        &mut self,
+        ctx: &Ctx,
+        asset: AssetId,
+        review: ReviewRef,
+        justification: &[u8],
+    ) -> Result<Accepted<()>, Refusal> {
+        let top = self.enter(|| crate::call::Call::RemoveAsset {
+            ctx: *ctx,
+            asset,
+            review,
+            justification: justification.to_vec(),
+        });
+        // From its rules version only, and recorded at no earlier one (`ASSET_RETIREMENT`).
+        if self.generation() < ASSET_RETIREMENT {
+            self.cancel(top);
+            return Err(Refusal::MalformedCommand);
+        }
+        #[allow(clippy::redundant_closure_call)]
+        let r: Result<Accepted<()>, Refusal> = (|| {
+            let p = resolve(&self.state, &ctx.caller)?;
+            let d = digest("remove_asset", &p, justification, |c| {
+                c.bytes(asset.as_str().as_bytes());
+                c.bytes(&review.0);
+            });
+            if let Some(a) = self.replay(ctx, &p, &d, |_| ())? {
+                return Ok(a);
+            }
+            let command = Command::RemoveAsset;
+            let subjects = vec![AuditSubject::Asset(asset), AuditSubject::Review(review.0)];
+            let run = |l: &Self| -> Result<(AuthorityUsed, Justification), Refusal> {
+                let (used, j) = l.frame(&p, OperatorOpKind::RemoveAsset, justification, ctx.now)?;
+                if review.0 == [0; 32] {
+                    return Err(Refusal::NotAuthorised);
+                }
+                match l.state.asset_removable(&asset) {
+                    Ok(()) => Ok((used, j)),
+                    Err(StoreRefusal::Registry(RegistryError::NotRegistered(_))) => {
+                        Err(Refusal::UnknownAsset)
+                    }
+                    Err(_) => Err(Refusal::NotAuthorised),
+                }
+            };
+            let (used, j) = match run(self) {
+                Ok(x) => x,
+                Err(r) => return Err(self.refused(ctx, &p, command, subjects, r)),
+            };
+            self.commit_operator(
+                ctx,
+                &p,
+                d,
+                command,
+                used,
+                j,
+                Vec::new(),
+                subjects,
+                vec![Write::RemoveAsset(asset)],
+                (),
+            )
+        })();
+        self.leave(top, || crate::call::Summary::of(&r));
+        r
+    }
+
+    /// `retire_asset` (amendment 0043, `REQ-AS-10`, step 1): freeze an asset to be removed and
+    /// start its sweep. Refused with `ERR-NotAuthorised` unless the point checks hold
+    /// ([`crate::state::State::asset_retirable`]); an unknown asset is `ERR-UnknownAsset`, one
+    /// already retiring `ERR-InvalidTransition`. From this input nothing new may name the asset.
+    /// The value is where the sweep starts. Before [`ASSET_RETIREMENT`] it is
+    /// `ERR-MalformedCommand`, and records nothing.
+    pub fn retire_asset(
+        &mut self,
+        ctx: &Ctx,
+        asset: AssetId,
+        review: ReviewRef,
+        justification: &[u8],
+    ) -> Result<Accepted<Option<SweepNext>>, Refusal> {
+        self.retirement_step(ctx, asset, RetireStep::Begin { review }, justification)
+    }
+
+    /// `sweep_asset_uses` (amendment 0043, `REQ-AS-10`, step 2, `DEC-28`): check one page of a
+    /// retiring asset's sweep ([`crate::state::State::sweep_page`]). A clean page moves the cursor
+    /// past it; the value is where the next page starts, or `None` once the sweep is complete. A
+    /// Treasury limit in the asset or an unrevoked grant over or bounding it is `ERR-NotAuthorised`,
+    /// with the account or grant in the audit record, and the sweep stays where it was; a page that
+    /// is not at the cursor, or a sweep that is not running, `ERR-InvalidTransition`; a page with
+    /// more than [`crate::asset::MAX_SWEEP_PAGE`] leaves `ERR-BatchTooLarge`; a page outside the
+    /// accounts and grants, or not a subtree, `ERR-MalformedCommand`.
+    pub fn sweep_asset_uses(
+        &mut self,
+        ctx: &Ctx,
+        asset: AssetId,
+        page: SweepPage,
+        justification: &[u8],
+    ) -> Result<Accepted<Option<SweepNext>>, Refusal> {
+        self.retirement_step(ctx, asset, RetireStep::Sweep(page), justification)
+    }
+
+    /// `cancel_asset_retirement` (amendment 0043, `REQ-AS-10`): end a retirement; the asset has
+    /// the status it had before it. One that is not retiring is `ERR-InvalidTransition`.
+    pub fn cancel_asset_retirement(
+        &mut self,
+        ctx: &Ctx,
+        asset: AssetId,
+        justification: &[u8],
+    ) -> Result<Accepted<()>, Refusal> {
+        self.retirement_step(ctx, asset, RetireStep::Cancel, justification)
+            .map(|a| Accepted {
+                value: (),
+                record: a.record,
+                status: a.status,
+            })
+    }
+
+    /// Where the sweep of `asset` goes next, as it stands: `None` once it is complete or the
+    /// asset is not retiring.
+    fn sweep_next(&self, asset: &AssetId) -> Option<SweepNext> {
+        let r = self.state.retirement(asset).filter(|r| !r.complete())?;
+        Some(SweepNext {
+            start: r.cursor,
+            level: self.state.suggest_sweep_level(&r.cursor),
+        })
+    }
+
+    /// One step of a removal before `remove_asset`: the three share the call, the authority, the
+    /// rules version and the shape of the audit record.
+    fn retirement_step(
+        &mut self,
+        ctx: &Ctx,
+        asset: AssetId,
+        step: RetireStep,
+        justification: &[u8],
+    ) -> Result<Accepted<Option<SweepNext>>, Refusal> {
+        let top = self.enter(|| crate::call::Call::RetireAsset {
+            ctx: *ctx,
+            asset,
+            step,
+            justification: justification.to_vec(),
+        });
+        // From its rules version only, and recorded at no earlier one (`ASSET_RETIREMENT`): an
+        // older core Agent cannot decode the call.
+        if self.generation() < ASSET_RETIREMENT {
+            self.cancel(top);
+            return Err(Refusal::MalformedCommand);
+        }
+        #[allow(clippy::redundant_closure_call)]
+        let r: Result<Accepted<Option<SweepNext>>, Refusal> = (|| {
+            let p = resolve(&self.state, &ctx.caller)?;
+            let (method, command) = match step {
+                RetireStep::Begin { .. } => ("retire_asset", Command::RetireAsset),
+                RetireStep::Sweep(_) => ("sweep_asset_uses", Command::SweepAssetUses),
+                RetireStep::Cancel => ("cancel_asset_retirement", Command::CancelAssetRetirement),
+            };
+            let d = digest(method, &p, justification, |c| {
+                c.bytes(asset.as_str().as_bytes());
+                match step {
+                    RetireStep::Begin { review } => {
+                        c.bytes(&review.0);
+                    }
+                    RetireStep::Sweep(page) => {
+                        c.bytes(&page.start);
+                        c.u64(u64::from(page.level));
+                    }
+                    RetireStep::Cancel => {}
+                }
+            });
+            if let Some(a) = self.replay(ctx, &p, &d, |_| ())? {
+                return Ok(Accepted {
+                    value: self.sweep_next(&asset),
+                    record: a.record,
+                    status: a.status,
+                });
+            }
+            let mut subjects = vec![AuditSubject::Asset(asset)];
+            if let RetireStep::Begin { review } = step {
+                subjects.push(AuditSubject::Review(review.0));
+            }
+            type Run =
+                Result<(AuthorityUsed, Justification, Write), (Refusal, Option<AuditSubject>)>;
+            let run = |l: &Self| -> Run {
+                let (used, j) = l
+                    .frame(&p, OperatorOpKind::RemoveAsset, justification, ctx.now)
+                    .map_err(|r| (r, None))?;
+                let write = match step {
+                    RetireStep::Begin { review } => {
+                        if review.0 == [0; 32] {
+                            return Err((Refusal::NotAuthorised, None));
+                        }
+                        l.state
+                            .asset_retirable(&asset)
+                            .map_err(retirement_refusal)?;
+                        Write::RetireAsset(asset)
+                    }
+                    RetireStep::Sweep(page) => {
+                        let sub = Subtree::new(page.start, page.level)
+                            .ok_or((Refusal::MalformedCommand, None))?;
+                        l.state
+                            .sweep_page(&asset, &sub)
+                            .map_err(retirement_refusal)?;
+                        Write::SweepPage { asset, page: sub }
+                    }
+                    RetireStep::Cancel => {
+                        if l.state.registry().get(&asset).is_err() {
+                            return Err((Refusal::UnknownAsset, None));
+                        }
+                        if l.state.retirement(&asset).is_none() {
+                            return Err((Refusal::InvalidTransition, None));
+                        }
+                        Write::CancelRetirement(asset)
+                    }
+                };
+                Ok((used, j, write))
+            };
+            let (used, j, write) = match run(self) {
+                Ok(x) => x,
+                Err((r, found)) => {
+                    subjects.extend(found);
+                    return Err(self.refused(ctx, &p, command, subjects, r));
+                }
+            };
+            let accepted = self.commit_operator(
+                ctx,
+                &p,
+                d,
+                command,
+                used,
+                j,
+                Vec::new(),
+                subjects,
+                vec![write],
+                (),
+            )?;
+            Ok(Accepted {
+                value: self.sweep_next(&asset),
+                record: accepted.record,
+                status: accepted.status,
+            })
         })();
         self.leave(top, || crate::call::Summary::of(&r));
         r
@@ -480,5 +776,28 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
         })();
         self.leave(top, || crate::call::Summary::of(&r));
         r
+    }
+}
+
+/// The caller's refusal for a store refusal of a removal step, and the record a finding names for
+/// the audit trail (amendment 0043, `REQ-AS-10`).
+fn retirement_refusal(e: StoreRefusal) -> (Refusal, Option<AuditSubject>) {
+    match e {
+        StoreRefusal::Registry(RegistryError::NotRegistered(_)) => (Refusal::UnknownAsset, None),
+        StoreRefusal::Registry(RegistryError::Retiring(_))
+        | StoreRefusal::Retirement(
+            RetirementRefusal::NotRetiring | RetirementRefusal::NotAtCursor,
+        ) => (Refusal::InvalidTransition, None),
+        StoreRefusal::Retirement(RetirementRefusal::MalformedPage) => {
+            (Refusal::MalformedCommand, None)
+        }
+        StoreRefusal::Retirement(RetirementRefusal::PageTooLarge) => (Refusal::BatchTooLarge, None),
+        StoreRefusal::AssetInUse(AssetInUse::TreasuryLimit(a)) => {
+            (Refusal::NotAuthorised, Some(AuditSubject::Account(a)))
+        }
+        StoreRefusal::AssetInUse(AssetInUse::LiveGrant(g) | AssetInUse::GrantBound(g)) => {
+            (Refusal::NotAuthorised, Some(AuditSubject::Grant(g)))
+        }
+        _ => (Refusal::NotAuthorised, None),
     }
 }

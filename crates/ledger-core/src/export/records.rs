@@ -129,7 +129,11 @@ impl Canonical for AssetLocation {
 }
 
 tagged!(AssetKind { Fiat => 1, Stable => 2, Native => 3, Other => 4 });
-tagged!(AssetStatus { Active => 1, Deprecated => 2 });
+tagged!(AssetStatus {
+    Active => 1,
+    Deprecated => 2,
+    Retiring => 3,
+});
 
 impl Canonical for Minor {
     fn encode(&self, e: &mut Enc) {
@@ -497,6 +501,10 @@ tagged!(Command {
     ProposeMigration => 56,
     // 53 to 56 are `T-037-05`'s (`crate::audit::command_code`).
     Upgrade => 57,
+    RemoveAsset => 58,
+    RetireAsset => 59,
+    SweepAssetUses => 60,
+    CancelAssetRetirement => 61,
 });
 
 impl Canonical for OperationRecord {

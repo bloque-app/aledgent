@@ -674,6 +674,7 @@ pub fn asset(a: &Asset) -> AssetBody {
         status: match a.status() {
             AssetStatus::Active => "active",
             AssetStatus::Deprecated => "deprecated",
+            AssetStatus::Retiring => "retiring",
         }
         .to_owned(),
     }

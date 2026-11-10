@@ -87,11 +87,13 @@ pub enum OperatorOpKind {
     /// holder opens identities, and ledger accounts for any identity, as the operator does. Only
     /// the operator grants it.
     OpenIdentity,
+    /// Remove an asset that was registered book-only and never used (amendment 0043).
+    RemoveAsset,
 }
 
 impl OperatorOpKind {
     /// Every kind.
-    pub const ALL: [OperatorOpKind; 19] = [
+    pub const ALL: [OperatorOpKind; 20] = [
         OperatorOpKind::ResolveOperation,
         OperatorOpKind::Resume,
         OperatorOpKind::ProposeReversal,
@@ -111,7 +113,19 @@ impl OperatorOpKind {
         OperatorOpKind::ReadSignals,
         OperatorOpKind::ImportCredentials,
         OperatorOpKind::OpenIdentity,
+        OperatorOpKind::RemoveAsset,
     ];
+
+    /// Whether `kinds` is a catch-all: it holds every kind there was before `RemoveAsset` (amendment
+    /// 0043). Counting the kinds would make a grant of the nineteen older ones stop being a
+    /// catch-all the day a twentieth is added, and an input decided before it would replay
+    /// differently.
+    pub fn is_catch_all(kinds: &crate::set::NonEmptySet<OperatorOpKind>) -> bool {
+        OperatorOpKind::ALL
+            .iter()
+            .filter(|k| **k != OperatorOpKind::RemoveAsset)
+            .all(|k| kinds.contains(k))
+    }
 
     /// A stable one-byte code. Never reorder.
     pub const fn code(self) -> u8 {
@@ -135,6 +149,7 @@ impl OperatorOpKind {
             OperatorOpKind::ReadSignals => 17,
             OperatorOpKind::ImportCredentials => 18,
             OperatorOpKind::OpenIdentity => 19,
+            OperatorOpKind::RemoveAsset => 20,
         }
     }
 }
@@ -540,7 +555,7 @@ impl OpsState {
                 if g.revoked.is_some() {
                     return Err(OpsRefusal::Absorbing);
                 }
-                if g.kinds.len() >= OperatorOpKind::ALL.len() {
+                if OperatorOpKind::is_catch_all(&g.kinds) {
                     return Err(OpsRefusal::CatchAll);
                 }
                 if g.kinds.contains(&OperatorOpKind::OpenIdentity)

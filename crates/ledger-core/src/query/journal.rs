@@ -435,6 +435,13 @@ impl Journal {
         }
     }
 
+    /// Whether any posting has ever touched `account` in `asset`. The running sums of a position
+    /// are removed only when an undo takes its last posting back, so once a posting is final they
+    /// are permanent: a position that holds nothing now but did once still answers `true`.
+    pub fn touched(&self, account: &AccountId, asset: &AssetId) -> bool {
+        self.running.contains_key(&(*account, *asset))
+    }
+
     /// How many postings are recorded.
     pub fn len(&self) -> usize {
         self.entries.len()

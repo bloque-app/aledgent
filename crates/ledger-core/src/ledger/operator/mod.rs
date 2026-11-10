@@ -290,6 +290,14 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             expires,
             justification: justification.to_vec(),
         });
+        // The removal's kind (20) is decodable only from its rules version (amendment 0043,
+        // `ASSET_RETIREMENT`): before it the grant is malformed, and recorded nowhere.
+        if kinds.contains(&OperatorOpKind::RemoveAsset)
+            && self.generation() < crate::asset::ASSET_RETIREMENT
+        {
+            self.cancel(top);
+            return Err(Refusal::MalformedCommand);
+        }
         #[allow(clippy::redundant_closure_call)]
         let r: Result<Accepted<GrantId>, Refusal> = (|| {
             let p = resolve(&self.state, &ctx.caller)?;
@@ -312,7 +320,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                     return Err(Refusal::NotAuthorised);
                 }
                 let j = Justification::new(justification)?;
-                if kinds.len() >= OperatorOpKind::ALL.len() {
+                if OperatorOpKind::is_catch_all(&kinds) {
                     return Err(Refusal::UnboundedGrant);
                 }
                 // The identities principal's role is a grant of its own, held by one principal at
@@ -623,6 +631,6 @@ pub use signals::{Signals, SpecSignal, anchor_incident_name, incident_name};
 pub use aliases::MAX_ALIAS_REFERENCE;
 pub use export::{ImportFailure, ImportTarget, Imported, openings_of};
 pub use opening::LoadReport;
-pub use registry::{RegisterAsset, ReviewRef};
+pub use registry::{RegisterAsset, RetireStep, ReviewRef, SweepNext, SweepPage};
 pub use resolution::{ResolutionEvidence, Resolve, SubmitEvidence};
 pub use upgrade::CodeInput;

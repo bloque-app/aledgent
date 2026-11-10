@@ -511,9 +511,13 @@ fn input(
     };
     // The service leaves the input touches, proven against the Agent's service root, as a
     // partial store that refuses anything else (`crate::service`).
-    let service: ServiceWitness =
+    let mut service: ServiceWitness =
         decode(&blob(inv, &i.service, "service")?).map_err(AgentRefusal::Malformed)?;
+    // The subtrees the calls read whole come from the calls, never from the host (amendment
+    // 0043): the witness proves them or the store fails closed on them.
+    service.claims = crate::service::claims_of(&i.calls);
     service.verify(&hot.service_root).map_err(service_refusal)?;
+    let subtrees = service.proven_claims().map_err(service_refusal)?;
     if service.whole.contains(&kind::DELIVERED) {
         return Err(AgentRefusal::Malformed(String::from(
             "deliveries witnessed whole",
@@ -528,7 +532,7 @@ fn input(
         .collect();
     let mut state = State::partial(&hot.audit());
     state
-        .load_leaves(&library, &service.whole)
+        .load_leaves_with(&library, &service.whole, &subtrees)
         .map_err(|e| AgentRefusal::Witness(alloc::format!("service: {e:?}")))?;
     drop(library);
     let config: LifecycleConfig = decode(
