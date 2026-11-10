@@ -1639,6 +1639,13 @@ impl<P: AgentPort> Inner<P> {
                     .map(|id| (id.0, *at)),
                 _ => None,
             };
+            // The input is decided as the number the driver gives it (`Driver::stage` prepares the
+            // replica for the next input as it stages each), as the Agent decides it: never as the
+            // executor's own count, which starts at 1 whenever the executor is made (`T-037-05`).
+            let next = running.ledger().input();
+            if next > 0 {
+                running.set_next_seq(next);
+            }
             let outcome = running.execute(input);
             let deliveries = match (&outcome, delivery) {
                 (Outcome::Recorded { known: true, .. }, Some(d)) => vec![d],

@@ -837,3 +837,58 @@ async fn t037_23_the_signals_show_the_writers_code_generation_and_scheduled_upgr
     assert_eq!(after["generation"], 1);
     assert!(after.get("upgrade").is_none(), "{after}");
 }
+
+/// `T-037-04`, `T-037-05`, `REQ-RT-16`: the host decides each input as the number the writer gives
+/// it, as the Agent does. An upgrade whose `from` is exactly the lead (`MAX_LEAD`) past its own
+/// input is within the lead, and is accepted, by both. Decided as the executor's own count from 1
+/// (input 1), the host refused it `ERR-InvalidTransition` while the Agent accepted it and read the
+/// client-key leaf of a command the host never witnessed: `Refused(UnprovenRead)` twice, and the
+/// core halted (test r10, 2026-11-10: `from` 185,997 at input 185,977, past `MAX_LEAD` from 1).
+/// Before the fix this answered 503 and halted the core; after it, the upgrade is scheduled.
+#[tokio::test(flavor = "multi_thread")]
+async fn t037_04_the_host_decides_an_upgrade_at_the_writers_input_number_not_its_own_count() {
+    let w = world().await;
+    let op = operator(&w);
+    // A few inputs first, so the writer's number is past 1.
+    for k in 0..3 {
+        let (s, _) =
+            w.d.call(
+                "POST",
+                "/v1/identities",
+                Some(&op),
+                &[("client-key", &format!("lead-{k}"))],
+                Some(json!({ "kind": "person", "verifier": "0a" })),
+            )
+            .await;
+        assert_eq!(s.as_u16(), 200);
+    }
+    let before = hot(&w);
+    assert!(before.inputs >= 3);
+    let input = before.inputs + 1;
+    let h1 = w.code.version(1);
+    let from = input + ledger_core::code::authority::MAX_LEAD;
+    let (s, v) =
+        w.d.call(
+            "POST",
+            "/v1/ops/upgrade",
+            Some(&op),
+            &[("client-key", "upgrade-at-the-lead")],
+            Some(upgrade_body(&h1, from)),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "decided by host and Agent alike: {v}");
+    let after = hot(&w);
+    assert_eq!(after.inputs, input, "the upgrade is input {input}");
+    assert_eq!(after.upgrade, Some((h1, from)), "scheduled from {from}");
+    // The core is not halted: the next command is decided.
+    let (s, v) =
+        w.d.call(
+            "POST",
+            "/v1/identities",
+            Some(&op),
+            &[("client-key", "after-the-lead")],
+            Some(json!({ "kind": "person", "verifier": "0a" })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+}
