@@ -984,6 +984,53 @@ pub struct DeprecateAssetBody {
     pub justification: String,
 }
 
+/// `remove_asset` of the asset in the path (amendment 0043, `REQ-AS-10`): remove an asset that
+/// was registered book-only and never used, so its id can be registered again.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RemoveAssetBody {
+    /// The reviewed change it comes from, 32 bytes of hex.
+    pub review: String,
+    /// Why.
+    pub justification: String,
+}
+
+/// `retire_asset` of the asset in the path (amendment 0043, `REQ-AS-10`): freeze an asset to be
+/// removed, and start its sweep.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RetireAssetBody {
+    /// The reviewed change it comes from, 32 bytes of hex.
+    pub review: String,
+    /// Why.
+    pub justification: String,
+}
+
+/// `sweep_asset_uses` of the asset in the path (amendment 0043, `REQ-AS-10`): one page of its
+/// sweep, as the last step's `sweep` result named it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SweepAssetBody {
+    /// Where the page starts: the sweep's cursor, 16 bytes of hex.
+    pub start: String,
+    /// How many leading bits of the key the page fixes, 8 to 128. A page with more than 64
+    /// records is `ERR-BatchTooLarge`: send it again one level deeper.
+    pub level: u16,
+    /// Why.
+    pub justification: String,
+}
+
+/// Where an asset's sweep goes next (amendment 0043): the page start the book takes, and the
+/// level the host suggests for it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SweepNextBody {
+    /// The cursor, 16 bytes of hex.
+    pub start: String,
+    /// The suggested level, when the host has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<u16>,
+}
+
 /// `bind_asset` of the asset in the path (amendment 0011, `REQ-AS-8`, `DEC-20`): bind a
 /// book-only asset to the settlement layer, under issuance authority over it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1050,6 +1097,8 @@ pub enum OperatorOpKindBody {
     /// Open identities, and ledger accounts for any identity: the identities principal's role
     /// (`REQ-ID-6`, amendment 0025).
     OpenIdentity,
+    /// Remove an asset registered book-only and never used (amendment 0043).
+    RemoveAsset,
 }
 
 /// `grant_operator` (`REQ-OS-1`, `F-013`).
@@ -1156,6 +1205,42 @@ pub enum OperatorCommand {
         asset: String,
         /// The reviewed change, hex.
         review: String,
+        /// Why.
+        justification: String,
+    },
+    /// Remove an asset registered book-only and never used (amendment 0043, `REQ-AS-10`).
+    RemoveAsset {
+        /// The asset.
+        asset: String,
+        /// The reviewed change, hex.
+        review: String,
+        /// Why.
+        justification: String,
+    },
+    /// Retire an asset to be removed (amendment 0043, `REQ-AS-10`).
+    RetireAsset {
+        /// The asset.
+        asset: String,
+        /// The reviewed change, hex.
+        review: String,
+        /// Why.
+        justification: String,
+    },
+    /// One page of a retiring asset's sweep (amendment 0043, `REQ-AS-10`).
+    SweepAssetUses {
+        /// The asset.
+        asset: String,
+        /// Where the page starts, hex.
+        start: String,
+        /// Its level.
+        level: u16,
+        /// Why.
+        justification: String,
+    },
+    /// Cancel an asset's retirement (amendment 0043, `REQ-AS-10`).
+    CancelAssetRetirement {
+        /// The asset.
+        asset: String,
         /// Why.
         justification: String,
     },
@@ -1394,6 +1479,10 @@ pub struct CommandResult {
     /// What an anchoring command produced (`F-017`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchoring: Option<Box<crate::anchoring::AnchoringResultBody>>,
+    /// Where an asset's sweep goes next, after its retirement or a page (amendment 0043); absent
+    /// once the sweep is complete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sweep: Option<SweepNextBody>,
 }
 
 /// The class of a state (`REQ-OP-7`): whether it is final, and whether anything has returned.

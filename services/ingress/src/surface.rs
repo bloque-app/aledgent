@@ -66,8 +66,8 @@ use crate::wire::{
     AccountCommand, BindAssetBody, CaptureBody, CaptureCommand, CloseAccountCommand, CommandBody,
     CommandReply, CompleteRecoveryBody, DeprecateAssetBody, EmptyBody, InitiateRecoveryBody,
     JustifiedBody, NameSuccessorBody, NameSuccessorCommand, OperationReply, OperatorCommand,
-    PassThrough, PendingCommand, ReleaseCommand, RemoveCredentialCommand, ResolveBody,
-    RevokeCommand, ShownBody, SubmitEvidenceBody,
+    PassThrough, PendingCommand, ReleaseCommand, RemoveAssetBody, RemoveCredentialCommand,
+    ResolveBody, RetireAssetBody, RevokeCommand, ShownBody, SubmitEvidenceBody, SweepAssetBody,
 };
 
 /// The header a caller names its client key in. Optional: without it, one is derived.
@@ -124,6 +124,14 @@ pub enum CommandRoute {
     RegisterAsset,
     /// `POST /v1/ops/assets/{asset}/deprecate`.
     DeprecateAsset,
+    /// `POST /v1/ops/assets/{asset}/remove` (amendment 0043).
+    RemoveAsset,
+    /// `POST /v1/ops/assets/{asset}/retire` (amendment 0043).
+    RetireAsset,
+    /// `POST /v1/ops/assets/{asset}/retire/sweep` (amendment 0043).
+    SweepAssetUses,
+    /// `POST /v1/ops/assets/{asset}/retire/cancel` (amendment 0043).
+    CancelAssetRetirement,
     /// `POST /v1/ops/assets/{asset}/bind` (amendment 0011, `REQ-AS-8`).
     BindAsset,
     /// `POST /v1/ops/issuance-grants`.
@@ -404,6 +412,30 @@ pub const ROUTES: &[Route] = &[
         CommandRoute::DeprecateAsset,
         "deprecate_asset",
         "Operator: deprecate an asset (F-013).",
+    ),
+    command(
+        "/v1/ops/assets/{asset}/remove",
+        CommandRoute::RemoveAsset,
+        "remove_asset",
+        "Operator: remove an asset that was registered book-only and never used, once it is retiring and its sweep is complete, retiring its tag, so the same id can be registered again at the right precision (amendment 0043, REQ-AS-10).",
+    ),
+    command(
+        "/v1/ops/assets/{asset}/retire",
+        CommandRoute::RetireAsset,
+        "retire_asset",
+        "Operator: retire an asset registered book-only and never used, so that nothing new may name it, and start its sweep; the result names the first page (amendment 0043, REQ-AS-10).",
+    ),
+    command(
+        "/v1/ops/assets/{asset}/retire/sweep",
+        CommandRoute::SweepAssetUses,
+        "sweep_asset_uses",
+        "Operator: check one page of a retiring asset's sweep over every ledger account and grant; the result names the next page, and none once the sweep is complete (amendment 0043, REQ-AS-10).",
+    ),
+    command(
+        "/v1/ops/assets/{asset}/retire/cancel",
+        CommandRoute::CancelAssetRetirement,
+        "cancel_asset_retirement",
+        "Operator: cancel an asset's retirement; the asset has the status it had before (amendment 0043, REQ-AS-10).",
     ),
     command(
         "/v1/ops/assets/{asset}/bind",
@@ -1074,6 +1106,35 @@ fn operator_command(
                 justification: b.justification,
             }
         }
+        CommandRoute::RemoveAsset => {
+            let b: RemoveAssetBody = json(bytes)?;
+            OperatorCommand::RemoveAsset {
+                asset: path?,
+                review: b.review,
+                justification: b.justification,
+            }
+        }
+        CommandRoute::RetireAsset => {
+            let b: RetireAssetBody = json(bytes)?;
+            OperatorCommand::RetireAsset {
+                asset: path?,
+                review: b.review,
+                justification: b.justification,
+            }
+        }
+        CommandRoute::SweepAssetUses => {
+            let b: SweepAssetBody = json(bytes)?;
+            OperatorCommand::SweepAssetUses {
+                asset: path?,
+                start: b.start,
+                level: b.level,
+                justification: b.justification,
+            }
+        }
+        CommandRoute::CancelAssetRetirement => OperatorCommand::CancelAssetRetirement {
+            asset: path?,
+            justification: justification()?,
+        },
         CommandRoute::BindAsset => {
             let b: BindAssetBody = json(bytes)?;
             OperatorCommand::BindAsset {

@@ -60,10 +60,13 @@ async fn ac_c4_2_all_six_signals_and_the_three_extras_are_scraped_and_hold_no_le
                 axis,
                 ran: axis != 3,
                 findings: Vec::new(),
+                note: None,
             })
             .collect(),
         suspense: Vec::new(),
         audited: None,
+        inputs: Default::default(),
+        suspense_checked: true,
     }
     .record(&runs)
     .unwrap();

@@ -150,6 +150,8 @@ pub mod kind {
     pub const GRANTS_BY_ASSET_OR_IDENTITY: u8 = 19;
     /// The accounts in owned custody each identity owns (`State::holds_owned_custody`).
     pub const OWNED_CUSTODY_BY_OWNER: u8 = 22;
+    /// Each asset being removed: the status it had and where its sweep stands (amendment 0043).
+    pub const ASSET_RETIREMENT: u8 = 23;
     // The reservation index.
     pub const RESERVED_TOTAL: u8 = 20;
     pub const OPEN_RESERVATIONS: u8 = 21;
@@ -296,6 +298,8 @@ struct Partial<K> {
     known: BTreeSet<K>,
     complete: bool,
     loaded_present: usize,
+    /// The subtrees of this kind the witness proved it gives whole ([`Subtree`]).
+    subtrees: Vec<Subtree>,
 }
 
 impl<K> Default for Partial<K> {
@@ -304,8 +308,84 @@ impl<K> Default for Partial<K> {
             known: BTreeSet::new(),
             complete: false,
             loaded_present: 0,
+            subtrees: Vec::new(),
         }
     }
+}
+
+/// A subtree of the service tree (amendment 0043, `PLAN.md` `DEC-28`): every key whose first
+/// `level` bits are those of `start`, the subtree's first key. A level of at least 8 keeps it
+/// inside one kind ([`Subtree::kind`]), the key's first byte. A witness proves a subtree whole as
+/// it proves a kind whole: the probe at `start` is on a proven path, and no frontier node of the
+/// proof lies inside it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Subtree {
+    start: [u8; 16],
+    level: u16,
+}
+
+/// The bits of a service-tree key.
+const KEY_BITS: u16 = 128;
+
+impl Subtree {
+    /// The subtree at `level` whose first key is `start`: `None` unless `8 <= level <= 128` and
+    /// every bit of `start` after the first `level` is zero.
+    pub fn new(start: [u8; 16], level: u16) -> Option<Subtree> {
+        if !(8..=KEY_BITS).contains(&level) {
+            return None;
+        }
+        let aligned = (level..KEY_BITS).all(|i| !bit(&start, i));
+        aligned.then_some(Subtree { start, level })
+    }
+
+    /// Its first key.
+    pub const fn start(&self) -> [u8; 16] {
+        self.start
+    }
+
+    /// How many leading bits of a key it fixes.
+    pub const fn level(&self) -> u16 {
+        self.level
+    }
+
+    /// The kind of every leaf in it: its keys' first byte.
+    pub const fn kind(&self) -> u8 {
+        self.start[0]
+    }
+
+    /// Whether the key `key` lies in it.
+    pub fn contains(&self, key: &[u8; 16]) -> bool {
+        (0..self.level).all(|i| bit(key, i) == bit(&self.start, i))
+    }
+
+    /// Whether the tree node at `level` with key bits `prefix` lies in it (the node's subtree is
+    /// part of this one).
+    pub fn contains_node(&self, level: u16, prefix: &[u8; 16]) -> bool {
+        level >= self.level && self.contains(prefix)
+    }
+
+    /// The first key after it, or `None` past the last key of the tree.
+    pub fn end(&self) -> Option<[u8; 16]> {
+        let mut out = self.start;
+        // Add one at bit `level - 1`, carrying towards the first bit.
+        let mut i = self.level;
+        while i > 0 {
+            i -= 1;
+            let (byte, mask) = (usize::from(i / 8), 0x80u8 >> (i % 8));
+            if out[byte] & mask == 0 {
+                out[byte] |= mask;
+                return Some(out);
+            }
+            out[byte] &= !mask;
+        }
+        None
+    }
+}
+
+/// Bit `i` of `key`, most significant first.
+fn bit(key: &[u8; 16], i: u16) -> bool {
+    key[usize::from(i / 8)] & (0x80 >> (i % 8)) != 0
 }
 
 /// A map whose entries are leaves of kind `KIND` (module documentation). Its methods are the
@@ -493,6 +573,11 @@ impl<K: Ord + Clone, V, const KIND: u8> Leaves<K, V, KIND> {
         self.map.first_key_value()
     }
 
+    /// Whether this map is partial: a witnessed store's (the core Agent's).
+    pub fn is_partial(&self) -> bool {
+        self.partial.is_some()
+    }
+
     /// How many entries this partial map holds beyond those it was given present: the entries
     /// the run created (net). Zero on a whole map.
     pub fn created(&self) -> usize {
@@ -501,6 +586,100 @@ impl<K: Ord + Clone, V, const KIND: u8> Leaves<K, V, KIND> {
             None => 0,
         }
     }
+}
+
+impl<K: Ord + Clone + Canonical, V: Canonical, const KIND: u8> Leaves<K, V, KIND> {
+    /// The service-tree key of the entry at `k`.
+    fn tree_key(k: &K) -> [u8; 16] {
+        crate::delta::library_key(KIND, &canon::to_bytes(k))
+    }
+
+    /// The entries whose service-tree key lies in `sub`, in that key order (amendment 0043,
+    /// `DEC-28`): a page of a sweep, and whether it is over its bounds, more than `limit` entries
+    /// or, past its first entry, more than `budget` bytes of canonical keys and values
+    /// ([`over_bounds`]). An entry alone is never over: it is what any read of it brings. Never a
+    /// read of the kind whole: a whole map hashes every key and keeps those in `sub`, in order, up
+    /// to and with the first entry that takes the page over a bound, and records each one it
+    /// returns by key. A partial map answers from the leaves it was given: every one in `sub` when
+    /// the witness proved `sub` whole; the same prefix when what it was given goes over a bound
+    /// (the page is too large, provably, without the rest); and otherwise it fails closed. A
+    /// subtree of another kind holds nothing.
+    ///
+    /// TODO(amendment 0043, review of ff2c0fd item 5a): a whole map hashes every key of the kind on
+    /// each call, and a sweep input calls this three times (the decision, the store's check and
+    /// commit) besides [`Leaves::tree_keys_unrecorded`] for the suggestion: at about 175 000
+    /// accounts, some tenths of a second of host time per input, and as much on replay. A host-side
+    /// index of tree keys would remove it; it changes no decision.
+    pub fn subtree(&self, sub: &Subtree, limit: usize, budget: usize) -> (Vec<(&K, &V)>, bool) {
+        if sub.kind() != KIND {
+            return (Vec::new(), false);
+        }
+        let mut found: Vec<([u8; 16], &K, &V)> = self
+            .map
+            .iter()
+            .map(|(k, v)| (Self::tree_key(k), k, v))
+            .filter(|(t, _, _)| sub.contains(t))
+            .collect();
+        found.sort_by_key(|a| a.0);
+        let sizes: Vec<usize> = found
+            .iter()
+            .map(|(_, k, v)| canon::to_bytes(*k).len() + canon::to_bytes(*v).len())
+            .collect();
+        let over = over_bounds(&sizes, limit, budget);
+        if let Some(n) = over {
+            found.truncate(n);
+        }
+        if let Some(p) = &self.partial
+            && !p.complete
+            && !p.subtrees.contains(sub)
+            && over.is_none()
+        {
+            self.track.missed.set(true);
+        }
+        for (_, k, _) in &found {
+            self.point(k);
+        }
+        (
+            found.into_iter().map(|(_, k, v)| (k, v)).collect(),
+            over.is_some(),
+        )
+    }
+
+    /// Every entry's service-tree key and its canonical size (key and value), sorted by key, read
+    /// without recording: for a choice the host passes as data (the next page's suggested level,
+    /// `DEC-28`). On a partial map it is empty and fails nothing: the core Agent makes no such
+    /// choice, and its caller asks only a whole store.
+    pub fn tree_keys_unrecorded(&self) -> Vec<([u8; 16], usize)> {
+        if self.partial.is_some() {
+            return Vec::new();
+        }
+        let mut keys: Vec<([u8; 16], usize)> = self
+            .map
+            .iter()
+            .map(|(k, v)| {
+                (
+                    Self::tree_key(k),
+                    canon::to_bytes(k).len() + canon::to_bytes(v).len(),
+                )
+            })
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+}
+
+/// Where a page of entries of these `sizes`, in key order, goes over its bounds (amendment 0043):
+/// the length of the prefix up to and with the first entry that takes it past `limit` entries,
+/// or, past the first entry, past `budget` bytes; `None` if it stays within both.
+pub fn over_bounds(sizes: &[usize], limit: usize, budget: usize) -> Option<usize> {
+    let mut bytes = 0usize;
+    for (i, size) in sizes.iter().enumerate() {
+        bytes = bytes.saturating_add(*size);
+        if i >= limit || (i > 0 && bytes > budget) {
+            return Some(i + 1);
+        }
+    }
+    None
 }
 
 impl<K: Ord + Clone, T: Ord, const KIND: u8> Leaves<K, BTreeSet<T>, KIND> {
@@ -586,6 +765,15 @@ impl<K: Ord + Clone + Canonical, V: Canonical, const KIND: u8> LeafMap for Leave
     fn set_complete(&mut self) {
         if let Some(p) = self.partial.as_mut() {
             p.complete = true;
+        }
+    }
+
+    fn set_subtree_complete(&mut self, sub: Subtree) {
+        if let Some(p) = self.partial.as_mut()
+            && sub.kind() == KIND
+            && !p.subtrees.contains(&sub)
+        {
+            p.subtrees.push(sub);
         }
     }
 
@@ -874,6 +1062,11 @@ pub trait LeafMap {
     fn load(&mut self, key: &[u8], value: Option<&[u8]>) -> Result<(), DecodeError>;
     /// The witness gave this collection whole.
     fn set_complete(&mut self);
+    /// The witness proved it gives every leaf of `sub`, a subtree of this kind (amendment 0043).
+    /// Only a map of leaves keeps it; for anything else it is nothing.
+    fn set_subtree_complete(&mut self, sub: Subtree) {
+        let _ = sub;
+    }
     /// Whether a read or a write went outside the witness.
     fn missed(&self) -> bool;
     /// A partial collection's witnessed keys and the keys it created, with their values as they

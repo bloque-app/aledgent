@@ -37,6 +37,45 @@ The run also carries the `Suspense` report (`REQ-LA-2`): each `Suspense` (accoun
 since when. `AledgentSuspenseNotReconciled` pages once one has not been zero for a day: its value is placed
 where it belongs by an operation through `CTR-OPS`, never by an edit.
 
+## The daily job
+
+`opsctl reconcile --exporter-config <exporter.toml> --from <archive> --config <deployment config>
+(--anchors-rpc <URL> | --no-anchors) (--token-file <file> | --token-env <VAR>) [--compare-settlement]` (`T-018-12`) is the daily run against a
+running deployment. Axis 1 is `opsctl archive verify` on the off-node archive; axis 2 is `GET
+/v1/trial-balance` with the operator's token (`--token-file` or `--token-env`, never an argument; the exporter's
+`read_signals` token is refused the trial balance, and the opt-in also needs the `compare_settlement` kind);
+axis 3 is `F-017`'s comparison. It writes one run record into the exporter configuration's
+`[records] reconciliation` and exits non-zero unless every axis ran and found nothing.
+
+- Axis 3 with **nothing bound** has no baseline: the record says `no baseline (nothing bound)`, the axis
+  counts as run with no difference, and nothing is written (owner's ruling).
+- Axis 3 with an asset **bound** needs `--compare-settlement`, because the comparison writes an operator
+  record on the audit trail and runs only with the owner's go. Without the flag it is recorded as not run
+  and pages as not run. No other flag implies it.
+- An axis 1 with a `Deferred` check (the anchor checks under `--no-anchors`) or an undecided one is
+  recorded as not run, with the checks named. An empty trial balance (no accounts or no assets) is axis 2
+  not run. An asset whose binding is not `book_only`, `binding` or `bound` makes axis 3 not run. A bound
+  asset with no row in the comparison is held by neither side; the note says so.
+
+What the job does not catch, and what does:
+
+- **Posted, but the record was not written.** If the comparison was posted and writing the run record
+  then failed, the audit trail has a `compare_settlement` record with no run record, and the command
+  exits non-zero. Re-run; do not treat the audit record as a run.
+- **Token or configuration errors** (unreadable token, no `[records] reconciliation`, bad arguments) fail
+  the command before any record is written. Nothing on the record says so; the exporter pages
+  `AledgentReconciliationNotRun` after 24 hours without a run.
+- **Axis 3 not run** (a bound asset without `--compare-settlement`, or a comparison that failed) pages
+  only 24 hours after the last run that did run that axis, not at once. The command's exit status shows
+  it at once.
+- **A stalled archive still verifies clean.** Axis 1 checks what the archive holds, not that it is
+  current. Only the archive-lag alert catches an archiver that stopped.
+- **Suspense.** This command does not make the report. The exporter keeps publishing the last run that
+  did (with its age growing), so `AledgentSuspenseNotReconciled` still fires from it. If no run has ever
+  made it, there is no signal and no page.
+- The command does not make the `Suspense` report; its records say `suspense_checked: false` and the
+  exporter publishes no `Suspense` signal from them.
+
 ## Procedure
 
 1. **Freeze the evidence.** Take a core backup and an audit backup now (`restore.md`, "Collect the

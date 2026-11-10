@@ -82,7 +82,7 @@ pub enum Refusal {
     DeadlineRequired,
     /// `ERR-ClientKeyReused`: The same client key was submitted with a different request (`REQ-OP-10`).
     ClientKeyReused,
-    /// `ERR-BatchTooLarge`: A multi-leg submission is larger than the declared maximum.
+    /// `ERR-BatchTooLarge`: A multi-leg submission, or a page of an asset's sweep (`REQ-AS-10`), is larger than the declared maximum.
     BatchTooLarge,
     /// `ERR-UnsupportedLeg`: The settlement adapter does not support this operation or asset (`REQ-SA-1`).
     UnsupportedLeg,
@@ -275,7 +275,9 @@ impl Refusal {
             Refusal::ClientKeyReused => {
                 "The same client key was submitted with a different request (`REQ-OP-10`)"
             }
-            Refusal::BatchTooLarge => "A multi-leg submission is larger than the declared maximum",
+            Refusal::BatchTooLarge => {
+                "A multi-leg submission, or a page of an asset's sweep (`REQ-AS-10`), is larger than the declared maximum"
+            }
             Refusal::UnsupportedLeg => {
                 "The settlement adapter does not support this operation or asset (`REQ-SA-1`)"
             }

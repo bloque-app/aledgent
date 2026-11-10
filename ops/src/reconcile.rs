@@ -156,6 +156,19 @@ pub enum Finding {
         /// The layer's position less the book's, minor units: an aggregate, no account's.
         difference: String,
     },
+    /// Axis 1, against an archive (`opsctl reconcile`): one of the archive verification's checks
+    /// failed. The check's name and what it found; no figure of any balance.
+    Archive {
+        /// The check: the requirement it shows.
+        check: String,
+        /// What it found.
+        detail: String,
+    },
+    /// Axis 3: the comparison says the book and the layer differ, with no row to show it.
+    SettlementDiffers {
+        /// The cut.
+        cut: u64,
+    },
     /// Axis 3: the latest cut the adapter reported is older than [`MAX_CUT_AGE_MS`].
     StaleCut {
         /// The cut.
@@ -174,6 +187,10 @@ pub struct AxisResult {
     pub ran: bool,
     /// What it found; empty when it reconciles.
     pub findings: Vec<Finding>,
+    /// What the record says beside the result: why the axis did not run, or what it had to compare
+    /// against. Absent in older records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// Axis 1(a) over `snap`.
@@ -374,6 +391,9 @@ impl SettlementComparator for Compared {
                 difference: r.difference.clone(),
             })
             .collect();
+        if c.differs && out.is_empty() {
+            out.push(Finding::SettlementDiffers { cut: c.cut });
+        }
         if let Some(at) = self.reported_at {
             let age = self.now.saturating_sub(at);
             if age > MAX_CUT_AGE_MS {
@@ -391,11 +411,13 @@ pub fn axis_3(comparator: &dyn SettlementComparator) -> AxisResult {
             axis: 3,
             ran: true,
             findings,
+            note: None,
         },
         None => AxisResult {
             axis: 3,
             ran: false,
             findings: Vec::new(),
+            note: None,
         },
     }
 }
@@ -469,6 +491,22 @@ pub struct Run {
     /// audit trail, its justification the run's summary; `None` when axis 3 could not run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audited: Option<String>,
+    /// What the run covered: counts and names, no figure (`opsctl reconcile`: the archive, its
+    /// segments and inputs, the view and accounts of the trial balance, the assets and how many
+    /// are bound). Empty for a run in process.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub inputs: BTreeMap<String, String>,
+    /// Whether the `Suspense` report was made. `false` for a run that could not read it
+    /// (`opsctl reconcile` reaches the book through ingress and the archive, neither of which
+    /// shows `Suspense`): `suspense` is then empty because it was not looked at, not because it is
+    /// zero, and the exporter publishes no `Suspense` signal for it. Records written before this
+    /// field are runs in process, which made the report.
+    #[serde(default = "suspense_made")]
+    pub suspense_checked: bool,
+}
+
+fn suspense_made() -> bool {
+    true
 }
 
 impl Run {
@@ -581,16 +619,20 @@ pub fn run<S: LeafStore, V: VaultBackend>(
                 axis: 1,
                 ran: true,
                 findings: one,
+                note: None,
             },
             AxisResult {
                 axis: 2,
                 ran: true,
                 findings: two,
+                note: None,
             },
             axis_3(sources.settlement),
         ],
         suspense: suspense_report(ledger),
         audited: None,
+        inputs: BTreeMap::new(),
+        suspense_checked: true,
     })
 }
 
@@ -639,9 +681,45 @@ pub async fn compare_through<L: IngressLink>(
     summary: &str,
     now: u64,
 ) -> (Box<dyn SettlementComparator + Send + Sync>, Option<String>) {
+    let (c, audited, _) = compare_covering(link, summary, now, &[]).await;
+    (c, audited)
+}
+
+/// [`compare_through`], requiring a row for each of `required` (the bound assets), and saying what
+/// it could not check: the third item is the notes (the stale-cut check skipped when the anchors
+/// could not be read).
+pub async fn compare_covering<L: IngressLink>(
+    link: &L,
+    summary: &str,
+    now: u64,
+    required: &[String],
+) -> (
+    Box<dyn SettlementComparator + Send + Sync>,
+    Option<String>,
+    Vec<String>,
+) {
+    let mut notes = Vec::new();
     let reported_at = match link.call("GET", "/v1/ops/anchors", None).await {
-        Ok((200, v)) => v["latest_comparison"]["at"].as_u64(),
-        _ => None,
+        Ok((200, v)) => {
+            let at = v["latest_comparison"]["at"].as_u64();
+            if at.is_none() {
+                notes
+                    .push("the stale-cut check was skipped: no earlier comparison time".to_owned());
+            }
+            at
+        }
+        Ok((status, _)) => {
+            notes.push(format!(
+                "the stale-cut check was skipped: GET /v1/ops/anchors answered {status}"
+            ));
+            None
+        }
+        Err(e) => {
+            notes.push(format!(
+                "the stale-cut check was skipped: GET /v1/ops/anchors: {e}"
+            ));
+            None
+        }
     };
     let reply = link
         .call(
@@ -652,22 +730,46 @@ pub async fn compare_through<L: IngressLink>(
         .await;
     let (status, v) = match reply {
         Ok(r) => r,
-        Err(e) => return (Box::new(NotRun(format!("ingress: {e}"))), None),
+        Err(e) => return (Box::new(NotRun(format!("ingress: {e}"))), None, notes),
     };
     if status != 200 {
-        return (Box::new(NotRun(format!("{status}: {}", v["error"]))), None);
+        return (
+            Box::new(NotRun(format!("{status}: {}", v["error"]))),
+            None,
+            notes,
+        );
     }
     let audited = v["operation_reference"].as_str().map(str::to_owned);
     match serde_json::from_value::<ComparisonBody>(v["result"]["anchoring"]["comparison"].clone()) {
         Ok(comparison) => (
             Box::new(Compared {
-                comparison,
+                comparison: comparison.clone(),
                 reported_at,
                 now,
             }),
             audited,
+            {
+                // The comparison has a row for every asset either side holds, so a bound asset
+                // with none is held by neither: equal at zero. Said, not hidden.
+                let missing: Vec<&str> = required
+                    .iter()
+                    .filter(|a| !comparison.rows.iter().any(|r| &r.asset == *a))
+                    .map(String::as_str)
+                    .collect();
+                if !missing.is_empty() {
+                    notes.push(format!(
+                        "no row for bound asset(s) {}: neither side holds any",
+                        missing.join(", ")
+                    ));
+                }
+                notes
+            },
         ),
-        Err(e) => (Box::new(NotRun(format!("the comparison: {e}"))), audited),
+        Err(e) => (
+            Box::new(NotRun(format!("the comparison: {e}"))),
+            audited,
+            notes,
+        ),
     }
 }
 
@@ -730,6 +832,27 @@ pub fn latest_run(dir: &Path) -> Result<Option<Run>, Error> {
     }
 }
 
+/// The latest run recorded in `dir` that made the `Suspense` report: for the exporter, which keeps
+/// publishing it (with its age growing) while later runs do not look at `Suspense`.
+pub fn latest_suspense_run(dir: &Path) -> Result<Option<Run>, Error> {
+    if !dir.exists() {
+        return Ok(None);
+    }
+    let mut names: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect();
+    names.sort();
+    for p in names.iter().rev() {
+        if let Ok(run) = serde_json::from_slice::<Run>(&std::fs::read(p)?)
+            && run.suspense_checked
+        {
+            return Ok(Some(run));
+        }
+    }
+    Ok(None)
+}
+
 /// The latest run of each axis recorded in `dir`: for the exporter. An axis that has not run is
 /// reported with no run time.
 pub fn latest_axes(dir: &Path) -> Result<Vec<AxisSignal>, Error> {
@@ -771,4 +894,378 @@ pub fn latest_axes(dir: &Path) -> Result<Vec<AxisSignal>, Error> {
         }
     }
     Ok(out.into_values().collect())
+}
+
+// ---------------------------------------------------------------------------------------------
+// The daily job against a running deployment (`opsctl reconcile`)
+// ---------------------------------------------------------------------------------------------
+//
+// [`daily`] needs the core in process. A deployment's core is its own process, so the command
+// reaches the book the way an operator does: axis 1 from the off-node archive (re-derived by
+// `ops::agent::verify`, the same checks as `opsctl archive verify`), axes 2 and 3 through
+// ingress. It only reads, with one exception that is never implicit: see [`axis_3_gated`].
+
+/// What axis 1 read of the archive: its description and counts, and the checks of its
+/// verification (`ops::agent::verify`).
+#[derive(Clone, Debug)]
+pub struct ArchiveChecked {
+    /// The archive, as `core_archive::Archive::describe` names it.
+    pub archive: String,
+    /// Segments read and checked.
+    pub segments: u64,
+    /// Inputs up to the restore point.
+    pub inputs: u64,
+    /// Postings in the re-derived book.
+    pub postings: u64,
+    /// The checks.
+    pub checks: Vec<crate::drill::Check>,
+}
+
+/// Axis 1 from the archive (`NFR-9` first axis, `INV-6`): the archive's verification, re-deriving
+/// the book from its entries. `read` is what it read, or why it could not.
+///
+/// - a check that failed is a finding, whatever else did not run;
+/// - no failure and a check that could not decide (`Unknown`, as `opsctl archive verify` treats it:
+///   not a pass) or that is `Deferred` (the anchor checks under `--no-anchors`) is *not run*, and
+///   the note names them;
+/// - nothing that ran passed (no check at all, or every one deferred) is *not run*;
+/// - an archive that could not be read or is damaged is *not run*, with the reason.
+pub fn axis_1_archive(
+    read: Result<&ArchiveChecked, &str>,
+) -> (AxisResult, BTreeMap<String, String>) {
+    use crate::drill::Verdict;
+    let mut inputs = BTreeMap::new();
+    let not_run = |why: String| AxisResult {
+        axis: 1,
+        ran: false,
+        findings: Vec::new(),
+        note: Some(why),
+    };
+    let a = match read {
+        Ok(a) => a,
+        Err(why) => {
+            return (
+                not_run(format!("the archive was not verified: {why}")),
+                inputs,
+            );
+        }
+    };
+    inputs.insert("archive".into(), a.archive.clone());
+    inputs.insert("archive_segments".into(), a.segments.to_string());
+    inputs.insert("archive_inputs".into(), a.inputs.to_string());
+    inputs.insert("archive_postings".into(), a.postings.to_string());
+    let findings: Vec<Finding> = a
+        .checks
+        .iter()
+        .filter(|c| c.verdict == Verdict::Failed)
+        .map(|c| Finding::Archive {
+            check: c.name.clone(),
+            detail: c.detail.clone(),
+        })
+        .collect();
+    if !findings.is_empty() {
+        return (
+            AxisResult {
+                axis: 1,
+                ran: true,
+                findings,
+                note: None,
+            },
+            inputs,
+        );
+    }
+    let named = |v: Verdict| -> Vec<&str> {
+        a.checks
+            .iter()
+            .filter(|c| c.verdict == v)
+            .map(|c| c.name.as_str())
+            .collect()
+    };
+    let (undecided, deferred) = (named(Verdict::Unknown), named(Verdict::Deferred));
+    if !undecided.is_empty() || !deferred.is_empty() {
+        let mut why = Vec::new();
+        if !undecided.is_empty() {
+            why.push(format!(
+                "undecided, which is not a pass: {} (read again from an archive node, \
+                 --anchors-rpc)",
+                undecided.join(", ")
+            ));
+        }
+        if !deferred.is_empty() {
+            why.push(format!(
+                "deferred, so not checked: {} (--no-anchors leaves the anchor checks deferred)",
+                deferred.join(", ")
+            ));
+        }
+        return (not_run(why.join("; ")), inputs);
+    }
+    if !a.checks.iter().any(|c| c.verdict == Verdict::Passed) {
+        return (not_run("no check passed".into()), inputs);
+    }
+    (
+        AxisResult {
+            axis: 1,
+            ran: true,
+            findings: Vec::new(),
+            note: None,
+        },
+        inputs,
+    )
+}
+
+/// Axis 2 through ingress (`NFR-9` second axis, `INV-5`): `GET /v1/trial-balance`, which sums every
+/// kernel account's commitments per (currency, layer) and every asset's openings, and answers the
+/// operator only. Every (currency, layer) that does not sum to the identity, and every asset whose
+/// openings are not exactly zero (compared as an integer, not as text), is a finding.
+pub async fn axis_2_route<L: IngressLink>(link: &L) -> (AxisResult, BTreeMap<String, String>) {
+    let mut inputs = BTreeMap::new();
+    let not_run = |why: String| AxisResult {
+        axis: 2,
+        ran: false,
+        findings: Vec::new(),
+        note: Some(why),
+    };
+    let v = match link.call("GET", "/v1/trial-balance", None).await {
+        Ok((200, v)) => v,
+        Ok((status, v)) => {
+            return (
+                not_run(format!(
+                    "GET /v1/trial-balance answered {status}: {}",
+                    v["error"]
+                )),
+                inputs,
+            );
+        }
+        Err(e) => return (not_run(format!("GET /v1/trial-balance: {e}")), inputs),
+    };
+    let body: ingress::query::TrialBalanceBody = match serde_json::from_value(v) {
+        Ok(b) => b,
+        Err(e) => return (not_run(format!("the trial balance: {e}")), inputs),
+    };
+    inputs.insert("trial_balance_view".into(), body.view.to_string());
+    inputs.insert("trial_balance_accounts".into(), body.accounts.to_string());
+    inputs.insert("trial_balance_assets".into(), body.rows.len().to_string());
+    // A trial balance over nothing is zero by construction: it reconciles nothing.
+    if body.rows.is_empty() || body.accounts == 0 {
+        return (
+            not_run(format!(
+                "the trial balance covered nothing ({} accounts, {} assets)",
+                body.accounts,
+                body.rows.len()
+            )),
+            inputs,
+        );
+    }
+    let mut findings: Vec<Finding> = body
+        .unbalanced
+        .iter()
+        .map(|u| Finding::Unbalanced {
+            currency: u.currency,
+            layer: u.layer as usize,
+            over: "the trial balance route".into(),
+        })
+        .collect();
+    for r in &body.rows {
+        // Anything that is not exactly the integer zero is a difference, an unparsable figure too.
+        if r.openings.trim().parse::<i128>() != Ok(0) {
+            findings.push(Finding::TrialBalance {
+                asset: r.asset.clone(),
+            });
+        }
+    }
+    (
+        AxisResult {
+            axis: 2,
+            ran: true,
+            findings,
+            note: None,
+        },
+        inputs,
+    )
+}
+
+/// The assets whose binding is `bound` (`REQ-AS-8`): the only ones the settlement layer holds
+/// something for. `binding` (asked for, not yet bound) and `book_only` have no baseline. Any other
+/// value, or an entry without a text id or binding, is not known to have none: `Err`.
+fn bound_assets(assets: &serde_json::Value) -> Result<(usize, Vec<String>), String> {
+    let items = assets.as_array().ok_or("not a list")?;
+    let mut bound = Vec::new();
+    for a in items {
+        let (Some(id), Some(binding)) = (a["id"].as_str(), a["binding"].as_str()) else {
+            return Err("an asset without a text id or binding".into());
+        };
+        match binding {
+            "bound" => bound.push(id.to_owned()),
+            "book_only" | "binding" => {}
+            other => return Err(format!("asset {id} has the binding {other:?}, not known")),
+        }
+    }
+    Ok((items.len(), bound))
+}
+
+/// Axis 3 for the daily job (`NFR-9` third axis, `REQ-PR-5`), with its one write behind two gates.
+///
+/// `POST /v1/ops/settlement/comparisons` writes an operator record on the audit trail, so it is
+/// made only when **both** hold: `compare` (the operator named `--compare-settlement`, the
+/// owner's go to write it) and at least one asset is `bound` (`GET /v1/assets`). Nothing else
+/// implies it, and no other path in this module posts.
+///
+/// - nothing bound: there is no baseline (`F-029`), so nothing is compared, and nothing is
+///   written: *ran, no differences*, noted "no baseline (nothing bound)". The owner ruled a zero
+///   acceptable here for now;
+/// - something bound and `compare` not given: *not run*, noted. That pages as not run and the
+///   command exits non-zero: the comparison is due, and waits for the go;
+/// - something bound and `compare`: [`compare_through`], with `summary` as the justification.
+///
+/// Returns the axis, the audit operation reference (only when the comparison was posted) and the
+/// inputs covered.
+pub async fn axis_3_gated<L: IngressLink>(
+    link: &L,
+    compare: bool,
+    summary: &str,
+    now: u64,
+) -> (AxisResult, Option<String>, BTreeMap<String, String>) {
+    let mut inputs = BTreeMap::new();
+    let not_run = |why: String| AxisResult {
+        axis: 3,
+        ran: false,
+        findings: Vec::new(),
+        note: Some(why),
+    };
+    let assets = match link.call("GET", "/v1/assets", None).await {
+        Ok((200, v)) => v,
+        Ok((status, v)) => {
+            return (
+                not_run(format!("GET /v1/assets answered {status}: {}", v["error"])),
+                None,
+                inputs,
+            );
+        }
+        Err(e) => return (not_run(format!("GET /v1/assets: {e}")), None, inputs),
+    };
+    let (total, bound) = match bound_assets(&assets) {
+        Ok(x) => x,
+        Err(why) => return (not_run(format!("GET /v1/assets: {why}")), None, inputs),
+    };
+    inputs.insert("assets".into(), total.to_string());
+    inputs.insert("assets_bound".into(), bound.len().to_string());
+    if bound.is_empty() {
+        return (
+            AxisResult {
+                axis: 3,
+                ran: true,
+                findings: Vec::new(),
+                note: Some("no baseline (nothing bound)".into()),
+            },
+            None,
+            inputs,
+        );
+    }
+    inputs.insert("assets_bound_ids".into(), bound.join(","));
+    if !compare {
+        return (
+            not_run(format!(
+                "{} bound asset(s) to compare ({}); the comparison writes an audit record and \
+                 was not requested (--compare-settlement, with the owner's go)",
+                bound.len(),
+                bound.join(", ")
+            )),
+            None,
+            inputs,
+        );
+    }
+    let (comparator, audited, notes) = compare_covering(link, summary, now, &bound).await;
+    let mut axis = axis_3(comparator.as_ref());
+    if !axis.ran {
+        axis.note = Some("the comparison could not be made".into());
+    } else if !notes.is_empty() {
+        axis.note = Some(notes.join("; "));
+    }
+    (axis, audited, inputs)
+}
+
+/// The daily job against a running deployment (`NFR-9`, `AC-J3.1`): axis 1 from `archive`, axes 2
+/// and 3 through `link`, then the run's JSON record in `records` (written even when an axis could
+/// not run, so the exporter sees what happened). `compare` is [`axis_3_gated`]'s opt-in.
+///
+/// The `Suspense` report is not made (`suspense_checked` is false): it needs the book's accounts,
+/// which neither the archive's checks nor the operator's routes expose.
+pub async fn job<L: IngressLink>(
+    link: &L,
+    archive: Result<&ArchiveChecked, &str>,
+    compare: bool,
+    at: u64,
+    records: &Path,
+) -> Result<Run, Error> {
+    let (one, mut inputs) = axis_1_archive(archive);
+    let (two, i2) = axis_2_route(link).await;
+    inputs.extend(i2);
+    let mut run = Run {
+        at,
+        axes: vec![one, two],
+        suspense: Vec::new(),
+        audited: None,
+        inputs,
+        suspense_checked: false,
+    };
+    let (three, audited, i3) = axis_3_gated(link, compare, &run.summary(), at).await;
+    run.axes.push(three);
+    run.audited = audited;
+    run.inputs.extend(i3);
+    run.record(records)?;
+    Ok(run)
+}
+
+/// Ingress over HTTP with the operator's token, for `opsctl reconcile`. The token is held
+/// zeroizing and goes nowhere but the `Authorization` header; no error carries it or the URL.
+pub struct HttpLink {
+    base: String,
+    token: zeroize::Zeroizing<String>,
+    client: reqwest::Client,
+}
+
+impl HttpLink {
+    /// A link to `base` (ingress's URL), giving up on a request after `timeout`.
+    pub fn new(
+        base: &str,
+        token: zeroize::Zeroizing<String>,
+        timeout: std::time::Duration,
+    ) -> Result<HttpLink, Error> {
+        Ok(HttpLink {
+            base: base.trim_end_matches('/').to_owned(),
+            token,
+            client: reqwest::Client::builder()
+                .timeout(timeout)
+                .build()
+                .map_err(|e| Error::Config(e.to_string()))?,
+        })
+    }
+}
+
+impl IngressLink for HttpLink {
+    async fn call(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<(u16, serde_json::Value), String> {
+        let url = format!("{}{path}", self.base);
+        let req = match method {
+            "GET" => self.client.get(url),
+            "POST" => self.client.post(url),
+            other => return Err(format!("method {other} is not used")),
+        }
+        .bearer_auth(self.token.as_str());
+        let req = match body {
+            Some(b) => req.json(&b),
+            None => req,
+        };
+        let r = req.send().await.map_err(|e| e.without_url().to_string())?;
+        let status = r.status().as_u16();
+        let bytes = r.bytes().await.map_err(|e| e.without_url().to_string())?;
+        Ok((
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        ))
+    }
 }

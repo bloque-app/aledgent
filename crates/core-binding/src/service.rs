@@ -27,7 +27,10 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 use cipher_clerk::merkle::{SMT_DEPTH, build_empty_chain, smt_node_hash};
+use ledger_core::call::Call;
 use ledger_core::delta::{library_key, library_leaf_hash};
+use ledger_core::leaves::Subtree;
+use ledger_core::ledger::operator::RetireStep;
 use ledger_core::state::LeafEntry;
 use ledger_kernel::compact_smt::Version;
 use ledger_kernel::compact_smt::v2::{
@@ -59,6 +62,38 @@ pub struct ServiceWitness {
     pub frontier: Vec<Node>,
     /// The same multiproof in v2, its node entries opened. v2 only.
     pub compact: Option<PackedProof>,
+    /// The subtrees the input's calls read whole: the pages of an asset's sweep (amendment
+    /// 0043, `DEC-28`, [`claims_of`]). Never encoded: the host and the Agent each derive them
+    /// from the same calls, so the witness's wire form is what it was and an older Agent decodes
+    /// every witness as before. Each claim's probe (its first key) is a proven key, as a whole
+    /// kind's is.
+    #[serde(skip)]
+    pub claims: Vec<Subtree>,
+}
+
+/// The subtrees `calls` read whole: each page of an asset's sweep that is a subtree inside the
+/// sweep's range, the ledger accounts and the grants (amendment 0043, `DEC-28`); any other page is
+/// refused by the ledger before it reads anything, and claims nothing. The host proves them in the
+/// witness it builds for those calls, the probe at each one's first key with the leaf that stands
+/// there if one does (`crate::host`), and the Agent checks the proof against the same list. A claim
+/// the proof does not show whole is no error: the page's read then fails closed or finds the page
+/// too large, as the replica does.
+pub fn claims_of(calls: &[Call]) -> Vec<Subtree> {
+    use ledger_core::leaves::kind;
+    let mut out: Vec<Subtree> = calls
+        .iter()
+        .filter_map(|c| match c {
+            Call::RetireAsset {
+                step: RetireStep::Sweep(page),
+                ..
+            } => Subtree::new(page.start, page.level),
+            _ => None,
+        })
+        .filter(|s| matches!(s.kind(), kind::LEDGER_ACCOUNT | kind::GRANT))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Why a service witness is refused before anything runs.
@@ -83,10 +118,16 @@ pub fn probe(kind: u8) -> [u8; 16] {
 /// The service-tree keys a witness of `leaves` and `whole` proves: every leaf's key and every
 /// whole kind's probe, sorted, without repeats. The host builds the frontier over these.
 pub fn proven_keys(leaves: &[LeafEntry], whole: &[u8]) -> Vec<[u8; 16]> {
+    proven_keys_with(leaves, whole, &[])
+}
+
+/// [`proven_keys`], and the probe of each claimed subtree (its first key, amendment 0043).
+pub fn proven_keys_with(leaves: &[LeafEntry], whole: &[u8], claims: &[Subtree]) -> Vec<[u8; 16]> {
     let keys: BTreeSet<[u8; 16]> = leaves
         .iter()
         .map(|(kind, key, _)| library_key(*kind, key))
         .chain(whole.iter().map(|k| probe(*k)))
+        .chain(claims.iter().map(Subtree::start))
         .collect();
     keys.into_iter().collect()
 }
@@ -179,6 +220,11 @@ impl ServiceWitness {
                 .entry(probe(*k))
                 .or_insert(cipher_clerk::merkle::SMT_EMPTY_LEAF);
         }
+        for c in &self.claims {
+            touched
+                .entry(c.start())
+                .or_insert(cipher_clerk::merkle::SMT_EMPTY_LEAF);
+        }
         let touched: Vec<([u8; 16], [u8; 32])> = touched.into_iter().collect();
         if Version::ACTIVE == Version::V2 {
             return self.compute_v2(&touched, &whole);
@@ -218,6 +264,45 @@ impl ServiceWitness {
             .find(|f| f.level >= 8 && whole.contains(&f.prefix[0]))
             .map(|f| f.prefix[0]);
         Ok((root, 0, not_whole))
+    }
+
+    /// The claimed subtrees this witness proves whole (amendment 0043): those with no frontier
+    /// node of the multiproof inside them that is not empty. Each claim's probe is a proven key,
+    /// so no frontier node contains one; a node inside one is a leaf the witness does not give.
+    /// A claim not proven is no error: the partial store then fails closed on the page, or finds
+    /// it too large from the leaves it was given.
+    pub fn proven_claims(&self) -> Result<Vec<Subtree>, ServiceRefusal> {
+        if self.claims.is_empty() {
+            return Ok(Vec::new());
+        }
+        let nodes: Vec<(u16, [u8; 16])> = if Version::ACTIVE == Version::V2 {
+            match &self.compact {
+                Some(p) => p
+                    .unpack()
+                    .map_err(|_| ServiceRefusal::Shape)?
+                    .frontier
+                    .iter()
+                    .map(|f| (f.level, f.prefix))
+                    .collect(),
+                None => Vec::new(),
+            }
+        } else {
+            let empty = build_empty_chain();
+            self.frontier
+                .iter()
+                .filter(|n| {
+                    let height = SMT_DEPTH.saturating_sub(usize::from(n.level));
+                    n.hash != empty[height]
+                })
+                .map(|n| (n.level, n.prefix))
+                .collect()
+        };
+        Ok(self
+            .claims
+            .iter()
+            .filter(|c| !nodes.iter().any(|(l, p)| c.contains_node(*l, p)))
+            .copied()
+            .collect())
     }
 
     /// Check the witness against the Agent's service root (module documentation).
@@ -267,7 +352,7 @@ impl ServiceWitness {
     pub fn conceal(&mut self, index: usize) {
         let (kind, key, value) = self.leaves.remove(index);
         let k = library_key(kind, &key);
-        let others = proven_keys(&self.leaves, &self.whole);
+        let others = proven_keys_with(&self.leaves, &self.whole, &self.claims);
         if Version::ACTIVE == Version::V2 {
             return self.conceal_v2(k, library_leaf_hash(kind, &key, value.as_deref()), &others);
         }
@@ -495,6 +580,7 @@ mod tests {
             whole: Vec::new(),
             frontier: frontier_of(&all, &proven_keys(&given, &[])),
             compact: None,
+            claims: Vec::new(),
         };
         w.verify(&t.root()).unwrap();
         // Tampered, stale, or a key the proof does not cover.
@@ -528,6 +614,7 @@ mod tests {
             whole: vec![3],
             frontier: frontier_of(&all, &proven_keys(&whole, &[3])),
             compact: None,
+            claims: Vec::new(),
         };
         w.verify(&t.root()).unwrap();
         // A new leaf in a whole kind: the proof covers it.
@@ -543,6 +630,7 @@ mod tests {
             whole: vec![3],
             frontier: frontier_of(&all, &proven_keys(&part, &[3])),
             compact: None,
+            claims: Vec::new(),
         };
         assert_eq!(w.verify(&t.root()), Err(ServiceRefusal::NotWhole(3)));
         // A kind with no leaf at all, whole.
@@ -551,6 +639,7 @@ mod tests {
             whole: vec![9],
             frontier: frontier_of(&all, &proven_keys(&[], &[9])),
             compact: None,
+            claims: Vec::new(),
         };
         w.verify(&t.root()).unwrap();
     }
@@ -565,6 +654,7 @@ mod tests {
             whole: Vec::new(),
             frontier: frontier_of(&all, &proven_keys(&given, &[])),
             compact: None,
+            claims: Vec::new(),
         };
         w.verify(&t.root()).unwrap();
         let hidden = w.leaves[2].clone();
@@ -578,6 +668,7 @@ mod tests {
             whole: vec![4],
             frontier: frontier_of(&all, &proven_keys(&kind4, &[4])),
             compact: None,
+            claims: Vec::new(),
         };
         w.verify(&t.root()).unwrap();
         w.conceal(0);
@@ -617,7 +708,55 @@ mod v2_tests {
             whole: whole.to_vec(),
             frontier: Vec::new(),
             compact: Some((&MultiProof::build(&sorted(all), &keys, true)).into()),
+            claims: Vec::new(),
         }
+    }
+
+    /// Amendment 0043, `DEC-28`: a claimed subtree is proven whole when the witness gives every
+    /// leaf in it, and not when one is withheld; the root checks either way, and the claim's probe
+    /// is proven even where the subtree is empty.
+    #[test]
+    fn dec_28_a_claimed_subtree_is_proven_whole_only_when_every_leaf_in_it_is_given() {
+        let all: Vec<LeafEntry> = (0..40u8).map(|n| entry(3 + n % 3, n, Some(n))).collect();
+        let root = root_of(&all);
+        let mut start = [0u8; 16];
+        start[0] = 4;
+        let half = Subtree::new(start, 9).unwrap();
+        let inside: Vec<LeafEntry> = all
+            .iter()
+            .filter(|(k, key, _)| half.contains(&library_key(*k, key)))
+            .cloned()
+            .collect();
+        assert!(!inside.is_empty() && inside.len() < 14);
+        let with = |given: &[LeafEntry]| {
+            let keys = proven_keys_with(given, &[], &[half]);
+            ServiceWitness {
+                leaves: given.to_vec(),
+                whole: Vec::new(),
+                frontier: Vec::new(),
+                compact: Some((&MultiProof::build(&sorted(&all), &keys, true)).into()),
+                claims: vec![half],
+            }
+        };
+        let w = with(&inside);
+        w.verify(&root).unwrap();
+        assert_eq!(w.proven_claims(), Ok(vec![half]));
+        let w = with(&inside[1..]);
+        w.verify(&root).unwrap();
+        assert_eq!(w.proven_claims(), Ok(Vec::new()));
+        // An empty subtree: nothing given, and it is proven empty.
+        start[0] = 7;
+        let empty = Subtree::new(start, 8).unwrap();
+        let keys = proven_keys_with(&[], &[], &[empty]);
+        let w = ServiceWitness {
+            leaves: Vec::new(),
+            whole: Vec::new(),
+            frontier: Vec::new(),
+            compact: Some((&MultiProof::build(&sorted(&all), &keys, true)).into()),
+            claims: vec![empty],
+        };
+        w.verify(&root).unwrap();
+        assert_eq!(w.proven_claims(), Ok(vec![empty]));
     }
 
     #[test]

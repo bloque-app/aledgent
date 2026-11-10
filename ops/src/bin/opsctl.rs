@@ -36,6 +36,18 @@
 //!                       [--fetch-concurrency <n>] [--chainspec <file>]
 //!                                                 check the archive and re-derive its book, laying
 //!                                                 nothing out
+//! opsctl reconcile --exporter-config <exporter.toml> --from <archive> --config <deployment config>
+//!                  (--anchors-rpc <URL> | --no-anchors) (--token-file <file> | --token-env <VAR>)
+//!                  [--compare-settlement]
+//!                                                 the daily reconciliation (NFR-9): axis 1 verifies the
+//!                                                 archive (as `archive verify`), axis 2 reads the trial
+//!                                                 balance from ingress, axis 3 compares the book with
+//!                                                 the settlement layer, only when an asset is bound AND
+//!                                                 --compare-settlement is named (it writes an audit record,
+//!                                                 so it needs the owner's go). Writes one run record to
+//!                                                 the exporter's `[records] reconciliation`; the token is the
+//!                                                 operator's (the trial balance is the operator's); exits non-zero
+//!                                                 unless every axis ran and found nothing
 //! opsctl archive status --state <dir>             the core host's archiver status
 //! opsctl exporter --config <exporter.toml>        serve /metrics
 //! opsctl health --config <exporter.toml>          exit 0 when the exporter at the configuration's
@@ -839,6 +851,91 @@ fn health(args: &[String]) -> Result<(), Error> {
     }
 }
 
+/// `opsctl reconcile` (`NFR-9`, `AC-J3.1`): see `ops::reconcile::job`. The exporter's configuration
+/// names ingress, the operator's token (never an argument) and the records directory the exporter
+/// reads, so the run is recorded where it is watched.
+async fn reconcile_daily(args: &[String]) -> Result<(), Error> {
+    if flag(args, "--accept-damaged-archive") {
+        return Err(Error::Config(
+            "reconcile: a damaged archive is a finding, not something to accept".into(),
+        ));
+    }
+    // Usage errors fail the command; they are not a run's result.
+    arg(args, "--from")?;
+    arg(args, "--config")?;
+    anchors(args)?;
+    let c = ops::exporter::ExporterConfig::parse(&std::fs::read_to_string(arg(
+        args,
+        "--exporter-config",
+    )?)?)?;
+    let records = c.records.reconciliation.clone().ok_or_else(|| {
+        Error::Config("the exporter configuration has no [records] reconciliation".into())
+    })?;
+    let link = ops::reconcile::HttpLink::new(
+        &c.ingress,
+        // The operator's own token, not the exporter's: `read_signals` alone is refused the trial
+        // balance (the operator's). Named by file or variable, never given as an argument.
+        ops::exporter::read_token(
+            opt(args, "--token-file").map(PathBuf::from).as_deref(),
+            opt(args, "--token-env").as_deref(),
+        )?,
+        Duration::from_millis(c.timeout_ms.max(100)),
+    )?;
+    let checked = archive_verified(args).map(|(archive, fetched, verified, _)| {
+        ops::reconcile::ArchiveChecked {
+            archive: archive.describe(),
+            segments: fetched.segments,
+            inputs: fetched.point.inputs,
+            postings: verified.postings,
+            checks: verified.checks,
+        }
+    });
+    let read = checked.as_ref().map_err(|e| e.to_string());
+    let run = ops::reconcile::job(
+        &link,
+        read.as_ref().map_err(String::as_str).copied(),
+        flag(args, "--compare-settlement"),
+        now(),
+        &records,
+    )
+    .await?;
+    for a in &run.axes {
+        let what = match (a.ran, a.findings.len()) {
+            (false, _) => "not run".to_owned(),
+            (true, 0) => "no differences".to_owned(),
+            (true, n) => format!("{n} difference(s)"),
+        };
+        println!(
+            "axis {}: {what}{}",
+            a.axis,
+            a.note.as_ref().map_or(String::new(), |n| format!(" ({n})"))
+        );
+        for f in &a.findings {
+            println!(
+                "  {}",
+                serde_json::to_string(f).map_err(|e| Error::Config(e.to_string()))?
+            );
+        }
+    }
+    println!(
+        "suspense: {}",
+        if run.suspense_checked {
+            "checked"
+        } else {
+            "not checked by this command"
+        }
+    );
+    println!("record: {}/run-{:020}.json", records.display(), run.at);
+    if run.clean() {
+        Ok(())
+    } else {
+        Err(Error::Core(
+            "the reconciliation is not clean: an axis found a difference or did not run (above)"
+                .into(),
+        ))
+    }
+}
+
 async fn run(args: &[String]) -> Result<(), Error> {
     let words: Vec<&str> = args.iter().take(2).map(String::as_str).collect();
     match words.as_slice() {
@@ -917,6 +1014,7 @@ async fn run(args: &[String]) -> Result<(), Error> {
             );
             Ok(())
         }
+        ["reconcile"] | ["reconcile", ..] => reconcile_daily(args).await,
         ["exporter"] | ["exporter", ..] => exporter(args).await,
         ["health"] | ["health", ..] => health(args),
         _ => Err(Error::Config(

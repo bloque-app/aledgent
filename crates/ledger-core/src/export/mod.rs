@@ -68,7 +68,10 @@ pub use kernel::{Leaves, Openings};
 /// partition other than its subject's, after its balance rule (`REQ-RT-9`, `F-031`); kernel
 /// account ids and transfer ids carry their partition. 12: a checkpoint names its construction and
 /// its code binding (the book's genesis, the code version and the upgrade-authority mode; anchor
-/// commitment `v3`, `T-037-03`). As for every version, this build reads only its own.
+/// commitment `v3`, `T-037-03`). Still 12 after amendment 0043: a registry that retired a tag adds
+/// a last section, `service.retired-tags`, and a registry that never did writes none, so those
+/// exports are byte for byte what they were; a build without it refuses the one that has it. As for
+/// every version, this build reads only its own.
 pub const FORMAT_VERSION: u32 = 12;
 
 /// The bytes every export starts with.

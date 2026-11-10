@@ -103,6 +103,158 @@ fn ac_k5_2_export_and_reimport_give_identical_observable_state() {
     assert_eq!(e2.manifest.audit.emitted, e.manifest.audit.emitted + 2);
 }
 
+/// Amendment 0043: a book with an asset retiring exports its retirement, the cursor included, and
+/// imports it back, so the import's sweep goes on where the original's stood and both decide each
+/// page alike; a book that removed an asset exports the tag it retired, so the same id registers
+/// again with the same fresh tag in the original and in the import. A book that did neither writes
+/// neither section.
+#[test]
+fn req_as_10_a_retirement_and_a_retired_tag_cross_an_export_and_an_import() {
+    use ledger_core::asset::{ASSET_RETIREMENT, AssetId, AssetKind, AssetStatus};
+    use ledger_core::ledger::operator::{RegisterAsset, ReviewRef, SweepNext, SweepPage};
+
+    let mut b = random(0x543, 200);
+    let mut anchors = Checkpoints::new();
+    let plain = export(&mut b, &mut anchors);
+    assert!(plain.sections.iter().all(|s| {
+        s.name() != "service.retired-tags" && s.name() != "service.asset-retirements"
+    }));
+    let mut first = import(&mut b, &plain, &anchors);
+    first.set_generation(ASSET_RETIREMENT, false);
+
+    let tstx = AssetId::parse("TSTX").unwrap();
+    // The random book's operator holds a fixed list of kinds; add the two this needs.
+    let op = b.operator();
+    let ctx = b.ctx(op);
+    first
+        .grant_operator(
+            &ctx,
+            op.principal,
+            ledger_core::set::NonEmptySet::new(
+                [
+                    ledger_core::operator::OperatorOpKind::RegisterAsset,
+                    ledger_core::operator::OperatorOpKind::RemoveAsset,
+                ]
+                .into(),
+            )
+            .unwrap(),
+            None,
+            b"asset staff",
+        )
+        .expect("granted");
+    let register = |l: &mut Ledger<MemStore, MemVault>, b: &mut Mem, precision: u8, n: u8| {
+        let ctx = b.ctx(b.operator());
+        l.register_asset(
+            &ctx,
+            RegisterAsset {
+                id: tstx,
+                precision,
+                kind: AssetKind::Other,
+                review: ReviewRef([n; 32]),
+            },
+            b"listing",
+        )
+        .expect("registered");
+        l.state().registry().get(&tstx).unwrap().tag()
+    };
+    let page_of = |n: SweepNext| SweepPage {
+        start: n.start,
+        level: n.level.expect("a whole store suggests a level"),
+    };
+    let crossed = |l: &mut Ledger<MemStore, MemVault>, b: &mut Mem, label: &str| {
+        let mut anchors = Checkpoints::new();
+        anchors.anchor(l).expect("a checkpoint");
+        let ctx = b.ctx(b.operator());
+        let e = l
+            .export_book(&ctx, &anchors, label.as_bytes(), &mut b.audit)
+            .expect("the export");
+        let e = Export::from_bytes(&e.to_bytes()).expect("the bytes read back");
+        let ctx = b.ctx(b.operator());
+        let t = target(b);
+        let (mut l2, _) =
+            Ledger::import_book(&e, t, &anchors, &ctx, b"restore drill", &mut b.audit)
+                .expect("the import");
+        l2.set_generation(ASSET_RETIREMENT, false);
+        (e, l2)
+    };
+    // The highest tag is the one retired, so only the next tag remembers it.
+    let wrong = register(&mut first, &mut b, 8, 1);
+    let ctx = b.ctx(b.operator());
+    let mut next = first
+        .retire_asset(&ctx, tstx, ReviewRef([2; 32]), b"8 decimals, never used")
+        .expect("retired")
+        .value;
+    // One page swept, then exported and imported mid-sweep.
+    let ctx = b.ctx(b.operator());
+    next = first
+        .sweep_asset_uses(&ctx, tstx, page_of(next.unwrap()), b"sweep")
+        .expect("a page")
+        .value;
+    let (e, mut second) = crossed(&mut first, &mut b, "export mid-sweep");
+    assert_eq!(
+        e.sections.last().map(|s| s.name()),
+        Some("service.asset-retirements")
+    );
+    assert_eq!(
+        second.state().retirement(&tstx),
+        first.state().retirement(&tstx)
+    );
+    assert_eq!(
+        second.state().registry().get(&tstx).unwrap().status(),
+        AssetStatus::Retiring
+    );
+    assert_eq!(
+        second.state().registry().digest(),
+        first.state().registry().digest()
+    );
+    // Both go on from the same cursor, page for page, to the end, and remove it.
+    while let Some(n) = next {
+        let ctx = b.ctx(b.operator());
+        let a = first
+            .sweep_asset_uses(&ctx, tstx, page_of(n), b"sweep")
+            .expect("a page")
+            .value;
+        let ctx = b.ctx(b.operator());
+        let c = second
+            .sweep_asset_uses(&ctx, tstx, page_of(n), b"sweep")
+            .expect("the same page")
+            .value;
+        assert_eq!(a.map(|x| x.start), c.map(|x| x.start));
+        next = a;
+    }
+    for l in [&mut first, &mut second] {
+        let ctx = b.ctx(b.operator());
+        l.remove_asset(
+            &ctx,
+            tstx,
+            ReviewRef([3; 32]),
+            b"wrong precision, never used",
+        )
+        .expect("removed");
+    }
+    // Export the book that removed it, and import that. The import continues the audit store's
+    // chain, so it is the one exported again.
+    let (e, mut third) = crossed(&mut second, &mut b, "export after a removal");
+    assert_eq!(
+        e.sections.last().map(|s| s.name()),
+        Some("service.retired-tags")
+    );
+    assert_eq!(
+        third.state().registry().digest(),
+        first.state().registry().digest()
+    );
+    let fresh_third = register(&mut third, &mut b, 6, 3);
+    let fresh_second = register(&mut second, &mut b, 6, 3);
+    let fresh_first = register(&mut first, &mut b, 6, 3);
+    assert!(fresh_third.0 > wrong.0, "{fresh_third:?} reuses {wrong:?}");
+    assert_eq!(fresh_third, fresh_first);
+    assert_eq!(fresh_second, fresh_first);
+    assert_eq!(
+        third.state().registry().digest(),
+        first.state().registry().digest()
+    );
+}
+
 /// `F-005`: the service store's leaves are a function of what it holds, not of how it came to
 /// hold it: a book rebuilt from its export holds exactly the original's leaves, derived indexes
 /// included, so the core Agent's service root does not depend on the path.

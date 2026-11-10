@@ -726,7 +726,14 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
     }
 
     pub(super) fn check(&mut self, writes: &[Write]) -> Result<(), Refusal> {
-        self.state.check(writes).map_err(|_| Refusal::NotAuthorised)
+        self.state.check(writes).map_err(|e| match e {
+            // A write that names a retiring asset as something new (amendment 0043).
+            StoreRefusal::AssetRetiring(_)
+            | StoreRefusal::Registry(crate::asset::RegistryError::Retiring(_)) => {
+                Refusal::AssetDeprecated
+            }
+            _ => Refusal::NotAuthorised,
+        })
     }
 
     // ---------------------------------------------------------------- identities

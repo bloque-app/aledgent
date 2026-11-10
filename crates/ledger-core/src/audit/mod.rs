@@ -141,6 +141,10 @@ impl AuditClass {
             | Command::UnfreezeAccount
             | Command::RegisterAsset
             | Command::DeprecateAsset
+            | Command::RemoveAsset
+            | Command::RetireAsset
+            | Command::SweepAssetUses
+            | Command::CancelAssetRetirement
             | Command::BindAsset
             | Command::DeclareAdapterSupport
             | Command::InitiateRecovery
@@ -234,11 +238,15 @@ pub const fn command_code(c: Command) -> u8 {
         Command::ApproveUpgrade => 55,
         Command::ProposeMigration => 56,
         Command::Upgrade => 57,
+        Command::RemoveAsset => 58,
+        Command::RetireAsset => 59,
+        Command::SweepAssetUses => 60,
+        Command::CancelAssetRetirement => 61,
     }
 }
 
 /// Every command, for decoding.
-const COMMANDS: [Command; 57] = [
+const COMMANDS: [Command; 61] = [
     Command::Genesis,
     Command::OpenIdentity,
     Command::SetIdentityStatus,
@@ -296,6 +304,10 @@ const COMMANDS: [Command; 57] = [
     Command::ApproveUpgrade,
     Command::ProposeMigration,
     Command::Upgrade,
+    Command::RemoveAsset,
+    Command::RetireAsset,
+    Command::SweepAssetUses,
+    Command::CancelAssetRetirement,
 ];
 
 /// What a privileged read read (`REQ-PV-4`). Each is one place that uses the mechanism.

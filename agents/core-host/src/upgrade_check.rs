@@ -20,8 +20,11 @@
 //!    state as if the switch had already been made, and *N* decides the way out: it must reach
 //!    the same archived log hash *P* reached.
 //!
-//! Where the recorded book needs a generation before *P*'s, the check refuses: the packages of
-//! those generations are not given (a later release supplies the chain of predecessors). The
+//! Where the recorded book ran generations before *P*'s, their packages are given with `--earlier`
+//! (one per generation, repeatable): the book is founded under the lowest, and each is installed in
+//! place at its recorded upgrade, as a replay of the book takes them, up to *P* and then *N*. A
+//! generation the book ran whose package is not given is refused. So the upgrade from 1 to 2 runs
+//! with the genesis package as `--earlier`, and the one from 0 to 1 needs none. The
 //! history is the gate's, not a deployment's archive: the release job holds no credential to read
 //! one. The keys are test keys, as every check of this binary uses; the host that drives the
 //! packages is this tree's.
@@ -107,18 +110,20 @@ pub struct Plan {
     pub switch_at: u64,
 }
 
-/// Which of the recorded inputs the packages of generations `previous` and `previous + 1` can run.
+/// Which of the recorded inputs the packages of generations `earliest` to `previous + 1` can run:
+/// `earliest` is the lowest generation a package is given of, `previous` itself when no earlier
+/// one is.
 ///
 /// # Errors
 ///
-/// The book needs a generation before `previous` (its package is not given), or it records no
+/// The book ran a generation before `earliest` (its package is not given), or it records no
 /// range of `previous` or of the next generation.
-pub fn plan(map: &CodeMap, previous: u64) -> Result<Plan, String> {
+pub fn plan(map: &CodeMap, earliest: u64, previous: u64) -> Result<Plan, String> {
     let next = previous + 1;
-    if let Some(r) = map.ranges.iter().find(|r| r.generation < previous) {
+    if let Some(r) = map.ranges.iter().find(|r| r.generation < earliest) {
         return Err(format!(
             "the recorded book's inputs {}..={} ran generation {}, before the code in force's {previous}: \
-             the check needs the package of every earlier generation, which is not given",
+             the check needs the package of every earlier generation, which is not given (--earlier)",
             r.from, r.to, r.generation
         ));
     }
@@ -248,8 +253,9 @@ fn fresh(
     })
 }
 
-/// `check-upgrade --runtime <pvm> --previous <vos> --package <vos> --history <dir> [--out <file>]`
-/// (module documentation). Prints its report as JSON, and writes it to `--out`.
+/// `check-upgrade --runtime <pvm> --previous <vos> --package <vos> --history <dir>
+/// [--earlier <vos>]... [--out <file>]` (module documentation). Prints its report as JSON, and
+/// writes it to `--out`.
 ///
 /// # Errors
 ///
@@ -281,13 +287,46 @@ pub fn check_upgrade(args: &[String]) -> Result<(), String> {
     }
     let admit =
         |b: &[u8], what: &str| crate::package::admit_actor(b).map_err(|e| format!("{what}: {e:?}"));
-    let packages: BTreeMap<u64, AdmittedActorPackage> = [
+    let mut packages: BTreeMap<u64, AdmittedActorPackage> = [
         (gp, admit(&previous, "--previous")?),
         (gn, admit(&package, "--package")?),
     ]
     .into_iter()
     .collect();
-    let plan = plan(&history.map, gp)?;
+    // The packages of the generations before P's, one each.
+    for (i, a) in args.iter().enumerate() {
+        if a != "--earlier" {
+            continue;
+        }
+        let p = args
+            .get(i + 1)
+            .filter(|v| !v.starts_with("--"))
+            .ok_or("--earlier: a package is required")?;
+        let bytes = std::fs::read(p).map_err(|e| format!("--earlier {p}: {e}"))?;
+        let g = crate::code::package_generation(&bytes)?;
+        if g >= gp {
+            // Not earlier than the code in force (a release whose predecessor is the genesis
+            // itself): nothing to add.
+            eprintln!(
+                "aledgent-core-host: check-upgrade: --earlier {p} is generation {g}: not before {gp}, left out"
+            );
+            continue;
+        }
+        if packages.contains_key(&g) {
+            return Err(format!(
+                "--earlier {p} is generation {g}: one package of each earlier generation is taken"
+            ));
+        }
+        packages.insert(g, admit(&bytes, "--earlier")?);
+    }
+    let earliest = *packages.keys().next().unwrap_or(&gp);
+    if let Some(g) = (earliest..gp).find(|g| !packages.contains_key(g)) {
+        return Err(format!(
+            "no package of generation {g} is given, between the earliest {earliest} and the code in \
+             force's {gp}"
+        ));
+    }
+    let plan = plan(&history.map, earliest, gp)?;
     let entries = history.entries.get(..plan.inputs).ok_or_else(|| {
         format!(
             "the recorded code map names {} inputs and entries.bin holds {}: the book is cut",
@@ -297,8 +336,9 @@ pub fn check_upgrade(args: &[String]) -> Result<(), String> {
     })?;
     let started = std::time::Instant::now();
 
-    // 1. P's state, carried by N: the whole of both generations' recorded inputs.
-    let port = fresh(&runtime, &packages, &history.map, gp)?;
+    // 1. P's state, carried by N: the whole of the recorded inputs up to N's generation, each
+    // earlier generation installed in place at its recorded upgrade.
+    let port = fresh(&runtime, &packages, &history.map, earliest)?;
     let (port, rolled) =
         roll_forward_agent(port, &history.founding, entries, &ReplicaStores::Memory)
             .map_err(|e| format!("the recorded book does not replay through the packages: {e}"))?;
@@ -308,9 +348,10 @@ pub fn check_upgrade(args: &[String]) -> Result<(), String> {
             rolled.to, plan.inputs
         ));
     }
-    if port.installs != [gn] {
+    let expected: Vec<u64> = (earliest + 1..=gn).collect();
+    if port.installs != expected {
         return Err(format!(
-            "the switches taken were to generations {:?}, not one to generation {gn}",
+            "the switches taken were to generations {:?}, not one to each of {expected:?}",
             port.installs
         ));
     }
@@ -339,7 +380,7 @@ pub fn check_upgrade(args: &[String]) -> Result<(), String> {
         if history.map.range_of(e.seq).map(|r| r.generation) != Some(gp) {
             continue;
         }
-        let port = fresh(&runtime, &packages, &history.map, gp)?;
+        let port = fresh(&runtime, &packages, &history.map, earliest)?;
         let (mut port, _) = roll_forward_agent(
             port,
             &history.founding,
@@ -379,6 +420,7 @@ pub fn check_upgrade(args: &[String]) -> Result<(), String> {
     }
     let report = serde_json::json!({
         "previous_generation": gp,
+        "earliest_generation": earliest,
         "generation": gn,
         "inputs": rolled.to,
         "switch_at": plan.switch_at,
@@ -425,7 +467,7 @@ mod tests {
     fn t037_12_the_check_runs_the_two_generations_it_has_packages_for() {
         let m = map(&[(1, 14, 0), (15, 34, 1), (35, 40, 2)]);
         assert_eq!(
-            plan(&m, 0),
+            plan(&m, 0, 0),
             Ok(Plan {
                 inputs: 34,
                 switch_at: 15
@@ -433,12 +475,38 @@ mod tests {
         );
         // Generation 1's package alone cannot run the inputs of generation 0.
         assert!(
-            plan(&m, 1)
+            plan(&m, 1, 1)
                 .unwrap_err()
                 .contains("before the code in force's 1")
         );
         // Nothing recorded of the next generation: extend the book first.
-        assert!(plan(&m, 2).is_err());
+        assert!(plan(&m, 0, 2).is_err());
+    }
+
+    /// `T-037-12`, the upgrade from 1 to 2: with generation 0's package given earlier, the check
+    /// re-sends every input up to generation 2's and installs 2 at its first input; 0 to 1 is as
+    /// before.
+    #[test]
+    fn t037_12_an_upgrade_from_1_to_2_runs_with_the_genesis_package_earlier() {
+        let m = map(&[(1, 14, 0), (15, 34, 1), (35, 40, 2), (41, 45, 3)]);
+        assert_eq!(
+            plan(&m, 0, 1),
+            Ok(Plan {
+                inputs: 40,
+                switch_at: 35
+            })
+        );
+        assert_eq!(plan(&m, 0, 0).map(|p| p.switch_at), Ok(15));
+        // The recorded book itself: 0, 1 and 2 are recorded, so 1 to 2 can be checked.
+        let h = read_history(&history()).unwrap();
+        let p = plan(&h.map, 0, 1).unwrap();
+        let first_of_2 = h.map.ranges.iter().find(|r| r.generation == 2).unwrap();
+        assert_eq!(p.switch_at, first_of_2.from);
+        assert_eq!(p.inputs as u64, first_of_2.to);
+        assert!(
+            plan(&h.map, 1, 1).is_err(),
+            "not without generation 0's package"
+        );
     }
 
     /// `T-037-12`: the recorded book reads back, and holds what the check needs for the first
@@ -447,7 +515,7 @@ mod tests {
     fn t037_12_the_recorded_book_reads_back() {
         let h = read_history(&history()).unwrap();
         assert_eq!(h.entries.len() as u64, h.map.ranges.last().unwrap().to);
-        let p = plan(&h.map, 0).unwrap();
+        let p = plan(&h.map, 0, 0).unwrap();
         assert!(p.switch_at > 1 && p.inputs >= p.switch_as_usize());
     }
 

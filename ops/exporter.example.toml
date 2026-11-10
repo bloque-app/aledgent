@@ -13,6 +13,8 @@ review_owner = "settlement-operations"
 timeout_ms = 5000
 
 [records]
+# `opsctl reconcile --exporter-config <this file>` writes its run records here, and the exporter reads
+# them: the directory is shared between the two.
 reconciliation = "/var/lib/aledgent/reconciliation"
 backups = "/var/backups/aledgent"
 drills = "/var/lib/aledgent/drills"
