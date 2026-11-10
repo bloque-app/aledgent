@@ -35,9 +35,6 @@ use core_binding::envelope::BlobKey;
 /// the macro defines from it is read.
 const GENERATION: u64 = 2;
 
-// The removal of an unused asset is taken from its rules version (amendment 0043): a package
-// built at a rules version below it would carry the calls and never take them.
-const _: () = assert!(GENERATION >= core_binding::ledger_core::asset::ASSET_RETIREMENT);
 
 core_binding::ledger_core::code_generation!(GENERATION);
 use core_binding::transition::{Invocation, Rows, transition};

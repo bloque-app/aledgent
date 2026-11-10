@@ -1490,7 +1490,7 @@ impl State {
     }
 
     /// Whether an asset can be retired (amendment 0043, `REQ-AS-10`, step 1): the point checks of
-    /// [`State::never_held`], it is not retiring already, and the index of grants over the asset
+    /// `State::never_held`, it is not retiring already, and the index of grants over the asset
     /// holds no unrevoked one (an early refusal: the sweep reads every grant, so the index's
     /// completeness is not relied on). Point reads only.
     pub fn asset_retirable(&self, id: &AssetId) -> Result<(), StoreRefusal> {
