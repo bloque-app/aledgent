@@ -774,9 +774,42 @@ struct Inner<P: AgentPort> {
     /// The latest time input of any input offered to the core (`T-037-15`): where the fenced clock
     /// starts, so that an input logged long before it was refused does not age the fence.
     latest_time: Time,
-    /// The scheduled upgrade's code version the core last asked its code source for, and when
-    /// (`T-037-24`, aledgent#128): asked again only after [`RESTAGE_AFTER`].
-    restage: Option<([u8; 32], std::time::Instant)>,
+    /// Where the core's own staging of a scheduled upgrade's code version stands (`T-037-24`,
+    /// aledgent#128).
+    restage: Restage,
+}
+
+/// The core's own staging of a scheduled upgrade's code version (`T-037-24`): the version, whether
+/// a staging of it runs on its own thread now, and when one last failed. A version that failed is
+/// asked for again only after [`RESTAGE_AFTER`]; one that is staged is not asked for again.
+#[derive(Clone, Copy, Debug, Default)]
+struct Restage {
+    code: Option<[u8; 32]>,
+    in_flight: bool,
+    failed_at: Option<std::time::Instant>,
+}
+
+impl Restage {
+    /// Whether `code` may be asked for now: not while a staging of it runs, and not within
+    /// [`RESTAGE_AFTER`] of a failed one.
+    fn may_ask(&self, code: &[u8; 32], now: std::time::Instant) -> bool {
+        if self.code != Some(*code) {
+            return true;
+        }
+        !self.in_flight
+            && self
+                .failed_at
+                .is_none_or(|at| now.duration_since(at) >= RESTAGE_AFTER)
+    }
+
+    /// Record how a staging of `code` went.
+    fn done(&mut self, code: [u8; 32], staged: bool) {
+        *self = Restage {
+            code: Some(code),
+            in_flight: false,
+            failed_at: (!staged).then(std::time::Instant::now),
+        };
+    }
 }
 
 /// How long the core waits before it asks its code source again for a scheduled upgrade's code
@@ -1087,7 +1120,7 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
             segment: segment.map(|(spec, start)| (spec.clone(), start)),
             node_trail: None,
             latest_time: 0,
-            restage: None,
+            restage: Restage::default(),
         };
         // The code the writer is in, and the platform's check at start (`T-037-23`).
         inner.report_code();
@@ -1121,7 +1154,7 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
     }
 
     /// Fetch `code` from the code source and stage it (`T-037-04`), on the calling thread: the
-    /// door's staging and the restage of a scheduled upgrade (`T-037-24`). Only the writer's
+    /// door's staging and the core's own, off a decision (`T-037-24`). Only the writer's
     /// generation is read before the fetch and the staging done after it, each briefly under the
     /// lock, so decisions are not held up by a fetch.
     fn stage_now(&self, code: &[u8; 32]) -> Result<ingress::boundary::Staged, CoreError> {
@@ -1131,18 +1164,13 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
                 reason: crate::staging::StageRefusal::NoSource.to_string(),
             });
         };
-        let (core, code) = (self, *code);
+        let code = *code;
         let generation = {
-            let mut inner = lock(&core.inner.ctl);
+            let mut inner = lock(&self.inner.ctl);
             if inner.stopped.is_some() {
                 return Err(CoreError::Unavailable);
             }
-            inner
-                .driver
-                .as_mut()
-                .and_then(|d| d.port_mut().hot().ok().flatten())
-                .map(|h| h.generation)
-                .ok_or(CoreError::Unavailable)?
+            inner.writer_generation().ok_or(CoreError::Unavailable)?
         };
         let checked = match crate::staging::fetch(&*source, &code, generation) {
             Ok(c) => c,
@@ -1152,59 +1180,29 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
                 });
             }
         };
-        let mut inner = lock(&core.inner.ctl);
+        let mut inner = lock(&self.inner.ctl);
         let Some(driver) = inner.driver.as_mut() else {
             return Err(CoreError::Unavailable);
         };
-        // Could the switch install it? Asked before the version is staged, under the same lock
-        // as the staging, so a version it would refuse at its input is refused at the door
-        // (`T-037-22`, owner ruling w16): nothing is staged and, the door refusing it, nothing
-        // is logged.
-        if let Err(why) = driver.port_mut().can_install(&checked) {
-            let refusal = crate::staging::StageRefusal::CannotInstall(why).to_string();
-            std::eprintln!(
-                "aledgent-core: refused an upgrade to code {} before it was logged (the last \
-                 committed input is {}): {refusal}",
-                crate::switch::short(&code),
-                driver.seq()
-            );
-            return Ok(Staged::Refused { reason: refusal });
-        }
-        match driver.port_mut().stage_code(checked) {
-            Ok(()) => Ok(Staged::Staged),
-            Err(r) => Ok(Staged::Refused {
-                reason: r.to_string(),
-            }),
-        }
+        Ok(stage_checked(driver, &code, checked))
     }
 
-    /// Stage a scheduled upgrade's `code` on a thread of its own (`T-037-24`, aledgent#128), and
-    /// write one line saying how it went.
+    /// Stage a scheduled upgrade's `code` on a thread of its own (`T-037-24`, aledgent#128), as
+    /// soon as the decision that left it unstaged returns, and write one line saying how it went.
     fn restage_in_background(&self, code: [u8; 32]) {
         let core = self.clone();
         let spawned = std::thread::Builder::new()
             .name("core-restage".into())
             .spawn(move || {
-                let short = crate::switch::short(&code);
-                match core.stage_now(&code) {
-                    Ok(ingress::boundary::Staged::Staged) => std::eprintln!(
-                        "aledgent-core: code version {short}, the scheduled upgrade's, is staged \
-                         from the code source"
-                    ),
-                    Ok(ingress::boundary::Staged::Refused { reason }) => std::eprintln!(
-                        "aledgent-core: WARNING: code version {short}, the scheduled upgrade's, \
-                         cannot be staged ({reason}); asked again after {} s. At its input the \
-                         switch is refused until it is",
-                        RESTAGE_AFTER.as_secs()
-                    ),
-                    Err(e) => std::eprintln!(
-                        "aledgent-core: WARNING: code version {short}, the scheduled upgrade's, \
-                         was not staged: {e:?}"
-                    ),
-                }
+                let r = core.stage_now(&code);
+                let mut inner = lock(&core.inner.ctl);
+                let staged = matches!(r, Ok(ingress::boundary::Staged::Staged));
+                inner.restage.done(code, staged);
+                inner.report_restage(&code, &r);
             });
         if let Err(e) = spawned {
             std::eprintln!("aledgent-core: WARNING: the restage thread does not start: {e}");
+            lock(&self.inner.ctl).restage.done(code, false);
         }
     }
 
@@ -1309,17 +1307,29 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
         if inner.stopped.is_some() {
             return Err(CoreError::Unavailable);
         }
-        self.decide(&mut inner, |inner| inner.apply(input))
+        self.decide(&mut inner, 1, |inner| inner.apply(input))
     }
 
     fn apply_batch_now(&self, inputs: &[CoreInput]) -> Vec<Result<CoreReply, CoreError>> {
         let mut inner = lock(&self.inner.ctl);
-        self.decide(&mut inner, |inner| inner.apply_batch(inputs))
+        self.decide(&mut inner, inputs.len(), |inner| inner.apply_batch(inputs))
     }
 
     /// Run `f` with the executor taken out of the gate, holding the gate exclusively until it is
     /// put back: no read sees the replica between an input's native run and the Agent's commit.
-    fn decide<T>(&self, inner: &mut Inner<P>, f: impl FnOnce(&mut Inner<P>) -> T) -> T {
+    fn decide<T>(
+        &self,
+        inner: &mut Inner<P>,
+        inputs: usize,
+        f: impl FnOnce(&mut Inner<P>) -> T,
+    ) -> T {
+        // A decision that may reach the input a scheduled upgrade applies from needs its code
+        // version: when this host does not hold it, it is staged now, before the decision and
+        // under its lock (`T-037-24`, aledgent#128). Rare (once a version, or once a failure
+        // every `RESTAGE_AFTER`), and the switch could not go through without it anyway.
+        if let Some(source) = self.inner.code_source.get() {
+            inner.restage_before(&**source, inputs);
+        }
         let mut slot = self.inner.running.write();
         let held = std::time::Instant::now();
         inner.running = slot.take();
@@ -1328,9 +1338,12 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
         // What happened to the writer's code and the platform in this decision, in the log, and
         // the signals' view of the writer's code (`T-037-23`).
         inner.report_code();
-        // A scheduled upgrade whose code version this host does not hold is staged now, off the
-        // decision (`T-037-24`): a re-decided `Upgrade` was never staged at the door.
-        if let Some(code) = inner.restage_wanted() {
+        // A scheduled upgrade whose code version this host does not hold is staged as soon as
+        // this decision returns, off it (`T-037-24`): a re-decided `Upgrade` was never staged at
+        // the door.
+        if self.inner.code_source.get().is_some()
+            && let Some(code) = inner.restage_wanted()
+        {
             self.restage_in_background(code);
         }
         // The committed credentials, before any read sees the new state (`Credentials`), with
@@ -1435,24 +1448,104 @@ impl<P: AgentPort> Inner<P> {
         }
     }
 
-    /// The scheduled upgrade's code version, if the writer has one as of the last commit, this
-    /// host's port does not hold it, and the core has not asked for it within [`RESTAGE_AFTER`]
-    /// (`T-037-24`). Marks it asked.
-    fn restage_wanted(&mut self) -> Option<[u8; 32]> {
+    /// The writer's rules version, as the Agent's hot row holds it now.
+    fn writer_generation(&mut self) -> Option<u64> {
+        self.driver
+            .as_mut()
+            .and_then(|d| d.port_mut().hot().ok().flatten())
+            .map(|h| h.generation)
+    }
+
+    /// The scheduled upgrade, as of the last commit, whose code version this host's port does
+    /// not hold (`T-037-24`): the version and the input it applies from.
+    fn scheduled_missing(&self) -> Option<([u8; 32], u64)> {
         let driver = self.driver.as_ref()?;
-        let (code, _) = driver.committed_writer()?.upgrade?;
-        if driver.port().holds_code(&code) {
+        let (code, from) = driver.committed_writer()?.upgrade?;
+        (!driver.port().holds_code(&code)).then_some((code, from))
+    }
+
+    /// The scheduled upgrade's code version to stage off the decision, if it is missing and may
+    /// be asked for now ([`Restage::may_ask`]). Marks a staging of it in flight.
+    fn restage_wanted(&mut self) -> Option<[u8; 32]> {
+        let (code, _) = self.scheduled_missing()?;
+        if !self.restage.may_ask(&code, std::time::Instant::now()) {
             return None;
         }
-        let now = std::time::Instant::now();
-        if self
-            .restage
-            .is_some_and(|(c, at)| c == code && now.duration_since(at) < RESTAGE_AFTER)
-        {
-            return None;
-        }
-        self.restage = Some((code, now));
+        self.restage = Restage {
+            code: Some(code),
+            in_flight: true,
+            failed_at: None,
+        };
         Some(code)
+    }
+
+    /// Before a decision of `inputs` inputs (`T-037-24`): if the scheduled upgrade's code version
+    /// is missing and the decision may reach the input it applies from, fetch and stage it now,
+    /// under the decision's lock, unless a staging of it failed within [`RESTAGE_AFTER`]. A
+    /// staging in flight on its own thread is not waited for: this one is the one that counts.
+    fn restage_before(&mut self, source: &dyn crate::staging::CodeFetch, inputs: usize) {
+        let Some((code, from)) = self.scheduled_missing() else {
+            return;
+        };
+        let Some(seq) = self.driver.as_ref().map(Driver::seq) else {
+            return;
+        };
+        let reach = seq.saturating_add(inputs as u64);
+        let now = std::time::Instant::now();
+        let failed_recently = self.restage.code == Some(code)
+            && self
+                .restage
+                .failed_at
+                .is_some_and(|at| now.duration_since(at) < RESTAGE_AFTER);
+        if from > reach || failed_recently {
+            return;
+        }
+        let r = match self.writer_generation() {
+            None => Err(CoreError::Unavailable),
+            Some(generation) => match crate::staging::fetch(source, &code, generation) {
+                Err(why) => Ok(ingress::boundary::Staged::Refused {
+                    reason: why.to_string(),
+                }),
+                Ok(checked) => match self.driver.as_mut() {
+                    Some(driver) => Ok(stage_checked(driver, &code, checked)),
+                    None => Err(CoreError::Unavailable),
+                },
+            },
+        };
+        let staged = matches!(r, Ok(ingress::boundary::Staged::Staged));
+        let in_flight = self.restage.code == Some(code) && self.restage.in_flight;
+        self.restage.done(code, staged);
+        // The thread still running reports into the same record when it returns.
+        self.restage.in_flight = in_flight;
+        self.report_restage(&code, &r);
+    }
+
+    /// One line for the core's own staging of a scheduled upgrade's `code` (`T-037-24`).
+    fn report_restage(&self, code: &[u8; 32], r: &Result<ingress::boundary::Staged, CoreError>) {
+        let short = crate::switch::short(code);
+        let held = self
+            .driver
+            .as_ref()
+            .is_some_and(|d| d.port().holds_code(code));
+        match r {
+            Ok(ingress::boundary::Staged::Staged) => std::eprintln!(
+                "aledgent-core: code version {short}, the scheduled upgrade's, is staged from the \
+                 code source"
+            ),
+            // Staged meanwhile, by the door or the other staging, or switched to already: no
+            // warning.
+            _ if held || self.scheduled_missing().is_none() => {}
+            Ok(ingress::boundary::Staged::Refused { reason }) => std::eprintln!(
+                "aledgent-core: WARNING: code version {short}, the scheduled upgrade's, cannot be \
+                 staged ({reason}); asked again after {} s. If it is still not staged at its \
+                 input, the switch is refused there",
+                RESTAGE_AFTER.as_secs()
+            ),
+            Err(e) => std::eprintln!(
+                "aledgent-core: WARNING: code version {short}, the scheduled upgrade's, was not \
+                 staged: {e:?}"
+            ),
+        }
     }
 
     /// Stop on an incident: every later call is `Unavailable` until the core is reopened.
@@ -2154,6 +2247,34 @@ impl<P: AgentPort + Send + 'static> Core for AgentCore<P> {
         // can only answer "none" for a tie it has not seen yet.
         let principal = String::from(principal);
         self.read(move |r| r.party_of(&principal)).await
+    }
+}
+
+/// Stage a fetched and checked `code` on the driver's port (`T-037-04`): asked first whether the
+/// switch could install it, under the same lock as the staging, so a version it would refuse at
+/// its input is refused here (`T-037-22`, owner ruling w16): nothing is staged and, at the door,
+/// nothing is logged.
+fn stage_checked<P: AgentPort>(
+    driver: &mut Driver<P>,
+    code: &[u8; 32],
+    checked: crate::staging::Checked,
+) -> ingress::boundary::Staged {
+    use ingress::boundary::Staged;
+    if let Err(why) = driver.port_mut().can_install(&checked) {
+        let refusal = crate::staging::StageRefusal::CannotInstall(why).to_string();
+        std::eprintln!(
+            "aledgent-core: refused an upgrade to code {} before it was logged (the last \
+             committed input is {}): {refusal}",
+            crate::switch::short(code),
+            driver.seq()
+        );
+        return Staged::Refused { reason: refusal };
+    }
+    match driver.port_mut().stage_code(checked) {
+        Ok(()) => Staged::Staged,
+        Err(r) => Staged::Refused {
+            reason: r.to_string(),
+        },
     }
 }
 

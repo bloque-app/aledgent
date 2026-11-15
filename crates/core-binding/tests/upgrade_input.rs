@@ -348,7 +348,8 @@ async fn ac_k7_1_an_upgrade_through_ops_is_staged_scheduled_switched_and_in_forc
 /// rehearsal's case: an `Upgrade` kept from a halted process was decided again by the next one,
 /// whose start had staged only the code in force, so the switch was refused at `n` until a restart.
 /// Here the version the door staged is dropped from the port after the decision, as that process
-/// never held it; the next decision stages it again, and the switch at `n` goes through.
+/// never held it; the inputs then run back to back, with no wait, and the switch at `n` goes
+/// through.
 #[tokio::test(flavor = "multi_thread")]
 async fn t037_24_a_scheduled_upgrade_the_node_does_not_hold_is_staged_without_a_restart() {
     let w = world().await;
@@ -388,12 +389,8 @@ async fn t037_24_a_scheduled_upgrade_the_node_does_not_hold_is_staged_without_a_
             assert_eq!(s.as_u16(), 200, "{v}");
         }
     };
-    // The next decision finds the scheduled version missing and asks the code source for it.
-    person(0).await;
-    until("the scheduled version is staged again", || {
-        w.core.with_port(|p| p.holds_code(&h1)).unwrap_or(false)
-    })
-    .await;
+    // No waiting: the inputs run back to back up to n. The decision that may reach n stages the
+    // version first, whatever the staging off the earlier decisions has done by then.
     let mut k = 0;
     while hot(&w).inputs < n {
         k += 1;
