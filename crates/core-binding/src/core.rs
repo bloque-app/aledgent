@@ -774,7 +774,14 @@ struct Inner<P: AgentPort> {
     /// The latest time input of any input offered to the core (`T-037-15`): where the fenced clock
     /// starts, so that an input logged long before it was refused does not age the fence.
     latest_time: Time,
+    /// The scheduled upgrade's code version the core last asked its code source for, and when
+    /// (`T-037-24`, aledgent#128): asked again only after [`RESTAGE_AFTER`].
+    restage: Option<([u8; 32], std::time::Instant)>,
 }
+
+/// How long the core waits before it asks its code source again for a scheduled upgrade's code
+/// version that a first try did not stage (`T-037-24`).
+const RESTAGE_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The core's two locks (`T-031-12`, finding F3 of `F-032`). An input takes `ctl`, then the
 /// executor exclusively, for the whole of its run: the replica runs it, the Agent commits it (or
@@ -1080,6 +1087,7 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
             segment: segment.map(|(spec, start)| (spec.clone(), start)),
             node_trail: None,
             latest_time: 0,
+            restage: None,
         };
         // The code the writer is in, and the platform's check at start (`T-037-23`).
         inner.report_code();
@@ -1110,6 +1118,94 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
                 code_source: OnceLock::new(),
             }),
         })
+    }
+
+    /// Fetch `code` from the code source and stage it (`T-037-04`), on the calling thread: the
+    /// door's staging and the restage of a scheduled upgrade (`T-037-24`). Only the writer's
+    /// generation is read before the fetch and the staging done after it, each briefly under the
+    /// lock, so decisions are not held up by a fetch.
+    fn stage_now(&self, code: &[u8; 32]) -> Result<ingress::boundary::Staged, CoreError> {
+        use ingress::boundary::Staged;
+        let Some(source) = self.inner.code_source.get().cloned() else {
+            return Ok(Staged::Refused {
+                reason: crate::staging::StageRefusal::NoSource.to_string(),
+            });
+        };
+        let (core, code) = (self, *code);
+        let generation = {
+            let mut inner = lock(&core.inner.ctl);
+            if inner.stopped.is_some() {
+                return Err(CoreError::Unavailable);
+            }
+            inner
+                .driver
+                .as_mut()
+                .and_then(|d| d.port_mut().hot().ok().flatten())
+                .map(|h| h.generation)
+                .ok_or(CoreError::Unavailable)?
+        };
+        let checked = match crate::staging::fetch(&*source, &code, generation) {
+            Ok(c) => c,
+            Err(r) => {
+                return Ok(Staged::Refused {
+                    reason: r.to_string(),
+                });
+            }
+        };
+        let mut inner = lock(&core.inner.ctl);
+        let Some(driver) = inner.driver.as_mut() else {
+            return Err(CoreError::Unavailable);
+        };
+        // Could the switch install it? Asked before the version is staged, under the same lock
+        // as the staging, so a version it would refuse at its input is refused at the door
+        // (`T-037-22`, owner ruling w16): nothing is staged and, the door refusing it, nothing
+        // is logged.
+        if let Err(why) = driver.port_mut().can_install(&checked) {
+            let refusal = crate::staging::StageRefusal::CannotInstall(why).to_string();
+            std::eprintln!(
+                "aledgent-core: refused an upgrade to code {} before it was logged (the last \
+                 committed input is {}): {refusal}",
+                crate::switch::short(&code),
+                driver.seq()
+            );
+            return Ok(Staged::Refused { reason: refusal });
+        }
+        match driver.port_mut().stage_code(checked) {
+            Ok(()) => Ok(Staged::Staged),
+            Err(r) => Ok(Staged::Refused {
+                reason: r.to_string(),
+            }),
+        }
+    }
+
+    /// Stage a scheduled upgrade's `code` on a thread of its own (`T-037-24`, aledgent#128), and
+    /// write one line saying how it went.
+    fn restage_in_background(&self, code: [u8; 32]) {
+        let core = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("core-restage".into())
+            .spawn(move || {
+                let short = crate::switch::short(&code);
+                match core.stage_now(&code) {
+                    Ok(ingress::boundary::Staged::Staged) => std::eprintln!(
+                        "aledgent-core: code version {short}, the scheduled upgrade's, is staged \
+                         from the code source"
+                    ),
+                    Ok(ingress::boundary::Staged::Refused { reason }) => std::eprintln!(
+                        "aledgent-core: WARNING: code version {short}, the scheduled upgrade's, \
+                         cannot be staged ({reason}); asked again after {} s. At its input the \
+                         switch is refused until it is",
+                        RESTAGE_AFTER.as_secs()
+                    ),
+                    Err(e) => std::eprintln!(
+                        "aledgent-core: WARNING: code version {short}, the scheduled upgrade's, \
+                         was not staged: {e:?}"
+                    ),
+                }
+            });
+        if let Err(e) = spawned {
+            std::eprintln!("aledgent-core: WARNING: the restage thread does not start: {e}");
+        }
     }
 
     /// The roots of the book's genesis as this host rebuilt them (`F-036`); `None` while the core
@@ -1232,6 +1328,11 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
         // What happened to the writer's code and the platform in this decision, in the log, and
         // the signals' view of the writer's code (`T-037-23`).
         inner.report_code();
+        // A scheduled upgrade whose code version this host does not hold is staged now, off the
+        // decision (`T-037-24`): a re-decided `Upgrade` was never staged at the door.
+        if let Some(code) = inner.restage_wanted() {
+            self.restage_in_background(code);
+        }
         // The committed credentials, before any read sees the new state (`Credentials`), with
         // the ones this decision created: their holders' first requests would otherwise each wait
         // for an invocation.
@@ -1332,6 +1433,26 @@ impl<P: AgentPort> Inner<P> {
         if let Some(w) = driver.committed_writer() {
             *lock(&self.stats.writer_code) = Some(w);
         }
+    }
+
+    /// The scheduled upgrade's code version, if the writer has one as of the last commit, this
+    /// host's port does not hold it, and the core has not asked for it within [`RESTAGE_AFTER`]
+    /// (`T-037-24`). Marks it asked.
+    fn restage_wanted(&mut self) -> Option<[u8; 32]> {
+        let driver = self.driver.as_ref()?;
+        let (code, _) = driver.committed_writer()?.upgrade?;
+        if driver.port().holds_code(&code) {
+            return None;
+        }
+        let now = std::time::Instant::now();
+        if self
+            .restage
+            .is_some_and(|(c, at)| c == code && now.duration_since(at) < RESTAGE_AFTER)
+        {
+            return None;
+        }
+        self.restage = Some((code, now));
+        Some(code)
     }
 
     /// Stop on an incident: every later call is `Unavailable` until the core is reopened.
@@ -2014,64 +2135,18 @@ impl<P: AgentPort + Send + 'static> Core for AgentCore<P> {
     }
 
     async fn stage_code(&self, code: &[u8; 32]) -> Result<ingress::boundary::Staged, CoreError> {
-        use ingress::boundary::Staged;
-        let Some(source) = self.inner.code_source.get().cloned() else {
-            return Ok(Staged::Refused {
-                reason: crate::staging::StageRefusal::NoSource.to_string(),
-            });
-        };
         let (core, code) = (self.clone(), *code);
-        // Retrieval is slow: it runs off the async runtime and outside the core's locks. Only
-        // the writer's generation is read before it and the staging done after it, each briefly
-        // under the lock, so decisions are not held up by a fetch.
-        tokio::task::spawn_blocking(move || {
-            let generation = {
-                let mut inner = lock(&core.inner.ctl);
-                if inner.stopped.is_some() {
-                    return Err(CoreError::Unavailable);
-                }
-                inner
-                    .driver
-                    .as_mut()
-                    .and_then(|d| d.port_mut().hot().ok().flatten())
-                    .map(|h| h.generation)
-                    .ok_or(CoreError::Unavailable)?
-            };
-            let checked = match crate::staging::fetch(&*source, &code, generation) {
-                Ok(c) => c,
-                Err(r) => {
-                    return Ok(Staged::Refused {
-                        reason: r.to_string(),
-                    });
-                }
-            };
-            let mut inner = lock(&core.inner.ctl);
-            let Some(driver) = inner.driver.as_mut() else {
-                return Err(CoreError::Unavailable);
-            };
-            // Could the switch install it? Asked before the version is staged, under the same lock
-            // as the staging, so a version it would refuse at its input is refused at the door
-            // (`T-037-22`, owner ruling w16): nothing is staged and, the door refusing it, nothing
-            // is logged.
-            if let Err(why) = driver.port_mut().can_install(&checked) {
-                let refusal = crate::staging::StageRefusal::CannotInstall(why).to_string();
-                std::eprintln!(
-                    "aledgent-core: refused an upgrade to code {} before it was logged (the last \
-                     committed input is {}): {refusal}",
-                    crate::switch::short(&code),
-                    driver.seq()
-                );
-                return Ok(Staged::Refused { reason: refusal });
-            }
-            match driver.port_mut().stage_code(checked) {
-                Ok(()) => Ok(Staged::Staged),
-                Err(r) => Ok(Staged::Refused {
-                    reason: r.to_string(),
-                }),
-            }
-        })
-        .await
-        .unwrap_or(Err(CoreError::Unavailable))
+        // Retrieval is slow: it runs off the async runtime and outside the core's locks.
+        let r = tokio::task::spawn_blocking(move || core.stage_now(&code))
+            .await
+            .unwrap_or(Err(CoreError::Unavailable));
+        if let Ok(ingress::boundary::Staged::Staged) = &r {
+            std::eprintln!(
+                "aledgent-core: code version {} is staged for the upgrade that names it",
+                crate::switch::short(&code)
+            );
+        }
+        r
     }
 
     async fn party_of(&self, principal: &str) -> Result<Option<String>, CoreError> {
