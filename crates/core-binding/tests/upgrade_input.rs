@@ -343,6 +343,78 @@ async fn ac_k7_1_an_upgrade_through_ops_is_staged_scheduled_switched_and_in_forc
     assert_eq!(w.core.with_port(|p| p.generation), Some(1));
 }
 
+/// `T-037-24` (aledgent#128), `REQ-RT-16`, `REQ-RT-20`: a scheduled upgrade whose code version
+/// the node does not hold is staged by the core itself, from its code source, with no restart. The
+/// rehearsal's case: an `Upgrade` kept from a halted process was decided again by the next one,
+/// whose start had staged only the code in force, so the switch was refused at `n` until a restart.
+/// Here the version the door staged is dropped from the port after the decision, as that process
+/// never held it; the inputs then run back to back, with no wait, and the switch at `n` goes
+/// through.
+#[tokio::test(flavor = "multi_thread")]
+async fn t037_24_a_scheduled_upgrade_the_node_does_not_hold_is_staged_without_a_restart() {
+    restaged_and_switched(5).await;
+}
+
+/// `T-037-24`: the same when the upgrade applies from the input right after it. No decision runs
+/// between the two, so nothing has staged the version off a decision: the decision of input `n`
+/// stages it first, under its own lock.
+#[tokio::test(flavor = "multi_thread")]
+async fn t037_24_the_decision_that_reaches_the_switch_stages_the_version_first() {
+    restaged_and_switched(2).await;
+}
+
+/// An upgrade scheduled `gap` inputs ahead, its version dropped from the port once it is decided,
+/// then the inputs up to its input sent back to back: the switch goes through there.
+async fn restaged_and_switched(gap: u64) {
+    let w = world().await;
+    let op = operator(&w);
+    let g = hot(&w);
+    let h1 = w.code.version(1);
+    let n = g.inputs + gap;
+    let (s, v) =
+        w.d.call(
+            "POST",
+            "/v1/ops/upgrade",
+            Some(&op),
+            &[],
+            Some(upgrade_body(&h1, n)),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    assert_eq!(hot(&w).upgrade, Some((h1, n)));
+    // The process that decides it again never staged it: only the code in force is held.
+    w.core.with_port(|p| {
+        p.code_map.remove(&h1);
+        assert!(p.holds_code(&g.code) && !p.holds_code(&h1));
+    });
+    let person = |k: usize| {
+        let d = &w.d;
+        let op = op.clone();
+        async move {
+            let (s, v) = d
+                .call(
+                    "POST",
+                    "/v1/identities",
+                    Some(&op),
+                    &[("client-key", &format!("person-{k}"))],
+                    Some(json!({ "kind": "person", "verifier": "0a" })),
+                )
+                .await;
+            assert_eq!(s.as_u16(), 200, "{v}");
+        }
+    };
+    // No waiting: the inputs run back to back up to n. The decision that may reach n stages the
+    // version first, whatever the staging off the earlier decisions has done by then.
+    let mut k = 0;
+    while hot(&w).inputs < n {
+        k += 1;
+        person(k).await;
+    }
+    let h = hot(&w);
+    assert_eq!((h.code, h.generation, h.upgrade), (h1, 1, None));
+    assert_eq!(w.core.with_port(|p| p.switched.clone()), Some(vec![h1]));
+}
+
 /// `REQ-OP-10`, `INV-18` on the new routes: a retry of an upgrade is answered from its first
 /// decision, not staged again. After the upgrade is in force its code names the generation the
 /// writer is at, and its source may be gone; the retry still gets the original answer, and logs
