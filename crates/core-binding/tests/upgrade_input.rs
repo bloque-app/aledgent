@@ -352,11 +352,25 @@ async fn ac_k7_1_an_upgrade_through_ops_is_staged_scheduled_switched_and_in_forc
 /// through.
 #[tokio::test(flavor = "multi_thread")]
 async fn t037_24_a_scheduled_upgrade_the_node_does_not_hold_is_staged_without_a_restart() {
+    restaged_and_switched(5).await;
+}
+
+/// `T-037-24`: the same when the upgrade applies from the input right after it. No decision runs
+/// between the two, so nothing has staged the version off a decision: the decision of input `n`
+/// stages it first, under its own lock.
+#[tokio::test(flavor = "multi_thread")]
+async fn t037_24_the_decision_that_reaches_the_switch_stages_the_version_first() {
+    restaged_and_switched(2).await;
+}
+
+/// An upgrade scheduled `gap` inputs ahead, its version dropped from the port once it is decided,
+/// then the inputs up to its input sent back to back: the switch goes through there.
+async fn restaged_and_switched(gap: u64) {
     let w = world().await;
     let op = operator(&w);
     let g = hot(&w);
     let h1 = w.code.version(1);
-    let n = g.inputs + 5;
+    let n = g.inputs + gap;
     let (s, v) =
         w.d.call(
             "POST",

@@ -1197,7 +1197,10 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
                 let r = core.stage_now(&code);
                 let mut inner = lock(&core.inner.ctl);
                 let staged = matches!(r, Ok(ingress::boundary::Staged::Staged));
-                inner.restage.done(code, staged);
+                // A schedule that moved to another version meanwhile keeps its own record.
+                if inner.restage.code == Some(code) {
+                    inner.restage.done(code, staged);
+                }
                 inner.report_restage(&code, &r);
             });
         if let Err(e) = spawned {
