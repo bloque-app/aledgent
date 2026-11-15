@@ -644,6 +644,9 @@ pub struct CoreStats {
     /// How many lines about the writer's code the core has written (`T-037-23`): tests count them,
     /// since the lines themselves go to standard error.
     pub code_lines: AtomicU64,
+    /// 1 when this start reopened the replica a clean stop kept (`T-031-25`, aledgent#129), 0
+    /// when it rebuilt it from genesis.
+    pub replica_reused: AtomicU64,
     read_wait_us: Window,
     hold_us: Window,
     native_us: Window,
@@ -777,6 +780,9 @@ struct Inner<P: AgentPort> {
     /// Where the core's own staging of a scheduled upgrade's code version stands (`T-037-24`,
     /// aledgent#128).
     restage: Restage,
+    /// A kept replica was reopened and its record is still on disk (`T-031-25`): removed before
+    /// the first decision, when the stores first move past it.
+    kept_record: bool,
 }
 
 /// The core's own staging of a scheduled upgrade's code version (`T-037-24`): the version, whether
@@ -1034,6 +1040,7 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
                 "a verify-genesis segment founds a fresh Agent; this one holds state".into(),
             );
         }
+        let mut reused = false;
         let (mut driver, replica, founded) = if let Some((spec, start)) = segment {
             Driver::found_at_chunk(
                 &stores,
@@ -1050,22 +1057,56 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
         } else if founded_already {
             let mut archive = log.entries()?;
             let archived = archive.len();
-            let (driver, replica) = Driver::recover_audited(
+            // A replica a clean stop kept is reopened where it stands, checked, instead of
+            // replayed from genesis (`T-031-25`, aledgent#129); anything else rebuilds it.
+            let started = std::time::Instant::now();
+            let reopened = Driver::reopen(
                 &stores,
                 port,
                 founding.keys.clone(),
-                founding.genesis.clone(),
-                founding.op,
-                founding.at,
-                &mut archive,
+                &founding.genesis,
+                &archive,
                 floor,
-            )
-            .map_err(|e| format!("{e:?}"))?;
-            // What the Agent committed beyond the log (the host died before archiving it) is
-            // archived now, before the Agent is told so.
-            for e in &archive[archived..] {
-                log.push_entry(e)?;
-            }
+            );
+            let (driver, replica) = match reopened {
+                Ok((driver, replica)) => {
+                    std::eprintln!(
+                        "aledgent-core: the replica kept at input {} is reopened and checked in \
+                         {} ms (no rebuild)",
+                        driver.seq(),
+                        started.elapsed().as_millis()
+                    );
+                    reused = true;
+                    (driver, replica)
+                }
+                Err(crate::host::Reopen::Failed(e)) => {
+                    return Err(format!("the kept replica reopened and failed: {e:?}"));
+                }
+                Err(crate::host::Reopen::Unusable(port, why)) => {
+                    if stores != ReplicaStores::Memory {
+                        std::eprintln!(
+                            "aledgent-core: the replica is rebuilt from the archive ({why})"
+                        );
+                    }
+                    let recovered = Driver::recover_audited(
+                        &stores,
+                        port,
+                        founding.keys.clone(),
+                        founding.genesis.clone(),
+                        founding.op,
+                        founding.at,
+                        &mut archive,
+                        floor,
+                    )
+                    .map_err(|e| format!("{e:?}"))?;
+                    // What the Agent committed beyond the log (the host died before archiving it)
+                    // is archived now, before the Agent is told so.
+                    for e in &archive[archived..] {
+                        log.push_entry(e)?;
+                    }
+                    recovered
+                }
+            };
             let founded = founded_of(&replica, &founding);
             (driver, replica, founded)
         } else {
@@ -1121,7 +1162,12 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
             node_trail: None,
             latest_time: 0,
             restage: Restage::default(),
+            kept_record: reused,
         };
+        inner
+            .stats
+            .replica_reused
+            .store(u64::from(reused), Ordering::Relaxed);
         // The code the writer is in, and the platform's check at start (`T-037-23`).
         inner.report_code();
         let mut running = inner.executor(replica)?;
@@ -1207,6 +1253,52 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
             std::eprintln!("aledgent-core: WARNING: the restage thread does not start: {e}");
             lock(&self.inner.ctl).restage.done(code, false);
         }
+    }
+
+    /// Stop taking inputs and keep the replica for the next start (`T-031-25`, aledgent#129):
+    /// what the host does when it is told to stop. Every later input is `Unavailable`. The audit
+    /// shipper is given up to `drain` to ship what is outstanding (what it has not shipped is
+    /// kept with the replica); then the stores are made durable and where the replica stands is
+    /// recorded. `Ok(n)`: kept at input `n`.
+    ///
+    /// # Errors
+    ///
+    /// Why nothing was kept (the core stopped on an incident, inputs staged, a store that could
+    /// not be made durable). The next start then rebuilds the
+    /// replica, as before.
+    pub fn keep_replica(&self, drain: std::time::Duration) -> Result<u64, String> {
+        {
+            let mut inner = lock(&self.inner.ctl);
+            if let Some(why) = &inner.stopped {
+                return Err(format!("the core had stopped: {why}"));
+            }
+            inner.stopped = Some("the host is stopping".into());
+        }
+        let until = std::time::Instant::now() + drain;
+        loop {
+            let unshipped = self
+                .inner
+                .running
+                .read()
+                .as_ref()
+                .map_or(0, |exec| exec.audit_outbox().0);
+            if unshipped == 0 || std::time::Instant::now() >= until {
+                break;
+            }
+            if let Some(handle) = self.inner.ship.get() {
+                handle.nudge();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let inner = lock(&self.inner.ctl);
+        let slot = self.inner.running.read();
+        let (Some(driver), Some(exec)) = (inner.driver.as_ref(), slot.as_ref()) else {
+            return Err("the core holds no replica".into());
+        };
+        driver
+            .keep(exec.ledger(), &inner.stores)
+            .map(|k| k.seq)
+            .map_err(|e| format!("{e:?}"))
     }
 
     /// The roots of the book's genesis as this host rebuilt them (`F-036`); `None` while the core
@@ -1326,6 +1418,13 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
         inputs: usize,
         f: impl FnOnce(&mut Inner<P>) -> T,
     ) -> T {
+        // The stores move past a kept replica's record from here (`T-031-25`).
+        if inner.kept_record {
+            if let Err(e) = inner.stores.forget_kept() {
+                std::eprintln!("aledgent-core: WARNING: the kept replica's record stays: {e:?}");
+            }
+            inner.kept_record = false;
+        }
         // A decision that may reach the input a scheduled upgrade applies from needs its code
         // version: when this host does not hold it, it is staged now, before the decision and
         // under its lock (`T-037-24`, aledgent#128). Rare (once a version, or once a failure

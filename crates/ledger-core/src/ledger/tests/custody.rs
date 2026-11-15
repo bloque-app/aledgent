@@ -1135,6 +1135,9 @@ fn rebuilt(s: &State) -> State {
     };
     let back = State::from_sections(&s.sections(), &head).unwrap();
     assert!(back.sections() == s.sections());
+    // And from its leaves alone, as a host's kept service store holds them (`T-031-25`).
+    let leaves = State::from_whole_leaves(s.all_leaves(), &head).unwrap();
+    assert!(leaves.sections() == s.sections() && leaves.all_leaves() == s.all_leaves());
     back
 }
 
