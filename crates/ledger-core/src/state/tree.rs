@@ -286,12 +286,12 @@ impl State {
     /// A whole store rebuilt from every leaf of its service tree (`T-031-25`, aledgent#129): what
     /// a host that kept its replica's service store across a restart loads, instead of replaying
     /// the book. The leaves are loaded as a witness that gives every kind whole, then rebuilt
-    /// through the export's rebuild ([`State::from_sections`]), which derives every index again
+    /// through the export's rebuild (`State::from_sections`), which derives every index again
     /// by the code that keeps it; the writer's upgrade-authority record, which an export does not
     /// carry, is carried over. The audit chain continues at `audit` with nothing unshipped.
     ///
     /// The result is checked: its own leaves must be exactly the leaves given, by count and by
-    /// [`LeafSetDigest`]. The audit records still unshipped are put back with
+    /// `LeafSetDigest`. The audit records still unshipped are put back with
     /// [`State::restore_audit_outbox`]. Never called by the core Agent.
     ///
     /// # Errors
