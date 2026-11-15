@@ -328,6 +328,38 @@ impl AuditLog {
         }
     }
 
+    /// Put back the records a host kept unshipped (`T-031-25`): they must be the records that
+    /// follow the last one acknowledged, in order and chained, and end at the head. `Err` with
+    /// why otherwise, and nothing changes.
+    pub(crate) fn restore_outbox(&mut self, records: Vec<AuditRecord>) -> Result<(), &'static str> {
+        if !self.outbox.is_empty() {
+            return Err("the outbox holds records already");
+        }
+        let (mut seq, mut prev) = match self.shipped {
+            Some((s, h)) => (s + 1, h),
+            None => (0, [0; 32]),
+        };
+        if records.is_empty() {
+            return if seq >= self.next {
+                Ok(())
+            } else {
+                Err("records emitted and neither shipped nor kept")
+            };
+        }
+        for r in &records {
+            if r.audit_seq != seq || r.prev_hash != prev {
+                return Err("the kept records do not follow the last one shipped");
+            }
+            prev = r.hash();
+            seq += 1;
+        }
+        if seq != self.next || prev != self.head {
+            return Err("the kept records do not end at the head");
+        }
+        self.outbox = records.into_iter().map(|r| (r.audit_seq, r)).collect();
+        Ok(())
+    }
+
     /// The hash of the last record emitted: zeroes before the first.
     pub fn head_hash(&self) -> [u8; 32] {
         self.head

@@ -526,6 +526,7 @@ dependencies = [
  "audit-store",
  "cipher-clerk",
  "curve25519-dalek",
+ "hex",
  "ingress",
  "leaf-store",
  "ledger-core",

@@ -41,7 +41,7 @@ libc = "0.2"
 ingress = { path = "../../services/ingress", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["rt-multi-thread", "signal", "macros", "time"] }
 ledger-core = { path = "../../crates/ledger-core", features = ["serde"] }
 ledger-kernel = { path = "../../crates/ledger-kernel" }
 # The book in shards (F-031, DEC-22): the shard Agents' host, over this crate's VOS port.
