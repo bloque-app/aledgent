@@ -741,6 +741,10 @@ impl Replies {
     }
 }
 
+/// A replica as [`AgentCore::replica_digest`] gives it: the service store's leaves in order, the
+/// audit chain's head (records emitted, the last one's hash), and how many wait unshipped.
+pub type ReplicaDigest = (Vec<crate::host::WholeLeaf>, (u64, [u8; 32]), usize);
+
 /// The replica's executor: what reads are answered from.
 type Exec = Running<HostStore, HostVault>;
 
@@ -1079,9 +1083,6 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
                     reused = true;
                     (driver, replica)
                 }
-                Err(crate::host::Reopen::Failed(e)) => {
-                    return Err(format!("the kept replica reopened and failed: {e:?}"));
-                }
                 Err(crate::host::Reopen::Unusable(port, why)) => {
                     if stores != ReplicaStores::Memory {
                         std::eprintln!(
@@ -1290,15 +1291,41 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        let inner = lock(&self.inner.ctl);
-        let slot = self.inner.running.read();
+        let mut inner = lock(&self.inner.ctl);
+        let mut slot = self.inner.running.write();
         let (Some(driver), Some(exec)) = (inner.driver.as_ref(), slot.as_ref()) else {
             return Err("the core holds no replica".into());
         };
-        driver
+        let kept = driver
             .keep(exec.ledger(), &inner.stores)
             .map(|k| k.seq)
-            .map_err(|e| format!("{e:?}"))
+            .map_err(|e| format!("{e:?}"))?;
+        // The record is the one just written: nothing removes it now. The replica's stores are
+        // closed, so the next start opens files that were closed cleanly.
+        inner.kept_record = false;
+        drop(slot.take());
+        if let Some(d) = inner.driver.as_mut() {
+            d.release_stores().map_err(|e| format!("{e:?}"))?;
+        }
+        Ok(kept)
+    }
+
+    /// The replica's service store as its leaves, with the audit chain's head and how many
+    /// records wait unshipped (`T-031-25`): what a test compares between a reopened replica and
+    /// a replayed one. `None` while the core holds no replica.
+    #[doc(hidden)]
+    pub fn replica_digest(&self) -> Option<ReplicaDigest> {
+        let slot = self.inner.running.read();
+        let exec = slot.as_ref()?;
+        let state = exec.ledger().state();
+        let mut leaves = state.all_leaves();
+        leaves.sort();
+        let audit = state.audit();
+        Some((
+            leaves,
+            (audit.emitted(), audit.head_hash()),
+            audit.unshipped(),
+        ))
     }
 
     /// The roots of the book's genesis as this host rebuilt them (`F-036`); `None` while the core
@@ -1418,8 +1445,9 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
         inputs: usize,
         f: impl FnOnce(&mut Inner<P>) -> T,
     ) -> T {
-        // The stores move past a kept replica's record from here (`T-031-25`).
-        if inner.kept_record {
+        // The stores move past a kept replica's record from here (`T-031-25`); a core that is
+        // stopping keeps the record it may just have written.
+        if inner.kept_record && inner.stopped.is_none() {
             if let Err(e) = inner.stores.forget_kept() {
                 std::eprintln!("aledgent-core: WARNING: the kept replica's record stays: {e:?}");
             }

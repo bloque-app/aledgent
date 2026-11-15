@@ -114,11 +114,33 @@ async fn t031_25_a_replica_kept_at_a_clean_stop_is_reopened_not_rebuilt() {
     let before = (account(&d, &alice).await, account(&d, &bob).await);
     drop(d);
 
-    // The clean stop.
+    // The clean stop: nothing is answered after it, and the record is written.
+    let replica = core.replica_digest().expect("a replica");
+    assert!(
+        replica.2 > 0,
+        "audit records wait unshipped: no audit store here"
+    );
     let at = core.keep_replica(Duration::from_secs(2)).expect("kept");
     assert!(kept_file.exists());
-    assert!(core.last_tick().await.is_ok(), "reads still answer");
+    assert!(
+        core.last_tick().await.is_err(),
+        "a kept core answers nothing"
+    );
     let port = take_port(core);
+
+    // Reopened, it is the replica that stopped, leaf for leaf, with the same audit chain and the
+    // same records unshipped.
+    let reopened = AgentCore::open_in(port, founding(), log.clone(), stores.clone()).unwrap();
+    assert_eq!(reused(&reopened), 1);
+    assert_eq!(reopened.replica_digest().as_ref(), Some(&replica));
+    // And a replay from genesis is that replica too.
+    let port = take_port(reopened);
+    std::fs::remove_file(&kept_file).unwrap();
+    let replayed = AgentCore::open_in(port, founding(), log.clone(), stores.clone()).unwrap();
+    assert_eq!(reused(&replayed), 0);
+    assert_eq!(replayed.replica_digest().as_ref(), Some(&replica));
+    replayed.keep_replica(Duration::from_secs(2)).expect("kept");
+    let port = take_port(replayed);
 
     // The next start reopens it, and removes the record.
     let again = AgentCore::open_in(port, founding(), log.clone(), stores.clone()).unwrap();

@@ -340,11 +340,46 @@ impl ReplicaStores {
         let Some(path) = self.kept_path() else {
             return Ok(());
         };
+        let io = |e: std::io::Error| DriveError::Replica(format!("{}: {e}", path.display()));
         match std::fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(DriveError::Replica(format!("{}: {e}", path.display()))),
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(io(e)),
         }
+        // Gone for good: a record that came back after a crash would only cost a rebuild (it
+        // must match the Agent), but it should not come back.
+        match path.parent() {
+            Some(parent) => std::fs::File::open(parent)
+                .and_then(|d| d.sync_all())
+                .map_err(io),
+            None => Ok(()),
+        }
+    }
+
+    /// Make every file of the replica's own archive durable, whatever its `fsync` setting
+    /// (`T-031-25`): a kept replica's stores must survive a power loss after the stop.
+    fn sync_archive(&self) -> Result<(), DriveError> {
+        let ReplicaStores::Disk { dir, .. } = self else {
+            return Ok(());
+        };
+        let archive = dir.join("book").join("archive");
+        let io = |e: std::io::Error| DriveError::Replica(format!("{}: {e}", archive.display()));
+        let entries = match std::fs::read_dir(&archive) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(io(e)),
+        };
+        for entry in entries {
+            let path = entry.map_err(io)?.path();
+            if path.is_file() {
+                std::fs::File::open(&path)
+                    .and_then(|f| f.sync_all())
+                    .map_err(io)?;
+            }
+        }
+        std::fs::File::open(&archive)
+            .and_then(|d| d.sync_all())
+            .map_err(io)
     }
 
     /// Record where the replica stands, after its stores were made durable (`T-031-25`): written
@@ -414,6 +449,7 @@ impl ReplicaStores {
             },
         )
         .map_err(rep)?;
+        let last = archive.last();
         let store = BookStore::with_engine(
             RedbEngine::open_cached(book.join("leaves.redb"), *cache_bytes).map_err(rep)?,
             Some(archive),
@@ -423,6 +459,16 @@ impl ReplicaStores {
             },
         )
         .map_err(rep)?;
+        // The store's own archive ends exactly where the store stands: no record missing, none
+        // beyond.
+        let head = store.applied_sequence().map(|s| (s, store.log_head()));
+        if last != head {
+            return Err(DriveError::Replica(format!(
+                "the kept book's archive ends at {:?}, the store stands at {:?}",
+                last.map(|l| l.0),
+                head.map(|h| h.0)
+            )));
+        }
         let vault =
             OpeningsStore::open_cached(book.join("openings.redb"), *cache_bytes).map_err(rep)?;
         Ok((store, vault))
@@ -2252,6 +2298,7 @@ impl<P: AgentPort> Driver<P> {
         Self::assemble(
             port, keys, hot, replica, service, recorder, genesis, archive,
         )
+        .map_err(|(_, e)| e)
     }
 
     /// The driver over a replica that stands where the Agent's hot row `hot` does, built by a
@@ -2266,18 +2313,24 @@ impl<P: AgentPort> Driver<P> {
         recorder: Recorder,
         genesis: Roots,
         archive: &[RingEntry],
-    ) -> Result<(Self, Replica), DriveError> {
+    ) -> Result<(Self, Replica), (P, DriveError)> {
         recorder.clear();
         // From here the replica runs the Agent's next inputs, under its hot row's code and mode,
         // and any scheduled change of mode (`Driver::prepare`, below; `T-037-05`).
         replica.set_code(hot.code, hot.authority);
         replica.set_authority_next(hot.authority_next);
-        let (roots, next_posting) = replica_roots(&replica, &service)?;
+        let (roots, next_posting) = match replica_roots(&replica, &service) {
+            Ok(r) => r,
+            Err(e) => return Err((port, e)),
+        };
         if roots != hot.roots() || next_posting != hot.next_posting {
-            return Err(DriveError::Diverged(format!(
-                "the rebuilt replica does not stand where the Agent does (input {})",
-                hot.inputs
-            )));
+            return Err((
+                port,
+                DriveError::Diverged(format!(
+                    "the rebuilt replica does not stand where the Agent does (input {})",
+                    hot.inputs
+                )),
+            ));
         }
         let _ = replica.book().store().take_keys();
         replica.book().vault_backend_take();
@@ -2304,8 +2357,10 @@ impl<P: AgentPort> Driver<P> {
             code_events: Vec::new(),
         };
         driver.prepare(&mut replica, hot.inputs + 1);
-        driver.pin(&replica)?;
-        Ok((driver, replica))
+        match driver.pin(&replica) {
+            Ok(()) => Ok((driver, replica)),
+            Err(e) => Err((driver.into_port(), e)),
+        }
     }
 }
 
@@ -2313,11 +2368,9 @@ impl<P: AgentPort> Driver<P> {
 #[derive(Debug)]
 pub enum Reopen<P> {
     /// There was none, or it does not stand where the Agent and the log do, or its stores do not
-    /// open or reach its roots: the port, given back, and why. The host rebuilds the replica.
+    /// open or reach its roots, or the driver over it cannot be built: the port, given back, and
+    /// why. The host rebuilds the replica.
     Unusable(P, String),
-    /// The replica reopened and checked, and the driver over it could not be built: as a replay
-    /// that fails there.
-    Failed(DriveError),
 }
 
 impl<P: AgentPort> Driver<P> {
@@ -2344,6 +2397,7 @@ impl<P: AgentPort> Driver<P> {
             ));
         }
         replica.book().store().inner().flush().map_err(rep)?;
+        stores.sync_archive()?;
         self.service.store.flush().map_err(rep)?;
         let kept = Kept {
             version: Kept::VERSION,
@@ -2359,6 +2413,14 @@ impl<P: AgentPort> Driver<P> {
         };
         stores.write_kept(&kept)?;
         Ok(kept)
+    }
+
+    /// Close the replica's service store, once it is kept (`T-031-25`): its file is closed
+    /// cleanly before the process exits. The driver takes no input after this.
+    pub fn release_stores(&mut self) -> Result<(), DriveError> {
+        self.service = ServiceStore::new()?;
+        self.view = None;
+        Ok(())
     }
 
     /// Reopen the replica a clean stop kept (`T-031-25`, aledgent#129), instead of replaying the
@@ -2392,6 +2454,19 @@ impl<P: AgentPort> Driver<P> {
             Ok(None) => return Err(unusable(port, "the Agent is not founded".into())),
             Err(e) => return Err(unusable(port, format!("{e:?}"))),
         };
+        // An audit store behind the record (reset, or restored from older media) needs records the
+        // kept outbox no longer holds: a replay re-emits them, a reopen cannot.
+        let behind = match (audit_floor, kept.audit_shipped) {
+            (_, None) => false,
+            (None, Some(_)) => true,
+            (Some((f, _)), Some((k, _))) => f < k,
+        };
+        if behind {
+            return Err(unusable(
+                port,
+                "the audit store is behind what the kept replica had shipped".into(),
+            ));
+        }
         let log_head = archive.last().map_or([0; 32], RingEntry::log_hash);
         if hot.inputs != kept.seq
             || archive.len() as u64 != kept.seq
@@ -2448,7 +2523,9 @@ impl<P: AgentPort> Driver<P> {
             let _ = replica.state().take_touched();
             // What the audit store holds already leaves the outbox, as a replay drops it.
             if let Some(f) = audit_floor {
-                let _ = replica.acknowledge_audit(f);
+                replica
+                    .acknowledge_audit(f)
+                    .map_err(|e| DriveError::Replica(format!("the audit store's head: {e:?}")))?;
             }
             replica.record_calls(true);
             let (roots, next) = replica_roots(&replica, &service)?;
@@ -2475,7 +2552,7 @@ impl<P: AgentPort> Driver<P> {
             kept.genesis_roots,
             archive,
         )
-        .map_err(Reopen::Failed)
+        .map_err(|(port, e)| Reopen::Unusable(port, format!("the kept replica's driver: {e:?}")))
     }
 }
 
