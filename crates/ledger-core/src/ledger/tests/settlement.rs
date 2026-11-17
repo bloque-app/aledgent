@@ -1638,3 +1638,104 @@ fn t043_08_one_chunk_an_input() {
     lx.fx.ledger.move_incidents(10).unwrap();
     assert!(lx.fx.ledger.state().settlement().incidents().is_empty());
 }
+
+// ------------------------------------------------------------------ a kept replica's reopen
+
+/// The store rebuilt from its leaves alone, as a host's kept service store holds them
+/// (`T-031-25`, aledgent#129): the same leaves and the same sections.
+fn reopens(s: &crate::state::State) {
+    let back = crate::state::State::from_whole_leaves(s.all_leaves(), &s.chain_head()).unwrap();
+    assert!(back.all_leaves() == s.all_leaves(), "the same leaves");
+    assert!(back.sections() == s.sections(), "the same sections");
+}
+
+/// The digests the layer shows at positions `0..n`.
+fn layer(lx: &Lx, n: u64) -> Vec<(u64, [u8; 32])> {
+    (0..n)
+        .map(|s| match lx.sim.read(s) {
+            Read::Record(r) => (s, r.digest),
+            other => panic!("{other:?}"),
+        })
+        .collect()
+}
+
+/// `T-031-25` (aledgent#129), `T-043-06`: a record ingested from the chained generation on is not
+/// indexed by its inbox position, as one ingested before it is; an import derives the index for
+/// every record, so the store rebuilt from a kept replica's leaves keeps the replica's own, and
+/// reopens a book that ingested at both generations. A position indexed with no record ingested
+/// there is refused.
+#[test]
+fn t_031_25_a_book_that_ingested_at_both_generations_reopens() {
+    let mut lx = Lx::new();
+    let a = empty(&mut lx.fx);
+    lx.sim.deposit(crate::id::account_reference(&a), usd(), 1);
+    lx.settle();
+    lx.fx.ledger.set_input(1);
+    lx.fx.ledger.set_generation(0, true);
+    lx.fx.ledger.switch_settlement().unwrap();
+    lx.fx
+        .ledger
+        .set_generation(crate::settlement::CHAINED_SETTLEMENT, false);
+    lx.sim.deposit(crate::id::account_reference(&a), usd(), 2);
+    lx.settle();
+    assert_eq!(lx.view(&a), (3, 0));
+    let s = lx.fx.ledger.state();
+    assert_eq!(s.settlement().all_ingested().count(), 2);
+    assert_eq!(
+        s.leaf_count_of(crate::leaves::kind::INGESTED_AT),
+        1,
+        "the record ingested before the chained generation only"
+    );
+    reopens(s);
+    // A position indexed with a digest ingested nowhere.
+    let mut forged = s.all_leaves();
+    let at = forged
+        .iter()
+        .position(|(k, _, _)| *k == crate::leaves::kind::INGESTED_AT)
+        .unwrap();
+    *forged[at].2.last_mut().unwrap() ^= 1;
+    assert!(crate::state::State::from_whole_leaves(forged, &s.chain_head()).is_err());
+}
+
+/// `T-031-25` (aledgent#129), `T-043-08`: the switch to the chained generation moves the incidents
+/// an earlier one kept to the audit trail and leaves the index of the re-scan differences recorded
+/// as it is; an import derives that index from the incidents, so the store rebuilt from a kept
+/// replica's leaves keeps the replica's own. Before the switch, a difference among the incidents
+/// that the index does not hold is refused.
+#[test]
+fn t_031_25_re_scan_differences_moved_at_the_switch_reopen() {
+    let mut lx = Lx::new();
+    let a = empty(&mut lx.fx);
+    for n in 1..=3 {
+        lx.sim.deposit(crate::id::account_reference(&a), usd(), n);
+    }
+    lx.settle();
+    let mut shown = layer(&lx, 3);
+    shown[1].1 = [0xEE; 32];
+    shown.pop();
+    lx.fx.ledger.rescan(ADAPTER, 0, 3, &shown, 10).unwrap();
+    assert_eq!(lx.incidents().len(), 3, "one missing, two unknown");
+    let s = lx.fx.ledger.state();
+    reopens(s);
+    let mut fewer = s.all_leaves();
+    let at = fewer
+        .iter()
+        .position(|(k, _, _)| *k == crate::leaves::kind::RESCAN_RECORDED)
+        .unwrap();
+    fewer.remove(at);
+    assert!(crate::state::State::from_whole_leaves(fewer, &s.chain_head()).is_err());
+    lx.fx.ledger.set_input(1);
+    lx.fx.ledger.set_generation(0, true);
+    lx.fx.ledger.switch_settlement().unwrap();
+    let s = lx.fx.ledger.state();
+    assert!(
+        s.settlement().incidents().is_empty(),
+        "moved to the audit trail"
+    );
+    assert_eq!(
+        s.leaf_count_of(crate::leaves::kind::RESCAN_RECORDED),
+        3,
+        "the index left as it is"
+    );
+    reopens(s);
+}
