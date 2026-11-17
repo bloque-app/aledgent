@@ -357,6 +357,7 @@ cache and Kreivo's 4 MiB preimage limit); the manifest records `s`, and another 
 | `a0022-q3` | Rebuild on every start, as built | — |
 | `a0022-q4` | Agreed: continue the anchor sequence while nothing is bound; a new instance once value is bound. Nothing is bound on a deployment's contract before its final re-genesis; `T-036-14` to `T-036-16` before a rehearsal book anchors on a contract an earlier book anchored on; resetting a Space's anchoring is an open requirement | "Recommendation" above; `OQ-68`, `DEC-17` |
 | `a0022-q5` | The store stays in memory for now; `T-036-17` (a disk-backed replica service store) is required before about 3× | `features/F-036-seeded-genesis/tasks.md` |
+| `a0022-q5` (restated 2026-11-17) | The trigger for `T-036-17` is memory, not a multiple of genesis: the core's resident memory above 40% of the node's, or the replica's service store above 4,000,000 leaves, whichever comes first. A multiple of genesis means nothing for a book founded on a small seed and grown by commands, which can pass any multiple of its genesis while its memory is still small | `features/F-036-seeded-genesis/tasks.md`, `features/F-018-operations/tasks.md` |
 | `a0022-q6` | A restart checks package and runtime only: any meta-protocol-compliant host (JAM/VOS) may restart a book, including the native `vosx` once it is the host. Founding pins the host binary the genesis code names | "The genesis code" above; F-036 `spec.md` §7 |
 
 ## Questions for the owner (as asked)
