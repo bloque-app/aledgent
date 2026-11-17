@@ -342,7 +342,7 @@ cache and Kreivo's 4 MiB preimage limit); the manifest records `s`, and another 
   over the chainspec's opening set and its reconciliation, which the chainspec carries.
 - Memory: the native genesis holds the book's service store whole, as the replica does when serving
   (about 1.3 KB a record); everything else is streamed. In memory for
-  now; the disk-backed store, `T-036-17`, is required before a book of about 3× is served (`a0022-q5`).
+  now; the disk-backed store, `T-036-17`, is required before a book of about 3× is served (`a0022-q5`; the trigger restated in memory terms on 2026-11-17, see the rulings below).
 - The window waits for `verify-genesis` (`a0022-q2`, `a0022-q2b`). The gate is the core host's (`T-036-25`, built): every command is
   refused `ERR-InitialStateNotSealed` until `install-verified` has installed a passing report for this
   chainspec and these genesis roots; reads are answered meanwhile.
