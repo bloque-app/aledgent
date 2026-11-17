@@ -282,27 +282,83 @@ impl LeafSetDigest {
     }
 }
 
+/// One kind whose leaves a rebuild from whole leaves did not give back (`T-031-25`): how many
+/// leaves of it were given, and how many the rebuilt store holds. The counts are equal when only
+/// a value differs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KindMismatch {
+    /// The kind.
+    pub kind: u8,
+    /// How many leaves of it were given.
+    pub given: u64,
+    /// How many the rebuilt store holds.
+    pub rebuilt: u64,
+}
+
+/// Why a store could not be rebuilt from its whole leaves (`T-031-25`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WholeLeavesError {
+    /// A leaf the store cannot load, or a store the export cannot rebuild.
+    Decode(DecodeError),
+    /// The rebuilt store's leaves are not the ones given: each kind that differs, in kind order.
+    Differ(Vec<KindMismatch>),
+}
+
+impl From<DecodeError> for WholeLeavesError {
+    fn from(e: DecodeError) -> Self {
+        WholeLeavesError::Decode(e)
+    }
+}
+
+/// One [`LeafSetDigest`] per kind: equal for two sets of leaves exactly when every kind's is.
+struct KindDigests(Vec<LeafSetDigest>);
+
+impl KindDigests {
+    fn new() -> Self {
+        KindDigests(alloc::vec![LeafSetDigest::default(); 256])
+    }
+
+    fn add(&mut self, kind: u8, key: &[u8], value: &[u8]) {
+        self.0[usize::from(kind)].add(kind, key, value);
+    }
+
+    /// Every kind whose digest differs from `rebuilt`'s, in kind order.
+    fn differing(&self, rebuilt: &KindDigests) -> Vec<KindMismatch> {
+        (0..=u8::MAX)
+            .filter(|k| self.0[usize::from(*k)] != rebuilt.0[usize::from(*k)])
+            .map(|kind| KindMismatch {
+                kind,
+                given: self.0[usize::from(kind)].count,
+                rebuilt: rebuilt.0[usize::from(kind)].count,
+            })
+            .collect()
+    }
+}
+
 impl State {
     /// A whole store rebuilt from every leaf of its service tree (`T-031-25`, aledgent#129): what
     /// a host that kept its replica's service store across a restart loads, instead of replaying
     /// the book. The leaves are loaded as a witness that gives every kind whole, then rebuilt
     /// through the export's rebuild (`State::from_sections`), which derives every index again
     /// by the code that keeps it; the writer's upgrade-authority record, which an export does not
-    /// carry, is carried over. The audit chain continues at `audit` with nothing unshipped.
+    /// carry, is carried over, and so are the two indexes only a re-scan reads, which hold what
+    /// the generation that wrote them did (`SettlementStore::keep_rescan_indexes`). The audit
+    /// chain continues at `audit` with nothing unshipped.
     ///
-    /// The result is checked: its own leaves must be exactly the leaves given, by count and by
-    /// `LeafSetDigest`. The audit records still unshipped are put back with
+    /// The result is checked: its own leaves must be exactly the leaves given, kind by kind, by
+    /// count and by `LeafSetDigest`. The audit records still unshipped are put back with
     /// [`State::restore_audit_outbox`]. Never called by the core Agent.
     ///
     /// # Errors
     ///
-    /// A leaf the store cannot load, a store the export cannot rebuild, or a rebuilt store whose
-    /// leaves are not the ones given.
+    /// A leaf the store cannot load or a store the export cannot rebuild
+    /// ([`WholeLeavesError::Decode`]), or a rebuilt store whose leaves are not the ones given
+    /// ([`WholeLeavesError::Differ`], naming each kind that differs).
     pub fn from_whole_leaves(
         leaves: impl IntoIterator<Item = (u8, Vec<u8>, Vec<u8>)>,
         audit: &AuditHead,
-    ) -> Result<State, DecodeError> {
-        let mut given = LeafSetDigest::default();
+    ) -> Result<State, WholeLeavesError> {
+        let mut given = KindDigests::new();
         let entries: Vec<LeafEntry> = leaves
             .into_iter()
             .map(|(k, key, value)| {
@@ -316,22 +372,22 @@ impl State {
         drop(entries);
         let sections = partial.sections();
         if partial.missed() {
-            return Err(DecodeError(
-                "the export of the loaded leaves read past them",
-            ));
+            return Err(DecodeError("the export of the loaded leaves read past them").into());
         }
         let mut whole = State::from_sections(&sections, audit)?;
         drop(sections);
         whole
             .upgrade_authority
             .set(partial.upgrade_authority.get().clone());
+        // The indexes only a re-scan reads hold what the generation that wrote them did, which
+        // the records do not say: the kept ones, checked against the records.
+        whole.settlement.keep_rescan_indexes(&partial.settlement)?;
         drop(partial);
-        let mut rebuilt = LeafSetDigest::default();
+        let mut rebuilt = KindDigests::new();
         whole.for_each_leaf(&mut |k, key, value| rebuilt.add(k, &key, &value));
-        if rebuilt != given {
-            return Err(DecodeError(
-                "the rebuilt store does not hold the leaves given",
-            ));
+        let differ = given.differing(&rebuilt);
+        if !differ.is_empty() {
+            return Err(WholeLeavesError::Differ(differ));
         }
         Ok(whole)
     }

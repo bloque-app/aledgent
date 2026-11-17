@@ -225,7 +225,7 @@ state is computed from its chainspec.
 
 Peak RSS of `build-spec` measured for the 1× synthetic book and for 2×; `--max-memory` refuses a chainspec above a bound before anything is built.
 The O(n) service store is the replica's existing design, not the build's; making it disk-backed is
-`T-036-17`, required before a book of about 3× is served (ruling `a0022-q5`; design in `NOTES.md` §13).
+`T-036-17`, required before its trigger fires (ruling `a0022-q5`, restated 2026-11-17 in memory terms: see `tasks.md`; design in `NOTES.md` §13).
 
 ## 7. The genesis code (amendment 0023, PR #201)
 
