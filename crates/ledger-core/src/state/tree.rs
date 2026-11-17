@@ -258,6 +258,99 @@ impl State {
     }
 }
 
+/// An order-free digest of a set of leaves (`T-031-25`): the count, and the wrapping sum of their
+/// leaf hashes as four 64-bit words. Equal sets give equal digests in any order; a leaf missing,
+/// added or changed changes it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LeafSetDigest {
+    /// How many leaves.
+    pub count: u64,
+    /// The sum of their leaf hashes.
+    pub sum: [u64; 4],
+}
+
+impl LeafSetDigest {
+    /// Add one leaf of `kind` at `key` holding `value`.
+    pub fn add(&mut self, kind: u8, key: &[u8], value: &[u8]) {
+        let h = crate::delta::library_leaf(kind, key, value).leaf_hash();
+        self.count += 1;
+        for (i, w) in self.sum.iter_mut().enumerate() {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&h[i * 8..i * 8 + 8]);
+            *w = w.wrapping_add(u64::from_le_bytes(b));
+        }
+    }
+}
+
+impl State {
+    /// A whole store rebuilt from every leaf of its service tree (`T-031-25`, aledgent#129): what
+    /// a host that kept its replica's service store across a restart loads, instead of replaying
+    /// the book. The leaves are loaded as a witness that gives every kind whole, then rebuilt
+    /// through the export's rebuild (`State::from_sections`), which derives every index again
+    /// by the code that keeps it; the writer's upgrade-authority record, which an export does not
+    /// carry, is carried over. The audit chain continues at `audit` with nothing unshipped.
+    ///
+    /// The result is checked: its own leaves must be exactly the leaves given, by count and by
+    /// `LeafSetDigest`. The audit records still unshipped are put back with
+    /// [`State::restore_audit_outbox`]. Never called by the core Agent.
+    ///
+    /// # Errors
+    ///
+    /// A leaf the store cannot load, a store the export cannot rebuild, or a rebuilt store whose
+    /// leaves are not the ones given.
+    pub fn from_whole_leaves(
+        leaves: impl IntoIterator<Item = (u8, Vec<u8>, Vec<u8>)>,
+        audit: &AuditHead,
+    ) -> Result<State, DecodeError> {
+        let mut given = LeafSetDigest::default();
+        let entries: Vec<LeafEntry> = leaves
+            .into_iter()
+            .map(|(k, key, value)| {
+                given.add(k, &key, &value);
+                (k, key, Some(value))
+            })
+            .collect();
+        let mut partial = State::partial(audit);
+        let kinds = partial.leaf_kinds();
+        partial.load_leaves(&entries, &kinds)?;
+        drop(entries);
+        let sections = partial.sections();
+        if partial.missed() {
+            return Err(DecodeError(
+                "the export of the loaded leaves read past them",
+            ));
+        }
+        let mut whole = State::from_sections(&sections, audit)?;
+        drop(sections);
+        whole
+            .upgrade_authority
+            .set(partial.upgrade_authority.get().clone());
+        drop(partial);
+        let mut rebuilt = LeafSetDigest::default();
+        whole.for_each_leaf(&mut |k, key, value| rebuilt.add(k, &key, &value));
+        if rebuilt != given {
+            return Err(DecodeError(
+                "the rebuilt store does not hold the leaves given",
+            ));
+        }
+        Ok(whole)
+    }
+
+    /// Put back the audit records a host kept unshipped with its replica (`T-031-25`): the records
+    /// after the last one the audit store acknowledged, through the head of the chain, in order.
+    ///
+    /// # Errors
+    ///
+    /// Records that do not follow the last one shipped, are not chained, or do not end at the
+    /// head; nothing changes then.
+    pub fn restore_audit_outbox(
+        &mut self,
+        records: Vec<crate::audit::AuditRecord>,
+    ) -> Result<(), DecodeError> {
+        self.audit.restore_outbox(records).map_err(DecodeError)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

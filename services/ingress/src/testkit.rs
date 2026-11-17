@@ -431,6 +431,12 @@ impl<S: Store, C: Core + Clone> Deployment<S, C> {
         d
     }
 
+    /// Register a party's token and recipient with this deployment: one opened by another
+    /// deployment over the same book, as after a restart of the core (`T-031-25`).
+    pub async fn adopt(&self, p: &Party) {
+        self.register(p, CredentialKind::Holder).await;
+    }
+
     async fn register(&self, p: &Party, kind: CredentialKind) {
         self.auth
             .add_token(

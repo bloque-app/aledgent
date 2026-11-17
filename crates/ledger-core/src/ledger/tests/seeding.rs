@@ -474,6 +474,63 @@ fn t_014_01_the_export_carries_the_seed_and_rebuilds_it() {
     assert!(back.chainspec().progress().is_none());
 }
 
+/// `T-031-25` (aledgent#129): a seeded book's store, rebuilt from its leaves alone (what a host's
+/// kept service store holds), is the store: the same sections, the same seed record, the same
+/// leaves, and the writer's upgrade-authority record carried over.
+#[test]
+fn t_031_25_the_store_rebuilds_from_its_leaves_alone() {
+    let (l, _, _) = seeded();
+    let s = l.state();
+    let head = s.chain_head();
+    let back = State::from_whole_leaves(s.all_leaves(), &head).unwrap();
+    assert_eq!(back.sections(), s.sections());
+    assert_eq!(back.chainspec(), s.chainspec());
+    assert_eq!(back.all_leaves(), s.all_leaves());
+    assert_eq!(back.upgrade_authority(), s.upgrade_authority());
+    // A derived leaf missing (the rebuild derives it again), or a leaf changed, is refused. A
+    // record missing whole cannot be told from leaves alone: the host checks the count against
+    // its service tree, and the roots.
+    let mut fewer = s.all_leaves();
+    let at = fewer
+        .iter()
+        .position(|(k, _, _)| *k == crate::leaves::kind::ACCOUNTS_BY_OWNER)
+        .expect("a seeded book has accounts by owner");
+    fewer.remove(at);
+    assert!(State::from_whole_leaves(fewer, &head).is_err());
+    let mut changed = s.all_leaves();
+    let last = changed.len() - 1;
+    changed[last].2.push(0);
+    assert!(State::from_whole_leaves(changed, &head).is_err());
+}
+
+/// `T-031-25` at scale (aledgent#129), by hand: `ALEDGENT_REOPEN_N=175000 cargo test --release -p
+/// ledger-core --lib t_031_25_scale -- --ignored --nocapture`. A seeded book of `N` identities and
+/// accounts with the service principals' grants (the production book's shape), rebuilt from its
+/// leaves; prints the time of each step.
+#[test]
+#[ignore = "a measurement, run by hand"]
+fn t_031_25_scale_the_store_rebuilds_from_its_leaves() {
+    let n: u64 = std::env::var("ALEDGENT_REOPEN_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20_000);
+    let t = std::time::Instant::now();
+    let s = crate::chainspec::testing::synthetic_with_services(g(), n, 13, limits());
+    let (mut l, f) = book(&s, true);
+    apply(&mut l, &f, &s, 0..s.seed.chunk_count());
+    std::eprintln!("seeded {n} in {} ms", t.elapsed().as_millis());
+    let st = l.state();
+    let head = st.chain_head();
+    let t = std::time::Instant::now();
+    let leaves = st.all_leaves();
+    let count = leaves.len();
+    std::eprintln!("{count} leaves listed in {} ms", t.elapsed().as_millis());
+    let t = std::time::Instant::now();
+    let back = State::from_whole_leaves(leaves, &head).unwrap();
+    std::eprintln!("rebuilt from its leaves in {} ms", t.elapsed().as_millis());
+    assert_eq!(back.all_leaves().len(), count);
+}
+
 #[test]
 fn f_018_the_signals_show_the_seeding() {
     // Two records a chunk: the operator's grants and the grants after them fall in chunks of

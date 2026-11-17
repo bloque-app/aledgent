@@ -29,7 +29,7 @@ opening = []
 mapped = []
 # The host side: the recording store and vault, the witness builder over F-006's leaf store, the
 # driver, and the native Agent port. Never in the guest.
-std = ["dep:leaf-store", "ledger-kernel/std", "mapped"]
+std = ["dep:leaf-store", "ledger-kernel/std", "mapped", "dep:serde_json", "dep:hex"]
 # The Agent core: ingress's boundary::Core over the Agent, with the host's durable log
 # (core::AgentCore). What aledgent-core-host serves.
 ingress = ["std", "dep:ingress", "dep:tokio", "dep:serde_json", "dep:audit-store"]
@@ -57,6 +57,7 @@ leaf-store = { path = "../leaf-store", optional = true }
 ingress = { path = "../../services/ingress", default-features = false, optional = true }
 tokio = { version = "1", features = ["rt", "sync"], optional = true }
 serde_json = { version = "1", optional = true }
+hex = { version = "0.4", optional = true }
 # The audit store's node trail, where the core audits an input the fence refused (T-037-15).
 audit-store = { path = "../audit-store", optional = true }
 
@@ -79,6 +80,10 @@ hex = "0.4"
 
 [[test]]
 name = "agent_core"
+required-features = ["ingress"]
+
+[[test]]
+name = "kept_replica"
 required-features = ["ingress"]
 
 [[test]]

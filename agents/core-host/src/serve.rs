@@ -758,12 +758,71 @@ pub fn serve(args: &[String]) -> Result<(), String> {
     );
     // F-038 §4: one sequencer in front of the core, for every link: signatures checked, stale
     // feeders fenced, the order kept. The Agent's calls are unchanged (`DEC-26(d)`).
+    // T-031-25 (aledgent#129): told to stop, the host keeps its replica for the next start.
+    let agent = core.clone();
     let core = Arc::new(ingress::feed::Sequencer::new(core, feed_keys));
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
-    rt.block_on(async move {
+    let served = rt.block_on(async move {
+        tokio::select! {
+            r = serve_links(core, dial, endpoint, link) => r,
+            why = stop_signal() => {
+                eprintln!("aledgent-core-host: {why}: keeping the replica, then stopping");
+                let kept = tokio::task::spawn_blocking(move || agent.keep_replica(KEEP_DRAIN))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                match kept {
+                    Ok(n) => eprintln!(
+                        "aledgent-core-host: the replica is kept at input {n}: the next start \
+                         reopens it"
+                    ),
+                    Err(e) => eprintln!(
+                        "aledgent-core-host: WARNING: the replica is not kept ({e}): the next \
+                         start rebuilds it from the archive"
+                    ),
+                }
+                Ok(())
+            }
+        }
+    });
+    // The links' tasks are not waited for: the core takes no input once its replica is kept.
+    rt.shutdown_background();
+    served
+}
+
+/// How long a stopping host lets the audit shipper ship what is outstanding before it keeps the
+/// replica (`T-031-25`): well inside the container's stop timeout (10 s by default).
+const KEEP_DRAIN: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// The first of SIGTERM (a container or unit stop) and SIGINT, named.
+async fn stop_signal() -> &'static str {
+    let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("aledgent-core-host: WARNING: SIGTERM is not handled ({e})");
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+    };
+    tokio::select! {
+        _ = term.recv() => "SIGTERM",
+        _ = tokio::signal::ctrl_c() => "SIGINT",
+    }
+}
+
+/// Serve the core on its links until they end (`F-038`).
+async fn serve_links<C>(
+    core: Arc<C>,
+    dial: Option<ingress::stream::DialConfig>,
+    endpoint: Option<Endpoint>,
+    link: Option<ingress::remote::LinkAuth>,
+) -> Result<(), String>
+where
+    C: ingress::boundary::Core + Send + Sync + 'static,
+{
+    {
         if let Some(d) = dial {
             eprintln!(
                 "aledgent-core-host: dialing ingress at {:?} (F-038)",
@@ -784,7 +843,7 @@ pub fn serve(args: &[String]) -> Result<(), String> {
             }
             _ => Err("no link to serve".into()),
         }
-    })
+    }
 }
 
 /// The core over `log`: shipping its audit trail to the audit store when one is configured
