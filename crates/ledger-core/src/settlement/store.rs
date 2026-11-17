@@ -46,6 +46,7 @@ use super::{
     SupportDeclaration,
 };
 use crate::asset::{AssetId, AssetLocation};
+use crate::export::canon::DecodeError;
 use crate::id::OperationId;
 use crate::leaves::{LeafHost, LeafMap, Leaves, Slot, kind};
 
@@ -339,7 +340,10 @@ pub struct SettlementStore {
     /// Derived, never exported.
     bind_refs: Leaves<OperationId, AssetId, { kind::ASSET_BIND_REF }>,
     /// The digests ingested at each inbox position: how a re-scan reads its range by position
-    /// rather than every record ingested (finding F18's class). Derived, never exported.
+    /// rather than every record ingested (finding F18's class). Never exported: an import
+    /// derives it for every record ingested, but a live book indexes only the records ingested
+    /// before [`super::CHAINED_SETTLEMENT`] (`T-043-06`), so a rebuild from the kept leaves takes
+    /// it from them ([`SettlementStore::keep_rescan_indexes`], `T-031-25`).
     at_position: Leaves<(u32, u64), BTreeSet<[u8; 32]>, { kind::INGESTED_AT }>,
     /// The positions' tally (`REQ-PR-5`): the cursor `k`, every inbox position below it final,
     /// and the book's record of value held on the layer as of `k`, per asset. A comparison
@@ -354,7 +358,10 @@ pub struct SettlementStore {
     /// finds a difference again knows it is recorded without reading every incident (`REQ-IN-5`;
     /// finding F18's class: before, each re-scan appended its differences again, and the one
     /// leaf holding every incident grew with every re-scan until the Agent's heap ran out).
-    /// Derived, never exported.
+    /// Never exported: an import derives it from the incidents, but the switch to
+    /// [`super::CHAINED_SETTLEMENT`] moves the incidents out and leaves this index as it is
+    /// (`T-043-08`), so a rebuild from the kept leaves takes it from them
+    /// ([`SettlementStore::keep_rescan_indexes`], `T-031-25`).
     rescanned: Leaves<(u8, Coordinate), (), { kind::RESCAN_RECORDED }>,
 }
 
@@ -974,6 +981,49 @@ impl SettlementStore {
                 self.rescanned.insert(k, ());
             }
         }
+    }
+
+    /// Take the two indexes only a re-scan reads (`INGESTED_AT`, `RESCAN_RECORDED`) from `kept`,
+    /// in place of those [`SettlementStore::rebuild_indexes`] derived (`T-031-25`, aledgent#129):
+    /// what each holds depends on the generation that wrote it (`T-043-06`, `T-043-08`), which
+    /// the records do not say, so a store rebuilt from a kept replica's leaves keeps the replica's
+    /// own. Each must still agree with what the records give: every position indexed names a
+    /// record ingested there, and every re-scan difference still among the incidents is recorded.
+    ///
+    /// # Errors
+    ///
+    /// A kept index that does not agree with the records; nothing changes then.
+    pub(crate) fn keep_rescan_indexes(
+        &mut self,
+        kept: &SettlementStore,
+    ) -> Result<(), DecodeError> {
+        let named = kept.at_position.iter().all(|((instance, seq), digests)| {
+            !digests.is_empty()
+                && digests.iter().all(|digest| {
+                    self.ingested.contains_key(&Coordinate {
+                        instance: *instance,
+                        seq: *seq,
+                        digest: *digest,
+                    })
+                })
+        });
+        if !named {
+            return Err(DecodeError("an inbox position indexed with no record"));
+        }
+        if self
+            .rescanned
+            .keys()
+            .any(|k| !kept.rescanned.contains_key(k))
+        {
+            return Err(DecodeError("a re-scan difference not recorded"));
+        }
+        self.at_position = kept
+            .at_position
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        self.rescanned = kept.rescanned.iter().map(|(k, ())| (*k, ())).collect();
+        Ok(())
     }
 
     /// The operations with a final deposit or withdrawal record below inbox position `k` of the

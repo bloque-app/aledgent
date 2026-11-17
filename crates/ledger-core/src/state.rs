@@ -1949,7 +1949,7 @@ mod image;
 
 /// The service store as leaves of the service tree (`F-005`).
 mod tree;
-pub use tree::{LeafEntry, Touched};
+pub use tree::{KindMismatch, LeafEntry, Touched, WholeLeavesError};
 
 /// What applying a transition did (`INV-18`).
 #[derive(Clone, Debug, PartialEq, Eq)]
