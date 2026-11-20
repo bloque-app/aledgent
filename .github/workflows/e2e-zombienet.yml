@@ -321,15 +321,22 @@ jobs:
         run: |
           set -euo pipefail
           version() {
-            curl -s -m 15 -H 'Content-Type: application/json' \
+            curl -sS -m 15 -H 'Content-Type: application/json' \
               -d '{"jsonrpc":"2.0","id":1,"method":"state_getRuntimeVersion","params":[]}' "$1" \
-              | python3 -c 'import json,sys; r=json.load(sys.stdin)["result"]; print(r["specName"], r["specVersion"], r["transactionVersion"])' 2>/dev/null || true
+              | python3 -c 'import json,sys; r=json.load(sys.stdin)["result"]; print(r["specName"], r["specVersion"], r["transactionVersion"])' \
+              || true
           }
           ours="$(version "http://127.0.0.1:${KREIVO_WS##*:}")"
+          # Our own endpoint first: kreivo.io sits behind a Cloudflare filter and the probe read as
+          # "unreachable" on every release tag. Retry, and print why a probe failed.
           mainnet=""
-          for url in https://kreivo.io; do
-            mainnet="$(version "$url")"
-            [ -n "$mainnet" ] && break
+          for attempt in 1 2 3; do
+            for url in https://rpc.kreivo.bloque.sh https://kreivo.io; do
+              mainnet="$(version "$url")"
+              [ -n "$mainnet" ] && break 2
+              echo "mainnet probe $url failed (attempt $attempt)"
+            done
+            sleep $((attempt * 10))
           done
           echo "under test: $ours; mainnet: ${mainnet:-unreachable}"
           echo "Runtime under test: \`$ours\`; Kreivo mainnet: \`${mainnet:-unreachable}\`." >> "$GITHUB_STEP_SUMMARY"
