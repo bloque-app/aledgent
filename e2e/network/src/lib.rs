@@ -45,6 +45,14 @@ pub const NON_SUFFICIENT_ASSET: u32 = 2;
 pub const BOOK_ONLY_ASSET: u32 = 3;
 /// The book-only asset's symbol, which is its id in the book.
 pub const BOOK_ONLY_SYMBOL: &str = "BKO";
+/// The first chain-bound asset of production, `Here(101)` (`BUSDC`, 6 decimals), held by Alice at
+/// genesis. Stress scenario c (F-032, gates 5 and 5b) registers it book-only, then binds it at
+/// zero divergence while the book is under load, and withdraws it through the adapter.
+pub const BUSDC_ASSET: u32 = 101;
+/// `BUSDC`'s symbol, which is its id in the book.
+pub const BUSDC_SYMBOL: &str = "BUSDC";
+/// `BUSDC`'s decimals.
+pub const BUSDC_DECIMALS: u8 = 6;
 /// Every asset's decimals.
 pub const ASSET_DECIMALS: u8 = 2;
 /// What Alice holds of each asset at genesis.
@@ -63,7 +71,7 @@ pub fn alice() -> String {
         .to_string()
 }
 
-/// The genesis override for Kreivo: the three assets, owned (issuer, admin and freezer) by Alice.
+/// The genesis override for Kreivo: the four assets, owned (issuer, admin and freezer) by Alice.
 ///
 /// Being the asset's owner is what lets the suite freeze the contract's account and so make Kreivo
 /// refuse a withdrawal (`Refusal::Kreivo`).
@@ -75,11 +83,13 @@ pub fn kreivo_genesis_overrides() -> serde_json::Value {
                 [{ "Here": SUFFICIENT_ASSET }, owner, true, 1],
                 [{ "Here": NON_SUFFICIENT_ASSET }, owner, false, 1],
                 [{ "Here": BOOK_ONLY_ASSET }, owner, true, 1],
+                [{ "Here": BUSDC_ASSET }, owner, true, 1],
             ],
             "accounts": [
                 [{ "Here": SUFFICIENT_ASSET }, owner, GENESIS_ASSET_BALANCE],
                 [{ "Here": NON_SUFFICIENT_ASSET }, owner, GENESIS_ASSET_BALANCE],
                 [{ "Here": BOOK_ONLY_ASSET }, owner, GENESIS_ASSET_BALANCE],
+                [{ "Here": BUSDC_ASSET }, owner, GENESIS_ASSET_BALANCE],
             ],
             // Two decimals: the aledgent driver books `USD` and `BKO` at 2; `BKO`'s binding checks
             // its decimals field against that (F-029).
@@ -87,6 +97,7 @@ pub fn kreivo_genesis_overrides() -> serde_json::Value {
                 [{ "Here": SUFFICIENT_ASSET }, b"testUSD".to_vec(), b"tUSD".to_vec(), ASSET_DECIMALS],
                 [{ "Here": NON_SUFFICIENT_ASSET }, b"testEUR".to_vec(), b"tEUR".to_vec(), ASSET_DECIMALS],
                 [{ "Here": BOOK_ONLY_ASSET }, b"BKO/9".to_vec(), BOOK_ONLY_SYMBOL.as_bytes().to_vec(), ASSET_DECIMALS],
+                [{ "Here": BUSDC_ASSET }, b"BUSDC/6".to_vec(), BUSDC_SYMBOL.as_bytes().to_vec(), BUSDC_DECIMALS],
             ],
         }
     })
