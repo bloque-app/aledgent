@@ -200,8 +200,8 @@ async fn t031_26_measure_reopen_on_a_large_book() {
     let n = log.entries().unwrap().len() as u64;
     let manifests = core.stats().replica_manifests.load(Ordering::Relaxed);
     eprintln!(
-        "{n} inputs in {ran:?} ({:.0}/s), {manifests} manifests, the last at input {m}; replica {} MB",
-        n as f64 / ran.as_secs_f64(),
+        "{n} inputs in {ran:?} ({}/s), {manifests} manifests, the last at input {m}; replica {} MB",
+        u128::from(n) * 1000 / ran.as_millis().max(1),
         dir_bytes(&live) / 1_000_000
     );
 
