@@ -2603,10 +2603,19 @@ async fn handle_metrics<S: Store, C: Core>(
 }
 
 /// The API description is public (`NFR-7`, amendment 0044): no credential is read, and the
-/// document carries no ledger fact. It is the one route that answers without one.
+/// document carries no ledger fact. It is the one route that answers without one. It is the same
+/// bytes every time, so it is serialised once.
 async fn handle_openapi<S: Store, C: Core>(State(_): State<Arc<Shared<S, C>>>) -> Response {
+    static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let text =
+        TEXT.get_or_init(|| serde_json::to_string(&crate::openapi::document()).unwrap_or_default());
     logged(
-        (StatusCode::OK, axum::Json(crate::openapi::document())).into_response(),
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            text.clone(),
+        )
+            .into_response(),
         None,
         "openapi",
     )

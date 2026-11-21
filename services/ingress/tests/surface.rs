@@ -91,7 +91,16 @@ async fn nfr_7_the_api_description_is_public_and_nothing_else_is() {
         assert_eq!(s, StatusCode::OK, "{token:?}");
         assert_eq!(v, openapi::document(), "{token:?}");
     }
+    // HEAD is deliberate (a GET route answers it), and a query string changes nothing.
+    for (method, path) in [("HEAD", OPENAPI_PATH), ("GET", "/openapi.json?x=1")] {
+        let (s, _) = d.call(method, path, None, &[], None).await;
+        assert_eq!(s, StatusCode::OK, "{method} {path}");
+    }
     for (method, path) in [
+        ("GET", "/OPENAPI.json"),
+        ("GET", "/openapi%2Ejson"),
+        ("PUT", OPENAPI_PATH),
+        ("DELETE", OPENAPI_PATH),
         ("GET", "/metrics"),
         ("GET", "/v1/assets"),
         ("GET", "/v1/trial-balance"),

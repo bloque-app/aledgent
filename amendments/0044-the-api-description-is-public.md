@@ -28,7 +28,8 @@ clients and the usual API tools from working without a secret.
 ## The change
 
 `NFR-7` gains one sentence: the machine-readable description of the API (`GET /openapi.json`) is public. It describes
-the routes, their bodies and the refusals, and carries no ledger fact, no deployment data and no credential.
+the routes, their bodies and the refusals, and carries no ledger fact, no deployment data and no credential. The
+public route is `GET /openapi.json`, and `HEAD` with it, which a GET route answers; no other method or path.
 **Nothing else becomes public because of it.** Every other route, an unknown route and a wrong method included, stays
 refused without a credential with `ERR-CredentialInvalid`, and a missing check on a new route still fails closed,
 because the exception is one path, named in the requirement.
@@ -40,5 +41,7 @@ gains the matching clause.
 
 - Every route other than `GET /openapi.json` needs a credential, as before.
 - `/ready` and `/live`, which are served beside the surface and carry no ledger fact, are not changed.
-- The document's content is unchanged. It is generated from the route table and the wire types, so it cannot name a
-  deployment, a key or a book.
+- The document's content is generated from the route table and the wire types, so it cannot name a deployment, a
+  key or a book. Two statements in it change with this amendment: the `/openapi.json` operation carries
+  `security: []` (it needs no bearer), and the description in `info` names it as public beside the two routes under
+  `/v1/auth`.
