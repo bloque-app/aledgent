@@ -566,7 +566,7 @@ fn archiver_config(args: &[String]) -> Result<ArchiverConfig, String> {
 }
 
 /// When the core takes a manifest of its replica (`T-031-26`): `--replica-manifest-every`
-/// (inputs, 1 024 by default) and `--replica-manifest-secs` (30 by default).
+/// (inputs, 1 024 by default) and `--replica-manifest-secs` (600 by default).
 fn manifest_every(args: &[String]) -> Result<ManifestEvery, String> {
     let mut every = ManifestEvery::DEFAULT;
     let num = |name: &str| -> Result<Option<u64>, String> {

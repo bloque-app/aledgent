@@ -12,7 +12,7 @@
 //! run on purpose, in release, and its numbers go to `features/F-031-core-throughput/NOTES.md`:
 //!
 //! ```text
-//! ALEDGENT_T031_26_ACCOUNTS=175000 ALEDGENT_T031_26_INPUTS=5000 \
+//! ALEDGENT_T031_26_ACCOUNTS=175000 ALEDGENT_T031_26_INPUTS=5000 [ALEDGENT_T031_26_DIR=<dir>] [ALEDGENT_T031_26_FALLBACK=0] \
 //!   cargo test --release -p core-binding --features ingress --test replica_measure -- --ignored --nocapture
 //! ```
 
@@ -136,6 +136,23 @@ fn copy_log(log: &MemLog) -> MemLog {
     out
 }
 
+/// `n mean p50/p99/max` of `v`.
+fn spread(v: &mut [u64]) -> String {
+    if v.is_empty() {
+        return "none".into();
+    }
+    v.sort_unstable();
+    let at = |pct: usize| v[(v.len() * pct).div_ceil(100).saturating_sub(1)];
+    let mean = v.iter().sum::<u64>() / v.len() as u64;
+    format!(
+        "n={} mean={mean} p50={} p99={} max={}",
+        v.len(),
+        at(50),
+        at(99),
+        v[v.len() - 1]
+    )
+}
+
 fn dir_bytes(dir: &Path) -> u64 {
     let mut n = 0;
     for entry in std::fs::read_dir(dir).unwrap() {
@@ -183,7 +200,10 @@ async fn t031_26_measure_reopen_on_a_large_book() {
     let accounts = env("ALEDGENT_T031_26_ACCOUNTS", 20_000);
     let inputs = env("ALEDGENT_T031_26_INPUTS", 3_000);
     let tail = env("ALEDGENT_T031_26_TAIL", 500);
-    let base = std::env::temp_dir().join(format!("aledgent-measure-{}", std::process::id()));
+    let base = std::env::var("ALEDGENT_T031_26_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir())
+        .join(format!("aledgent-measure-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     let live = base.join("live");
     let g = genesis(T0);
@@ -224,18 +244,31 @@ async fn t031_26_measure_reopen_on_a_large_book() {
     // All but the tail, then a manifest, then the tail: the kill lands `tail` inputs after it.
     let head = inputs.saturating_sub(tail);
     let mut i = 0;
+    // Each manifest's time, and each batch's, from the call to its replies: a batch queued behind
+    // a manifest waits for it.
+    let (mut manifest_us, mut batch_us, mut seen) = (Vec::new(), Vec::new(), 0u64);
     while i < inputs {
         if i == head {
             core.take_manifest().expect("a manifest");
         }
         let end = (i + 8).min(if i < head { head } else { inputs });
         let batch: Vec<CoreInput> = (i..end).map(|n| open_identity(&founded, n)).collect();
+        let asked = Instant::now();
         for r in core.apply_batch(&batch).await {
             r.expect("decided");
         }
+        batch_us.push(u64::try_from(asked.elapsed().as_micros()).unwrap_or(u64::MAX));
         let _ = core.ship(&mut shipper);
+        let st = core.stats();
+        let taken = st.replica_manifests.load(Ordering::Relaxed);
+        if taken > seen {
+            seen = taken;
+            manifest_us.push(st.replica_manifest_us.load(Ordering::Relaxed));
+        }
         i = end;
     }
+    eprintln!("manifest µs: {}", spread(&mut manifest_us));
+    eprintln!("batch reply µs: {}", spread(&mut batch_us));
     let ran = t.elapsed();
     let m = core.manifest().expect("a manifest").seq;
     let n = log.entries().unwrap().len() as u64;
@@ -277,6 +310,15 @@ async fn t031_26_measure_reopen_on_a_large_book() {
     assert_eq!(c.replica_digest().as_ref(), Some(&want));
     drop(c);
 
+    if env("ALEDGENT_T031_26_FALLBACK", 1) == 0 {
+        eprintln!(
+            "T-031-26 reopen, {accounts} accounts, {n} inputs, {leaves} service leaves: clean \
+             {clean:?}; unclean {unclean:?} ({rolled} inputs replayed over the manifest at input \
+             {m}); fallback not run"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        return;
+    }
     // The fallback: no usable manifest, a rebuild from genesis.
     let fallback_dir = base.join("fallback");
     copy_dir(&killed, &fallback_dir);

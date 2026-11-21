@@ -805,3 +805,72 @@ async fn t031_26_a_manifest_without_its_outbox_reopens_only_where_the_audit_stor
     drop(rebuilt);
     let _ = std::fs::remove_dir_all(&k.base);
 }
+
+/// `T-031-26`, `NFR-16`: a decision's replies are sent before the manifest it makes due is taken.
+/// With a manifest made slow (2 s at its first write point), the reply comes back well within it,
+/// and the manifest is taken after it, at that input.
+#[tokio::test(flavor = "multi_thread")]
+async fn t031_26_a_decision_s_reply_is_sent_before_its_manifest() {
+    let _serial = SERIAL.lock().await;
+    let base = root("reply-first");
+    let live = base.join("live");
+    let core = AgentCore::open_in(
+        NativePort::new(),
+        founding(),
+        MemLog::default(),
+        disk(&live),
+    )
+    .unwrap();
+    let d = deploy(&core, &[]).await;
+    traffic(&d, "a", 2).await;
+    core.set_manifest_every(ManifestEvery {
+        inputs: 1,
+        interval: Duration::from_secs(3600),
+    });
+    let began: Arc<Mutex<Option<std::time::Instant>>> = Arc::default();
+    {
+        let began = began.clone();
+        let live = live.clone();
+        set_write_hook(Some(Box::new(move |point, dir| {
+            if dir == live && point == WritePoint::Begin {
+                *began.lock().unwrap() = Some(std::time::Instant::now());
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        })));
+    }
+    let asked = std::time::Instant::now();
+    traffic(&d, "slow", 1).await;
+    let replied = std::time::Instant::now();
+    // The manifest, once it is done: `manifest` waits for the decision's lock it holds.
+    let taken = core.manifest().map(|k| k.seq);
+    let done = std::time::Instant::now();
+    set_write_hook(None);
+    drop(d);
+    let began = began
+        .lock()
+        .unwrap()
+        .expect("a manifest was due after the reply");
+    assert!(
+        replied - asked < Duration::from_millis(1500),
+        "the reply waited for the manifest: {:?}",
+        replied - asked
+    );
+    assert!(
+        replied < began + Duration::from_secs(2),
+        "the reply came first"
+    );
+    assert!(done >= began + Duration::from_secs(2));
+    assert_eq!(
+        taken,
+        Some(
+            core.with_port(|p| core_binding::host::AgentPort::hot(p)
+                .unwrap()
+                .unwrap()
+                .inputs)
+                .unwrap()
+        ),
+        "the manifest is at the decision's input"
+    );
+    drop(core);
+    let _ = std::fs::remove_dir_all(&base);
+}

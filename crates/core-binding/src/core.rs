@@ -819,9 +819,9 @@ struct Inner<P: AgentPort> {
     manifest_tried: (u64, std::time::Instant),
 }
 
-/// When a running core takes a replica manifest (`T-031-26`, [`crate::host::manifest`]): at the
-/// end of a decision, once this many inputs have committed since the last one, or this long has
-/// passed with at least one, whichever comes first. An unclean stop then replays at most about
+/// When a running core takes a replica manifest (`T-031-26`, [`crate::host::manifest`]): after a
+/// decision's replies are sent, once this many inputs have committed since the last one, or this
+/// long has passed with at least one, whichever comes first. An unclean stop then replays at most about
 /// that many inputs over the manifest instead of the whole archive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ManifestEvery {
@@ -832,12 +832,15 @@ pub struct ManifestEvery {
 }
 
 impl ManifestEvery {
-    /// 1 024 inputs or 30 s. A rebuild replays about 240 inputs a second on the production book
-    /// (555 000 in 39 minutes, 17 Nov), so the roll forward after an unclean stop stays within a
-    /// few seconds of replay; each manifest costs three synced commits and one small file.
+    /// 1 024 inputs, or 10 minutes with at least one. A rebuild replays about 240 inputs a second
+    /// on the production book (555 000 in 39 minutes, 17 Nov), so the roll forward after an
+    /// unclean stop stays within a few seconds of replay; what it costs is the inputs since the
+    /// manifest, not the time, so the interval only bounds an idle book's. Each manifest costs
+    /// three synced commits and one small file, taken after the replies of the decision that made
+    /// it due.
     pub const DEFAULT: ManifestEvery = ManifestEvery {
         inputs: 1024,
-        interval: std::time::Duration::from_secs(30),
+        interval: std::time::Duration::from_secs(600),
     };
 
     /// Never, but at open and after a rebuild.
@@ -1642,13 +1645,17 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
         drop(slot);
         self.inner.stats.hold_us.push(micros(held));
         self.inner.stats.decisions.fetch_add(1, Ordering::Relaxed);
-        // A replica manifest, when one is due (`T-031-26`): after the decision's inputs are
-        // archived and answered, still under the decision's lock, so no input moves the replica,
-        // and with the replica shared, so reads go on meanwhile: a manifest only reads it.
+        out
+    }
+
+    /// Take a replica manifest if one is due (`T-031-26`): what the decider does right after it has
+    /// sent a decision's replies ([`AgentCore::on_decider`]), so that no reply waits for one. Under
+    /// the decision's lock, so no input moves the replica and nothing is staged; with the replica
+    /// shared, so reads go on meanwhile: a manifest only reads it. The next decision waits for it.
+    fn manifest_if_due(&self) {
+        let mut inner = lock(&self.inner.ctl);
         let slot = self.inner.running.read();
         let _ = inner.checkpoint(false, slot.as_ref());
-        drop(slot);
-        out
     }
 
     /// Run `f` on the decider thread ([`decider`]); `None` if it did not answer.
@@ -1657,8 +1664,11 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
         f: impl FnOnce() -> T + Send + 'static,
     ) -> Option<T> {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let core = self.clone();
         let job: Job = Box::new(move || {
             let _ = tx.send(f());
+            // The replies are on their way: a manifest due now delays only the next decision.
+            core.manifest_if_due();
         });
         self.inner.decider.send(job).ok()?;
         rx.await.ok()
