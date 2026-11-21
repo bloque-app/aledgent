@@ -27,7 +27,7 @@ names its axis and where, never a balance:
 | `unbalanced` | 2 | a currency's commitments do not sum to the identity, over the leaves or the entries |
 | `trial-balance` | 2 | an asset's trial balance on openings is not zero |
 | `settlement` | 3 | the book's position and the settlement layer's differ at a cut, by the difference named: an aggregate per asset (`F-017`) |
-| `stale-cut` | 3 | the adapter's latest positions report is more than a day old: see `anchoring.md` |
+| `stale-cut` | 3 | the book has postings beyond its latest final cut that have waited more than a day (a quiet book's old cut is current): see `anchoring.md` |
 
 `AledgentReconciliationNotRun` on axis 3 means the daily comparison could not run: no positions report
 from the adapter yet (`ERR-EvidenceInsufficient`), or ingress refused or did not answer the job. Each run is

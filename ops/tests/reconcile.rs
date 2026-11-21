@@ -951,8 +951,9 @@ async fn ac_j3_2_the_comparison_must_cover_every_bound_asset_and_agree() {
     let anchors = (
         "GET /v1/ops/anchors",
         200,
-        json!({ "latest_comparison": { "at": 4_000 } }),
+        json!({ "checkpoints": [cp(1, 9, 1_000, "final")], "latest_comparison": { "at": 4_000 } }),
     );
+    let head = ("GET /v1/trial-balance", 200, json!({ "view": 10 }));
     let two_bound = (
         "GET /v1/assets",
         200,
@@ -969,6 +970,7 @@ async fn ac_j3_2_the_comparison_must_cover_every_bound_asset_and_agree() {
     let link = Canned::new(&[
         two_bound.clone(),
         anchors.clone(),
+        head.clone(),
         post(true, json!([zero_row("COPM"), zero_row("USD")])),
     ]);
     let (r, _, _) = reconcile::axis_3_gated(&link, true, "s", 5_000).await;
@@ -984,6 +986,7 @@ async fn ac_j3_2_the_comparison_must_cover_every_bound_asset_and_agree() {
     let link = Canned::new(&[
         two_bound.clone(),
         anchors.clone(),
+        head.clone(),
         post(false, json!([zero_row("COPM")])),
     ]);
     let (r, _, _) = reconcile::axis_3_gated(&link, true, "s", 5_000).await;
@@ -1013,6 +1016,176 @@ async fn ac_j3_2_the_comparison_must_cover_every_bound_asset_and_agree() {
             .contains("stale-cut check was skipped"),
         "{r:?}"
     );
+}
+
+// `AC-J1.1`, `NFR-9`: the stale-cut rule. The core checkpoints only when the book has postings no
+// checkpoint covers, so a quiet book's old cut is current; a cut is stale when postings beyond it
+// have waited more than a day, never by the age of the latest comparison (the job refreshes that).
+
+const DAY: u64 = 86_400_000;
+
+fn cp(number: u64, entry_sequence: u64, created_at: u64, status: &str) -> Value {
+    json!({ "number": number, "entry_sequence": entry_sequence, "created_at": created_at,
+            "status": status })
+}
+
+/// Axis 3 over canned reads: one bound asset that agrees, `checkpoints` and `latest_comparison_at`
+/// from `GET /v1/ops/anchors`, and the book's next posting sequence `head`, at `now`.
+async fn stale_axis(
+    checkpoints: Vec<Value>,
+    latest_comparison_at: u64,
+    head: u64,
+    now: u64,
+) -> ops::reconcile::AxisResult {
+    let link = Canned::new(&[
+        (
+            "GET /v1/assets",
+            200,
+            json!([{ "id": "COPM", "binding": "bound" }]),
+        ),
+        (
+            "GET /v1/ops/anchors",
+            200,
+            json!({ "checkpoints": checkpoints,
+                    "latest_comparison": { "at": latest_comparison_at } }),
+        ),
+        ("GET /v1/trial-balance", 200, json!({ "view": head })),
+        (
+            "POST /v1/ops/settlement/comparisons",
+            200,
+            json!({ "operation_reference": "did:op:1",
+                    "result": { "anchoring": { "comparison": {
+                        "cut": 4, "height": 9, "at": now, "anchors": [1], "differs": false,
+                        "rows": [zero_row("COPM")] } } } }),
+        ),
+    ]);
+    let (r, _, _) = reconcile::axis_3_gated(&link, true, "s", now).await;
+    r
+}
+
+/// `AC-J1.1`: a quiet book (no posting beyond the cut's last entry) with a cut ten days old is
+/// current: clean, and nothing in the note.
+#[tokio::test]
+async fn ac_j1_1_a_quiet_book_with_an_old_cut_is_clean() {
+    let now = 10 * DAY;
+    // The cut covers entries through 9; the next posting is 10, so there is none beyond.
+    let r = stale_axis(vec![cp(1, 9, 1_000, "final")], now - 1, 10, now).await;
+    assert!(r.ran && r.findings.is_empty() && r.note.is_none(), "{r:?}");
+}
+
+/// `AC-J1.1`, `NFR-9`: postings beyond an old cut, with no checkpoint made for them, are stale,
+/// aged from the cut the adapter reported.
+#[tokio::test]
+async fn nfr_9_postings_after_an_old_cut_are_stale() {
+    let now = 10 * DAY;
+    let r = stale_axis(vec![cp(1, 9, 1_000, "final")], now - 1, 12, now).await;
+    assert_eq!(
+        r.findings,
+        vec![Finding::StaleCut {
+            cut: 4,
+            age: now - 1_000
+        }],
+        "{r:?}"
+    );
+}
+
+/// `NFR-9`: a cut refreshed only by a new comparison is still stale: the comparison's own time
+/// says nothing about when the book was last anchored.
+#[tokio::test]
+async fn nfr_9_a_cut_refreshed_only_by_a_new_comparison_is_still_stale() {
+    let now = 10 * DAY;
+    let r = stale_axis(vec![cp(1, 9, 1_000, "final")], now, 12, now).await;
+    assert!(
+        matches!(r.findings.as_slice(), [Finding::StaleCut { .. }]),
+        "{r:?}"
+    );
+}
+
+/// `AC-J1.1`: postings that a newer checkpoint already covers are aged from that checkpoint, which
+/// was made because they existed: recent ones are not stale, however old the final cut is.
+#[tokio::test]
+async fn ac_j1_1_postings_in_a_recent_checkpoint_are_not_stale() {
+    let now = 10 * DAY;
+    let cps = vec![
+        cp(1, 9, 1_000, "final"),
+        cp(2, 11, now - 1_000, "submitted"),
+    ];
+    let r = stale_axis(cps, now, 12, now).await;
+    assert!(r.ran && r.findings.is_empty(), "{r:?}");
+    // And the same postings waiting for finality more than a day are stale, by that age.
+    let cps = vec![
+        cp(1, 9, 1_000, "final"),
+        cp(2, 11, now - DAY - 5, "pending"),
+    ];
+    let r = stale_axis(cps, now, 12, now).await;
+    assert_eq!(
+        r.findings,
+        vec![Finding::StaleCut {
+            cut: 4,
+            age: DAY + 5
+        }]
+    );
+}
+
+/// `AC-J1.1`: the rule on the checkpoints alone.
+#[test]
+fn ac_j1_1_uncovered_since_reads_the_latest_final_cut() {
+    let read = |v: Vec<Value>| -> Vec<reconcile::CheckpointRead> {
+        v.into_iter()
+            .map(|c| serde_json::from_value(c).unwrap())
+            .collect()
+    };
+    let cps = read(vec![cp(1, 4, 100, "final"), cp(2, 9, 200, "final")]);
+    // The latest final cut covers through 9.
+    assert_eq!(reconcile::uncovered_since(&cps, 10), Ok(None));
+    assert_eq!(reconcile::uncovered_since(&cps, 0), Ok(None));
+    assert_eq!(reconcile::uncovered_since(&cps, 11), Ok(Some(200)));
+    // Nothing final: there is no cut to measure.
+    let cps = read(vec![cp(1, 4, 100, "pending")]);
+    assert!(reconcile::uncovered_since(&cps, 10).is_err());
+}
+
+/// `NFR-9`, `AC-J3.2`: when the comparison is refused, the run record keeps the refusal (status,
+/// `ERR-*` id and description) instead of "the comparison could not be made" alone: a missing
+/// `CompareSettlement` grant reads as that.
+#[tokio::test]
+async fn nfr_9_a_refused_comparison_keeps_its_refusal_in_the_note() {
+    let link = Canned::new(&[
+        (
+            "GET /v1/assets",
+            200,
+            json!([{ "id": "COPM", "binding": "bound" }]),
+        ),
+        (
+            "GET /v1/ops/anchors",
+            200,
+            json!({ "checkpoints": [cp(1, 9, 1_000, "final")] }),
+        ),
+        ("GET /v1/trial-balance", 200, json!({ "view": 10 })),
+        (
+            "POST /v1/ops/settlement/comparisons",
+            403,
+            json!({ "error": "ERR-NotAuthorised",
+                    "description": "no CompareSettlement operator grant" }),
+        ),
+    ]);
+    let (r, audited, _) = reconcile::axis_3_gated(&link, true, "s", 5_000).await;
+    assert!(
+        !r.ran && audited.is_none() && r.findings.is_empty(),
+        "{r:?}"
+    );
+    let note = r.note.unwrap();
+    for part in [
+        "the comparison could not be made",
+        "403",
+        "ERR-NotAuthorised",
+        "CompareSettlement",
+    ] {
+        assert!(note.contains(part), "{part} missing from: {note}");
+    }
+    // A transport failure is kept too.
+    let (r, ..) = reconcile::axis_3_gated(&Canned::new(&[]), true, "s", 5_000).await;
+    assert!(r.note.unwrap().contains("GET /v1/assets"));
 }
 
 /// `REQ-LA-2`: a later run that did not look at `Suspense` neither hides the last report that did

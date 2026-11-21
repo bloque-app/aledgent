@@ -24,7 +24,7 @@
 //!   account: the book's position at a cut is derived from the settling postings behind the final
 //!   records below the cut, and compared with the positions the adapter reported at that cut. The
 //!   daily job asks the core to compare at the latest reported cut ([`compare_through`]); a cut
-//!   older than a day is itself a finding.
+//!   the book has moved past for more than a day is itself a finding ([`uncovered_since`]).
 //! - **`Suspense`** (`REQ-LA-2`, `RISK-8`): every non-zero `Suspense` balance, and since when
 //!   ([`suspense_report`]).
 //!
@@ -169,11 +169,13 @@ pub enum Finding {
         /// The cut.
         cut: u64,
     },
-    /// Axis 3: the latest cut the adapter reported is older than [`MAX_CUT_AGE_MS`].
+    /// Axis 3: the book has postings beyond the latest final cut, and the oldest of them that
+    /// the run can date is older than [`MAX_CUT_AGE_MS`] (`AC-J1.1`: a quiet book has no newer
+    /// checkpoint, and that is not stale).
     StaleCut {
         /// The cut.
         cut: u64,
-        /// Its age, in milliseconds.
+        /// How long the postings beyond it have waited for a checkpoint, in milliseconds.
         age: u64,
     },
 }
@@ -342,10 +344,54 @@ pub fn axis_2_openings<S: LeafStore, V: VaultBackend>(ledger: &Ledger<S, V>) -> 
         .collect()
 }
 
-/// How old the settlement layer's latest reported cut may be before axis 3 finds it stale: a day.
-/// The adapter reports positions whenever a final anchor wants its comparison (hourly by default)
-/// or the positions changed, so a cut older than this means anchoring or the adapter stopped.
+/// How long postings may wait beyond the latest final cut before axis 3 finds it stale: a day.
+/// The core checkpoints whenever the book has a posting no checkpoint covers, once the interval
+/// has passed (`AC-J1.1`, hourly by default), and the adapter reports positions whenever a final
+/// anchor wants its comparison. A book with no new posting makes no checkpoint, so its latest
+/// final cut stays current however old it is; postings beyond it for longer than this mean
+/// anchoring or the adapter stopped. The age is never the latest comparison's: the reconcile job
+/// refreshes that itself.
 pub const MAX_CUT_AGE_MS: u64 = 86_400_000;
+
+/// A checkpoint, as far as the stale-cut rule reads it (`GET /v1/ops/anchors`).
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct CheckpointRead {
+    /// Its number.
+    pub number: u64,
+    /// The sequence of the last entry it covers.
+    pub entry_sequence: u64,
+    /// When the core created it.
+    pub created_at: u64,
+    /// `pending`, `submitted` or `final`.
+    pub status: String,
+}
+
+/// Whether the book has postings the latest final cut does not cover, and since when the run can
+/// tell (`AC-J1.1`, `NFR-9`).
+///
+/// `head` is the book's next posting sequence (`GET /v1/trial-balance`'s `view`), so its last
+/// posting is `head - 1`; the cut covers entries through its `entry_sequence`. `Ok(None)`: nothing
+/// beyond the cut, which is current whatever its age. `Ok(Some(t))`: postings beyond it, no later
+/// than `t`, which is the creation of the oldest newer checkpoint (not final yet: it was made
+/// because those postings existed) or, with none, the creation of the cut itself, when the adapter
+/// had it. The core exposes no posting's time book-wide, so `t` never post-dates the first
+/// uncovered posting by more than the checkpoint interval. `Err`: no final cut to measure.
+pub fn uncovered_since(checkpoints: &[CheckpointRead], head: u64) -> Result<Option<u64>, String> {
+    let cut = checkpoints
+        .iter()
+        .filter(|c| c.status == "final")
+        .max_by_key(|c| c.number)
+        .ok_or_else(|| "no final checkpoint".to_owned())?;
+    if head.saturating_sub(1) <= cut.entry_sequence {
+        return Ok(None);
+    }
+    let newer = checkpoints
+        .iter()
+        .filter(|c| c.status != "final" && c.entry_sequence > cut.entry_sequence)
+        .map(|c| c.created_at)
+        .min();
+    Ok(Some(newer.unwrap_or(cut.created_at)))
+}
 
 /// Axis 3's comparison (`REQ-PR-5`, `AC-J3.1`, `AC-J3.2`): `F-017`'s `compare_settlement` at the
 /// latest cut the adapter reported, per asset. Implementations say whether it could run and what
@@ -353,6 +399,11 @@ pub const MAX_CUT_AGE_MS: u64 = 86_400_000;
 pub trait SettlementComparator {
     /// The findings, or `None` when no comparison could be made.
     fn compare(&self) -> Option<Vec<Finding>>;
+
+    /// Why no comparison could be made, as the refusal or failure said it; `None` when one was.
+    fn why(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Axis 3 could not run, and why: no positions report yet (`ERR-EvidenceInsufficient`), the core
@@ -364,16 +415,22 @@ impl SettlementComparator for NotRun {
     fn compare(&self) -> Option<Vec<Finding>> {
         None
     }
+
+    fn why(&self) -> Option<&str> {
+        Some(self.0.as_str()).filter(|w| !w.is_empty())
+    }
 }
 
 /// A comparison `compare_settlement` made: every asset that differs by as little as one minor unit
-/// is a finding, and so is a cut the adapter reported more than [`MAX_CUT_AGE_MS`] before.
+/// is a finding, and so is a cut the book has postings beyond for more than [`MAX_CUT_AGE_MS`]
+/// ([`uncovered_since`]).
 #[derive(Clone, Debug)]
 pub struct Compared {
     /// The comparison, as ingress returned it.
     pub comparison: ComparisonBody,
-    /// When the adapter reported the cut compared, if known.
-    pub reported_at: Option<u64>,
+    /// Since when the book has postings beyond the latest final cut ([`uncovered_since`]); `None`
+    /// when it has none, or when that could not be read (said in the notes).
+    pub uncovered_since: Option<u64>,
     /// When axis 3 ran.
     pub now: u64,
 }
@@ -394,7 +451,7 @@ impl SettlementComparator for Compared {
         if c.differs && out.is_empty() {
             out.push(Finding::SettlementDiffers { cut: c.cut });
         }
-        if let Some(at) = self.reported_at {
+        if let Some(at) = self.uncovered_since {
             let age = self.now.saturating_sub(at);
             if age > MAX_CUT_AGE_MS {
                 out.push(Finding::StaleCut { cut: c.cut, age });
@@ -417,7 +474,7 @@ pub fn axis_3(comparator: &dyn SettlementComparator) -> AxisResult {
             axis: 3,
             ran: false,
             findings: Vec::new(),
-            note: None,
+            note: comparator.why().map(str::to_owned),
         },
     }
 }
@@ -671,7 +728,8 @@ impl IngressLink for RouterLink {
 }
 
 /// The daily job's axis 3 through ingress (`F-017`'s `TODO(F-018)`: the daily comparison). It
-/// reads when the adapter last reported the layer's positions (`GET /v1/ops/anchors`), then asks
+/// reads whether the book has postings beyond the latest final cut (`GET /v1/ops/anchors`,
+/// `GET /v1/trial-balance`), then asks
 /// the core to compare at that cut (`POST /v1/ops/settlement/comparisons`), as the operations
 /// principal with the `compare_settlement` operator kind, with `summary` as the justification: the
 /// comparison and the summary of the run go on the audit trail together, in one operator record.
@@ -699,25 +757,10 @@ pub async fn compare_covering<L: IngressLink>(
     Vec<String>,
 ) {
     let mut notes = Vec::new();
-    let reported_at = match link.call("GET", "/v1/ops/anchors", None).await {
-        Ok((200, v)) => {
-            let at = v["latest_comparison"]["at"].as_u64();
-            if at.is_none() {
-                notes
-                    .push("the stale-cut check was skipped: no earlier comparison time".to_owned());
-            }
-            at
-        }
-        Ok((status, _)) => {
-            notes.push(format!(
-                "the stale-cut check was skipped: GET /v1/ops/anchors answered {status}"
-            ));
-            None
-        }
-        Err(e) => {
-            notes.push(format!(
-                "the stale-cut check was skipped: GET /v1/ops/anchors: {e}"
-            ));
+    let uncovered = match uncovered_through(link).await {
+        Ok(u) => u,
+        Err(why) => {
+            notes.push(format!("the stale-cut check was skipped: {why}"));
             None
         }
     };
@@ -730,11 +773,20 @@ pub async fn compare_covering<L: IngressLink>(
         .await;
     let (status, v) = match reply {
         Ok(r) => r,
-        Err(e) => return (Box::new(NotRun(format!("ingress: {e}"))), None, notes),
+        Err(e) => {
+            return (
+                Box::new(NotRun(format!("POST /v1/ops/settlement/comparisons: {e}"))),
+                None,
+                notes,
+            );
+        }
     };
     if status != 200 {
         return (
-            Box::new(NotRun(format!("{status}: {}", v["error"]))),
+            Box::new(NotRun(format!(
+                "POST /v1/ops/settlement/comparisons answered {}",
+                refusal_text(status, &v)
+            ))),
             None,
             notes,
         );
@@ -744,7 +796,7 @@ pub async fn compare_covering<L: IngressLink>(
         Ok(comparison) => (
             Box::new(Compared {
                 comparison: comparison.clone(),
-                reported_at,
+                uncovered_since: uncovered,
                 now,
             }),
             audited,
@@ -771,6 +823,48 @@ pub async fn compare_covering<L: IngressLink>(
             notes,
         ),
     }
+}
+
+/// A refusal as the record says it: the status, the `ERR-*` id and the description
+/// (`{"error", "description"}`, `REQ-CS-4`), or the body as it came when it is not that shape.
+fn refusal_text(status: u16, body: &serde_json::Value) -> String {
+    let text = |k: &str| body[k].as_str().map(str::to_owned);
+    match (text("error"), text("description")) {
+        (Some(id), Some(d)) => format!("{status} {id}: {d}"),
+        (Some(id), None) => format!("{status} {id}"),
+        _ if body.is_null() => status.to_string(),
+        _ => format!("{status}: {body}"),
+    }
+}
+
+/// [`uncovered_since`] from the operator's reads: the checkpoints (`GET /v1/ops/anchors`) and the
+/// book's next posting sequence (`GET /v1/trial-balance`'s `view`). `Err` says which read failed,
+/// with the refusal it gave.
+async fn uncovered_through<L: IngressLink>(link: &L) -> Result<Option<u64>, String> {
+    let anchors = match link.call("GET", "/v1/ops/anchors", None).await {
+        Ok((200, v)) => v,
+        Ok((status, v)) => {
+            return Err(format!(
+                "GET /v1/ops/anchors answered {}",
+                refusal_text(status, &v)
+            ));
+        }
+        Err(e) => return Err(format!("GET /v1/ops/anchors: {e}")),
+    };
+    let checkpoints: Vec<CheckpointRead> =
+        serde_json::from_value(anchors["checkpoints"].clone())
+            .map_err(|e| format!("GET /v1/ops/anchors: checkpoints: {e}"))?;
+    let head = match link.call("GET", "/v1/trial-balance", None).await {
+        Ok((200, v)) => v["view"].as_u64().ok_or("GET /v1/trial-balance: no view")?,
+        Ok((status, v)) => {
+            return Err(format!(
+                "GET /v1/trial-balance answered {}",
+                refusal_text(status, &v)
+            ));
+        }
+        Err(e) => return Err(format!("GET /v1/trial-balance: {e}")),
+    };
+    uncovered_since(&checkpoints, head)
 }
 
 /// The daily run (`NFR-9`, `AC-J3.1`): axes 1 and 2 and the `Suspense` report over the running
@@ -1177,7 +1271,13 @@ pub async fn axis_3_gated<L: IngressLink>(
     let (comparator, audited, notes) = compare_covering(link, summary, now, &bound).await;
     let mut axis = axis_3(comparator.as_ref());
     if !axis.ran {
-        axis.note = Some("the comparison could not be made".into());
+        // The refusal, as the core or ingress gave it (status, `ERR-*` id, description): a missing
+        // grant is a different repair from a down adapter.
+        let why = axis.note.take();
+        axis.note = Some(match why {
+            Some(w) => format!("the comparison could not be made: {w}"),
+            None => "the comparison could not be made".into(),
+        });
     } else if !notes.is_empty() {
         axis.note = Some(notes.join("; "));
     }

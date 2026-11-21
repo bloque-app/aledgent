@@ -187,9 +187,13 @@ drill's read of the layer's anchors.
 28. **Axis 3 is `F-017`'s `compare_settlement`, through ingress**, as the operations principal with the
     `compare_settlement` operator kind, at the latest cut the adapter reported. Each asset whose
     difference is not zero is a finding with the asset, the cut and the difference (an aggregate per
-    asset, no account's figure). A cut the adapter reported more than a day before is itself a finding
-    (`StaleCut`): the adapter reports positions whenever a final anchor wants its comparison, so an old cut
-    means anchoring or the adapter stopped. With no report yet (`ERR-EvidenceInsufficient`), or ingress
+    asset, no account's figure). A cut is itself a finding (`StaleCut`) when the book has postings beyond the latest final
+    checkpoint (`GET /v1/trial-balance` `view` - 1 > `entry_sequence`) and those have waited more than a day:
+    aged from the oldest newer checkpoint's `created_at`, else the cut's. The core checkpoints only when new
+    postings exist (`AC-J1.1`), so a quiet book's old cut is current, and the latest comparison's time (which
+    the job itself refreshes) is never the age. The core exposes no book-wide posting time, so the age can
+    undershoot the first uncovered posting's by up to the checkpoint interval, and a posting made just before
+    a run on a day-old cut reads as stale until the next checkpoint. With no report yet (`ERR-EvidenceInsufficient`), or ingress
     refusing the job, axis 3 is recorded as not run, and pages as not run after 24 h.
 29. **The daily job** (`reconcile::daily`) runs axes 1 and 2 and the `Suspense` report under the core's
     lock, then axis 3 through ingress, then writes the run's JSON record. `TODO(F-005)`: the host schedules
