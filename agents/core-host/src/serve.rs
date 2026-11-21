@@ -14,7 +14,7 @@
 //! | `agent.state` | The Agent's runtime state and the driver's positions ([`Persisting`]) | After every invocation, atomically (write, sync, rename) |
 //! | `archive.bin` | Every input the Agent committed, as its delta-ring entry | Before the Agent is told it is archived |
 //! | `replies.jsonl` | Every input's reply, by key | Before the reply is returned |
-//! | `replica/` | Unless `--replica-in-memory`: the replica's stores, the book's leaves, openings and service tree (`T-031-14`, the default since `T-032-15`) | Unsynced; wiped and rebuilt on every start |
+//! | `replica/` | Unless `--replica-in-memory`: the replica's stores, the book's leaves, openings and service tree (`T-031-14`, the default since `T-032-15`), and `kept.json` beside them | Unsynced, but for a manifest (`T-031-26`) every `--replica-manifest-every` inputs or `--replica-manifest-secs` seconds: a savepoint of each store, and the record, written atomically; at a clean stop, the stores synced and T-031-25's record |
 //! | `archive.status.json` | With `--archive`: the archiver's lag, failures and last restore point (`core_archive::ArchiveStatus`), for `opsctl exporter` | About once a second |
 //!
 //! **The off-node archive** (`--archive <spec>`, `T-005-15`). Every decision's bytes of
@@ -25,8 +25,10 @@
 //! ([`restore`]). Without `--archive`, losing this node's volume loses every decision since its
 //! last snapshot: the host says so on start.
 //!
-//! A restart restores the runtime state, re-attaches the installed actor, and rebuilds the
-//! replica from the archive and the Agent; what the Agent committed beyond the archive (a crash
+//! A restart restores the runtime state, re-attaches the installed actor, and reopens the replica:
+//! after a clean stop where it stopped (`T-031-25`), after any other stop from its last manifest,
+//! the archive's inputs since it replayed over it (`T-031-26`); only when neither checks out is it
+//! rebuilt from the archive and the Agent. What the Agent committed beyond the archive (a crash
 //! between the two writes) is read back from its ring.
 //!
 //! **The audit trail** (`T-013-13`): with `audit_store` in the configuration, the core ships its
@@ -68,7 +70,9 @@ use std::sync::Arc;
 
 use core_archive::archiver::StateReader;
 use core_archive::{Access, Archiver, ArchiverConfig, ArchivingLog};
-use core_binding::core::{AgentCore, FileLog, Founding, HostLog as _, roll_forward_agent};
+use core_binding::core::{
+    AgentCore, FileLog, Founding, HostLog as _, ManifestEvery, roll_forward_agent,
+};
 use core_binding::envelope::BlobKey;
 use core_binding::host::{
     AgentPort, BatchLimits, DRIVER, PortError, REPLICA_CACHE_BYTES, ReplicaStores,
@@ -561,10 +565,28 @@ fn archiver_config(args: &[String]) -> Result<ArchiverConfig, String> {
     Ok(c)
 }
 
+/// When the core takes a manifest of its replica (`T-031-26`): `--replica-manifest-every`
+/// (inputs, 1 024 by default) and `--replica-manifest-secs` (30 by default).
+fn manifest_every(args: &[String]) -> Result<ManifestEvery, String> {
+    let mut every = ManifestEvery::DEFAULT;
+    let num = |name: &str| -> Result<Option<u64>, String> {
+        arg(args, name)
+            .map(|v| v.parse::<u64>().map_err(|_| format!("{name}: a number")))
+            .transpose()
+    };
+    if let Some(n) = num("--replica-manifest-every")? {
+        every.inputs = n.max(1);
+    }
+    if let Some(s) = num("--replica-manifest-secs")? {
+        every.interval = std::time::Duration::from_secs(s.max(1));
+    }
+    Ok(every)
+}
+
 /// `serve --config <file> --runtime <runtime.pvm> --actor <actor.vos> --state <dir>
 /// [--chainspec <file> [--genesis-manifest <file>] [--unnamed-code]] [--budget <bytes>] [--batch <inputs>] [--replica-in-memory] [--archive <spec>
 /// [--archive-interval-ms <ms>] [--checkpoint-every <inputs>] [--checkpoint-every-secs <s>]]
-/// [--code-config <file>]`.
+/// [--replica-manifest-every <inputs>] [--replica-manifest-secs <s>] [--code-config <file>]`.
 /// `--batch` is the most inputs one invocation carries (`T-031-03`); it overrides the
 /// configuration's `core_batch`, and 1 is one input per invocation. The replica's stores are under
 /// `<dir>/replica/` (`T-031-14`) unless `--replica-in-memory`; `--replica-on-disk`, the default, is
@@ -756,6 +778,9 @@ pub fn serve(args: &[String]) -> Result<(), String> {
     core.set_batch_limits(
         BatchLimits::with_inputs(batch).with_actor_gas(crate::driver::actor_gas()),
     );
+    // T-031-26: a manifest of the replica every so many inputs or seconds, so that a start after
+    // an unclean stop replays only the archive's tail since it.
+    core.set_manifest_every(manifest_every(args)?);
     // F-038 §4: one sequencer in front of the core, for every link: signatures checked, stale
     // feeders fenced, the order kept. The Agent's calls are unchanged (`DEC-26(d)`).
     // T-031-25 (aledgent#129): told to stop, the host keeps its replica for the next start.
