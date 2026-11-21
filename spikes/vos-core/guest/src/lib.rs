@@ -29,8 +29,9 @@ use core_binding::envelope::BlobKey;
 use core_binding::transition::{Invocation, Rows, transition};
 use vos_sdk::prelude::*;
 
-/// The rules version this spike's package is built as: the production package's (2).
-const GENERATION: u64 = 2;
+/// The rules version this spike's package is built as: 0, a fresh book's first code (*H₀*): the
+/// spike founds its books, and the fence refuses any other at the first input.
+const GENERATION: u64 = 0;
 
 core_binding::ledger_core::code_generation!(GENERATION);
 

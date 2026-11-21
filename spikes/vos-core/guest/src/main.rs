@@ -8,10 +8,10 @@
 #![no_std]
 #![no_main]
 
-#[cfg(not(feature = "heap-probe"))]
+#[cfg(not(any(feature = "heap-probe", feature = "be-memcmp")))]
 vos_sdk::actor_program!(aledgent_core_vos::aledgent_core);
 
-#[cfg(feature = "heap-probe")]
+#[cfg(any(feature = "heap-probe", feature = "be-memcmp"))]
 mod probed {
     use core::alloc::{GlobalAlloc, Layout};
     use vos_sdk::heap::{Arena, Heap};
@@ -65,9 +65,53 @@ mod probed {
         &VOS_ARENA as *const _ as usize
     }
 
-    #[cfg(target_arch = "riscv64")]
+    #[cfg(all(target_arch = "riscv64", feature = "heap-probe"))]
     #[global_allocator]
     static VOS_HEAP: Probed = Probed(Heap::new(&VOS_ARENA));
+
+    #[cfg(all(target_arch = "riscv64", not(feature = "heap-probe")))]
+    #[global_allocator]
+    static VOS_HEAP: Heap<PROGRAM_HEAP, true> = Heap::new(&VOS_ARENA);
+
+    /// `be-memcmp`: the SDK's word compare (`vos_sdk::mem::compare`), with the first differing
+    /// word's order taken from its big-endian value instead of from its lowest differing byte
+    /// (`trailing_zeros` and a shift), and a result of -1, 0 or 1. At vos-core 1650c474 the SDK's
+    /// compare orders some keys wrongly in the guest (W2: genesis's service root).
+    #[cfg(feature = "be-memcmp")]
+    unsafe fn compare(a: *const u8, b: *const u8, len: usize) -> i32 {
+        const WORD: usize = 8;
+        let mut i = 0;
+        if (a as usize ^ b as usize).is_multiple_of(WORD) {
+            while i < len && !(a as usize + i).is_multiple_of(WORD) {
+                // SAFETY: `i < len`.
+                let (x, y) = unsafe { (*a.add(i), *b.add(i)) };
+                if x != y {
+                    return if x < y { -1 } else { 1 };
+                }
+                i += 1;
+            }
+            while i + WORD <= len {
+                // SAFETY: both sides are word-aligned here and `i + WORD <= len`.
+                let (x, y) = unsafe { (*a.add(i).cast::<u64>(), *b.add(i).cast::<u64>()) };
+                if x != y {
+                    let (x, y) = (u64::from_be(x), u64::from_be(y));
+                    return if x < y { -1 } else { 1 };
+                }
+                i += WORD;
+            }
+        }
+        while i < len {
+            // SAFETY: memcmp's contract.
+            let (x, y) = unsafe { (*a.add(i), *b.add(i)) };
+            if x != y {
+                return if x < y { -1 } else { 1 };
+            }
+            i += 1;
+        }
+        0
+    }
+    #[cfg(not(feature = "be-memcmp"))]
+    use vos_sdk::mem::compare;
 
     #[cfg(target_arch = "riscv64")]
     #[panic_handler]
@@ -80,14 +124,14 @@ mod probed {
     #[unsafe(no_mangle)]
     unsafe extern "C" fn memcmp(a: *const u8, b: *const u8, len: usize) -> i32 {
         // SAFETY: memcmp's contract.
-        unsafe { vos_sdk::mem::compare(a, b, len) }
+        unsafe { compare(a, b, len) }
     }
 
     #[cfg(target_arch = "riscv64")]
     #[unsafe(no_mangle)]
     unsafe extern "C" fn bcmp(a: *const u8, b: *const u8, len: usize) -> i32 {
         // SAFETY: bcmp's contract.
-        unsafe { vos_sdk::mem::compare(a, b, len) }
+        unsafe { compare(a, b, len) }
     }
 
     #[used]

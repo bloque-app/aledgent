@@ -160,14 +160,7 @@ fn classes(message: &[u8]) -> (String, String) {
             let names: Vec<String> = input
                 .calls
                 .iter()
-                .map(|c| {
-                    let debug = format!("{c:?}");
-                    debug
-                        .split(|ch: char| !ch.is_alphanumeric())
-                        .next()
-                        .unwrap_or("")
-                        .to_string()
-                })
+                .map(|c| c.method().to_string())
                 .collect();
             let mut kind = names.join("+");
             if kind.is_empty() {

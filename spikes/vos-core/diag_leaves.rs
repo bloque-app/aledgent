@@ -27,5 +27,25 @@ pub fn genesis_leaves(
         .expect("bootstrap");
     let (ledger, _) =
         core_binding::ledger_core::Ledger::genesis(book, g.genesis, g.op, g.at).expect("genesis");
-    encode(&ledger.state().all_leaves())
+    let leaves = ledger.state().all_leaves();
+    // Each leaf's tree key, leaf hash and leaf node, then the roots: the service root over the
+    // leaves, and compact-smt's root of the sorted (key, hash) pairs.
+    let mut keyed: alloc::vec::Vec<([u8; 16], [u8; 32])> = leaves
+        .iter()
+        .map(|(k, key, value)| {
+            (
+                core_binding::ledger_core::delta::library_key(*k, key),
+                core_binding::ledger_core::delta::library_leaf_hash(*k, key, Some(value)),
+            )
+        })
+        .collect();
+    keyed.sort();
+    let nodes: alloc::vec::Vec<[u8; 32]> =
+        keyed.iter().map(|(k, h)| compact_smt::v2::leaf_node(k, h)).collect();
+    let entries: alloc::vec::Vec<_> =
+        leaves.iter().map(|(k, key, value)| (*k, key.clone(), Some(value.clone()))).collect();
+    let service = core_binding::service::root_of(&entries);
+    let sorted = compact_smt::v2::root_sorted(&keyed);
+    let pair = if nodes.len() >= 2 { compact_smt::v2::node(&nodes[0], &nodes[1]) } else { [0; 32] };
+    encode(&(leaves, keyed, nodes, pair, service, sorted))
 }

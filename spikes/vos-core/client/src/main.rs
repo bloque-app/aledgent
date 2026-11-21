@@ -96,7 +96,7 @@ impl core_binding::host::AgentPort for Tee {
                 slot: None,
                 message: &message,
                 blob: &fetch,
-                generation: 2,
+                generation: 0,
             };
             core_binding::transition::transition(&mut self.rows, &inv)
         });
@@ -107,14 +107,32 @@ impl core_binding::host::AgentPort for Tee {
             };
             let native = diag::genesis_leaves(&message, &fetch);
             let remote = self.remote.invoke(message, blobs)?;
-            let n: Vec<(u8, Vec<u8>, Vec<u8>)> = core_binding::envelope::decode(&native).unwrap();
-            let r: Vec<(u8, Vec<u8>, Vec<u8>)> = core_binding::envelope::decode(&remote).unwrap();
-            eprintln!("leaves: native {} vos {}", n.len(), r.len());
-            for (i, (a, b)) in n.iter().zip(r.iter()).enumerate() {
+            type D = (
+                Vec<(u8, Vec<u8>, Vec<u8>)>,
+                Vec<([u8; 16], [u8; 32])>,
+                Vec<[u8; 32]>,
+                [u8; 32],
+                [u8; 32],
+                [u8; 32],
+            );
+            let n: D = core_binding::envelope::decode(&native).unwrap();
+            let r: D = core_binding::envelope::decode(&remote).unwrap();
+            eprintln!("leaves equal: {}", n.0 == r.0);
+            eprintln!("keys+hashes equal: {}", n.1 == r.1);
+            for (i, (a, b)) in n.1.iter().zip(r.1.iter()).enumerate() {
                 if a != b {
-                    eprintln!("leaf {i} differs:\n native {a:?}\n    vos {b:?}");
+                    eprintln!(" pair {i}: native {a:?}\n          vos {b:?}");
                 }
             }
+            eprintln!("leaf nodes equal: {}", n.2 == r.2);
+            for (i, (a, b)) in n.2.iter().zip(r.2.iter()).enumerate() {
+                if a != b {
+                    eprintln!(" node {i}: native {a:?}\n          vos {b:?}");
+                }
+            }
+            eprintln!("node(0,1) equal: {}", n.3 == r.3);
+            eprintln!("service root equal: {} (native {:?}, vos {:?})", n.4 == r.4, &n.4[..4], &r.4[..4]);
+            eprintln!("root_sorted equal: {} (native {:?}, vos {:?})", n.5 == r.5, &n.5[..4], &r.5[..4]);
             std::process::exit(0);
         }
         let reply = self.remote.invoke(message, blobs)?;

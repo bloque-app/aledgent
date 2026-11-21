@@ -17,6 +17,7 @@ repository = "https://github.com/bloque-app/aledgent"
 core-binding = { path = "../../../crates/core-binding", features = ["std"] }
 ledger-core = { path = "../../../crates/ledger-core" }
 ledger-kernel = { path = "../../../crates/ledger-kernel" }
+compact-smt = { path = "../../../crates/compact-smt" }
 
 [profile.release]
 debug = false

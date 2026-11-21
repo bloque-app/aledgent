@@ -39,12 +39,16 @@ heap-probe = []
 diag-memrows = []
 # Diagnostic: `apply` on a genesis returns its service leaves (../diag_leaves.rs).
 diag-leaves = []
+# memcmp as a word compare by big-endian value (src/main.rs), in place of vos_sdk::mem::compare,
+# which orders some keys wrongly in the guest at 1650c474: every measured build has it.
+be-memcmp = []
 
 [dependencies]
 vos-sdk = { git = "https://github.com/virto-network/vos", rev = "1650c474da06408026923b8397d338d767e1cd27" }
 # Everything the Agent decides (Apache-2.0 OR MIT, no VOS), with every command group.
 core-binding = { path = "../../../crates/core-binding", default-features = false, features = ["full"] }
 ledger-kernel = { path = "../../../crates/ledger-kernel", default-features = false }
+compact-smt = { path = "../../../crates/compact-smt" }
 # CipherClerk hashes through vos-core's precompile 0x400 (`vos-core-blake2b`, cipherclerk.sh);
 # its curve arithmetic stays in software (DEC-16).
 cipher-clerk = { git = "https://codeberg.org/Virto/CipherClerk.git", rev = "e9a7b0851f183c14dbd1635dbf0437c86682ad6f", default-features = false }
