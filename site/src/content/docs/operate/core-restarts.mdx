@@ -11,14 +11,14 @@ Cites `REQ-CS-7`, `REQ-RT-3`, `INV-6`, `NFR-4`, `F-031`.
 
 The core host keeps a replica of the book on its disk and streams every decision to an off-node archive.
 How long a restart takes depends on whether it can keep that replica
-([T-031-25](https://github.com/bloque-app/aledgent/blob/main/features/F-031-core-throughput/tasks.md)).
+([T-031-25](https://github.com/bloque-app/aledgent/blob/develop/features/F-031-core-throughput/tasks.md)).
 
 ## A clean stop keeps the replica
 
 Stopped with `SIGTERM` or `SIGINT`, the core host stops taking inputs, makes its stores durable and
 records where it stopped. The next start reopens the stores where they are and checks that the replica,
-the record and the host's log all stand at the same input, log hash and roots. Then it serves: about
-0.1 to 0.3 s.
+the record and the host's log all stand at the same input, log hash and roots. Then it serves, without
+replaying anything.
 
 Commands keep arriving meanwhile: ingress acknowledges value-moving commands and holds the rest
 (`REQ-CS-7`; see [While the core is away](../../integrate/core-away/)).
@@ -30,8 +30,8 @@ Commands keep arriving meanwhile: ingress acknowledges value-moving commands and
 - a host that keeps nothing across starts (a fresh container with no persistent volume).
 
 Then the host replays the archive from genesis, deciding every past input again. That takes time in
-proportion to the book: one measured rebuild took about 45 minutes for a book of about 555 000 inputs.
-**Plan the window from your own archive's replay time**, measured, not guessed.
+proportion to the book's history. **Plan the window from your own archive's replay time**, measured on
+your own book, not guessed.
 
 <Aside type="caution" title="Give the replica a persistent volume">
 A core host whose state directory is not on a volume that survives the restart rebuilds on every start.

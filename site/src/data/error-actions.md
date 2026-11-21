@@ -62,15 +62,18 @@ Seen by: a holder completing a recovery or claiming a succession.
 Retry: yes, after the delay.
 
 The recovery or succession has a delay, and it has not elapsed. The reply that opened it carried
-`effective_at`: complete it after that time. Anyone the delay protects can still cancel it until then.
+`effective_at`: complete it after that time. Until then the holder can cancel it with an existing
+credential of the set, through `cancel_recovery` (`POST /v1/recoveries/{pending}/cancel`, `REQ-AU-16`).
 
 ## ERR-UnboundedGrant
 
 Seen by: whoever grants authority.
 Retry: after adding a bound.
 
-A grant over an account must carry a bound. Add `per_operation`, `per_window` (`{"length": <ms>,
-"limit": "<minor units>"}`), or both, and send it again under a new client key. See [Grants](../../integrate/grants/).
+Every grant must carry at least one bound (`REQ-AU-2`): `per_operation`, `per_window`
+(`{"length": <ms>, "limit": "<minor units>"}`), an `assets` list or a `counterparties` list. An issuance
+grant needs a `per_window` bound and an `assets` list that names its asset. Add the bound and send it
+again under a new client key. See [Grants](../../integrate/grants/).
 
 ## ERR-BoundExceeded
 
@@ -92,11 +95,12 @@ or an operation reference, and that your authority reaches it.
 
 ## ERR-AccountFrozen
 
-Seen by: every caller.
+Seen by: every caller debiting the account.
 Retry: no, until it is unfrozen.
 
-The operator froze the account. Nothing moves in or out of it until the operator unfreezes it. Reads
-still work. Contact the deployment's operator; there is nothing to fix in the request.
+The operator froze the account. A frozen account refuses every operation that debits it, and still
+accepts credits (`REQ-LA-7`, `INV-9`): value can be paid into it, none can leave it. Its balances do not
+change and stay `available`. Contact the deployment's operator; there is nothing to fix in the request.
 
 ## ERR-AccountClosed
 
@@ -127,8 +131,15 @@ fault in the request. Contact the deployment's operator.
 Seen by: every caller.
 Retry: after fixing the asset id.
 
-The asset is not in the registry. Asset ids are stored in uppercase: an asset registered as `bAI` is
-`BAI`. Read the registry with `GET /v1/assets` and use the stored id.
+No asset with this id is in the registry. The causes:
+
+- **It is not registered** (or was removed). Read the registry with `GET /v1/assets`.
+- **It cannot be an asset id**: not 2 to 12 ASCII letters and digits. On a command this is
+  `ERR-UnknownAsset`; in a read's query parameter it is `ERR-MalformedCommand`.
+
+Case is never the cause: aledgent normalises every asset id it is sent to uppercase, on every route
+(`REQ-AS-3`), so `crd` and `CRD` name the same asset. Replies always carry the uppercase form; compare
+against that form in your own records.
 
 ## ERR-AssetDeprecated
 
@@ -226,11 +237,15 @@ example). Never reuse a key for "the next" charge.
 
 ## ERR-BatchTooLarge
 
-Seen by: every caller.
+Seen by: every caller, and the operator.
 Retry: after splitting.
 
-The transfer has more legs than the deployment's published maximum. Split it into several transfers,
-each with its own client key. Each is atomic on its own; aledgent makes no promise across them.
+The submission is larger than the deployment's declared maximum. Two cases:
+
+- **A transfer with more legs than the published maximum.** Split it into several transfers, each with
+  its own client key. Each is atomic on its own; aledgent makes no promise across them.
+- **A page of an asset's sweep** (the operator retiring an asset, `REQ-AS-10`) larger than the maximum.
+  Send smaller pages.
 
 ## ERR-UnsupportedLeg
 
@@ -362,8 +377,8 @@ purpose. Check the body against the [API reference](../../api/). Common causes: 
 Seen by: every caller of a new deployment.
 Retry: yes, once the deployment is sealed.
 
-The book's initial state is not in place and checked yet, and the book takes no command until it is.
-Reads are answered meanwhile. This is the operator's to finish.
+The book's initial state is not in place and checked yet, and the book takes no command until it is
+(`REQ-RC-6`). This is the operator's to finish; retry once the deployment is sealed.
 
 ## ERR-IdentifierArchived
 

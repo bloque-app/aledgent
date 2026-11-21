@@ -18,15 +18,15 @@ issuance and leaves only by redemption. Below, `CRD` is that asset; amounts are 
 
 <Steps>
 
-1. **The asset.** The operator registers `CRD`, book-only, with its one precision. Asset ids are stored in
-   uppercase (`REQ-AS-3`): one registered as `crd` is `CRD`. Read it back with `GET /v1/assets` and use the
-   stored id everywhere.
+1. **The asset.** The operator registers `CRD`, book-only, with its one precision. aledgent normalises
+   asset ids to uppercase on every route (`REQ-AS-3`), and replies carry that form: keep `CRD` in your
+   own records, so your comparisons match what aledgent returns.
 
 2. **Your service's identity and key.** The deployment opens your service's identity with an API key; see
    [API keys from zero](../api-keys/).
 
 3. **Issuance authority.** The operator grants your service an issuance grant over `CRD`, naming `issue`
-   and `redeem`, with a `per_window` bound (`REQ-AU-10`).
+   and `redeem`, with a `per_window` bound and `assets` naming `CRD` (`REQ-AU-10`).
 
 4. **Your collection account.** Your service opens its own account, where captured credits land:
 
@@ -123,7 +123,7 @@ owner. There is no "redeem a reservation": a redemption is a separate command fr
 | You see | Usually | Do |
 |---|---|---|
 | `ERR-NotAuthorised` | The grant does not name this operation, asset or counterparty, or has lapsed | Check the grant ([Grants](../grants/)) |
-| `ERR-UnknownAsset` | The asset id's case | Use the stored id from `GET /v1/assets` |
+| `ERR-UnknownAsset` | The asset is not registered, or the id is not 2 to 12 letters and digits | Check `GET /v1/assets` |
 | `ERR-AmountMismatch` | A capture that is not the full reservation | [Metered usage](../metered-usage/) |
 | `ERR-InsufficientAvailable` | The user's available credits are short | Decline the task |
 | `ERR-ClientKeyReused` | A key reused for a different request | One key per request, derived from your own ids |

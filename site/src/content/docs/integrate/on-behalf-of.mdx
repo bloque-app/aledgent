@@ -18,8 +18,11 @@ for (`REQ-PN-1`).
 no account in owned custody. Acting for it, the identities principal may:
 
 - **register a credential into that identity's set**: `POST /v1/credentials` with
-  `on-behalf-of: <identity>` (a new API key for a service that lost its own, for example). A credential
-  that proves possession, such as a passkey, is still proven by its own ceremony;
+  `on-behalf-of: <identity>` (a new API key for a service that lost its own, for example). The identities
+  principal must call with an **unscoped** credential, and the new credential's `marker` must be
+  `ordinary`: a holder-held recovery credential is never added this way. Otherwise the call is
+  `ERR-NotAuthorised`. A credential that proves possession, such as a passkey, is still proven by its own
+  ceremony;
 - grant delegated authority over that identity's accounts in delegated custody.
 
 Each such action is attributed to the identities principal's authority and to the identity it acted for

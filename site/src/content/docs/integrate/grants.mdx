@@ -15,7 +15,7 @@ principal acts on another's account.
 | `kind` | Over | Granted by | Used for |
 |---|---|---|---|
 | `delegated` | One ledger account, or one identity (to open its accounts) | The owner, the identities principal, or the holder of a wider grant it narrows | Moving value on someone else's account |
-| `issuance` | One asset | The operator (`POST /v1/ops/issuance-grants`) | `issue` and `redeem` of that asset (`REQ-AU-10`) |
+| `issuance` | One asset | The operator (`POST /v1/ops/issuance-grants`) | `issue` and `redeem` of that asset (`REQ-AU-10`); it needs a `per_window` bound and `assets` naming the asset |
 | `operator` | Operator capabilities | The operator (`POST /v1/ops/operator-grants`) | The operator surface; see [Least privilege](../../operate/least-privilege/) |
 
 A delegated grant is made with `POST /v1/grants`:
@@ -47,8 +47,8 @@ A delegated grant is made with `POST /v1/grants`:
 
 ## The rules that bind every grant
 
-- **Bounded by construction.** A grant over an account with no bound cannot be made: it is
-  `ERR-UnboundedGrant` (`REQ-AU-2`). Give it `per_operation`, `per_window`, or both.
+- **Bounded by construction.** A grant with no bound cannot be made: it is `ERR-UnboundedGrant`
+  (`REQ-AU-2`). Give it at least one of `per_operation`, `per_window`, `assets` or `counterparties`.
 - **Narrowing only.** A grant made under another (`parent`) is never wider in kind or bound
   (`REQ-AU-4`).
 - **Revocation is at once and for everything under it** (`REQ-AU-3`): `POST /v1/grants/{grant}/revoke`.

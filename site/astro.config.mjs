@@ -37,12 +37,12 @@ mkdirSync(generated, { recursive: true });
 writeFileSync(new URL('openapi-integrator.json', generated), JSON.stringify(half((p) => !OPERATOR(p), spec.info?.title ?? 'aledgent')));
 writeFileSync(new URL('openapi-operator.json', generated), JSON.stringify(half(OPERATOR, `${spec.info?.title ?? 'aledgent'}: operator API`)));
 
-// The error catalogue, one page per ERR-* of SPEC.md §10, generated on every build from §10, this same
-// OpenAPI document and src/data/error-actions.md (lib/errors.mjs). It throws, and the build fails, when
-// the three disagree. The pages land in a gitignored folder; nothing is committed.
 // Where every identifier is defined, for the guide pages' links (lib/id-links.mjs).
 writeFileSync(new URL('id-index.json', generated), JSON.stringify(await buildIdIndex(fileURLToPath(new URL('.', import.meta.url)))));
 
+// The error catalogue, one page per ERR-* of SPEC.md §10, generated on every build from §10, this same
+// OpenAPI document and src/data/error-actions.md (lib/errors.mjs). It throws, and the build fails, when
+// the three disagree. The pages land in a gitignored folder; nothing is committed.
 generateErrors({ root: new URL('../', import.meta.url), out: new URL('./src/content/docs/errors/', import.meta.url) });
 
 export default defineConfig({

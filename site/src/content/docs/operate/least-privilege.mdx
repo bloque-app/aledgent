@@ -61,12 +61,16 @@ Each is granted on its own: `resolve_operation`, `resume`, `propose_reversal`, `
 `import_credentials`, `open_identity`. The [operator API](../../api/operator/) lists the routes.
 
 Operator authority reaches only accounts in delegated custody, and never, through a grant over all of
-them, an account the operator's own identity owns (`REQ-AU-5`).
+them, an account the operator's own identity owns (`REQ-AU-5`). A grant of operator authority over
+accounts (`kind: "operator"` on `POST /v1/grants`, over one account or over `delegated_accounts`) is
+bounded like any other: one with no bound is `ERR-UnboundedGrant` (`REQ-AU-2`). There is no catch-all.
 
 ## `open_identity` is different
 
-`open_identity` is the **identities principal's role** (`REQ-ID-6`). It is granted alone, never combined
-with another kind: a grant that mixes it with others is `ERR-NotAuthorised`. At most one principal besides
-the operator holds it at a time; granting it to another revokes it from the holder in the same operation.
+`open_identity` is the **identities principal's role** (`REQ-ID-6`), an operator authority of its own
+kind. It is granted alone, never combined with another kind: a grant that mixes it with others is
+`ERR-NotAuthorised`. Only the operator grants and revokes it, with a justification, and the operator keeps
+it while another principal holds it. At most one principal besides the operator holds it at a time;
+granting it to another revokes it from the holder in the same operation.
 
 The operator does not grant it to itself to open identities: the operator opens identities by policy.

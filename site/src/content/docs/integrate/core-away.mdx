@@ -16,7 +16,7 @@ command (`REQ-CS-8`).
 | Command | While the core is away |
 |---|---|
 | `transfer`, `reserve`, a withdrawal | `202 Received` within `NFR-1`, as always. The decision follows once a core is back, by notification and by `GET /v1/operations/{reference}` |
-| Everything else (`capture`, `release`, `issue`, `redeem`, accounts, credentials, grants, every operator command) | The reply waits for the decision up to the deployment's decision wait (30 s by default, and no longer than `NFR-16`'s 1 s while no core is connected at all). Past it: `503 ERR-DecisionUnavailable`, with `Retry-After` |
+| Everything else (`capture`, `release`, `issue`, `redeem`, accounts, credentials, grants, every operator command) | The reply waits for the decision up to the deployment's decision wait (30 s by default). While no core is connected at all, ingress keeps trying for at most `NFR-16`'s bound (a 1 s target at p99), then answers. Past the wait: `503 ERR-DecisionUnavailable`, with `Retry-After` |
 
 A principal whose transfers and reservations are answered with their decision (its answering setting,
 `REQ-CS-9`) gets the second behaviour for those too.
