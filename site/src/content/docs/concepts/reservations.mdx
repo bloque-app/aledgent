@@ -1,0 +1,96 @@
+---
+title: Reservations
+description: Available and reserved, what a reservation is, capture and release matched by identity, deadlines, and why a release can be refused.
+sidebar:
+  order: 4
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Cites `REQ-BA-1`, `REQ-BA-2`, `REQ-BA-3`, `REQ-BA-4`, `REQ-BA-6`, `REQ-CS-3`, `REQ-OP-2`, `REQ-OP-5`,
+`REQ-OP-9`, `REQ-SO-1`, `REQ-QR-7`, `REQ-EV-8`, `REQ-AG-3`, `INV-3`, `INV-13`, `INV-14`, `US-C1`, `US-C2`,
+`US-C3`, `US-C5`, `DEF-11`.
+
+## Three balance kinds
+
+Every ledger account holds, per asset, three amounts that are read separately:
+
+| Kind | Means |
+| --- | --- |
+| **available** | Spendable now, with no further decision. The only number a spend is checked against (`REQ-BA-2`) |
+| **reserved** | Committed to one identified operation whose outcome is not yet known. Already taken out of available |
+| **encumbered** | Restricted by a standing rule on an amount, not tied to one operation: a dispute, a legal hold |
+
+**total** is their sum, and every surface labels it as total. The number a holder is shown and the number a
+spend is checked against are the same number, read from the same view (`REQ-BA-3`). Movement between the
+kinds is ordinary entries in the book (`REQ-BA-1`). A freeze is not a kind: it is a status of the account,
+and changes no balance.
+
+Encumbrance under standing rules is deferred (`US-C5`, `DEF-11`); no V0 command encumbers.
+
+## A reservation is the balance effect, taken at once
+
+A **reservation** moves value from available to reserved for one named operation. It reduces available in
+the **same atomic step** as the check that there was enough (`REQ-BA-4`), so two reservations can never
+both spend the same value, and a `Customer` account never goes negative (`INV-3`). A reservation whose
+balance effect waited would not be a reservation.
+
+`POST /v1/reservations` is acknowledged at `Received` like every command that moves value (`REQ-CS-3`).
+Its decision follows: `Reserved`, with available already lower, or `Rejected` with the condition named
+(`ERR-InsufficientAvailable`, for one). See [The operation lifecycle](../operation-lifecycle/).
+
+## It ends in a capture or a release
+
+A reservation and its capture or release are **one object, matched by identity** (`REQ-OP-2`,
+`INV-14`): the operation reference in the path names the reservation, and what is reserved comes from the
+book, never from the caller.
+
+| | What moves | Posting | Ends in |
+| --- | --- | --- | --- |
+| **Capture** (`POST /v1/reservations/{reference}/capture`) | `cleared` goes from reserved to the destination account. If `cleared` is less than the reservation, the difference returns to available **in the same posting** | One `Capture` | `Settled` |
+| **Release** (`POST /v1/reservations/{reference}/release`) | All of it goes back to available. There is no amount to give | One `Release` | `Released` |
+
+- A capture **above** the reserved amount is `ERR-AmountMismatch`, and nothing changes (`US-C2`).
+- A capture and a release are each answered with their decision, and each needs its own client key. A
+  repeat under the same key returns the first outcome.
+- Once a reservation is captured or released it is closed: a second capture or release of it is refused.
+- A bound a grant spent on a reservation that is released, expired or reversed is restored (`REQ-AG-3`).
+
+Patterns for charging by usage: [Metered usage](../../integrate/metered-usage/).
+
+## Deadlines, and why a release can be refused
+
+Every reservation has a deadline: the one its command states, or the deployment's default for
+reservations (`REQ-OP-5`). **Past it, the reservation is not released.** It moves to `Needs-Review`, with
+its value still reserved, and waits for someone to resolve it: a reservation with no external leg is
+released there by one principal. Release it yourself before its deadline if you no longer need it.
+
+A reservation is never released on a timer alone, nor on a request alone (`REQ-OP-9`):
+
+- **With no external leg**, a release on request is safe, and is done.
+- **With an external leg** (a withdrawal), every release needs proof that the external instruction can no
+  longer take effect: proof of non-inclusion after its expiry, or a proved rejection by the settlement
+  layer. Where that proof exists, the reservation is released at once, with no manual step. A release
+  asked for without it, while the leg may still execute, is refused with `ERR-ReleaseUnsafe`, and the
+  operation moves to `Needs-Review`. That move releases nothing.
+
+<Aside type="caution" title="Trade-off, stated plainly">
+Some reservations wait until a human clears them, and holders experience this as stuck money. The
+alternative is worse: releasing while the external instruction may still execute is a double spend. The
+queue, its owner and its service level are what make "stuck" a bounded condition.
+</Aside>
+
+A withdrawal always reserves first: there is exactly one route from intent to the settlement layer, and it
+passes through the reservation (`REQ-SO-1`, `INV-13`). See [Assets and the settlement layer](../assets-and-settlement/).
+
+## Reading what is reserved
+
+`GET /v1/balances` returns available, reserved, encumbered and total per asset from one view, and
+reserved is the sum of the account's open reservations (`REQ-BA-6`). `GET /v1/operations/{reference}`
+returns one reservation's state and deadline.
+
+<Aside type="note" title="Specified, not served by this release">
+A query of open reservations, aggregated per (account, asset) and itemised (`REQ-QR-7`), and reservation
+reports pushed at a cadence the recipient sets (`REQ-EV-8`), are specified. This release's ingress serves
+neither. Until it does, keep your own record of the reservations you made, by operation reference.
+</Aside>

@@ -24,7 +24,8 @@
 //!   account: the book's position at a cut is derived from the settling postings behind the final
 //!   records below the cut, and compared with the positions the adapter reported at that cut. The
 //!   daily job asks the core to compare at the latest reported cut ([`compare_through`]); a cut
-//!   older than a day is itself a finding.
+//!   the book has moved past for more than a day, or that the core fails to checkpoint new postings, is
+//!   itself a finding ([`assess_cut`]).
 //! - **`Suspense`** (`REQ-LA-2`, `RISK-8`): every non-zero `Suspense` balance, and since when
 //!   ([`suspense_report`]).
 //!
@@ -169,12 +170,22 @@ pub enum Finding {
         /// The cut.
         cut: u64,
     },
-    /// Axis 3: the latest cut the adapter reported is older than [`MAX_CUT_AGE_MS`].
+    /// Axis 3: the book has postings beyond the latest final cut and the checkpoints are not
+    /// catching up (`AC-J1.1`: a quiet book has no newer checkpoint, and that is not stale). Two
+    /// cases: a checkpoint covering them has been created and has not become final for more than
+    /// [`MAX_CUT_AGE_MS`]; or a checkpoint was due and the core made none (see [`Cut::Due`]).
     StaleCut {
         /// The cut.
         cut: u64,
-        /// Its age, in milliseconds.
+        /// In milliseconds: the time since the checkpoint covering the postings was created
+        /// (still not final); or, when none was made, since the last checkpoint was created.
         age: u64,
+    },
+    /// Axis 3: the stale-cut check could not run, so the cut is not known to be current. A failed
+    /// check is a finding, never a clean run (`NFR-9`).
+    StaleCutUnchecked {
+        /// Why: the read that failed, and what it answered.
+        reason: String,
     },
 }
 
@@ -342,10 +353,122 @@ pub fn axis_2_openings<S: LeafStore, V: VaultBackend>(ledger: &Ledger<S, V>) -> 
         .collect()
 }
 
-/// How old the settlement layer's latest reported cut may be before axis 3 finds it stale: a day.
-/// The adapter reports positions whenever a final anchor wants its comparison (hourly by default)
-/// or the positions changed, so a cut older than this means anchoring or the adapter stopped.
+/// How long postings may wait beyond the latest final cut before axis 3 finds it stale: a day.
+/// The core checkpoints whenever the book has a posting no checkpoint covers, once the interval
+/// has passed (`AC-J1.1`, hourly by default), and the adapter reports positions whenever a final
+/// anchor wants its comparison. A book with no new posting makes no checkpoint, so its latest
+/// final cut stays current however old it is; postings beyond it for longer than this mean
+/// anchoring or the adapter stopped. The age is never the latest comparison's: the reconcile job
+/// refreshes that itself.
 pub const MAX_CUT_AGE_MS: u64 = 86_400_000;
+
+/// A checkpoint, as far as the stale-cut rule reads it (`GET /v1/ops/anchors`).
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct CheckpointRead {
+    /// Its number.
+    pub number: u64,
+    /// The sequence of the last entry it covers.
+    pub entry_sequence: u64,
+    /// When the core created it.
+    pub created_at: u64,
+    /// `pending`, `submitted` or `final`.
+    pub status: String,
+}
+
+/// Whether the book has postings the latest final cut does not cover, and since when the run can
+/// tell (`AC-J1.1`, `NFR-9`).
+///
+/// `head` is the book's next posting sequence (`GET /v1/trial-balance`'s `view`), so its last
+/// posting is `head - 1`; the cut covers entries through its `entry_sequence`. `Ok(None)`: nothing
+/// beyond the cut, which is current whatever its age. `Ok(Some(t))`: postings beyond it, no later
+/// than `t`, which is the creation of the oldest newer checkpoint (not final yet: it was made
+/// because those postings existed) or, with none, the creation of the cut itself, when the adapter
+/// had it. The core exposes no posting's time book-wide, so `t` never post-dates the first
+/// uncovered posting by more than the checkpoint interval. `Err`: no final cut to measure.
+pub fn uncovered_since(checkpoints: &[CheckpointRead], head: u64) -> Result<Option<u64>, String> {
+    let cut = checkpoints
+        .iter()
+        .filter(|c| c.status == "final")
+        .max_by_key(|c| c.number)
+        .ok_or_else(|| "no final checkpoint".to_owned())?;
+    if head.saturating_sub(1) <= cut.entry_sequence {
+        return Ok(None);
+    }
+    let newer = checkpoints
+        .iter()
+        .filter(|c| c.status != "final" && c.entry_sequence > cut.entry_sequence)
+        .map(|c| c.created_at)
+        .min();
+    Ok(Some(newer.unwrap_or(cut.created_at)))
+}
+
+/// The interval between the core's checkpoints (`REQ-PR-1`, `AC-J1.1`): one hour by default
+/// (amendment 0009), which the deployment templates keep for the test and production books. A
+/// checkpoint is due once this has passed since the last was created. Assumed, not read: the
+/// operator's `GET /v1/ops/anchors` does not carry the core's configured interval. A book
+/// configured with a longer one would be flagged early by [`Cut::Due`], a shorter one late.
+pub const CHECKPOINT_INTERVAL_MS: u64 = 3_600_000;
+
+/// How long axis 3 waits for the core to checkpoint postings that no checkpoint covers, when one
+/// is due: a few ticks (a tick is about a minute). The state is normal for about one tick.
+pub const CHECKPOINT_SETTLE_MS: u64 = 180_000;
+
+/// How far a checkpoint's creation time may be ahead of the run's clock before the run says so.
+pub const MAX_CLOCK_SKEW_MS: u64 = 300_000;
+
+/// How often axis 3 re-reads the checkpoints while it waits ([`CHECKPOINT_SETTLE_MS`]).
+pub const CHECKPOINT_POLL_MS: u64 = 15_000;
+
+/// How long axis 3 waits for a due checkpoint, and how often it looks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Settle {
+    /// Re-reads after the first, at most.
+    pub polls: u32,
+    /// The pause before each.
+    pub pause: std::time::Duration,
+}
+
+impl Default for Settle {
+    fn default() -> Settle {
+        Settle {
+            polls: (CHECKPOINT_SETTLE_MS / CHECKPOINT_POLL_MS) as u32,
+            pause: std::time::Duration::from_millis(CHECKPOINT_POLL_MS),
+        }
+    }
+}
+
+/// How the book stands against its checkpoints at one read (`AC-J1.1`, `NFR-9`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Cut {
+    /// No posting beyond the latest final cut: current, however old.
+    Covered,
+    /// Postings beyond the latest final cut, no later than this time ([`uncovered_since`]).
+    Since(u64),
+    /// Postings beyond every checkpoint, and a checkpoint is due (the interval has passed since
+    /// the last was created): the next tick should have made one. If none appears within
+    /// [`CHECKPOINT_SETTLE_MS`] the core is not checkpointing, or its last checkpoint is still in
+    /// flight (the core makes no new one until it is final). This flags at about the interval
+    /// plus the wait (one hour and three minutes after the last checkpoint), not after
+    /// [`MAX_CUT_AGE_MS`]: that threshold applies only to a checkpoint covering the postings that
+    /// stays in flight ([`Cut::Since`]).
+    Due {
+        /// The last checkpoint the core made.
+        last: CheckpointRead,
+    },
+}
+
+/// [`uncovered_since`], and whether a due checkpoint is missing. `now` is the run's time.
+pub fn assess_cut(checkpoints: &[CheckpointRead], head: u64, now: u64) -> Result<Cut, String> {
+    let since = uncovered_since(checkpoints, head)?;
+    let Some(last) = checkpoints.iter().max_by_key(|c| c.number) else {
+        return Ok(Cut::Covered);
+    };
+    let beyond_all = head.saturating_sub(1) > last.entry_sequence;
+    if beyond_all && now >= last.created_at.saturating_add(CHECKPOINT_INTERVAL_MS) {
+        return Ok(Cut::Due { last: last.clone() });
+    }
+    Ok(since.map_or(Cut::Covered, Cut::Since))
+}
 
 /// Axis 3's comparison (`REQ-PR-5`, `AC-J3.1`, `AC-J3.2`): `F-017`'s `compare_settlement` at the
 /// latest cut the adapter reported, per asset. Implementations say whether it could run and what
@@ -353,6 +476,11 @@ pub const MAX_CUT_AGE_MS: u64 = 86_400_000;
 pub trait SettlementComparator {
     /// The findings, or `None` when no comparison could be made.
     fn compare(&self) -> Option<Vec<Finding>>;
+
+    /// Why no comparison could be made, as the refusal or failure said it; `None` when one was.
+    fn why(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Axis 3 could not run, and why: no positions report yet (`ERR-EvidenceInsufficient`), the core
@@ -364,16 +492,22 @@ impl SettlementComparator for NotRun {
     fn compare(&self) -> Option<Vec<Finding>> {
         None
     }
+
+    fn why(&self) -> Option<&str> {
+        Some(self.0.as_str()).filter(|w| !w.is_empty())
+    }
 }
 
 /// A comparison `compare_settlement` made: every asset that differs by as little as one minor unit
-/// is a finding, and so is a cut the adapter reported more than [`MAX_CUT_AGE_MS`] before.
+/// is a finding, and so is a cut the book has postings beyond for more than [`MAX_CUT_AGE_MS`]
+/// ([`uncovered_since`]).
 #[derive(Clone, Debug)]
 pub struct Compared {
     /// The comparison, as ingress returned it.
     pub comparison: ComparisonBody,
-    /// When the adapter reported the cut compared, if known.
-    pub reported_at: Option<u64>,
+    /// How the book stands against its checkpoints ([`assess_cut`]), or why that could not be read
+    /// (a finding: [`Finding::StaleCutUnchecked`]).
+    pub cut: Result<Cut, String>,
     /// When axis 3 ran.
     pub now: u64,
 }
@@ -394,11 +528,22 @@ impl SettlementComparator for Compared {
         if c.differs && out.is_empty() {
             out.push(Finding::SettlementDiffers { cut: c.cut });
         }
-        if let Some(at) = self.reported_at {
-            let age = self.now.saturating_sub(at);
-            if age > MAX_CUT_AGE_MS {
-                out.push(Finding::StaleCut { cut: c.cut, age });
+        match &self.cut {
+            Ok(Cut::Since(at)) => {
+                let age = self.now.saturating_sub(*at);
+                if age > MAX_CUT_AGE_MS {
+                    out.push(Finding::StaleCut { cut: c.cut, age });
+                }
             }
+            // A checkpoint was due and the core made none in the wait: the fault itself.
+            Ok(Cut::Due { last }) => out.push(Finding::StaleCut {
+                cut: c.cut,
+                age: self.now.saturating_sub(last.created_at),
+            }),
+            Ok(Cut::Covered) => {}
+            Err(reason) => out.push(Finding::StaleCutUnchecked {
+                reason: reason.clone(),
+            }),
         }
         Some(out)
     }
@@ -417,7 +562,7 @@ pub fn axis_3(comparator: &dyn SettlementComparator) -> AxisResult {
             axis: 3,
             ran: false,
             findings: Vec::new(),
-            note: None,
+            note: comparator.why().map(str::to_owned),
         },
     }
 }
@@ -671,7 +816,8 @@ impl IngressLink for RouterLink {
 }
 
 /// The daily job's axis 3 through ingress (`F-017`'s `TODO(F-018)`: the daily comparison). It
-/// reads when the adapter last reported the layer's positions (`GET /v1/ops/anchors`), then asks
+/// reads whether the book has postings beyond the latest final cut (`GET /v1/ops/anchors`,
+/// `GET /v1/trial-balance`), then asks
 /// the core to compare at that cut (`POST /v1/ops/settlement/comparisons`), as the operations
 /// principal with the `compare_settlement` operator kind, with `summary` as the justification: the
 /// comparison and the summary of the run go on the audit trail together, in one operator record.
@@ -698,29 +844,65 @@ pub async fn compare_covering<L: IngressLink>(
     Option<String>,
     Vec<String>,
 ) {
+    compare_covering_with(link, summary, now, required, None, &Settle::default()).await
+}
+
+/// [`compare_covering`], waiting for a due checkpoint as `settle` says. `head` is the book's next
+/// posting sequence when the caller holds the core (the in-process daily run: the operations
+/// principal that posts the comparison cannot read the operator's trial balance); `None` reads it
+/// from `GET /v1/trial-balance`.
+pub async fn compare_covering_with<L: IngressLink>(
+    link: &L,
+    summary: &str,
+    now: u64,
+    required: &[String],
+    head: Option<u64>,
+    settle: &Settle,
+) -> (
+    Box<dyn SettlementComparator + Send + Sync>,
+    Option<String>,
+    Vec<String>,
+) {
     let mut notes = Vec::new();
-    let reported_at = match link.call("GET", "/v1/ops/anchors", None).await {
-        Ok((200, v)) => {
-            let at = v["latest_comparison"]["at"].as_u64();
-            if at.is_none() {
-                notes
-                    .push("the stale-cut check was skipped: no earlier comparison time".to_owned());
-            }
-            at
-        }
-        Ok((status, _)) => {
-            notes.push(format!(
-                "the stale-cut check was skipped: GET /v1/ops/anchors answered {status}"
-            ));
-            None
-        }
-        Err(e) => {
-            notes.push(format!(
-                "the stale-cut check was skipped: GET /v1/ops/anchors: {e}"
-            ));
-            None
-        }
-    };
+    let cut = cut_through(link, now, head, settle).await;
+    if let Err(why) = &cut {
+        notes.push(format!("the stale-cut check could not be made: {why}"));
+    }
+    if let Some(at) = match &cut {
+        Ok(Cut::Since(at)) => Some(*at),
+        Ok(Cut::Due { last }) => Some(last.created_at),
+        _ => None,
+    }
+    .filter(|at| *at > now.saturating_add(MAX_CLOCK_SKEW_MS))
+    {
+        notes.push(format!(
+            "a checkpoint was created {} s after this run's clock: the age reads as zero until \
+             they agree",
+            (at - now) / 1000
+        ));
+    }
+    if let Ok(Cut::Due { last }) = &cut {
+        notes.push(if last.status == "final" {
+            format!(
+                concat!(
+                    "the core is not checkpointing new postings: checkpoint {} (final) covers ",
+                    "entries through {}, the book has more, and no checkpoint appeared in {} s"
+                ),
+                last.number,
+                last.entry_sequence,
+                settle.pause.as_secs() * u64::from(settle.polls)
+            )
+        } else {
+            format!(
+                concat!(
+                    "the core is not checkpointing new postings: checkpoint {} is still {} ",
+                    "(in flight), and the core makes no new one until it is final; the book ",
+                    "has more entries than it covers (through {})"
+                ),
+                last.number, last.status, last.entry_sequence
+            )
+        });
+    }
     let reply = link
         .call(
             "POST",
@@ -730,11 +912,20 @@ pub async fn compare_covering<L: IngressLink>(
         .await;
     let (status, v) = match reply {
         Ok(r) => r,
-        Err(e) => return (Box::new(NotRun(format!("ingress: {e}"))), None, notes),
+        Err(e) => {
+            return (
+                Box::new(NotRun(format!("POST /v1/ops/settlement/comparisons: {e}"))),
+                None,
+                notes,
+            );
+        }
     };
     if status != 200 {
         return (
-            Box::new(NotRun(format!("{status}: {}", v["error"]))),
+            Box::new(NotRun(format!(
+                "POST /v1/ops/settlement/comparisons answered {}",
+                refusal_text(status, &v)
+            ))),
             None,
             notes,
         );
@@ -744,7 +935,7 @@ pub async fn compare_covering<L: IngressLink>(
         Ok(comparison) => (
             Box::new(Compared {
                 comparison: comparison.clone(),
-                reported_at,
+                cut,
                 now,
             }),
             audited,
@@ -773,6 +964,78 @@ pub async fn compare_covering<L: IngressLink>(
     }
 }
 
+/// A refusal as the record says it: the status, the `ERR-*` id and the description
+/// (`{"error", "description"}`, `REQ-CS-4`), or the body as it came when it is not that shape.
+fn refusal_text(status: u16, body: &serde_json::Value) -> String {
+    let text = |k: &str| body[k].as_str().map(str::to_owned);
+    match (text("error"), text("description")) {
+        (Some(id), Some(d)) => format!("{status} {id}: {d}"),
+        (Some(id), None) => format!("{status} {id}"),
+        _ if body.is_null() => status.to_string(),
+        _ => {
+            // A body that is not a refusal is bounded: it goes in a record the exporter reads.
+            let raw = body.to_string();
+            match raw.char_indices().nth(200) {
+                Some((i, _)) => format!("{status}: {}...", &raw[..i]),
+                None => format!("{status}: {raw}"),
+            }
+        }
+    }
+}
+
+/// One read of `GET /v1/ops/anchors`' checkpoints.
+async fn read_checkpoints<L: IngressLink>(link: &L) -> Result<Vec<CheckpointRead>, String> {
+    let anchors = match link.call("GET", "/v1/ops/anchors", None).await {
+        Ok((200, v)) => v,
+        Ok((status, v)) => {
+            return Err(format!(
+                "GET /v1/ops/anchors answered {}",
+                refusal_text(status, &v)
+            ));
+        }
+        Err(e) => return Err(format!("GET /v1/ops/anchors: {e}")),
+    };
+    serde_json::from_value(anchors["checkpoints"].clone())
+        .map_err(|e| format!("GET /v1/ops/anchors: checkpoints: {e}"))
+}
+
+/// [`assess_cut`] from the operator's reads: the checkpoints (`GET /v1/ops/anchors`) and the
+/// book's next posting sequence (`GET /v1/trial-balance`'s `view`). When a checkpoint is due and
+/// none covers the book's last posting, the checkpoints are read again up to `settle.polls` times:
+/// the next tick makes one, so that state is normal for about a minute. A newer checkpoint ends the
+/// wait and is aged as any other; none is [`Cut::Due`]. `Err` says which read failed, with the
+/// refusal it gave.
+async fn cut_through<L: IngressLink>(
+    link: &L,
+    now: u64,
+    known_head: Option<u64>,
+    settle: &Settle,
+) -> Result<Cut, String> {
+    let mut checkpoints = read_checkpoints(link).await?;
+    let head = match known_head {
+        Some(h) => h,
+        None => match link.call("GET", "/v1/trial-balance", None).await {
+            Ok((200, v)) => v["view"].as_u64().ok_or("GET /v1/trial-balance: no view")?,
+            Ok((status, v)) => {
+                return Err(format!(
+                    "GET /v1/trial-balance answered {}",
+                    refusal_text(status, &v)
+                ));
+            }
+            Err(e) => return Err(format!("GET /v1/trial-balance: {e}")),
+        },
+    };
+    let mut cut = assess_cut(&checkpoints, head, now)?;
+    let mut polls = 0;
+    while matches!(cut, Cut::Due { .. }) && polls < settle.polls {
+        polls += 1;
+        tokio::time::sleep(settle.pause).await;
+        checkpoints = read_checkpoints(link).await?;
+        cut = assess_cut(&checkpoints, head, now)?;
+    }
+    Ok(cut)
+}
+
 /// The daily run (`NFR-9`, `AC-J3.1`): axes 1 and 2 and the `Suspense` report over the running
 /// core, under its lock; then axis 3 through ingress, which also records the run's summary on the
 /// audit trail ([`compare_through`]); then the run's JSON record in `records`. `external` is axis
@@ -793,9 +1056,9 @@ where
 {
     // Axis 3 runs through ingress after axes 1 and 2, and replaces this.
     static PENDING: NotRun = NotRun(String::new());
-    let mut run = core
+    let run = core
         .checkpoint(|l, _| {
-            run(
+            let r = run(
                 l,
                 None,
                 Sources {
@@ -803,12 +1066,33 @@ where
                     settlement: &PENDING,
                 },
                 at,
-            )
+            )?;
+            // The book's head, for the stale-cut check: the operations principal that posts the
+            // comparison cannot read the operator's trial balance.
+            let head = l
+                .book()
+                .store()
+                .next_posting_seq()
+                .map_err(|e| Error::Core(format!("the book's head: {e:?}")))?;
+            Ok::<_, Error>((r, head))
         })
         .ok_or_else(|| Error::Core("the core is not running".into()))??;
-    let (comparator, audited) = compare_through(link, &run.summary(), at).await;
+    let (mut run, head) = run;
+    let (comparator, audited, notes) = compare_covering_with(
+        link,
+        &run.summary(),
+        at,
+        &[],
+        Some(head),
+        &Settle::default(),
+    )
+    .await;
     run.axes.retain(|a| a.axis != 3);
-    run.axes.push(axis_3(comparator.as_ref()));
+    let mut three = axis_3(comparator.as_ref());
+    if three.ran && !notes.is_empty() {
+        three.note = Some(notes.join("; "));
+    }
+    run.axes.push(three);
     run.audited = audited;
     run.record(records)?;
     Ok(run)
@@ -1125,6 +1409,17 @@ pub async fn axis_3_gated<L: IngressLink>(
     summary: &str,
     now: u64,
 ) -> (AxisResult, Option<String>, BTreeMap<String, String>) {
+    axis_3_gated_with(link, compare, summary, now, &Settle::default()).await
+}
+
+/// [`axis_3_gated`], waiting for a due checkpoint as `settle` says.
+pub async fn axis_3_gated_with<L: IngressLink>(
+    link: &L,
+    compare: bool,
+    summary: &str,
+    now: u64,
+    settle: &Settle,
+) -> (AxisResult, Option<String>, BTreeMap<String, String>) {
     let mut inputs = BTreeMap::new();
     let not_run = |why: String| AxisResult {
         axis: 3,
@@ -1174,10 +1469,17 @@ pub async fn axis_3_gated<L: IngressLink>(
             inputs,
         );
     }
-    let (comparator, audited, notes) = compare_covering(link, summary, now, &bound).await;
+    let (comparator, audited, notes) =
+        compare_covering_with(link, summary, now, &bound, None, settle).await;
     let mut axis = axis_3(comparator.as_ref());
     if !axis.ran {
-        axis.note = Some("the comparison could not be made".into());
+        // The refusal, as the core or ingress gave it (status, `ERR-*` id, description): a missing
+        // grant is a different repair from a down adapter.
+        let why = axis.note.take();
+        axis.note = Some(match why {
+            Some(w) => format!("the comparison could not be made: {w}"),
+            None => "the comparison could not be made".into(),
+        });
     } else if !notes.is_empty() {
         axis.note = Some(notes.join("; "));
     }

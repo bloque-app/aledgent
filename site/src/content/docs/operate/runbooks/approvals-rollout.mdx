@@ -1,0 +1,56 @@
+---
+title: Turning on approvals
+description: Roll out per-command approvals in three modes, moving the integrating service first and enforcing only when nothing would be refused.
+sidebar:
+  order: 52
+---
+
+Cites `REQ-AU-23`, `NFR-17`, `ERR-CommandApprovalRequired`, `ERR-CredentialInvalid`.
+
+## What it is for, and when to run it
+
+Run it when a deployment is to require that a person's device approves each command a service sends for that
+person's session ([Approving a command](../../../integrate/approving-a-command/)). The deployment declares one of
+three modes: `off` (the default), `report_only` or `enforce`. The integrating service owns moving its calls; the
+operator owns the switch. The step is done when the service says so and the counts below agree.
+
+**Rule that does not bend:** `enforce` is not turned on in a deployment while report-only still logs calls made
+for a person's session. Such a call is refused under `enforce`.
+
+## Preconditions
+
+- Ingress's `approvals` and `environment` settings are available to you. `environment` names this running
+  environment (for example `prod` or `test`) and separates its approvals from another's, a restore drill's
+  included; it is required unless `approvals` is `off`. Never share the authentication key between
+  environments.
+- The integrating service knows which of its calls are made for a person's session and which with an issued
+  secret or a configured token. Callers that use an issued secret or a configured token are exempt and do not
+  move.
+
+## Steps
+
+1. **Report only.** Set ingress's `approvals` to `report_only` (and `environment`), and restart ingress. Nothing
+   is refused. For each command that would be refused, ingress writes one log line (target
+   `aledgent_ingress::approval`, with `would_refuse`, the command kind and how the caller proved who it is).
+   There is no counter yet: count those lines, and join them to the access log to see which caller they came
+   from (the line itself does not name the caller). Exempt callers are not logged.
+2. **The service moves.** For each person's session call it makes, it asks for the digest first, shows the
+   person the command, has the device approve it, then sends the command with the approval. Calls it makes with
+   its issued secret or configured token do not move.
+3. **Watch.** The `would_refuse` lines for the service's sessions fall to zero (found by joining them to the
+   access log), and the refusals ingress would have made fall with them. Anything that remains is a caller that
+   was not expected: find it before going on.
+4. **Enforce.** Only when the `would_refuse` lines for sessions have been zero over the period the owner chose,
+   set `approvals` to `enforce` and restart ingress. Keep watching `ERR-CommandApprovalRequired` and
+   `ERR-CredentialInvalid` for a day.
+
+## Verify
+
+- Under `report_only`: no `would_refuse` line for a session call.
+- Under `enforce`: a session call without an approval is refused `ERR-CommandApprovalRequired`, a session call
+  with one is taken, and an exempt call is taken without one.
+
+## Roll back
+
+Set `approvals` back to `report_only` (or `off`). It takes effect on restart of ingress. Nothing is lost: a
+command taken in under `enforce` stays taken in.

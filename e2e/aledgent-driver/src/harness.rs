@@ -292,6 +292,11 @@ impl Harness {
                 asset: crate::BOOK_ONLY.into(),
                 chain: ChainAsset(format!("Here({})", crate::BOOK_ONLY_INDEX)),
             },
+            // Production's first bound asset, bound under load by scenario c (F-032).
+            AssetBinding {
+                asset: crate::BUSDC.into(),
+                chain: ChainAsset(format!("Here({})", crate::BUSDC_INDEX)),
+            },
         ];
         adapter.keys = vec![PassKey {
             user: hex::encode(TEST_PASS_USER),

@@ -313,7 +313,7 @@ pub struct AssetBody {
     pub precision: u8,
     /// `fiat`, `stable`, `native` or `other`.
     pub kind: String,
-    /// `active` or `deprecated`.
+    /// `active`, `deprecated` or `retiring` (amendment 0043, `REQ-AS-10`).
     pub status: String,
 }
 
@@ -426,6 +426,13 @@ pub struct SignalsBody {
     /// How long the checkpoint in flight has waited for finality, if one is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor_in_flight_age: Option<u64>,
+    /// Postings past the latest checkpoint, of any status (`T-018-13`, `AC-J1.1`): what the next
+    /// checkpoint would cover; before the first checkpoint, every posting. Zero means there is
+    /// nothing new to anchor, so a growing `anchor_lag` is not a late anchor. Absent from a core
+    /// that does not report it (an older core host): a reader that does not know the field
+    /// ignores it, and a body without it reads as "not reported".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_unanchored_entries: Option<u64>,
     /// Anchoring's incidents, per kind (`commitment_mismatch`, `unknown_anchor`,
     /// `position_difference`); `latest` is not known for them and is zero.
     #[serde(default)]

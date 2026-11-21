@@ -1,0 +1,52 @@
+---
+title: The operator token
+description: What the operator's bearer token is, how ingress knows it, where it is kept and how it is rotated.
+sidebar:
+  order: 2
+---
+
+Cites `REQ-AU-8`, `REQ-OS-1`, `NFR-7`, `NFR-8`, `F-035`.
+
+The operator calls ingress like any other principal, with a bearer token. That token is a **configured**
+credential: the deployment's ingress configuration lists it, and ingress keeps only its SHA-256.
+
+## How ingress knows it
+
+Genesis founds the operator's identity and credential. `aledgent-ingress founded --config <file>` prints
+them. The operator's entry in the configuration's `tokens` names them, with the token's hash:
+
+```json
+{
+  "token_sha256": "<hex SHA-256 of the token, as presented>",
+  "principal": "<the operator's identity, from founded>",
+  "credential": "<the operator's credential, from founded>",
+  "kind": "service"
+}
+```
+
+Generate the token as 32 random bytes or more, encoded as text; hash the text exactly as it will be
+presented in `Authorization: Bearer`:
+
+```sh
+TOKEN=$(openssl rand -base64 32 | tr -d '\n')
+printf %s "$TOKEN" | sha256sum | cut -d' ' -f1   # the token_sha256
+```
+
+## What it is, and is not
+
+- **It is a bearer secret.** Whoever presents it is the operator. Keep it in the deployment's secret
+  store, never in a configuration file, a URL or a log (`REQ-AU-8`). Name its location in your private
+  runbook, not in shared documentation.
+- **It is not key material.** It signs nothing and is not one of the keys the signer holds
+  ([The signer boundary](../signer-boundary/)). Keep it out of the signer's own secrets, so that reading
+  one never gives the other.
+- **It grants nothing by itself.** The operator holds no operator capability until it grants itself one,
+  for one task; see [Least privilege](../least-privilege/).
+
+## Rotating it
+
+1. Generate a new token and add its hash as a **second** entry for the same principal and credential.
+   Restart ingress.
+2. Switch every client to the new token.
+3. Remove the old entry and restart ingress. The old token is refused from then on
+   (`ERR-CredentialInvalid`).

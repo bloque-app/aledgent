@@ -49,11 +49,13 @@ Incidents and gaps are written to the audit trail (`NFR-6`, `REQ-AT-1`), not to 
 2. **Let it re-read.** A difference the node caused (one that is behind the finalized head it reported,
    say) clears at the next sync with no action: the alert closes itself when the fold
    matches. Do not clear it by hand. If it persists across two syncs, it is real or the node is wrong.
-3. **Check against a second node.** Run a second adapter process with the same configuration, a different
-   `holder` name so it never takes the signing lease, against another node (an archive node for an old
-   range). It reads only; it signs nothing. If it folds to the layer's head, the first node was wrong:
-   point the primary at the second, or replace the first (`release/replace-node.md`). If it also differs,
-   treat it as a divergence of the layer's record: page security and follow
+3. **Check against a second node, with the one adapter.** Do **not** start a second adapter to read: `holder` is
+   only the lease's name, there is no read-only mode, and a second adapter with the same lane keys can
+   double-sign or collide on nonces (on the same store it takes the lease when the primary's lapses; on its own
+   store nothing stops it). Stop the adapter, point its node endpoint (or history endpoint, for an old range) at
+   a different node, and start it again; it re-reads and folds from its accepted head. If it now folds to the
+   layer's head, the first node was wrong: keep the second, or replace the first (`release/replace-node.md`). If
+   it also differs, treat it as a divergence of the layer's record: page security and follow
    [divergence](release/divergence.md). Do not accept the head.
 4. **A reset by governance** (`AnchorHeadSet`) starts a new chain at position 0. The adapter reports it to
    the core, which follows it when nothing of the chain before can be confused with the new one; then no
@@ -61,9 +63,10 @@ Incidents and gaps are written to the audit trail (`NFR-6`, `REQ-AT-1`), not to 
    step 3's second case and page security, whatever the core did.
 5. **If no node can serve the range**, choose, and write the choice on the incident:
    - **Wait**, for a node that keeps the range. The rest of the book goes on.
-   - **Record a gap.** Have the adapter record the range as a gap through its own authoritative source
+   - **Record a gap.** Recording is irreversible and leaves part of the book unverified, so it needs the
+     owner's explicit go, written on the incident. Have the adapter record the range as a gap through its own authoritative source
      (the core refuses a gap from any other, `REQ-AT-3`): stop the running adapter (the command takes its
-     lease), then run once `aledgent-settle <config> gap <from> <to>` with the range the alert names, and
+     lease), then run once `aledgent-settle <config> gap <from> <to>` with the range the alert names (`[from, to)`: `from` is included, `to` is not), and
      start the adapter again. Use the range the command reports: it prints what it recorded, and if it
      refuses the range it says which range it can record. The adapter then accepts the layer's head as it
      stands, **unverified for that range**, and the gap is on the audit trail. The book keeps only the end of its highest gap, so `proof` answers

@@ -1246,9 +1246,7 @@ async fn t_038_13_readiness_turns_on_drain() {
     assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
     let (s, v) = call(&ready, "GET", "/live", None, &[], None).await;
     assert_eq!((s, v), (StatusCode::OK, json!("live")));
-    let (s, _) = d
-        .call("GET", "/openapi.json", Some(&d.operator.token), &[], None)
-        .await;
+    let (s, _) = d.call("GET", "/openapi.json", None, &[], None).await;
     assert_eq!(s, StatusCode::OK);
 }
 

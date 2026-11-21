@@ -1470,6 +1470,7 @@ impl<S: LeafStore, V: VaultBackend> Running<S, V> {
                 .collect(),
             anchor_lag: s.anchor_lag,
             anchor_in_flight_age: s.anchor_in_flight_age,
+            anchor_unanchored_entries: s.anchor_unanchored_entries,
             anchor_incidents: s
                 .anchor_incidents
                 .iter()

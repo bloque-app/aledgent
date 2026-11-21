@@ -8,7 +8,11 @@ sidebar:
 import { Aside } from '@astrojs/starlight/components';
 
 <Aside type="caution" title="Prototype">
-A stub. The operator guide (deployment, runbooks, reconciliation) is not written yet.
+The operator guide is being written. Here now: [the operator token](../operator-token/),
+[least privilege](../least-privilege/), [registering an asset](../registering-assets/),
+[core restarts](../core-restarts/), [the signer boundary](../signer-boundary/), [the signals](../signals/),
+the deployment guide for [one machine](../one-machine/), and the [runbooks](../runbooks/), one page per
+situation. The cloud deployment guide comes next.
 </Aside>
 
 The operator surface lives under `/v1/ops/` on ingress. Every operator command is answered with its
@@ -18,7 +22,8 @@ path that moves value outside the command surface.
 
 ## What is watched
 
-These are continuously observable:
+These are continuously observable, and each has its metrics, alerts and runbook on
+[Signals](../signals/):
 
 - the age of the oldest non-terminal operation;
 - observation completeness;

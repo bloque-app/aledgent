@@ -10,9 +10,11 @@
   },
   "scripts": {
     "dev": "astro dev",
-    "build": "astro build",
+    "build": "node lib/check-public.mjs --self-test && astro build && node lib/check-links.mjs && node lib/check-public.mjs",
     "preview": "astro preview",
-    "astro": "astro"
+    "astro": "astro",
+    "check:errors": "node lib/errors.mjs --check",
+    "check:public": "node lib/check-public.mjs"
   },
   "dependencies": {
     "@astrojs/markdown-satteri": "0.4.2",
@@ -21,8 +23,15 @@
     "@fontsource/geist": "5.3.0",
     "@fontsource/geist-mono": "5.3.0",
     "astro": "7.3.5",
+    "hast-util-from-html": "2.0.3",
+    "hast-util-to-html": "9.0.5",
+    "rehype-raw": "7.0.0",
+    "remark-gfm": "4.0.1",
+    "remark-parse": "11.0.0",
+    "remark-rehype": "11.1.2",
     "sharp": "0.35.5",
     "specsite": "github:swimmingoncode/specsite#579e8ef",
-    "starlight-openapi": "0.26.2"
+    "starlight-openapi": "0.26.2",
+    "unified": "11.0.5"
   }
 }

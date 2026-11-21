@@ -1,0 +1,51 @@
+---
+title: Acting for another identity
+description: The on-behalf-of header, the one principal that uses it, and what it may do with it.
+sidebar:
+  order: 5
+---
+
+Cites `REQ-PN-1`, `REQ-ID-6`, `REQ-AU-20`, `REQ-AG-1`.
+
+Every command takes an optional header, `on-behalf-of: <identity>`: the identity the caller acts for,
+where it is not the caller itself. The operation records both, the initiator and the identity it acted
+for (`REQ-PN-1`).
+
+## Who sends it
+
+**The identities principal, acting for an identity it manages.** That is the case it exists for
+(`REQ-ID-6`, `REQ-AU-20`). An identity it manages is one that is not the operator, not an agent, and holds
+no account in owned custody. Acting for it, the identities principal may:
+
+- **register a credential into that identity's set**: `POST /v1/credentials` with
+  `on-behalf-of: <identity>` (a new API key for a service that lost its own, for example). The identities
+  principal must call with an **unscoped** credential, and the new credential's `marker` must be
+  `ordinary`: a holder-held recovery credential is never added this way. Otherwise the call is
+  `ERR-NotAuthorised`. A credential that proves possession, such as a passkey, is still proven by its own
+  ceremony;
+- grant delegated authority over that identity's accounts in delegated custody.
+
+Each such action is attributed to the identities principal's authority and to the identity it acted for
+(`REQ-AU-7`).
+
+## Who does not
+
+- **A grantee never sends it.** A service charging a user's account calls as itself; its grant over the
+  account is its authority. See [Which key do I call with?](../which-key/).
+- **An agent does not need to.** An agent identity always acts for the identity it was opened for
+  (`acts_for`, `REQ-AG-1`). It may send that same identity in `on-behalf-of`, or nothing; any other
+  identity is refused with `ERR-CredentialInvalid`.
+
+## Example: replacing a lost key
+
+```sh
+curl -X POST "$INGRESS/v1/credentials" \
+  -H "Authorization: Bearer $IDENTITIES_PRINCIPAL_KEY" \
+  -H "on-behalf-of: did:aledgent:id:<the service>" \
+  -H "client-key: reissue-key-<the service>-2026-11-20" \
+  -H "content-type: application/json" \
+  -d '{"marker":"ordinary","scheme":"api-key"}'
+```
+
+The reply's `api_key` is the new key, shown once. Hand it to the service through your secret store, then
+have the service (or the identities principal, the same way) remove the lost credential.

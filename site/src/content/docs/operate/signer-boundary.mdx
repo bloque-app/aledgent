@@ -1,0 +1,43 @@
+---
+title: The signer boundary
+description: Why no key lives in the book's process, what the signer holds, and how the core and the adapter reach it.
+sidebar:
+  order: 6
+---
+
+Cites `NFR-8`, `REQ-SA-8`, `REQ-AU-8`, `F-035`, `F-042`.
+
+Key material never lives in the process that holds the book (`NFR-8`, `REQ-SA-8`). Every key the operator
+holds is in **`aledgent-signer`**, a process of its own that holds no book state (`F-035`).
+
+## What it holds and who reaches it
+
+- **Its keys**: the core's key ring, the clerk key that signs anchors and disclosures, the Agent's keys,
+  ingress's feed key, the settlement adapter's lane keys. Each is read from its source at start: a
+  secret store's key-value field, or a key held by an engine that never lets it leave (Vault Transit,
+  `F-042`; a cloud KMS, opted in per key). A key file is for development only.
+- **Its clients**: the core host, ingress, the settlement adapter. Each reaches the signer over a Unix
+  socket, as its own user id, with **its own token**, and may use only the keys granted to it. A
+  revocation takes effect on the client's next request.
+
+The book's process asks the signer to sign; it never sees a key, and a key is never readable from any
+process's environment.
+
+## What it is not
+
+- It does not hold bearer tokens for ingress, such as [the operator token](../operator-token/). Those
+  authenticate callers; they are not keys.
+- It is not a policy engine. Whether a command may happen is decided by the book; the signer signs what
+  its granted clients ask of the keys they are granted.
+
+## Configuration, in outline
+
+`deploy/templates/signer.json` in the repository is the shape:
+
+- `listen`: the socket, and `socket_mode`;
+- `clients`: per client, its user ids, the SHA-256 of its token (`aledgent-signer token-sha256 <file>`),
+  and the keys it may use;
+- `keys`: per key, its id, scheme and source.
+
+Rotating a client's token is two entries for a while: add the new hash, `kill -HUP` the signer, switch the
+client, remove the old hash.

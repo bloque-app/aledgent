@@ -1,0 +1,70 @@
+---
+title: The restore drill
+description: Rehearse recovery on a schedule, and what counts as a pass for production.
+sidebar:
+  order: 22
+---
+
+Cites `NFR-10`, `NFR-4`, `INV-5`, `INV-6`, `INV-19`, `REQ-AT-3`, `F-018`, `F-005`.
+
+## What it is for, and when to run it
+
+A backup you have not restored is a hope. The drill restores the book on an isolated host and runs five
+checks. Page names: `AledgentDrillFailed`, and `AledgentDrillOverdue` (warning). Suggested owner: platform.
+
+The procedure is [Restore](../restore/). This page sets the cadence and what counts as a pass. A drill
+restores only into empty stores on an isolated host; nothing in it edits a store or moves value outside the
+command surface (`REQ-AT-3`).
+
+| When | Which parts |
+|---|---|
+| Before production use (a milestone gate) | The book and the keys |
+| Monthly in production | The book |
+| After every change of the runtime or kernel pin, or of the root format | The book |
+| After every key change | The keys |
+
+The repository's own CI runs a drill of the Agent core on every change, over the native Agent, and a drill
+over the real runtime on a schedule. Those prove the tools; they do not replace a drill on **your** archive.
+
+## Preconditions
+
+- An **isolated host** with no network path to production, of the production instance class.
+- The latest verified backups: the core's archive (`opsctl archive verify --from <spec> --config <deployment
+  config> --anchors-rpc <archive node URL>`), and the audit, ingress and adapter backups (base backup and
+  WAL, `opsctl backup verify <dir>`).
+- A read-only role on the archive's bucket, and permission to decrypt with its key.
+- The node behind `--anchors-rpc` is an **archive node**: `INV-19` reads each anchor's state at the block it
+  was anchored in, and a node that prunes state answers "State already discarded". The drill then reports
+  `INV-19` as `Unknown` for the older anchors, which is not a pass: run it again on an archive node.
+- The keys for the drill come from your secret store's own backup into the drill's signer only, never an
+  environment.
+
+## Steps
+
+1. **The book.** Restore into empty stores ([Restore](../restore/)): the audit store, then the databases to the
+   latest archived point, then the core, then the adapter.
+   - **Agent core:** from its off-node archive, as [Total-loss recovery](../total-loss-recovery/) path B does:
+     `opsctl restore core --from <spec> … --report <drills dir> --core-host aledgent-core-host …`, run from the
+     core image, then the core host on the restored directory, then `opsctl restore core-tail`. The report is
+     the drill's record. Add `--code-config <file>` when the core unit's `serve` has it. The flags go together,
+     and a retry needs a new, empty `--state` directory.
+   - Record the archive's point, the replayed tail, the restore time, and the archive's read time.
+2. **The keys.** Restore the signer's secrets (the key-ring root, the clerk key, the Agent's keys) from your
+   secret store's backup into a staging store, restore the backups' sealing key, and start the signer on them.
+   A restore that uses them succeeds. Do this at least once before the deployment's first production use.
+
+## Verify (a pass)
+
+- The five checks: `INV-6`, `INV-5`, the composite root, `INV-19` and `NFR-4`. A check that is `Unknown` is
+  not a pass.
+- Recovery time and the data-loss window are recorded against your stated recovery objectives: the archive's
+  point, and the received-log's tail replayed after it with every reply as recorded. For the Agent core, the
+  archive's lag at the "failure" is the window that would be lost if the received-log were lost too.
+- Results are recorded (pass or fail, times, digests) with aggregates only, never personal data. The exporter
+  reads the latest record: `aledgent_drill_passed`, `aledgent_drill_last_age_ms`.
+
+## Roll back
+
+A drill changes nothing in production. A failed drill before production use holds the deployment back until it
+passes. In production, a failed drill is an incident for platform: find why before the next backup cycle relies
+on the same path. Destroy the isolated host and its keys after the drill.

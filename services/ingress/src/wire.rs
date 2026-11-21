@@ -81,7 +81,10 @@ pub struct ReserveBody {
 pub struct CaptureBody {
     /// The account credited.
     pub destination: String,
-    /// The amount cleared, in minor units. It must equal the reservation (`INV-14`).
+    /// The amount cleared, in minor units: at most the reserved amount, which comes from the
+    /// reservation, never from this field (`INV-14`). Below it, the rest returns to the payer's
+    /// available balance in the same posting (`US-C2`, `REQ-OP-2`); above it is
+    /// `ERR-AmountMismatch`, and nothing changes.
     pub cleared: String,
 }
 

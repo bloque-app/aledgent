@@ -1,0 +1,63 @@
+---
+title: Crank outage and liquidity shortfall
+description: The settlement layer produces blocks only while its coretime is cranked, and the adapter parks what it cannot fund.
+sidebar:
+  order: 32
+---
+
+Cites `REQ-SA-7`, `REQ-SN-2`, `REQ-OP-9`, `F-018`.
+
+## What it is for, and when to run it
+
+Run it when `AledgentBlockProductionStalled`, `AledgentLiquidityShortfall` or `AledgentLaneUnderFeeFloor`
+pages. Suggested owners: settlement operations for blocks, treasury for liquidity.
+
+**Rule that does not bend:** nothing is released on a timer and nothing is refunded while the layer is
+stalled (`REQ-OP-9`). Parked withdrawals resume by themselves when the shortfall clears (`REQ-SN-2`).
+
+## Blocks stalled
+
+The settlement layer produces blocks only while its coretime is cranked; an idle chain can stop. While the
+finalised height does not move, nothing is observed, nothing is final, and deadlines keep running: operations
+move to `Needs-Review`, never to a refund.
+
+### Preconditions
+
+- On the dashboard: `aledgent_finalized_height` is flat, `aledgent_finalized_stall_ms` is rising, and the
+  adapter is still `serving`.
+
+### Steps
+
+1. Confirm the case with [Finality stall](../finality-stall/).
+2. Crank: submit the chain's own block-production trigger from the crank account (the chain operators'
+   procedure; its key is not the adapter's). This step has been exercised against a local network only, not
+   automatically.
+3. Verify the height moves, then that the adapter's cursor catches up
+   (`aledgent_observation_cursor_lag` back to zero) and it accepts the layer's head with no chain mismatch
+   ([Chain mismatch, gaps and resets](../gap-filling/) if it raises one). A stall longer than a full node
+   keeps events (about 256 blocks) needs a node that keeps history.
+4. Operations that reached `Needs-Review` while stalled are resolved with the layer's records as evidence
+   through the command surface (`resolve_operation`, `POST /v1/ops/operations/{reference}/resolve`), one by
+   one. None is released without evidence.
+
+## Liquidity or fees short
+
+The adapter parks an instruction whose position (less what it has signed and not settled) or whose lane's fees
+cannot cover it, raises one alert per position, and resumes it when the shortfall clears.
+
+### Steps
+
+1. Read which: `aledgent_liquidity_alerts{kind}`, `aledgent_position{asset}`, `aledgent_lane_native`.
+2. Whoever holds the treasury tops up the instance's position, or the lane's native balance, on the layer (the
+   pallet's calls from the treasury's own keys).
+3. Do not resubmit anything: the adapter signs each operation at most once, ever.
+
+## Verify
+
+- The finalised height moves, the alert clears, and parked withdrawals resume.
+- The adapter's cursor lag is back to about zero.
+
+## Roll back
+
+Cranking and top-ups are not reversed. Nothing here changes aledgent's stores; a top-up that was wrong in
+amount is corrected on the layer by the treasury, and the book follows what the layer records.

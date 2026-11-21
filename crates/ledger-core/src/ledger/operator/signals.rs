@@ -29,6 +29,7 @@ use crate::refusal::Refusal;
 
 /// The core's signals at one time. See the module documentation.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Signals {
     /// Non-terminal operations.
     pub open: u64,
@@ -56,6 +57,11 @@ pub struct Signals {
     pub anchor_lag: Option<Time>,
     /// How long the checkpoint in flight has waited for finality, if one is.
     pub anchor_in_flight_age: Option<Time>,
+    /// Postings past the latest checkpoint, of any status (`T-018-13`, `AC-J1.1`): the entries the
+    /// next checkpoint would cover, by the test the cadence makes before it creates one; before
+    /// the first checkpoint, every posting. Zero means the book has nothing new to anchor, so a
+    /// growing [`Signals::anchor_lag`] is not a late anchor. `None` if the store cannot say.
+    pub anchor_unanchored_entries: Option<u64>,
     /// Anchoring's incidents (`F-017`), per kind: a commitment mismatch and an unknown anchor stop
     /// or question anchoring until an operator acts.
     pub anchor_incidents: BTreeMap<&'static str, u64>,
@@ -74,6 +80,7 @@ pub struct Signals {
 /// The book's size, counted by the collections that hold it, never by visiting a record
 /// (`T-018-11`, the trigger of `T-036-17`, ruling `a0022-q5`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BookSize {
     /// The book's records, in a chainspec's unit (`F-036`): one for each identity, ledger
     /// account, grant (authority, issuance and operator-surface), alias and operation (`F-007`)
@@ -104,6 +111,7 @@ const RECORD_KINDS: [u8; 6] = [
 
 /// A seeded genesis's progress, as the signals carry it: counts only.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SpecSignal {
     /// Chunks applied, the header included.
     pub applied: u32,
@@ -189,6 +197,13 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             None => anchoring.checkpoints().next().map(|c| age(c.created_at)),
         };
         s.anchor_in_flight_age = anchoring.in_flight().map(|c| age(c.created_at));
+        // The cadence's own test (`next_checkpoint`): the postings after the latest checkpoint's
+        // entry sequence, through an open batch, which the next tick commits before it anchors.
+        s.anchor_unanchored_entries = self.book.next_posting_seq().ok().map(|next| {
+            anchoring.latest().map_or(next, |c| {
+                next.saturating_sub(c.entry_sequence.saturating_add(1))
+            })
+        });
         for i in anchoring.incidents() {
             *s.anchor_incidents
                 .entry(anchor_incident_name(i))

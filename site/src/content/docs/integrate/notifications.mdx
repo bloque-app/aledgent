@@ -1,0 +1,161 @@
+---
+title: Notifications
+description: How aledgent pushes each operation's transitions, how to verify one with the secret you share, and how to handle redeliveries.
+sidebar:
+  order: 10
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Cites `CTR-EVT`, `REQ-EV-1`, `REQ-EV-2`, `REQ-EV-3`, `REQ-EV-4`, `REQ-EV-5`, `REQ-EV-6`, `REQ-EV-7`,
+`REQ-EV-8`, `REQ-EV-9`, `REQ-PO-5`, `REQ-AU-8`, `REQ-OP-7`, `REQ-PR-8`.
+
+Notifications are how you learn an operation's outcome (`REQ-EV-7`). aledgent pushes one on **every state
+transition** of an operation, terminal or not, `Received → Accepted` and `Received → Rejected` included
+(`REQ-EV-1`). Reading `GET /v1/operations/{reference}` is for recovering or confirming an outcome, not the
+way to learn one: polling is not the contract.
+
+aledgent never waits for you. An operation reaches its terminal state whether or not anyone is listening,
+and a notification is never a condition of anything (`REQ-EV-5`).
+
+## Who receives what
+
+A notification of an operation's transition is owed to the principal that initiated it. It is delivered to
+the **destination** registered for that principal, signed with the **secret** registered with it.
+
+<Aside type="caution" title="Registered by the operator in this release">
+The specification has each recipient register its destination and secret itself, through the command
+surface, under its own authority, and replace either the same way (`REQ-EV-4`). This release's ingress
+has no route for that yet. The deployment's operator registers them for you:
+
+```sh
+aledgent-ingress recipient --config <deployment file> \
+  --principal did:aledgent:id:<your principal> \
+  --endpoint https://<your host>/<your path> --secret-env <VARIABLE HOLDING THE SECRET>
+```
+
+The secret is read from the environment variable named, never from an argument or a file
+(`REQ-AU-8`). Agree the secret with the operator over a channel you both trust, and ask them to replace it
+the same way.
+</Aside>
+
+**A principal with no destination, or no secret, gets no delivery.** Delivery never proceeds
+unauthenticated: its notifications wait, undelivered and visible to the operator with their age, and go
+out once a recipient with a secret is registered (`REQ-EV-4`, `REQ-EV-6`).
+
+## What a notification carries
+
+A `POST` to your destination, with a JSON body:
+
+```json
+{
+  "id": "6f1c…",
+  "operation_reference": "did:aledgent:op:…",
+  "state": "Settled",
+  "class": "terminal",
+  "terminal": true,
+  "outcome": "Settled",
+  "anchor": {
+    "number": 412,
+    "entry_sequence": 918273,
+    "coordinate": { "instance": 3, "seq": 20841, "digest": "9b2e…" },
+    "height": 5531021
+  },
+  "reference": { "invoice": "inv-8812" }
+}
+```
+
+| Field | Means |
+| --- | --- |
+| `id` | The notification's identity, derived from (operation, transition). The same on every redelivery (`REQ-EV-3`) |
+| `operation_reference` | The operation |
+| `state` | The state it entered |
+| `class` | `terminal`, `open-non-refunding`, or `awaiting-human` (`Needs-Review`). Only `terminal` is an outcome (`REQ-OP-7`) |
+| `terminal`, `outcome` | Whether it is terminal and, if so, which terminal state |
+| `error` | The named refusal, where the operation was refused: `{"error": "ERR-…", "description": "…"}` |
+| `anchor` | The latest anchor whose publication had reached finality when the transition was recorded, or `null` if none had (`REQ-EV-1`, `REQ-PR-8`). Fixed when the transition is recorded |
+| `reference` | The pass-through data the operation was submitted with, exactly as sent, when you are of the submitting principal's integrating party (`REQ-PO-5`) |
+
+Each notification is understandable on its own (`REQ-EV-2`): it never needs an earlier one to have
+arrived.
+
+## Verify every notification
+
+Each attempt carries three headers:
+
+| Header | Value |
+| --- | --- |
+| `aledgent-notification-id` | The notification's identity: the body's `id` |
+| `aledgent-attempt-time` | This attempt's time, in milliseconds since the Unix epoch |
+| `aledgent-signature` | `v1=` and the hex of an HMAC-SHA256 |
+
+The signature is HMAC-SHA256, keyed with the secret's bytes, over four parts in order, **each preceded by
+its length as an unsigned 64-bit big-endian integer**:
+
+1. the ASCII bytes `aledgent/notification/v1`;
+2. the notification id, as UTF-8;
+3. the attempt time, as an unsigned 64-bit big-endian integer;
+4. the request body, exactly as received.
+
+aledgent signs nothing with a key of its own: the shared secret is the only credential a notification
+involves (`REQ-EV-4`). Check, in this order:
+
+1. The three headers are present, and the time parses.
+2. The signature you compute equals the one sent, **compared in constant time**. If not, it is forged or
+   altered: reject it.
+3. The attempt is not older than you accept (a few minutes, say). An older one is a replay of an old
+   capture: reject it.
+4. The body's `id` equals the header's.
+5. If you have seen this `id` before, it is a redelivery or a replay: acknowledge it and change nothing.
+
+```js
+import { createHmac, timingSafeEqual } from 'node:crypto';
+
+const u64 = (n) => { const b = Buffer.alloc(8); b.writeBigUInt64BE(BigInt(n)); return b; };
+
+export function verify({ headers, rawBody, secret, now = Date.now(), maxAgeMs = 300_000, seen }) {
+  const id = headers['aledgent-notification-id'];
+  const time = headers['aledgent-attempt-time'];
+  const sig = headers['aledgent-signature'];
+  if (!id || !/^\d+$/.test(time ?? '') || !sig) return 'malformed';
+  const mac = createHmac('sha256', secret);
+  for (const part of [Buffer.from('aledgent/notification/v1'), Buffer.from(id, 'utf8'), u64(time), rawBody]) {
+    mac.update(u64(part.length));
+    mac.update(part);
+  }
+  const want = Buffer.from(`v1=${mac.digest('hex')}`);
+  const got = Buffer.from(sig);
+  if (want.length !== got.length || !timingSafeEqual(want, got)) return 'bad-signature';
+  if (now - Number(time) > maxAgeMs) return 'stale';
+  if (JSON.parse(rawBody.toString('utf8')).id !== id) return 'mismatch';
+  if (seen.has(id)) return 'duplicate';
+  seen.add(id);
+  return 'fresh';
+}
+```
+
+Verify the **raw** body, before any JSON parsing or re-serialising, and keep the identities you have seen
+in durable storage, not in memory: a redelivery can come after your restart.
+
+## Answer, then process
+
+Answer a `2xx` once you have verified the notification and stored it, duplicates included. A `2xx` is what
+records it as delivered. Anything else, or no answer within 10 seconds, is a failed attempt.
+
+- **At least once, in any order** (`REQ-EV-2`). A crash between your `2xx` and aledgent's record of it
+  means one more delivery under the same `id`. Two notifications of one operation can arrive in either
+  order: go by `state` and `terminal`, never by arrival.
+- **Retries.** A failed attempt is retried with a growing wait: in this release, from half a second,
+  doubling, up to a minute between attempts, for 24 attempts. After that the notification is **parked**:
+  kept, counted, and shown to the operator with its age (`REQ-EV-6`), but not tried again on its own.
+  Recover what you missed with `GET /v1/operations/{reference}`.
+
+## Specified, not served by this release
+
+- **Credit notifications** (`REQ-EV-9`): a notice to an account's serving principal whenever a posting
+  credits that account with value from outside it (a transfer, a capture, an issuance, a reversal).
+  Today, a credit reaches only the requester's transition notification; the payee's side learns of it from
+  its movements.
+- **Reservation reports** (`REQ-EV-8`): an aggregate of your open reservations at a cadence you choose,
+  from one hour to one day.
+- **Registering your own destination and secret** (`REQ-EV-4`), as above.

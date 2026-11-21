@@ -1,0 +1,139 @@
+---
+title: Creating a system account
+description: Open an account that a service operates, owned by the operator, named by a role, reachable only through a bounded grant.
+sidebar:
+  order: 51
+---
+
+Cites `REQ-RC-7`, `REQ-AU-2`, `REQ-ID-7`, `REQ-AT-1`, `REQ-AT-3`, `INV-16`, `INV-17`, `REQ-LA-4`,
+`ERR-UnboundedGrant`.
+
+## What it is for, and when to run it
+
+Run it when a service of yours needs an account of its own that is not a customer's: a fee account, a
+provider-cost account, a float. Suggested owner: platform, with the owner of each service that holds a grant on
+the account.
+
+**Rules that do not bend:** a system account is owned by **the operator's identity** and opened under it;
+services act on it only through **account-scoped, bounded grants** on exactly the accounts they operate; no
+service holds the operator's token or credential. Everything goes through the command surface (`REQ-AT-3`):
+nothing writes a store by hand, and nothing moves value outside a command. A service names a system account by
+its **role**, never by its identifier: the identifier changes at every genesis, the role does not.
+
+The accounts that exist at genesis come from the chainspec with their role aliases already; this runbook is for
+one created after the book is serving.
+
+## Preconditions
+
+- The operator's credential, used for steps 2 to 4 only. Each of those needs a live operator grant of the
+  matching kind, for as short a time as it takes ([Least privilege](../../least-privilege/)).
+- Your ingress URL, and the service principal's identity (`did:aledgent:id:…`).
+- Below, `$OP` is the operator's bearer token ([The operator token](../../operator-token/)), `$ACCOUNT` the new
+  account, `$SERVICE` the service principal and `$INGRESS` ingress's URL.
+
+## Steps
+
+### 1. Decide, and record the decision
+
+In your change's tracking issue, before anything is opened:
+
+- the **role**: `<service>/<purpose>`, for example `payments/provider-cost/example`. Lower case, `/` separated,
+  at most 256 bytes, no personal data (`INV-17`);
+- the **kind**: `customer` (or `suspense`) unless it must go below zero, then `treasury` with a per-asset limit;
+- the **assets** it holds;
+- **which service principal** acts on it, with which operations (`transfer`, `reserve`, `capture`, `release`),
+  and which bounds (per operation, per window, assets, counterparties). A role with no service stays under the
+  operator alone and gets no grant.
+
+The issue records the decision, never the identifiers.
+
+### 2. Open the account, as the operator, under the operator's own identity
+
+```sh
+curl -sS -X POST "$INGRESS/v1/accounts" -H "authorization: Bearer $OP" \
+  -H "client-key: system-payments-provider-cost-example" -H 'content-type: application/json' \
+  -d '{"owner":"<the operator identity>","kind":"customer","custody":"delegated"}'
+```
+
+The operator identity is what `aledgent-ingress founded --config <file>` prints. The reply's `result.account` is
+`$ACCOUNT`. The client key makes a retry safe: the same key returns the same account.
+
+### 3. Register its role
+
+```sh
+curl -sS -X POST "$INGRESS/v1/ops/accounts/$ACCOUNT/aliases" -H "authorization: Bearer $OP" \
+  -H 'content-type: application/json' \
+  -d '{"source":"system-role","name":"payments/provider-cost/example","justification":"<issue>: <why>"}'
+```
+
+`source` is `system-role` for every role: the same source a seeded genesis gives its system accounts (16 bytes,
+`system-role` zero-padded; its hex spelling `73797374656d2d726f6c650000000000` is the same source). An alias
+names one account **for good**: a role already registered (to this account or another) is refused
+`403 ERR-NotAuthorised`, and nothing re-points or removes it. Pick the name in step 1 with that in mind. The
+command is audited with its justification (`REQ-AT-1`).
+
+### 4. Grant the service what it needs
+
+If the service principal is not tied to its integrating party yet, tie it first
+(`POST /v1/ops/integrating-parties/{party}/principals`). Then the account-scoped grant, from the account's owner
+(the operator) to the service, with the bounds of step 1:
+
+```sh
+curl -sS -X POST "$INGRESS/v1/grants" -H "authorization: Bearer $OP" -H 'content-type: application/json' \
+  -d '{"kind":"delegated","principal":"'"$SERVICE"'","subject":{"account":"'"$ACCOUNT"'"},
+       "ops":["transfer"],"per_window":{"length":86400000,"limit":"<minor units>"},"assets":["<asset>"]}'
+```
+
+A grant needs at least one bound (`REQ-AU-2`, `ERR-UnboundedGrant`). This account-scoped grant is the **only**
+way a service reaches a system account: an operator grant over every delegated account (such as a custody
+service's) never covers an account the operator's identity owns, whatever its custody. So a system account is
+safe in delegated custody, and no broad grant is ever the answer for one ([Grants](../../../integrate/grants/)).
+
+### 5. Make the service name the role, not the identifier
+
+One line in the service's configuration names the role. At start the service resolves it as its own principal:
+
+```sh
+curl -sS "$INGRESS/v1/aliases?source=system-role&name=payments/provider-cost/example" \
+  -H "authorization: Bearer <the service's token>"
+# {"account":"did:aledgent:acct:…"}
+```
+
+It answers only to a principal that reaches the account: before step 4 the service gets `404 ERR-UnknownAccount`,
+as for a role that does not exist. Never paste the account's identifier into a configuration, a secret store's
+entry or an environment variable.
+
+## Verify
+
+All reads; nothing changes.
+
+- **The grants on the account** are exactly the decision's: one per service of step 1, nothing else.
+
+  ```sh
+  curl -sS "$INGRESS/v1/accounts/$ACCOUNT/grants" -H "authorization: Bearer $OP"
+  ```
+
+  Each item names the grant, its grantor (the operator), when it was granted, `revoked` if it was, and its terms
+  (holder, operations, bounds). Only the operator and the account's owner read this; a grantee gets `403`.
+- **The role resolves**, as the service (step 5), to `$ACCOUNT`.
+- **The account** is empty and owned by the operator: `GET /v1/balances?account=$ACCOUNT` shows zero.
+- **One smoke operation** as the service inside its bounds succeeds, and one outside them is refused
+  `ERR-BoundExceeded` or `ERR-NotAuthorised`.
+- **No other service reaches it**: one operation on it with a token that holds only a broad grant is refused
+  `ERR-UnknownAccount`.
+- **The audit trail** (`REQ-AT-1`) holds the open, the alias and the grant, each attributed.
+
+## Roll back
+
+Retiring the account is the roll back. Revoke the grant (`POST /v1/grants/{grant}/revoke`), let the service stop
+resolving the role, drain the account through the command surface, freeze it
+(`POST /v1/ops/accounts/{account}/freeze`) and close it (`POST /v1/accounts/{account}/close`; only at zero
+balance, `REQ-LA-4`). The alias stays, as every alias does, and keeps naming the closed account: a role is never
+reused for another account. Choose a new role for a replacement.
+
+### Archived identifiers
+
+An identifier a migration left behind (the exclusion list the chainspec commits) is answered
+`410 ERR-IdentifierArchived` wherever a request names it, for good: in a path, a query parameter, a command's
+body, or as an alias's name. It cannot become a role. To use such an identity again, open it afresh with a new
+identifier.

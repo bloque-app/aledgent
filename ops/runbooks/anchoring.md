@@ -33,8 +33,10 @@ after any rotation (`key-loss.md`).
 ## Anchor lag, or a checkpoint stuck in flight
 
 The core makes a checkpoint every anchoring interval (`OQ-11`; one hour by default) and one at a time: the
-next waits until the last is final (`F-017` decision 4). A lag over twice the interval, or a checkpoint in
-flight for an hour, means the anchor is not reaching finality.
+next waits until the last is final (`F-017` decision 4). It makes none while no posting is past the latest
+checkpoint (`AC-J1.1`), so a quiet book's lag grows without anything being late: `AledgentAnchorLag` pages
+only while `aledgent_anchor_unanchored_entries` is above zero (`T-018-13`). A lag over twice the interval
+with postings waiting, or a checkpoint in flight for an hour, means the anchor is not reaching finality.
 
 1. Read anchoring as the operator: `GET /v1/ops/anchors` — the checkpoints with their status, the
    incidents, the latest comparison.

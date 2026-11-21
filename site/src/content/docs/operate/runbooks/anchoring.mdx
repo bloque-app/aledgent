@@ -1,0 +1,91 @@
+---
+title: Anchoring and the daily settlement comparison
+description: Set the attestation key, handle anchor lag and anchor mismatches, and read the daily comparison of the book against the settlement layer.
+sidebar:
+  order: 34
+---
+
+Cites `F-017`, `F-018`, `REQ-PR-1`, `REQ-PR-5`, `REQ-PR-8`, `INV-17`, `INV-19`, `NFR-9`, `NFR-11`,
+`REQ-AT-3`.
+
+## What it is for, and when to run it
+
+Run it to set the instance's attestation key (once per clerk key), and when one of these pages:
+`AledgentAnchorLag`, `AledgentAnchorStuck`, `AledgentAnchorCommitmentMismatch`, `AledgentUnknownAnchor`.
+Suggested owners: settlement operations for the lag, security for the incidents.
+
+**Rules that do not bend:** an anchor is a number and 32 bytes, nothing else (`INV-17`); it proves
+non-revision, never solvency; nothing here writes a store by hand (`REQ-AT-3`). The operator acts only through
+the command surface: `POST /v1/ops/anchors` (kind `anchor_checkpoint`) and
+`POST /v1/ops/settlement/comparisons` (kind `compare_settlement`), each with a `justification`. Each needs a
+live operator grant of its kind ([Least privilege](../../least-privilege/)).
+
+## Setting the instance's attestation key
+
+The core signs disclosures with the deployment's clerk key, through the signer (`F-035`), never in the core's
+process and never on a command line. Recipients check that signature against the key the settlement layer's
+instance record publishes, so the key must be on the record before any disclosure is issued, and again after
+any rotation ([Key loss](../key-loss/), [Key rotation](../key-rotation/)).
+
+1. Read the clerk key's public key from the signer: `aledgent-signer public <signer.json> clerk`. The secret
+   never leaves the signer.
+2. The instance's admin sets it with the settlement pallet's `set_keys` call, naming the instance's key list
+   unchanged and the new attestation key. The adapter's keys cannot do this; the admin's can.
+3. Verify from outside aledgent. Issue one disclosure to an internal recipient, then run
+   `aledgent-verify <disclosure-file> --clerk-key <public key from step 1> --rpc <node URL>` (feature `cli` of the
+   `verify` crate). It reads the instance record at the finalized head over the node's RPC and checks the
+   disclosure against the key the record publishes; with `--clerk-key`, a record that publishes a different key
+   fails the check. It must pass.
+
+## Anchor lag, or a checkpoint stuck in flight
+
+The core makes a checkpoint every anchoring interval (`OQ-11`; one hour by default), one at a time: the next
+waits until the last is final. A lag over twice the interval, or a checkpoint in flight for an hour, means the
+anchor is not reaching finality.
+
+1. Read anchoring as the operator: `GET /v1/ops/anchors` returns the checkpoints with their status, the
+   incidents and the latest comparison.
+2. If the latest checkpoint is `pending` and never `submitted`: the adapter is not taking it. Check that the
+   adapter serves (`aledgent_adapter_serving`), that its anchor key is configured and is one of the instance's
+   keys (its start-up assertions say so), and that the anchor key's native balance covers fees.
+3. If it is `submitted` and not `final`: blocks are not being finalized, or the extrinsic did not land. See
+   [Finality stall](../finality-stall/) and [Crank outage and liquidity shortfall](../crank-outage/). An
+   extrinsic that provably did not execute is re-emitted by the core on the adapter's proof: do nothing by hand.
+4. When the layer moves again the checkpoint becomes final and the lag falls. An on-demand checkpoint
+   (`POST /v1/ops/anchors`, with a justification) answers the latest if one is still in flight.
+
+## A commitment mismatch, or an unknown anchor
+
+`commitment_mismatch`: the layer recorded the anchor of a number with another commitment. The checkpoint never
+becomes final and anchoring stops until an operator acts: the number is taken on the layer. `unknown_anchor`:
+the layer holds an anchor aledgent never made. Either means someone else wrote under the instance's keys, or
+the book the anchors were made from is not this one.
+
+1. Page security. Freeze the instance's anchor key on the layer (its admin removes it from the instance's keys)
+   until the cause is known.
+2. Run the restore drill on an isolated host ([Restore](../restore/)): its `INV-19` check recomputes every
+   `Final` anchor it can from rebuilt state and compares each with the layer. A drill that passes shows the
+   book is the one anchored; the stray record is not the book's.
+3. The way forward is the owner's: anchoring resumes only once the number sequence on the layer and the book's
+   checkpoints agree again. No store is edited to make them agree.
+
+## The daily settlement comparison (axis 3)
+
+The daily reconciliation asks the core to compare the book's position, derived from the settling postings
+behind the final records below the cut, with the positions the adapter last reported, and records the run's
+summary as that command's justification on the audit trail. A difference of one minor unit pages
+(`AledgentReconciliationDifference`, `AledgentSettlementDifference`): follow [A reconciliation
+failure](../reconciliation-failure/). A cut older than a day is itself a finding: the adapter has stopped
+reporting, usually because anchoring stopped (above).
+
+## Verify
+
+- `GET /v1/ops/anchors` shows the latest checkpoint `final` and no open incident; `AledgentAnchorLag` clears.
+- After setting the attestation key: the `aledgent-verify` check in step 3 passes.
+- After a mismatch: the next anchor goes final and the drill's `INV-19` check passes.
+
+## Roll back
+
+An on-demand checkpoint cannot be undone and does not need to be. The attestation key is restored by the admin's
+`set_keys` with the previous value. A frozen anchor key is unfrozen by the same admin once the cause is known.
+Setting the attestation key needs the live chain and has been rehearsed against staging only.

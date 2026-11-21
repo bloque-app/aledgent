@@ -1,0 +1,86 @@
+---
+title: The audit trail does not ship
+description: Records are not reaching the audit store. Tell not configured, unreachable and refused apart, and what each means for the core.
+sidebar:
+  order: 13
+---
+
+Cites `REQ-AT-1`, `REQ-AT-2`, `REQ-AT-3`, `NFR-6`, `NFR-11`.
+
+## What it is for, and when to run it
+
+Run it when any of these page: `AledgentAuditNotShipped`, `AledgentAuditShipLag`, `AledgentAuditStoreDown`,
+`AledgentAuditStoreRefused`, `AledgentAuditBackpressure`. They are routed at once and every 15 minutes.
+Suggested owner: security, with platform for the store's volume.
+
+How shipping works:
+
+1. The core emits every audit record inside its commit, into its audit outbox.
+2. A shipper thread in the core's process (`aledgent-core-host serve`, or ingress's in-process core) copies
+   the outbox to the audit store in batches, outside the core's locks, using the store's own writer
+   credential (`ALEDGENT_AUDIT_WRITER_CREDENTIAL`).
+3. The store takes each record **once, in order**: only the next sequence number, linked to the one before.
+   A record it already holds is accepted again and appends nothing; any other is refused.
+4. Records leave the outbox only once the store confirmed the append. Nothing is lost: every record can be
+   derived again from the archive.
+5. **Back-pressure.** At `max_unshipped` records waiting (65 536 by default, about 23 MiB), the core refuses
+   new inputs. They stay `Received` in ingress's log, in order, and decide once the store takes records
+   again. Nothing decides without its record, and nothing is dropped.
+
+| Alert | Means |
+|---|---|
+| `AledgentAuditNotShipped` | No `audit_store` in the configuration: nothing ships, the outbox grows with the book |
+| `AledgentAuditStoreDown` | The last rounds did not reach the store: the volume, its mount, its permissions or the credential |
+| `AledgentAuditShipLag` | A record has waited over five minutes: the store is down, or slower than the core |
+| `AledgentAuditBackpressure` | The outbox is at its bound: the core decides nothing until the store takes records |
+| `AledgentAuditStoreRefused` | The store refused the core's record, or holds another at its head. Shipping has stopped. An integrity incident |
+
+## Preconditions
+
+- Read the signals: `aledgent_audit_unshipped_records`, `aledgent_audit_ship_lag_ms`,
+  `aledgent_audit_store_up`, `aledgent_audit_store_refused`, `aledgent_audit_backpressure`.
+- Read the core's standard error for `the audit store does not take records` or an `aledgent-core: ALERT`
+  line naming the record.
+- Tell the cases apart: **not configured**, **unreachable** (store up is 0, not refused), or **refused**.
+
+## Steps
+
+1. **Not configured.** Add `audit_store` to the deployment configuration that the core reads (the same file
+   ingress reads; `aledgent-core-host serve` reads it too): `{"dir": "<the audit volume's mount>"}`.
+   Provision `ALEDGENT_AUDIT_WRITER_CREDENTIAL` from your secret store (16 bytes or more). The directory must
+   not be inside the core's `--state`; the store refuses that. Restart the core (*Replica:* a clean stop (SIGTERM within the stop timeout) keeps the core host's replica; a crash, SIGKILL, a stop timeout, a halted core or a fresh node rebuilds it from genesis, which takes time in proportion to the book's history ([Core restarts](../../core-restarts/)).). An empty directory is
+   initialised on the first start, and the first rounds ship the whole trail.
+2. **Unreachable.** Restore the store's volume: its mount, free space and permissions for the core's user. Do
+   not move or edit the store's files. The shipper retries every 500 ms by itself, so no restart is needed.
+   If back-pressure has started, decisions resume as soon as the outbox drains under its bound.
+3. **Refused.** Do not restart in a loop, and do not repair the store: it is evidence (`REQ-AT-3`).
+   - Capture the `ALERT` line. It names the record number and the store's refusal (`Rewrite`, `Gap`,
+     `ChainBreak`, or the head that differs).
+   - The usual causes: the store belongs to another book (a reused volume); the core was restored from an
+     older backup while the store kept going, so the store holds records of inputs the restored core no longer
+     has; or someone wrote to the store.
+   - After a restore of the core ([Total-loss recovery](../total-loss-recovery/)) the store is ahead of the
+     restored book. Keep it aside, read-only, as evidence of the decisions the restore lost. Point
+     `audit_store.dir` at a store restored from a backup at or before the core's restore point, and restart.
+   - Treat it as a security incident at your highest severity. The security owner decides with the evidence;
+     the core's trail and the store's are compared with `opsctl` reads, never by editing either.
+   - While refused, the outbox grows to its bound, then the core holds every input. That is by design: no
+     decision without its record kept apart.
+4. **Back-pressure that will last.** The bound is configuration (`audit_store.max_unshipped`). Raise it, with
+   a restart, only if the store will return. Each record holds about 350 bytes of the core's memory, so check
+   the headroom first.
+
+## Verify
+
+- `aledgent_audit_store_up == 1`, `aledgent_audit_store_refused == 0`, `aledgent_audit_backpressure == 0`.
+- `aledgent_audit_unshipped_records` falls to a few, and `aledgent_audit_ship_lag_ms` to under a second.
+  `aledgent_audit_shipped_records` rises with the book.
+- `opsctl backup audit --store-dir <dir> --root <backup root> --id <id>` takes a verified copy of the store;
+  it re-reads every segment and walks the chain.
+- If inputs were held: the oldest undecided row falls under the decision bound, and nothing is still
+  `Received` after the drain.
+
+## Roll back
+
+Nothing here changes the book. A configuration added in step 1 can be removed again with a restart. Records
+already shipped stay in the store, which never removes a record.

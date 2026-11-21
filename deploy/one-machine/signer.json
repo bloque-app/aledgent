@@ -1,0 +1,19 @@
+{
+  "listen": "/run/aledgent-signer/signer.sock",
+  "socket_mode": "660",
+  "development": true,
+  "clients": [
+    {
+      "name": "core",
+      "uids": [65532],
+      "token_sha256": ["<filled by the guide: the SHA-256 of the core host's signer token, hex>"],
+      "keys": ["keyring", "clerk", "agent-authority", "agent-package"]
+    }
+  ],
+  "keys": [
+    { "id": "keyring", "scheme": "key_ring", "source": { "file": { "path": "/etc/aledgent-signer/keys/keyring.hex" } } },
+    { "id": "clerk", "scheme": "clerk", "source": { "file": { "path": "/etc/aledgent-signer/keys/clerk.hex" } } },
+    { "id": "agent-authority", "scheme": "ed25519", "source": { "file": { "path": "/etc/aledgent-signer/keys/agent-authority.hex" } } },
+    { "id": "agent-package", "scheme": "ed25519", "source": { "file": { "path": "/etc/aledgent-signer/keys/agent-package.hex" } } }
+  ]
+}

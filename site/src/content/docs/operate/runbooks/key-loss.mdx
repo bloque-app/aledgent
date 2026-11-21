@@ -1,0 +1,56 @@
+---
+title: Key loss
+description: Which key was lost, what is lost with it, and how it comes back. Keys are restored from their own backup, never rebuilt from the book.
+sidebar:
+  order: 23
+---
+
+Cites `NFR-8`, `REQ-SA-8`, `REQ-AU-3`, `REQ-AU-8`, `REQ-AT-3`, `F-018`, `F-035`, `F-017`.
+
+## What it is for, and when to run it
+
+Run it when a key the deployment holds is lost, or its store is. Compare [Key rotation](../key-rotation/),
+which is for keys that are known and changed on purpose. Suggested owner: security, with platform.
+
+**Rules that do not bend:** key material never lives in the process that holds the book, and never in the
+backups (the backup schedule excludes keys). A lost key is recovered from its own backup (your secret store's
+backup for the signer's keys, your KMS's for an opted-in lane and the backups' sealing key), never rebuilt
+from the book, and never replaced by an edit of any store (`REQ-AT-3`).
+
+## Which key
+
+| Key | Holds | If lost |
+|---|---|---|
+| The core's key-ring root (the signer's `keyring`; `ALEDGENT_CORE_ROOT` for the in-process core only) | every kernel account key, the registrar key, every blinding and signing nonce | Restore its secret from your secret store's backup. Without it the book cannot be imported (the import refuses foreign keys) and no posting can be signed. There is no other way back: the book is unreadable and unwritable, by design |
+| A settlement lane's signer | one nonce lane on the settlement layer | Stop that lane: remove it from the adapter's configuration and restart the adapter; other lanes continue. Register a new key for the instance on the layer (the pallet's admin), then add the lane. An extrinsic already signed under the lost key is still on the layer or provably not: the adapter's next reads settle it |
+| The backups' sealing key (`ALEDGENT_OPS_SEALING_KEY`) | the openings of every core backup | Restore it from your KMS. Without it, every core backup's openings stay sealed and no core backup can be restored: the live core keeps running from its own journal, and a new core backup under a new sealing key must be taken at once. Until one is, a lost core is restored by the received-log's full replay from genesis, its journal rebuilt from the log alone, which is slower and needs the log from its first row |
+| The clerk key (the signer's `clerk`; `ALEDGENT_CLERK_KEY` for the in-process core only) | the signature on every disclosure | Restore its secret from backup; the instance's published attestation key is unchanged and disclosures verify again. If it cannot be restored, generate a new one into the signer's secret, publish its public key on the instance record ([Anchoring](../anchoring/), "Setting the attestation key"), and tell recipients that disclosures signed under the old key verify only against a record read before the change |
+| The audit store's writer credential | appending to the audit trail | Reading needs none. Initialise a new writer credential only through the audit store's own procedure; never edit its files |
+| Ingress's recipients' sealing key | notification secrets at rest | Recipients re-register their secrets (`aledgent-ingress recipient`). Nothing in the book changes |
+
+## Preconditions
+
+- You know which key, from the table, and which processes use it.
+- The latest backups are verified (`opsctl backup verify <dir>`), so you know what the restore will be checked
+  against.
+
+## Steps
+
+1. Page security. Rotate every credential that could have been exposed with the key (`REQ-AU-3` takes effect
+   at once).
+2. Restore the key from its backup into the signer's secret (or the KMS key, for an opted-in lane), and send
+   the signer `SIGHUP` so it re-reads its configuration. Never into an environment, never onto a disk the
+   book's backups reach, never onto a command line.
+
+## Verify
+
+- For the core root: `opsctl restore core` on an isolated host against the latest backup passes
+  ([Restore](../restore/)).
+- For a lane: the adapter's start-up assertions pass and it declares `serving`.
+- For the clerk key: an internal disclosure verifies with `aledgent-verify` (it needs `--rpc <node URL>` or `--anchors <file>`; see [Anchoring](../anchoring/)) against the instance
+  record.
+
+## Roll back
+
+Restoring a key is the roll-back of losing it. If the restored key fails verification, do not use it: stay
+paused (for a lane, the contract's admin empties the key set) until a key verifies.

@@ -1,0 +1,59 @@
+---
+title: Which key do I call with?
+description: Who the caller is, what it may touch, and when on-behalf-of applies, with one full request.
+sidebar:
+  order: 3
+---
+
+Cites `REQ-PN-1`, `REQ-AU-1`, `REQ-AU-10`, `REQ-ID-6`, `REQ-OP-10`, `DEP-7`.
+
+Three separate questions are often answered as one. Keep them apart.
+
+| Question | Answered by | Where it is checked |
+|---|---|---|
+| **Who is calling?** | The bearer credential: your API key | Ingress, at the door |
+| **What may it touch?** | Ownership of your own accounts; a delegated grant over someone else's account; issuance authority over an asset, for issuing and redeeming | The core, when it decides the command |
+| **For whom is it acting?** | Nobody, almost always. `on-behalf-of` is only for the identities principal acting for an identity it manages | The core, and the operation's record (`REQ-PN-1`) |
+
+So a service that charges a user's account calls **with its own API key**. It does not hold the user's
+key, and it does not send `on-behalf-of`. What lets it touch the user's account is a delegated grant over
+that account, held by the service's identity (see [Grants](../grants/)).
+
+## One full request
+
+A service reserving 1 500 minor units of `CRD` against a user's account, under its grant:
+
+```http
+POST /v1/reservations HTTP/1.1
+Host: ingress.example.com
+Authorization: Bearer aledgent_ak1.<credential id body>.<secret>
+client-key: task-7f3c2a
+content-type: application/json
+
+{
+  "payer": "did:aledgent:acct:…",
+  "asset": "CRD",
+  "amount": "1500",
+  "reference": { "task": "7f3c2a" }
+}
+```
+
+- `Authorization` says who calls: the service.
+- `payer` is the user's account; the service's grant over it, naming `reserve`, is what makes this
+  allowed. Without one it is `ERR-NotAuthorised`.
+- `client-key` makes a retry the same request (`REQ-OP-10`). Every command carries one.
+- `reference` is your own pass-through data, echoed back, never read by aledgent (`REQ-PO-5`).
+- There is no `on-behalf-of`.
+
+## When a holder calls directly
+
+A person or an agent can also call aledgent with its own credential, where the deployment allows holder
+credentials (`DEP-7`, see
+[service principals](../principals-and-credentials/#service-principals-and-the-dep-7-switch)). Then it
+acts on its own accounts as their owner, and needs no grant for them.
+
+## The API description
+
+The routes and bodies are in the [API reference](../../api/), generated from ingress's own OpenAPI
+document. Ingress also serves that document at `GET /openapi.json`. That route is public: it
+needs no credential, and it carries no ledger fact. Every other route needs one (`NFR-7`, amendment 0044).

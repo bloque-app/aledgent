@@ -173,7 +173,16 @@ fn main() {
                 }
             );
         }
-        Some("package") if args.len() == 4 || (args.len() == 6 && args[4] == "--previous") => {
+        Some("package")
+            if args.len() == 4
+                || (args.len() == 5 && args[4] == "--no-generation")
+                || (args.len() == 6 && args[4] == "--previous") =>
+        {
+            // `--no-generation`: an actor that is not the core (the stress suite's shard Agents,
+            // F-031) carries no code generation record, and has no code history to fence.
+            // NEVER for the core: a core package without its record has no fence (T-037-01).
+            // release-checks.yml refuses the flag under `deploy/` and in core-release.yml.
+            let no_generation = args.len() == 5;
             let elf = std::fs::read(&args[2]).expect("actor ELF");
             let key = ed25519_dalek::SigningKey::from_bytes(&[0x71; 32]);
             // T-037-19: a generation after the first claims to read the state of the previous
@@ -201,11 +210,15 @@ fn main() {
             // (`ALEDGENT_CODE_GENERATION`) must be there once, and must survive linking: the
             // program the package carries, which keeps no sections, holds the same one record in
             // its read-only data.
-            let generation = match package::generation(&elf, &pvm) {
-                Ok(g) => g,
-                Err(e) => {
-                    eprintln!("aledgent-core-host: package: {e}");
-                    std::process::exit(1);
+            let generation = if no_generation {
+                "none".to_string()
+            } else {
+                match package::generation(&elf, &pvm) {
+                    Ok(g) => g.to_string(),
+                    Err(e) => {
+                        eprintln!("aledgent-core-host: package: {e}");
+                        std::process::exit(1);
+                    }
                 }
             };
             std::fs::write(&args[3], &pkg).expect("write");

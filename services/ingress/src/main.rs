@@ -138,8 +138,8 @@ async fn migrate(args: &[String]) -> Result<(), String> {
 
 /// The image's health check (deploy/docker/services.Dockerfile): the replica at `listen` answers
 /// `GET /openapi.json` with anything below 500. It binds its listener only once the store is
-/// connected, the core started and the replica running, so an answer means ready; with no
-/// credential the document is refused (401), which is an answer all the same. Needs no secret.
+/// connected, the core started and the replica running, so an answer means ready. The document
+/// is public (`NFR-7`, amendment 0044), so with no credential it answers 200. Needs no secret.
 fn health(args: &[String]) -> Result<(), String> {
     let c = config(args)?;
     let addr = ingress::probe::address(&c.listen)?;

@@ -1,0 +1,54 @@
+---
+title: Unacknowledged authority decisions
+description: The runtime keeps a bounded number of decisions it has not seen acknowledged. Act before it refuses new ones.
+sidebar:
+  order: 12
+---
+
+Cites `REQ-RT-1`, `REQ-RT-2`, `INV-18`, `NFR-11`, `REQ-AT-3`, `F-005`.
+
+## What it is for, and when to run it
+
+Run it when `AledgentVosAuthorityBacklog` pages (more than 191 decisions, three quarters of 256) or
+`AledgentVosAuthorityUnacknowledged` warns (any decision unacknowledged for ten minutes). Suggested owner:
+platform.
+
+The core host is the Agent's local host. It signs an authority receipt (a decision) for every invocation it
+makes, and acknowledges the invocation at once, in a second execution; the runtime then retires the result.
+An invocation whose acknowledgement fails keeps its result retained, and the runtime bounds what it retains:
+its authority issuer journal refuses a new decision once it holds 256 without evidence of their
+consumption, and a local lane retains at most 32 unacknowledged results.
+
+So the warning comes well before the page. Past either limit the runtime refuses further invocations, and
+the core halts on the next input ([The core stalls or halts](../core-halt/)).
+`aledgent_vos_unacknowledged_authority_decisions` counts the host's unacknowledged decisions since it
+started; it is normally 0.
+
+## Preconditions
+
+- Read the core's standard error for `acknowledgement refused` and the runtime outcome it names.
+- Check that the core still decides: `aledgent_core_halted == 0`, with decisions rising in the core host's
+  diagnostic report.
+
+## Steps
+
+1. **Capture the evidence:** the refusal, the input it belonged to, and the runtime and actor pins of the
+   release you run.
+2. **Do not restart in a loop.** A restart resets the counter, not the runtime's retained results: those are
+   in the Agent's state.
+3. **Reproduce off production** from a copy of the core volume, as for a halt. The usual causes are a
+   runtime limit (state image, retained bytes per lane) or an acknowledgement under another identity than
+   the invocation's.
+4. **Fix forward** with a build whose host acknowledges correctly, through your release gate. Deploy by
+   digest. The runtime then retires what was retained on the next acknowledgements.
+
+## Verify
+
+- `aledgent_vos_unacknowledged_authority_decisions` returns to 0 and stays there.
+- No input is lost or doubled (`INV-18`): the archive and the replies agree, and an on-demand reconciliation
+  passes axes 1 and 2.
+
+## Roll back
+
+Redeploy the previous digest. Never edit the Agent's state file, or any store outside the command surface
+(`REQ-AT-3`).

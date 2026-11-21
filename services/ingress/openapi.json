@@ -784,7 +784,7 @@
             "type": "integer"
           },
           "status": {
-            "description": "`active` or `deprecated`.",
+            "description": "`active`, `deprecated` or `retiring` (amendment 0043, `REQ-AS-10`).",
             "type": "string"
           }
         },
@@ -1142,7 +1142,7 @@
         "description": "`capture` of the reservation named in the path (SPEC §8.1, `INV-14`).",
         "properties": {
           "cleared": {
-            "description": "The amount cleared, in minor units. It must equal the reservation (`INV-14`).",
+            "description": "The amount cleared, in minor units: at most the reserved amount, which comes from the\nreservation, never from this field (`INV-14`). Below it, the rest returns to the payer's\navailable balance in the same posting (`US-C2`, `REQ-OP-2`); above it is\n`ERR-AmountMismatch`, and nothing changes.",
             "type": "string"
           },
           "destination": {
@@ -5320,6 +5320,15 @@
               "null"
             ]
           },
+          "anchor_unanchored_entries": {
+            "description": "Postings past the latest checkpoint, of any status (`T-018-13`, `AC-J1.1`): what the next\ncheckpoint would cover; before the first checkpoint, every posting. Zero means there is\nnothing new to anchor, so a growing `anchor_lag` is not a late anchor. Absent from a core\nthat does not report it (an older core host): a reader that does not know the field\nignores it, and a body without it reads as \"not reported\".",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "audit": {
             "anyOf": [
               {
@@ -6270,7 +6279,7 @@
     }
   },
   "info": {
-    "description": "The command and query surfaces of aledgent (CTR-CMD, CTR-QRY) and its notifications (CTR-EVT). Amounts are decimal-integer strings of minor units. Identifiers are did:aledgent strings. Times are milliseconds since the Unix epoch. Every route requires a bearer credential, except the two under /v1/auth, which check what their body carries (F-028).",
+    "description": "The command and query surfaces of aledgent (CTR-CMD, CTR-QRY) and its notifications (CTR-EVT). Amounts are decimal-integer strings of minor units. Identifiers are did:aledgent strings. Times are milliseconds since the Unix epoch. Every route requires a bearer credential, except /openapi.json, which is public, and the two under /v1/auth, which check what their body carries (F-028).",
     "title": "aledgent-ingress",
     "version": "0.5.0"
   },
@@ -6359,6 +6368,7 @@
             }
           }
         },
+        "security": [],
         "summary": "This document."
       }
     },

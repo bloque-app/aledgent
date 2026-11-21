@@ -2,10 +2,14 @@
 title: The operation lifecycle
 description: The states a caller sees, how a client key makes a retry the same operation, and how a refusal is named.
 sidebar:
-  order: 1
+  order: 3
 ---
 
 import { Aside } from '@astrojs/starlight/components';
+
+Cites `REQ-CS-2`, `REQ-CS-7`, `REQ-CS-8`, `REQ-CS-9`, `REQ-OP-1`, `REQ-OP-4`, `REQ-OP-5`, `REQ-OP-6`,
+`REQ-OP-7`, `REQ-OP-9`, `REQ-OP-10`, `REQ-OP-11`, `REQ-OP-12`, `REQ-RC-5`, `REQ-IN-7`, `INV-15`, `INV-21`,
+`NFR-1`, `NFR-15`, `NFR-16`.
 
 Every command that aledgent takes in becomes an **operation** with a **reference** that aledgent
 derives and that never changes. A command returns at once, with that reference and the operation's
@@ -43,11 +47,72 @@ by notification. These three are the ones a caller is expected to act on.
 internal transfer has no external leg and needs no reservation, so it is final on acceptance: it goes on
 to `Settled`, or to `Rejected` with its refusal named.
 
-<Aside type="note" title="Needs-Review is an answer, not a failure">
-aledgent never fails, releases or retries an operation on silence alone. An operation whose outcome
-cannot be established past its deadline moves to `Needs-Review`: non-terminal, non-refunding, with an
-owner and a service level. Its value stays reserved until it is resolved.
+## Every state
+
+An operation passes through these states, and no transition exists that §5.6 of the specification does
+not list. Every transition is pushed by notification and every state is visible by query.
+
+| State | What it means | Posting appended on entering it |
+| --- | --- | --- |
+| `Received` | Taken in durably, not decided | None |
+| `Accepted` | Decided to go ahead; no balance effect yet | None |
+| `Reserved` | The value moved from available to reserved for this operation | `Reserve` |
+| `Submitted` | Its outbound instruction was handed durably to the settlement adapter | None |
+| `Observed` | A provisional observation names its external leg: a confirmation, not finality | None |
+| `Final` | Finality passed the observation and the record still matches | None |
+| `Expired` | The instruction's explicit expiry passed with no observation | None |
+| `Orphaned` | The settlement layer's record no longer matches what was observed | None |
+| `Needs-Review` | Its deadline passed and its outcome is neither established nor provably impossible | None: the value stays reserved |
+| `Settled` | Terminal: completed | Exactly one of `Transfer`, `Capture`, `Redeem`, `Issue` or `Reversal` |
+| `Released` | Terminal: the reservation returned to available | `Release`, if a reservation exists |
+| `Rejected` | Terminal: refused, with its condition named | `Release`, if a reservation exists |
+
+For an external leg, nothing is posted against the issuance counterparty before `Final` (`REQ-OP-1`), so a
+revision of the settlement layer's record costs nothing: an `Orphaned` operation needs no reversal.
+`Observed` (confirmation), `Final` (finality) and `Settled` (settlement) are three distinct conditions,
+and no surface conflates them (`REQ-IN-7`).
+
+The terminal states are the same for every kind of operation, and a terminal operation never changes
+again (`REQ-OP-4`, `INV-21`). An inbound arrival that aledgent did not originate enters at `Observed`.
+
+## Deadlines
+
+Every non-terminal state carries a **deadline**, and an operation without one is not accepted
+(`REQ-OP-5`, `INV-15`). A command may state its own (`deadline`, milliseconds since the Unix epoch);
+otherwise the deployment's default for that kind applies, and with neither the command is refused with
+`ERR-DeadlineRequired`. `Received`'s deadline is the bound within which
+a received command must be decided (`REQ-CS-7`); passing it is also an incident.
+
+**Past its deadline, an operation moves to `Needs-Review`.** It is not failed, released or retried:
+absence of evidence is not evidence of failure (`REQ-OP-6`). A terminal state carries no deadline.
+
+<Aside type="caution" title="A reservation past its deadline is not released">
+A reservation whose deadline passes stays reserved, in `Needs-Review`, until it is resolved. If you want
+the value back, release it before its deadline. See [Reservations](../reservations/).
 </Aside>
+
+## Needs-Review is an answer, not a failure
+
+`Needs-Review` is shown to callers as an explicit outcome that is **non-terminal and non-refunding**
+(`REQ-OP-7`): never read it as success, and never as a refund. It acts as terminal until a human resolves
+it. Each one sits in a queue with an owner and a **review service level**; past that, it stays in
+`Needs-Review` and is escalated.
+
+An operation also moves to `Needs-Review` when a release is asked for while its external leg may still
+execute: the release is refused with `ERR-ReleaseUnsafe` and the move is recorded with it. That move
+releases nothing (`REQ-OP-9`).
+
+It is resolved to `Settled` or `Released` in up to three steps (`REQ-RC-5`):
+
+1. **On the settlement adapter's proof alone**, with no human: a final record naming the operation
+   settles it; proof that the leg did not and cannot take effect releases it.
+2. **On evidence one authority submits**: where to find the proof on the settlement layer. The adapter
+   fetches and verifies it on its own; the submitter's word proves nothing.
+3. **Only when the adapter finds no proof** in that evidence: a release that two distinct principals
+   agree to, which raises an incident. Two principals can only release, never settle.
+
+An operation with no external leg needs no proof: one principal releases it. Every human step carries a
+justification and is audited. The operator's side of this: [Overview](../../operate/overview/).
 
 ## Client keys make a retry the same operation
 

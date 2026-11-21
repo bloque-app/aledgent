@@ -1,0 +1,54 @@
+---
+title: While the core is away
+description: What each command gets when no core can decide it, and the one rule for retrying.
+sidebar:
+  order: 6
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Cites `REQ-CS-2`, `REQ-CS-7`, `REQ-CS-8`, `REQ-CS-9`, `NFR-1`, `NFR-16`, `REQ-OP-10`, `DEC-27`.
+
+Ingress takes your command and logs it durably before it answers. The **core** decides it. When the core
+is restarting, or no core is connected, ingress still answers, in one of two ways, depending on the
+command (`REQ-CS-8`).
+
+| Command | While the core is away |
+|---|---|
+| `transfer`, `reserve`, a withdrawal | `202 Received` within `NFR-1`, as always. The decision follows once a core is back, by notification and by `GET /v1/operations/{reference}` |
+| Everything else (`capture`, `release`, `issue`, `redeem`, accounts, credentials, grants, every operator command) | The reply waits for the decision up to the deployment's decision wait (30 s by default). While no core is connected at all, ingress keeps trying for at most `NFR-16`'s bound (a 1 s target at p99), then answers. Past the wait: `503 ERR-DecisionUnavailable`, with `Retry-After` |
+
+A principal whose transfers and reservations are answered with their decision (its answering setting,
+`REQ-CS-9`) gets the second behaviour for those too.
+
+## `503 ERR-DecisionUnavailable` is not a failure
+
+The command is **logged and will be decided** (`REQ-CS-7`). It is not lost and not refused. Do this:
+
+1. Wait the `Retry-After` header's seconds.
+2. Send the **same request with the same `client-key`**.
+3. You get the decision once it exists, or the same 503 again; repeat.
+
+<Aside type="danger" title="Never change the client key on retry">
+A new key is a new command. If the first one is decided later, both happen: a double charge, a double
+credit. The client key is what makes the retry the same operation (`REQ-OP-10`).
+</Aside>
+
+A decision can arrive after you stopped waiting for it. If your own caller was already told "declined",
+be ready to undo it: release a reservation that turned out `Reserved`, for example.
+
+## What keeps working
+
+Ingress keeps taking commands, and keeps authenticating known API keys from its own copy of their public
+verifiers, so a caller is never locked out by a core restart. Reads come from the core: while none is
+connected they answer `ERR-DecisionUnavailable` too, and the same rule applies: retry.
+
+## Retries in general
+
+| Reply | Retry? |
+|---|---|
+| `202 Received` | No. Follow the operation |
+| `503 ERR-DecisionUnavailable` | Yes, same client key, after `Retry-After` |
+| `500 ERR-Internal` | Yes, same client key, later |
+| Network error, no reply | Yes, same client key: the retry returns the first reply if the first request arrived |
+| Any 4xx | Not unchanged: see the [error catalogue](../../errors/) |

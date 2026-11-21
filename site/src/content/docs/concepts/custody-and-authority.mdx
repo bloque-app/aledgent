@@ -1,0 +1,120 @@
+---
+title: Custody and authority
+description: Who may act on a ledger account, within what bounds, the two custody modes, and how authority is recovered or passed on.
+sidebar:
+  order: 2
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Cites `REQ-AU-1`, `REQ-AU-2`, `REQ-AU-3`, `REQ-AU-5`, `REQ-AU-6`, `REQ-AU-7`, `REQ-AU-9`, `REQ-AU-10`,
+`REQ-AU-11`, `REQ-AU-12`, `REQ-AU-13`, `REQ-AU-14`, `REQ-AU-15`, `REQ-AU-16`, `REQ-AU-17`, `REQ-AU-18`,
+`REQ-AU-19`, `REQ-AG-2`, `REQ-AG-3`, `REQ-LA-3`, `REQ-LA-6`, `REQ-OS-1`, `INV-20`, `NFR-20`, `DEC-13`,
+`F-012`.
+
+## Authority is separate from ownership
+
+A ledger account has exactly one owning identity. **Authority** is the right to cause a named class of
+operation on a named account, within bounds, and more than one principal may hold it over one account
+(`REQ-LA-3`). An operation is refused unless its initiating principal holds an authority that covers its
+kind, its account and its bounds; an authority that cannot be evaluated counts as absent (`REQ-AU-1`).
+
+There are four kinds, and every use of one records which kind and which principal (`REQ-AU-7`), so "the
+operator acted" is always distinguishable from "the holder acted":
+
+| Authority | Held by | Over |
+| --- | --- | --- |
+| **Owner** | The owning identity, with any credential of its set that covers the account | Its own accounts |
+| **Delegated** | A principal the owner (or the identities principal) granted it to: an agent, a member, a service | One account, or one identity (to open its accounts), as far as the grant reaches |
+| **Operator** | The operator, split by kind | Accounts in **delegated** custody only |
+| **Issuance** | The operator, or an identity the operator granted it to | One asset: issue and redeem it (`REQ-AU-10`) |
+
+## Every grant is bounded
+
+A grant that names an account and sets no bound cannot be expressed (`REQ-AU-2`). Each delegated grant
+carries at least one bound that aledgent enforces when the operation is made: per operation, per window,
+per asset or per counterparty. Exceeding one is `ERR-BoundExceeded` (`REQ-AG-2`). When an operation that
+consumed a bound is later released, expired or reversed, the bound is restored (`REQ-AG-3`).
+
+A grant may be narrowed into another grant, never widened. **Revoking** a grant stops it and every grant
+derived from it, for every credential that relied on it, within `NFR-20`'s bound (1 s at p99, proposed)
+of the revocation's commit (`REQ-AU-3`). Inside that bound the grant can still be used, but only as far
+as its own bounds allow: an agent's last operations inside it stand.
+
+A pool that many identities draw on is the same thing: an explicit, bounded grant per drawing identity,
+never a shared identifier or credential (`REQ-LA-6`).
+
+The fields of a grant, with an example: [Grants](../../integrate/grants/).
+
+## Operator authority is bounded too
+
+Operator authority is not one capability over everything (`REQ-AU-5`):
+
+- it is split by operation kind, each its own grant (`REQ-OS-1`);
+- it reaches accounts in delegated custody only;
+- a grant over every account in delegated custody does not reach an account the operator's own identity
+  owns: that needs a grant naming the account;
+- it is checked where the authority is checked, not declared in configuration.
+
+Every operator action on an account is visible to that account's authority holders (`INV-20`). How an
+operator holds these grants: [Least privilege](../../operate/least-privilege/).
+
+## Two custody modes
+
+Custody mode is a property of the account (`REQ-AU-6`):
+
+| | **Delegated** | **Owned** |
+| --- | --- | --- |
+| Operator authority over it | Exists, bounded as above | **None.** aledgent cannot move its value |
+| Who initiates | The holder, the grantees, and the operator under its grants | The holder and its grantees only |
+| Needs | Nothing more | A holder credential proven to work, and a recovery mechanism |
+
+<Aside type="caution" title="Owned custody is not self-custody of the value">
+In a single deployment the operator is custodian in **both** modes: the value sits in positions the
+operator controls on the settlement layer, so a holder's balance is a claim on the operator. Owned
+custody removes only the operator's power to *initiate* operations on the account.
+</Aside>
+
+A new account's mode is stated when it is opened. Making owned custody the default is deferred
+(`DEF-2`). A deployment with no recovery configured offers delegated custody only.
+
+### Changing mode
+
+An account changes mode in either direction without being closed (`REQ-AU-11`). The change is an
+operation: idempotent on its client key, attributed, audited, and visible to every authority holder.
+
+- **Owned → delegated** gives the operator a power it did not have, so only the holder's own credential
+  can start it (`REQ-AU-12`): `POST /v1/accounts/{account}/custody/delegate`. The operator cannot.
+- **Delegated → owned** removes operator authority (`REQ-AU-13`): `POST /v1/accounts/{account}/custody/reclaim`.
+  The holder proves a credential works, with a signature (`key`) or an assertion (passkey) over a
+  challenge that binds the account and its custody epoch, and acknowledges the recovery mechanisms it was
+  shown (`GET /v1/accounts/{account}/recovery-mechanisms`, `REQ-AU-9`). Operations already reserved run to
+  a terminal state under the authority that started them.
+
+A custody change does not touch the delegated grants the holder made to agents and members (`REQ-AU-14`).
+
+## Recovering an owned account
+
+A deployment that offers owned custody must offer a way to recover it, and the operator must not be able
+to use it alone: that would be operator authority under another name (`REQ-AU-9`). The mechanisms that
+apply to an account are shown to the holder before it chooses owned custody:
+
+| Mechanism | How it works | Delay |
+| --- | --- | --- |
+| **Recovery authority** (`REQ-AU-15`) | A principal distinct from the operator verifies the holder out of band. The operator initiates the recovery (`POST /v1/ops/accounts/{account}/recovery`) and completes it only with the recovery authority's approval (`POST /v1/ops/recoveries/{pending}/complete`). The recovery authority alone can move no value | The deployment's recovery delay |
+| **Successor** (`REQ-AU-17`) | The holder names a successor with its own credential. After the delay the successor may claim: it gets owner authority, the previous holder loses it, and the delegated grants the previous holder made are revoked | The deployment's succession delay |
+| **Holder-held recovery credential** (`REQ-AU-18`) | An extra credential the holder keeps away from everyday devices. Presenting it counts as owner authority | None. A convenience, never the only mechanism |
+
+**Every recovery and succession waits out its delay** (`REQ-AU-16`). While it is pending it is visible to
+every authority holder of the account (`GET /v1/accounts/{account}/custody`), and the holder can cancel
+it with an existing credential (`POST /v1/recoveries/{pending}/cancel`). Only that cancels it: ordinary use
+of a credential does not. A completed recovery reissues a credential into the set and keeps the delegated
+grants; a completion before the delay ends is `ERR-RecoveryNotElapsed`. Completion is attributed to every
+principal that approved it.
+
+Guardian-threshold recovery, a set of principals of whom some number must agree, is not offered
+(`REQ-AU-19`).
+
+The plan sets the first deployment's delays at 72 hours for recovery and 30 days for succession, both
+configurable per deployment, with the recovery authority run as a separate service by a different team
+(`DEC-13`).

@@ -1,0 +1,134 @@
+---
+title: Scale out and in
+description: What can be scaled online in this release, how to add an adapter lane, and what waits for later features.
+sidebar:
+  order: 16
+---
+
+Cites `NFR-21`, `NFR-18`, `NFR-17`, `REQ-RT-9`, `INV-25`, `DEC-22`, `DEC-23`.
+
+## What it is for, and when to run it
+
+Run it when capacity is short: `aledgent_oldest_undecided_row_age_ms` is rising,
+`AledgentReceivedOverDecisionBound` pages, or your sustained rate approaches the ceiling you measured for
+your reference load. Suggested owner: platform.
+
+**The rule** (`NFR-17`, `NFR-21` (a)): capacity is added online, with no change to the book, to any identifier
+or to any operation. A change that cannot be made that way is **not made** once the deployment is in
+production. Nothing here moves value or edits a store outside the command surface (`REQ-AT-3`).
+
+### What can be scaled in this release
+
+| Lever | Online in this release? | Depends on |
+|---|---|---|
+| Adapter lanes (more device keys signing in parallel) | **Yes** | A new key in the adapter signer's secret (or an opted-in KMS key), and the settlement contract's key set |
+| Ingress instances | **Yes** (A2), over the stream link, where the feed lease decides which instance feeds each partition (`F-038`). Cross-host needs mutual TLS; a Unix socket works on the core's host only | The `stream` section of ingress's configuration |
+| The execution node's machine size (vertical) | **No.** A size change is a stop and start of the node, minutes with the volumes attached. Take it ahead of need, in a maintenance window, on your own growth triggers: memory first, then CPU | An ingress off the core's host, or a replicated core |
+| The core and audit volumes | **Yes**, where your platform grows volumes online; then grow the filesystem | Nothing: alert at 70 % full and grow by half again |
+| Shard count | **Fixed at genesis**, until online splits exist | Online split, and ingress routing to shards |
+| Shards across hosts | At genesis only, and only under outcome A of the multi-host relay experiment | The multi-host relay experiment |
+| Replicas per Agent | No | The replicated core (`F-021`, `DEP-11`) |
+
+## Preconditions
+
+- The signal says capacity is short (above).
+- Reconciliation is green on every axis. Never scale a book that is diverging.
+- The latest backups are verified (`opsctl backup verify <dir>`).
+
+## Steps
+
+### A. Add an adapter lane (online)
+
+1. Write a new secp256k1 secret as a new field of the adapter signer's secret (`lane-2`), add it to the
+   adapter's signer as a key granted to the adapter's client, and `kill -HUP` the signer. For a lane opted into
+   KMS, create an `ECC_SECG_P256K1` key and grant `kms:Sign` on it to the adapter's role instead.
+2. Register its public key as a device of a PASS account on the settlement layer (`Pass.register` for a new
+   account, `add_device` for an existing one). A new PASS account also needs a membership, funding, and the
+   contract admin's `set_keys` with the full key list.
+3. Add the lane to the adapter's configuration (`adapter.keys`) as a signer key
+   (`{"signer": {"key": "lane-2"}}`). Restart the adapter. The lease hands over and the adapter resumes from
+   its store.
+
+### A2. Add or remove an ingress instance (online)
+
+Ingress instances share one database and one fleet. Each serves the stream, and a core host keeps one stream to
+every instance in the **roster**. Only the holder of the feed lease feeds commands; the others read, and one of
+them takes the lease if the feeder goes, with no reconnect on the way.
+
+**A Unix socket works only on the core's own host.** Scaling across hosts needs the `tls:` transport, with
+mutual TLS under your own certificate authority: each ingress and each core host present a certificate the
+other checks.
+
+To add an instance:
+
+1. Start from a copy of an existing instance's configuration and image. In its `stream` section set `listen`
+   (`tls:<host:port>`), `tls` (this instance's certificate, key and the CA that signs the core hosts'), and the
+   feed key (`stream.feed_key` or `keys.feed`, granted to this instance in the signer). Set `stream.advertise`
+   to the address the core hosts can reach this instance at (`tls:<host:port>`, or `unix:<path>` on the core's
+   host); if it is left out it is detected from `listen`, which fails for a listener on every interface that has
+   no route. Set `readiness_listen` so your load balancer can use `GET /ready` and `GET /live`.
+2. Check that the certificate carries the name the core hosts expect (`stream.dial.server_name`).
+3. Start it. It renews its roster entry every `roster_ms` (2 s by default) and it is dropped after three missed
+   renewals. The core hosts read the roster at the same interval and on every go-away, and open a stream to the
+   new instance. No change to the core hosts' configuration is needed unless the fleet's stable name changes.
+4. Add it to the load balancer once `/ready` answers.
+
+To remove one:
+
+1. Take it out of the load balancer.
+2. Stop it with SIGTERM. It goes not-ready, takes no new feed, finishes the one in flight, releases its leases
+   and sends the core hosts a **go-away**; it refuses new handshakes and keeps answering its clients for
+   `stream.drain_ms` (5 s by default). The core hosts re-read the roster and the streams of the remaining
+   instances carry on; another instance takes the feed lease.
+3. Do not SIGKILL: the lease then lapses by time instead of being released, and the feed pauses for that long.
+
+Verify: the roster lists the instances you expect; `GET /ready` is 200 on each; commands are accepted and
+decided through the changed fleet; `aledgent_oldest_undecided_row_age_ms` stays normal; exactly one instance
+holds each partition's feed lease. Roll back: remove the instance as above (or re-add the one you removed).
+Neither direction changes the book.
+
+### B. Add shards (after online split exists; recorded here as `DEC-23` specifies it)
+
+1. Create an empty shard Agent on the target execution node, pinned to aledgent's runtime.
+2. The principals Agent records the move at directory version v+1, `moving`.
+3. The source shard applies it from `feed`, fences the range (its debits are refused with a retryable
+   error), and streams the range's subtrees as `handoff/<n>`.
+4. The target applies the handoff exactly once and reports its roots.
+5. The principals Agent flips the range at v+2, and ingress routes to the target. The source forwards credits
+   for moved partitions until every sender's trim has passed the cut.
+
+One range at a time. The fence is the only unavailability, and only for that range.
+
+### C. Add replicas (after the replicated core)
+
+1. Start a node with no local state.
+2. Admit it with `ChangeReplicas`, signed by the Space's authority.
+3. It installs the latest quorum-certified checkpoint from the archive sink, then replays the log's tail
+   ([Replace a node](../replace-node/), C).
+
+### Scale in
+
+- **Lanes:** remove the lane from the adapter's configuration and restart. Its in-flight extrinsics are
+  settled by the adapter's next reads. Then remove the device from the PASS account, or the account from the
+  contract's keys.
+- **Replicas** (after the replicated core): `ChangeReplicas` to remove a voter, never below three voters.
+- **Shards:** `DEC-23` specifies no merge. Shards are not scaled in.
+
+## Verify
+
+- For each step: every balance is unchanged, and on-demand reconciliation shows axes 1 and 2 at zero.
+- `NFR-1`, `NFR-16` and `NFR-15` held through the change, read from ingress's metrics.
+- For B: no credit lost or doubled; the in-transit positions match the outbox (`REQ-RT-11`); the next anchor
+  is consistent (`REQ-RT-14`).
+- For C: record the admission time and the rate during admission.
+- Record the new decision rate with the mix and principals it was measured at (`NFR-18`).
+
+## Roll back
+
+- **A:** remove the lane (scale in, above).
+- **A2:** remove the instance as above, or add the removed one back.
+- **B:** run the same split procedure back toward the source shard. Never edit a store.
+- **C:** remove the replica with `ChangeReplicas`.
+
+Adding and removing an adapter lane has been exercised by hand against a staging deployment, not
+automatically. Shards and replicas wait on features that are not built.

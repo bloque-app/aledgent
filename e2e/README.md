@@ -94,6 +94,16 @@ the adapter's own process (`aledgent.sh stress`). The harness's `report.json` an
 the withdrawals' settlement times (`withdrawals.json`), are in `$E2E_OUT/aledgent/stress/`; the
 withdrawals are also in `expect.json`, so `e2e.mjs check` covers them.
 
+Gates 5 and 5b of the stress gate (`PLAN.md` §5) run on `BUSDC`, production's first chain-bound asset
+(`Here(101)`, 6 decimals; in the genesis beside the other three). Thirty seconds into the load the
+driver registers `BUSDC` book-only, issues 50 of it to alice, puts exactly that in the contract's
+account and asks for the binding while the load goes on (gate 5b: `busdc_binding` in
+`withdrawals.json` has the time to the request's reply and to `Bound` final). From then on the
+withdrawals every twenty seconds are of `BUSDC` (gate 5; before it, of `USD`; each row of
+`withdrawals.json` names its asset, and `settled_ms_busdc` is the gate's figure). After the load, a
+checkpoint is final and the settlement comparison finds every asset, `BUSDC` included, at zero
+difference.
+
 ```sh
 gh workflow run e2e-zombienet.yml --ref <branch> -f driver=aledgent -f stress_phases=c-1x:300:300,c-5x:1500:300
 ```

@@ -1,0 +1,57 @@
+---
+title: Registering an asset
+description: Book-only registration with one precision, the review field, and binding to the settlement layer later.
+sidebar:
+  order: 4
+---
+
+Cites `REQ-AS-2`, `REQ-AS-3`, `REQ-AS-7`, `REQ-AS-8`, `INV-24`, `REQ-OS-1`.
+
+## Every asset starts book-only
+
+An asset is registered **book-only** (`REQ-AS-7`): in the registry, with its one precision (`INV-24`),
+and bound to nothing on the settlement layer. Its value enters the book only by issuance and leaves only by
+redemption. An external leg in it is refused with `ERR-UnsupportedLeg` until it is bound.
+
+```sh
+curl -X POST "$INGRESS/v1/ops/assets" -H "Authorization: Bearer $OPERATOR_TOKEN" \
+  -H "client-key: register-asset-crd" -H "content-type: application/json" \
+  -d '{"id":"CRD","precision":2,"kind":"other",
+       "review":"<32 bytes, hex>",
+       "justification":"Credits for the credits integration, approved in change 456"}'
+```
+
+This needs a live `register_asset` operator grant ([Least privilege](../least-privilege/)).
+
+- **`id`** is 2 to 12 ASCII letters and digits, normalised to uppercase (`REQ-AS-3`): `crd` is stored as
+  `CRD`, and every route normalises the ids it is sent the same way, so any case names the same asset.
+  Replies carry the uppercase form.
+- **`precision`** is fixed for the asset's life. Amounts are integers of minor units at that precision.
+- **`kind`** is `fiat`, `stable`, `native` or `other`.
+
+## The `review` field
+
+`review` is 32 non-zero bytes, hex, that point to the reviewed change the registration comes from. aledgent
+records it and never checks it: it is there so an auditor can trace the registration back.
+
+A convention that works: the SHA-256 of
+
+```
+<repository>#<pull request> <merge commit> <approval id> <environment>
+```
+
+or, where there is no pull request, of the ticket or thread with the approval. It is **not** the hash of
+`justification`.
+
+## Binding later
+
+A book-only asset may be bound to the settlement layer once, after registration, by a holder of issuance
+authority for it, with `POST /v1/ops/assets/{asset}/bind` (`REQ-AS-8`). The binding names the asset's
+location on the settlement layer and succeeds only if the settlement layer describes a live asset there
+that matches.
+
+## Registered wrongly
+
+An asset registered by mistake and never used can be retired, swept and removed (`remove_asset`); one in
+use can be deprecated, so it takes no new operation (`ERR-AssetDeprecated`) while its balances stay
+readable.
