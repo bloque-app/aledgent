@@ -1,0 +1,72 @@
+---
+title: Least privilege
+description: The operator holds nothing by default; grant one capability for one task, act, revoke.
+sidebar:
+  order: 3
+---
+
+import { Steps } from '@astrojs/starlight/components';
+
+Cites `REQ-OS-1`, `REQ-AU-5`, `REQ-ID-6`, `REQ-AU-7`, `REQ-AT-1`.
+
+Every operator capability is its own operation kind, with its own authority, audit record and required
+justification (`REQ-OS-1`). There is no "all of the above". **The operator holds none by default**: every
+operator command needs a live operator grant of that kind, held by the operator's identity.
+
+## The routine
+
+<Steps>
+
+1. **Grant yourself one kind, briefly.** `expires` is milliseconds since the Unix epoch; make it minutes
+   away, not days.
+
+   ```sh
+   curl -X POST "$INGRESS/v1/ops/operator-grants" -H "Authorization: Bearer $OPERATOR_TOKEN" \
+     -H "client-key: og-register-asset-2026-11-20" -H "content-type: application/json" \
+     -d '{"principal":"'$OPERATOR'","kinds":["register_asset"],
+          "justification":"Register CRD for the credits integration, ticket 123",
+          "expires":'$(( $(date +%s) * 1000 + 15 * 60 * 1000 ))'}'
+   ```
+
+   `result.grant` is the grant.
+
+2. **Act.** Here, register the asset (see [Registering an asset](../registering-assets/)).
+
+3. **Revoke.**
+
+   ```sh
+   curl -X POST "$INGRESS/v1/ops/operator-grants/$GRANT/revoke" -H "Authorization: Bearer $OPERATOR_TOKEN" \
+     -H "client-key: og-register-asset-2026-11-20-revoke" -H "content-type: application/json" \
+     -d '{"justification":"Done"}'
+   ```
+
+</Steps>
+
+Every step is attributed and audited (`REQ-AU-7`, `REQ-AT-1`), with its justification.
+
+## Reading the refusals
+
+| Refusal | Means |
+|---|---|
+| `ERR-AuthorityRevoked` | A grant of that kind existed and was revoked |
+| `ERR-NotAuthorised` | None ever existed, or it lapsed (`expires` passed) |
+| `ERR-JustificationRequired` | The command came without a `justification` |
+
+## The kinds
+
+Each is granted on its own: `resolve_operation`, `resume`, `propose_reversal`, `approve_reversal`,
+`freeze_account`, `unfreeze_account`, `register_asset`, `deprecate_asset`, `remove_asset`,
+`issuance_authority`, `declare_adapter_support`, `privileged_read`, `import_book`,
+`load_opening_balances`, `anchor_checkpoint`, `compare_settlement`, `legal_disclosure`, `read_signals`,
+`import_credentials`, `open_identity`. The [operator API](../../api/operator/) lists the routes.
+
+Operator authority reaches only accounts in delegated custody, and never, through a grant over all of
+them, an account the operator's own identity owns (`REQ-AU-5`).
+
+## `open_identity` is different
+
+`open_identity` is the **identities principal's role** (`REQ-ID-6`). It is granted alone, never combined
+with another kind: a grant that mixes it with others is `ERR-NotAuthorised`. At most one principal besides
+the operator holds it at a time; granting it to another revokes it from the holder in the same operation.
+
+The operator does not grant it to itself to open identities: the operator opens identities by policy.

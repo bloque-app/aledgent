@@ -1,0 +1,133 @@
+---
+title: A credits integration
+description: A service that sells credits through a payment provider and charges them for usage, from setup to refunds.
+sidebar:
+  order: 7
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+Cites `REQ-ID-6`, `REQ-ID-7`, `REQ-AS-3`, `REQ-AS-7`, `REQ-AU-10`, `REQ-OP-10`, `REQ-PO-5`, `REQ-CS-7`,
+`INV-14`.
+
+A worked example: a platform sells credits through a payment provider, keeps them in aledgent, and charges
+them as its users run tasks. The credits are a **book-only asset** (`REQ-AS-7`): value enters only by
+issuance and leaves only by redemption. Below, `CRD` is that asset; amounts are minor units, as strings.
+
+## Setup (once, with the deployment's operator)
+
+<Steps>
+
+1. **The asset.** The operator registers `CRD`, book-only, with its one precision. Asset ids are stored in
+   uppercase (`REQ-AS-3`): one registered as `crd` is `CRD`. Read it back with `GET /v1/assets` and use the
+   stored id everywhere.
+
+2. **Your service's identity and key.** The deployment opens your service's identity with an API key; see
+   [API keys from zero](../api-keys/).
+
+3. **Issuance authority.** The operator grants your service an issuance grant over `CRD`, naming `issue`
+   and `redeem`, with a `per_window` bound (`REQ-AU-10`).
+
+4. **Your collection account.** Your service opens its own account, where captured credits land:
+
+   ```sh
+   curl -X POST "$INGRESS/v1/accounts" -H "Authorization: Bearer $API_KEY" \
+     -H "client-key: collection-account" -H "content-type: application/json" \
+     -d '{"owner":"'$SERVICE_IDENTITY'","kind":"customer","custody":"delegated"}'
+   ```
+
+   `result.account` is its identifier.
+
+</Steps>
+
+## Map your users first
+
+aledgent does not know your users and holds no facts about them (`REQ-ID-7`). You keep the map from your
+user to the aledgent identity and ledger account that serve them, in your own store, or you use the
+deployment's own resolver if it offers one.
+
+That map is a privilege: whoever can read it can find any user's account. Prefer the design where the
+**deployment's identity service** opens the identity and the account, and hands your service only the
+account identifier and a grant over it. Then your service never resolves users it was not given.
+
+## Signup: open the user's account
+
+Two ways, depending on the deployment:
+
+- **The identities principal opens it** (the recommended design above). It opens the user's identity and a
+  customer account in delegated custody, and grants your service a delegated grant over that account
+  (`REQ-ID-6`). You receive the account id.
+- **You open it under an `open_account` grant** over the user's identity, made by the identity or by the
+  identities principal; see [Grants](../grants/#opening-accounts-for-an-identity).
+
+Either way, the grant your service holds over the user's account names `reserve`, `capture` and
+`release` (and `transfer`, for [costs known afterwards](../metered-usage/#the-cost-is-known-only-afterwards)),
+limited to `CRD` and to your collection account as counterparty, with bounds.
+
+## Payment: credit on the provider's paid event
+
+When the provider reports a paid invoice, issue the credits to the user's account. **Use the provider's
+invoice id as the client key**, so a webhook delivered twice never credits twice (`REQ-OP-10`), and put the
+provider's ids in `reference` for reconciliation (`REQ-PO-5`):
+
+```sh
+curl -X POST "$INGRESS/v1/issuances" -H "Authorization: Bearer $API_KEY" \
+  -H "client-key: invoice-$INVOICE_ID" -H "content-type: application/json" \
+  -d '{"asset":"CRD","destination":"'$USER_ACCOUNT'","amount":"5000",
+       "reference":{"invoice":"'$INVOICE_ID'","customer":"'$PROVIDER_CUSTOMER_ID'"}}'
+```
+
+An issuance is answered with its decision. A `503 ERR-DecisionUnavailable` means "retry with the same key",
+not "failed" (`REQ-CS-7`): answer the provider's webhook with an error so it retries, or retry yourself.
+See [While the core is away](../core-away/).
+
+## Usage: reserve, then capture or release
+
+For each task: reserve its cost against the user's account, run it, then capture the whole reservation
+into your collection account or release it. Use the task id in the client keys. A capture must equal its
+reservation (`INV-14`); the patterns for variable costs are in [Metered usage](../metered-usage/).
+
+A reservation is acknowledged at `202 Received`. Act only on its decision: `Reserved` (run the task) or
+`Rejected` with `ERR-InsufficientAvailable` (the user has too few credits).
+
+## Burning: redeem from your collection account
+
+Captured credits sit in your collection account. Redeem them when you account for them, from that account:
+
+```sh
+curl -X POST "$INGRESS/v1/redemptions" -H "Authorization: Bearer $API_KEY" \
+  -H "client-key: burn-2026-11-20" -H "content-type: application/json" \
+  -d '{"asset":"CRD","source":"'$COLLECTION_ACCOUNT'","amount":"120000"}'
+```
+
+A redemption needs both your issuance grant and authority over the source account, which you have as its
+owner. There is no "redeem a reservation": a redemption is a separate command from an account.
+
+## Refunds
+
+- **A charge made in error:** transfer it back from your collection account to the user's account.
+- **Unused credits, refunded in money:** move them out of the user's account to your collection account
+  with a `transfer` (your grant must name `transfer`), redeem them, and then refund on the provider, with
+  the provider's refund id in each client key and `reference`.
+
+## Reads
+
+| You want | Read |
+|---|---|
+| A user's credits | `GET /v1/balances?account=<user's account>&asset=CRD`: `available` is what can be spent, `reserved` is held by open reservations |
+| What happened to one command | `GET /v1/operations/{operation_reference}` |
+| A user's history | `GET /v1/movements`, filtered and paged; see [Reading the book](../../start/reading-the-book/) |
+
+## Common errors
+
+| You see | Usually | Do |
+|---|---|---|
+| `ERR-NotAuthorised` | The grant does not name this operation, asset or counterparty, or has lapsed | Check the grant ([Grants](../grants/)) |
+| `ERR-UnknownAsset` | The asset id's case | Use the stored id from `GET /v1/assets` |
+| `ERR-AmountMismatch` | A capture that is not the full reservation | [Metered usage](../metered-usage/) |
+| `ERR-InsufficientAvailable` | The user's available credits are short | Decline the task |
+| `ERR-ClientKeyReused` | A key reused for a different request | One key per request, derived from your own ids |
+| `ERR-DecisionUnavailable` | No core decided in time | Retry with the same key after `Retry-After` |
+| `ERR-CredentialInvalid` | The API key | [API keys from zero](../api-keys/) |
+
+Every condition is in the [error catalogue](../../errors/).

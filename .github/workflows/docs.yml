@@ -2,19 +2,29 @@
 # SPDX-License-Identifier: Apache-2.0 OR MIT
 name: Docs site
 
-# The public documentation site (site/, Starlight). Builds on every PR that touches it or the
-# ingress OpenAPI document the API reference is generated from; deploys to GitHub Pages from main.
+# The public documentation site (site/, Starlight). Builds on every PR that touches it, the ingress
+# OpenAPI document the API reference and the error catalogue are generated from, or the documents the
+# site renders (SPEC.md, PLAN.md, OVERVIEW.md); deploys to GitHub Pages from main. The build is the
+# check: specsite's strict identifiers, the error catalogue against SPEC.md §10 and the OpenAPI
+# document (site/lib/errors.mjs), the guide pages' identifiers (site/lib/id-links.mjs), and every
+# internal link (site/lib/check-links.mjs).
 on:
   push:
     branches: [main]
     paths:
       - "site/**"
       - "services/ingress/openapi.json"
+      - "SPEC.md"
+      - "PLAN.md"
+      - "OVERVIEW.md"
       - ".github/workflows/docs.yml"
   pull_request:
     paths:
       - "site/**"
       - "services/ingress/openapi.json"
+      - "SPEC.md"
+      - "PLAN.md"
+      - "OVERVIEW.md"
       - ".github/workflows/docs.yml"
   workflow_dispatch:
 

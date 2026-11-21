@@ -1,0 +1,92 @@
+---
+title: API keys from zero
+description: Generate a secret, open the identity with its hash, build the key, and issue or replace keys later.
+sidebar:
+  order: 2
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+Cites `F-028`, `REQ-AU-8`, `REQ-AU-20`, `REQ-ID-6`.
+
+This is the path for a service's **first** key, when the deployment opens your identity. Later keys are
+simpler (see [More keys](#more-keys-and-a-lost-one)).
+
+<Steps>
+
+1. **Generate the secret and its verifier.** 32 random bytes. The verifier is the hex SHA-256 of the
+   **raw bytes**.
+
+   ```js
+   // Node 18 or later
+   import { randomBytes, createHash } from 'node:crypto';
+
+   const secret = randomBytes(32);
+   const verifier = createHash('sha256').update(secret).digest('hex');
+   // Keep `secret` in your secret store. Send only `verifier`.
+   ```
+
+   <Aside type="danger" title="Hash the bytes, not their text">
+   Hashing the hex or base64 text of the secret gives a verifier that never authenticates, and nothing
+   reports why: every call is `ERR-CredentialInvalid`.
+   </Aside>
+
+2. **Have the identity opened with that verifier.** Whoever may open identities (the operator or the
+   identities principal, `REQ-ID-6`) sends:
+
+   ```sh
+   curl -X POST "$INGRESS/v1/identities" \
+     -H "Authorization: Bearer $OPENER_TOKEN" \
+     -H "client-key: open-identity-my-service" \
+     -H "content-type: application/json" \
+     -d '{"kind":"organisation","scheme":"api-key","verifier":"<verifier, hex>"}'
+   ```
+
+   The reply carries `result.identity` (`did:aledgent:id:…`) and `result.credential`
+   (`did:aledgent:cred:…`).
+
+3. **Build the key.** Take the credential identifier's body (the part after `did:aledgent:cred:`) and the
+   secret in base64url without padding:
+
+   ```js
+   const body = credential.slice('did:aledgent:cred:'.length);
+   const apiKey = `aledgent_ak1.${body}.${secret.toString('base64url')}`;
+   ```
+
+4. **Call with it.**
+
+   ```sh
+   curl "$INGRESS/v1/assets" -H "Authorization: Bearer $API_KEY"
+   ```
+
+   If ingress refuses it with `ERR-CredentialInvalid`, check the verifier (step 1), the body (step 3,
+   no `did:` prefix), and whether the deployment accepts your identity's key (see
+   [service principals](../principals-and-credentials/#service-principals-and-the-dep-7-switch)).
+
+</Steps>
+
+## More keys, and a lost one
+
+A further key needs no secret from you. Ask for one with a credential you already hold:
+
+```sh
+curl -X POST "$INGRESS/v1/credentials" \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "client-key: second-key-2026-11" \
+  -H "content-type: application/json" \
+  -d '{"marker":"ordinary","scheme":"api-key"}'
+```
+
+Ingress draws the secret and returns the whole key **once**, in `api_key`. Add `"scope": [<accounts>]` to
+limit it to some of your accounts.
+
+**A lost secret cannot be recovered**: aledgent holds only its hash. Issue a new key, then remove the old
+credential with `POST /v1/credentials/{credential}/remove`. If you hold no working key at all, the
+identities principal can register a new one into your set, acting for your identity (`on-behalf-of`, see
+[Acting for another identity](../on-behalf-of/)), when it manages your identity.
+
+## Where the secret lives
+
+The key is a bearer secret: anyone who has it is you. Keep it in a secret store, never in a URL, a log
+line or a repository (`REQ-AU-8`). Rotate by issuing a second key, switching to it, and removing the
+first.

@@ -1,0 +1,79 @@
+---
+title: Metered usage
+description: Charging for usage when a capture must equal its reservation, and when the cost is known only afterwards.
+sidebar:
+  order: 8
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Cites `INV-14`, `REQ-BA-4`, `REQ-OP-10`, `REQ-CS-3`.
+
+A reservation holds value against an account at once (`REQ-BA-4`). It ends in exactly one of two ways:
+**capture**, which moves the reserved value to a destination, or **release**, which gives it back. A
+reservation and its capture or release are one object, matched by identity, and **a capture must clear
+exactly the reserved amount** (`INV-14`). There is no partial capture: a capture of any other amount is
+`ERR-AmountMismatch`.
+
+Every integrator that charges for usage meets this. Pick the pattern by when you know the cost.
+
+## The cost is known before the work
+
+Reserve the cost, do the work, then capture or release. Use your task id in the reservation's client key.
+
+```sh
+# 1. Reserve. Acknowledged at Received (202); the decision follows.
+curl -X POST "$INGRESS/v1/reservations" -H "Authorization: Bearer $API_KEY" \
+  -H "client-key: task-7f3c2a-reserve" -H "content-type: application/json" \
+  -d '{"payer":"'$USER_ACCOUNT'","asset":"CRD","amount":"1500","reference":{"task":"7f3c2a"}}'
+
+# 2. Wait for Reserved (notification, or GET /v1/operations/{reference}). Rejected means declined.
+
+# 3a. The work succeeded: capture all of it into your collection account.
+curl -X POST "$INGRESS/v1/reservations/$RESERVATION/capture" -H "Authorization: Bearer $API_KEY" \
+  -H "client-key: task-7f3c2a-capture" -H "content-type: application/json" \
+  -d '{"destination":"'$COLLECTION_ACCOUNT'","cleared":"1500"}'
+
+# 3b. The work failed: release it.
+curl -X POST "$INGRESS/v1/reservations/$RESERVATION/release" -H "Authorization: Bearer $API_KEY" \
+  -H "client-key: task-7f3c2a-release" -H "content-type: application/json" -d '{}'
+```
+
+If the cost changes before the capture, **release and reserve again** for the new amount, then capture
+that. Or charge in small fixed steps, one reservation per step.
+
+## The cost is known only afterwards
+
+An LLM proxy, say: the price depends on the tokens the call used. Reserve a **cap** before the call, then:
+
+- **The cost equals the cap:** `capture` it. Done.
+- **Otherwise:** `release` the reservation, then charge the real cost with a `transfer` from the user's
+  account to your collection account, with the request id in its client key
+  (`request-<id>-charge`).
+
+The grant over the user's account then needs `transfer` as well as `reserve`, `capture` and `release`.
+Limit it to your collection account with `counterparties`.
+
+<Aside type="caution" title="Trade-off, stated plainly">
+Between the release and the transfer, the value is no longer held. If the user spends it elsewhere in
+that gap, the transfer is refused (`ERR-InsufficientAvailable`) and you have done the work unpaid. A
+partial capture would close the gap; aledgent has none (`INV-14`). Keep the gap short (release and
+transfer back to back), and size the cap so the cost rarely exceeds it.
+</Aside>
+
+## At volume
+
+One reservation per call is many operations. For a session of many calls:
+
+- reserve one **budget** for the session;
+- meter the calls on your side;
+- at the session's end, either capture the budget (if it was used up) or release it and send **one**
+  transfer for the session's total.
+
+The same trade-off applies to that final transfer.
+
+## Keys for each step
+
+Each step is its own command and needs its own client key, stable across retries: derive them from your
+own ids (`task-<id>-reserve`, `task-<id>-capture`), never from a timestamp. A retry with the same key
+returns the first reply; a different request under a used key is `ERR-ClientKeyReused` (`REQ-OP-10`).

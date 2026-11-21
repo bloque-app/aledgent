@@ -1,0 +1,72 @@
+---
+title: Grants
+description: Delegated, issuance and operator grants; what a grant is over, what it may do, and its bounds.
+sidebar:
+  order: 4
+---
+
+Cites `REQ-AU-2`, `REQ-AU-3`, `REQ-AU-4`, `REQ-AU-5`, `REQ-AU-10`, `REQ-ID-6`, `REQ-OS-1`, `NFR-20`.
+
+A grant gives one principal bounded authority over something it does not own. It is the only way one
+principal acts on another's account.
+
+## Three kinds
+
+| `kind` | Over | Granted by | Used for |
+|---|---|---|---|
+| `delegated` | One ledger account, or one identity (to open its accounts) | The owner, the identities principal, or the holder of a wider grant it narrows | Moving value on someone else's account |
+| `issuance` | One asset | The operator (`POST /v1/ops/issuance-grants`) | `issue` and `redeem` of that asset (`REQ-AU-10`) |
+| `operator` | Operator capabilities | The operator (`POST /v1/ops/operator-grants`) | The operator surface; see [Least privilege](../../operate/least-privilege/) |
+
+A delegated grant is made with `POST /v1/grants`:
+
+```json
+{
+  "kind": "delegated",
+  "principal": "did:aledgent:id:<the service>",
+  "subject": { "account": "did:aledgent:acct:<the user's account>" },
+  "ops": ["reserve", "capture", "release"],
+  "assets": ["CRD"],
+  "counterparties": ["did:aledgent:acct:<the service's collection account>"],
+  "per_operation": "100000",
+  "per_window": { "length": 86400000, "limit": "1000000" },
+  "expires": 1798761600000
+}
+```
+
+| Field | Means |
+|---|---|
+| `principal` | Who will hold it |
+| `subject` | What it is over: `{"account": …}`, `{"identity": …}` (only with `open_account`), `{"asset": …}` (issuance), or `"delegated_accounts"` (operator authority over every account in delegated custody) |
+| `ops` | The operation kinds it may be used for: `transfer`, `reserve`, `capture`, `release`, `issue`, `redeem`, `close_account`, `disclose`, `open_account`, and others the [API reference](../../api/) lists |
+| `assets`, `counterparties` | Optional limits: only these assets, only to or from these accounts |
+| `per_operation` | The most one operation may move, in minor units |
+| `per_window` | The most that may move in one window: `length` in milliseconds, `limit` in minor units |
+| `expires` | When it stops working, in milliseconds since the Unix epoch |
+| `parent` | The grant it narrows, if any |
+
+## The rules that bind every grant
+
+- **Bounded by construction.** A grant over an account with no bound cannot be made: it is
+  `ERR-UnboundedGrant` (`REQ-AU-2`). Give it `per_operation`, `per_window`, or both.
+- **Narrowing only.** A grant made under another (`parent`) is never wider in kind or bound
+  (`REQ-AU-4`).
+- **Revocation is at once and for everything under it** (`REQ-AU-3`): `POST /v1/grants/{grant}/revoke`.
+  For a short while after it commits (`NFR-20`'s bound), operations already inside the grant's bound
+  may still stand.
+- **Revoked and lapsed are different answers.** A revoked grant gives `ERR-AuthorityRevoked`; one past
+  `expires` gives `ERR-NotAuthorised`, as if it had never existed.
+- **Over the bound** is `ERR-BoundExceeded`, and a refused command spends nothing of the window.
+
+## Opening accounts for an identity
+
+A delegated grant over an **identity** that names `open_account` lets its holder open customer accounts
+in delegated custody for that identity (`REQ-ID-6`). It is made by the identity itself or by the
+identities principal; no other grant names `open_account`, and it reaches no account by itself. It may
+also name the operation kinds its holder may then delegate over those accounts, always as a narrowing of
+it. See [A credits integration](../credits-example/#signup-open-the-users-account).
+
+## Reading what is granted
+
+`GET /v1/accounts/{account}/grants` lists the grants over an account; `GET /v1/identities/{identity}/grants`
+the grants an identity holds.

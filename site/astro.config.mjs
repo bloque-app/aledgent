@@ -6,6 +6,10 @@ import starlight from '@astrojs/starlight';
 import starlightOpenAPI, { createOpenAPISidebarGroup } from 'starlight-openapi';
 import specsite from 'specsite';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { generateErrors } from './lib/errors.mjs';
+import { buildIdIndex } from './lib/id-links.mjs';
+import { specsiteOptions } from './lib/specsite-options.mjs';
 
 // GitHub Pages serves a project site under /<repo>/. Both values come from the environment so the
 // same build works for a fork, a custom domain (SITE_BASE=/) or a local preview.
@@ -32,6 +36,14 @@ const generated = new URL('./.generated/', import.meta.url);
 mkdirSync(generated, { recursive: true });
 writeFileSync(new URL('openapi-integrator.json', generated), JSON.stringify(half((p) => !OPERATOR(p), spec.info?.title ?? 'aledgent')));
 writeFileSync(new URL('openapi-operator.json', generated), JSON.stringify(half(OPERATOR, `${spec.info?.title ?? 'aledgent'}: operator API`)));
+
+// The error catalogue, one page per ERR-* of SPEC.md §10, generated on every build from §10, this same
+// OpenAPI document and src/data/error-actions.md (lib/errors.mjs). It throws, and the build fails, when
+// the three disagree. The pages land in a gitignored folder; nothing is committed.
+// Where every identifier is defined, for the guide pages' links (lib/id-links.mjs).
+writeFileSync(new URL('id-index.json', generated), JSON.stringify(await buildIdIndex(fileURLToPath(new URL('.', import.meta.url)))));
+
+generateErrors({ root: new URL('../', import.meta.url), out: new URL('./src/content/docs/errors/', import.meta.url) });
 
 export default defineConfig({
 	site,
@@ -73,6 +85,7 @@ export default defineConfig({
 			components: {
 				Footer: './src/components/Footer.astro',
 				Hero: './src/components/Hero.astro',
+				MarkdownContent: './src/components/MarkdownContent.astro',
 			},
 			expressiveCode: {
 				themes: ['github-light', 'github-dark'],
@@ -99,23 +112,18 @@ export default defineConfig({
 				]),
 				// The specification, plan and overview, rendered from the repo's own Markdown on every build
 				// (the .md files are the source of truth; nothing is copied). Ids link to their definition.
-				specsite({
-					root: '..',
-					documents: [
-						{ file: 'SPEC.md', slug: 'spec', title: 'Specification', split: 'h2',
-							defines: ['REQ', 'INV', 'NFR', 'OQ', 'DEF', 'ERR', 'US', 'AC', 'CTR', 'CND'] },
-						{ file: 'PLAN.md', slug: 'plan', title: 'Plan', defines: ['DEC', 'F', 'M', 'RISK', 'DEP', 'T'] },
-						{ file: 'OVERVIEW.md', slug: 'overview', title: 'Overview', defines: false },
-					],
-					ids: { prefixes: ['REQ', 'INV', 'NFR', 'OQ', 'DEF', 'DEC', 'ERR', 'US', 'AC', 'CTR', 'CND', 'T', 'F', 'M', 'RISK', 'DEP'] },
-					check: 'error',
-					sidebar: { label: 'Specification' },
-				}),
+				specsite(specsiteOptions),
 			],
 			sidebar: [
 				{ label: 'Start', items: [{ autogenerate: { directory: 'start' } }] },
 				{ label: 'Concepts', items: [{ autogenerate: { directory: 'concepts' } }] },
-				{ label: 'Integrate', items: [{ autogenerate: { directory: 'integrate' } }] },
+				{
+					label: 'Integrate',
+					items: [
+						{ autogenerate: { directory: 'integrate' } },
+						{ label: 'Errors', collapsed: true, items: [{ autogenerate: { directory: 'errors' } }] },
+					],
+				},
 				{ label: 'Operate', items: [{ autogenerate: { directory: 'operate' } }] },
 				apiGroup,
 				operatorGroup,
