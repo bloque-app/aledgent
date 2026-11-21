@@ -857,11 +857,23 @@ jobs:
     needs: gate
     if: ${{ !cancelled() && !contains(fromJSON('["skip","hotfix"]'), needs.gate.outputs.mode) }}
     runs-on: ubuntu-latest
+    env:
+      # The root rust-toolchain.toml says `stable`, which rustup honours inside the checkout over
+      # the action's default; this overrides it so the pins build on the pinned compiler.
+      RUSTUP_TOOLCHAIN: 1.99.1
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned, not floating: kreivo-pin-132 keeps Kreivo 1.3.2's old dependencies on purpose, and
+      # trie-db 0.31 stopped compiling on 1.100.0 (rust-lang/rust#148922, E0277). 1.99.1 is the
+      # last stable these workspaces built on. Raise it on purpose, with the pins.
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: rustfmt, clippy
+      - name: Compiler in use, per pin directory
+        run: |
+          for d in services/settle/kreivo-pin services/settle/kreivo-pin-136 services/settle/kreivo-pin-132 spikes; do
+            (cd "$d" && echo "== $d" && rustc --version && cargo --version)
+          done
       - name: kreivo pin (kreivo-pin)
         run: |
           m=services/settle/kreivo-pin/Cargo.toml
