@@ -55,5 +55,5 @@ acts on its own accounts as their owner, and needs no grant for them.
 ## The API description
 
 The routes and bodies are in the [API reference](../../api/), generated from ingress's own OpenAPI
-document. Ingress also serves that document at `GET /openapi.json`, which today needs a credential like
-any other route.
+document. Ingress also serves that document at `GET /openapi.json`. That route is public: it
+needs no credential, and it carries no ledger fact. Every other route needs one (`NFR-7`, amendment 0044).
