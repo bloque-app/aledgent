@@ -39,11 +39,6 @@ deployment's**: the values below are the shipped defaults. Every rule labels its
 and an `owner` (shipped as generic team names), which you map to your own teams in Alertmanager. Severity `page` pages a human;
 `warning` shows on the dashboard only.
 
-<Aside type="note">
-The runbooks linked below are the repository's own, written for this deployment shape. Public versions
-for the documentation site are being written.
-</Aside>
-
 ## Age of the oldest non-terminal operation
 
 `REQ-OP-8`. How long the oldest operation that has not reached `Settled`, `Released` or `Rejected` has been
@@ -57,8 +52,8 @@ open. A large age means something is waiting on evidence, on a human, or on a co
 
 | Alert | Fires when | Runbook |
 | --- | --- | --- |
-| `AledgentOldestNonTerminalOverServiceLevel` | Oldest non-terminal operation over 1 h, for 5 min | [restore](https://github.com/bloque-app/aledgent/blob/main/ops/runbooks/restore.md) |
-| `AledgentReceivedOverDecisionBound` | A received command undecided for over 60 s, for 1 min | [restore](https://github.com/bloque-app/aledgent/blob/main/ops/runbooks/restore.md); for a restarting core, [Core restarts](../core-restarts/) |
+| `AledgentOldestNonTerminalOverServiceLevel` | Oldest non-terminal operation over 1 h, for 5 min | [restore](../runbooks/restore/) |
+| `AledgentReceivedOverDecisionBound` | A received command undecided for over 60 s, for 1 min | [restore](../runbooks/restore/); for a restarting core, [Core restarts](../core-restarts/) |
 | `AledgentReviewOverdue` | Any `Needs-Review` operation past its service level | Resolve it: [Overview](../overview/#when-an-operation-needs-a-human) |
 
 ## Observation completeness
@@ -76,11 +71,11 @@ recorded as an explicit gap.
 
 | Alert | Fires when | Runbook |
 | --- | --- | --- |
-| `AledgentObservationGap` | Any skipped range | [gap filling](https://github.com/bloque-app/aledgent/blob/main/ops/runbooks/gap-filling.md) |
-| `AledgentSettlementChainMismatch` | Any chain mismatch | [gap filling](https://github.com/bloque-app/aledgent/blob/main/ops/runbooks/gap-filling.md) |
-| `AledgentObservationStopped` | Observation waits for an operator | [gap filling](https://github.com/bloque-app/aledgent/blob/main/ops/runbooks/gap-filling.md) |
-| `AledgentSettlementEpochRefused` | The core refused to follow a new sequence of the layer's record; new withdrawals are refused meanwhile | [gap filling](https://github.com/bloque-app/aledgent/blob/main/ops/runbooks/gap-filling.md) |
-| `AledgentObservationLag` | Cursor more than 100 positions behind, for 10 min | [gap filling](https://github.com/bloque-app/aledgent/blob/main/ops/runbooks/gap-filling.md) |
+| `AledgentObservationGap` | Any skipped range | [gap filling](../runbooks/gap-filling/) |
+| `AledgentSettlementChainMismatch` | Any chain mismatch | [gap filling](../runbooks/gap-filling/) |
+| `AledgentObservationStopped` | Observation waits for an operator | [gap filling](../runbooks/gap-filling/) |
+| `AledgentSettlementEpochRefused` | The core refused to follow a new sequence of the layer's record; new withdrawals are refused meanwhile | [gap filling](../runbooks/gap-filling/) |
+| `AledgentObservationLag` | Cursor more than 100 positions behind, for 10 min | [gap filling](../runbooks/gap-filling/) |
 
 ## Undelivered notifications
 
@@ -100,21 +95,23 @@ used up its delivery attempts. See [Notifications](../../integrate/notifications
 
 `REQ-PR-1`, `REQ-PR-8`, `F-017`. The time since the newest checkpoint whose anchor is final on the
 settlement layer was created; before the first is final, the age of the oldest checkpoint. Anchoring is
-hourly by default and one checkpoint at a time, so a lag over twice the cadence means anchors are not
-reaching finality. A lag reduces provability only: holders' operations go on
+hourly by default and one checkpoint at a time. With no new posting the cadence makes no checkpoint, so a
+quiet book's lag grows without being late: what matters is a large lag **while postings wait** past the
+latest checkpoint, which means anchors are not reaching finality. A lag reduces provability only: holders' operations go on
 ([While the settlement layer is away](../../concepts/settlement-layer-away/)).
 
 | Read as | Metric |
 | --- | --- |
 | `anchor_lag`, `anchor_in_flight_age`; every checkpoint with its status at `GET /v1/ops/anchors` | `aledgent_anchor_lag_ms`, `aledgent_anchor_in_flight_age_ms` |
+| `anchor_unanchored_entries`: postings after the latest checkpoint's entry sequence (every posting, before the first checkpoint). Absent from a core that does not report it, which then exports no series | `aledgent_anchor_unanchored_entries` |
 | `anchor_incidents`, per kind | `aledgent_anchor_incidents{kind=…}` |
 
 | Alert | Fires when | Runbook |
 | --- | --- | --- |
-| `AledgentAnchorLag` | Newest final checkpoint older than 2 h | [anchoring](https://github.com/bloque-app/aledgent/blob/main/ops/runbooks/anchoring.md) |
-| `AledgentAnchorStuck` | A checkpoint in flight for over 1 h | [anchoring](https://github.com/bloque-app/aledgent/blob/main/ops/runbooks/anchoring.md) |
-| `AledgentAnchorCommitmentMismatch` | The layer recorded an anchor of this number with another commitment; anchoring stops | [anchoring](https://github.com/bloque-app/aledgent/blob/main/ops/runbooks/anchoring.md) |
-| `AledgentUnknownAnchor` | The layer holds an anchor aledgent never made | [anchoring](https://github.com/bloque-app/aledgent/blob/main/ops/runbooks/anchoring.md) |
+| `AledgentAnchorLag` | Newest final checkpoint older than 2 h **and** postings waiting past the latest checkpoint, for 10 min. It cannot fire against a core that does not report the waiting postings | [anchoring](../runbooks/anchoring/) |
+| `AledgentAnchorStuck` | A checkpoint in flight for over 1 h | [anchoring](../runbooks/anchoring/) |
+| `AledgentAnchorCommitmentMismatch` | The layer recorded an anchor of this number with another commitment; anchoring stops | [anchoring](../runbooks/anchoring/) |
+| `AledgentUnknownAnchor` | The layer holds an anchor aledgent never made | [anchoring](../runbooks/anchoring/) |
 
 ## Reconciliation outcome per axis
 
@@ -132,10 +129,10 @@ runs it and writes the records the exporter reads.
 
 | Alert | Fires when | Runbook |
 | --- | --- | --- |
-| `AledgentReconciliationDifference` | Any difference on any axis | [reconciliation failure](https://github.com/bloque-app/aledgent/blob/main/ops/runbooks/reconciliation-failure.md) |
-| `AledgentReconciliationNotRun` | An axis has not run in 24 h | [reconciliation failure](https://github.com/bloque-app/aledgent/blob/main/ops/runbooks/reconciliation-failure.md) |
-| `AledgentSettlementDifference` | The latest settlement comparison differs, by as little as one minor unit | [reconciliation failure](https://github.com/bloque-app/aledgent/blob/main/ops/runbooks/reconciliation-failure.md) |
-| `AledgentSuspenseNotReconciled` | A `Suspense` balance not zero for over a day | [reconciliation failure](https://github.com/bloque-app/aledgent/blob/main/ops/runbooks/reconciliation-failure.md) |
+| `AledgentReconciliationDifference` | Any difference on any axis | [reconciliation failure](../runbooks/reconciliation-failure/) |
+| `AledgentReconciliationNotRun` | An axis has not run in 24 h | [reconciliation failure](../runbooks/reconciliation-failure/) |
+| `AledgentSettlementDifference` | The latest settlement comparison differs, by as little as one minor unit | [reconciliation failure](../runbooks/reconciliation-failure/) |
+| `AledgentSuspenseNotReconciled` | A `Suspense` balance not zero for over a day | [reconciliation failure](../runbooks/reconciliation-failure/) |
 
 ## Liquidity of the positions that fund settlement
 
@@ -152,13 +149,14 @@ raised per position, and they resume on their own when it clears.
 
 | Alert | Fires when | Runbook |
 | --- | --- | --- |
-| `AledgentLiquidityShortfall` | Any open shortfall; withdrawals are parked | [crank outage](https://github.com/bloque-app/aledgent/blob/main/ops/runbooks/crank-outage.md) |
+| `AledgentLiquidityShortfall` | Any open shortfall; withdrawals are parked | [crank outage](../runbooks/crank-outage/) |
 | `AledgentLaneUnderFeeFloor` | A lane under its fee floor | Fund the lane |
 
 ## Beyond the six
 
 The same rule file pages on more than `NFR-11` asks: completion over its 30 s ceiling at p99
-(`AledgentCompletionOverCeiling`), a stale ticker that moves deadlines (`AledgentTickerStale`), the
+(`AledgentCompletionOverCeiling`), a ticker, which moves deadlines, silent for over 90 s
+(`AledgentTickerStale`; an idle book ticks about once a minute), the
 settlement layer's finalized height not moving (`AledgentBlockProductionStalled`), a fault answered
 `ERR-Internal`, an audit gap, late backups, a failed or overdue restore drill, and the core's halt
 (`AledgentCoreHalted`). Each names its runbook in the rule's `runbook` annotation.
