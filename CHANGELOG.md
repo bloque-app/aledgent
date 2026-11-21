@@ -8,6 +8,30 @@ SPDX-License-Identifier: CC-BY-4.0
 Releases are cut by release-please from the conventional-commit titles of the pull requests merged
 into `main` (`release-please-config.json`). Each entry below is written by its release pull request.
 
+## [0.6.0](https://github.com/bloque-app/aledgent/compare/v0.5.0...v0.6.0) (2026-11-21)
+
+
+### ⚠ BREAKING CHANGES
+
+* **ledger-core:** `ledger_core::ledger::operator::Signals`, `SpecSignal` and `BookSize` are `#[non_exhaustive]`, and `Signals` has the new field `anchor_unanchored_entries`. Code outside `ledger-core` can no longer build them with a struct literal or match them without `..`; read the fields, or start from `Default::default()` inside the crate.
+
+### Features
+
+* **deploy:** one-machine deployment, its guide and the CI walkthrough (T-038-17, T-038-19, M-3D) ([#143](https://github.com/bloque-app/aledgent/issues/143)) ([a062fa2](https://github.com/bloque-app/aledgent/commit/a062fa2c9c950f4bf2021cbaa4770dbe2c2573a6))
+* **ingress:** serve /openapi.json without a credential (NFR-7, amendment 0044) ([#142](https://github.com/bloque-app/aledgent/issues/142)) ([41fd214](https://github.com/bloque-app/aledgent/commit/41fd214ee562a9fd81caced3e85378712eb8a4de))
+* **ledger-core:** Signals is non_exhaustive and carries anchor_unanchored_entries (T-018-13) ([#154](https://github.com/bloque-app/aledgent/issues/154)) ([c0c70ad](https://github.com/bloque-app/aledgent/commit/c0c70add7a766fd254beac1dbfa78922ae841694))
+
+
+### Bug Fixes
+
+* **core-host:** keep the replica across a clean stop, reopen it at start (T-031-25) ([#131](https://github.com/bloque-app/aledgent/issues/131)) ([59cf44f](https://github.com/bloque-app/aledgent/commit/59cf44fb4a41288e380e3a0037b02edd29d72a6d))
+* **core:** reopen a kept replica past the chained generation (T-031-25) ([#135](https://github.com/bloque-app/aledgent/issues/135)) ([e935c21](https://github.com/bloque-app/aledgent/commit/e935c214416908780f098a29fae5e137c0f03893))
+* **core:** stage a scheduled upgrade's code without a restart (T-037-24) ([#130](https://github.com/bloque-app/aledgent/issues/130)) ([0cbbb94](https://github.com/bloque-app/aledgent/commit/0cbbb9482271c5a0dd3301f7d850f1aab023827d))
+* **ops:** page the anchor lag only while postings wait; ticker past its heartbeat (T-018-13, T-018-14) ([#150](https://github.com/bloque-app/aledgent/issues/150)) ([a8d7b45](https://github.com/bloque-app/aledgent/commit/a8d7b45ef584b4b58b34e8a28356cdef755340f9))
+* **ops:** reconcile stale-cut rule and masked refusal reasons ([#144](https://github.com/bloque-app/aledgent/issues/144)) ([e5fb16a](https://github.com/bloque-app/aledgent/commit/e5fb16ad22c099d6644582d1c5260ea22beccecf))
+* promote develop to main (a kept replica reopens past the chained generation) ([294a8fa](https://github.com/bloque-app/aledgent/commit/294a8fad03534b4a0c2c5efc91a3bc33f1f271f1))
+* promote develop to main (in-flight code staging and a replica kept across restarts) ([2bf2d93](https://github.com/bloque-app/aledgent/commit/2bf2d93aae0595c68fcee9f4364d21f565b08074))
+
 ## [0.5.0](https://github.com/bloque-app/aledgent/compare/v0.4.1...v0.5.0) (2026-11-10)
 
 
