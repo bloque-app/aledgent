@@ -95,7 +95,10 @@ const BOOK_ONLY_MOVED: u64 = 2_345;
 /// suite's Kreivo (`e2e/network`), what the book issues of it before the binding (50 BUSDC, at 6
 /// decimals), and what each withdrawal of it takes (0.01 BUSDC).
 const BUSDC: &str = "BUSDC";
+// `Here(101)`, as production binds BUSDC, not one of the small test indexes (`TSTA` and the
+// stress world's other assets are book-only and have no location).
 const BUSDC_INDEX: u32 = 101;
+/// Keep `BUSDC_BOUND` in contracts/settlement/scripts/e2e.mjs at or above this.
 const BUSDC_ISSUED: u64 = 50_000_000;
 const BUSDC_WITHDRAW: u64 = 10_000;
 /// What each fault case's withdrawal takes.
@@ -761,6 +764,28 @@ async fn stress_with_settlement(cx: &mut Ctx, phases: &str, out: &Path) -> Resul
     .ok();
     r?;
     let binding = binding?;
+    // A withdrawal that was refused or did not settle fails the run: the gate must not pass on the
+    // rows that happened to settle.
+    let failed: Vec<&Value> = latencies
+        .iter()
+        .filter(|l| l.get("error").is_some())
+        .collect();
+    if !failed.is_empty() {
+        return Err(format!(
+            "{} of {} withdrawals did not settle (see withdrawals.json): {}",
+            failed.len(),
+            latencies.len(),
+            failed
+                .iter()
+                .take(3)
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+    if settled_busdc.is_empty() {
+        return Err("no BUSDC withdrawal settled after the binding".into());
+    }
     // After the load: a checkpoint covering every withdrawal and the binding, compared at zero
     // difference on every asset, `BUSDC` included (`NFR-9`'s third axis).
     let compared = busdc_compared_at_zero(cxr).await?;
@@ -774,6 +799,11 @@ async fn stress_with_settlement(cx: &mut Ctx, phases: &str, out: &Path) -> Resul
         stress::record::percentiles(settled_busdc),
         binding
     ))
+}
+
+/// `id` as the book's asset id.
+fn asset_id(id: &str) -> Result<ledger_core::asset::AssetId, String> {
+    ledger_core::asset::AssetId::parse(id).map_err(|e| format!("asset {id}: {e:?}"))
 }
 
 /// An operation as ingress shows it to alice, and the last incidents the core holds.
@@ -889,16 +919,10 @@ async fn bind_busdc_under_load(
     )
     .await?;
     let bound_ms = t.elapsed().as_millis() as u64;
+    let busdc = asset_id(BUSDC)?;
     let recorded = d
         .core
-        .with_ledger(|l| {
-            l.state()
-                .settlement()
-                .asset_bind(
-                    &ledger_core::asset::AssetId::parse(BUSDC).unwrap_or_else(|_| unreachable!()),
-                )
-                .copied()
-        })
+        .with_ledger(|l| l.state().settlement().asset_bind(&busdc).copied())
         .flatten()
         .ok_or("no BUSDC binding recorded")?;
     if recorded.amount.get() != BUSDC_ISSUED {
@@ -946,7 +970,7 @@ async fn busdc_compared_at_zero(cx: &Ctx) -> Result<String, String> {
             .map(|n| format!("checkpoint {n} is final"))
     })
     .await?;
-    let asset = ledger_core::asset::AssetId::parse(BUSDC).unwrap_or_else(|_| unreachable!());
+    let asset = asset_id(BUSDC)?;
     let compared = wait(
         "a comparison with BUSDC at zero difference",
         PATIENT,
@@ -954,6 +978,9 @@ async fn busdc_compared_at_zero(cx: &Ctx) -> Result<String, String> {
             d.core
                 .with_ledger(|l| {
                     l.state().anchoring().latest_comparison().and_then(|c| {
+                        // Taken for a checkpoint made after `before`, not left from an earlier
+                        // one: it must name a final checkpoint numbered above it.
+                        c.anchors.iter().any(|n| *n > before).then_some(())?;
                         let row = c.rows.iter().find(|r| r.asset == asset)?;
                         (row.difference() == 0 && c.rows.iter().all(|r| r.difference() == 0))
                             .then(|| format!("cut {}: {:?}", c.cut, row))
@@ -1266,17 +1293,10 @@ async fn book_only(cx: &mut Ctx) -> Result<(), String> {
         (binding_of(&cx.d, BOOK_ONLY).await == "bound").then(|| "bound".to_owned())
     })
     .await?;
+    let bko = asset_id(BOOK_ONLY)?;
     let bound =
         cx.d.core
-            .with_ledger(|l| {
-                l.state()
-                    .settlement()
-                    .asset_bind(
-                        &ledger_core::asset::AssetId::parse(BOOK_ONLY)
-                            .unwrap_or_else(|_| unreachable!()),
-                    )
-                    .copied()
-            })
+            .with_ledger(|l| l.state().settlement().asset_bind(&bko).copied())
             .flatten()
             .ok_or("no binding recorded")?;
     if bound.amount.get() != BOOK_ONLY_ISSUED {
@@ -1317,7 +1337,7 @@ async fn book_only(cx: &mut Ctx) -> Result<(), String> {
         },
     )
     .await?;
-    let asset = ledger_core::asset::AssetId::parse(BOOK_ONLY).unwrap_or_else(|_| unreachable!());
+    let asset = asset_id(BOOK_ONLY)?;
     let compared = wait(
         "a comparison with BKO at zero difference",
         PATIENT,
@@ -1325,6 +1345,9 @@ async fn book_only(cx: &mut Ctx) -> Result<(), String> {
             d.core
                 .with_ledger(|l| {
                     l.state().anchoring().latest_comparison().and_then(|c| {
+                        // Taken for a checkpoint made after `before`, not left from an earlier
+                        // one: it must name a final checkpoint numbered above it.
+                        c.anchors.iter().any(|n| *n > before).then_some(())?;
                         let row = c.rows.iter().find(|r| r.asset == asset)?;
                         (row.difference() == 0 && c.rows.iter().all(|r| r.difference() == 0))
                             .then(|| format!("cut {}: {:?}", c.cut, row))

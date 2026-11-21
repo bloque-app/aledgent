@@ -180,6 +180,8 @@ fn main() {
         {
             // `--no-generation`: an actor that is not the core (the stress suite's shard Agents,
             // F-031) carries no code generation record, and has no code history to fence.
+            // NEVER for the core: a core package without its record has no fence (T-037-01).
+            // release-checks.yml refuses the flag under `deploy/` and in core-release.yml.
             let no_generation = args.len() == 5;
             let elf = std::fs::read(&args[2]).expect("actor ELF");
             let key = ed25519_dalek::SigningKey::from_bytes(&[0x71; 32]);

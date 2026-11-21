@@ -77,6 +77,8 @@ const ASSET2 = JSON.parse(env('ASSET2', '{"Here":2}')); // non-sufficient, minim
 // withdrawal of an asset with no bound (`NoWithdrawalBound`), so the deployment sets one, as the
 // operator does before the first withdrawal.
 const ASSET_BUSDC = JSON.parse(env('ASSET_BUSDC', '{"Here":101}'));
+// At least what the aledgent driver issues of BUSDC (BUSDC_ISSUED in e2e/aledgent-driver), so that
+// the bound never limits a withdrawal in the run.
 const BUSDC_BOUND = 50_000_000n;
 const DEPOSIT = 500_000n;
 const WITHDRAW = 1_000n;
