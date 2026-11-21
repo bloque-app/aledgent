@@ -191,9 +191,13 @@ drill's read of the layer's anchors.
     checkpoint (`GET /v1/trial-balance` `view` - 1 > `entry_sequence`) and those have waited more than a day:
     aged from the oldest newer checkpoint's `created_at`, else the cut's. The core checkpoints only when new
     postings exist (`AC-J1.1`), so a quiet book's old cut is current, and the latest comparison's time (which
-    the job itself refreshes) is never the age. The core exposes no book-wide posting time, so the age can
-    undershoot the first uncovered posting's by up to the checkpoint interval, and a posting made just before
-    a run on a day-old cut reads as stale until the next checkpoint. With no report yet (`ERR-EvidenceInsufficient`), or ingress
+    the job itself refreshes) is never the age. The core exposes no book-wide posting time, so the age is the checkpoint's, not the
+    posting's. A posting made just before a run on a day-old cut is not read as stale: once the checkpoint
+    interval (one hour) has passed since the last checkpoint, the next tick makes one as soon as a posting
+    exists, so the run re-reads `GET /v1/ops/anchors` for up to three minutes (`CHECKPOINT_SETTLE_MS`). A
+    newer checkpoint ends the wait and is aged from its `created_at`. If none appears, the core is not
+    checkpointing new postings (or the last checkpoint is still in flight, and the core makes no new one
+    until it is final): that is `StaleCut`, with a note saying which. With no report yet (`ERR-EvidenceInsufficient`), or ingress
     refusing the job, axis 3 is recorded as not run, and pages as not run after 24 h.
 29. **The daily job** (`reconcile::daily`) runs axes 1 and 2 and the `Suspense` report under the core's
     lock, then axis 3 through ingress, then writes the run's JSON record. `TODO(F-005)`: the host schedules

@@ -24,7 +24,8 @@
 //!   account: the book's position at a cut is derived from the settling postings behind the final
 //!   records below the cut, and compared with the positions the adapter reported at that cut. The
 //!   daily job asks the core to compare at the latest reported cut ([`compare_through`]); a cut
-//!   the book has moved past for more than a day is itself a finding ([`uncovered_since`]).
+//!   the book has moved past for more than a day, or that the core fails to checkpoint new postings, is
+//!   itself a finding ([`assess_cut`]).
 //! - **`Suspense`** (`REQ-LA-2`, `RISK-8`): every non-zero `Suspense` balance, and since when
 //!   ([`suspense_report`]).
 //!
@@ -393,6 +394,65 @@ pub fn uncovered_since(checkpoints: &[CheckpointRead], head: u64) -> Result<Opti
     Ok(Some(newer.unwrap_or(cut.created_at)))
 }
 
+/// The interval between the core's checkpoints (`REQ-PR-1`, `AC-J1.1`): one hour by default
+/// (amendment 0009). A checkpoint is due once this has passed since the last was created.
+pub const CHECKPOINT_INTERVAL_MS: u64 = 3_600_000;
+
+/// How long axis 3 waits for the core to checkpoint postings that no checkpoint covers, when one
+/// is due: a few ticks (a tick is about a minute). The state is normal for about one tick.
+pub const CHECKPOINT_SETTLE_MS: u64 = 180_000;
+
+/// How often axis 3 re-reads the checkpoints while it waits ([`CHECKPOINT_SETTLE_MS`]).
+pub const CHECKPOINT_POLL_MS: u64 = 15_000;
+
+/// How long axis 3 waits for a due checkpoint, and how often it looks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Settle {
+    /// Re-reads after the first, at most.
+    pub polls: u32,
+    /// The pause before each.
+    pub pause: std::time::Duration,
+}
+
+impl Default for Settle {
+    fn default() -> Settle {
+        Settle {
+            polls: (CHECKPOINT_SETTLE_MS / CHECKPOINT_POLL_MS) as u32,
+            pause: std::time::Duration::from_millis(CHECKPOINT_POLL_MS),
+        }
+    }
+}
+
+/// How the book stands against its checkpoints at one read (`AC-J1.1`, `NFR-9`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Cut {
+    /// No posting beyond the latest final cut: current, however old.
+    Covered,
+    /// Postings beyond the latest final cut, no later than this time ([`uncovered_since`]).
+    Since(u64),
+    /// Postings beyond every checkpoint, and a checkpoint is due (the interval has passed since
+    /// the last was created): the next tick should have made one. If this lasts more than a few
+    /// ticks the core is not checkpointing, or its last checkpoint is still in flight (the core
+    /// makes no new one until it is final).
+    Due {
+        /// The last checkpoint the core made.
+        last: CheckpointRead,
+    },
+}
+
+/// [`uncovered_since`], and whether a due checkpoint is missing. `now` is the run's time.
+pub fn assess_cut(checkpoints: &[CheckpointRead], head: u64, now: u64) -> Result<Cut, String> {
+    let since = uncovered_since(checkpoints, head)?;
+    let Some(last) = checkpoints.iter().max_by_key(|c| c.number) else {
+        return Ok(Cut::Covered);
+    };
+    let beyond_all = head.saturating_sub(1) > last.entry_sequence;
+    if beyond_all && now >= last.created_at.saturating_add(CHECKPOINT_INTERVAL_MS) {
+        return Ok(Cut::Due { last: last.clone() });
+    }
+    Ok(since.map_or(Cut::Covered, Cut::Since))
+}
+
 /// Axis 3's comparison (`REQ-PR-5`, `AC-J3.1`, `AC-J3.2`): `F-017`'s `compare_settlement` at the
 /// latest cut the adapter reported, per asset. Implementations say whether it could run and what
 /// it found.
@@ -428,9 +488,9 @@ impl SettlementComparator for NotRun {
 pub struct Compared {
     /// The comparison, as ingress returned it.
     pub comparison: ComparisonBody,
-    /// Since when the book has postings beyond the latest final cut ([`uncovered_since`]); `None`
-    /// when it has none, or when that could not be read (said in the notes).
-    pub uncovered_since: Option<u64>,
+    /// How the book stands against its checkpoints ([`assess_cut`]); `None` when that could not be
+    /// read (said in the notes).
+    pub cut: Option<Cut>,
     /// When axis 3 ran.
     pub now: u64,
 }
@@ -451,11 +511,19 @@ impl SettlementComparator for Compared {
         if c.differs && out.is_empty() {
             out.push(Finding::SettlementDiffers { cut: c.cut });
         }
-        if let Some(at) = self.uncovered_since {
-            let age = self.now.saturating_sub(at);
-            if age > MAX_CUT_AGE_MS {
-                out.push(Finding::StaleCut { cut: c.cut, age });
+        match &self.cut {
+            Some(Cut::Since(at)) => {
+                let age = self.now.saturating_sub(*at);
+                if age > MAX_CUT_AGE_MS {
+                    out.push(Finding::StaleCut { cut: c.cut, age });
+                }
             }
+            // A checkpoint was due and the core made none in the wait: the fault itself.
+            Some(Cut::Due { last }) => out.push(Finding::StaleCut {
+                cut: c.cut,
+                age: self.now.saturating_sub(last.created_at),
+            }),
+            Some(Cut::Covered) | None => {}
         }
         Some(out)
     }
@@ -756,14 +824,51 @@ pub async fn compare_covering<L: IngressLink>(
     Option<String>,
     Vec<String>,
 ) {
+    compare_covering_with(link, summary, now, required, &Settle::default()).await
+}
+
+/// [`compare_covering`], waiting for a due checkpoint as `settle` says.
+pub async fn compare_covering_with<L: IngressLink>(
+    link: &L,
+    summary: &str,
+    now: u64,
+    required: &[String],
+    settle: &Settle,
+) -> (
+    Box<dyn SettlementComparator + Send + Sync>,
+    Option<String>,
+    Vec<String>,
+) {
     let mut notes = Vec::new();
-    let uncovered = match uncovered_through(link).await {
-        Ok(u) => u,
+    let cut = match cut_through(link, now, settle).await {
+        Ok(c) => Some(c),
         Err(why) => {
             notes.push(format!("the stale-cut check was skipped: {why}"));
             None
         }
     };
+    if let Some(Cut::Due { last }) = &cut {
+        notes.push(if last.status == "final" {
+            format!(
+                concat!(
+                    "the core is not checkpointing new postings: checkpoint {} (final) covers ",
+                    "entries through {}, the book has more, and no checkpoint appeared in {} s"
+                ),
+                last.number,
+                last.entry_sequence,
+                settle.pause.as_secs() * u64::from(settle.polls)
+            )
+        } else {
+            format!(
+                concat!(
+                    "the core is not checkpointing new postings: checkpoint {} is still {} ",
+                    "(in flight), and the core makes no new one until it is final; the book ",
+                    "has more entries than it covers (through {})"
+                ),
+                last.number, last.status, last.entry_sequence
+            )
+        });
+    }
     let reply = link
         .call(
             "POST",
@@ -796,7 +901,7 @@ pub async fn compare_covering<L: IngressLink>(
         Ok(comparison) => (
             Box::new(Compared {
                 comparison: comparison.clone(),
-                uncovered_since: uncovered,
+                cut,
                 now,
             }),
             audited,
@@ -837,10 +942,8 @@ fn refusal_text(status: u16, body: &serde_json::Value) -> String {
     }
 }
 
-/// [`uncovered_since`] from the operator's reads: the checkpoints (`GET /v1/ops/anchors`) and the
-/// book's next posting sequence (`GET /v1/trial-balance`'s `view`). `Err` says which read failed,
-/// with the refusal it gave.
-async fn uncovered_through<L: IngressLink>(link: &L) -> Result<Option<u64>, String> {
+/// One read of `GET /v1/ops/anchors`' checkpoints.
+async fn read_checkpoints<L: IngressLink>(link: &L) -> Result<Vec<CheckpointRead>, String> {
     let anchors = match link.call("GET", "/v1/ops/anchors", None).await {
         Ok((200, v)) => v,
         Ok((status, v)) => {
@@ -851,9 +954,18 @@ async fn uncovered_through<L: IngressLink>(link: &L) -> Result<Option<u64>, Stri
         }
         Err(e) => return Err(format!("GET /v1/ops/anchors: {e}")),
     };
-    let checkpoints: Vec<CheckpointRead> =
-        serde_json::from_value(anchors["checkpoints"].clone())
-            .map_err(|e| format!("GET /v1/ops/anchors: checkpoints: {e}"))?;
+    serde_json::from_value(anchors["checkpoints"].clone())
+        .map_err(|e| format!("GET /v1/ops/anchors: checkpoints: {e}"))
+}
+
+/// [`assess_cut`] from the operator's reads: the checkpoints (`GET /v1/ops/anchors`) and the
+/// book's next posting sequence (`GET /v1/trial-balance`'s `view`). When a checkpoint is due and
+/// none covers the book's last posting, the checkpoints are read again up to `settle.polls` times:
+/// the next tick makes one, so that state is normal for about a minute. A newer checkpoint ends the
+/// wait and is aged as any other; none is [`Cut::Due`]. `Err` says which read failed, with the
+/// refusal it gave.
+async fn cut_through<L: IngressLink>(link: &L, now: u64, settle: &Settle) -> Result<Cut, String> {
+    let mut checkpoints = read_checkpoints(link).await?;
     let head = match link.call("GET", "/v1/trial-balance", None).await {
         Ok((200, v)) => v["view"].as_u64().ok_or("GET /v1/trial-balance: no view")?,
         Ok((status, v)) => {
@@ -864,7 +976,15 @@ async fn uncovered_through<L: IngressLink>(link: &L) -> Result<Option<u64>, Stri
         }
         Err(e) => return Err(format!("GET /v1/trial-balance: {e}")),
     };
-    uncovered_since(&checkpoints, head)
+    let mut cut = assess_cut(&checkpoints, head, now)?;
+    let mut polls = 0;
+    while matches!(cut, Cut::Due { .. }) && polls < settle.polls {
+        polls += 1;
+        tokio::time::sleep(settle.pause).await;
+        checkpoints = read_checkpoints(link).await?;
+        cut = assess_cut(&checkpoints, head, now)?;
+    }
+    Ok(cut)
 }
 
 /// The daily run (`NFR-9`, `AC-J3.1`): axes 1 and 2 and the `Suspense` report over the running
@@ -1219,6 +1339,17 @@ pub async fn axis_3_gated<L: IngressLink>(
     summary: &str,
     now: u64,
 ) -> (AxisResult, Option<String>, BTreeMap<String, String>) {
+    axis_3_gated_with(link, compare, summary, now, &Settle::default()).await
+}
+
+/// [`axis_3_gated`], waiting for a due checkpoint as `settle` says.
+pub async fn axis_3_gated_with<L: IngressLink>(
+    link: &L,
+    compare: bool,
+    summary: &str,
+    now: u64,
+    settle: &Settle,
+) -> (AxisResult, Option<String>, BTreeMap<String, String>) {
     let mut inputs = BTreeMap::new();
     let not_run = |why: String| AxisResult {
         axis: 3,
@@ -1268,7 +1399,8 @@ pub async fn axis_3_gated<L: IngressLink>(
             inputs,
         );
     }
-    let (comparator, audited, notes) = compare_covering(link, summary, now, &bound).await;
+    let (comparator, audited, notes) =
+        compare_covering_with(link, summary, now, &bound, settle).await;
     let mut axis = axis_3(comparator.as_ref());
     if !axis.ran {
         // The refusal, as the core or ingress gave it (status, `ERR-*` id, description): a missing

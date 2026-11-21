@@ -1059,7 +1059,66 @@ async fn stale_axis(
                         "rows": [zero_row("COPM")] } } } }),
         ),
     ]);
-    let (r, _, _) = reconcile::axis_3_gated(&link, true, "s", now).await;
+    let (r, _, _) = reconcile::axis_3_gated_with(&link, true, "s", now, &NO_WAIT).await;
+    r
+}
+
+/// Two re-reads with no pause: the wait for a due checkpoint, without the wall-clock time.
+const NO_WAIT: reconcile::Settle = reconcile::Settle {
+    polls: 2,
+    pause: Duration::ZERO,
+};
+
+/// The reads of [`stale_axis`], with `GET /v1/ops/anchors` answering each of `anchors` in turn
+/// (the last one for every read after).
+struct Evolving {
+    inner: Canned,
+    anchors: std::sync::Mutex<std::collections::VecDeque<Value>>,
+}
+
+impl IngressLink for Evolving {
+    async fn call(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<(u16, Value), String> {
+        if (method, path) == ("GET", "/v1/ops/anchors") {
+            let mut q = self.anchors.lock().unwrap();
+            let v = if q.len() > 1 {
+                q.pop_front().unwrap()
+            } else {
+                q.front().cloned().unwrap()
+            };
+            return Ok((200, v));
+        }
+        self.inner.call(method, path, body).await
+    }
+}
+
+async fn evolving_axis(reads: Vec<Vec<Value>>, head: u64, now: u64) -> ops::reconcile::AxisResult {
+    let link = Evolving {
+        inner: Canned::new(&[
+            (
+                "GET /v1/assets",
+                200,
+                json!([{ "id": "COPM", "binding": "bound" }]),
+            ),
+            ("GET /v1/trial-balance", 200, json!({ "view": head })),
+            (
+                "POST /v1/ops/settlement/comparisons",
+                200,
+                comparison_reply(false, json!([zero_row("COPM")])),
+            ),
+        ]),
+        anchors: std::sync::Mutex::new(
+            reads
+                .into_iter()
+                .map(|cps| json!({ "checkpoints": cps }))
+                .collect(),
+        ),
+    };
+    let (r, _, _) = reconcile::axis_3_gated_with(&link, true, "s", now, &NO_WAIT).await;
     r
 }
 
@@ -1125,6 +1184,73 @@ async fn ac_j1_1_postings_in_a_recent_checkpoint_are_not_stale() {
             age: DAY + 5
         }]
     );
+}
+
+/// `AC-J1.1`: postings with no checkpoint yet, the interval past, are the state of about one tick.
+/// A checkpoint that appears within the wait is aged as any other: recent, so not stale.
+#[tokio::test]
+async fn ac_j1_1_a_checkpoint_made_within_the_wait_clears_the_state() {
+    let now = 10 * DAY;
+    let before = vec![cp(1, 9, 1_000, "final")];
+    let after = vec![cp(1, 9, 1_000, "final"), cp(2, 11, now - 30_000, "pending")];
+    let r = evolving_axis(vec![before, after], 12, now).await;
+    assert!(r.ran && r.findings.is_empty() && r.note.is_none(), "{r:?}");
+}
+
+/// `AC-J1.1`, `NFR-9`: none appears in the wait: the core is not checkpointing new postings, which
+/// is the fault, and axis 3 finds the cut stale and says so.
+#[tokio::test]
+async fn nfr_9_no_checkpoint_within_the_wait_is_a_stale_cut_and_says_why() {
+    let now = 10 * DAY;
+    let r = evolving_axis(vec![vec![cp(1, 9, 1_000, "final")]], 12, now).await;
+    assert_eq!(
+        r.findings,
+        vec![Finding::StaleCut {
+            cut: 4,
+            age: now - 1_000
+        }],
+        "{r:?}"
+    );
+    let note = r.note.unwrap();
+    assert!(
+        note.contains("not checkpointing new postings") && note.contains("checkpoint 1 (final)"),
+        "{note}"
+    );
+}
+
+/// `AC-J1.1`, `NFR-9`: the core makes no checkpoint while one is in flight, so a last checkpoint
+/// that is not final, past its interval, with postings beyond it, is the same fault; the note names
+/// the checkpoint in flight.
+#[tokio::test]
+async fn nfr_9_a_checkpoint_in_flight_too_long_is_a_stale_cut() {
+    let now = 10 * DAY;
+    let cps = vec![
+        cp(1, 9, 1_000, "final"),
+        cp(2, 11, now - 2 * 3_600_000, "submitted"),
+    ];
+    let r = stale_axis(cps, now, 14, now).await;
+    assert_eq!(
+        r.findings,
+        vec![Finding::StaleCut {
+            cut: 4,
+            age: 2 * 3_600_000
+        }],
+        "{r:?}"
+    );
+    let note = r.note.unwrap();
+    assert!(
+        note.contains("checkpoint 2 is still submitted") && note.contains("in flight"),
+        "{note}"
+    );
+}
+
+/// `AC-J1.1`: before the interval has passed since the last checkpoint, none is due: a posting
+/// beyond it is not a fault, and the run does not wait for one.
+#[tokio::test]
+async fn ac_j1_1_no_checkpoint_is_due_inside_the_interval() {
+    let now = 10 * DAY;
+    let r = stale_axis(vec![cp(1, 9, now - 600_000, "final")], now, 12, now).await;
+    assert!(r.ran && r.findings.is_empty() && r.note.is_none(), "{r:?}");
 }
 
 /// `AC-J1.1`: the rule on the checkpoints alone.
