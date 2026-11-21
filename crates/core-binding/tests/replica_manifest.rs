@@ -383,9 +383,18 @@ async fn t031_26_a_kill_at_each_write_point_reopens_without_a_rebuild() {
         ]
     );
     for (point, dir) in &shots {
+        // Before the rename, the manifest in force, and the inputs after it; from it, the clean
+        // stop's record at the last input.
+        let from = read_kept(dir).seq;
+        if matches!(
+            point,
+            WritePoint::RecordRenamed | WritePoint::RecordDone | WritePoint::SavepointsCleared
+        ) {
+            assert_eq!(from, n, "stop, {point:?}");
+        }
         let (c, r) = start(dir, copy_port_of(&port), copy_log(&logged));
         assert_eq!(r, 1, "stop, {point:?}: reopened, not rebuilt");
-        assert_eq!(rolled(&c), 0, "stop, {point:?}");
+        assert_eq!(rolled(&c), n - from, "stop, {point:?}");
         assert_eq!(c.replica_digest().as_ref(), Some(&want), "stop, {point:?}");
         drop(c);
     }
@@ -450,8 +459,9 @@ async fn t031_26_a_kill_inside_an_input_reopens_where_the_agent_stands() {
         interval: Duration::from_secs(3600),
     });
     let d = deploy(&core, &[]).await;
-    let alice = d.party("alice", 1_000).await;
-    mixed(&d, &alice, "a", 5).await;
+    // Identities alone: no notification, so no delivery decided on its own between the kill and
+    // the copies of the Agent below.
+    traffic(&d, "a", 5).await;
     let m = core.manifest().expect("a manifest").seq;
     let at_n = core.replica_digest().expect("a replica");
     let port_n = copy_port(&core);
