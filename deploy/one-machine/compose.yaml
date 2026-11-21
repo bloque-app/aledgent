@@ -15,13 +15,24 @@
 # the tree of release 0.5.1), and the core from that tree's on-genesis build (images.yml, job `core on
 # genesis`: the host of commit 294a8fa with the generation-0 package 1d10625e copied in), because a new
 # book is founded at rules version 0 and the fence refuses code of any other (REQ-RT-20). Set
-# ALEDGENT_INGRESS_IMAGE, ALEDGENT_CORE_IMAGE and ALEDGENT_SIGNER_IMAGE to deploy others. Nothing secret is in this file or in the two configuration files
-# beside it: the guide writes the secrets into secrets/ (git-ignored), one file per value.
+# ALEDGENT_INGRESS_BLUE_IMAGE, ALEDGENT_INGRESS_GREEN_IMAGE, ALEDGENT_CORE_IMAGE and
+# ALEDGENT_SIGNER_IMAGE to deploy others; a new core image on a running book is a host roll
+# (the guide's "Core restarts" page: replay the archive with it first). Nothing secret is in this
+# file or in the two configuration files beside it: the guide writes the secrets into secrets/
+# (git-ignored), one file per value.
+#
+# Every container drops every Linux capability and cannot gain privileges; the two that start as
+# root (the volume set-up and PostgreSQL's entrypoint, which steps down to its own user) keep only
+# what that takes.
 #
 # What one machine does not give (REQ-AR-5): surviving the machine's own reboot without a restart,
 # or the loss of its disk. It does not claim NFR-21. The guide says so, and what the keys' custody is.
 
 name: aledgent
+
+x-hardened: &hardened
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
 
 services:
   # Ownership of the shared volumes, once, before anything else starts: the signer's socket
@@ -29,6 +40,9 @@ services:
   # the core host's to connect to (mode 660) and no one else's; the core's socket and state are the
   # core host's (65532), whose socket ingress (65532) connects to.
   volumes:
+    <<: *hardened
+    # FSETID: the setgid bit on a directory whose group is not its own.
+    cap_add: [CHOWN, FOWNER, FSETID]
     image: docker.io/library/busybox:1.37.0@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec
     user: "0:0"
     network_mode: none
@@ -37,13 +51,18 @@ services:
       - -euc
       - |
         chown 65533:65532 /run/aledgent-signer && chmod 2770 /run/aledgent-signer
-        chown 65532:65532 /run/aledgent /var/lib/aledgent/core && chmod 0750 /run/aledgent /var/lib/aledgent/core
+        chown 65532:65532 /run/aledgent /var/lib/aledgent/core /var/lib/aledgent/archive
+        chmod 0750 /run/aledgent /var/lib/aledgent/core /var/lib/aledgent/archive
     volumes:
       - signer-run:/run/aledgent-signer
       - core-run:/run/aledgent
       - core-state:/var/lib/aledgent/core
+      - core-archive:/var/lib/aledgent/archive
 
   postgres:
+    <<: *hardened
+    # Its entrypoint initialises the data directory as root, then runs PostgreSQL as its own user.
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
     image: docker.io/library/postgres:17.6-bookworm@sha256:f3bd19c606e442c3d7bdfa8002e03fe260a1023351e0ea4598032022b68dd6e3
     restart: unless-stopped
     environment:
@@ -64,6 +83,7 @@ services:
 
   # The key boundary (F-035): the core host's four keys, from files only it can read. No network.
   signer:
+    <<: *hardened
     image: ${ALEDGENT_SIGNER_IMAGE:-ghcr.io/bloque-app/aledgent-signer@sha256:339cd676366775bc16caff2b6a8a0f65eeb5b262156bda13f8b16f471200c266}
     restart: unless-stopped
     network_mode: none
@@ -75,8 +95,12 @@ services:
       - signer-run:/run/aledgent-signer
 
   # The core as a VOS Agent, serving ingress on a Unix socket (the same-host link, DEC-27 (h′)).
-  # It takes its keys from the signer and none from its environment. No network.
+  # It takes its keys from the signer and none from its environment. No network. Every decision is
+  # streamed to the archive, a volume of its own (T-005-15): after an unclean stop the host rebuilds
+  # from it. On this machine's disk it survives a crash, not the disk; an archive off the machine is
+  # `--archive s3://…` (ops/runbooks/restore.md).
   core:
+    <<: *hardened
     image: ${ALEDGENT_CORE_IMAGE:-ghcr.io/bloque-app/aledgent-core@sha256:3f8893ce5ba38615d808161e3fc81b885d833e48438bfa63340090f83efb8ce1}
     restart: unless-stopped
     network_mode: none
@@ -89,12 +113,26 @@ services:
       - signer-run:/run/aledgent-signer
       - core-run:/run/aledgent
       - core-state:/var/lib/aledgent/core
+      - core-archive:/var/lib/aledgent/archive
+    command:
+      - serve
+      - --config
+      - /etc/aledgent/ingress.json
+      - --runtime
+      - /usr/share/aledgent/agent_runtime.pvm
+      - --actor
+      - /usr/share/aledgent/core.vos
+      - --state
+      - /var/lib/aledgent/core
+      - --archive
+      - fs:/var/lib/aledgent/archive
     stop_grace_period: 60s
 
   # Ingress, twice: a release starts the other colour, waits for it to be ready, then stops this
   # one, which drains (F-038 §9). Only the proxy publishes a port.
   ingress-blue: &ingress
-    image: ${ALEDGENT_INGRESS_IMAGE:-ghcr.io/bloque-app/aledgent-ingress@sha256:5382c2eca906b25906df116d24af01d8f1ba448f04889507245f433887b29652}
+    <<: *hardened
+    image: ${ALEDGENT_INGRESS_BLUE_IMAGE:-ghcr.io/bloque-app/aledgent-ingress@sha256:5382c2eca906b25906df116d24af01d8f1ba448f04889507245f433887b29652}
     restart: unless-stopped
     depends_on:
       volumes: { condition: service_completed_successfully }
@@ -109,19 +147,21 @@ services:
 
   ingress-green:
     <<: *ingress
-    image: ${ALEDGENT_INGRESS_GREEN_IMAGE:-${ALEDGENT_INGRESS_IMAGE:-ghcr.io/bloque-app/aledgent-ingress@sha256:5382c2eca906b25906df116d24af01d8f1ba448f04889507245f433887b29652}}
+    image: ${ALEDGENT_INGRESS_GREEN_IMAGE:-ghcr.io/bloque-app/aledgent-ingress@sha256:5382c2eca906b25906df116d24af01d8f1ba448f04889507245f433887b29652}
     profiles: [green]
 
   # The local proxy: both colours, each checked on its readiness port. A draining instance answers
-  # 503 there and leaves the rotation while it still answers its clients.
+  # 503 there and leaves the rotation while it still answers its clients. It depends on neither
+  # colour: an instance that is not running is down until it is (haproxy.cfg).
   proxy:
+    <<: *hardened
     image: docker.io/library/haproxy:3.2.4-alpine@sha256:436a5691e6fd563ca4090e351048fda1066bec93b595cc8eaf26988c65eb1152
     restart: unless-stopped
-    depends_on:
-      ingress-blue: { condition: service_started }
     volumes:
       - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     networks: [front]
+    # The loopback only. Never 0.0.0.0: the operator surface (/v1/ops/) shares this listener, and
+    # it is plain HTTP. Put a TLS proxy of your own in front to serve other machines.
     ports:
       - "127.0.0.1:8080:8080"
 
@@ -134,5 +174,6 @@ networks:
 volumes:
   postgres-data:
   core-state:
+  core-archive:
   core-run:
   signer-run:

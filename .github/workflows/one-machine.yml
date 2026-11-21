@@ -11,13 +11,13 @@ name: One-machine walkthrough
 # script as root (the guide's shell) from the repository's root on a fresh GitHub-hosted runner.
 # Nothing here adds a step the page does not show; what this job adds is only observation: a
 # prober that sends GET /v1/assets through the proxy every 200 ms once the deployment answers, and
-# fails the job if any request from the release's first block on is not answered 200 (DEC-27 (h′):
-# a release refuses no request).
+# fails the job if any request from the release's first block until the unclean stop's is not
+# answered 200 (DEC-27 (h′): a release refuses no request).
 #
-# The deposit is an issuance into a book-only asset (owner ruling of 2026-11-20, the M-3D gap's
-# Q2): a deposit through the settlement layer needs a chain and the adapter, which the zombienet
-# suite proves (e2e-zombienet.yml). Every secret is drawn by the page's commands on the runner, for
-# this run, and is gone with it.
+# The deposit is an issuance into a book-only asset: a deposit through the settlement layer needs a
+# chain and the adapter, which the zombienet suite proves (e2e-zombienet.yml). Every secret is drawn
+# by the page's commands on the runner, for this run, and is gone with it; a last check fails the job
+# if any of them appears in the guide's output or the services' logs (REQ-AU-8).
 
 on:
   pull_request:
@@ -62,8 +62,15 @@ jobs:
           release=$(awk '/^# --- block [0-9]+,/ { b = $4 + 0 } /--profile green up/ { print b; exit }' \
             "$RUNNER_TEMP/walkthrough.sh")
           [ -n "$release" ] || { echo "::error::the guide has no release step (--profile green up)"; exit 1; }
+          # It ends where the unclean stop starts: while a killed core rebuilds, reads answer 503
+          # ERR-DecisionUnavailable with Retry-After, as they should; that is not a release.
+          after=$(awk '/^# --- block [0-9]+,/ { b = $4 + 0 } /kill -s KILL core/ { print b; exit }' \
+            "$RUNNER_TEMP/walkthrough.sh")
+          [ -n "$after" ] && [ "$after" -gt "$release" ] \
+            || { echo "::error::the guide has no unclean stop after its release (kill -s KILL core)"; exit 1; }
           echo "RELEASE_BLOCK=$release" >> "$GITHUB_ENV"
-          echo "The release starts at block $release"
+          echo "AFTER_RELEASE_BLOCK=$after" >> "$GITHUB_ENV"
+          echo "The release runs from block $release to block $after"
           cat -n "$RUNNER_TEMP/walkthrough.sh"
 
       - name: Tools
@@ -80,12 +87,11 @@ jobs:
           # Every 200 ms, once the operator's token exists and the proxy answers: one GET /v1/assets,
           # its time (ms) and its HTTP status, one line each.
           set -u
-          tok=deploy/one-machine/secrets/operator.token
-          until [ -s "$tok" ]; do sleep 0.5; done
-          t=$(cat "$tok")
-          until curl -sf -o /dev/null -m 2 -H "Authorization: Bearer $t" http://127.0.0.1:8080/v1/assets; do sleep 0.5; done
+          h=deploy/one-machine/secrets/operator.header
+          until [ -s "$h" ]; do sleep 0.5; done
+          until curl -sf -o /dev/null -m 2 -H @"$h" http://127.0.0.1:8080/v1/assets; do sleep 0.5; done
           while :; do
-            code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' -H "Authorization: Bearer $t" http://127.0.0.1:8080/v1/assets)
+            code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' -H @"$h" http://127.0.0.1:8080/v1/assets)
             echo "$(date +%s%3N) $code"
             sleep 0.2
           done
@@ -100,6 +106,7 @@ jobs:
           start=$(date +%s)
           # Each line the script writes to stderr is stamped, so the release's window is known.
           sudo bash "$RUNNER_TEMP/walkthrough.sh" \
+            > >(tee "$RUNNER_TEMP/guide.out") \
             2> >(while IFS= read -r l; do echo "$(date +%s%3N) $l"; done | tee "$RUNNER_TEMP/guide.log" >&2)
           end=$(date +%s)
           echo "WALKTHROUGH_SECONDS=$((end - start))" >> "$GITHUB_ENV"
@@ -109,10 +116,11 @@ jobs:
           set -euo pipefail
           sudo pkill -f "$RUNNER_TEMP/prober.sh" || true
           from=$(awk -v b="[guide] block $RELEASE_BLOCK " 'index($0, b) { print $1; exit }' "$RUNNER_TEMP/guide.log")
-          [ -n "$from" ] || { echo "::error::the release's block never started"; exit 1; }
-          total=$(awk -v f="$from" '$1 >= f' "$RUNNER_TEMP/prober.log" | wc -l)
-          bad=$(awk -v f="$from" '$1 >= f && $2 != "200"' "$RUNNER_TEMP/prober.log")
-          echo "requests from the release on: $total"
+          to=$(awk -v b="[guide] block $AFTER_RELEASE_BLOCK " 'index($0, b) { print $1; exit }' "$RUNNER_TEMP/guide.log")
+          [ -n "$from" ] && [ -n "$to" ] || { echo "::error::the release's blocks never ran"; exit 1; }
+          total=$(awk -v f="$from" -v t="$to" '$1 >= f && $1 < t' "$RUNNER_TEMP/prober.log" | wc -l)
+          bad=$(awk -v f="$from" -v t="$to" '$1 >= f && $1 < t && $2 != "200"' "$RUNNER_TEMP/prober.log")
+          echo "requests during the release: $total"
           [ "$total" -ge 20 ] || { echo "::error::only $total requests were sent during the release"; exit 1; }
           if [ -n "$bad" ]; then
             echo "::error::requests not answered 200 during the release:"
@@ -135,6 +143,32 @@ jobs:
           tail -n 300 "$RUNNER_TEMP/compose.log" || true
           tail -n 50 "$RUNNER_TEMP/prober.log" || true
 
+      - name: No secret in any output or log
+        if: always()
+        run: |
+          set -euo pipefail
+          d=deploy/one-machine/secrets
+          sudo test -d "$d" || { echo "no secrets directory: the guide never drew them"; exit 0; }
+          # Every value the guide drew: each secret file's contents, each value of ingress.env, and the
+          # credential of each header file (the operator's token, each customer's API key).
+          sudo bash -c '
+            set -euo pipefail
+            for f in "$1"/*.token "$1"/*.password "$1"/signer/*.hex; do [ -f "$f" ] && { cat "$f"; echo; }; done
+            sed -n "s/^[A-Z_]*=//p" "$1/ingress.env"
+            sed -n "s/^Authorization: Bearer //p" "$1"/*.header
+          ' _ "$d" | sort -u | awk 'length($0) >= 16' > "$RUNNER_TEMP/secrets.txt"
+          n=$(wc -l < "$RUNNER_TEMP/secrets.txt")
+          [ "$n" -ge 10 ] || { echo "::error::only $n secret values found to check"; exit 1; }
+          logs=("$RUNNER_TEMP/compose.log" "$RUNNER_TEMP/guide.log" "$RUNNER_TEMP/guide.out" "$RUNNER_TEMP/prober.log")
+          if grep -F -l -f "$RUNNER_TEMP/secrets.txt" "${logs[@]}" 2>/dev/null; then
+            echo "::error::a generated secret appears in the file(s) above"
+            rm -f "$RUNNER_TEMP/secrets.txt"
+            exit 1
+          fi
+          rm -f "$RUNNER_TEMP/secrets.txt"
+          echo "$n generated secrets checked: none in the guide's output, its log, the prober's or the services' logs"
+          echo "- No secret in any output or log: $n generated values checked" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload the logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -145,6 +179,7 @@ jobs:
             ${{ runner.temp }}/compose.log
             ${{ runner.temp }}/prober.log
             ${{ runner.temp }}/guide.log
+            ${{ runner.temp }}/guide.out
           if-no-files-found: ignore
 
       - name: Tear down

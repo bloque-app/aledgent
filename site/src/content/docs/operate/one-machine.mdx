@@ -7,7 +7,8 @@ sidebar:
 
 import { Aside, Steps } from '@astrojs/starlight/components';
 
-Cites `DEC-27`, `REQ-AR-5`, `NFR-17`, `NFR-21`, `NFR-8`, `F-035`, `F-037`, `REQ-RT-20`, `REQ-AS-7`, `REQ-OP-10`, `REQ-CS-7`.
+Cites `DEC-27`, `REQ-AR-5`, `NFR-17`, `NFR-21`, `NFR-8`, `NFR-4`, `REQ-AU-8`, `REQ-OS-1`, `F-035`, `F-037`,
+`REQ-RT-20`, `REQ-AS-7`, `REQ-OP-10`, `REQ-CS-7`.
 
 This guide brings up a whole deployment on one Linux machine: PostgreSQL, the signer, the core as a VOS
 Agent and ingress, behind a local proxy. Then it makes a deposit and a transfer through the API, reads them
@@ -48,7 +49,7 @@ repository's end-to-end suite against a local network.
 ## Before you start
 
 - A Linux machine (x86-64), 2 CPUs and 4 GB of memory at least, with Docker Engine and its Compose plugin
-  (`docker compose`, version 2), `openssl`, `jq`, `curl` and `git`.
+  (`docker compose`, version 2), `openssl`, `jq`, `curl` 7.55 or later and `git`.
 - A Bash shell **as root** (`sudo -i`): the guide sets the owners of the files the containers read.
 - A checkout of the repository at the release you deploy:
 
@@ -57,8 +58,8 @@ repository's end-to-end suite against a local network.
   cd aledgent
   ```
 
-Every command below runs from the checkout's root, in one shell: later steps use variables earlier ones
-set.
+The first command below changes to `deploy/one-machine`. Every command after it runs from there, **in the
+same shell**: later steps use the variables and functions earlier ones set.
 
 ## What runs
 
@@ -66,13 +67,19 @@ set.
 |---|---|---|
 | `postgres` | PostgreSQL 17 | Ingress's store: the received log, credentials, notifications. On a network only ingress reaches |
 | `signer` | `aledgent-signer` | The key boundary (`F-035`): signs for the core host. No network; one Unix socket |
-| `core` | `aledgent-core` | The core as a VOS Agent (`aledgent-core-host serve`): decides every command. No network; serves ingress on a Unix socket |
+| `core` | `aledgent-core` | The core as a VOS Agent (`aledgent-core-host serve`): decides every command and streams each decision to the archive volume. No network; serves ingress on a Unix socket |
 | `ingress-blue`, `ingress-green` | `aledgent-ingress` | The API. One runs; a release starts the other |
 | `proxy` | HAProxy | Listens on `127.0.0.1:8080` and sends each request to whichever ingress is ready |
 
+Every container drops every Linux capability and cannot gain privileges. The proxy listens on the loopback
+only. **Do not change its bind to `0.0.0.0`**: the operator surface (`/v1/ops/`) shares that listener, and it
+is plain HTTP; to serve other machines, put a TLS proxy of your own in front of it.
+
 The images are pinned by digest in `deploy/one-machine/compose.yaml`: ingress and the signer from a
 release's `images.json`, and the core from that release's **on-genesis** build. To deploy other images, set
-`ALEDGENT_INGRESS_IMAGE`, `ALEDGENT_CORE_IMAGE` and `ALEDGENT_SIGNER_IMAGE`.
+`ALEDGENT_INGRESS_BLUE_IMAGE`, `ALEDGENT_INGRESS_GREEN_IMAGE`, `ALEDGENT_CORE_IMAGE` and
+`ALEDGENT_SIGNER_IMAGE`. A new `ALEDGENT_CORE_IMAGE` on a book that already runs is a host roll: replay the
+archive with the new build first ([Core restarts](../core-restarts/#rolling-a-host-to-a-new-build)).
 
 <Aside type="caution" title="A new book starts at rules version 0">
 Every book is founded at rules version 0, and the core refuses any input its own code's rules version does
@@ -89,7 +96,9 @@ the image `core.Dockerfile` builds as `core-on-genesis` and publishes as
 <Steps>
 
 1. **Generate the secrets.** Each is 32 random bytes, hex, in a file of its own under `secrets/` (which
-   git ignores). None goes into a configuration file, a command line or a log.
+   git ignores). None goes into a configuration file, onto a command line or into a log: the commands
+   below read each from its file, and `curl` takes its `Authorization` header from a file
+   (`-H @file`).
 
    ```sh
    cd deploy/one-machine
@@ -103,9 +112,11 @@ the image `core.Dockerfile` builds as `core-on-genesis` and publishes as
    for key in keyring agent-authority agent-package; do secret > "secrets/signer/$key.hex"; done
    # The clerk key is a scalar: its last byte (little-endian, the top) below 0x10 keeps it canonical.
    printf '%s0%s' "$(openssl rand -hex 31)" "$(openssl rand -hex 1 | cut -c1)" > secrets/signer/clerk.hex
+   # The operator's header, for curl -H @file.
+   printf 'Authorization: Bearer %s\n' "$(cat secrets/operator.token)" > secrets/operator.header
    ```
 
-   Ingress reads its own secrets from its environment:
+   Ingress reads its own three secrets from its environment, and from nowhere else today:
 
    ```sh
    cat > secrets/ingress.env <<EOF
@@ -114,6 +125,19 @@ the image `core.Dockerfile` builds as `core-on-genesis` and publishes as
    ALEDGENT_CORE_LINK_TOKEN=$(cat secrets/core-link.token)
    EOF
    ```
+
+   They are an exception to the rule that no key is readable from a process's environment
+   ([The signer boundary](../signer-boundary/)), and you should know what each one is:
+
+   - The **database URL** carries PostgreSQL's password.
+   - The **sealing key** is not a signing key, and the signer does not hold it: it seals, at rest in
+     PostgreSQL, the secrets of the notification recipients you register. Back it up with `secrets/`:
+     without it the stored recipient secrets cannot be read, and every recipient must be registered again
+     with a new secret.
+   - The **core link token** authenticates ingress to the core's socket, with ingress's user id.
+
+   Anyone who can run `docker inspect` on this machine reads them. Access to Docker is root on this machine:
+   give it to no one who should not hold the book.
 
    Each file is readable only by the process that needs it: the signer's keys by the signer (user
    65533), the core host's signer token by the core host (user 65532), PostgreSQL's password by
@@ -168,9 +192,10 @@ the image `core.Dockerfile` builds as `core-on-genesis` and publishes as
    ```
 
 3. **Start it.** The first start pulls the images, founds the book and applies ingress's migrations.
+   `ingress-blue` is the instance that serves first.
 
    ```sh
-   docker compose up -d --wait --wait-timeout 300
+   docker compose up -d --wait --wait-timeout 300 postgres signer core ingress-blue proxy
    docker compose ps
    ```
 
@@ -178,32 +203,32 @@ the image `core.Dockerfile` builds as `core-on-genesis` and publishes as
    start; until it serves, a command is acknowledged and waits.
 
 4. **Check that it answers.** Every route needs a bearer token; with the operator's, ingress lists the
-   registry:
+   registry. Until the core serves, a read answers `503` with `Retry-After`; `curl` retries it.
 
    ```sh
    INGRESS=http://127.0.0.1:8080
-   OPERATOR_TOKEN=$(cat secrets/operator.token)
-   curl -sf "$INGRESS/v1/assets" -H "Authorization: Bearer $OPERATOR_TOKEN" | jq .
+   curl -sf --retry 60 --retry-all-errors --retry-delay 1 "$INGRESS/v1/assets" -H @secrets/operator.header | jq .
    ```
 
 </Steps>
 
 The operator's token is a bearer secret and grants nothing by itself; see [The operator token](../operator-token/)
-and [Least privilege](../least-privilege/) before you use it for more than this guide.
+and [Least privilege](../least-privilege/).
 
 ## Make a deposit and a transfer
 
 A command is sent with a **client key** of your choosing (`REQ-OP-10`). Sending it again under the same key
 never runs it twice: it answers with where the command stands. A command answered with its decision may
 answer `503 ERR-DecisionUnavailable` while the core is starting (`REQ-CS-7`); a transfer is acknowledged at
-`202 Received`. Either way, send it again with the same key until it is terminal. This function does that:
+`202 Received`. Either way, send it again with the same key until it is terminal. This function does that,
+with the caller's `Authorization` header read from a file:
 
 ```sh
-send() {  # send <token> <path> <client key> <JSON body>: prints the terminal reply
+send() {  # send <header file> <path> <client key> <JSON body>: prints the terminal reply
   local code
   for _ in $(seq 1 120); do
     code=$(curl -s -o reply.json -w '%{http_code}' -X POST "$INGRESS$2" \
-      -H "Authorization: Bearer $1" -H "client-key: $3" -H 'content-type: application/json' -d "$4")
+      -H @"$1" -H "client-key: $3" -H 'content-type: application/json' -d "$4")
     case "$code" in
       200|202) if jq -e '.terminal' reply.json > /dev/null; then jq . reply.json; return 0; fi ;;
       503) ;;
@@ -214,42 +239,50 @@ send() {  # send <token> <path> <client key> <JSON body>: prints the terminal re
   echo "$2: not terminal after two minutes" >&2
   return 1
 }
+in_minutes() { echo $(( $(date +%s) * 1000 + $1 * 60 * 1000 )); }  # ms since the epoch
 ```
 
 <Steps>
 
-1. **Give the operator issuance authority over `CRD`.** `CRD` is the book-only asset the deployment file
-   registers at genesis. An issuance grant names the asset, the operations and a bound per window: none is
-   unbounded.
+1. **Give the operator issuance authority over `CRD`, for this task only.** `CRD` is the book-only asset
+   the deployment file registers at genesis. The operator holds no operator capability by default
+   (`REQ-OS-1`): it grants itself `issuance_authority` for fifteen minutes, then an issuance grant over
+   `CRD` that expires with it. Each carries its justification, and none is unbounded.
 
    ```sh
-   send "$OPERATOR_TOKEN" /v1/grants grant-issuance-crd '{
-     "kind": "issuance", "principal": "'"$OPERATOR"'", "subject": { "asset": "CRD" },
-     "ops": ["issue", "redeem"], "assets": ["CRD"],
-     "per_window": { "length": 86400000, "limit": "100000000" } }'
+   send secrets/operator.header /v1/ops/operator-grants og-issuance-authority-1 '{
+     "principal": "'"$OPERATOR"'", "kinds": ["issuance_authority"], "expires": '"$(in_minutes 15)"',
+     "justification": "One-machine guide: the first deposit" }' > config/operator-grant.json
+   send secrets/operator.header /v1/ops/issuance-grants issuance-crd-1 '{
+     "justification": "One-machine guide: the first deposit",
+     "grant": { "kind": "issuance", "principal": "'"$OPERATOR"'", "subject": { "asset": "CRD" },
+                "ops": ["issue"], "assets": ["CRD"], "expires": '"$(in_minutes 15)"',
+                "per_window": { "length": 86400000, "limit": "1000000" } } }' > config/issuance-grant.json
+   jq -r .result.grant config/operator-grant.json config/issuance-grant.json
    ```
 
 2. **Open two customers, each with an API key.** An API key's verifier is the SHA-256 of its secret's raw
    bytes; the key is the credential's body and the secret in base64url
-   ([API keys from zero](../../integrate/api-keys/) explains it).
+   ([API keys from zero](../../integrate/api-keys/) explains it). Each key goes into a header file, like
+   the operator's.
 
    ```sh
-   open_customer() {  # open_customer <name>: prints its account and its API key
+   open_customer() {  # open_customer <name>: prints its account; its key goes to secrets/<name>.header
      openssl rand 32 > "secrets/$1.secret"
-     send "$OPERATOR_TOKEN" /v1/identities "identity-$1" '{
+     send secrets/operator.header /v1/identities "identity-$1" '{
        "kind": "person", "scheme": "api-key",
        "verifier": "'"$(sha256sum < "secrets/$1.secret" | cut -c1-64)"'" }' > "config/$1.identity.json"
      local identity credential
      identity=$(jq -r .result.identity "config/$1.identity.json")
      credential=$(jq -r .result.credential "config/$1.identity.json")
-     send "$OPERATOR_TOKEN" /v1/accounts "account-$1" '{
+     send secrets/operator.header /v1/accounts "account-$1" '{
        "owner": "'"$identity"'", "kind": "customer", "custody": "delegated" }' > "config/$1.account.json"
-     printf '%s aledgent_ak1.%s.%s\n' "$(jq -r .result.account "config/$1.account.json")" \
-       "${credential#did:aledgent:cred:}" \
-       "$(openssl base64 -A < "secrets/$1.secret" | tr '+/' '-_' | tr -d '=')"
+     printf 'Authorization: Bearer aledgent_ak1.%s.%s\n' "${credential#did:aledgent:cred:}" \
+       "$(openssl base64 -A < "secrets/$1.secret" | tr '+/' '-_' | tr -d '=')" > "secrets/$1.header"
+     jq -r .result.account "config/$1.account.json"
    }
-   alice=$(open_customer alice) && read -r ALICE_ACCOUNT ALICE_KEY <<< "$alice"
-   bob=$(open_customer bob) && read -r BOB_ACCOUNT BOB_KEY <<< "$bob"
+   ALICE_ACCOUNT=$(open_customer alice)
+   BOB_ACCOUNT=$(open_customer bob)
    echo "alice: $ALICE_ACCOUNT"
    echo "bob:   $BOB_ACCOUNT"
    ```
@@ -258,31 +291,41 @@ send() {  # send <token> <path> <client key> <JSON body>: prints the terminal re
    `CRD` has two decimals, so `"10000"` is 100.00.
 
    ```sh
-   send "$OPERATOR_TOKEN" /v1/issuances deposit-alice-1 '{
+   send secrets/operator.header /v1/issuances deposit-alice-1 '{
      "asset": "CRD", "destination": "'"$ALICE_ACCOUNT"'", "amount": "10000" }' \
      | jq '{operation_reference, terminal, postings: .result.postings}'
    ```
 
    An issuance is answered with its decision: `terminal` is `true` and `postings` names what it appended.
 
-4. **Transfer: Alice sends 25.00 to Bob,** with her own key. It is acknowledged at `Received`, then
+4. **Revoke the authority.** The task is done: the issuance grant first, then the operator grant it was
+   made under. Both would lapse in fifteen minutes; revoking says so now, in the audit trail.
+
+   ```sh
+   send secrets/operator.header "/v1/ops/issuance-grants/$(jq -r .result.grant config/issuance-grant.json)/revoke" \
+     revoke-issuance-crd-1 '{ "justification": "One-machine guide: deposit done" }' | jq '{terminal}'
+   send secrets/operator.header "/v1/ops/operator-grants/$(jq -r .result.grant config/operator-grant.json)/revoke" \
+     revoke-og-issuance-authority-1 '{ "justification": "One-machine guide: deposit done" }' | jq '{terminal}'
+   ```
+
+5. **Transfer: Alice sends 25.00 to Bob,** with her own key. It is acknowledged at `Received`, then
    decided.
 
    ```sh
-   send "$ALICE_KEY" /v1/transfers transfer-alice-bob-1 '{
+   send secrets/alice.header /v1/transfers transfer-alice-bob-1 '{
      "legs": [{ "from": "'"$ALICE_ACCOUNT"'", "to": "'"$BOB_ACCOUNT"'", "asset": "CRD", "amount": "2500" }] }' \
      > config/transfer.json
    jq '{operation_reference, state, terminal}' config/transfer.json
    ```
 
-5. **Read them back.** The operation, then both balances, from one view of the book:
+6. **Read them back.** The operation, then both balances, from one view of the book:
 
    ```sh
    curl -sf "$INGRESS/v1/operations/$(jq -r .operation_reference config/transfer.json)" \
-     -H "Authorization: Bearer $ALICE_KEY" | jq '{kind, state, terminal, postings: (.postings | length)}'
-   curl -sf "$INGRESS/v1/balances?account=$ALICE_ACCOUNT&asset=CRD" -H "Authorization: Bearer $ALICE_KEY" \
+     -H @secrets/alice.header | jq '{kind, state, terminal, postings: (.postings | length)}'
+   curl -sf "$INGRESS/v1/balances?account=$ALICE_ACCOUNT&asset=CRD" -H @secrets/alice.header \
      | jq -e '.rows[0] | .available == "7500"'
-   curl -sf "$INGRESS/v1/balances?account=$BOB_ACCOUNT&asset=CRD" -H "Authorization: Bearer $BOB_KEY" \
+   curl -sf "$INGRESS/v1/balances?account=$BOB_ACCOUNT&asset=CRD" -H @secrets/bob.header \
      | jq -e '.rows[0] | .available == "2500"'
    ```
 
@@ -312,7 +355,8 @@ instances share the database and the core's socket, so nothing moves between the
    ready green && echo "green is in the rotation"
    ```
 
-2. **Stop blue.** It drains for up to its drain period, then exits.
+2. **Stop blue.** It drains for up to its drain period, then exits. From here on, **green is the live
+   instance** and blue is stopped.
 
    ```sh
    docker compose stop ingress-blue
@@ -322,27 +366,58 @@ instances share the database and the core's socket, so nothing moves between the
    reads the result:
 
    ```sh
-   send "$BOB_KEY" /v1/transfers transfer-bob-alice-1 '{
+   send secrets/bob.header /v1/transfers transfer-bob-alice-1 '{
      "legs": [{ "from": "'"$BOB_ACCOUNT"'", "to": "'"$ALICE_ACCOUNT"'", "asset": "CRD", "amount": "500" }] }' \
      | jq '{state, terminal}'
-   curl -sf "$INGRESS/v1/balances?account=$BOB_ACCOUNT&asset=CRD" -H "Authorization: Bearer $BOB_KEY" \
+   curl -sf "$INGRESS/v1/balances?account=$BOB_ACCOUNT&asset=CRD" -H @secrets/bob.header \
      | jq -e '.rows[0] | .available == "2000"'
    ```
 
 </Steps>
 
-The next release does the same the other way round: set `ALEDGENT_INGRESS_IMAGE`, start `ingress-blue`,
-wait for it, stop `ingress-green`.
+The next release does the same the other way round: set `ALEDGENT_INGRESS_BLUE_IMAGE`, start
+`ingress-blue` (`docker compose up -d --wait ingress-blue`), wait until the proxy counts it up, stop
+`ingress-green`.
+
+## An unclean stop
+
+A clean stop (`SIGTERM`, what `docker compose stop` sends) keeps the core's replica, and the next start
+reopens it at once. Anything else, a crash, `SIGKILL`, the machine losing power, makes the next start
+**rebuild the book from the archive**, deciding every past input again
+([Core restarts](../core-restarts/#anything-else-rebuilds-from-genesis)). The compose file streams every
+decision to the `core-archive` volume for that (`--archive fs:…`). Without an archive, an unclean stop can
+leave the core unable to rebuild what it decided since its last snapshot (`NFR-4`).
+
+The archive here is on the machine's own disk: it survives a crash, not the disk's loss. To survive that,
+point `--archive` at storage off the machine (`s3://…`).
+
+Kill the core, start it again, and check it decides:
+
+```sh
+docker compose kill -s KILL core
+docker compose up -d core
+send secrets/alice.header /v1/transfers transfer-alice-bob-2 '{
+  "legs": [{ "from": "'"$ALICE_ACCOUNT"'", "to": "'"$BOB_ACCOUNT"'", "asset": "CRD", "amount": "100" }] }' \
+  | jq '{state, terminal}'
+curl -sf "$INGRESS/v1/balances?account=$BOB_ACCOUNT&asset=CRD" -H @secrets/bob.header \
+  | jq -e '.rows[0] | .available == "2100"'
+```
+
+The rebuild's time grows with the book's history; measure it on your own book.
 
 ## Day to day
 
-- **Logs:** `docker compose logs -f core ingress-blue`.
-- **Stop and start:** `docker compose stop` drains ingress and stops the core cleanly;
-  `docker compose up -d --wait` brings them back. The book is in the `core-state` volume, the received log in
-  `postgres-data`. Every service restarts on failure and when Docker starts with the machine.
-- **Backups:** the core host can stream every decision to an archive off the machine (`--archive`); without
-  it, losing the `core-state` volume loses every decision since its last snapshot. Back up `secrets/` and
-  `config/` apart from the book.
+After this guide's release, **`ingress-green` is the live instance** and `ingress-blue` is stopped. Name the
+live one in each command; `--profile green` makes `ingress-green` known to Compose.
+
+- **Logs:** `docker compose --profile green logs -f core ingress-green`.
+- **Stop:** `docker compose --profile green stop` drains ingress and stops the core cleanly.
+- **Start:** `docker compose --profile green up -d --wait postgres signer core ingress-green proxy`. Naming
+  the services starts the live instance and leaves the other one stopped. Every service restarts on
+  failure, and when Docker starts with the machine.
+- **Where things are:** the book in the `core-state` volume, its archive in `core-archive`, the received
+  log in `postgres-data`.
+- **Backups:** back up `secrets/` and `config/`, apart from the book and its archive.
 - **Starting again from nothing:** `docker compose --profile green down -v` removes every volume, and with
   them the book. Generate new genesis values (step 2) before starting again: a deployment's genesis is
   never reused.
