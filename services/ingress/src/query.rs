@@ -313,7 +313,7 @@ pub struct AssetBody {
     pub precision: u8,
     /// `fiat`, `stable`, `native` or `other`.
     pub kind: String,
-    /// `active` or `deprecated`.
+    /// `active`, `deprecated` or `retiring` (amendment 0043, `REQ-AS-10`).
     pub status: String,
 }
 

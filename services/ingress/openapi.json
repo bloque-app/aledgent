@@ -784,7 +784,7 @@
             "type": "integer"
           },
           "status": {
-            "description": "`active` or `deprecated`.",
+            "description": "`active`, `deprecated` or `retiring` (amendment 0043, `REQ-AS-10`).",
             "type": "string"
           }
         },
@@ -1142,7 +1142,7 @@
         "description": "`capture` of the reservation named in the path (SPEC §8.1, `INV-14`).",
         "properties": {
           "cleared": {
-            "description": "The amount cleared, in minor units. It must equal the reservation (`INV-14`).",
+            "description": "The amount cleared, in minor units: at most the reserved amount, which comes from the\nreservation, never from this field (`INV-14`). Below it, the rest returns to the payer's\navailable balance in the same posting (`US-C2`, `REQ-OP-2`); above it is\n`ERR-AmountMismatch`, and nothing changes.",
             "type": "string"
           },
           "destination": {

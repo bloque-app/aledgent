@@ -24,10 +24,11 @@ An **anchor** is a commitment to a state of the book, published on the settlemen
 commits to is a **checkpoint**.
 
 - **When.** Every hour, and on demand (`REQ-PR-1`): when the operator asks, with a justification
-  (`POST /v1/ops/anchors`), and when a disclosure concerns entries no final anchor covers yet. In this
-  release a disclosure rests on the final checkpoint it names, or the latest final one, and asserts its
-  fact as of that checkpoint; a fact newer than the latest final anchor waits for an on-demand anchor to
-  become final.
+  (`POST /v1/ops/anchors`), and when a disclosure concerns entries no final anchor covers yet.
+  **The second trigger is specified and not built in this release:** issuing a disclosure never takes an
+  anchor. A disclosure rests on the final checkpoint it names, or the latest final one, and asserts its
+  fact as of that checkpoint. To disclose a fact newer than the latest final anchor, the operator takes
+  an on-demand anchor and, once it is final, the disclosure is issued against it.
 - **What it commits to.** At one consistent cut of the book's writers, every entry up to and including a
   stated sequence, the registry of identities, credentials and grants, the audit trail, and nothing else
   (`REQ-PR-7`, `INV-19`). Taking the cut stops no writer.

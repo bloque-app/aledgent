@@ -177,13 +177,18 @@ by notification or with `GET /v1/operations/{reference}`.
 
 ## ERR-AmountMismatch
 
-Seen by: whoever captures a reservation.
+Seen by: whoever captures a reservation, and the operator.
 Retry: not unchanged.
 
-A capture cleared more than the reservation holds (`INV-14`). A capture may clear the reserved amount or
-less, and the difference returns to the payer in the same posting; never more. Capture at most the
-reserved amount, and charge any excess separately. For charges whose cost is known only afterwards, see
-[Metered usage](../../integrate/metered-usage/).
+**A capture** cleared more than the reservation holds (`INV-14`), and nothing changed. A capture may clear
+the reserved amount or less, and the difference returns to the payer in the same posting; never more.
+Capture at most the reserved amount, and charge any excess separately. For charges whose cost is known
+only afterwards, see [Metered usage](../../integrate/metered-usage/).
+
+**An external leg** (operator side): the settlement layer executed a withdrawal for an amount that differs
+from its reservation (`REQ-OP-2`). This is a detected condition, not a caller's fault: the difference is
+posted explicitly, never left as a silent residue, and an incident is raised for the operator. The caller
+has nothing to retry.
 
 ## ERR-ReleaseUnsafe
 

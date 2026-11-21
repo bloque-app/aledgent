@@ -36,7 +36,7 @@ starting point. A source that does not answer is itself a signal: `aledgent_sign
 The alert rules are `ops/prometheus/rules/aledgent.yml` and the dashboard is
 `ops/grafana/dashboards/aledgent-operations.json`, both in the repository. **Thresholds are the
 deployment's**: the values below are the shipped defaults. Every rule labels its alert with its `signal`
-and an `owner`, which you map to your own teams in Alertmanager. Severity `page` pages a human;
+and an `owner` (shipped as generic team names), which you map to your own teams in Alertmanager. Severity `page` pages a human;
 `warning` shows on the dashboard only.
 
 <Aside type="note">

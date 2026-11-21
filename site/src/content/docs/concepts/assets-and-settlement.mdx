@@ -28,7 +28,8 @@ never carried by a name, an account or a caller's input, and it never changes.
   operation.
 
 The registry is read with `GET /v1/assets`: each asset's id, precision, kind (`fiat`, `stable`, `native`,
-`other`), status (`active`, `deprecated`) and binding.
+`other`), status (`active`, `deprecated`, or `retiring` while an asset registered wrongly and never used
+is being removed) and binding.
 
 ## How value enters and leaves the book
 
