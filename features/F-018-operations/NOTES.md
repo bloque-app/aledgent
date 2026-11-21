@@ -187,9 +187,25 @@ drill's read of the layer's anchors.
 28. **Axis 3 is `F-017`'s `compare_settlement`, through ingress**, as the operations principal with the
     `compare_settlement` operator kind, at the latest cut the adapter reported. Each asset whose
     difference is not zero is a finding with the asset, the cut and the difference (an aggregate per
-    asset, no account's figure). A cut the adapter reported more than a day before is itself a finding
-    (`StaleCut`): the adapter reports positions whenever a final anchor wants its comparison, so an old cut
-    means anchoring or the adapter stopped. With no report yet (`ERR-EvidenceInsufficient`), or ingress
+    asset, no account's figure). A cut is itself a finding (`StaleCut`) when the book has postings beyond the latest final
+    checkpoint (`GET /v1/trial-balance` `view` - 1 > `entry_sequence`) and those have waited more than a day:
+    aged from the oldest newer checkpoint's `created_at`, else the cut's. The core checkpoints only when new
+    postings exist (`AC-J1.1`), so a quiet book's old cut is current, and the latest comparison's time (which
+    the job itself refreshes) is never the age. The core exposes no book-wide posting time, so the age is the checkpoint's, not the
+    posting's. The one-day threshold applies only to a checkpoint that covers the postings and stays in
+    flight (not final). Postings beyond every checkpoint are judged differently: once the checkpoint interval
+    has passed since the last checkpoint was created, the next tick makes one as soon as a posting exists,
+    so the run re-reads `GET /v1/ops/anchors` for up to three minutes (`CHECKPOINT_SETTLE_MS`). A newer
+    checkpoint ends the wait and is aged from its `created_at`. If none appears, the core is not
+    checkpointing new postings (or the last checkpoint is still in flight, and the core makes no new one
+    until it is final): that is `StaleCut` at about the interval plus three minutes after the last
+    checkpoint, with a note saying which. The interval is assumed to be the one-hour default
+    (`CHECKPOINT_INTERVAL_MS`): the test and production deployment templates set `interval_ms` to 3600000,
+    and `GET /v1/ops/anchors` does not carry it. A check that cannot be made (a failed or refused read of
+    the anchors or the trial balance, unparseable checkpoints, no final checkpoint) is the finding
+    `StaleCutUnchecked` with the reason, never a clean run. The check reads the trial balance, which is the
+    operator's: the in-process `daily` run takes the head from the core instead, since the operations
+    principal that posts the comparison cannot read it. With no report yet (`ERR-EvidenceInsufficient`), or ingress
     refusing the job, axis 3 is recorded as not run, and pages as not run after 24 h.
 29. **The daily job** (`reconcile::daily`) runs axes 1 and 2 and the `Suspense` report under the core's
     lock, then axis 3 through ingress, then writes the run's JSON record. `TODO(F-005)`: the host schedules

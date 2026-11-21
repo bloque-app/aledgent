@@ -754,7 +754,9 @@ async fn ac_j3_1_the_opt_in_posts_the_comparison_once_for_a_bound_asset() {
             (
                 "GET /v1/ops/anchors",
                 200,
-                json!({ "latest_comparison": { "at": 4_000 } }),
+                // The cut covers entries through 6; the trial balance's view 7 is the next posting.
+                json!({ "checkpoints": [cp(1, 6, 1_000, "final")],
+                        "latest_comparison": { "at": 4_000 } }),
             ),
             (
                 "POST /v1/ops/settlement/comparisons",
@@ -773,6 +775,8 @@ async fn ac_j3_1_the_opt_in_posts_the_comparison_once_for_a_bound_asset() {
         assert_eq!(posts, ["POST /v1/ops/settlement/comparisons"]);
         assert_eq!(run.audited.as_deref(), Some("did:op:1"));
         assert_eq!(run.clean(), clean, "{run:#?}");
+        // The stale-cut rule ran and found the cut current: no skip note, no unchecked finding.
+        assert!(axis(&run, 3).note.is_none(), "{run:#?}");
         if !clean {
             assert!(matches!(
                 axis(&run, 3).findings.as_slice(),
@@ -951,8 +955,9 @@ async fn ac_j3_2_the_comparison_must_cover_every_bound_asset_and_agree() {
     let anchors = (
         "GET /v1/ops/anchors",
         200,
-        json!({ "latest_comparison": { "at": 4_000 } }),
+        json!({ "checkpoints": [cp(1, 9, 1_000, "final")], "latest_comparison": { "at": 4_000 } }),
     );
+    let head = ("GET /v1/trial-balance", 200, json!({ "view": 10 }));
     let two_bound = (
         "GET /v1/assets",
         200,
@@ -969,6 +974,7 @@ async fn ac_j3_2_the_comparison_must_cover_every_bound_asset_and_agree() {
     let link = Canned::new(&[
         two_bound.clone(),
         anchors.clone(),
+        head.clone(),
         post(true, json!([zero_row("COPM"), zero_row("USD")])),
     ]);
     let (r, _, _) = reconcile::axis_3_gated(&link, true, "s", 5_000).await;
@@ -984,6 +990,7 @@ async fn ac_j3_2_the_comparison_must_cover_every_bound_asset_and_agree() {
     let link = Canned::new(&[
         two_bound.clone(),
         anchors.clone(),
+        head.clone(),
         post(false, json!([zero_row("COPM")])),
     ]);
     let (r, _, _) = reconcile::axis_3_gated(&link, true, "s", 5_000).await;
@@ -997,22 +1004,477 @@ async fn ac_j3_2_the_comparison_must_cover_every_bound_asset_and_agree() {
             .contains("no row for bound asset(s) USD"),
         "{r:?}"
     );
+}
 
-    // Covered and agreeing: clean. The anchors unreadable: said in a note, not skipped silently.
+// `AC-J1.1`, `NFR-9`: the stale-cut rule. The core checkpoints only when the book has postings no
+// checkpoint covers, so a quiet book's old cut is current; a cut is stale when postings beyond it
+// have waited more than a day, never by the age of the latest comparison (the job refreshes that).
+
+const DAY: u64 = 86_400_000;
+
+fn cp(number: u64, entry_sequence: u64, created_at: u64, status: &str) -> Value {
+    json!({ "number": number, "entry_sequence": entry_sequence, "created_at": created_at,
+            "status": status })
+}
+
+/// Axis 3 over canned reads: one bound asset that agrees, `checkpoints` and `latest_comparison_at`
+/// from `GET /v1/ops/anchors`, and the book's next posting sequence `head`, at `now`.
+async fn stale_axis(
+    checkpoints: Vec<Value>,
+    latest_comparison_at: u64,
+    head: u64,
+    now: u64,
+) -> ops::reconcile::AxisResult {
     let link = Canned::new(&[
-        two_bound.clone(),
-        ("GET /v1/ops/anchors", 500, json!({ "error": "down" })),
-        post(false, json!([zero_row("COPM"), zero_row("USD")])),
+        (
+            "GET /v1/assets",
+            200,
+            json!([{ "id": "COPM", "binding": "bound" }]),
+        ),
+        (
+            "GET /v1/ops/anchors",
+            200,
+            json!({ "checkpoints": checkpoints,
+                    "latest_comparison": { "at": latest_comparison_at } }),
+        ),
+        ("GET /v1/trial-balance", 200, json!({ "view": head })),
+        (
+            "POST /v1/ops/settlement/comparisons",
+            200,
+            json!({ "operation_reference": "did:op:1",
+                    "result": { "anchoring": { "comparison": {
+                        "cut": 4, "height": 9, "at": now, "anchors": [1], "differs": false,
+                        "rows": [zero_row("COPM")] } } } }),
+        ),
     ]);
-    let (r, _, _) = reconcile::axis_3_gated(&link, true, "s", 5_000).await;
-    assert!(r.ran && r.findings.is_empty(), "{r:?}");
-    assert!(
-        r.note
-            .as_deref()
-            .unwrap()
-            .contains("stale-cut check was skipped"),
+    let (r, _, _) = reconcile::axis_3_gated_with(&link, true, "s", now, &NO_WAIT).await;
+    r
+}
+
+/// Two re-reads with no pause: the wait for a due checkpoint, without the wall-clock time.
+const NO_WAIT: reconcile::Settle = reconcile::Settle {
+    polls: 2,
+    pause: Duration::ZERO,
+};
+
+/// The reads of [`stale_axis`], with `GET /v1/ops/anchors` answering each of `anchors` in turn
+/// (the last one for every read after).
+struct Evolving {
+    inner: Canned,
+    anchors: std::sync::Mutex<std::collections::VecDeque<Value>>,
+}
+
+impl IngressLink for Evolving {
+    async fn call(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<(u16, Value), String> {
+        if (method, path) == ("GET", "/v1/ops/anchors") {
+            let mut q = self.anchors.lock().unwrap();
+            let v = if q.len() > 1 {
+                q.pop_front().unwrap()
+            } else {
+                q.front().cloned().unwrap()
+            };
+            return Ok((200, v));
+        }
+        self.inner.call(method, path, body).await
+    }
+}
+
+async fn evolving_axis(reads: Vec<Vec<Value>>, head: u64, now: u64) -> ops::reconcile::AxisResult {
+    let link = Evolving {
+        inner: Canned::new(&[
+            (
+                "GET /v1/assets",
+                200,
+                json!([{ "id": "COPM", "binding": "bound" }]),
+            ),
+            ("GET /v1/trial-balance", 200, json!({ "view": head })),
+            (
+                "POST /v1/ops/settlement/comparisons",
+                200,
+                comparison_reply(false, json!([zero_row("COPM")])),
+            ),
+        ]),
+        anchors: std::sync::Mutex::new(
+            reads
+                .into_iter()
+                .map(|cps| json!({ "checkpoints": cps }))
+                .collect(),
+        ),
+    };
+    let (r, _, _) = reconcile::axis_3_gated_with(&link, true, "s", now, &NO_WAIT).await;
+    r
+}
+
+/// `AC-J1.1`: a quiet book (no posting beyond the cut's last entry) with a cut ten days old is
+/// current: clean, and nothing in the note.
+#[tokio::test]
+async fn ac_j1_1_a_quiet_book_with_an_old_cut_is_clean() {
+    let now = 10 * DAY;
+    // The cut covers entries through 9; the next posting is 10, so there is none beyond.
+    let r = stale_axis(vec![cp(1, 9, 1_000, "final")], now - 1, 10, now).await;
+    assert!(r.ran && r.findings.is_empty() && r.note.is_none(), "{r:?}");
+}
+
+/// `AC-J1.1`, `NFR-9`: postings beyond an old cut, with no checkpoint made for them, are stale,
+/// aged from the cut the adapter reported.
+#[tokio::test]
+async fn nfr_9_postings_after_an_old_cut_are_stale() {
+    let now = 10 * DAY;
+    let r = stale_axis(vec![cp(1, 9, 1_000, "final")], now - 1, 12, now).await;
+    assert_eq!(
+        r.findings,
+        vec![Finding::StaleCut {
+            cut: 4,
+            age: now - 1_000
+        }],
         "{r:?}"
     );
+}
+
+/// `NFR-9`: a cut refreshed only by a new comparison is still stale: the comparison's own time
+/// says nothing about when the book was last anchored.
+#[tokio::test]
+async fn nfr_9_a_cut_refreshed_only_by_a_new_comparison_is_still_stale() {
+    let now = 10 * DAY;
+    let r = stale_axis(vec![cp(1, 9, 1_000, "final")], now, 12, now).await;
+    assert!(
+        matches!(r.findings.as_slice(), [Finding::StaleCut { .. }]),
+        "{r:?}"
+    );
+}
+
+/// `AC-J1.1`: postings that a newer checkpoint already covers are aged from that checkpoint, which
+/// was made because they existed: recent ones are not stale, however old the final cut is.
+#[tokio::test]
+async fn ac_j1_1_postings_in_a_recent_checkpoint_are_not_stale() {
+    let now = 10 * DAY;
+    let cps = vec![
+        cp(1, 9, 1_000, "final"),
+        cp(2, 11, now - 1_000, "submitted"),
+    ];
+    let r = stale_axis(cps, now, 12, now).await;
+    assert!(r.ran && r.findings.is_empty(), "{r:?}");
+    // And the same postings waiting for finality more than a day are stale, by that age.
+    let cps = vec![
+        cp(1, 9, 1_000, "final"),
+        cp(2, 11, now - DAY - 5, "pending"),
+    ];
+    let r = stale_axis(cps, now, 12, now).await;
+    assert_eq!(
+        r.findings,
+        vec![Finding::StaleCut {
+            cut: 4,
+            age: DAY + 5
+        }]
+    );
+}
+
+/// `AC-J1.1`: postings with no checkpoint yet, the interval past, are the state of about one tick.
+/// A checkpoint that appears within the wait is aged as any other: recent, so not stale.
+#[tokio::test]
+async fn ac_j1_1_a_checkpoint_made_within_the_wait_clears_the_state() {
+    let now = 10 * DAY;
+    let before = vec![cp(1, 9, 1_000, "final")];
+    let after = vec![cp(1, 9, 1_000, "final"), cp(2, 11, now - 30_000, "pending")];
+    let r = evolving_axis(vec![before, after], 12, now).await;
+    assert!(r.ran && r.findings.is_empty() && r.note.is_none(), "{r:?}");
+}
+
+/// `AC-J1.1`, `NFR-9`: none appears in the wait: the core is not checkpointing new postings, which
+/// is the fault, and axis 3 finds the cut stale and says so.
+#[tokio::test]
+async fn nfr_9_no_checkpoint_within_the_wait_is_a_stale_cut_and_says_why() {
+    let now = 10 * DAY;
+    let r = evolving_axis(vec![vec![cp(1, 9, 1_000, "final")]], 12, now).await;
+    assert_eq!(
+        r.findings,
+        vec![Finding::StaleCut {
+            cut: 4,
+            age: now - 1_000
+        }],
+        "{r:?}"
+    );
+    let note = r.note.unwrap();
+    assert!(
+        note.contains("not checkpointing new postings") && note.contains("checkpoint 1 (final)"),
+        "{note}"
+    );
+}
+
+/// `AC-J1.1`, `NFR-9`: the core makes no checkpoint while one is in flight, so a last checkpoint
+/// that is not final, past its interval, with postings beyond it, is the same fault; the note names
+/// the checkpoint in flight.
+#[tokio::test]
+async fn nfr_9_a_checkpoint_in_flight_too_long_is_a_stale_cut() {
+    let now = 10 * DAY;
+    let cps = vec![
+        cp(1, 9, 1_000, "final"),
+        cp(2, 11, now - 2 * 3_600_000, "submitted"),
+    ];
+    let r = stale_axis(cps, now, 14, now).await;
+    assert_eq!(
+        r.findings,
+        vec![Finding::StaleCut {
+            cut: 4,
+            age: 2 * 3_600_000
+        }],
+        "{r:?}"
+    );
+    let note = r.note.unwrap();
+    assert!(
+        note.contains("checkpoint 2 is still submitted") && note.contains("in flight"),
+        "{note}"
+    );
+}
+
+/// `AC-J1.1`: before the interval has passed since the last checkpoint, none is due: a posting
+/// beyond it is not a fault, and the run does not wait for one.
+#[tokio::test]
+async fn ac_j1_1_no_checkpoint_is_due_inside_the_interval() {
+    let now = 10 * DAY;
+    let r = stale_axis(vec![cp(1, 9, now - 600_000, "final")], now, 12, now).await;
+    assert!(r.ran && r.findings.is_empty() && r.note.is_none(), "{r:?}");
+}
+
+/// A link that answers as `Canned` does, except `GET /v1/ops/anchors`, which fails to answer.
+struct AnchorsDown(Canned);
+
+impl IngressLink for AnchorsDown {
+    async fn call(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<(u16, Value), String> {
+        if path == "/v1/ops/anchors" {
+            return Err("connection reset".into());
+        }
+        self.0.call(method, path, body).await
+    }
+}
+
+/// The reads of [`stale_axis`], each replaceable, for the checks that cannot be made.
+fn reads(anchors: (u16, Value), trial: (u16, Value)) -> Vec<(&'static str, u16, Value)> {
+    vec![
+        (
+            "GET /v1/assets",
+            200,
+            json!([{ "id": "COPM", "binding": "bound" }]),
+        ),
+        ("GET /v1/ops/anchors", anchors.0, anchors.1),
+        ("GET /v1/trial-balance", trial.0, trial.1),
+        (
+            "POST /v1/ops/settlement/comparisons",
+            200,
+            comparison_reply(false, json!([zero_row("COPM")])),
+        ),
+    ]
+}
+
+/// `NFR-9`: a stale-cut check that could not be made is never a clean run. Each cause (the
+/// anchors refused, unparseable or without a final checkpoint; the trial balance refused or
+/// without a view; either read failing to answer) is a `StaleCutUnchecked` finding with the reason,
+/// so the run is not clean and `AledgentReconciliationDifference` fires; and the comparison itself
+/// is still reported.
+#[tokio::test]
+async fn nfr_9_a_stale_cut_check_that_could_not_run_is_a_finding_not_a_clean_run() {
+    let good_anchors = (200, json!({ "checkpoints": [cp(1, 9, 1_000, "final")] }));
+    let good_trial = (200, json!({ "view": 10 }));
+    let refusal = json!({ "error": "ERR-NotAuthorised", "description": "no ReadSignals grant" });
+    type Cause = (&'static str, (u16, Value), (u16, Value), &'static str);
+    let causes: Vec<Cause> = vec![
+        (
+            "anchors refused",
+            (403, refusal.clone()),
+            good_trial.clone(),
+            "GET /v1/ops/anchors answered 403 ERR-NotAuthorised: no ReadSignals grant",
+        ),
+        (
+            "anchors down",
+            (500, json!({ "error": "down" })),
+            good_trial.clone(),
+            "GET /v1/ops/anchors answered 500 down",
+        ),
+        (
+            "checkpoints unparseable",
+            (200, json!({ "checkpoints": [{ "number": "one" }] })),
+            good_trial.clone(),
+            "checkpoints",
+        ),
+        (
+            "checkpoints missing",
+            (200, json!({})),
+            good_trial.clone(),
+            "checkpoints",
+        ),
+        (
+            "no final checkpoint",
+            (200, json!({ "checkpoints": [cp(1, 9, 1_000, "pending")] })),
+            good_trial.clone(),
+            "no final checkpoint",
+        ),
+        (
+            "trial balance refused",
+            good_anchors.clone(),
+            (403, refusal),
+            "GET /v1/trial-balance answered 403 ERR-NotAuthorised",
+        ),
+        (
+            "trial balance without a view",
+            good_anchors.clone(),
+            (200, json!({ "accounts": 3 })),
+            "GET /v1/trial-balance: no view",
+        ),
+    ];
+    for (name, anchors, trial, expect) in causes {
+        let link = Canned::new(&reads(anchors, trial));
+        let (r, audited, _) = reconcile::axis_3_gated_with(&link, true, "s", 5_000, &NO_WAIT).await;
+        assert!(r.ran && audited.is_some(), "{name}: {r:?}");
+        let Some(Finding::StaleCutUnchecked { reason }) = r.findings.first() else {
+            panic!("{name}: {r:?}");
+        };
+        assert!(reason.contains(expect), "{name}: {reason}");
+        assert_eq!(r.findings.len(), 1, "{name}: {r:?}");
+        assert!(r.note.as_deref().unwrap().contains(expect), "{name}: {r:?}");
+        let run = Run {
+            at: 5_000,
+            axes: vec![r],
+            suspense: Vec::new(),
+            audited: None,
+            inputs: Default::default(),
+            suspense_checked: false,
+        };
+        assert!(!run.clean(), "{name}");
+    }
+
+    // Either read failing to answer at all.
+    let down = AnchorsDown(Canned::new(&reads(good_anchors, good_trial.clone())));
+    let (r, ..) = reconcile::axis_3_gated_with(&down, true, "s", 5_000, &NO_WAIT).await;
+    assert!(
+        matches!(
+            r.findings.as_slice(),
+            [Finding::StaleCutUnchecked { reason }] if reason.contains("connection reset")
+        ),
+        "{r:?}"
+    );
+
+    // A comparison that differs still shows beside the unchecked finding.
+    let mut answers = reads((500, json!({})), good_trial);
+    answers[3].2 = comparison_reply(
+        true,
+        json!([{ "asset": "COPM", "book": "10",
+                                                    "layer": "9", "difference": "-1" }]),
+    );
+    let (r, ..) =
+        reconcile::axis_3_gated_with(&Canned::new(&answers), true, "s", 5_000, &NO_WAIT).await;
+    assert!(
+        matches!(
+            r.findings.as_slice(),
+            [
+                Finding::Settlement { .. },
+                Finding::StaleCutUnchecked { .. }
+            ]
+        ),
+        "{r:?}"
+    );
+}
+
+/// `NFR-9`: a body that is not a refusal is bounded in the record: about 200 characters.
+#[tokio::test]
+async fn nfr_9_a_non_standard_refusal_body_is_truncated_in_the_note() {
+    let long = "x".repeat(5_000);
+    let link = Canned::new(&reads(
+        (502, json!({ "html": long })),
+        (200, json!({ "view": 10 })),
+    ));
+    let (r, ..) = reconcile::axis_3_gated_with(&link, true, "s", 5_000, &NO_WAIT).await;
+    let note = r.note.unwrap();
+    assert!(note.contains("502") && note.contains("..."), "{note}");
+    assert!(note.len() < 500, "{}", note.len());
+}
+
+/// `NFR-9`: a checkpoint created more than five minutes after the run's clock is said in the note.
+#[tokio::test]
+async fn nfr_9_a_checkpoint_from_the_future_is_noted() {
+    let now = 10 * DAY;
+    // Covered by the final cut, but postings beyond it wait in a pending checkpoint from the future.
+    let cps = vec![
+        cp(1, 9, 1_000, "final"),
+        cp(2, 11, now + 600_000, "pending"),
+    ];
+    let r = stale_axis(cps, now, 12, now).await;
+    assert!(r.findings.is_empty(), "{r:?}");
+    let note = r.note.unwrap();
+    assert!(note.contains("600 s after this run's clock"), "{note}");
+    // Within five minutes it is not.
+    let cps = vec![cp(1, 9, 1_000, "final"), cp(2, 11, now + 60_000, "pending")];
+    assert!(stale_axis(cps, now, 12, now).await.note.is_none());
+}
+
+/// `AC-J1.1`: the rule on the checkpoints alone.
+#[test]
+fn ac_j1_1_uncovered_since_reads_the_latest_final_cut() {
+    let read = |v: Vec<Value>| -> Vec<reconcile::CheckpointRead> {
+        v.into_iter()
+            .map(|c| serde_json::from_value(c).unwrap())
+            .collect()
+    };
+    let cps = read(vec![cp(1, 4, 100, "final"), cp(2, 9, 200, "final")]);
+    // The latest final cut covers through 9.
+    assert_eq!(reconcile::uncovered_since(&cps, 10), Ok(None));
+    assert_eq!(reconcile::uncovered_since(&cps, 0), Ok(None));
+    assert_eq!(reconcile::uncovered_since(&cps, 11), Ok(Some(200)));
+    // Nothing final: there is no cut to measure.
+    let cps = read(vec![cp(1, 4, 100, "pending")]);
+    assert!(reconcile::uncovered_since(&cps, 10).is_err());
+}
+
+/// `NFR-9`, `AC-J3.2`: when the comparison is refused, the run record keeps the refusal (status,
+/// `ERR-*` id and description) instead of "the comparison could not be made" alone: a missing
+/// `CompareSettlement` grant reads as that.
+#[tokio::test]
+async fn nfr_9_a_refused_comparison_keeps_its_refusal_in_the_note() {
+    let link = Canned::new(&[
+        (
+            "GET /v1/assets",
+            200,
+            json!([{ "id": "COPM", "binding": "bound" }]),
+        ),
+        (
+            "GET /v1/ops/anchors",
+            200,
+            json!({ "checkpoints": [cp(1, 9, 1_000, "final")] }),
+        ),
+        ("GET /v1/trial-balance", 200, json!({ "view": 10 })),
+        (
+            "POST /v1/ops/settlement/comparisons",
+            403,
+            json!({ "error": "ERR-NotAuthorised",
+                    "description": "no CompareSettlement operator grant" }),
+        ),
+    ]);
+    let (r, audited, _) = reconcile::axis_3_gated(&link, true, "s", 5_000).await;
+    assert!(
+        !r.ran && audited.is_none() && r.findings.is_empty(),
+        "{r:?}"
+    );
+    let note = r.note.unwrap();
+    for part in [
+        "the comparison could not be made",
+        "403",
+        "ERR-NotAuthorised",
+        "CompareSettlement",
+    ] {
+        assert!(note.contains(part), "{part} missing from: {note}");
+    }
+    // A transport failure is kept too.
+    let (r, ..) = reconcile::axis_3_gated(&Canned::new(&[]), true, "s", 5_000).await;
+    assert!(r.note.unwrap().contains("GET /v1/assets"));
 }
 
 /// `REQ-LA-2`: a later run that did not look at `Suspense` neither hides the last report that did
