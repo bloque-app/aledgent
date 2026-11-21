@@ -713,7 +713,12 @@ async fn stress_with_settlement(cx: &mut Ctx, phases: &str, out: &Path) -> Resul
                             }));
                         }
                         Err(e) => {
-                            latencies.push(json!({ "operation": op, "asset": asset, "error": e }))
+                            // What the operation is, and what the core holds against the
+                            // settlement, for whoever reads the run.
+                            let diagnosis = diagnose_operation(cxr, &op).await;
+                            say(format!("{op} did not settle: {e}; {diagnosis}"));
+                            latencies.push(json!({ "operation": op, "asset": asset, "error": e,
+                                                   "diagnosis": diagnosis }));
                         }
                     }
                 }
@@ -762,6 +767,28 @@ async fn stress_with_settlement(cx: &mut Ctx, phases: &str, out: &Path) -> Resul
         stress::record::percentiles(settled_busdc),
         binding
     ))
+}
+
+/// An operation as ingress shows it to alice, and the last incidents the core holds.
+async fn diagnose_operation(cx: &Ctx, op: &str) -> Value {
+    let (status, body) =
+        cx.d.call(
+            "GET",
+            &format!("/v1/operations/{op}"),
+            Some(&cx.alice.token),
+            &[],
+            None,
+        )
+        .await;
+    let incidents: Vec<String> =
+        cx.d.core
+            .with_ledger(|l| {
+                let all = l.state().settlement().incidents();
+                let skip = all.len().saturating_sub(10);
+                all.iter().skip(skip).map(|i| format!("{i:?}")).collect()
+            })
+            .unwrap_or_default();
+    json!({ "status": status.as_u16(), "operation": body, "last_incidents": incidents })
 }
 
 /// Gate 5b (F-032, `F-029`, amendment 0011): bind `BUSDC`, production's first chain-bound asset,
