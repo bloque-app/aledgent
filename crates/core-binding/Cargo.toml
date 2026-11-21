@@ -87,6 +87,18 @@ name = "kept_replica"
 required-features = ["ingress"]
 
 [[test]]
+name = "replica_manifest"
+required-features = ["ingress"]
+
+[[test]]
+name = "release_replica"
+required-features = ["ingress"]
+
+[[test]]
+name = "replica_measure"
+required-features = ["ingress"]
+
+[[test]]
 name = "upgrade_input"
 required-features = ["ingress"]
 

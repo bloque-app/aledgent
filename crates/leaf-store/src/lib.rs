@@ -27,6 +27,7 @@
 //!   and the service-tree witness.
 //! - [`archive`]: the committed delta log, append-only, in fsynced segments.
 //! - [`openings`]: the sealed openings store.
+//! - [`savepoint`]: persistent savepoints of a store's file, for the host replica's manifest.
 //! - [`balance`]: balance reads, pinned, in three point reads.
 //! - [`rebuild`]: rebuild from the archive, and the commitment checks of `INV-6` and `INV-5`.
 
@@ -36,6 +37,7 @@ pub mod engine;
 pub mod kv;
 pub mod openings;
 pub mod rebuild;
+pub mod savepoint;
 pub mod store;
 pub mod trie;
 pub mod witness;

@@ -15,8 +15,8 @@
 #      hyper, h2, reqwest, ureq, rustls, native-tls);
 #   2. no use of std's clock, OS randomness or sockets in the guest's sources:
 #      agents/core/src, and the parts of core-binding, ledger-core and
-#      ledger-kernel the guest compiles (core-binding's host and core modules
-#      are std-only and never in the guest).
+#      ledger-kernel the guest compiles (core-binding's host module, with its
+#      submodules, and its core module are std-only and never in the guest).
 #
 # Deterministic generators seeded by the caller (rand_core's traits,
 # rand_chacha) are allowed: they are how randomness arrives as a parameter.
@@ -60,7 +60,7 @@ for d in "${sources[@]}"; do
   [[ -d $d ]] || { echo "check-guest-deps: no source directory $d" >&2; exit 2; }
   hits=$(grep -rnE "$uses" "$d" --include='*.rs' \
     | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' \
-    | grep -vE '(^|/)core-binding/src/(host|core)\.rs:|(^|/)ledger-kernel/src/(store|vault)/file\.rs:|(^|/)shards/src/(host|proto|native|attest)\.rs:|(^|/)shards/src/net/[a-z_]+\.rs:|_tests?\.rs:|/tests/' || true)
+    | grep -vE '(^|/)core-binding/src/(host|core)\.rs:|(^|/)core-binding/src/host/[a-z_]+\.rs:|(^|/)ledger-kernel/src/(store|vault)/file\.rs:|(^|/)shards/src/(host|proto|native|attest)\.rs:|(^|/)shards/src/net/[a-z_]+\.rs:|_tests?\.rs:|/tests/' || true)
   if [[ -n $hits ]]; then
     echo "check-guest-deps: the guest's sources use a clock, randomness or a socket:" >&2
     echo "$hits" | sed 's/^/  /' >&2
