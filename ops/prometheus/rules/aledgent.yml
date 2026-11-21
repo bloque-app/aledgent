@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0 OR MIT
 # F-018, T-018-05: the alert rules of NFR-11's signals and the three extras (plan, "Signals").
 #
-# Every rule is `<metric>{<label>="<value>",...} <op> <integer>`: ops/src/alerts.rs evaluates this
-# very file in the tests that push each signal over its line (tests/alerts.rs), so keep to that
-# form. Thresholds are the deployment's; the values below are the V0 proposals, in milliseconds.
+# Every rule is `<metric>{<label>="<value>",...} <op> <integer>`, or such comparisons joined by
+# `and`: ops/src/alerts.rs evaluates this very file in the tests that push each signal over its
+# line (tests/alerts.rs), so keep to that form. Thresholds are the deployment's; the values below are the V0 proposals, in milliseconds.
 #
 # severity "page" pages a human through Alertmanager's `pager` route; a failed reconciliation
 # pages and never opens a ticket (NFR-9). severity "warning" shows on the dashboard only.
@@ -73,12 +73,18 @@ groups:
           summary: A notification has been owed for more than fifteen minutes.
 
       # Anchor lag (F-017): the newest Final checkpoint older than twice the anchoring cadence
-      # (one hour by default; the cadence is OQ-11's), or a checkpoint in flight for an hour.
+      # (one hour by default; the cadence is OQ-11's) while postings wait past the latest
+      # checkpoint, or a checkpoint in flight for an hour. With no new posting the cadence makes
+      # no checkpoint (AC-J1.1), so the lag of a quiet book grows and is not late (T-018-13). The
+      # `for` covers the seconds between the first posting after a quiet spell and the tick that
+      # takes its checkpoint. A core that does not report the postings (an older core host)
+      # exports no series, so this rule does not fire there.
       - alert: AledgentAnchorLag
-        expr: aledgent_anchor_lag_ms > 7200000
+        expr: aledgent_anchor_lag_ms > 7200000 and aledgent_anchor_unanchored_entries > 0
+        for: 10m
         labels: { severity: page, owner: settlement-operations, signal: anchor-lag }
         annotations:
-          summary: The newest Final checkpoint is older than twice the anchoring cadence.
+          summary: Postings wait past the latest checkpoint, and the newest Final checkpoint is older than twice the anchoring cadence.
           runbook: ops/runbooks/anchoring.md
       - alert: AledgentAnchorStuck
         expr: aledgent_anchor_in_flight_age_ms > 3600000
@@ -143,12 +149,17 @@ groups:
         annotations:
           summary: A signing lane's native balance is under the fee floor.
 
-      # DEC-6, RISK-7: the ticker. Deadlines move only on ticks.
+      # DEC-6, RISK-7: the ticker. Deadlines move only on ticks. When the core says nothing is due,
+      # the ticker logs a tick only once per heartbeat (ingress's `tick_heartbeat`, 60 s by
+      # default; stress finding F2), so an idle book's tick age reaches about a minute by design.
+      # The line is that heartbeat and a margin (T-018-14). Hard constraint: this 90 s line holds
+      # only while `tick_heartbeat` is 60 s (the default). Raising `tick_heartbeat` means raising
+      # this line with it, to the new heartbeat plus 30 s, or an idle book pages.
       - alert: AledgentTickerStale
-        expr: aledgent_ticker_age_ms > 30000
+        expr: aledgent_ticker_age_ms > 90000
         labels: { severity: page, owner: platform, signal: ticker }
         annotations:
-          summary: The core has applied no tick for thirty seconds; deadlines are not moving.
+          summary: The core has applied no tick for ninety seconds, past the idle heartbeat; deadlines are not moving.
           runbook: ops/runbooks/restore.md
 
       # REQ-OP-6, AC-C4.1: the Needs-Review queue, past its service level, to its owner.

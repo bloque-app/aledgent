@@ -198,7 +198,7 @@
       "id": 5,
       "type": "stat",
       "title": "Anchor lag (F-017)",
-      "description": "NFR-11: time since the newest Final checkpoint was created, and how long the checkpoint in flight has waited. Pages over twice the cadence, or an hour in flight.",
+      "description": "NFR-11: time since the newest Final checkpoint was created, how long the checkpoint in flight has waited, and the postings past the latest checkpoint (T-018-13). The lag pages over twice the cadence only while postings wait (a quiet book makes no checkpoint, AC-J1.1); in flight, after an hour.",
       "gridPos": {
         "x": 0,
         "y": 13,
@@ -219,12 +219,31 @@
           "refId": "B",
           "expr": "aledgent_anchor_in_flight_age_ms",
           "legendFormat": "in flight"
+        },
+        {
+          "refId": "C",
+          "expr": "aledgent_anchor_unanchored_entries",
+          "legendFormat": "postings not anchored"
         }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "ms"
-        }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "C"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              }
+            ]
+          }
+        ]
       }
     },
     {

@@ -85,7 +85,7 @@ VOS or CipherClerk pin. *Alternative:* quarterly.
 | Age of the oldest non-terminal operation (`REQ-OP-8`) | core query; oldest `Received` row in ingress | over its service level; `Received` over the `REQ-CS-7` bound |
 | Observation completeness | adapter: cursor lag behind the finalized inbox head, open gaps, open chain mismatches (`AledgentSettlementChainMismatch`) | any gap or mismatch; lag over a limit |
 | Undelivered notifications, count and age (`REQ-EV-6`) | core outbox, through the delivery worker | oldest over a limit |
-| Anchor lag | core: time since the newest `Final` checkpoint was created | over twice the cadence |
+| Anchor lag | core: time since the newest `Final` checkpoint was created; the postings past the latest checkpoint (`T-018-13`) | over twice the cadence, while postings wait past the latest checkpoint (with none, the cadence makes no checkpoint, `AC-J1.1`) |
 | Reconciliation outcome per axis | reconciliation job | any non-zero result, or no run in 24 h |
 | Liquidity of positions that fund settlement costs (`REQ-SN-2`) | adapter: signer native balances; instance positions per asset | under the floor |
 

@@ -51,6 +51,7 @@ fn healthy() -> Snapshot {
             }],
             anchor_lag: Some(1_800_000),
             anchor_in_flight_age: Some(60_000),
+            anchor_unanchored_entries: Some(3),
             anchor_incidents: Vec::new(),
             settlement_differing: 0,
             settlement_comparison_age: Some(1_800_000),
@@ -261,8 +262,9 @@ fn nfr_11_each_signal_over_its_line_pages_the_test_route() {
         ("AledgentLaneUnderFeeFloor", "liquidity", |s| {
             s.adapter.as_mut().unwrap().lanes[0].under_floor = true
         }),
+        // T-018-14: past the idle heartbeat (60 s) and its margin.
         ("AledgentTickerStale", "ticker", |s| {
-            s.core.as_mut().unwrap().tick_age = Some(30_001)
+            s.core.as_mut().unwrap().tick_age = Some(90_001)
         }),
         // REQ-RT-20, T-037-15: a writer fenced past `fence_alert_after` (five minutes).
         ("AledgentWriterFenced", "writer-fence", |s| {
@@ -309,6 +311,7 @@ fn nfr_11_each_signal_over_its_line_pages_the_test_route() {
         ("AledgentAdapterBackupLate", "backup", |s| {
             s.backups.insert(StoreKind::Adapter, NOW - 172_800_001);
         }),
+        // T-018-13: with postings past the latest checkpoint (`healthy` has three).
         ("AledgentAnchorLag", "anchor-lag", |s| {
             s.core.as_mut().unwrap().anchor_lag = Some(7_200_001)
         }),
@@ -528,6 +531,69 @@ fn nfr_11_each_signal_over_its_line_pages_the_test_route() {
     ));
 }
 
+/// `T-018-13`, `AC-J1.1`, `NFR-11`: the anchor lag of a book with nothing new to anchor grows, since
+/// the cadence makes no checkpoint without a new posting, and pages no one; the same lag with
+/// postings waiting past the latest checkpoint pages once it has held ten minutes; a core that does
+/// not report the postings (an older core host) exports no series, and the rule does not fire.
+#[test]
+fn t_018_13_anchor_lag_pages_only_while_postings_wait_past_the_latest_checkpoint() {
+    let with = |lag: u64, unanchored: Option<u64>| {
+        let mut s = healthy();
+        let c = s.core.as_mut().unwrap();
+        c.anchor_lag = Some(lag);
+        c.anchor_unanchored_entries = unanchored;
+        s
+    };
+    let lag = |s: &Snapshot| page(s).0.got("AledgentAnchorLag");
+    // A quiet book: days since the newest Final checkpoint, and nothing past it.
+    let quiet = with(3 * 86_400_000, Some(0));
+    assert!(!lag(&quiet));
+    let (pager, dashboard) = page(&quiet);
+    assert!(pager.delivered.is_empty(), "{:#?}", pager.delivered);
+    assert!(dashboard.delivered.is_empty(), "{:#?}", dashboard.delivered);
+    // Postings past it, and the lag over twice the cadence: it pages.
+    assert!(lag(&with(7_200_001, Some(1))));
+    // Postings past it, the lag inside its line: nothing.
+    assert!(!lag(&with(7_200_000, Some(1))));
+    // An older core: no series, and so no page, whatever the lag.
+    let older = with(3 * 86_400_000, None);
+    assert!(
+        !parse(&render(&older))
+            .iter()
+            .any(|(n, _, _)| n == "aledgent_anchor_unanchored_entries")
+    );
+    assert!(!lag(&older));
+    // The first posting after a quiet spell: the tick takes its checkpoint within seconds, the
+    // lag drops, and the rule's `for` has not run out.
+    let mut ev = Evaluator::new(Rules::committed().unwrap());
+    let fired = |a: &Vec<ops::alerts::Alert>| a.iter().any(|a| a.alert == "AledgentAnchorLag");
+    assert!(!fired(
+        &ev.step(NOW, &parse(&render(&with(3 * 86_400_000, Some(1)))))
+    ));
+    assert!(!fired(
+        &ev.step(NOW + 5_000, &parse(&render(&with(5_000, Some(0)))))
+    ));
+    assert!(!fired(
+        &ev.step(NOW + 600_000, &parse(&render(&with(600_000, Some(0)))))
+    ));
+}
+
+/// `T-018-14`, `DEC-6`, `RISK-7`: an idle book's ticker logs a tick once per heartbeat (60 s by
+/// default), so its tick age reaches about a minute and pages no one; ninety seconds without a tick
+/// does.
+#[test]
+fn t_018_14_an_idle_ticker_at_its_heartbeat_pages_no_one() {
+    let at = |age: u64| {
+        let mut s = healthy();
+        s.core.as_mut().unwrap().tick_age = Some(age);
+        page(&s).0.got("AledgentTickerStale")
+    };
+    for idle in [30_001, 60_000, 61_500, 90_000] {
+        assert!(!at(idle), "{idle} ms is the heartbeat's");
+    }
+    assert!(at(90_001));
+}
+
 /// `AC-C4.1`, `REQ-OP-6`: over a running deployment, a reservation left past its deadline and its
 /// service level joins the review queue, and the exporter's scrape pages its owner through the
 /// test route.
@@ -624,12 +690,13 @@ fn req_op_6_the_dashboards_show_every_signal_and_the_review_queue() {
         );
     }
     for r in &Rules::committed().unwrap().0 {
-        let m = &r.expr.metric;
-        assert!(
-            exported.contains(m) || DEFERRED.contains(&m.as_str()),
-            "{}: {m} is not exported",
-            r.alert
-        );
+        for m in r.expr.metrics() {
+            assert!(
+                exported.contains(m) || DEFERRED.contains(&m),
+                "{}: {m} is not exported",
+                r.alert
+            );
+        }
     }
     let queue = dash["panels"]
         .as_array()

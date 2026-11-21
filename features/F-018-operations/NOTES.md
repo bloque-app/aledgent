@@ -150,12 +150,14 @@ drill's read of the layer's anchors.
 
 ### Alerts, routes, dashboards (T-018-05)
 
-20. **The rules are a subset of PromQL**: `metric{label="value"} op integer`, evaluated by `ops::alerts` over
-    the committed files in the tests; anything else is refused by the parser. Thresholds are the V0
+20. **The rules are a subset of PromQL**: `metric{label="value"} op integer`, or such comparisons joined by
+    `and` (since `T-018-13`), evaluated by `ops::alerts` over the committed files in the tests; anything
+    else is refused by the parser. Thresholds are the V0
     proposals written in the rules file (the oldest non-terminal operation over the review service level of
     one hour; `Received` over the one-minute decision bound; undelivered over fifteen minutes; ticker over
-    thirty seconds; the finalized height stalled two minutes; reconciliation not run in 24 h; backups two
-    cadences late; anchor lag over 2 × 1 h, a placeholder for `OQ-11`). *Amendment 0007
+    thirty seconds, ninety since `T-018-14`; the finalized height stalled two minutes; reconciliation not
+    run in 24 h; backups two cadences late; anchor lag over 2 × 1 h, a placeholder for `OQ-11`, while
+    postings wait past the latest checkpoint since `T-018-13`). *Amendment 0007
     (2026-09-29):* there was no latency rule, and no 50 ms threshold to correct. Two rules are added:
     **completion over its 30 s ceiling at p99** (`AledgentCompletionOverCeiling` on
     `aledgent_completion_p99_ms`, `NFR-15`, the signal `completion`, ingress's measurement carried in
@@ -274,6 +276,49 @@ The run is repeated by CI on every change (`cargo test --workspace`, Docker on t
 the drill in staging at production-like size (no staging environment), and each runbook exercised once in
 staging.
 
+## T-018-13: the anchor lag of a quiet book (2026-11-20)
+
+`AledgentAnchorLag` paged on the anchor lag alone: the time since the newest `Final` checkpoint was
+created. The cadence makes no checkpoint while no posting is past the latest one (`AC-J1.1`, `F-017`'s
+plan), so a book with no new posting has a lag that grows without bound and is not late: everything it
+holds is anchored. The rule would page on a quiet book, and nothing exported said whether anything was
+waiting to be anchored.
+
+**The signal.** `aledgent_anchor_unanchored_entries`: the postings after the latest checkpoint's entry
+sequence, the latest of any status, by the very test the cadence makes before it creates one (the book's
+next posting sequence, through an open batch, against the latest checkpoint's `entry_sequence`); before
+the first checkpoint, every posting. A count, no ledger fact (`REQ-PV-5`). The latest of any status, not
+the latest `Final`: a checkpoint in flight already covers its postings, and `AledgentAnchorStuck` pages on
+it after an hour.
+
+**The rule.** `aledgent_anchor_lag_ms > 7200000 and aledgent_anchor_unanchored_entries > 0`, for 10
+minutes. The `for` covers the seconds between the first posting after a quiet spell, when the lag is
+already old, and the tick that takes its checkpoint. `and` joins the evaluated subset of decision 20: as
+Prometheus's, a sample of the left is kept only when a sample with the same labels holds the right; any
+other operator is still refused.
+
+**Compatibility.** The field is optional in `SignalsBody`, as `writer_code` is: a body from an older core
+host has none, and the exporter then writes no series (never a zero, which would read as "nothing to
+anchor"), so the rule does not fire against an older core. The value is computed by the core host's
+replica (`Ledger::signals`, which the core's guest never calls), so the core's package and code version are
+unchanged; the core host, ingress (which carries the body from the core host to the exporter) and opsctl
+must each be new for the series to appear.
+
+*Trade-off, stated plainly.* Against an older core host the anchor lag pages no one at all, not even
+when postings wait. Deploying the rules ahead of the core host trades that page for the false one.
+
+## T-018-14: the ticker's idle heartbeat (2026-11-20)
+
+`AledgentTickerStale` paged at thirty seconds without a tick. Since stress finding F2 the ticker logs a
+tick only when the core says a deadline or a checkpoint is due, or once per `tick_heartbeat` (60 s by
+default) when nothing is: an idle tick costs a full core input. An idle book's tick age therefore reaches
+about a minute by design, and the rule paged on it again and again. The line moves to ninety seconds:
+the heartbeat and a margin for the tick's own decision. A deployment that sets another heartbeat moves the
+line with it.
+
+*Trade-off, stated plainly.* A ticker that has really stopped is noticed after ninety seconds instead of
+thirty: a deadline that falls in that minute moves up to a minute late before anyone is paged.
+
 ## Tests
 
 | Test | Covers |
@@ -281,7 +326,7 @@ staging.
 | `ops/tests/restore.rs` | `T-018-01` (a core backup verifies, holds no secret in the clear, opens only under its key; the audit backup), `AC-K5.1` / `T-018-02` / `T-018-03` in memory (restore to an older backup plus replay gives the pre-failure roots; every check including `INV-19` against the layer, which fails against a layer without the anchors; export format 3's anchoring sections across the backup and the restored anchor store equal to the source's; the outage's deposit issued; a restart from the rebuilt journal; the record), a log behind the backup refused, the journal rebuilt from the log alone |
 | `ops/tests/postgres.rs` | `NFR-10`, `AC-K5.1`, `INV-19`: the drill over PostgreSQL restored from `pg_basebackup` and the WAL archive, with anchors before and after the backup point |
 | `ops/tests/signals.rs` | `AC-C4.2`, `NFR-11`: every signal scraped (the anchor lag included), no ledger fact; `REQ-PV-5`: the query refused without `read_signals`; a core down is a source down |
-| `ops/tests/alerts.rs` | `NFR-11`: a healthy deployment pages and warns no one; every paging rule pushed over its line pages the test route with its signal and owner (the anchoring and `Suspense` rules included); `AC-C4.1` end to end; the dashboards show every signal |
+| `ops/tests/alerts.rs` | `NFR-11`: a healthy deployment pages and warns no one; every paging rule pushed over its line pages the test route with its signal and owner (the anchoring and `Suspense` rules included); `AC-C4.1` end to end; the dashboards show every signal; `T-018-13`: the anchor lag pages only while postings wait past the latest checkpoint |
 | `ops/tests/reconcile.rs` | `AC-J3.1`: the daily run reconciles three axes and is recorded as JSON and on the audit trail; an axis that cannot run pages as not run; `AC-J3.2`: one minor unit on axis 1 (a copied leaf), axis 2 (an unbalanced copy) and axis 3 (sent to the position outside the pallet's calls), each paging; `REQ-PV-4`: the external source's audited privileged read; `REQ-LA-2`: a `Suspense` balance with its age, paging after a day |
 | `ops/tests/runbooks.rs`, `ops/tests/opsctl.rs` | `T-018-08`, `REQ-AT-3`; the binary |
 | `ops` unit tests | the schedule, manifests and pruning, sealing, the rules and routes' parser, the exporter's example configuration |
