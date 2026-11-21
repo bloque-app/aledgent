@@ -18,14 +18,14 @@
 //! the previous manifest, whose savepoints each file still holds, or the new one. Each file keeps
 //! the savepoint the current manifest names and the one being taken, never more.
 //!
-//! **Reopened** ([`Driver::reopen_manifest`]). The record is read and its digest checked. The
+//! **Reopened** (`Driver::reopen_manifest`). The record is read and its digest checked. The
 //! input it names must be one the host's log holds (extended from the Agent's ring, as a rebuild
 //! extends it), with the same log hash, roots and next posting, and the Agent must stand at or
 //! after it. Each file is put back to its savepoint and the replica's own archive cut where the
 //! book store then stands, so the three files agree on that input again; the replica is rebuilt
 //! over them as a clean stop's is (the service store from its leaves, checked leaf for leaf; the
 //! audit records restored) and must reach the record's roots. Then every input after it is
-//! replayed over it by the same step a rebuild from genesis takes ([`super::replay_entry`]), each
+//! replayed over it by the same step a rebuild from genesis takes (`replay_entry`), each
 //! reaching its archived roots, and the driver is built only where the Agent's hot row stands.
 //!
 //! **What makes it equal to a rebuild, stated plainly.** A replay is deterministic in the state it

@@ -2413,7 +2413,7 @@ impl<P: AgentPort> Driver<P> {
     /// the same input, log hash and roots. A clean stop's record must also be where the Agent's hot
     /// row and the host's log end; a manifest must be an input of the log, and the inputs after it
     /// are replayed over the reopened replica, each reaching its archived roots, up to the Agent's
-    /// hot row ([`Driver::reopen_manifest`]).
+    /// hot row (`Driver::reopen_manifest`).
     ///
     /// `archive` is the host's log. What the Agent committed beyond it is appended to it here
     /// (the host died before archiving it), as [`Driver::recover_audited`] does; the caller
