@@ -60,6 +60,12 @@ orders: about a thousand to a few thousand shards at native speed, a received-lo
 them, and an edge that pushes decisions rather than serving polls. No lever short of sharding
 moves the headline by more than about two orders of magnitude from today's.
 
+**Poller count.** A manually dispatched `stress.yml` now defaults to 200 completion pollers, the
+figure of the gate's own `e2e/stress/matrix.json`; it used to fall back to the harness default of
+2 000. Heavy polling degrades decide throughput (finding F3): a gate 1 dispatched with 2 000 pollers
+measured 10 a second where 200 pollers sustain 24. Scheduled and matrix runs set their own
+`pollers` and are unchanged.
+
 ## 1. Where the time goes today
 
 *Measured:* the batch curve, x86 bench run

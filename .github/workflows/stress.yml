@@ -113,6 +113,10 @@ on:
         description: "name:commands_per_min:secs,... (overrides plan)"
         type: string
         default: ""
+      pollers:
+        description: "completion pollers at once; 200 is the gate's own figure (e2e/stress/matrix.json). Heavy polling degrades decide throughput (finding F3)"
+        type: string
+        default: "200"
       holders:
         description: "funded holders"
         type: string
