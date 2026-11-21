@@ -10,10 +10,11 @@
   },
   "scripts": {
     "dev": "astro dev",
-    "build": "astro build && node lib/check-links.mjs",
+    "build": "node lib/check-public.mjs --self-test && astro build && node lib/check-links.mjs && node lib/check-public.mjs",
     "preview": "astro preview",
     "astro": "astro",
-    "check:errors": "node lib/errors.mjs --check"
+    "check:errors": "node lib/errors.mjs --check",
+    "check:public": "node lib/check-public.mjs"
   },
   "dependencies": {
     "@astrojs/markdown-satteri": "0.4.2",

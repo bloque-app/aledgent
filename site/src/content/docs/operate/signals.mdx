@@ -1,0 +1,162 @@
+---
+title: Signals
+description: The six signals NFR-11 requires, what each measures, where it is read, the alert that fires on it, and the runbook it leads to.
+sidebar:
+  order: 7
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Cites `NFR-11`, `REQ-OP-8`, `REQ-OP-6`, `REQ-CS-7`, `REQ-SA-7`, `REQ-IN-5`, `REQ-EV-6`, `REQ-PR-1`,
+`REQ-PR-5`, `REQ-PR-8`, `NFR-9`, `REQ-SN-2`, `REQ-PV-5`, `REQ-OS-1`, `F-017`, `F-018`.
+
+Six things must be continuously observable (`NFR-11`): the age of the oldest non-terminal operation,
+observation completeness, the count and age of undelivered notifications, anchor lag, the reconciliation
+outcome per axis, and the liquidity of every position that funds settlement-layer costs. Every signal is a
+count, an age or a time, never a ledger fact: no account, customer amount, identity or operation reference
+appears in one.
+
+## Where they are read
+
+| Source | What | Who may read it |
+| --- | --- | --- |
+| `GET /v1/ops/signals` | The core's signals, one consistent view, ages in milliseconds at the time of the read | A principal holding a live `read_signals` operator grant. The read is attributed like any other (`REQ-PV-5`) |
+| The settlement adapter's signals file | Observation, positions and fee lanes: only the adapter reads the settlement layer | The host's own processes |
+| The reconciliation's run records, the backups' manifests, the last drill's record | Reconciliation outcome per axis, backup ages, drill result | The host's own processes |
+| `opsctl exporter` | Joins all of the above into Prometheus metrics on its own `/metrics`, on every scrape | Your Prometheus |
+| `GET /metrics` on ingress | That ingress instance's own metrics | Your Prometheus |
+
+The exporter reads the core through ingress, as a principal that should hold `read_signals` and nothing else. Its
+configuration names ingress, the token's file (or the variable that holds it, never an argument), the
+adapter's signals file and the records directories; `ops/exporter.example.toml` in the repository is a
+starting point. A source that does not answer is itself a signal: `aledgent_signals_up{source=…} 0` pages
+(`AledgentSignalsDown`), and an adapter signals file older than a minute pages
+(`AledgentAdapterSignalsStale`).
+
+The alert rules are `ops/prometheus/rules/aledgent.yml` and the dashboard is
+`ops/grafana/dashboards/aledgent-operations.json`, both in the repository. **Thresholds are the
+deployment's**: the values below are the shipped defaults. Every rule labels its alert with its `signal`
+and an `owner` (shipped as generic team names), which you map to your own teams in Alertmanager. Severity `page` pages a human;
+`warning` shows on the dashboard only.
+
+## Age of the oldest non-terminal operation
+
+`REQ-OP-8`. How long the oldest operation that has not reached `Settled`, `Released` or `Rejected` has been
+open. A large age means something is waiting on evidence, on a human, or on a core that is not deciding.
+
+| Read as | Metric |
+| --- | --- |
+| `oldest_open_age`, with `open`, `received` and `needs_review` counts | `aledgent_oldest_non_terminal_age_ms` |
+| `oldest_undecided_age`: the oldest command ingress holds that no core has decided yet (`REQ-CS-7`) | `aledgent_oldest_undecided_row_age_ms` |
+| `review`, `review_overdue`, `review_most_overdue`, `review_service_level`: the `Needs-Review` queue (`REQ-OP-6`) | `aledgent_review_queue`, `aledgent_needs_review`, `aledgent_review_overdue`, `aledgent_review_most_overdue_ms`, `aledgent_review_service_level_ms` |
+
+| Alert | Fires when | Runbook |
+| --- | --- | --- |
+| `AledgentOldestNonTerminalOverServiceLevel` | Oldest non-terminal operation over 1 h, for 5 min | [restore](../runbooks/restore/) |
+| `AledgentReceivedOverDecisionBound` | A received command undecided for over 60 s, for 1 min | [restore](../runbooks/restore/); for a restarting core, [Core restarts](../core-restarts/) |
+| `AledgentReviewOverdue` | Any `Needs-Review` operation past its service level | Resolve it: [Overview](../overview/#when-an-operation-needs-a-human) |
+
+## Observation completeness
+
+`REQ-SA-7`, `REQ-IN-5`. Whether the book has seen everything the settlement layer recorded for this
+deployment. The adapter never advances past a range it did not read; a range it was forced to skip is
+recorded as an explicit gap.
+
+| Metric | Means |
+| --- | --- |
+| `aledgent_observation_cursor_lag` | Inbox positions the adapter's cursor is behind the finalized inbox |
+| `aledgent_observation_gaps_total` | Ranges the adapter was ever forced to skip |
+| `aledgent_observation_chain_mismatches` | Entries read that do not lead to the head the layer holds, after a second read |
+| `aledgent_observation_stopped` | Observation waiting for an operator: a range no reader can serve, or the layer reset under a running adapter |
+
+| Alert | Fires when | Runbook |
+| --- | --- | --- |
+| `AledgentObservationGap` | Any skipped range | [gap filling](../runbooks/gap-filling/) |
+| `AledgentSettlementChainMismatch` | Any chain mismatch | [gap filling](../runbooks/gap-filling/) |
+| `AledgentObservationStopped` | Observation waits for an operator | [gap filling](../runbooks/gap-filling/) |
+| `AledgentSettlementEpochRefused` | The core refused to follow a new sequence of the layer's record; new withdrawals are refused meanwhile | [gap filling](../runbooks/gap-filling/) |
+| `AledgentObservationLag` | Cursor more than 100 positions behind, for 10 min | [gap filling](../runbooks/gap-filling/) |
+
+## Undelivered notifications
+
+`REQ-EV-6`. How many notifications are owed and not yet acknowledged by their recipient, and the age of the
+oldest. A notification whose principal has no registered destination or secret waits here; so does one that
+used up its delivery attempts. See [Notifications](../../integrate/notifications/).
+
+| Read as | Metric |
+| --- | --- |
+| `undelivered`, `oldest_undelivered_age`; each one, with its recipient and age, at `GET /v1/notifications/undelivered` | `aledgent_undelivered_notifications`, `aledgent_oldest_undelivered_age_ms` |
+
+| Alert | Fires when | Runbook |
+| --- | --- | --- |
+| `AledgentUndeliveredNotification` | A notification owed for over 15 min, for 5 min | None yet: check the recipient's registration and that its endpoint answers `2xx` |
+
+## Anchor lag
+
+`REQ-PR-1`, `REQ-PR-8`, `F-017`. The time since the newest checkpoint whose anchor is final on the
+settlement layer was created; before the first is final, the age of the oldest checkpoint. Anchoring is
+hourly by default and one checkpoint at a time. With no new posting the cadence makes no checkpoint, so a
+quiet book's lag grows without being late: what matters is a large lag **while postings wait** past the
+latest checkpoint, which means anchors are not reaching finality. A lag reduces provability only: holders' operations go on
+([While the settlement layer is away](../../concepts/settlement-layer-away/)).
+
+| Read as | Metric |
+| --- | --- |
+| `anchor_lag`, `anchor_in_flight_age`; every checkpoint with its status at `GET /v1/ops/anchors` | `aledgent_anchor_lag_ms`, `aledgent_anchor_in_flight_age_ms` |
+| `anchor_unanchored_entries`: postings after the latest checkpoint's entry sequence (every posting, before the first checkpoint). Absent from a core that does not report it, which then exports no series | `aledgent_anchor_unanchored_entries` |
+| `anchor_incidents`, per kind | `aledgent_anchor_incidents{kind=…}` |
+
+| Alert | Fires when | Runbook |
+| --- | --- | --- |
+| `AledgentAnchorLag` | Newest final checkpoint older than 2 h **and** postings waiting past the latest checkpoint, for 10 min. It cannot fire against a core that does not report the waiting postings | [anchoring](../runbooks/anchoring/) |
+| `AledgentAnchorStuck` | A checkpoint in flight for over 1 h | [anchoring](../runbooks/anchoring/) |
+| `AledgentAnchorCommitmentMismatch` | The layer recorded an anchor of this number with another commitment; anchoring stops | [anchoring](../runbooks/anchoring/) |
+| `AledgentUnknownAnchor` | The layer holds an anchor aledgent never made | [anchoring](../runbooks/anchoring/) |
+
+## Reconciliation outcome per axis
+
+`NFR-9`, `REQ-PR-5`. Reconciliation runs at least daily, at one minor unit and zero tolerance, on three
+axes: (1) each (account, asset) against every independent source; (2) the per-asset trial balance, exactly
+zero, and the in-transit position against the credits in transit; (3) the book against the settlement
+layer's view of what aledgent holds. A failure pages a human; it never opens a ticket. `opsctl reconcile`
+runs it and writes the records the exporter reads.
+
+| Read as | Metric |
+| --- | --- |
+| Per axis: differences found, whether it could run, time since its last run | `aledgent_reconciliation_differences{axis=…}`, `aledgent_reconciliation_ran{axis=…}`, `aledgent_reconciliation_last_run_age_ms{axis=…}` |
+| `settlement_differing`, `settlement_comparison_age`: the latest settlement comparison | `aledgent_settlement_differing_assets`, `aledgent_settlement_comparison_age_ms` |
+| `Suspense` balances not at zero, and the oldest | `aledgent_suspense_nonzero`, `aledgent_suspense_oldest_age_ms` |
+
+| Alert | Fires when | Runbook |
+| --- | --- | --- |
+| `AledgentReconciliationDifference` | Any difference on any axis | [reconciliation failure](../runbooks/reconciliation-failure/) |
+| `AledgentReconciliationNotRun` | An axis has not run in 24 h | [reconciliation failure](../runbooks/reconciliation-failure/) |
+| `AledgentSettlementDifference` | The latest settlement comparison differs, by as little as one minor unit | [reconciliation failure](../runbooks/reconciliation-failure/) |
+| `AledgentSuspenseNotReconciled` | A `Suspense` balance not zero for over a day | [reconciliation failure](../runbooks/reconciliation-failure/) |
+
+## Liquidity of the positions that fund settlement
+
+`REQ-SN-2`. aledgent bears every settlement-layer cost, so the positions that pay for it must not run dry
+unseen. A shortfall is a named, parked, self-clearing condition: the affected withdrawals park, one alert is
+raised per position, and they resume on their own when it clears.
+
+| Metric | Means |
+| --- | --- |
+| `aledgent_position{asset=…}` | The deployment's position per asset on the settlement layer, in the layer's units |
+| `aledgent_lane_native{lane=…}` | A signing lane's native balance, which pays the fees |
+| `aledgent_lane_under_fee_floor{lane=…}` | Whether that lane is under the fee floor |
+| `aledgent_liquidity_alerts{kind=…}` | Open shortfalls, one per position: `kind` is `position` or `fees` |
+
+| Alert | Fires when | Runbook |
+| --- | --- | --- |
+| `AledgentLiquidityShortfall` | Any open shortfall; withdrawals are parked | [crank outage](../runbooks/crank-outage/) |
+| `AledgentLaneUnderFeeFloor` | A lane under its fee floor | Fund the lane |
+
+## Beyond the six
+
+The same rule file pages on more than `NFR-11` asks: completion over its 30 s ceiling at p99
+(`AledgentCompletionOverCeiling`), a ticker, which moves deadlines, silent for over 90 s
+(`AledgentTickerStale`; an idle book ticks about once a minute), the
+settlement layer's finalized height not moving (`AledgentBlockProductionStalled`), a fault answered
+`ERR-Internal`, an audit gap, late backups, a failed or overdue restore drill, and the core's halt
+(`AledgentCoreHalted`). Each names its runbook in the rule's `runbook` annotation.

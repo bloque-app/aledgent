@@ -165,7 +165,7 @@ groups:
       # REQ-OP-6, AC-C4.1: the Needs-Review queue, past its service level, to its owner.
       - alert: AledgentReviewOverdue
         expr: aledgent_review_overdue > 0
-        labels: { severity: page, signal: needs-review }
+        labels: { severity: page, owner: settlement-operations, signal: needs-review }
         annotations:
           summary: An operation in the review queue is past its service level.
 

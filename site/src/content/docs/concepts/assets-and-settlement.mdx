@@ -1,0 +1,134 @@
+---
+title: Assets and the settlement layer
+description: The asset registry and its one precision, book-only and bound assets, the settlement adapter's role, and how deposits and withdrawals move.
+sidebar:
+  order: 5
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Cites `REQ-AS-1`, `REQ-AS-3`, `REQ-AS-4`, `REQ-AS-6`, `REQ-AS-7`, `REQ-AS-8`, `REQ-AS-9`, `REQ-AS-10`,
+`REQ-SL-3`, `REQ-SL-4`, `REQ-SL-5`, `REQ-SL-7`, `REQ-SL-8`, `REQ-SA-1`, `REQ-SA-2`, `REQ-SA-4`, `REQ-SA-8`,
+`REQ-AR-2`, `REQ-IN-1`, `REQ-IN-2`, `REQ-IN-3`, `REQ-SO-1`, `REQ-SO-2`, `REQ-SN-1`, `REQ-SN-2`, `INV-5`,
+`INV-7`, `INV-10`, `INV-11`, `INV-24`, `INV-25`, `NFR-15`, `DEC-17`, `DEC-20`.
+
+## One registry, one precision
+
+An **asset** is a unit of value with a registered identity and a fixed precision. There is exactly one
+asset registry, and an asset's precision is recorded there and nowhere else (`REQ-AS-1`, `INV-24`). It is
+never carried by a name, an account or a caller's input, and it never changes.
+
+- **Amounts are exact integers of minor units** (`REQ-AS-4`, `INV-7`). There is one conversion between a
+  decimal and minor units, at one boundary, and it never rounds: an amount with more precision than its
+  asset is refused with `ERR-PrecisionExceeded`.
+- **Asset ids are normalised at every boundary** (`REQ-AS-3`), to uppercase: two spellings of one asset
+  cannot exist as two assets.
+- **Assets are kept apart** within an account: no operation mixes two assets' balances. aledgent does not
+  convert between assets; a conversion is a redemption of one and an issuance of another, each its own
+  operation.
+
+The registry is read with `GET /v1/assets`: each asset's id, precision, kind (`fiat`, `stable`, `native`,
+`other`), status (`active`, `deprecated`, or `retiring` while an asset registered wrongly and never used
+is being removed) and binding.
+
+## How value enters and leaves the book
+
+Value crosses aledgent's boundary in only two ways, and both post against the **issuance counterparty**,
+the named position whose balance is the negative of all value aledgent holds:
+
+| Way | Who | Posting |
+| --- | --- | --- |
+| **Issuance and redemption** | A principal holding issuance authority for the asset, within its bounds (`REQ-AS-6`) | `Issue` (`POST /v1/issuances`) or `Redeem` (`POST /v1/redemptions`), answered with its decision |
+| **The settlement layer** | A deposit observed on it, or a withdrawal executed through it | `Issue` at an inbound leg's settlement, `Redeem` at an outbound leg's |
+
+For every asset, the entries across the whole book sum to exactly zero (`INV-5`), so the trial balance makes
+every issuance measurable. Internal transfers move value between ledger accounts and never touch the
+settlement layer, which holds no record per operation, account or identity (`REQ-SL-5`).
+
+## Book-only, then bound
+
+Every asset is **registered book-only** (`REQ-AS-7`): in the registry, bound to nothing on the settlement
+layer. Its value enters and leaves only by issuance and redemption, and moves inside the book like any
+other asset's. An external leg in it is refused at submission with `ERR-UnsupportedLeg`.
+
+A book-only asset may be **bound** to the settlement layer once, by a holder of issuance authority for it,
+with a justification (`REQ-AS-8`, `POST /v1/ops/assets/{asset}/bind`). The binding names the asset's
+location on the settlement layer, and succeeds only if:
+
+- the settlement layer describes a live asset there whose symbol, normalised, is the asset's id and whose
+  precision is the registry's, read from the layer's own fields for them, never parsed from a name;
+- no other asset is bound, or being bound, to the same location;
+- **zero divergence:** what the settlement layer holds for aledgent in the asset equals, to the minor unit,
+  the book's outstanding balance of it, established by the settlement layer and final there.
+
+While a binding is in progress the asset is `binding`, and its issuance and redemption are refused, so the
+amount being checked cannot move. A refused binding returns it to book-only. Once final, it is `bound`:
+external legs in it are supported as the settlement adapter declares, issuance and redemption go on under
+issuance authority, and the book is reconciled against the settlement layer's holding from that point. A
+binding is never undone, and after it the settlement layer's description of the asset no longer changes the
+registry (`REQ-AS-9`).
+
+How an operator registers, binds and, for one registered wrongly and never used, removes an asset
+(`REQ-AS-10`): [Registering an asset](../../operate/registering-assets/).
+
+## The settlement layer and its adapter
+
+A deployment has exactly one **settlement layer**: the one external network through which value enters and
+leaves aledgent, and on which anchors are published (`INV-25`). The plan binds it to a settlement contract
+on Kreivo (`DEC-17`), and `DEC-20` describes how a bound asset maps to a location there. The specification defines it by what it must do:
+record a transfer at a coordinate that is unique, stable and independently readable, and offer a point
+after which a recorded fact cannot be revised (`REQ-SL-3`).
+
+The **settlement adapter** is the one component that touches it. It holds the keys to execute outbound
+legs and observes the layer, and it holds no authority over any ledger account (`REQ-SA-8`):
+
+- it **submits evidence and executes instructions**, and never writes the book or declares an outcome
+  (`REQ-AR-2`, `INV-11`). aledgent derives every status from what was observed;
+- it **declares what it supports**, for which assets, and aledgent refuses an unsupported operation at
+  submission, not at execution (`REQ-SA-1`, `ERR-UnsupportedLeg`);
+- at start-up it **asserts it is connected to the declared settlement layer**, and refuses to serve on a
+  mismatch (`REQ-SA-2`). While it does not serve, withdrawals are refused with
+  `ERR-SettlementLayerUnavailable`;
+- it reports each instruction as **executed, provably not executed, or unknown**, and never collapses
+  "unknown" into either of the others (`REQ-SA-4`).
+
+aledgent bears every settlement-layer cost. No holder-facing flow shows a fee, a funding step or a fee
+asset (`REQ-SN-1`); a shortfall in the positions that pay for settlement parks the affected operations and
+raises one alert per position, and they resume when it clears (`REQ-SN-2`).
+
+## A deposit
+
+1. A counterparty sends value on the settlement layer to the deployment, with an **opaque account
+   reference** that the deployment resolves to one ledger account (`REQ-SL-7`). The settlement layer
+   holds no record of the account itself. An operator prints the reference for an account with
+   `aledgent-ingress account-ref <account>`.
+2. The adapter observes the arrival at its coordinate. aledgent deduplicates on that coordinate (`REQ-IN-1`)
+   and credits whether or not it started anything. The operation enters at `Observed`. **Nothing is
+   credited yet** (`INV-10`).
+3. Once the layer's finality has passed the observation and the canonical record still matches
+   (`REQ-IN-3`), the operation is `Final`, and then `Settled` with one `Issue` posting to the account.
+4. If the record no longer matches before finality, the operation is `Orphaned` and released. Nothing was
+   posted, so nothing is reversed.
+
+## A withdrawal
+
+1. **Reserve.** `POST /v1/withdrawals` reserves the amount against the payer (`REQ-SO-1`). It is
+   acknowledged at `Received`; its decision follows.
+2. **Submit.** `POST /v1/withdrawals/{reference}/submit` names the destination. aledgent assembles the
+   instruction itself (`REQ-SO-2`), with the operation reference and an explicit expiry (`REQ-SL-4`,
+   `REQ-SL-8`), and hands it to the adapter: `Submitted`.
+3. **Observe.** The leg's inclusion is observed: `Observed`. The command has completed (`NFR-15`), but
+   the value has not left the book.
+4. **Finality.** Finality passes the observation: `Final`, then `Settled` with one `Redeem` posting from
+   the reservation to the issuance counterparty.
+5. **If it cannot execute.** A proved rejection, or proven non-inclusion after the expiry, releases the
+   reservation at once. If neither can be proven, the operation goes to `Needs-Review` and stays reserved:
+   it is never released on silence ([Reservations](../reservations/)).
+
+An executed amount that differs from the reservation is `ERR-AmountMismatch`, with the difference posted
+explicitly, never left as a silent residue.
+
+<Aside type="note">
+A withdrawal's command completes at **inclusion** (`Observed`), within `NFR-15`. The time from inclusion
+to finality is mostly the settlement layer's, is measured and reported, and is not bounded by aledgent.
+</Aside>
