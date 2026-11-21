@@ -340,6 +340,8 @@ fn operation(route: &crate::surface::Route) -> Value {
             );
         }
         Handler::OpenApi => {
+            // Public (`NFR-7`, amendment 0044): the global bearer requirement does not apply.
+            op.insert("security".into(), json!([]));
             responses.insert(
                 "200".into(),
                 json!({
@@ -524,8 +526,8 @@ pub fn document() -> Value {
                             notifications (CTR-EVT). Amounts are decimal-integer strings of minor \
                             units. Identifiers are did:aledgent strings. Times are milliseconds \
                             since the Unix epoch. Every route requires a bearer credential, \
-                            except the two under /v1/auth, which check what their body carries \
-                            (F-028)."
+                            except /openapi.json, which is public, and the two under /v1/auth, \
+                            which check what their body carries (F-028)."
         },
         "security": [ { "bearer": [] } ],
         "paths": paths,
