@@ -486,11 +486,18 @@ impl Ctx {
             Duration::from_millis(100),
             || async move {
                 let s = state(d, p, op).await;
-                (s == "Settled").then_some(s)
+                // A withdrawal the layer refused is `Released`: nothing more will happen to it.
+                (s == "Settled" || s == "Released").then_some(s)
             },
         )
         .await
-        .map(|_| ())
+        .and_then(|s| {
+            if s == "Settled" {
+                Ok(())
+            } else {
+                Err(format!("{op} ended {s}, not Settled"))
+            }
+        })
     }
 }
 
