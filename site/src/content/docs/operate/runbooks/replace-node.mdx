@@ -37,7 +37,7 @@ node before you start the new one.
 3. **Attach** the core volume and the audit volume, and mount them where the deployment configuration
    expects them (the core's `--state` and `audit_store.dir`).
 4. **Start the core**, then ingress. The core replays `archive.bin` and rebuilds its replica; start-up time
-   grows with the book. The forwarder then decides every row the log holds undecided.
+   grows with the book. *Replica:* a clean stop on the old node (SIGTERM within the stop timeout) keeps the core host's replica; a crash, SIGKILL, a stop timeout, a halted core or a fresh node rebuilds it from genesis, which takes time in proportion to the book's history ([Core restarts](../../core-restarts/)). The forwarder then decides every row the log holds undecided.
 5. Register the new node with your load balancer. If your log stream is named after the node, the new node's
    logs appear under a new name.
 

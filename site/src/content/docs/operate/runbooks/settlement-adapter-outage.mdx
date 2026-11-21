@@ -12,7 +12,7 @@ Cites `REQ-SA-5`, `REQ-SA-6`, `REQ-SA-7`, `REQ-OP-6`, `REQ-OP-9`, `INV-10`, `INV
 Run it when any of these page: `AledgentAdapterNotServing` (not serving for 5 minutes),
 `AledgentAdapterRuntimeUnconfirmed` (a `runtime:<spec_version>` alert is open), `AledgentAdapterSignalsStale`,
 `AledgentSignalsDown`, `AledgentObservationLag`, `AledgentObservationStopped`, `AledgentAnchorLag`,
-`AledgentLaneUnderFeeFloor`, or your platform's task-not-running alarm. Suggested owner: settlement
+`AledgentLaneUnderFeeFloor`, `AledgentAdapterSignerNotReady`, or your platform's task-not-running alarm. Suggested owner: settlement
 operations.
 
 While the adapter is down:
@@ -87,14 +87,15 @@ While the adapter is down:
      **This is urgent, and no other page will say so.** A withdrawal is instructed with an expiry 150 heights
      above the finalized head (`expiry_window` in the settlement configuration,
      `deploy/templates/settlement.json`). At 2.0 s blocks and a finality lag of about 16 blocks it can wait
-     unsigned for about **4.5 minutes**; then no era fits, the adapter records it as never signed, and about 5
-     minutes after it was instructed the core releases it: the operation ends `Released` (terminal; the payer's
-     withdrawal does not happen, and it does not go to review). The oldest-non-terminal page (over 1 hour, for 5
+     unsigned for about **4.5 minutes**; then no era fits, the adapter records it as never signed. That is
+     proof that it cannot be included, and on that proof of non-inclusion (not on a timer) the core releases it,
+     about 5 minutes after it was instructed: the operation ends `Released` (terminal; the payer's withdrawal does
+     not happen, and it does not go to review). The oldest-non-terminal page (over 1 hour, for 5
      minutes) never fires for these, `AledgentAdapterNotServing` does not fire (the adapter still serves), and
      the anchor lag pages only after 2 hours. Payers can retry once the runtime is confirmed.
 6. **Database.** If the adapter cannot reach its database, follow the database server's own failover. The
    adapter resumes from the head it last accepted.
-7. **Keys.** If signing fails, read the signer's log: a signer that cannot log in to your secret store or read
+7. **Keys.** `AledgentAdapterSignerNotReady` (a `signer` alert open for 2 minutes) means a settlement key's signer is not ready and nothing is signed. `aledgent-settle <config> keys` signs a probe with each key and shows only public halves, so it tells you which key fails. If signing fails, read the signer's log: a signer that cannot log in to your secret store or read
    its secret does not start (check the role's binding to the task's identity); for a lane opted into KMS,
    check KMS reachability and the task role's sign permission. Do not fall back to a key in the environment.
 8. **Liquidity.** A lane or anchor key under its fee floor parks instructions. Whoever holds the treasury tops

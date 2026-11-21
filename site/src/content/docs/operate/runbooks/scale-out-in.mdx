@@ -22,7 +22,7 @@ production. Nothing here moves value or edits a store outside the command surfac
 | Lever | Online in this release? | Depends on |
 |---|---|---|
 | Adapter lanes (more device keys signing in parallel) | **Yes** | A new key in the adapter signer's secret (or an opted-in KMS key), and the settlement contract's key set |
-| Ingress instances | **Yes**, over the stream link: the instances connect to the core over mutual TLS or a Unix socket, and the feed lease decides which feeds each partition (`F-038`) | The `stream` section of ingress's configuration |
+| Ingress instances | **Yes** (A2), over the stream link; cross-host needs mutual TLS, a Unix socket works on the core's host only: the instances connect to the core over mutual TLS or a Unix socket, and the feed lease decides which feeds each partition (`F-038`) | The `stream` section of ingress's configuration |
 | The execution node's machine size (vertical) | **No.** A size change is a stop and start of the node, minutes with the volumes attached. Take it ahead of need, in a maintenance window, on your own growth triggers: memory first, then CPU | An ingress off the core's host, or a replicated core |
 | The core and audit volumes | **Yes**, where your platform grows volumes online; then grow the filesystem | Nothing: alert at 70 % full and grow by half again |
 | Shard count | **Fixed at genesis**, until online splits exist | Online split, and ingress routing to shards |
@@ -48,6 +48,44 @@ production. Nothing here moves value or edits a store outside the command surfac
 3. Add the lane to the adapter's configuration (`adapter.keys`) as a signer key
    (`{"signer": {"key": "lane-2"}}`). Restart the adapter. The lease hands over and the adapter resumes from
    its store.
+
+### A2. Add or remove an ingress instance (online)
+
+Ingress instances share one database and one fleet. Each serves the stream, and a core host keeps one stream to
+every instance in the **roster**. Only the holder of the feed lease feeds commands; the others read, and one of
+them takes the lease if the feeder goes, with no reconnect on the way.
+
+**A Unix socket works only on the core's own host.** Scaling across hosts needs the `tls:` transport, with
+mutual TLS under your own certificate authority: each ingress and each core host present a certificate the
+other checks.
+
+To add an instance:
+
+1. Start from a copy of an existing instance's configuration and image. In its `stream` section set `listen`
+   (`tls:<host:port>`), `tls` (this instance's certificate, key and the CA that signs the core hosts'), and the
+   feed key (`stream.feed_key` or `keys.feed`, granted to this instance in the signer). Set `stream.advertise`
+   to the address the core hosts can reach this instance at (`tls:<host:port>`, or `unix:<path>` on the core's
+   host); if it is left out it is detected from `listen`, which fails for a listener on every interface that has
+   no route. Set `readiness_listen` so your load balancer can use `GET /ready` and `GET /live`.
+2. Check that the certificate carries the name the core hosts expect (`stream.dial.server_name`).
+3. Start it. It renews its roster entry every `roster_ms` (2 s by default) and it is dropped after three missed
+   renewals. The core hosts read the roster at the same interval and on every go-away, and open a stream to the
+   new instance. No change to the core hosts' configuration is needed unless the fleet's stable name changes.
+4. Add it to the load balancer once `/ready` answers.
+
+To remove one:
+
+1. Take it out of the load balancer.
+2. Stop it with SIGTERM. It goes not-ready, takes no new feed, finishes the one in flight, releases its leases
+   and sends the core hosts a **go-away**; it refuses new handshakes and keeps answering its clients for
+   `stream.drain_ms` (5 s by default). The core hosts re-read the roster and the streams of the remaining
+   instances carry on; another instance takes the feed lease.
+3. Do not SIGKILL: the lease then lapses by time instead of being released, and the feed pauses for that long.
+
+Verify: the roster lists the instances you expect; `GET /ready` is 200 on each; commands are accepted and
+decided through the changed fleet; `aledgent_oldest_undecided_row_age_ms` stays normal; exactly one instance
+holds each partition's feed lease. Roll back: remove the instance as above (or re-add the one you removed).
+Neither direction changes the book.
 
 ### B. Add shards (after online split exists; recorded here as `DEC-23` specifies it)
 
@@ -88,6 +126,7 @@ One range at a time. The fence is the only unavailability, and only for that ran
 ## Roll back
 
 - **A:** remove the lane (scale in, above).
+- **A2:** remove the instance as above, or add the removed one back.
 - **B:** run the same split procedure back toward the source shard. Never edit a store.
 - **C:** remove the replica with `ChangeReplicas`.
 

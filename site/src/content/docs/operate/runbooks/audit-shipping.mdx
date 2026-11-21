@@ -48,7 +48,7 @@ How shipping works:
 1. **Not configured.** Add `audit_store` to the deployment configuration that the core reads (the same file
    ingress reads; `aledgent-core-host serve` reads it too): `{"dir": "<the audit volume's mount>"}`.
    Provision `ALEDGENT_AUDIT_WRITER_CREDENTIAL` from your secret store (16 bytes or more). The directory must
-   not be inside the core's `--state`; the store refuses that. Restart the core. An empty directory is
+   not be inside the core's `--state`; the store refuses that. Restart the core (*Replica:* a clean stop (SIGTERM within the stop timeout) keeps the core host's replica; a crash, SIGKILL, a stop timeout, a halted core or a fresh node rebuilds it from genesis, which takes time in proportion to the book's history ([Core restarts](../../core-restarts/)).). An empty directory is
    initialised on the first start, and the first rounds ship the whole trail.
 2. **Unreachable.** Restore the store's volume: its mount, free space and permissions for the core's user. Do
    not move or edit the store's files. The shipper retries every 500 ms by itself, so no restart is needed.

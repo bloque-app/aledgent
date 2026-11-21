@@ -37,6 +37,7 @@ one node is not this runbook ([Replace a node](../replace-node/)). Pages that le
 - **The database survives.** A replicated database server, or a point-in-time restore of ingress's database
   and the adapter's (`opsctl restore pg-script` from the base backup and the WAL archive). The received-log is
   the source of every acknowledged command.
+- `ALEDGENT_CORE_LINK_TOKEN` is available for `opsctl restore core-tail` (the legacy Unix-socket link; the stream link uses mutual TLS).
 - **Keys** are available to the signer from your secret store: the key-ring root (without it the book cannot
   be imported or signed; [Key loss](../key-loss/)), the backups' sealing key, the clerk key and the Agent keys.
 - The **audit backup** is verified (`opsctl backup verify`).
@@ -169,5 +170,5 @@ once; and the recovery time and data-loss window recorded.
 
 There is nothing to roll back to: the old nodes are gone. If a check fails, do not serve; try the next older
 checkpoint (A) or, for B, `--from-genesis` (the Agent founded afresh, every archived input re-sent) on a new
-isolated host. If every candidate fails, escalate to the owner: it is an `INV-5` or `INV-6` breach. Never fix a
+isolated host. If you restored with `--accept-damaged-archive`, treat the result as a restore to an earlier point: run the checks and compare the point with what the received-log shows decided before serving. If every candidate fails, escalate to the owner: it is an `INV-5` or `INV-6` breach. Never fix a
 restored store to make a check pass.

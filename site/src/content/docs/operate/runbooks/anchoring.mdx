@@ -31,10 +31,11 @@ any rotation ([Key loss](../key-loss/), [Key rotation](../key-rotation/)).
    never leaves the signer.
 2. The instance's admin sets it with the settlement pallet's `set_keys` call, naming the instance's key list
    unchanged and the new attestation key. The adapter's keys cannot do this; the admin's can.
-3. Verify from outside aledgent: `aledgent-verify` (feature `cli` of the `verify` crate) reads the instance
-   record at the finalized head over the node's RPC and prints the attestation key; it must be the public key
-   of step 1. Then issue one disclosure to an internal recipient and verify it offline with the same tool: it
-   must pass.
+3. Verify from outside aledgent. Issue one disclosure to an internal recipient, then run
+   `aledgent-verify <disclosure-file> --clerk-key <public key from step 1> --rpc <node URL>` (feature `cli` of the
+   `verify` crate). It reads the instance record at the finalized head over the node's RPC and checks the
+   disclosure against the key the record publishes; with `--clerk-key`, a record that publishes a different key
+   fails the check. It must pass.
 
 ## Anchor lag, or a checkpoint stuck in flight
 

@@ -43,6 +43,14 @@ bearer token ([The operator token](../operator-token/)). Commands marked `opsctl
 core image carries `opsctl` beside `aledgent-core-host`.
 </Aside>
 
+<Aside type="caution" title="Restarting the core host">
+A core host stopped cleanly (SIGTERM or SIGINT within the stop timeout) keeps its replica and reopens it in a
+fraction of a second. Anything else (a crash, SIGKILL, a stop that times out, a halted core, a fresh node with
+no persistent volume) rebuilds the replica from genesis, in time proportional to the book's history. Several
+runbooks below end in a restart; read [Core restarts and host rolls](../core-restarts/) first, and plan the
+window from your own archive's replay time.
+</Aside>
+
 ## Which page
 
 ### The core
@@ -92,6 +100,17 @@ core image carries `opsctl` beside `aledgent-core-host`.
 | Rotating a key, token or credential | [Key rotation](./key-rotation/) |
 | Opening an account a service operates | [Creating a system account](./system-accounts/) |
 | Turning on per-command approvals | [Turning on approvals](./approvals-rollout/) |
+
+## Alerts without a page of their own
+
+| Alert | What to do |
+|---|---|
+| `AledgentReviewOverdue` | An operation in the review queue is past its service level. Find the operations in the review queue (`Needs-Review`), and resolve each with evidence: `POST /v1/ops/operations/{reference}/resolve`, with a `target` (`settle` or `release`), the `evidence` (a settlement record, non-inclusion under the last finalised head, or, last, `no_proof` with a second principal agreeing) and a `justification` ([Overview](../overview/)). Resolve none without evidence (`REQ-OP-9`) |
+| `AledgentAdapterSignerNotReady` | A settlement key's signer is not ready; nothing is signed. See [Settlement adapter outage](./settlement-adapter-outage/), step 7 |
+| `AledgentCoreBackupLate`, `AledgentAuditBackupLate`, `AledgentIngressBackupLate`, `AledgentAdapterBackupLate` | No verified backup for that store within its schedule. `opsctl backup due --root <dir>` says which are due; take them (`opsctl backup pg`, `opsctl backup audit`; the Agent core's backup is its archive, [The core's off-node archive](./core-archive/)) and check each with `opsctl backup verify` |
+| `AledgentAuditGap` | The audit store's head does not match what the core emitted. Treat it as the refused case in [The audit trail does not ship](./audit-shipping/) |
+| `AledgentInternalFault` | A command failed on a fault inside aledgent and was answered `ERR-Internal`. Keep the log lines and the audit record, reproduce off production as in [The core stalls or halts](./core-halt/), and fix forward; do not retry in a loop |
+| `AledgentUndeliveredNotification` | A notification has been owed for more than fifteen minutes. Check that the recipient's endpoint answers, and that its secret is registered (`aledgent-ingress recipient`); the notification is delivered when it does |
 
 ## Who owns what
 

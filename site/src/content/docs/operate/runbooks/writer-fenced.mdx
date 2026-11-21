@@ -43,7 +43,7 @@ state names.
 1. **Check whether the switch happened.** If the state names an upgrade that applies (its input is the next
    one) and the installed package is the old rules version, the switch was missed. The core host installs the
    scheduled version through its `switch` at start and before each input, from its staged copy. Restart the
-   core host so it runs that check. Never install a package by hand outside `switch` (`REQ-RT-20`: the
+   core host so it runs that check. *Replica:* a clean stop (SIGTERM within the stop timeout) keeps the core host's replica; a crash, SIGKILL, a stop timeout, a halted core or a fresh node rebuilds it from genesis, which takes time in proportion to the book's history ([Core restarts](../../core-restarts/)). Never install a package by hand outside `switch` (`REQ-RT-20`: the
    platform's install authority is not an authority over the book).
 2. **If the new code cannot run, take the way out.** The door refuses, before recording a version, one that
    names another runtime than the host runs, or whose package has another key, state layout, constructor ABI
@@ -55,7 +55,7 @@ state names.
    overtake them. After a way out at the upgrade's input, the core host installs the old rules version's
    package again before the next input.
 3. **If the installed package is a rules version the state never names**, the code map's version was
-   replaced outside `switch`. Treat it as an incident, find who installed it, and restart the core host so it
+   replaced outside `switch`. Treat it as an incident, find who installed it, and restart the core host (see the replica note in step 1) so it
    installs the code map's version.
 4. Confirm `aledgent_writer_fenced_seconds` is back to 0 and inputs commit again.
 
