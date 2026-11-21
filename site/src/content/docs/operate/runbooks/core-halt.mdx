@@ -1,0 +1,73 @@
+---
+title: The core stalls or halts
+description: Tell a halted core from a slow one, contain it, and get the input that stopped it applied by a fixed build.
+sidebar:
+  order: 10
+---
+
+Cites `REQ-CS-7`, `REQ-RT-13`, `REQ-AT-3`, `NFR-11`, `NFR-15`, `NFR-16`, `F-032`.
+
+## What it is for, and when to run it
+
+Run it when `AledgentCoreHalted` pages (at once, and again every 15 minutes), or when the pages that follow
+it do: `AledgentReceivedOverDecisionBound` (the oldest undecided row is over 60 s),
+`AledgentTickerStale`, `AledgentCompletionOverCeiling`, `AledgentOldestNonTerminalOverServiceLevel`.
+Suggested owner: platform.
+
+How the core behaves, as built:
+
+1. An input the Agent fails alone and definitively (refused, panicked, out of gas) is retried first and
+   alone on the next try.
+2. After two such failures in a row the core host **halts** on it: an `aledgent-core: ALERT` line on
+   standard error names the input, the host reports `halted=1`, every later input answers `Unavailable`
+   without reaching the Agent, **reads are still answered** at what the Agent committed, and inputs stay
+   `Received`, in order.
+3. Nothing skips or forces the input (`REQ-AT-3`). The only way on is a build whose Agent applies it, and
+   a restart.
+
+The halt has its own signal: `aledgent_core_halted` is 1, and the core host reports it in
+`GET /v1/ops/signals` as `core_halted`. It is also 1 when the core stopped on an incident (a divergence,
+or an archive or reply log that does not write); the `ALERT` line or the core's last error says which.
+If the core's reads stop as well, `AledgentSignalsDown` pages instead: the core is not answering.
+
+A full audit outbox is **not** a halt: `core_halted` stays 0 and `AledgentAuditBackpressure` fires. See
+[The audit trail does not ship](../audit-shipping/).
+
+## Preconditions
+
+- Tell a **halt** from a **slow core**. A halt shows `halted=1` in the core host's diagnostic report, an
+  `ALERT` line, and every new decision `Unavailable`. A slow core still commits (the decision count rises)
+  but behind the load: go to [Scale out and in](../scale-out-in/) and compare the load with your own capacity
+  plan.
+- Capture the evidence: the `ALERT` line, the input it names (an operation reference, or a tick), the core
+  host's last reports and the image digests.
+
+## Steps
+
+1. **Contain.** Ingress keeps acknowledging transfers and reservations (`REQ-AR-7`). A command that needs
+   a decision gets `ERR-DecisionUnavailable` after its wait, which is a named refusal. Tell integrators
+   under your incident process that decisions are delayed. Do not restart in a loop: a restart without a
+   fix halts again on the same input.
+2. **Reproduce off production.** Take the input from the received-log (its canonical form) and a copy of
+   the core's state volume. On an isolated host run the same image; `aledgent-core-host measure` can replay
+   a workload. Find why the Agent fails where the native replica succeeds: heap, gas, the package's size
+   limit, or a defect.
+3. **Fix forward.** Build an image whose Agent applies the input, through your normal review and release
+   gate. If the fix changes the Agent's program, follow the runtime and package procedure for your
+   deployment's pin.
+4. **Deploy by digest.** Restart the core on the new image, then ingress if it was restarted too. *Replica:* a halted core is not a clean stop, so a new image on it **always rebuilds from genesis**; before you roll, replay the archive with the new build on a separate machine first, and plan the window from that replay's time ([Core restarts](../../core-restarts/)). The core
+   replays its archive, then the forwarder decides the waiting rows in order.
+
+## Verify
+
+- `halted=0`, and the named input is decided with the outcome the replica computes.
+- The backlog drains: `aledgent_oldest_undecided_row_age_ms` falls under 60 s. Record the drain time.
+- `NFR-4`: no acknowledged operation is missing, and nothing is still `Received` after the drain.
+- The trial balance is zero and an on-demand reconciliation passes axes 1 and 2
+  ([A reconciliation failure](../reconciliation-failure/)).
+- A regression test naming the input's class is merged with the fix.
+
+## Roll back
+
+If the new image misbehaves, redeploy the previous digest. The core halts again on the same input, which is
+safe: every input waits `Received`. Never edit the received-log or the archive to remove the input.

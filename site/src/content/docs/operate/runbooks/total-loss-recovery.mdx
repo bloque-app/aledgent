@@ -1,0 +1,174 @@
+---
+title: Total-loss recovery
+description: Recover the book from the off-node archive and the received-log when every live copy of the writer's state is gone.
+sidebar:
+  order: 21
+---
+
+Cites `NFR-4`, `NFR-10`, `NFR-21`, `INV-5`, `INV-6`, `INV-19`, `INV-25`, `REQ-AT-3`, `DEC-22`, `DEP-11`,
+`F-021`, `F-005`.
+
+## What it is for, and when to run it
+
+Run it when the deployment has lost every live copy of a writer's state: a quorum of voters (with a
+replicated core), or, in the single-voter profile, the one execution node's core volume or its zone. Losing
+one node is not this runbook ([Replace a node](../replace-node/)). Pages that lead here:
+`AledgentSignalsDown`, `AledgentReceivedOverDecisionBound`, your platform's node health alarm,
+`AledgentCoreArchiveStale`. Suggested owner: platform, with the deployment's owner.
+
+**The rules that do not bend:**
+
+- A restore writes only into **empty** stores, through the tools below. Nothing edits a store in place
+  (`REQ-AT-3`).
+- One core identity never runs on two machines (`INV-25`).
+
+### The archive
+
+- **Single-voter profile (built).** The core host streams every decision of its log (`archive.bin`,
+  `replies.jsonl`) and checkpoints of the Agent's runtime state to the bucket
+  ([The core's off-node archive](../core-archive/)). That is path B.
+- **Replicated core** (`DEP-11`): the voters publish each quorum-certified checkpoint and the log segments
+  after it, through the runtime's checkpoint-archive sink and source, over the same bucket. That is path A.
+  It waits for `F-021`.
+
+## Preconditions
+
+- The owner has **declared** a total loss. Every old node is terminated and fenced.
+- **The database survives.** A replicated database server, or a point-in-time restore of ingress's database
+  and the adapter's (`opsctl restore pg-script` from the base backup and the WAL archive). The received-log is
+  the source of every acknowledged command.
+- `ALEDGENT_CORE_LINK_TOKEN` is available for `opsctl restore core-tail` (the legacy Unix-socket link; the stream link uses mutual TLS).
+- **Keys** are available to the signer from your secret store: the key-ring root (without it the book cannot
+  be imported or signed; [Key loss](../key-loss/)), the backups' sealing key, the clerk key and the Agent keys.
+- The **audit backup** is verified (`opsctl backup verify`).
+- An isolated host is ready to run the drill's checks before anything serves.
+
+## Steps
+
+### Path A: from the archive sink (replicated core)
+
+1. **Pick the checkpoint.** List the bucket. Take the latest checkpoint whose quorum certificate verifies
+   against the Agent's committee, and every log segment after it, contiguous. A gap in the segments means
+   stopping at the gap: the received-log covers the rest (step 4).
+2. **Fresh nodes**, three per Agent, with no local state, under the same Agent identities. Do not create new
+   Agents: that would be a re-genesis, which `NFR-17` forbids.
+3. **Install** the checkpoint on each voter and replay the segments. The Agents resume at the last certified
+   commit.
+4. **Ingress** starts against the surviving received-log. The forwarder re-submits every row the log holds
+   undecided. Rows decided after the last certified commit come back with **the reply the log recorded**; an
+   exact retry answers from the retained result (`INV-18`). A different reply is a divergence: **stop**
+   ([Divergence](../divergence/)).
+5. **The adapter** starts on its database. It resumes from the head it last accepted, reads the events since
+   and folds them to check them against the head the layer holds; behind what a full node keeps, it catches
+   up from the history endpoint. A difference raises `AledgentSettlementChainMismatch`
+   ([Chain mismatch, gaps and resets](../gap-filling/)).
+6. **The audit store** is restored into an empty directory, on media apart from the book
+   (`opsctl restore audit`). Restore it from a backup taken **at or before** the core's restore point; the
+   core ships from the store's head onward, re-deriving every record after it from its archive. A store
+   **ahead** of the restored core holds records of decisions the restored book no longer has: the store
+   refuses the core's records at those numbers and the core holds every input
+   ([The audit trail does not ship](../audit-shipping/)). Keep such a store aside, read-only, as evidence of
+   what was lost, and ship the restored book to a store restored from the earlier backup. Never cut a store
+   back by hand.
+
+### Path B: single-voter profile, from the core host's archive
+
+The recovery point is the archive's last segment. With ingress's received-log intact, step 3 re-decides
+everything after it, and no acknowledged operation is lost.
+
+1. **Check the archive and lay it out on the fresh node.** On the replacement node (or the drill's isolated
+   host), with the node's signer running and reading its keys from your secret store (the deployment file's
+   `core_keys` names them; no key goes into any environment), and a read-only role on the bucket. Run it from
+   the **core image** the node ran, by digest: it carries `opsctl` beside `aledgent-core-host` and the Agent's
+   programs, which `--core-host` needs on one filesystem. Mount the deployment file, the signer's socket
+   directory and the empty state directory as the core's unit does:
+
+   ```sh
+   podman run --rm --entrypoint /usr/local/bin/opsctl \
+     -v /etc/aledgent/ingress.json:/etc/aledgent/ingress.json:ro \
+     -v <signer socket dir>:<signer socket dir> \
+     -v /var/lib/aledgent/core:/var/lib/aledgent/core -v /var/lib/aledgent/drills:/var/lib/aledgent/drills \
+     <core image>@sha256:<digest> \
+     restore core --from 's3://<bucket>/<prefix>?region=<region>' \
+     --config /etc/aledgent/ingress.json --state /var/lib/aledgent/core \
+     --anchors-rpc <archive node URL> --report /var/lib/aledgent/drills \
+     --core-host aledgent-core-host \
+     --runtime /usr/share/aledgent/agent_runtime.pvm --actor /usr/share/aledgent/core.vos
+   ```
+
+   Take the bucket and prefix from the core unit's `--archive`, without `kms-key-id`. The prefix is per
+   genesis, not the bucket's root. A chainspec book needs its chainspec: `opsctl` reads it from the archive
+   (`<prefix>/chainspec/<digest>.bin`, by the digest the deployment's genesis commits, and refuses any other)
+   and passes `--archive` to the core host's `restore`, which lays out the chainspec and its kept
+   `verify-genesis` report. `--chainspec <file>` overrides the archive's copy. Pass `--unnamed-code` and
+   `--genesis-manifest <file>` when the core unit's `serve` has them.
+
+   Pass `--code-config <file>` too when the core unit's `serve` has it, which is for any book that may have
+   upgraded ([Restore](../restore/), "A book that has upgraded"). Mount the code file, each code source
+   directory (read-only) and the code cache (writable, outside `--state`) at the same absolute paths the file
+   names.
+
+   `--core-host`, `--runtime`, `--actor` and `--code-config` go together: `opsctl` lays the archive out in
+   `--state` before it reads `--runtime` and `--actor`, so a missing one fails with the layout already
+   written, and a retry into that directory is refused. Start again from a new, empty `--state` directory.
+
+   `opsctl` reads every segment and checks each one: its digest, its offsets and the entries' hash chain. The
+   segments are read 32 at a time (`--fetch-concurrency <n>`, 1 to 256) and checked strictly in order, so a
+   missing or damaged segment ends or fails the read exactly as reading one at a time would. Concurrency
+   matters with a large archive: at tens of thousands of segments, one request per segment at tens of
+   milliseconds is an hour or more, and 32 at a time is minutes. It prints the time it took. It re-derives the
+   book natively from genesis, reaching every entry's roots, and runs the drill's checks (`INV-6`, `INV-5`, the
+   roots at the archive's point, `INV-19` against the anchors on the layer, and `NFR-4` against every archived
+   reply). It **refuses** if any check fails; if the layer holds an anchor after the archived book's last
+   checkpoint (`archive-behind-anchor`: the archive does not reach the book the layer anchored); or if the
+   archive is damaged.
+
+   Then it lays out the empty `--state` directory. `aledgent-core-host restore` starts the Agent from the
+   archive's latest checkpoint and re-sends every archived input after it, each checked against its archived
+   entry. The Agent must end at the archive's point: its input number, log head and roots. Without
+   `--core-host` the command prints what to run on the node, in the same image; it then records no
+   `roll-forward` check, so read the core host's `restore.done.json` by hand: its `rolled` `to` and
+   `kernel_root` are the archive's point.
+2. **Start the core host** on the directory, with the same `--archive` (the archiver resumes where the bucket
+   stands). Do **not** start ingress yet.
+3. **Replay the received-log's tail** through the restored core:
+
+   ```sh
+   opsctl restore core-tail --config deployment.json --state /var/lib/aledgent/core
+   ```
+
+   It re-sends every input the log shows decided after the archive's point, in order. Each must come back
+   with the reply the log recorded. A different reply stops it: that is a divergence, so **stop**
+   ([Divergence](../divergence/)).
+4. **Start ingress.** Its forwarder sends the rows still `Received`.
+5. Steps 5 and 6 of path A (the adapter, the audit store).
+
+**If the received-log is lost too**, skip step 3. The decisions after the archive's point are lost: that is
+the archive's lag at the failure, which the report records. Restore the databases to the latest point first
+(preconditions) and replay what they hold.
+
+**A volume snapshot**, if you take them, is a fallback only, for when the owner declares the archive
+unreadable. A volume from a snapshot is older than the archive: the core host starts on it and replays its
+own `archive.bin`, step 3 replays the received-log's tail, and its archiver refuses to write to the old
+archive (`AledgentCoreArchiveConflict`), so it needs a new prefix.
+
+## Verify
+
+Run the drill's five checks on the restored state **before it serves** ([Restore](../restore/)):
+
+- `INV-6`: every balance equals its entries.
+- `INV-5`: the trial balance is zero per asset, with credits in transit counted (`REQ-RT-11`).
+- The composite root equals the last certified one: the checkpoint's under A, the archive's point under B.
+- `INV-19`: every `Final` anchor on the layer matches its commitment, recomputed where the restored log holds
+  its sequence.
+- `NFR-4`: every operation the received-log shows acknowledged or answered is present.
+
+Then: an on-demand reconciliation with axes 1, 2 and 3 at zero; a fresh core backup and audit backup taken at
+once; and the recovery time and data-loss window recorded.
+
+## Roll back
+
+There is nothing to roll back to: the old nodes are gone. If a check fails, do not serve; try the next older
+checkpoint (A) or, for B, `--from-genesis` (the Agent founded afresh, every archived input re-sent) on a new
+isolated host. If you restored with `--accept-damaged-archive`, treat the result as a restore to an earlier point: run the checks and compare the point with what the received-log shows decided before serving. If every candidate fails, escalate to the owner: it is an `INV-5` or `INV-6` breach. Never fix a
+restored store to make a check pass.

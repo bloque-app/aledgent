@@ -1,0 +1,60 @@
+---
+title: Credit, revocation and stream lag
+description: Lags that exist only in the sharded profile, and how to respond to each.
+sidebar:
+  order: 43
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Cites `NFR-19`, `NFR-20`, `REQ-RT-11`, `REQ-RT-13`, `REQ-AU-3`, `REQ-AT-3`, `F-031`, `F-033`.
+
+<Aside type="note" title="Status in this release">
+None of these lags exists with **one core Agent**, the single-voter profile this release deploys. A credit is
+applied in its debit's commit. A revocation takes effect at its commit; the only lag left is ingress's API-key
+cache, whose lifetime is 500 ms and which ingress refuses above the 1 s bound of `NFR-20` at start
+(`api_key_cache_ms`). There are no streams between Agents and no native decide. The metrics come with the
+sharded profile's host; the alert rules are committed so that they page the day the metrics appear.
+</Aside>
+
+## What it is for, and when to run it
+
+Run it when `AledgentCreditLag` (p99 over 2 s), `AledgentRevocationLag` (p99 over 1 s), `AledgentStreamLag` or
+`AledgentReplayFenced` pages. Suggested owner: platform; security for revocation and the fence.
+
+## Preconditions
+
+- Which signal: credit lag (a peer shard's `credit/<n>` stream), revocation lag (the principals Agent's `feed`),
+  a stream's lag (the relay), or a shard's replay fence.
+- Whether one shard or every shard: one points at that shard's host; every shard points at the relay or the
+  principals Agent.
+
+## Steps
+
+1. **Credit or stream lag.**
+   - Check the relay between hosts: its connections, and the receiving shard's decision rate.
+   - A shard behind its own load is a capacity question ([Scale out and in](../scale-out-in/)). Rebalance hot
+     accounts with ordinary transfers (`REQ-RT-12`).
+   - The value in transit is neither payer's nor payee's until the credit lands: never move it by hand.
+2. **Revocation lag.**
+   - A revoked credential may act until the revocation reaches every shard. Treat a lag over `NFR-20`'s bound as
+     a security matter.
+   - Check the principals Agent's `feed` stream and the slowest shard.
+   - If an exposed credential is involved, freeze the accounts it reaches through the command surface
+     (`POST /v1/ops/accounts/{account}/freeze`) while the feed catches up.
+3. **Replay fenced** (native decide).
+   - A shard's replay through the runtime disagreed with its native decision, and the shard fenced itself: it
+     decides nothing more.
+   - This is a divergence: follow [Divergence](../divergence/). Do not unfence by hand.
+   - Turn native decide off, then restart the shard from its last committed state.
+
+## Verify
+
+- The p99 lags are under their bounds for 30 minutes.
+- Reconciliation on demand: axes 1 and 2 at zero, and every partition's in-transit position balances against
+  its peers.
+
+## Roll back
+
+Redeploy the previous digest of the shard host or relay. Nothing here edits a store, and nothing moves value
+outside the command surface (`REQ-AT-3`). Lift a freeze with `POST /v1/ops/accounts/{account}/unfreeze`.
