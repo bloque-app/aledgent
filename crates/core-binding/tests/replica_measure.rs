@@ -257,13 +257,25 @@ async fn t031_26_measure_reopen_on_a_large_book() {
         for r in core.apply_batch(&batch).await {
             r.expect("decided");
         }
-        batch_us.push(u64::try_from(asked.elapsed().as_micros()).unwrap_or(u64::MAX));
+        let took = u64::try_from(asked.elapsed().as_micros()).unwrap_or(u64::MAX);
+        batch_us.push(took);
         let _ = core.ship(&mut shipper);
         let st = core.stats();
         let taken = st.replica_manifests.load(Ordering::Relaxed);
-        if taken > seen {
+        let manifest = taken > seen;
+        if manifest {
             seen = taken;
             manifest_us.push(st.replica_manifest_us.load(Ordering::Relaxed));
+        }
+        if took > 250_000 {
+            eprintln!(
+                "slow batch at input {i}: {took} µs{}",
+                if manifest {
+                    ", a manifest after it"
+                } else {
+                    ""
+                }
+            );
         }
         i = end;
     }

@@ -235,10 +235,10 @@ What this says, stated plainly:
    **mean 237 ms, max 1.21 s**; in run 3, where every manifest left the 450 000 unshipped records
    out, mean 281 ms, max 764 ms. That is three synced commits with redb's allocator state
    (3.3 GB of files) and one small file, on this laptop's file system, where every sync is a full
-   flush of the drive's cache. It is taken under the decision's lock, so the next decision waits for
-   it, once every 1 024 inputs or 30 s (about 0.3 ms an input over 1 024); reads go on meanwhile,
-   since a manifest only reads the replica. A Linux volume's sync is usually cheaper; production's
-   is not measured here.
+   flush of the drive's cache. It is taken after the replies of the decision that made it due, under
+   the decision's lock, so no reply waits for it and the next decision does, once every 1 024
+   inputs or 10 minutes; reads go on meanwhile, since a manifest only reads the replica. On a
+   production-like volume, below.
 5. **The clean reopen's 25–33 s is T-031-25's, not this task's,** and larger than production's
    0.1–0.3 s because this book has far more service leaves. A later change could keep the service
    store's derived indexes on disk and skip the rebuild from leaves; it is not in scope here.
@@ -248,3 +248,32 @@ of this build. A clean stop writes T-031-25's record and deletes the savepoints,
 reopens as its own. Any other stop leaves a manifest (layout 2), which the release does not read:
 it rebuilds from genesis, correctly and at the full rebuild's cost, and wipes the savepoints with
 the files.
+
+### On a production-like volume (EBS gp3)
+
+The test environment's core node: an m7a.large (2 vCPU, 8 GB), the core's own gp3 volume (3 000
+IOPS, 125 MB/s, ext4), the test core idle beside it. The same book (175 000 accounts, 2.4 M service
+leaves, 3.3 GB replica), **40 000 inputs** in batches of 8, an audit store in memory, 40 manifests;
+the fallback not run. The release `e935c21` ran the same inputs as a baseline (no manifest).
+
+| | This build | With the write-back | Release `e935c21` |
+|---|---|---|---|
+| A manifest, µs: mean / p50 / p99 / max (n = 40) | 186 029 / 182 562 / 1 443 360 / 1 443 360 | 186 754 / 175 341 / 1 481 263 / 1 481 263 | (none) |
+| A batch's replies, µs: mean / p50 / p99 / max (n = 5 000) | 76 453 / 22 825 / 37 954 / 7 655 495 | 71 913 / 23 516 / 59 593 / 6 836 615 | 70 026 / 20 719 / 34 057 / 6 786 216 |
+| Reopen after a clean stop | 13.4 s (files 1.0 s, replica 12.1 s) | | |
+| Reopen after an unclean stop, 1 000 inputs after the manifest | 47.8 s (files 1.4 s, replica 39.4 s, replay 2.6 s) | | |
+
+What this says, stated plainly:
+
+1. **No reply waits for a manifest.** No batch took over 250 ms because of one: the batch after a
+   manifest waits for it, 0.18 s typically. The p99 of 40 manifests is their max, 1.44 s, the one
+   taken on demand at input 39 000; the other 39 averaged 0.15 s.
+2. **The tail is not the manifest's, and it is older than this task.** Every 1 024 inputs a batch
+   waits 4.3 to 7.7 s, in this build and in the release alike (7.66 s and 6.79 s at most): the
+   replica's redb engines make one write in 1 024 durable (`T-031-14`), and on this volume that
+   commit takes seconds. It is 0.7 % of the batches, under the p99, and over 1 s at the max. It is
+   an open problem for `NFR-16` on the replica's engines, not something a manifest adds; this
+   build's is about 12 % longer, which the savepoints may account for.
+3. **The write-back did not help, and was not kept.** Syncing the three files and the archive's
+   newest segments off the lock every 256 inputs took 7.3 s itself, left the 1 024-input stalls as
+   they were (6.8 s), did not shorten the manifest, and raised the batches' p99 to 60 ms.
