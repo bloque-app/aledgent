@@ -795,7 +795,28 @@ async fn diagnose_operation(cx: &Ctx, op: &str) -> Value {
                 all.iter().skip(skip).map(|i| format!("{i:?}")).collect()
             })
             .unwrap_or_default();
-    json!({ "status": status.as_u16(), "operation": body, "last_incidents": incidents })
+    // The layer's own words for each record that names the operation: a refusal's payload is
+    // the contract's reason.
+    let records: Vec<Value> = OperationId::parse(op)
+        .ok()
+        .and_then(|id| {
+            cx.d.core.with_ledger(|l| {
+                l.state()
+                    .settlement()
+                    .naming(&id)
+                    .map(|r| {
+                        let bytes = &r.observation.payload.0;
+                        json!({ "kind": format!("{:?}", r.observation.kind),
+                                "standing": format!("{:?}", r.standing),
+                                "payload_hex": hex::encode(bytes),
+                                "payload_text": String::from_utf8_lossy(bytes) })
+                    })
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
+    json!({ "status": status.as_u16(), "operation": body, "last_incidents": incidents,
+            "records": records })
 }
 
 /// Gate 5b (F-032, `F-029`, amendment 0011): bind `BUSDC`, production's first chain-bound asset,
