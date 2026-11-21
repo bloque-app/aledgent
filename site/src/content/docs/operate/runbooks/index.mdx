@@ -1,0 +1,107 @@
+---
+title: Runbooks
+description: The operator's runbooks for aledgent, one page per situation, written for any deployment.
+sidebar:
+  order: 1
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Cites `NFR-9`, `NFR-11`, `REQ-AT-3`, `REQ-OS-1`, `F-018`, `F-039`.
+
+A runbook is the page you open when an alert fires, or before you do something that is hard to undo. Each
+one says what it is for and when to run it, what must be true first, the steps, how to check that it
+worked, and how to go back. Each cites the requirements, invariants and features it serves, so you can read
+what the system promises before you act on it.
+
+The pages name no deployment. Wherever a step needs infrastructure, it says what kind (your secret store,
+your object store with Object Lock, your database server, your container scheduler), and you substitute
+your own. Names that look like `AledgentCoreHalted` are alerts in the rules shipped under `ops/prometheus/`
+in the repository; names like `aledgent_core_halted` are the metrics `opsctl exporter` publishes.
+
+## Rules that hold on every page
+
+- **Nothing edits a store.** Not the book, not the received-log, not the audit store, not the archive
+  (`REQ-AT-3`). A restore writes only into an empty directory or database. A correction to the book is an
+  operation through the command surface, with its justification on the audit trail.
+- **An operator command needs a live grant of its kind, and a justification.** The operator holds no
+  capability by default: grant yourself the one kind, for one task, then revoke it
+  ([Least privilege](../least-privilege/)). A command without a justification is refused
+  (`ERR-JustificationRequired`).
+- **A secret never appears on a command line, in a log, in a URL or in a repository.** Secrets go to a
+  process through its environment or a file only that process can read, from your secret store
+  ([The signer boundary](../signer-boundary/)).
+- **Divergence and key exposure are incidents, not tickets** (`NFR-9`). Open yours, and freeze the
+  evidence before you change anything.
+- **Operations that need a human are resolved with evidence, never released on a timer**
+  (`REQ-OP-9`; [Overview](../overview/)).
+
+<Aside type="note" title="What the examples assume">
+Examples call the operator API with `curl`, `$INGRESS` for ingress's URL and `$OP` for the operator's
+bearer token ([The operator token](../operator-token/)). Commands marked `opsctl`, `aledgent-settle`,
+`aledgent-signer`, `aledgent-verify` and `aledgent-core-host` are the binaries the repository builds; the
+core image carries `opsctl` beside `aledgent-core-host`.
+</Aside>
+
+## Which page
+
+### The core
+
+| Situation | Page |
+|---|---|
+| The core stopped deciding, or decides very slowly | [The core stalls or halts](./core-halt/) |
+| Every input is refused by the rules-version fence | [The core's writer is fenced](./writer-fenced/) |
+| Decisions the runtime has not acknowledged are piling up | [Unacknowledged authority decisions](./authority-backlog/) |
+| Audit records do not reach the audit store | [The audit trail does not ship](./audit-shipping/) |
+| The off-node archive lags, is stale, or refuses to write | [The core's off-node archive](./core-archive/) |
+| A node is lost but its volumes are not | [Replace a node](./replace-node/) |
+| Capacity is short | [Scale out and in](./scale-out-in/) |
+
+### Recovery
+
+| Situation | Page |
+|---|---|
+| Restoring any store, and what a drill checks | [Restore, and the restore drill's checks](./restore/) |
+| Every live copy of the core's state is gone | [Total-loss recovery](./total-loss-recovery/) |
+| Rehearsing recovery on a schedule | [The restore drill](./restore-drill/) |
+| A key is lost | [Key loss](./key-loss/) |
+
+### The settlement layer
+
+| Situation | Page |
+|---|---|
+| The settlement adapter is down or will not serve | [Settlement adapter outage](./settlement-adapter-outage/) |
+| The layer's head is not moving | [Finality stall](./finality-stall/) |
+| The layer produces no blocks, or liquidity is short | [Crank outage and liquidity shortfall](./crank-outage/) |
+| Chain mismatch, unreadable range, a reset of the layer's record | [Chain mismatch, gaps and resets](./gap-filling/) |
+| Anchor lag, the attestation key, the daily settlement comparison | [Anchoring](./anchoring/) |
+
+### Integrity
+
+| Situation | Page |
+|---|---|
+| A reconciliation axis found a difference, or did not run | [A reconciliation failure](./reconciliation-failure/) |
+| Anything diverged | [Divergence](./divergence/) |
+| A message between Agents failed its provenance check (sharded profile) | [Message provenance failure](./r03-provenance/) |
+| Credit, revocation or stream lag (sharded profile) | [Credit, revocation and stream lag](./partition-lag/) |
+
+### Keys and access
+
+| Situation | Page |
+|---|---|
+| Rotating a key, token or credential | [Key rotation](./key-rotation/) |
+| Opening an account a service operates | [Creating a system account](./system-accounts/) |
+| Turning on per-command approvals | [Turning on approvals](./approvals-rollout/) |
+
+## Who owns what
+
+Pages suggest an owning role: **platform** (hosts, volumes, images, databases), **security** (keys,
+integrity incidents), **settlement operations** (the adapter and the layer), **treasury** (balances that
+fund the layer) and **finance operations** (reconciliation). Your organisation may split them differently;
+what matters is that each page has one named owner on the day.
+
+## What is not here
+
+Deployment guides (a cloud guide and a one-machine guide) and the upgrades page are separate pieces of the
+operator guide. Runbooks that depend on one organisation's own release process or cutover plan are not
+part of the public set.

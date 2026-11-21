@@ -1,0 +1,95 @@
+---
+title: Scale out and in
+description: What can be scaled online in this release, how to add an adapter lane, and what waits for later features.
+sidebar:
+  order: 16
+---
+
+Cites `NFR-21`, `NFR-18`, `NFR-17`, `REQ-RT-9`, `INV-25`, `DEC-22`, `DEC-23`.
+
+## What it is for, and when to run it
+
+Run it when capacity is short: `aledgent_oldest_undecided_row_age_ms` is rising,
+`AledgentReceivedOverDecisionBound` pages, or your sustained rate approaches the ceiling you measured for
+your reference load. Suggested owner: platform.
+
+**The rule** (`NFR-17`, `NFR-21` (a)): capacity is added online, with no change to the book, to any identifier
+or to any operation. A change that cannot be made that way is **not made** once the deployment is in
+production. Nothing here moves value or edits a store outside the command surface (`REQ-AT-3`).
+
+### What can be scaled in this release
+
+| Lever | Online in this release? | Depends on |
+|---|---|---|
+| Adapter lanes (more device keys signing in parallel) | **Yes** | A new key in the adapter signer's secret (or an opted-in KMS key), and the settlement contract's key set |
+| Ingress instances | **Yes**, over the stream link: the instances connect to the core over mutual TLS or a Unix socket, and the feed lease decides which feeds each partition (`F-038`) | The `stream` section of ingress's configuration |
+| The execution node's machine size (vertical) | **No.** A size change is a stop and start of the node, minutes with the volumes attached. Take it ahead of need, in a maintenance window, on your own growth triggers: memory first, then CPU | An ingress off the core's host, or a replicated core |
+| The core and audit volumes | **Yes**, where your platform grows volumes online; then grow the filesystem | Nothing: alert at 70 % full and grow by half again |
+| Shard count | **Fixed at genesis**, until online splits exist | Online split, and ingress routing to shards |
+| Shards across hosts | At genesis only, and only under outcome A of the multi-host relay experiment | The multi-host relay experiment |
+| Replicas per Agent | No | The replicated core (`F-021`, `DEP-11`) |
+
+## Preconditions
+
+- The signal says capacity is short (above).
+- Reconciliation is green on every axis. Never scale a book that is diverging.
+- The latest backups are verified (`opsctl backup verify <dir>`).
+
+## Steps
+
+### A. Add an adapter lane (online)
+
+1. Write a new secp256k1 secret as a new field of the adapter signer's secret (`lane-2`), add it to the
+   adapter's signer as a key granted to the adapter's client, and `kill -HUP` the signer. For a lane opted into
+   KMS, create an `ECC_SECG_P256K1` key and grant `kms:Sign` on it to the adapter's role instead.
+2. Register its public key as a device of a PASS account on the settlement layer (`Pass.register` for a new
+   account, `add_device` for an existing one). A new PASS account also needs a membership, funding, and the
+   contract admin's `set_keys` with the full key list.
+3. Add the lane to the adapter's configuration (`adapter.keys`) as a signer key
+   (`{"signer": {"key": "lane-2"}}`). Restart the adapter. The lease hands over and the adapter resumes from
+   its store.
+
+### B. Add shards (after online split exists; recorded here as `DEC-23` specifies it)
+
+1. Create an empty shard Agent on the target execution node, pinned to aledgent's runtime.
+2. The principals Agent records the move at directory version v+1, `moving`.
+3. The source shard applies it from `feed`, fences the range (its debits are refused with a retryable
+   error), and streams the range's subtrees as `handoff/<n>`.
+4. The target applies the handoff exactly once and reports its roots.
+5. The principals Agent flips the range at v+2, and ingress routes to the target. The source forwards credits
+   for moved partitions until every sender's trim has passed the cut.
+
+One range at a time. The fence is the only unavailability, and only for that range.
+
+### C. Add replicas (after the replicated core)
+
+1. Start a node with no local state.
+2. Admit it with `ChangeReplicas`, signed by the Space's authority.
+3. It installs the latest quorum-certified checkpoint from the archive sink, then replays the log's tail
+   ([Replace a node](../replace-node/), C).
+
+### Scale in
+
+- **Lanes:** remove the lane from the adapter's configuration and restart. Its in-flight extrinsics are
+  settled by the adapter's next reads. Then remove the device from the PASS account, or the account from the
+  contract's keys.
+- **Replicas** (after the replicated core): `ChangeReplicas` to remove a voter, never below three voters.
+- **Shards:** `DEC-23` specifies no merge. Shards are not scaled in.
+
+## Verify
+
+- For each step: every balance is unchanged, and on-demand reconciliation shows axes 1 and 2 at zero.
+- `NFR-1`, `NFR-16` and `NFR-15` held through the change, read from ingress's metrics.
+- For B: no credit lost or doubled; the in-transit positions match the outbox (`REQ-RT-11`); the next anchor
+  is consistent (`REQ-RT-14`).
+- For C: record the admission time and the rate during admission.
+- Record the new decision rate with the mix and principals it was measured at (`NFR-18`).
+
+## Roll back
+
+- **A:** remove the lane (scale in, above).
+- **B:** run the same split procedure back toward the source shard. Never edit a store.
+- **C:** remove the replica with `ChangeReplicas`.
+
+Adding and removing an adapter lane has been exercised by hand against a staging deployment, not
+automatically. Shards and replicas wait on features that are not built.

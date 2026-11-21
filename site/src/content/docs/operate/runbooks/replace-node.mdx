@@ -1,0 +1,84 @@
+---
+title: Replace a node
+description: Replace a lost execution node without ever running one core identity on two machines.
+sidebar:
+  order: 15
+---
+
+Cites `NFR-21`, `NFR-4`, `NFR-5`, `INV-25`, `DEC-10`, `DEC-22`.
+
+## What it is for, and when to run it
+
+Run it when your platform's node health alarm fires for the machine that runs the core and ingress, or when
+`AledgentSignalsDown`, `AledgentReceivedOverDecisionBound` or `AledgentTickerStale` point at a lost node.
+Suggested owner: platform.
+
+**The rule that does not bend:** one core identity never runs on two live machines (`INV-25`). Fence the old
+node before you start the new one.
+
+## Preconditions
+
+- You know which kind of node it is: the **execution node** (core and ingress), or the **adapter's container
+  task** (your scheduler replaces that by itself; see D).
+- The old node is stopped or terminated, confirmed from your platform's own console or API. Its core
+  container cannot come back.
+- The secrets for the new node are in your secret store. The node's identity is unchanged, so the signer's
+  role still binds it, and on the new node only the signer's user can reach the node's credentials.
+- The database server is healthy. Ingress's received-log is what makes the recovery point zero for
+  acknowledged commands.
+
+## Steps
+
+### A. Single-voter profile: the execution node, with its volumes intact
+
+1. **Fence.** Stop the old node. Confirm the core and audit volumes are detached.
+2. **Launch** a replacement from the same image and configuration, in the same zone as the volumes if your
+   platform's volumes are zonal.
+3. **Attach** the core volume and the audit volume, and mount them where the deployment configuration
+   expects them (the core's `--state` and `audit_store.dir`).
+4. **Start the core**, then ingress. The core replays `archive.bin` and rebuilds its replica; start-up time
+   grows with the book. The forwarder then decides every row the log holds undecided.
+5. Register the new node with your load balancer. If your log stream is named after the node, the new node's
+   logs appear under a new name.
+
+### B. Single-voter profile: the volume or the zone is lost
+
+This is a restore: follow [Total-loss recovery](../total-loss-recovery/).
+
+### C. A replicated core (`F-021`): a replica of any Agent
+
+1. Remove the lost voter with `ChangeReplicas`, signed by the Space's authority. Two of three keep committing
+   meanwhile.
+2. Start a fresh node with **no local state**: no persistent volume, in the zone that lost one.
+3. Admit it with `ChangeReplicas`. It installs the latest quorum-certified checkpoint from the archive sink
+   and replays the log's tail. No disk is copied or re-attached.
+
+### D. The adapter's task
+
+Your container scheduler starts a new task on its own. The lease passes after `lease_ttl`, and the new task
+resumes from its store and its light client's sync. Nothing else is needed unless it does not reach
+`serving` ([Settlement adapter outage](../settlement-adapter-outage/)).
+
+## Verify
+
+- Exactly one core process is running (the host report, `ps`), and the old node is terminated.
+- `aledgent_oldest_undecided_row_age_ms` falls back to normal. Rows that were `Received` are decided.
+- `NFR-4`: every acknowledged operation is present. Compare the received-log's count of acknowledged rows
+  with decided rows plus `Received` rows.
+- An on-demand reconciliation passes axes 1 and 2, and the next anchor goes final.
+- For C: record the admission time and the decision rate during admission.
+
+## Roll back
+
+- **A:** if the new node fails its checks, stop it and fall back to B. Never start the old node once the new
+  one has served.
+- **C:** remove the new replica with `ChangeReplicas`. The remaining quorum continues.
+
+Nothing here edits a store or moves value outside the command surface (`REQ-AT-3`).
+
+## Limit of the single-voter profile, stated plainly
+
+Under A, ingress shares the host, so the book is **unavailable** from the old node's loss until the new core
+serves. Commands are refused at the edge during that time, not buffered. `NFR-21` (b) is not met by the
+single-voter profile (see `DEC-22`). Path C is not exercised until the replicated core is built; A has been
+exercised only against fault injection under load, not on a real platform.

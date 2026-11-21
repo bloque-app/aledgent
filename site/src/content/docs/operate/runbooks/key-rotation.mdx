@@ -1,0 +1,75 @@
+---
+title: Key rotation
+description: Rotate each key, token and credential the deployment holds, online where it can be, without a secret ever appearing in a log or on a command line.
+sidebar:
+  order: 50
+---
+
+Cites `NFR-8`, `REQ-SA-8`, `REQ-AU-3`, `REQ-AU-8`, `REQ-AT-3`, `NFR-20`, `F-035`, `F-042`.
+
+## What it is for, and when to run it
+
+Run it on a schedule, after a staff change, or on suspected exposure (which is also an incident, under your
+incident process). For keys that are **lost**, not rotated, see [Key loss](../key-loss/). Suggested owner:
+security, with platform.
+
+**The rules that do not bend:**
+
+- A secret never appears on a command line, in a log, a URL, a file in a repository, or an image.
+- A new key is created in its boundary: a field of the signer's secret (generated on a trusted terminal
+  straight into your secret store, never echoed, never in shell history), or a KMS key for a lane opted into
+  KMS. Holders' passkeys are theirs and are never rotated here.
+- **The signer rotates online** (`F-035`): `SIGHUP` makes it re-read its configuration whole. A file that does
+  not load leaves the old configuration in place (its log says `reload refused`). A token or a grant removed is
+  refused on the caller's very next request, even on a connection already open.
+- Rotation never edits a store (`REQ-AT-3`).
+
+## Preconditions
+
+- A reason is recorded: scheduled, staff change, or suspected exposure.
+- The latest backups are verified (`opsctl backup verify <dir>`).
+- For a contract-side change, the settlement contract's admin key is available on the operator's terminal.
+
+## Steps, by key
+
+In the steps below, `<settle secret>` is the secret the adapter's signer reads, and `<core secret>` the one the
+core's signer reads; both are named in the signer's configuration (`signer.json`).
+
+| Key | Steps | Online? |
+|---|---|---|
+| **Lane key** (a device of a PASS account) | (1) Write the new secret as a new field of `<settle secret>` (`lane-1-v2`), or, for a lane opted into KMS, create a new `ECC_SECG_P256K1` key and grant the adapter's role sign and get-public-key on it. (2) Add it to the adapter's signer as a new key id (`{"id": "lane-1-v2", "scheme": "secp256k1", "source": {"vault": {"path": "<settle secret>", "field": "lane-1-v2"}}}`, or `{"kms": {"key_id": …}}`), grant it to the adapter's client, and `SIGHUP` the signer. (3) Register it as a device of the same PASS account (`add_device`). (4) In the adapter's configuration, point the lane's device at `{"signer": {"key": "lane-1-v2"}}` and restart the adapter. (5) Once the old device has no extrinsic in flight (the adapter's next reads settle each one), remove the old device, remove the old key id from the signer (`SIGHUP`), and remove the old field (or schedule the old KMS key for deletion) | Yes. Withdrawals wait a step |
+| **Anchor key** | As for a lane key, on the anchor PASS account. One extrinsic of the anchor key is in flight at a time; rotate between anchors | Yes |
+| **Lane under compromise** | **First** the contract's admin calls `set_keys` without that PASS account, or with **no keys at all**: every call stops, and nothing moves. Then rotate as above and restore the key set | No: external legs pause |
+| **Clerk key** (anchors, disclosures) | (1) Write a new clerk key (a canonical Ristretto scalar) as the field `clerk-v2` of `<core secret>`, add it to the core's signer as `clerk-v2`, granted to the core's client; `SIGHUP`. (2) The contract's admin calls `set_keys(keys, Some(new attestation key))` (the new key's public half: `aledgent-signer public <config> clerk-v2`). (3) Set `core_keys.clerk` to `clerk-v2` and restart the core host. (4) Verify with `aledgent-verify` that the record shows it ([Anchoring](../anchoring/)). (5) Remove `clerk` from the signer and its field from the secret store. (6) Tell recipients: a disclosure signed under the old key verifies only against a record read before the change | Yes; disclosures pause for the core host's restart |
+| **Key-ring root** | **Not rotatable.** It derives every kernel account key and blinding, so a new root is a new book: a re-genesis, which `NFR-17` forbids. Exposure is a security incident for the owner | None |
+| **Agent authority and package keys** | **No rotation procedure is built**: both are bound into the Agent's identity. They live in the signer, never in the core host, so exposure needs the signer's host. Exposure is a security incident for the owner | None |
+| **Feed key in an engine that keeps the key** (ingress's `keys.feed` on a `vault_transit` engine, `F-042`) | The engine keeps the key; ingress pins one version and never follows "the latest". **Never rotate such a key by accident**: a rotate call makes a new version, which is a new public key, and for a key that is an account on a chain it is a new account. Leave auto-rotation off for every key in use. A key is created non-exportable; the engine can make it exportable afterwards (never back), and ingress then reports not ready and the key is retired. To rotate on purpose: (1) rotate the key in the engine (or create a `-v2` key); the old version keeps signing. (2) List the new public half in `stream.ingress_keys` beside the old one on every core host (the engine shows each version's public key, base64; the core host takes it as hex) and restart them. (3) Set the version (or the name) in `keys.feed` and restart ingress. (4) Remove the old public half from `stream.ingress_keys`. The role ingress logs in with may read the key and use it to sign, and nothing else on the mount: no key configuration, export or backup. The example is `deploy/templates/ingress-feed-key-transit.json` | Yes, as for the signer's feed key |
+| **Signer token** (a caller's: the core host's, the adapter's) | (1) Generate a new token (32 bytes or more of randomness) in your secret store. (2) Add its SHA-256 (`aledgent-signer token-sha256 <file>`) as a **second** entry of the caller's `token_sha256` in the signer's configuration; `SIGHUP`. (3) Write the new token to the caller's token file and restart the caller. (4) Remove the old hash; `SIGHUP`. The old token is refused on its next request | Yes; the caller restarts once |
+| **Core link token** (ingress to core host) | (1) Generate a new token. (2) Add its SHA-256 as a second entry of `core_link.token_sha256` and restart the core host. (3) Set `ALEDGENT_CORE_LINK_TOKEN` to the new token and restart ingress. (4) Remove the old hash and restart the core host | Yes; decisions pause for each restart, acknowledgements continue |
+| **The signer's own access to your secret store** | Nothing to rotate in the signer if it logs in with a platform identity and holds no long-lived secret. To cut a signer off, unbind its identity from the secret store role it logs in with; it keeps the keys it has read until it restarts | Yes |
+| **Bearer token** (operator, adapter, ops, a party) | (1) Generate a new token. (2) Add its SHA-256 as a **second** entry in ingress's configuration for the same principal and credential, and restart ingress. (3) Switch the client. (4) Remove the old entry and restart ([The operator token](../../operator-token/)) | Yes |
+| **API key or credential** of a principal | Through the command surface: issue a new one, then `POST /v1/credentials/{credential}/remove`. Revocation takes effect within `NFR-20`'s bound | Yes |
+| **Ingress authn key** | Set the new value in your secret store and restart ingress. Every passkey session and outstanding challenge ends; holders sign in again | Yes, with sign-ins |
+| **Ingress sealing key** | Rotate in your secret store. Recipients re-register their notification secrets (`aledgent-ingress recipient`). The book is unchanged | Yes |
+| **Backups' sealing key** | A new key in your KMS, then **take a core backup at once** under it. Keep the old key until every backup sealed under it has expired | Yes |
+| **Database role password** | Rotate on the database server and in your secret store, then restart the process | Brief reconnection |
+| **Recovery key** | See the recovery service's own runbook in the repository (`services/recovery/RUNBOOK.md`, "The key"). Change the core's configuration through your reviewed-change process. Pending recoveries need new approvals | Yes |
+| **Relay transport key** (sharded profile, outcome A) | Draw a new host key and re-pin it at the peers. Sessions resume from `Hello` | Yes |
+
+## Verify
+
+- The adapter starts with its assertions passing (each key is a device of a PASS account in the contract's key
+  list) and declares `serving`. A withdrawal or an anchor goes final under the new key.
+- The signer's log shows `configuration reloaded`, then `key loaded` for every key with its origin (`vault`, or
+  `kms` for an opted-in lane; never `file` in production), and `signed` lines under the new key id only.
+- The old credential or token is refused: one request, expecting `401` or `ERR-NotAuthorised` (ingress),
+  `refused … not authenticated` in the signer's log (a signer token), or `core link: a connection refused` in
+  the core host's log (the link token).
+- Clerk key: an internal disclosure verifies offline with `aledgent-verify` against the new record.
+- No secret appears in any log during the change.
+
+## Roll back
+
+Keep the old key until verification passes. Each step above is reversed by restoring the previous handle, entry
+or key set. A **compromised** key is never restored: stay paused (keys emptied) until the new key verifies. The
+contract-side steps need the live chain and have been exercised by hand against staging, not automatically.

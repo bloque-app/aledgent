@@ -1,0 +1,91 @@
+---
+title: Message provenance failure
+description: A message between Agents failed its provenance check. In the sharded profile, treat it as a security incident.
+sidebar:
+  order: 42
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Cites `REQ-RT-13`, `INV-18`, `NFR-8`, `NFR-9`, `REQ-AT-3`, `F-033`.
+
+<Aside type="note" title="Status in this release">
+No message crosses Agents with **one core Agent**, the single-voter profile this release deploys. The metrics
+come with the sharded profile's host; the alert rules are committed so that they page the day the metrics
+appear.
+</Aside>
+
+## What it is for, and when to run it
+
+Run it when `AledgentR03CheckFailed` pages (at once), or `AledgentR03Unverified` (a message unverified for over a
+minute, for five minutes). Suggested owner: security, with platform.
+
+Every message between the book's Agents (`credit/<n>`, the principals `feed`, and `trim/<n>`, a peer telling a
+sender how far it applied its credits) is checked by the receiving Agent, in its own transition, against its
+sender's certified commit: a hash chain over the stream, and the sender's voter's signature over the chain's
+head. Each Agent has one voter, whose key is held by the signer.
+
+In **`report`** mode, the default, the check runs but does not gate (`enforce` refuses a failing message): a
+message that fails is **applied anyway**. So a page means that a message its sender did not commit has probably
+already moved value. Treat it as a security incident, never as noise.
+
+Each failure writes one line to the core host's standard error:
+
+```json
+{"event":"r03_check_failed","mode":"report","receiver":"book-1","stream":"credit/0","reason":"forged","applied":12,"verified":10,"applied_anyway":true}
+```
+
+| `reason` | What it means |
+|---|---|
+| `forged` | The messages applied do not chain to the sender's certified head: one was written, changed, reordered or left out after the sender committed it. The relay or its transport. On `trim/<n>`: a trim past what the peer certified, or a peer that applied credits this shard never sent; in `report` the credits were forgotten anyway, and only the relay's copy still delivers them |
+| `wrong_committee`, `bad_signature`, `non_canonical`, `insufficient_quorum`, `unknown_sender`, `wrong_agent` | The certificate is not the pinned voter's, for that sender. A forged certificate, or pins that drifted from the deployment |
+| `wrong_program` | The sender's commit ran under another runtime program than the one pinned: an unannounced runtime change |
+| `not_in_claim` | The certificate carried with the stream does not cover it: a relay fault |
+
+A stream that failed **keeps failing**: once a forged message is applied, the receiver's chain no longer meets
+its sender's. Nothing clears it yet; an operator's re-base after an incident is later work.
+
+## Preconditions
+
+- The receiver, the stream and the reason, from the log line.
+- Whether one stream fails or many: one points at a sender or one link; many point at the relay.
+- For `AledgentR03Unverified`: whether certificates stopped (the sender's host cannot reach the signer) or the
+  relay stopped carrying them.
+
+## Steps
+
+1. **Contain.** Stop the relay (it runs as its own process and OS user). Nothing crosses Agents while it is
+   stopped. Credits wait in transit: no value is lost, and it is neither payer's nor payee's until the credit
+   lands. Revocations wait too: freeze, through the command surface (`freeze_account`,
+   `POST /v1/ops/accounts/{account}/freeze`), the accounts any exposed credential reaches until the feed runs
+   again (`NFR-20`).
+2. **Measure the effect.** Run the reconciliation on demand (`opsctl reconcile`). A forged credit shows on the
+   second axis, in transit; a forged `settle` or `evidence` on the third. A forged `feed` entry (a grant) shows
+   on no axis: list the grants the receiving shard applied since the stream's last verified sequence (the log
+   line's `verified`) and compare them with the principals Agent's registry. Any difference: follow
+   [Divergence](../divergence/). Correct only through the command surface: a reversal by two principals. Never
+   edit a store.
+3. **Find the writer.** For `forged` or `not_in_claim`: the relay's host. Keep its process, memory and logs as
+   evidence. For a certificate reason: the signer's log of every use of the voters' keys, and the pins the
+   deployment admitted; a signature the signer never made means the key left the signer or its secret store. For
+   `wrong_program`: compare the runtime each Agent pins with the release's, and follow
+   [Divergence](../divergence/).
+4. **Rotate.** The relay's credential always ([Key rotation](../key-rotation/)). A voter's key if any
+   certificate reason is involved: a new key means pinning its committee again in every receiver, which is the
+   deployment's step through each Agent's driver, never the relay's.
+5. **Restart the relay** only when the writer is found and removed.
+6. **Write the incident** under your incident process. What never goes in a message: keys, tokens, account
+   identifiers.
+
+## Verify
+
+- Reconciliation on demand: every axis at zero, or every difference owned and being corrected through the
+  command surface.
+- No new `r03_check_failed` line, and `aledgent_r03_unverified_age_ms` back under a minute.
+- The failing stream is recorded in the incident with its last verified sequence: it keeps failing until the
+  re-base exists.
+
+## Roll back
+
+Nothing here edits a store. Setting the mode to `off` silences the check; it is never a fix. A freeze is lifted
+with `POST /v1/ops/accounts/{account}/unfreeze` once the feed runs again.

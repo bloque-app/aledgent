@@ -1,0 +1,70 @@
+---
+title: Finality stall
+description: The settlement layer's finalised height has stopped moving. What that does to operations, and why you wait for evidence.
+sidebar:
+  order: 31
+---
+
+Cites `REQ-IN-7`, `INV-10`, `REQ-OP-6`, `REQ-OP-9`, `NFR-15`.
+
+## What it is for, and when to run it
+
+Run it when `AledgentFinalityStalled` pages (the finalised head more than 20 blocks behind the best, for 2
+minutes), or `AledgentBlockProductionStalled` (finalised height flat for over 120 s), `AledgentAnchorStuck` or
+`AledgentOldestNonTerminalOverServiceLevel`. Suggested owner: settlement operations.
+
+While the layer's finalised height does not move:
+
+- nothing is final, so nothing posts against the issuance counterparty (`INV-10`);
+- deadlines keep running;
+- operations move to `Needs-Review`, never to a refund (`REQ-OP-9`; absence of evidence is not failure,
+  `REQ-OP-6`).
+
+A withdrawal **completes at inclusion** (`Observed`), so a stall of finality alone does not breach `NFR-15`
+for legs already included. A stall of block production does, because nothing is included.
+
+## Preconditions
+
+- Tell the two cases apart. The adapter reports both heights (`aledgent_best_height`,
+  `aledgent_finalized_height`).
+  - **Blocks stalled.** The best height is flat as well. `AledgentBlockProductionStalled` pages alone: the
+    layer's collators are not producing (coretime, or the collators themselves).
+  - **Finality stalled.** The best height moves and the finalised height does not, so
+    `aledgent_finality_lag_blocks` grows and `AledgentFinalityStalled` pages. The layer's finality follows its
+    relay chain.
+- Confirm the adapter itself is serving ([Settlement adapter outage](../settlement-adapter-outage/) if not). A
+  blind light client looks like a stall from inside.
+- Check from outside through a second source: a node you run, or a public endpoint.
+
+## Steps
+
+1. **Blocks stalled.** Run the block-production procedure ([Crank outage and liquidity
+   shortfall](../crank-outage/), "Blocks stalled"). The crank account's key is not the adapter's. Escalate to
+   the layer's operators.
+2. **Finality stalled.** Nothing on aledgent's side changes it. Escalate to the layer's operators and watch the
+   relay chain's finality.
+3. **Do not act on operations.**
+   - Do not release a reservation.
+   - Do not resolve a leg without evidence.
+   - Do not resubmit a withdrawal: the adapter signs each operation at most once, ever.
+   - If the contract's admin must stop new withdrawals, clear the asset's bound. In-flight legs still resolve
+     on their own evidence.
+4. **Communicate** if the stall exceeds 15 minutes, or `NFR-15`'s ceiling for new external legs, under your
+   incident process. Internal transfers are unaffected.
+
+## Verify
+
+- The finalised height moves; `aledgent_finalized_stall_ms` returns to about the block time.
+- The adapter's cursor catches up and it accepts the layer's head with no chain mismatch (a stall past what a
+  full node keeps of events needs a node with history: [Chain mismatch, gaps and
+  resets](../gap-filling/)).
+- The anchor in flight goes final, and the anchor lag falls.
+- Operations that reached `Needs-Review` are resolved one by one, with the layer's records as evidence
+  (`POST /v1/ops/operations/{reference}/resolve`, justified). Record how many, and how long each waited.
+  Nothing is resolved outside the command surface (`REQ-AT-3`).
+- Time to finality is recorded for your `NFR-15` measurements.
+
+## Roll back
+
+Nothing here changes aledgent's state. If you cleared a bound in step 3, the contract's admin restores it; then
+check that one withdrawal goes final.

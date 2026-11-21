@@ -1,0 +1,142 @@
+---
+title: Settlement adapter outage
+description: The adapter is the only process that touches the settlement layer. What carries on while it is down, and how to bring it back.
+sidebar:
+  order: 30
+---
+
+Cites `REQ-SA-5`, `REQ-SA-6`, `REQ-SA-7`, `REQ-OP-6`, `REQ-OP-9`, `INV-10`, `INV-11`, `F-016`, `F-027`.
+
+## What it is for, and when to run it
+
+Run it when any of these page: `AledgentAdapterNotServing` (not serving for 5 minutes),
+`AledgentAdapterRuntimeUnconfirmed` (a `runtime:<spec_version>` alert is open), `AledgentAdapterSignalsStale`,
+`AledgentSignalsDown`, `AledgentObservationLag`, `AledgentObservationStopped`, `AledgentAnchorLag`,
+`AledgentLaneUnderFeeFloor`, or your platform's task-not-running alarm. Suggested owner: settlement
+operations.
+
+While the adapter is down:
+
+- **Internal transfers, reservations and queries carry on.** They never touch the settlement layer.
+- **New external legs are refused** with `ERR-SettlementLayerUnavailable` once its status lease lapses. The
+  same error while the adapter runs and serves is its hold after a reset, or the core's guard against a stale
+  head (`reported` set on `GET /v1/ops/settlement/head`, which answers 503 while ingress's `settlement_head`
+  is off): see [Chain mismatch, gaps and resets](../gap-filling/), "After a reset".
+- **In-flight batches** land or expire on the layer, and are decided when the adapter returns.
+- **Nothing is released on a timer** (`REQ-OP-9`). An operation past its deadline goes to `Needs-Review`.
+
+## Preconditions
+
+- Confirm the state: `aledgent_adapter_serving` is 0, or the signals file is stale. Read the adapter's alerts
+  (`aledgent_adapter_alerts{kind}`): `unreachable`, `dry-run`, `batch:<lane>`, `gap:*`, `review:<op>`,
+  `runtime:<spec_version>`.
+- Rule out a chain-side cause first: `aledgent_finalized_stall_ms` and `aledgent_finality_lag_blocks`. If
+  blocks or finality have stalled, follow [Finality stall](../finality-stall/) instead.
+
+## Steps
+
+1. **The task is not running.** Your scheduler restarts it. If it crash-loops, read the adapter's log. A
+   light-client panic aborts the process by design, and the restart resumes it from its store. Repeated
+   panics on one chain spec point to the boot nodes (step 3).
+2. **It runs but does not serve** (a blind light client). It restarts itself after **3 minutes** blind. Between
+   restarts, check the egress path to the boot nodes (wss on 443, tcp on 30333), and that the relay-chain
+   checkpoint in the image is recent enough for warp sync. A stale one makes a cold start take longer than 3
+   minutes; the fix is a new pin and image.
+3. **Boot nodes.** Check the chain spec's boot nodes from outside your network. If entries are dead, deploy a
+   chain spec with live ones (`deploy/templates/chain-specs/` has the shape).
+4. **Dry runs fail** (a `dry-run` alert, nothing signed). The adapter backs off for a minute. If dry runs keep
+   failing over the light client, set the optional `dry_run_endpoint` to a node you run. That node is then
+   trusted for batch sizing only: it can make a batch fail whole, but it never moves value. Record it as a
+   finding.
+5. **Runtime mismatch.** A runtime upgrade of the layer that changes only the `spec_version` does not stop the
+   adapter; `spec_versions` in its configuration gates nothing. It refuses to serve on a runtime upgrade for
+   one of two reasons, which the `refusing` alert names:
+   - **`unknown_surface`**: what a transaction must carry changed (the `transaction_version`, the transaction
+     extensions, or the types of their data or of `Contracts::call`), and the adapter has no format for it.
+     Deploy the adapter build that pins the new format. If the change is known not to touch what the adapter
+     signs, you can instead name a known format for that `spec_version` in `adapter.formats`
+     (`{ "<spec_version>": "<format name>" }`) and restart: the layer still has to confirm it before anything
+     is broadcast. Record either as a finding. To see what changed, from a checkout run
+     `cargo run -p settle --example surface_probe -- <rpc url>` (read only): it prints the live surface and the
+     format chosen for it, and has the runtime validate a transaction signed in that format by throwaway,
+     unfunded keys, broadcasting nothing (`Invalid(Payment)` for the native form means the format is accepted).
+   - **`unconfirmed`** (with a `runtime:<spec_version>` alert): the surface matched a format, but the runtime
+     refused a transaction signed in it (`BadProof`, `BadSigner`, `UnknownOrigin`, an extension's `Custom`
+     error, bytes it cannot decode). The format changed in a way the metadata does not show. Nothing was
+     broadcast. Deploy the build with the right format, or name it in `adapter.formats`; a restart asks the layer
+     again. A restart alone with nothing changed is refused again. An upgrade enacted while a step was signing
+     does not cause it, so `unconfirmed` right after an upgrade is a real format change, with one exception:
+     the light client failing to run the validation at all. Its virtual machine can report that it could not
+     start the function, or that the runtime called a host function a light client does not provide, under the
+     same "execution" error as a runtime that cannot decode the transaction. Read the alert's detail, or the
+     error log "did not confirm the transaction format on its runtime": a real format change reads "Runtime
+     has trapped: …" (or "Runtime has aborted: …"); the light-client case reads "Function to start was not
+     found.", "Symbol to start is not a function.", "Function to start uses unsupported signature.", "The types
+     of the provided parameters don't match the signature.", "DataSizeOverflow" or "ForbiddenHostFunction".
+     **A restart clears the latter**: the refusal is held in memory and the restarted adapter asks the layer
+     again. If the same answer comes back after a restart, record a finding and consider the explicit RPC
+     fallback (`"connection": "rpc"` in the adapter's configuration).
+   - **Neither** (still serving, the warning "neither confirmed nor refused", withdrawals acknowledged but not
+     signed): the layer found the first transaction signed on a new runtime invalid *for now* (a nonce, fees,
+     the era, the block's resources), which neither confirms the runtime nor refuses it. Nothing goes out on
+     that runtime until it confirms. After `adapter.not_now_alert_after` such answers in a row (10 by default,
+     about 20 s at the template's 2 s `interval`), the adapter raises `runtime:<spec_version>`, whose detail
+     names the last answer, and `AledgentAdapterRuntimeUnconfirmed` pages. Check the lane's fees and nonce
+     (step 8) before anything else. The alert clears when the runtime confirms.
+
+     **This is urgent, and no other page will say so.** A withdrawal is instructed with an expiry 150 heights
+     above the finalized head (`expiry_window` in the settlement configuration,
+     `deploy/templates/settlement.json`). At 2.0 s blocks and a finality lag of about 16 blocks it can wait
+     unsigned for about **4.5 minutes**; then no era fits, the adapter records it as never signed, and about 5
+     minutes after it was instructed the core releases it: the operation ends `Released` (terminal; the payer's
+     withdrawal does not happen, and it does not go to review). The oldest-non-terminal page (over 1 hour, for 5
+     minutes) never fires for these, `AledgentAdapterNotServing` does not fire (the adapter still serves), and
+     the anchor lag pages only after 2 hours. Payers can retry once the runtime is confirmed.
+6. **Database.** If the adapter cannot reach its database, follow the database server's own failover. The
+   adapter resumes from the head it last accepted.
+7. **Keys.** If signing fails, read the signer's log: a signer that cannot log in to your secret store or read
+   its secret does not start (check the role's binding to the task's identity); for a lane opted into KMS,
+   check KMS reachability and the task role's sign permission. Do not fall back to a key in the environment.
+8. **Liquidity.** A lane or anchor key under its fee floor parks instructions. Whoever holds the treasury tops
+   up ([Crank outage and liquidity shortfall](../crank-outage/), "Liquidity or fees short").
+9. **Running, but observation is stopped** (`AledgentObservationStopped`). The adapter serves and signs, and
+   waits for an operator on one instance:
+   - `unreadable:<instance>:<position>`: no reader serves that range. Give the adapter a history endpoint, or
+     stop it, run once `aledgent-settle <config> gap <from> <to>` with the range the alert names (use the range
+     the command reports if it refuses), and start it again.
+   - `reset:<instance>`: governance reset the layer's instance under it, and the core does not follow the new
+     chain (amendment 0041): the reset names another book, entries of the chain before it were left
+     unreported, or the core refused it or cannot take it yet (an `epoch` alert says which). Nothing reaches
+     the book it serves, and the adapter declares that it does not serve, so new withdrawals are refused. A
+     refusal the core may still lift is reported again every ten minutes. For another book's reset: once the
+     book is re-founded and the configuration points at it, stop the adapter, run once
+     `aledgent-settle <config> refound`, and start it again.
+
+   Both commands take the adapter's lease, so the running adapter is stopped first; each runs once and exits.
+   The steps and their checks are in [Chain mismatch, gaps and resets](../gap-filling/).
+10. **A reset the core cannot take yet** (`AledgentSettlementEpochUnsupported`, which pages): the core runs
+    code before amendment 0041's rules version, or ingress's `settlement_epochs` is off, so its finalised head
+    stays on the chain before the reset. The adapter goes on stepping, held: withdrawals are refused. Upgrade
+    the core; the adapter reports the reset again within ten minutes and the warning clears.
+
+**To pause on purpose:** scale the service to zero (nothing is signed). If the keys are in doubt, the contract's
+admin clears a bound or empties the key set.
+
+## Verify
+
+- `aledgent_adapter_serving == 1`, and the signals are fresh.
+- `aledgent_observation_cursor_lag` returns to about 0 and the adapter accepts the layer's head. If it raises
+  `AledgentSettlementChainMismatch` or `AledgentObservationStopped`, or cannot read the range it missed, follow
+  [Chain mismatch, gaps and resets](../gap-filling/).
+- Parked withdrawals resume by themselves; nothing is resubmitted by hand. The oldest non-terminal age falls.
+- Anchors resume, and the anchor lag falls under the interval.
+- Operations that reached `Needs-Review` during the outage are resolved one by one, with the layer's records as
+  evidence (`POST /v1/ops/operations/{reference}/resolve`, with a `target`, the `evidence` and a
+  `justification`). None is released without evidence, and none outside the command surface (`REQ-AT-3`).
+
+## Roll back
+
+- A bad adapter release: redeploy the previous image digest and it resumes from its store. First check whether
+  the release ran a store migration (`services/settle/migrations`); if it did, the previous build must accept
+  the migrated schema.
+- A dry-run node set in step 4: remove `dry_run_endpoint` once the light client's dry runs work again.

@@ -1,0 +1,78 @@
+---
+title: The core's writer is fenced
+description: The installed code is not the code the writer's state names, so every input waits. Find out why, and how to get out.
+sidebar:
+  order: 11
+---
+
+Cites `REQ-RT-20`, `REQ-RT-18`, `NFR-11`, `REQ-AT-3`, `F-037`.
+
+## What it is for, and when to run it
+
+Run it when `AledgentWriterFenced` pages: the writer has been fenced for longer than `fence_alert_after`
+(five minutes). Suggested owner: platform.
+
+At every input the core Agent compares the rules version compiled into the package it runs with the rules
+version its state names (the fence). When they differ, the Agent refuses every input except a way out of a
+scheduled upgrade: nothing is written, no input number is taken, and inputs wait `Received`. It happens
+when a switch to a scheduled upgrade was not made or failed, or when a stale package (an older rules
+version) or an early one (the next rules version before its input) was installed.
+
+`aledgent_writer_fenced_seconds` says how long. The core's standard error and the audit store's node trail
+hold one `fenced` record per refusal, naming the input, the rules version installed and the rules version the
+state names.
+
+## Preconditions
+
+- Read the latest `aledgent-core: AUDIT: input … refused by the fence` line: the rules version installed,
+  the rules version in force, and the scheduled upgrade with the input it applies from.
+- Read which program the writer is in. `GET /v1/ops/signals` with the operations principal returns
+  `writer_code`: the version in force (`code`), its `generation` and the `upgrade` scheduled (the version and
+  the input it applies from), as of the last input that committed. The exporter shows the same as
+  `aledgent_writer_generation{code}` and, while an upgrade is scheduled,
+  `aledgent_writer_upgrade_scheduled_input{code}` (the label is the first eight bytes of the version, in hex).
+- Read the core's standard error for what happened to the code, one line each, naming the input:
+  `input N is the first to run code …` (a switch took effect), `input N took the way out: …`,
+  `input N scheduled an upgrade to code …`, and `the platform now runs code … for input N` (an install). If
+  the line is missing, the signals above are the exact record. Before an upgrade was recorded,
+  `aledgent-core: refused an upgrade to code …` and the front door's `an upgrade was refused before it was
+  logged` name the reason: another runtime, another package key, or code that could not be fetched or staged.
+
+## Steps
+
+1. **Check whether the switch happened.** If the state names an upgrade that applies (its input is the next
+   one) and the installed package is the old rules version, the switch was missed. The core host installs the
+   scheduled version through its `switch` at start and before each input, from its staged copy. Restart the
+   core host so it runs that check. Never install a package by hand outside `switch` (`REQ-RT-20`: the
+   platform's install authority is not an authority over the book).
+2. **If the new code cannot run, take the way out.** The door refuses, before recording a version, one that
+   names another runtime than the host runs, or whose package has another key, state layout, constructor ABI
+   or lane requirements. It does not check everything the runtime checks, so a version that passed the door
+   can still be refused when the switch tries it, and a broken package or a failed platform arrive here too.
+   Reschedule the upgrade to a later input (`POST /v1/ops/upgrade/reschedule`) or cancel it
+   (`POST /v1/ops/upgrade/cancel`), authorised under the upgrade-authority mode in force. The old code decides
+   it even while fenced. Check that it reached the writer: a way out queued behind other inputs does not
+   overtake them. After a way out at the upgrade's input, the core host installs the old rules version's
+   package again before the next input.
+3. **If the installed package is a rules version the state never names**, the code map's version was
+   replaced outside `switch`. Treat it as an incident, find who installed it, and restart the core host so it
+   installs the code map's version.
+4. Confirm `aledgent_writer_fenced_seconds` is back to 0 and inputs commit again.
+
+Two notes. Roll the front door out before the core: an older front door re-serialises the signals and
+drops `writer_code`, which then reads as "not reported". And the door compares a version with the package the
+host runs: if a host starts without the bytes of that package (a re-staging that failed), it refuses every
+later upgrade with "the package this host runs is not held" until the host restarts with them. That is a
+refusal by the host, not by the version.
+
+## Verify
+
+- `aledgent_writer_fenced_seconds` is 0 and the input number advances.
+- `writer_code` in the signals shows the version you expect, with no upgrade scheduled that you did not
+  intend.
+- The inputs that waited `Received` are decided, in order.
+
+## Roll back
+
+Nothing here changes the book's storage: every step is an input through the command surface or a restart
+(`REQ-AT-3`). A rescheduled upgrade is scheduled again the same way.
