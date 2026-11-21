@@ -1,0 +1,68 @@
+---
+title: While the settlement layer is away
+description: What keeps working, what waits and what is refused when the settlement layer or its adapter is unavailable.
+sidebar:
+  order: 8
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Cites `REQ-PR-9`, `AC-J1.4`, `REQ-SL-5`, `REQ-SA-2`, `REQ-SA-7`, `REQ-IN-5`, `REQ-OP-6`, `REQ-OP-9`,
+`REQ-SL-4`, `REQ-EV-5`, `REQ-SN-2`, `INV-10`, `INV-11`.
+
+The settlement layer is used for two things only: value entering or leaving aledgent, and anchoring
+(`REQ-SL-5`). Internal movements never touch it. So when it, or the settlement adapter that reaches it,
+is unavailable, the book goes on; what waits is whatever crosses the boundary. **An anchoring outage
+reduces provability and never availability** (`REQ-PR-9`, `AC-J1.4`).
+
+aledgent treats the adapter as unavailable while it declares that it does not serve (it refuses to serve
+when it is not connected to the declared settlement layer, `REQ-SA-2`), and once its last declaration has
+gone stale.
+
+## What keeps working
+
+| | |
+| --- | --- |
+| **Transfers** between ledger accounts | As always: acknowledged, decided, final on acceptance |
+| **Reservations, captures and releases** with no external leg | As always |
+| **Issuance and redemption** of any asset | As always, under issuance authority |
+| **Reads**: balances, movements, statements, operations | As always |
+| **Identities, accounts, credentials, grants, custody** | As always |
+| **Notifications** | Delivered as always: they go to recipients, not to the settlement layer, and no operation waits on a recipient (`REQ-EV-5`) |
+| **Disclosures** | Issued against the latest **final** checkpoint. A recipient verifies with its own read of the settlement layer, so verification needs the layer to be readable, not aledgent |
+
+## What waits
+
+| | While it is away | When it is back |
+| --- | --- | --- |
+| **Anchoring** | The checkpoint in flight stays in flight; anchor lag grows and pages. Notifications go on naming the last final anchor | The checkpoint reaches finality and anchoring resumes |
+| **Deposits** | Arrivals are not observed, and nothing is credited: nothing is ever posted for an inbound leg before finality (`INV-10`) | The adapter reads the range it missed. It never advances past a range it did not read; one it was forced to skip is recorded as a gap the operator sees, and reconciled afterwards (`REQ-SA-7`, `REQ-IN-5`) |
+| **Withdrawals already submitted** | They stay where they were (`Submitted`, `Observed`, `Final`), with their value reserved. Nothing is failed, released or retried on silence (`REQ-OP-6`) | They go on to `Settled` on finality, or are released at once on a proved rejection, or on proven non-inclusion once their expiry has passed (`REQ-SL-4`, `REQ-OP-9`) |
+| **Operations past their deadline** | Move to `Needs-Review`, value still reserved | Resolved on the adapter's proof first, with no human, where it can find one |
+
+## What is refused
+
+| | Refused with |
+| --- | --- |
+| A new withdrawal, and handing a reserved withdrawal to the adapter | `ERR-SettlementLayerUnavailable` |
+| Binding a book-only asset to the settlement layer | `ERR-SettlementLayerUnavailable` |
+| A release of a reservation whose external leg may still execute | `ERR-ReleaseUnsafe`, and the operation moves to `Needs-Review`. This is not specific to an outage: it is the rule at all times |
+
+A caller that gets `ERR-SettlementLayerUnavailable` retries the withdrawal later, under the same client key.
+Nothing about the account or its balance changed.
+
+<Aside type="note" title="Not an outage: a shortfall">
+If the settlement layer is reachable but a position that pays its costs cannot cover what waits on it, the
+affected withdrawals **park**. One alert is raised per position, nothing is released, and they resume on
+their own once the shortfall clears (`REQ-SN-2`).
+</Aside>
+
+## Why it works this way
+
+No caller and no adapter can assert an outcome (`INV-11`): aledgent derives each one from what was
+observed. While nothing is observed, nothing is derived, so the safe state is the one the operation is
+already in. Releasing a withdrawal's reservation while its instruction might still be included would be a
+double spend; crediting a deposit before finality would book value the settlement layer could still
+revise.
+
+The signals an operator watches through an outage, and their alerts: [Signals](../../operate/signals/).

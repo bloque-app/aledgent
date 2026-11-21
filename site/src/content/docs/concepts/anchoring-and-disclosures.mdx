@@ -1,0 +1,126 @@
+---
+title: Anchoring and disclosures
+description: What an anchor commits to and what it proves, what it does not, and what a disclosure lets a recipient check.
+sidebar:
+  order: 6
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Cites `REQ-PR-1`, `REQ-PR-2`, `REQ-PR-3`, `REQ-PR-4`, `REQ-PR-5`, `REQ-PR-6`, `REQ-PR-7`, `REQ-PR-8`,
+`REQ-PR-9`, `REQ-PR-10`, `REQ-PR-11`, `REQ-DS-1`, `REQ-DS-2`, `REQ-DS-3`, `REQ-DS-4`, `REQ-DS-5`,
+`REQ-AR-5`, `REQ-AR-6`, `REQ-EV-1`, `REQ-PV-6`, `INV-17`, `INV-19`, `NFR-9`, `DEF-3`, `F-017`, `F-023`.
+
+## The trade-off behind both
+
+Internal movements never touch the settlement layer, so nobody can rebuild a holder's balance from a public
+record. Provability is something aledgent **offers** (to a holder, a verifier, a named counterparty), not
+something the world simply has. If aledgent lied and nobody ever asked it for a proof, the settlement layer
+alone would not reveal the lie. Anchors and disclosures are how the parties with a stake can ask.
+
+## An anchor
+
+An **anchor** is a commitment to a state of the book, published on the settlement layer. The state it
+commits to is a **checkpoint**.
+
+- **When.** Every hour, and on demand (`REQ-PR-1`): when the operator asks, with a justification
+  (`POST /v1/ops/anchors`), and when a disclosure concerns entries no final anchor covers yet. In this
+  release a disclosure rests on the final checkpoint it names, or the latest final one, and asserts its
+  fact as of that checkpoint; a fact newer than the latest final anchor waits for an on-demand anchor to
+  become final.
+- **What it commits to.** At one consistent cut of the book's writers, every entry up to and including a
+  stated sequence, the registry of identities, credentials and grants, the audit trail, and nothing else
+  (`REQ-PR-7`, `INV-19`). Taking the cut stops no writer.
+- **What it reveals.** Nothing about any account, identity, amount, counterparty or asset (`REQ-PR-2`).
+  On the settlement layer an anchor is a number and a 32-byte commitment (`INV-17`).
+- **Which construction.** Every checkpoint names the construction of its state commitment, and its anchor
+  binds that name, so a recipient knows how to check a proof against it (`REQ-PR-10`). A change of
+  construction is a migration whose checkpoint carries both roots, and earlier anchors stay checkable
+  (`REQ-PR-11`).
+- **Only once final.** aledgent records whether each anchor's publication reached finality on the
+  settlement layer. One that has not is never cited as establishing anything (`REQ-PR-8`); citing one is
+  `ERR-AnchorNotFinal`.
+
+Every notification carries the latest anchor that was final when its transition was recorded: its number,
+the last entry it commits to, and its coordinate on the settlement layer (`REQ-EV-1`). That places each
+operation against the anchored history.
+
+## What an anchor proves, and what it does not
+
+<Aside type="caution" title="Non-revision, never solvency">
+An anchor establishes **exactly this**: aledgent held a particular book state at a particular time, and it
+cannot later claim to have held a different one (`REQ-PR-3`). It establishes **nothing** about whether
+that state was correct, whether the value it records exists, or whether the operator is solvent. No
+anchoring scheme proves solvency, and aledgent does not claim that anchoring prevents the operator from
+cheating. It prevents the operator from *revising* what it committed to.
+</Aside>
+
+- **A revision of anchored history is detectable** by anyone holding an earlier anchor, without the
+  operator's cooperation (`REQ-PR-4`).
+- **Between two anchors, a revision is not detectable this way.** Anchors are at most an hour apart, so
+  that hour is the longest such window.
+- **Checking an older anchor** needs a reader of the settlement layer that keeps its finalized history, or
+  a read saved earlier. Any reader serves the latest.
+
+What answers "does the value exist" is a different check: aledgent compares, continuously, the value it
+records as held on the settlement layer with what the settlement layer says it holds, at zero tolerance
+(`REQ-PR-5`, `NFR-9`'s third axis). A divergence is an incident. That comparison is the operator's, and
+it is aledgent's own report, not a proof to a third party.
+
+Anchoring is never on the critical path of a holder's operation: if it stops, provability is reduced and
+nothing else is (`REQ-PR-9`). See [While the settlement layer is away](../settlement-layer-away/).
+
+## A disclosure
+
+A **disclosure** is a statement about ledger facts, addressed to a named recipient. Issuing one
+(`POST /v1/disclosures`) needs the subject's authority: its owner, or a grant over it naming disclosure.
+The exception is a legal obligation, under which the operator discloses about an account in delegated
+custody with a justification, recorded in the audit trail (`REQ-DS-5`). Otherwise it is
+`ERR-NotDisclosable`.
+
+It asserts one of four things (`REQ-DS-1`):
+
+| Assertion | Says |
+| --- | --- |
+| Holds at least | The subject account holds at least an amount of an asset (in this release, of `available`) |
+| Occurred | A named operation occurred on the subject |
+| Moved | A named operation moved exactly a stated amount of an asset |
+| Flows within a bound | The subject's flows in or out over a range of entries meet a stated bound |
+
+Every disclosure names its subject, its recipient (an identity, or an opaque 32-byte reference: never
+personal data), its assertion, the checkpoint it rests on, and the deployment's **assurance level**
+(`REQ-DS-2`). aledgent refuses to issue one it can tell is false (`REQ-DS-4`, `ERR-DisclosureFalse`).
+A disclosure reveals only what it asserts, and gives the recipient no ability to read anything else, now
+or later (`REQ-PV-6`).
+
+## What a recipient can check, and what it cannot
+
+<Aside type="caution" title="A disclosure today is aledgent's signature">
+In this release every disclosure is a **signed assertion** by aledgent, and the disclosure and the
+assurance level both say so (`REQ-PR-6`, `REQ-AR-6`). A signed assertion is evidence of aledgent's
+**claim**, not of its **truth**. Disclosures that a recipient can check by a construction, without
+relying on aledgent's signature, are deferred (`DEF-3`, `F-023`).
+</Aside>
+
+A recipient checks a disclosure without aledgent taking part (`REQ-DS-3`), with the open-source
+verifier in the repository (`crates/verify`, the `aledgent-verify` command). Its inputs are the
+disclosure, the deployment's attestation key (given, or read from the deployment's record on the
+settlement layer) and a public read of the settlement layer. It checks:
+
+1. the disclosure's format and version;
+2. aledgent's signatures over it, and that the claim is bound to the checkpoint it names;
+3. that the checkpoint's anchor is on the settlement layer, read at a finalized block;
+4. that the commitment, recomputed from the checkpoint, is the anchor's.
+
+**A pass means:** aledgent asserted this fact about a book state it committed to publicly and cannot later
+deny having held. It does not mean the fact is true, and it says nothing about solvency.
+
+`GET /v1/disclosures/verify` runs the same check at the deployment. It is a convenience, and it is
+aledgent answering for itself: a recipient that wants the check to stand without aledgent runs the
+verifier.
+
+## The assurance level
+
+A deployment declares, in machine-readable form, which invariants it **enforces** and which it only
+**attests**, and every disclosure carries that declaration (`REQ-AR-5`). The first release declares every
+disclosure as a signed assertion until an independently checkable construction ships (`REQ-AR-6`).

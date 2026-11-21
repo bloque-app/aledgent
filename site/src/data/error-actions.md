@@ -180,9 +180,10 @@ by notification or with `GET /v1/operations/{reference}`.
 Seen by: whoever captures a reservation.
 Retry: not unchanged.
 
-A capture must clear exactly the reserved amount (`INV-14`): there is no partial capture. Capture the
-whole amount, or release the reservation and reserve again for the right amount. For charges whose cost
-is known only afterwards, see [Metered usage](../../integrate/metered-usage/).
+A capture cleared more than the reservation holds (`INV-14`). A capture may clear the reserved amount or
+less, and the difference returns to the payer in the same posting; never more. Capture at most the
+reserved amount, and charge any excess separately. For charges whose cost is known only afterwards, see
+[Metered usage](../../integrate/metered-usage/).
 
 ## ERR-ReleaseUnsafe
 

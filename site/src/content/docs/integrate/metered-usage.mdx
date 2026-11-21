@@ -1,19 +1,21 @@
 ---
 title: Metered usage
-description: Charging for usage when a capture must equal its reservation, and when the cost is known only afterwards.
+description: Charging for usage with a reservation, when the cost is known before the work and when it is known only afterwards.
 sidebar:
   order: 8
 ---
 
 import { Aside } from '@astrojs/starlight/components';
 
-Cites `INV-14`, `REQ-BA-4`, `REQ-OP-10`, `REQ-CS-3`.
+Cites `INV-14`, `REQ-OP-2`, `US-C2`, `REQ-BA-4`, `REQ-OP-10`, `REQ-CS-3`.
 
 A reservation holds value against an account at once (`REQ-BA-4`). It ends in exactly one of two ways:
-**capture**, which moves the reserved value to a destination, or **release**, which gives it back. A
-reservation and its capture or release are one object, matched by identity, and **a capture must clear
-exactly the reserved amount** (`INV-14`). There is no partial capture: a capture of any other amount is
-`ERR-AmountMismatch`.
+**capture**, which moves value from the reservation to a destination, or **release**, which gives all of
+it back. A reservation and its capture or release are one object, matched by identity (`INV-14`): what is
+reserved comes from the book, never from the caller. **A capture may clear less than the reservation**: the
+difference returns to the payer's available balance in the same posting (`REQ-OP-2`, `US-C2`). A capture
+above the reserved amount is `ERR-AmountMismatch`, and nothing changes. A reservation is captured or
+released once.
 
 Every integrator that charges for usage meets this. Pick the pattern by when you know the cost.
 
@@ -39,26 +41,27 @@ curl -X POST "$INGRESS/v1/reservations/$RESERVATION/release" -H "Authorization: 
   -H "client-key: task-7f3c2a-release" -H "content-type: application/json" -d '{}'
 ```
 
-If the cost changes before the capture, **release and reserve again** for the new amount, then capture
-that. Or charge in small fixed steps, one reservation per step.
+If the cost falls before the capture, capture the lower amount: the rest returns to the user at once. If it
+rises above what you reserved, capture what you reserved and charge the rest with a `transfer` (below), or
+release and reserve again for the new amount.
 
 ## The cost is known only afterwards
 
 An LLM proxy, say: the price depends on the tokens the call used. Reserve a **cap** before the call, then:
 
-- **The cost equals the cap:** `capture` it. Done.
-- **Otherwise:** `release` the reservation, then charge the real cost with a `transfer` from the user's
-  account to your collection account, with the request id in its client key
-  (`request-<id>-charge`).
+- **The cost is at or below the cap:** `capture` the real cost, as `cleared`. The rest of the cap returns
+  to the user's available balance in the same posting. Done.
+- **The cost exceeds the cap:** `capture` the whole cap, then charge the excess with a `transfer` from the
+  user's account to your collection account, with the request id in its client key
+  (`request-<id>-excess`). A capture above the reservation is refused.
 
-The grant over the user's account then needs `transfer` as well as `reserve`, `capture` and `release`.
-Limit it to your collection account with `counterparties`.
+For the second case the grant over the user's account needs `transfer` as well as `reserve`, `capture` and
+`release`. Limit it to your collection account with `counterparties`.
 
 <Aside type="caution" title="Trade-off, stated plainly">
-Between the release and the transfer, the value is no longer held. If the user spends it elsewhere in
-that gap, the transfer is refused (`ERR-InsufficientAvailable`) and you have done the work unpaid. A
-partial capture would close the gap; aledgent has none (`INV-14`). Keep the gap short (release and
-transfer back to back), and size the cap so the cost rarely exceeds it.
+Only the cap is held. If the cost exceeds it and the user spends the rest of their balance elsewhere first,
+the excess transfer is refused (`ERR-InsufficientAvailable`) and you have done that part of the work
+unpaid. Size the cap so the cost rarely exceeds it.
 </Aside>
 
 ## At volume
@@ -67,10 +70,10 @@ One reservation per call is many operations. For a session of many calls:
 
 - reserve one **budget** for the session;
 - meter the calls on your side;
-- at the session's end, either capture the budget (if it was used up) or release it and send **one**
-  transfer for the session's total.
+- at the session's end, capture the session's total from the budget (the rest returns to the user), or
+  release the budget if nothing was used.
 
-The same trade-off applies to that final transfer.
+If the total exceeds the budget, the same trade-off applies to the transfer for the excess.
 
 ## Keys for each step
 

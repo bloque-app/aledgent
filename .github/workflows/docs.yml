@@ -6,8 +6,10 @@ name: Docs site
 # OpenAPI document the API reference and the error catalogue are generated from, or the documents the
 # site renders (SPEC.md, PLAN.md, OVERVIEW.md); deploys to GitHub Pages from main. The build is the
 # check: specsite's strict identifiers, the error catalogue against SPEC.md §10 and the OpenAPI
-# document (site/lib/errors.mjs), the guide pages' identifiers (site/lib/id-links.mjs), and every
-# internal link (site/lib/check-links.mjs).
+# document (site/lib/errors.mjs), the guide pages' identifiers (site/lib/id-links.mjs), every
+# internal link (site/lib/check-links.mjs), and that no page names an operator's accounts or internal
+# hosts (site/lib/check-public.mjs, against the shapes in site/lib/public-denylist.json and the
+# operator's own patterns in the PUBLIC_DENYLIST_PATTERNS secret, when it is set).
 on:
   push:
     branches: [main]
@@ -47,6 +49,9 @@ jobs:
       # GitHub Pages serves a project site under /<repo>/.
       SITE_URL: https://bloque-app.github.io
       SITE_BASE: /aledgent/
+      # One regular expression per line: the operator's own hosts, accounts and tool names, kept out
+      # of the repository. Empty when the secret is not set (and on pull requests from forks).
+      PUBLIC_DENYLIST_PATTERNS: ${{ secrets.PUBLIC_DENYLIST_PATTERNS }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

@@ -84,8 +84,9 @@ See [While the core is away](../core-away/).
 ## Usage: reserve, then capture or release
 
 For each task: reserve its cost against the user's account, run it, then capture the whole reservation
-into your collection account or release it. Use the task id in the client keys. A capture must equal its
-reservation (`INV-14`); the patterns for variable costs are in [Metered usage](../metered-usage/).
+into your collection account or release it. Use the task id in the client keys. A capture may clear less
+than its reservation, and the rest returns to the user, but never more (`INV-14`); the patterns for
+variable costs are in [Metered usage](../metered-usage/).
 
 A reservation is acknowledged at `202 Received`. Act only on its decision: `Reserved` (run the task) or
 `Rejected` with `ERR-InsufficientAvailable` (the user has too few credits).

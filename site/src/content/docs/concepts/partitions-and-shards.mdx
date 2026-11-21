@@ -1,0 +1,106 @@
+---
+title: Partitions and shards
+description: How the one book is held in partitions of accounts, what is final when, the in-transit position, and how shards bind partitions.
+sidebar:
+  order: 7
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Cites `REQ-RT-1`, `REQ-RT-9`, `REQ-RT-10`, `REQ-RT-11`, `REQ-RT-12`, `REQ-RT-13`, `REQ-RT-14`,
+`REQ-BA-5`, `REQ-AU-3`, `INV-5`, `INV-9`, `INV-18`, `INV-19`, `INV-25`, `NFR-9`, `NFR-18`, `NFR-19`,
+`NFR-20`, `NFR-21`, `DEC-22`, `F-031`, `M-4`.
+
+## One book, held in parts
+
+A deployment has exactly **one book**: one registry, one trial balance, one sequence of anchors. Nothing
+splits it by asset, by account kind or by integrating party (`INV-25`). Its state **may** be held in
+**partitions** of ledger accounts, so that it scales by adding writers rather than by a faster single one
+(`NFR-18`). Holding it in partitions does not split it.
+
+- **Every ledger account belongs to exactly one partition**, fixed by a deterministic function of its
+  identifier when it is opened (`REQ-RT-9`).
+- **Everything ordered against an account lives in its partition:** its balances in every asset and kind,
+  its reservations, and every operation it pays.
+- **No identifier changes when the book is re-partitioned.** The partition is part of the identifiers of
+  what it holds, so a change in how many partitions there are moves state and renames nothing.
+- **The registry, the roles, the trial balance, the anchors and the audit trail are the book's,** not a
+  partition's.
+
+Each partition has one durable commit boundary, enclosing a posting's entries, the operation's state
+change, its evidence, its notifications and the messages it owes other writers (`REQ-RT-1`).
+
+## What is ordered, and what is not
+
+Every operation that debits an account, or takes, captures or releases a reservation on it, is ordered
+against every other such operation on that account (`REQ-RT-10`): their effects are those of some serial
+order. Operations on different accounts need no order, and credits to one account may apply in any order.
+
+## A transfer across partitions
+
+When payer and payee are in different partitions (`REQ-RT-11`):
+
+1. **The payer's partition decides and commits the debit.** The value moves from the payer to the book's
+   **in-transit position** for the asset, and the credit is enqueued in the same commit. From that commit
+   the transfer is **final**: its operation is terminal, and only a new operation undoes it.
+2. **The payee's partition applies the credit, exactly once**, within `NFR-19`'s bound (2 s at p99,
+   proposed). It cannot be refused: an account that exists can be credited (`INV-9`), and every check the
+   transfer needs was made before the debit committed.
+
+The in-transit position is part of the book. The trial balance includes it and is exactly zero at every
+commit of every partition (`INV-5`), and reconciliation checks it equals the credits in transit (`NFR-9`).
+The payer's view and notification follow the debit; the payee's follow the credit.
+
+<Aside type="caution" title="Trade-off, stated plainly">
+For up to `NFR-19`'s bound the value is neither the payer's nor the payee's: it is in transit. "Final"
+means final for the payer and for the book; it does not mean the payee can already spend it. When payer
+and payee share a partition, both sides commit in one posting.
+</Aside>
+
+A balance read for an identity across all its accounts is one query; value moving between two of its own
+accounts in different partitions is shown as in transit, never missing or counted twice (`REQ-BA-5`).
+
+## Writers, messages and the consistent cut
+
+The partitions are some of the book's **writers**. The others are the registry of identities, credentials
+and grants, the record of settlement instructions and their observations, and the audit trail with its
+anchors (`REQ-RT-13`). A writer decides from its own state and the messages it has applied, never by
+reading another's. Every message between two writers is enqueued in the sender's commit and applied by the
+receiver exactly once and in sequence (`INV-18`).
+
+So there is always a delay between writers, and the specification bounds the ones a holder can feel:
+
+| Delay | Bound |
+| --- | --- |
+| A credit across partitions | `NFR-19`: 2 s at p99, proposed |
+| A revocation reaching every partition | `NFR-20`: 1 s at p99, proposed. Until it arrives, the revoked grant can still be used within its own bounds (`REQ-AU-3`) |
+| Everything else | Measured and reported |
+
+An anchor, the trial-balance reconciliation and an asset's binding are each taken at a **consistent cut**:
+one commit of each writer, chosen so that nothing applied in it was not sent in it, and nothing in transit
+in it was dropped (`REQ-RT-14`, `INV-19`). A cut is decided from what each writer recorded, and taking one
+never stops a writer. It trails the newest commits by about one message delay.
+
+## Hot accounts
+
+An account whose debits arrive faster than one partition can order them (an issuer's escrow, a fee
+collector, a treasury) may be held as a **pool** of member positions in several partitions (`REQ-RT-12`).
+It is still one ledger account, with one owner, one statement and one balance, the sum of its members'. A
+debit the pool covers is never refused because no single member covers it. Moving value between members is
+an ordinary, audited operation that changes no balance of the account. A holder never sees a member.
+
+## How the plan binds partitions to shards
+
+The plan fixes the partitions and groups them into **shards** (`DEC-22`):
+
+- There are 2¹⁶ partitions. An account's partition is the first two bytes of a BLAKE2b-256 hash of a fixed
+  domain and the account's identifier, and account-scoped keys carry it in their top sixteen bits.
+- A **shard** is one writer holding a contiguous range of partitions, with a principals writer beside the
+  shards. A credit between shards travels in sequence per pair of shards, and each shard holds an
+  in-transit position per asset and peer shard.
+- **One shard holds every partition** until measurements justify more. With one shard, every transfer
+  commits both sides in one commit, and nothing is in transit.
+
+More than one shard, and replicas that can be lost without a restore (`NFR-21`), are the work of `F-031`
+and of milestone `M-4`. The number of shards is configuration; the sixteen-bit partition is in the key
+layout.
