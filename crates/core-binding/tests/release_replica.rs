@@ -174,6 +174,11 @@ fn layout(dir: &Path) -> u64 {
 /// commits on, and a kill after that comes back from the manifest.
 #[tokio::test(flavor = "multi_thread")]
 async fn t031_26_the_first_start_over_the_release_s_clean_stop_reopens_without_a_rebuild() {
+    // The fixture is a book in roots v2, the release's; a roots-v1 build (smt-v1) founds another
+    // book from the same genesis, as for the code-history gate's.
+    if cfg!(feature = "smt-v1") {
+        return;
+    }
     let fx = fixture();
     assert_eq!(layout(&fx.join("replica")), 1, "the release's record");
     let agent: Value =
