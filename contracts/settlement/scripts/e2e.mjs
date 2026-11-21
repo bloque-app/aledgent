@@ -72,6 +72,14 @@ const PRUNED_STATE_BLOCKS = Number(env('PRUNED_STATE_BLOCKS', '16'));
 
 const ASSET = drive.ASSET; // Here(1): sufficient, minimum balance 1 (e2e/network genesis)
 const ASSET2 = JSON.parse(env('ASSET2', '{"Here":2}')); // non-sufficient, minimum balance 1
+// BUSDC, production's first chain-bound asset: sufficient, 6 decimals (e2e/network genesis). The
+// aledgent driver's stress scenario c binds it under load and withdraws it; the contract refuses a
+// withdrawal of an asset with no bound (`NoWithdrawalBound`), so the deployment sets one, as the
+// operator does before the first withdrawal.
+const ASSET_BUSDC = JSON.parse(env('ASSET_BUSDC', '{"Here":101}'));
+// At least what the aledgent driver issues of BUSDC (BUSDC_ISSUED in e2e/aledgent-driver), so that
+// the bound never limits a withdrawal in the run.
+const BUSDC_BOUND = 50_000_000n;
 const DEPOSIT = 500_000n;
 const WITHDRAW = 1_000n;
 const BOUND = 1_000_000n;
@@ -427,6 +435,7 @@ const phases = {
     // Beyond the mainnet steps: a bound for the non-sufficient asset the suite also deposits.
     const contract = drive.contractOf(api, ctx.abi);
     await drive.callContract(api, contract, ctx.accounts.admin, 'setWithdrawalBound', [ASSET2, { amount: BOUND.toString(), period: BOUND_PERIOD }], `set_withdrawal_bound ${JSON.stringify(ASSET2)}`);
+    await drive.callContract(api, contract, ctx.accounts.admin, 'setWithdrawalBound', [ASSET_BUSDC, { amount: BUSDC_BOUND.toString(), period: BOUND_PERIOD }], `set_withdrawal_bound ${JSON.stringify(ASSET_BUSDC)}`);
     record('scenarios', 'deploy through the contracts store with the mainnet steps', 'pass', `${communityExisted ? 'community existed' : 'community registered first'}; then ${mainnetSteps.join(', ')}`);
     report.deploy = {
       appId: drive.state.appId,

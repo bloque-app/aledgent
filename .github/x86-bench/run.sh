@@ -568,7 +568,7 @@ EOF
       local selfh
       selfh=$(find "$W/target/shard/riscv64em-vos/release" -maxdepth 1 -name 'aledgent_shard*.elf' | head -n 1)
       [ -n "$selfh" ] || selfh=$W/target/shard/riscv64em-vos/release/aledgent_shard
-      "$H" package "$selfh" "$OUT/core/shard.vos"
+      "$H" package "$selfh" "$OUT/core/shard.vos" --no-generation
       done_
     fi
     # The runtime profiles the shard Agents, or the core Agent of a stress run (F-032's gate on

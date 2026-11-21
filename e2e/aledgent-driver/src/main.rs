@@ -91,6 +91,16 @@ const BOOK_ONLY: &str = "BKO";
 const BOOK_ONLY_INDEX: u32 = 3;
 const BOOK_ONLY_ISSUED: u64 = 12_345;
 const BOOK_ONLY_MOVED: u64 = 2_345;
+/// Production's first chain-bound asset (stress gates 5 and 5b, F-032): its id, its location on the
+/// suite's Kreivo (`e2e/network`), what the book issues of it before the binding (50 BUSDC, at 6
+/// decimals), and what each withdrawal of it takes (0.01 BUSDC).
+const BUSDC: &str = "BUSDC";
+// `Here(101)`, as production binds BUSDC, not one of the small test indexes (`TSTA` and the
+// stress world's other assets are book-only and have no location).
+const BUSDC_INDEX: u32 = 101;
+/// Keep `BUSDC_BOUND` in contracts/settlement/scripts/e2e.mjs at or above this.
+const BUSDC_ISSUED: u64 = 50_000_000;
+const BUSDC_WITHDRAW: u64 = 10_000;
 /// What each fault case's withdrawal takes.
 const FAULT_WITHDRAW: u64 = 100;
 /// What each fault case's deposit brings.
@@ -202,9 +212,20 @@ async fn patient_withdrawal(
     amount: u64,
     to: [u8; 32],
 ) -> Result<String, String> {
+    patient_withdrawal_of(d, party, USD, amount, to).await
+}
+
+/// [`patient_withdrawal`] of `asset`.
+async fn patient_withdrawal_of(
+    d: &Deployment,
+    party: &Party,
+    asset: &str,
+    amount: u64,
+    to: [u8; 32],
+) -> Result<String, String> {
     let start = Instant::now();
     loop {
-        match withdrawal(d, party, amount, to).await {
+        match withdrawal_of(d, party, asset, amount, to).await {
             Err(e)
                 if e.contains("ERR-SettlementLayerUnavailable")
                     && start.elapsed() < Duration::from_secs(120) =>
@@ -224,6 +245,17 @@ async fn withdrawal(
     amount: u64,
     to: [u8; 32],
 ) -> Result<String, String> {
+    withdrawal_of(d, party, USD, amount, to).await
+}
+
+/// [`withdrawal`] of `asset`.
+async fn withdrawal_of(
+    d: &Deployment,
+    party: &Party,
+    asset: &str,
+    amount: u64,
+    to: [u8; 32],
+) -> Result<String, String> {
     // A client key of its own for each: two withdrawals of the same amount under one key are one
     // operation (`REQ-OP-10`).
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -239,7 +271,7 @@ async fn withdrawal(
             "/v1/withdrawals",
             Some(&party.token),
             &[("client-key", key.as_str())],
-            Some(json!({ "payer": party.account, "asset": USD, "amount": amount.to_string() })),
+            Some(json!({ "payer": party.account, "asset": asset, "amount": amount.to_string() })),
         )
         .await;
     if !s.is_success() {
@@ -410,10 +442,15 @@ impl Ctx {
     }
 
     fn expect_withdrawn(&self, op: &str, amount: u64) {
+        self.expect_withdrawn_at(op, 1, amount);
+    }
+
+    /// [`Ctx::expect_withdrawn`] of the asset at `Here(index)`.
+    fn expect_withdrawn_at(&self, op: &str, index: u32, amount: u64) {
         push_expect(
             &self.out,
             json!({ "kind": "Withdrawn", "operationRef": op_ref(op),
-            "to": format!("0x{}", hex::encode(PAYEE)), "asset": { "Here": 1 },
+            "to": format!("0x{}", hex::encode(PAYEE)), "asset": { "Here": index },
             "amount": amount.to_string() }),
         );
     }
@@ -433,6 +470,11 @@ impl Ctx {
         patient_withdrawal(&self.d, &self.alice, amount, PAYEE).await
     }
 
+    /// [`Ctx::withdraw`] of `asset`.
+    async fn withdraw_of(&self, asset: &str, amount: u64) -> Result<String, String> {
+        patient_withdrawal_of(&self.d, &self.alice, asset, amount, PAYEE).await
+    }
+
     async fn settled(&self, op: &str, limit: Duration) -> Result<(), String> {
         until_state(&self.d, &self.alice, op, "Settled", limit).await
     }
@@ -447,11 +489,18 @@ impl Ctx {
             Duration::from_millis(100),
             || async move {
                 let s = state(d, p, op).await;
-                (s == "Settled").then_some(s)
+                // A withdrawal the layer refused is `Released`: nothing more will happen to it.
+                (s == "Settled" || s == "Released").then_some(s)
             },
         )
         .await
-        .map(|_| ())
+        .and_then(|s| {
+            if s == "Settled" {
+                Ok(())
+            } else {
+                Err(format!("{op} ended {s}, not Settled"))
+            }
+        })
     }
 }
 
@@ -629,59 +678,319 @@ async fn stress_with_settlement(cx: &mut Ctx, phases: &str, out: &Path) -> Resul
         }
     };
     let cxr = &*cx;
+    // Gate 5b: `BUSDC` is registered, issued and bound on the suite's Kreivo while the book is
+    // under load. Once it is bound, the withdrawals below are of it (gate 5): until then, of `USD`.
+    let bound = Arc::new(AtomicBool::new(false));
+    let binding = {
+        let bound = Arc::clone(&bound);
+        async move {
+            // Let the population form first, and the load reach its first phase.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let r = bind_busdc_under_load(cxr, &bound).await;
+            if let Err(e) = &r {
+                say(format!("the BUSDC binding under load failed: {e}"));
+            }
+            r
+        }
+    };
     let withdrawals = async {
         let mut latencies: Vec<Value> = Vec::new();
         // Let the population form first.
         tokio::time::sleep(Duration::from_secs(30)).await;
         while !done.load(Ordering::Relaxed) {
             let t = Instant::now();
+            let busdc = bound.load(Ordering::Relaxed);
+            let (asset, index, amount) = if busdc {
+                (BUSDC, BUSDC_INDEX, BUSDC_WITHDRAW)
+            } else {
+                (USD, 1, FAULT_WITHDRAW)
+            };
             // Wall-clock marks (`NFR-15`): read against the adapter's log and the chain clock.
             let requested_at = epoch_ms();
-            match cxr.withdraw(FAULT_WITHDRAW).await {
+            match cxr.withdraw_of(asset, amount).await {
                 Ok(op) => {
                     let submitted_at = epoch_ms();
                     match cxr.settled_promptly(&op, AFTER_FAULT).await {
                         Ok(()) => {
-                            cxr.expect_withdrawn(&op, FAULT_WITHDRAW);
+                            cxr.expect_withdrawn_at(&op, index, amount);
                             latencies.push(json!({
                                 "operation": op,
+                                "asset": asset,
                                 "settled_ms": t.elapsed().as_millis() as u64,
                                 "requested_at": requested_at,
                                 "submitted_at": submitted_at,
                                 "settled_at": epoch_ms(),
                             }));
                         }
-                        Err(e) => latencies.push(json!({ "operation": op, "error": e })),
+                        Err(e) => {
+                            // What the operation is, and what the core holds against the
+                            // settlement, for whoever reads the run.
+                            let diagnosis = diagnose_operation(cxr, &op).await;
+                            say(format!("{op} did not settle: {e}; {diagnosis}"));
+                            latencies.push(json!({ "operation": op, "asset": asset, "error": e,
+                                                   "diagnosis": diagnosis }));
+                        }
                     }
                 }
-                Err(e) => latencies.push(json!({ "error": e })),
+                Err(e) => latencies.push(json!({ "asset": asset, "error": e })),
             }
             tokio::time::sleep(Duration::from_secs(20)).await;
         }
         latencies
     };
-    let (r, latencies) = tokio::join!(load, withdrawals);
-    let settled: Vec<u64> = latencies
-        .iter()
-        .filter_map(|l| l["settled_ms"].as_u64())
-        .collect();
+    let (r, latencies, binding) = tokio::join!(load, withdrawals, binding);
+    let settled_of = |asset: &str| -> Vec<u64> {
+        latencies
+            .iter()
+            .filter(|l| l["asset"] == asset)
+            .filter_map(|l| l["settled_ms"].as_u64())
+            .collect()
+    };
+    let (settled_busdc, settled_usd) = (settled_of(BUSDC), settled_of(USD));
+    let settled: Vec<u64> = [settled_busdc.clone(), settled_usd.clone()].concat();
+    let binding_note = binding.as_ref().cloned().unwrap_or(Value::Null);
     std::fs::create_dir_all(out).ok();
     std::fs::write(
         out.join("withdrawals.json"),
         serde_json::to_string_pretty(&json!({
             "withdrawals": latencies,
             "settled_ms": stress::record::percentiles(settled.clone()),
+            "settled_ms_busdc": stress::record::percentiles(settled_busdc.clone()),
+            "settled_ms_usd": stress::record::percentiles(settled_usd),
+            "busdc_binding": binding_note,
         }))
         .unwrap_or_default(),
     )
     .ok();
     r?;
+    let binding = binding?;
+    // A withdrawal that was refused or did not settle fails the run: the gate must not pass on the
+    // rows that happened to settle.
+    let failed: Vec<&Value> = latencies
+        .iter()
+        .filter(|l| l.get("error").is_some())
+        .collect();
+    if !failed.is_empty() {
+        return Err(format!(
+            "{} of {} withdrawals did not settle (see withdrawals.json): {}",
+            failed.len(),
+            latencies.len(),
+            failed
+                .iter()
+                .take(3)
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+    if settled_busdc.is_empty() {
+        return Err("no BUSDC withdrawal settled after the binding".into());
+    }
+    // After the load: a checkpoint covering every withdrawal and the binding, compared at zero
+    // difference on every asset, `BUSDC` included (`NFR-9`'s third axis).
+    let compared = busdc_compared_at_zero(cxr).await?;
     Ok(format!(
-        "{} withdrawals settled under load of {} tried; settled_ms {}",
+        "{} withdrawals settled under load of {} tried ({} of BUSDC); settled_ms {}; BUSDC settled_ms {}; \
+         BUSDC binding {}; {compared}",
         settled.len(),
         latencies.len(),
-        stress::record::percentiles(settled)
+        settled_busdc.len(),
+        stress::record::percentiles(settled),
+        stress::record::percentiles(settled_busdc),
+        binding
     ))
+}
+
+/// `id` as the book's asset id.
+fn asset_id(id: &str) -> Result<ledger_core::asset::AssetId, String> {
+    ledger_core::asset::AssetId::parse(id).map_err(|e| format!("asset {id}: {e:?}"))
+}
+
+/// An operation as ingress shows it to alice, and the last incidents the core holds.
+async fn diagnose_operation(cx: &Ctx, op: &str) -> Value {
+    let (status, body) =
+        cx.d.call(
+            "GET",
+            &format!("/v1/operations/{op}"),
+            Some(&cx.alice.token),
+            &[],
+            None,
+        )
+        .await;
+    let incidents: Vec<String> =
+        cx.d.core
+            .with_ledger(|l| {
+                let all = l.state().settlement().incidents();
+                let skip = all.len().saturating_sub(10);
+                all.iter().skip(skip).map(|i| format!("{i:?}")).collect()
+            })
+            .unwrap_or_default();
+    // The layer's own words for each record that names the operation: a refusal's payload is
+    // the contract's reason.
+    let records: Vec<Value> = OperationId::parse(op)
+        .ok()
+        .and_then(|id| {
+            cx.d.core.with_ledger(|l| {
+                l.state()
+                    .settlement()
+                    .naming(&id)
+                    .map(|r| {
+                        let bytes = &r.observation.payload.0;
+                        json!({ "kind": format!("{:?}", r.observation.kind),
+                                "standing": format!("{:?}", r.standing),
+                                "payload_hex": hex::encode(bytes),
+                                "payload_text": String::from_utf8_lossy(bytes) })
+                    })
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
+    json!({ "status": status.as_u16(), "operation": body, "last_incidents": incidents,
+            "records": records })
+}
+
+/// Gate 5b (F-032, `F-029`, amendment 0011): bind `BUSDC`, production's first chain-bound asset,
+/// on the suite's Kreivo while the book is under load. Registered book-only at 6 decimals,
+/// issued to alice, the issuer puts exactly the book's outstanding balance in the contract's
+/// account and asks for the binding; the contract records it at zero divergence and, once that is
+/// final, `BUSDC` is bound. Sets `bound` then, so that the withdrawals that go on are of it.
+/// Returns the times of each step, in milliseconds.
+async fn bind_busdc_under_load(
+    cx: &Ctx,
+    bound: &std::sync::atomic::AtomicBool,
+) -> Result<Value, String> {
+    let d = &cx.d;
+    let started = Instant::now();
+    let alice = cx.alice.account.clone().unwrap_or_default();
+    operator_call(
+        d,
+        "/v1/ops/assets",
+        "busdc-register",
+        json!({ "id": BUSDC, "precision": 6, "kind": "stable", "review": "b0".repeat(32),
+                "justification": "e2e: BUSDC/6, book-only" }),
+    )
+    .await?;
+    let (s, v) = d
+        .call(
+            "POST",
+            "/v1/grants",
+            Some(&d.operator.token),
+            &[],
+            Some(json!({
+                "kind": "issuance", "principal": d.operator.identity,
+                "subject": { "asset": BUSDC }, "ops": ["issue", "redeem"],
+                "per_window": { "length": 86_400_000u64, "limit": "1000000000000" },
+                "assets": [BUSDC],
+            })),
+        )
+        .await;
+    if s.as_u16() != 200 {
+        return Err(format!("BUSDC issuance grant: {s} {v}"));
+    }
+    operator_call(
+        d,
+        "/v1/issuances",
+        "busdc-issue",
+        json!({ "asset": BUSDC, "destination": alice, "amount": BUSDC_ISSUED.to_string() }),
+    )
+    .await?;
+    let funded = fund_contract(&cx.contract, BUSDC_INDEX, BUSDC_ISSUED).await?;
+    say(format!(
+        "BUSDC: registered book-only, {BUSDC_ISSUED} issued, the issuer put them in the contract: {funded}"
+    ));
+    let prepared_ms = started.elapsed().as_millis() as u64;
+
+    let asked_at = epoch_ms();
+    let t = Instant::now();
+    let accepted = operator_call(
+        d,
+        &format!("/v1/ops/assets/{BUSDC}/bind"),
+        "busdc-bind",
+        json!({ "location": format!("Here({BUSDC_INDEX})"), "justification": "e2e: bind BUSDC under load" }),
+    )
+    .await?;
+    let accepted_ms = t.elapsed().as_millis() as u64;
+    say(format!("BUSDC binding asked under load: {accepted}"));
+    wait_every(
+        "BUSDC binding final",
+        PATIENT,
+        Duration::from_millis(250),
+        || async { (binding_of(d, BUSDC).await == "bound").then(|| "bound".to_owned()) },
+    )
+    .await?;
+    let bound_ms = t.elapsed().as_millis() as u64;
+    let busdc = asset_id(BUSDC)?;
+    let recorded = d
+        .core
+        .with_ledger(|l| l.state().settlement().asset_bind(&busdc).copied())
+        .flatten()
+        .ok_or("no BUSDC binding recorded")?;
+    if recorded.amount.get() != BUSDC_ISSUED {
+        return Err(format!(
+            "BUSDC bound at {}, expected {BUSDC_ISSUED}",
+            recorded.amount.get()
+        ));
+    }
+    push_expect(
+        &cx.out,
+        json!({ "kind": "Bound", "operationRef": format!("0x{}", hex::encode(chain_ref(&recorded.reference))),
+                "asset": { "Here": BUSDC_INDEX }, "amount": BUSDC_ISSUED.to_string() }),
+    );
+    bound.store(true, std::sync::atomic::Ordering::Relaxed);
+    say(format!(
+        "BUSDC bound at zero divergence under load: {} ({bound_ms} ms from the request)",
+        recorded.amount.get()
+    ));
+    Ok(json!({
+        "asked_at": asked_at,
+        "prepared_ms": prepared_ms,
+        "accepted_ms": accepted_ms,
+        "bound_ms": bound_ms,
+        "amount": recorded.amount.get(),
+    }))
+}
+
+/// After scenario c's load: the next checkpoint, final, and a settlement comparison at its cut
+/// with `BUSDC` and every other asset at zero difference.
+async fn busdc_compared_at_zero(cx: &Ctx) -> Result<String, String> {
+    let d = &cx.d;
+    let before = d
+        .core
+        .with_ledger(|l| l.state().anchoring().latest_final().map(|c| c.number))
+        .flatten()
+        .unwrap_or(0);
+    d.pass(ANCHOR_INTERVAL_MS, PATIENCE)
+        .await
+        .map_err(|why| format!("the core did not tick: {why}"))?;
+    wait("a checkpoint after the load", PATIENT, || async move {
+        d.core
+            .with_ledger(|l| l.state().anchoring().latest_final().map(|c| c.number))
+            .flatten()
+            .filter(|n| *n > before)
+            .map(|n| format!("checkpoint {n} is final"))
+    })
+    .await?;
+    let asset = asset_id(BUSDC)?;
+    let compared = wait(
+        "a comparison with BUSDC at zero difference",
+        PATIENT,
+        || async move {
+            d.core
+                .with_ledger(|l| {
+                    l.state().anchoring().latest_comparison().and_then(|c| {
+                        // Taken for a checkpoint made after `before`, not left from an earlier
+                        // one: it must name a final checkpoint numbered above it.
+                        c.anchors.iter().any(|n| *n > before).then_some(())?;
+                        let row = c.rows.iter().find(|r| r.asset == asset)?;
+                        (row.difference() == 0 && c.rows.iter().all(|r| r.difference() == 0))
+                            .then(|| format!("cut {}: {:?}", c.cut, row))
+                    })
+                })
+                .flatten()
+        },
+    )
+    .await?;
+    Ok(format!("zero divergence after the load: {compared}"))
 }
 
 /// Step 3 through aledgent: a deposit with an account reference, credited at finality; a
@@ -984,17 +1293,10 @@ async fn book_only(cx: &mut Ctx) -> Result<(), String> {
         (binding_of(&cx.d, BOOK_ONLY).await == "bound").then(|| "bound".to_owned())
     })
     .await?;
+    let bko = asset_id(BOOK_ONLY)?;
     let bound =
         cx.d.core
-            .with_ledger(|l| {
-                l.state()
-                    .settlement()
-                    .asset_bind(
-                        &ledger_core::asset::AssetId::parse(BOOK_ONLY)
-                            .unwrap_or_else(|_| unreachable!()),
-                    )
-                    .copied()
-            })
+            .with_ledger(|l| l.state().settlement().asset_bind(&bko).copied())
             .flatten()
             .ok_or("no binding recorded")?;
     if bound.amount.get() != BOOK_ONLY_ISSUED {
@@ -1035,7 +1337,7 @@ async fn book_only(cx: &mut Ctx) -> Result<(), String> {
         },
     )
     .await?;
-    let asset = ledger_core::asset::AssetId::parse(BOOK_ONLY).unwrap_or_else(|_| unreachable!());
+    let asset = asset_id(BOOK_ONLY)?;
     let compared = wait(
         "a comparison with BKO at zero difference",
         PATIENT,
@@ -1043,6 +1345,9 @@ async fn book_only(cx: &mut Ctx) -> Result<(), String> {
             d.core
                 .with_ledger(|l| {
                     l.state().anchoring().latest_comparison().and_then(|c| {
+                        // Taken for a checkpoint made after `before`, not left from an earlier
+                        // one: it must name a final checkpoint numbered above it.
+                        c.anchors.iter().any(|n| *n > before).then_some(())?;
                         let row = c.rows.iter().find(|r| r.asset == asset)?;
                         (row.difference() == 0 && c.rows.iter().all(|r| r.difference() == 0))
                             .then(|| format!("cut {}: {:?}", c.cut, row))

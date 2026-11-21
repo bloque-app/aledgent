@@ -72,6 +72,14 @@ jobs:
         with:
           persist-credentials: false
       - run: python3 tools/release/check-config.py
+      # `aledgent-core-host package --no-generation` is for the stress suite's shard Agents only: a
+      # core package without its code generation record has no fence. Never in a deployment or the
+      # core's release.
+      - name: no --no-generation outside the stress build
+        run: |
+          if grep -rn -- '--no-generation' deploy .github/workflows/core-release.yml; then
+            echo "::error::--no-generation must not be used for the core"; exit 1
+          fi
 
   semver:
     name: semver (public API)
