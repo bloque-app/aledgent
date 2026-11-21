@@ -1,0 +1,51 @@
+---
+title: Core restarts and host rolls
+description: When the core reopens its replica in a fraction of a second, when it rebuilds from genesis, and how to plan a roll.
+sidebar:
+  order: 5
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Cites `REQ-CS-7`, `REQ-RT-3`, `INV-6`, `NFR-4`, `F-031`.
+
+The core host keeps a replica of the book on its disk and streams every decision to an off-node archive.
+How long a restart takes depends on whether it can keep that replica
+([T-031-25](https://github.com/bloque-app/aledgent/blob/develop/features/F-031-core-throughput/tasks.md)).
+
+## A clean stop keeps the replica
+
+Stopped with `SIGTERM` or `SIGINT`, the core host stops taking inputs, makes its stores durable and
+records where it stopped. The next start reopens the stores where they are and checks that the replica,
+the record and the host's log all stand at the same input, log hash and roots. Then it serves, without
+replaying anything.
+
+Commands keep arriving meanwhile: ingress acknowledges value-moving commands and holds the rest
+(`REQ-CS-7`; see [While the core is away](../../integrate/core-away/)).
+
+## Anything else rebuilds from genesis
+
+- an unclean stop (a crash, `SIGKILL`, a lost node);
+- a reopen check that fails (no record, a stale one, a store that does not reach its roots);
+- a host that keeps nothing across starts (a fresh container with no persistent volume).
+
+Then the host replays the archive from genesis, deciding every past input again. That takes time in
+proportion to the book's history. **Plan the window from your own archive's replay time**, measured on
+your own book, not guessed.
+
+<Aside type="caution" title="Give the replica a persistent volume">
+A core host whose state directory is not on a volume that survives the restart rebuilds on every start.
+That turns every routine restart into the long case above.
+</Aside>
+
+## Rolling a host to a new build
+
+A reopened replica is not re-checked against the new build's code: only a replay decides every past input
+again. So, before you roll:
+
+1. **Replay the archive with the new host build**, on a separate machine, and check that it reaches the
+   same state.
+2. Stop the old host cleanly, so the replica is kept.
+3. Start the new host on the same state directory.
+
+If step 1 disagrees, do not roll: the new build decides some past input differently.

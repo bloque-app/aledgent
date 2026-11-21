@@ -1,0 +1,16 @@
+---
+// Wraps Starlight's own content wrapper. On a guide page, every identifier written in inline code is linked
+// to its definition, and one nothing defines fails the build (lib/id-links.mjs). The documents specsite
+// publishes (SPEC, PLAN, OVERVIEW) are linked by specsite, and the API reference has none.
+import Default from '@astrojs/starlight/components/MarkdownContent.astro';
+import { linkIds } from '../../lib/id-links.mjs';
+import { specsiteSlugs } from '../../lib/specsite-options.mjs';
+import index from '../../.generated/id-index.json';
+
+const { id } = Astro.locals.starlightRoute;
+const top = id.split('/')[0];
+const guide = !specsiteSlugs.includes(top) && top !== 'api';
+const html = guide ? linkIds(await Astro.slots.render('default'), { base: import.meta.env.BASE_URL, page: id || 'index', index }) : '';
+---
+
+{guide ? <Default><Fragment set:html={html} /></Default> : <Default><slot /></Default>}

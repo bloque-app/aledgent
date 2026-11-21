@@ -42,14 +42,34 @@ pages are relative (`../../concepts/operation-lifecycle/`), so they work under a
 site/
   astro.config.mjs          Starlight, the sidebar, the OpenAPI plugin, fonts, component overrides
   src/content.config.ts     The docs collection; adds `kicker` and `status` for the landing hero
-  src/content/docs/         Pages. Folder = sidebar group (start/, concepts/, operate/)
-  src/components/           Hero (override), Footer (wraps Starlight's), Concept, Bounds
+  src/content/docs/         Pages. Folder = sidebar group (start/, concepts/, integrate/, operate/)
+  src/content/docs/errors/  The error catalogue, generated at every build (gitignored)
+  src/data/error-actions.md What the caller does about each ERR-*: the catalogue's hand-written half
+  src/components/           Hero, MarkdownContent (overrides), Footer (wraps Starlight's), Concept, Bounds
+  lib/                      Build-time checks and generators (below)
   src/styles/theme.css      Bloque's tokens mapped onto Starlight's custom properties
   screenshots/              Light and dark captures of the prototype, for review
 ```
 
 English only for now. The root locale is English (`locales.root` in `astro.config.mjs`). Adding a
 language is one more entry there and a folder `src/content/docs/<lang>/` mirroring the root.
+
+## Checks
+
+`npm run build` fails on any of these, and the docs workflow runs it on every change to the site, to
+`services/ingress/openapi.json`, and to `SPEC.md`, `PLAN.md` and `OVERVIEW.md`:
+
+- **specsite's strict identifiers** (`check: 'error'`) in the documents it renders.
+- **The error catalogue** (`lib/errors.mjs`): one page per `ERR-*` of `SPEC.md` §10, joined with its HTTP
+  status from the OpenAPI document and its action from `src/data/error-actions.md`. A condition missing
+  from any of the three, or an OpenAPI description that differs from §10, fails the build.
+  `npm run check:errors` runs the same check without building.
+- **Identifiers in guide pages** (`lib/id-links.mjs`, through `src/components/MarkdownContent.astro`): an
+  identifier in inline code links to its definition (an `ERR-*` to its catalogue page), and one nothing in
+  `SPEC.md` or `PLAN.md` defines fails the build. Task ids (`T-*`) live in `features/`, so cite them as
+  links to the tasks file.
+- **Internal links** (`lib/check-links.mjs`, after the build): every link to another page of the site, and
+  its fragment, must resolve.
 
 ## API reference
 
