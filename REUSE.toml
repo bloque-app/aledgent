@@ -33,6 +33,9 @@ path = [
   "spikes/guest/**",
   "spikes/vos-host/**",
   "spikes/vos-external/**",
+  "spikes/vos-core/guest/**",
+  "spikes/vos-core/host/**",
+  "spikes/vos-core/patches/vos-measure.patch",
   ".github/x86-bench/core-host-backends.patch",
 ]
 precedence = "aggregate"

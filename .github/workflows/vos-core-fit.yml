@@ -1,0 +1,92 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+name: vos-core fit spike (W2, gate G1)
+
+# The vos-core migration plan's W2: the core's actor shell on vos-core, measured on x86-64 Linux
+# with the recompiler (spikes/vos-core/run.sh). A spike: it runs on pushes to its own branch only,
+# and by hand. Never on main or develop. It runs on the host, not in a container: the recompiler
+# needs userfaultfd write-protect (Linux 6.7 or later), which default container seccomp profiles
+# deny, and vos-core falls back to the interpreter silently when it cannot have it (rutent G-36);
+# the run asks for the recompiler explicitly (VOS_PVM_BACKEND=recompiler), so a fallback fails.
+on:
+  push:
+    branches: [spike/vos-core-fit-g1]
+    paths: [spikes/vos-core/**, .github/workflows/vos-core-fit.yml]
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "ubuntu-latest (GitHub-hosted) or zombienet (the self-hosted fleet)"
+        type: choice
+        options: [ubuntu-latest, zombienet]
+        default: ubuntu-latest
+      stacks:
+        description: "stack floors, bytes"
+        type: string
+        default: "98304"
+      n:
+        description: "operations a workload"
+        type: string
+        default: "40"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vos-core-fit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fit:
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: host facts
+        run: |
+          uname -a
+          grep -m1 'model name' /proc/cpuinfo
+          nproc; free -h; df -h .
+          cat /proc/sys/vm/unprivileged_userfaultfd || true
+          cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || true
+
+      - name: toolchains
+        run: |
+          set -eu
+          if ! command -v rustup >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH=$HOME/.cargo/bin:$PATH
+          fi
+          rustup toolchain install nightly-2026-03-20 --profile minimal -c rust-src
+          rustup toolchain install nightly-2025-07-14 --profile minimal
+          rustup toolchain install stable --profile minimal
+
+      - name: allow userfaultfd for the recompiler (GitHub-hosted VM only)
+        if: (inputs.runner || 'ubuntu-latest') == 'ubuntu-latest'
+        run: |
+          # The hosted VM is this job's alone. Only when unprivileged userfaultfd is off.
+          if [ "$(cat /proc/sys/vm/unprivileged_userfaultfd)" = 0 ]; then
+            sudo sysctl -w vm.unprivileged_userfaultfd=1
+          fi
+
+      - name: run
+        env:
+          STACKS: ${{ inputs.stacks || '98304' }}
+          N: ${{ inputs.n || '40' }}
+          CONFORMANCE: "1"
+        run: |
+          OUT=$RUNNER_TEMP/vos-core-fit
+          echo "OUT=$OUT" >> "$GITHUB_ENV"
+          spikes/vos-core/run.sh "$OUT"
+
+      - name: summary
+        if: always()
+        run: if [ -f "$OUT/summary.md" ]; then cat "$OUT/summary.md" >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vos-core-fit-${{ github.run_id }}
+          path: ${{ env.OUT }}
+          if-no-files-found: warn

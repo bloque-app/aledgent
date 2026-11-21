@@ -1,0 +1,5 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# vos-core's workspace toolchain (rust-toolchain.toml at 1650c474).
+[toolchain]
+channel = "nightly-2025-07-14"
