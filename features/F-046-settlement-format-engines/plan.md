@@ -133,7 +133,20 @@ metadata lists. The runtime updater already reloads the metadata when the runtim
 - the values the adapter chooses for each extension;
 - what a signature covers beyond the standard signed payload (the PASS message order, while that form
   exists);
-- the contract's ABI.
+- the contract's ABI;
+- Kreivo's own transaction extensions. `PassAuthenticate` (encoded `None`), the fee asset's
+  `ChargeAssetTxPayment`, and wrappers such as `DynamicMaxBlockWeight` that carry no data stay
+  hand-written, as the engine's own implementations of subxt's `TransactionExtension` trait. Each one's
+  value is fixed by the engine and its type is checked by the fingerprint. Only the standard Substrate
+  extensions (the spec and transaction versions, genesis, the era, the nonce) use subxt's built-in
+  implementations.
+
+**Why this is safe only with an order-sensitive fingerprint.** subxt matches a composite's fields by
+name. Its validation hash (`subxt_metadata::utils::validation`) combines them with an XOR and so ignores
+their order. That is why `chain::surface` (`services/settle/src/chain/surface.rs:16-21`) rejected subxt's
+hash for the positional encoder. Encoding by name from live metadata puts the fields in the order the
+metadata gives, but nothing in subxt notices that the order changed. What keeps an engine from signing a
+reordered type it was never pinned against is the fingerprint, which stays sensitive to order.
 
 This makes engines smaller. It does not make a single engine accept more runtimes. The fingerprint stays
 strict and sensitive to order, so a field reordered under a dynamically encoded call is still a new
@@ -171,7 +184,9 @@ designed here.
    head every era is already born at (`T-027-08`). Between the upgrade's inclusion in the best chain and
    its finality (about 16 blocks at mainnet's median finality lag), nothing new is signed: a transaction
    signed for the old runtime would fail at the new best head, and an upgrade not yet final can still be
-   reorganised away. Stored transactions are still broadcast again (§7). *Today the adapter reads the
+   reorganised away. Stored transactions are still broadcast again (§7). Those signed for the old
+   runtime are rejected at the new best head (their `spec_version` is in their implicit data). That is
+   expected: they are not re-signed, and they end as their era ends (§7). *Today the adapter reads the
    runtime at the best head (`RpcChain::runtime`). This is the one behaviour this feature changes in what
    is already built.*
 4. **If no engine fits at enactment** (the release did not ship in time, or an upgrade came without
@@ -211,7 +226,7 @@ A release shipped before enactment replaces a running adapter. Taken one at a ti
 - **A transaction signed for the old runtime and not included before enactment is never re-signed.**
   The old `spec_version` is part of its implicit data, so the new runtime rejects it. Its era ends with
   its key's nonce unspent (`NotExecuted::EraEnded`). Once the finalized head passes the instruction's
-  expiry, the core releases it on both proofs: the inbox shows it was not included, and the nonce was
+  expiry, the core releases it on **both proofs**: the inbox shows it was not included, and the nonce was
   not consumed. `services/settle/tests/contract.rs:644`
   (`t_027_07_a_batch_in_flight_across_the_upgrade_is_released_on_both_proofs`) shows this for
   132 → 133. The user gets the funds back as available, and the withdrawal has to be requested again.
@@ -221,14 +236,17 @@ A release shipped before enactment replaces a running adapter. Taken one at a ti
   acknowledged, unsigned instruction when no era can end before its expiry. It first stores
   `NotExecuted::NeverSigned`, then records `SigningRecord::NeverSigned` with the core
   (`adapter.rs:4062-4074`). From then on the core refuses any signing for it (`record_signing`,
-  `crates/ledger-core/src/ledger/settlement.rs:849-850`). The core's proof reads a never-signed
-  instruction as not included (`settlement.rs:1850-1853`), provided the finalized inbox is complete over
-  its range with no gap (`settlement.rs:1838-1847`: a gap makes it unprovable, an incomplete range waits).
+  `crates/ledger-core/src/ledger/settlement.rs:849-850`). For a never-signed instruction there is no
+  nonce to check, so the release rests on **non-inclusion proven**: the inbox, plus the tombstone the
+  core holds (`settlement.rs:1851-1855`). That holds only if the finalized inbox is complete over the
+  range, and only if no gap lies within it or, on a chained book, starts below it
+  (`settlement.rs:1838`: `gap_within(from, to) || (chained() && gap_starts_below(from))`, which makes it
+  unprovable; an incomplete range waits, `:1845-1847`).
   `dispose` then moves the operation `Submitted` → `Expired` once the finalized head is at
   or past the expiry, then `NonInclusionProven`, and releases the reservation (`CHOSEN.release`,
   `settlement.rs:1888-1941`). If the kernel refuses that release, the transitions that move no value are
-  kept and the operation is queued for review (`settlement.rs:1956-1970`). If the inbox shows a gap over
-  its range, the operation reaches `Needs-Review` through `NonInclusionUnprovable` instead
+  kept and the operation is queued for review (`settlement.rs:1956-1970`). If the inbox shows such a gap,
+  the operation reaches `Needs-Review` through `NonInclusionUnprovable` instead
   (`settlement.rs:1909-1911`), and nothing is released on a timer (`REQ-OP-9`).
   `services/settle/tests/flow.rs:1136`
   (`ac_e1_4_an_instruction_that_can_no_longer_be_signed_is_tombstoned_and_released`) ends `Released`
@@ -254,6 +272,12 @@ therefore safe.
 - **Signing pauses for every upgrade's finality lag**, even one that keeps the format. That is about
   half a minute on mainnet, against the risk of signing for a runtime that a reorganisation takes away.
   Withdrawals instructed in that window wait. Their expiry is about five minutes, so they are not lost.
+- **Leaving `transaction_version` out of the native fingerprint gives up a guard.** A runtime change
+  that alters what a transaction means without changing any shape the fingerprint reads no longer stops
+  the adapter at the fingerprint. Kreivo would have marked such a change by bumping `transaction_version`.
+  Only the layer's confirmation stands in front of it then (§3, `F-027` decision 47). The confirmation
+  catches what validation checks: the signature over the payload, the implicit data, a call that does not
+  decode. It does not catch what the runtime checks only at dispatch.
 - **Withdrawals signed just before enactment and not yet included are released, not retried.** Each
   operation gets one transaction (`F-016`, the ruling of 2026-09-24), and that rule is not reopened here.
   The user requests the withdrawal again.
