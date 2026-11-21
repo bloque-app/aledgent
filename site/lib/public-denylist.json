@@ -122,18 +122,19 @@
     {
       "id": "operator-access-tooling",
       "why": "The commands an operator's own people run to reach its secrets and accounts are internal tooling",
-      "regex": "\\bsecurity\\s+find-generic-password\\b|\\baws\\s+secretsmanager\\s+get-secret-value\\b|\\bgcloud\\s+secrets\\s+versions\\s+access\\b|\\baws\\s+sso\\s+login\\b|--profile[ =][A-Za-z0-9_-]+|~/\\.aws/|~/\\.ssh/",
+      "regex": "\\bsecurity\\s+find-generic-password\\b|\\baws\\s+secretsmanager\\s+get-secret-value\\b|\\bgcloud\\s+secrets\\s+versions\\s+access\\b|\\baws\\s+sso\\s+login\\b|\\baws\\b[^\\n]*?--profile[ =][A-Za-z0-9_-]+|~/\\.aws/|~/\\.ssh/",
       "flags": "",
       "examples": [
         "security find-generic-password -s example",
         "aws secretsmanager get-secret-value --secret-id x",
         "aws sso login",
-        "--profile example",
+        "aws s3 ls --profile example",
         "~/.aws/config"
       ],
       "not": [
         "aledgent-signer public signer.json clerk",
-        "opsctl exporter --config exporter.toml"
+        "opsctl exporter --config exporter.toml",
+        "docker compose --profile green up -d --wait"
       ]
     },
     {
