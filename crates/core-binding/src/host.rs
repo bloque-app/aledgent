@@ -329,6 +329,11 @@ pub struct Kept {
     /// The records after it, not yet shipped, each in its canonical encoding, hex: the audit
     /// chain is not in the replica's stores.
     pub audit_outbox: Vec<String>,
+    /// A manifest whose outbox was over [`manifest::OUTBOX_MAX`] records holds none of them, and
+    /// says how many it left out (`T-031-26`): it is reopened only once the audit store holds them
+    /// all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_outbox_omitted: Option<u64>,
     /// A replica manifest's own part ([`Kept::MANIFEST`], `T-031-26`): none in a record a clean
     /// stop writes, which keeps T-031-25's layout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -405,19 +410,24 @@ impl ReplicaStores {
     /// Record where the replica stands, after its stores were made durable (`T-031-25`): written
     /// whole or not at all (a temporary file, synced, renamed, and the directory synced).
     pub fn write_kept(&self, kept: &Kept) -> Result<(), DriveError> {
+        let bytes = serde_json::to_vec(kept).map_err(|e| DriveError::Replica(e.to_string()))?;
+        self.write_record(&bytes)
+    }
+
+    /// Write the record's bytes beside the stores, whole or not at all ([`ReplicaStores::write_kept`]).
+    fn write_record(&self, bytes: &[u8]) -> Result<(), DriveError> {
         let Some(path) = self.kept_path() else {
             return Err(DriveError::Replica(
                 "a replica in memory is not kept".into(),
             ));
         };
         let io = |e: std::io::Error| DriveError::Replica(format!("{}: {e}", path.display()));
-        let bytes = serde_json::to_vec(kept).map_err(|e| DriveError::Replica(e.to_string()))?;
         let tmp = path.with_extension("json.tmp");
         let dir = path.parent().unwrap_or(std::path::Path::new("."));
         {
             use std::io::Write as _;
             let mut f = std::fs::File::create(&tmp).map_err(io)?;
-            f.write_all(&bytes).map_err(io)?;
+            f.write_all(bytes).map_err(io)?;
             manifest::at(manifest::WritePoint::RecordWritten, dir);
             f.sync_all().map_err(io)?;
         }
@@ -2381,6 +2391,7 @@ impl<P: AgentPort> Driver<P> {
             audit_head: audit.head_hash(),
             audit_shipped: audit.shipped(),
             audit_outbox: audit.outbox().map(|r| hex::encode(r.encode())).collect(),
+            audit_outbox_omitted: None,
             manifest: None,
             digest: None,
         };
@@ -2437,8 +2448,25 @@ impl<P: AgentPort> Driver<P> {
             Ok(None) => return Err(Reopen::Unusable(port, "no replica was kept".into())),
             Err(e) => return Err(Reopen::Unusable(port, format!("{e:?}"))),
         };
-        if kept.manifest.is_some() {
-            return Self::reopen_manifest(stores, port, keys, genesis, &kept, archive, audit_floor);
+        match kept.version {
+            Kept::MANIFEST => {
+                return Self::reopen_manifest(
+                    stores,
+                    port,
+                    keys,
+                    genesis,
+                    &kept,
+                    archive,
+                    audit_floor,
+                );
+            }
+            Kept::VERSION if kept.manifest.is_none() && kept.audit_outbox_omitted.is_none() => {}
+            v => {
+                return Err(Reopen::Unusable(
+                    port,
+                    format!("a kept record of layout {v} that is not one"),
+                ));
+            }
         }
         let seq = kept.seq;
         Self::reopen_kept(stores, port, keys, genesis, &kept, archive, audit_floor).map(
@@ -2453,6 +2481,7 @@ impl<P: AgentPort> Driver<P> {
                         stores_ms,
                         replica_ms,
                         replay_ms: 0,
+                        kept: None,
                     },
                 )
             },

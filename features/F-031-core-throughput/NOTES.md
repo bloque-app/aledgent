@@ -203,32 +203,48 @@ with an opening balance, founded natively, then **20 000 inputs** (identities th
 manifest every 1 024 inputs; the replica 3.56 GB on disk, 2 299 185 service leaves. The kill is a
 copy of the replica's directory while the core holds it open, 1 000 inputs after the last manifest.
 
-Two runs. The first was before the replica's engines saved redb's allocator state on their synced
-commits (quick repair); the second is this build. Wall clock is the whole open of the core; the
-breakdown is the core's own log line.
+Wall clock is the whole open of the core; the breakdown is the core's own log line. Run 1 was
+before the replica's engines saved redb's allocator state on their synced commits (quick repair).
+Runs 1 and 2 had no audit store, so every manifest carried the book's 450 000 unshipped audit
+records; run 4 ships to an audit store in memory after every batch, as production's shipper keeps
+the outbox small, and was taken with other builds on the machine (load average 15 to 23 on 12
+cores), so its times are the slowest.
 
-| Start | Run 1 | Run 2 (this build) | Of which, run 2 |
-|---|---|---|---|
-| After a clean stop (T-031-25's record) | 25.8 s | 32.9 s | files 0.2 s; the replica rebuilt over them, the service store from its leaves, 29.7 s |
-| After an unclean stop (the manifest at input 19 000, 1 000 inputs after it) | 59.8 s | 27.4 s | files put back to their savepoints 0.4 s; the replica 15.8 s; 1 000 inputs replayed 7.7 s |
-| Fallback: no usable record, a rebuild from genesis | 453.6 s | 364.1 s | the genesis rebuilt from the chainspec, then 20 000 inputs replayed |
+| Start | Run 1 | Run 2 | Run 4 | Of which, runs 2 / 4 |
+|---|---|---|---|---|
+| After a clean stop (T-031-25's record) | 25.8 s | 32.9 s | 25.4 s | files 0.2 s; the replica rebuilt over them, the service store from its leaves, 29.7 s / 24.8 s |
+| After an unclean stop (the manifest at input 19 000, 1 000 inputs after it) | 59.8 s | 27.4 s | 73.1 s | files put back to their savepoints 0.4 / 0.6 s; the replica 15.8 / 44.0 s; 1 000 inputs replayed 7.7 / 26.8 s |
+| Fallback: no usable record, a rebuild from genesis | 453.6 s | 364.1 s | 796.9 s | the genesis rebuilt from the chainspec, then 20 000 inputs replayed |
 
 What this says, stated plainly:
 
-1. **An unclean stop now costs what a clean one does, plus the tail.** Both are dominated by
+1. **An unclean stop now costs about what a clean one does, plus the tail.** Both are dominated by
    T-031-25's rebuild of the service store from its leaves (`State::from_whole_leaves`), 7 to
-   13 µs a leaf here, as the page cache allows; the manifest adds the replay of at most about 1 024
-   inputs (7.7 s per 1 000 here) and the savepoint restores (under 0.5 s).
-2. **The fallback grows with the archive; the reopen does not.** This book's fallback is 6 to 7.5
+   19 µs a leaf here, as the page cache and the machine's load allow (15.8 to 44 s); the manifest
+   adds the replay of at most about 1 024 inputs (7.7 to 26.8 s per 1 000 here) and the savepoint
+   restores (under 1 s).
+2. **The fallback grows with the archive; the reopen does not.** This book's fallback is 6 to 13
    minutes for 20 000 inputs. Production's was 39 minutes at 555 000 inputs on 17 Nov; a reopen of
    it replays at most a manifest's interval of inputs, whatever the archive's length.
 3. **Without quick repair the kill cost about another 35 s** (run 1). A redb file that was not closed cleanly is
    repaired at open by a walk of the whole file, unless its last synced commit saved the allocator
    state. The replica's engines now save it on every synced commit (one in 1 024 writes, and the
    savepoints); the openings store, which syncs every commit and is small, does not.
-4. **A manifest's cost on the decision path** is three synced commits and one small file, under the
-   decision's lock, once every 1 024 inputs or 30 s. It was not measured on its own: both runs took
-   20 manifests and ran 63 and 73 inputs a second.
-5. **The clean reopen's 26–33 s is T-031-25's, not this task's,** and larger than production's
+4. **A manifest's cost on the decision path** (`CoreStats::replica_manifest_us`, 20 manifests over
+   20 000 inputs): with an audit store keeping the outbox small (run 4, 92 inputs a second),
+   **mean 237 ms, max 1.21 s**; in run 3, where every manifest left the 450 000 unshipped records
+   out, mean 281 ms, max 764 ms. That is three synced commits with redb's allocator state
+   (3.3 GB of files) and one small file, on this laptop's file system, where every sync is a full
+   flush of the drive's cache. It is taken under the decision's lock, so the next decision waits for
+   it, once every 1 024 inputs or 30 s (about 0.3 ms an input over 1 024); reads go on meanwhile,
+   since a manifest only reads the replica. A Linux volume's sync is usually cheaper; production's
+   is not measured here.
+5. **The clean reopen's 25–33 s is T-031-25's, not this task's,** and larger than production's
    0.1–0.3 s because this book has far more service leaves. A later change could keep the service
    store's derived indexes on disk and skip the rebuild from leaves; it is not in scope here.
+
+**Rolling back, stated plainly.** A rollback to the release before T-031-26 must follow a clean stop
+of this build. A clean stop writes T-031-25's record and deletes the savepoints, which the release
+reopens as its own. Any other stop leaves a manifest (layout 2), which the release does not read:
+it rebuilds from genesis, correctly and at the full rebuild's cost, and wipes the savepoints with
+the files.

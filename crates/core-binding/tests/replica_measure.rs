@@ -25,9 +25,25 @@ use std::time::{Duration, Instant};
 use core_binding::core::{AgentCore, Founding, HostLog as _, MemLog};
 use core_binding::host::{KEPT_FILE, NativePort, ReplicaStores};
 use core_binding::hot::{Limits, MAX_BUDGET};
+use ingress::audit_ship::Shipper;
 use ingress::boundary::{CallerBody, Core as _, CoreInput, InputBody, InputKey};
 use ingress::testkit::{T0, genesis};
+use ledger_core::audit::{AuditSink, AuditTrail, SinkError};
 use ledger_core::chainspec::{ChainSpec, ChunkLimits};
+
+/// An audit store in memory, shared: a healthy one, shipped to after every batch, so the
+/// replica's outbox stays small, as production's does.
+#[derive(Clone, Default)]
+struct Store(std::sync::Arc<std::sync::Mutex<AuditTrail>>);
+
+impl AuditSink for Store {
+    fn append(&mut self, record: &ledger_core::audit::AuditRecord) -> Result<(), SinkError> {
+        AuditSink::append(&mut *self.0.lock().unwrap(), record)
+    }
+    fn head(&self) -> Result<Option<(u64, [u8; 32])>, SinkError> {
+        AuditSink::head(&*self.0.lock().unwrap())
+    }
+}
 
 fn env(name: &str, default: u64) -> u64 {
     std::env::var(name)
@@ -140,9 +156,18 @@ fn start(
     dir: &Path,
     port: NativePort,
     log: MemLog,
+    store: &Store,
 ) -> (AgentCore<NativePort>, u64, u64, Duration) {
     let t = Instant::now();
-    let core = AgentCore::open_in(port, founding(s), log, disk(dir)).unwrap();
+    let core = AgentCore::open_audited_unstarted(
+        port,
+        founding(s),
+        log,
+        disk(dir),
+        store.head().unwrap(),
+        u64::MAX,
+    )
+    .unwrap();
     let took = t.elapsed();
     let st = core.stats();
     let r = (
@@ -176,9 +201,24 @@ async fn t031_26_measure_reopen_on_a_large_book() {
     );
     let log = MemLog::default();
     let t = Instant::now();
-    let core =
-        AgentCore::open_in(NativePort::new(), founding(&s), log.clone(), disk(&live)).unwrap();
+    let store = Store::default();
+    let core = AgentCore::open_audited_unstarted(
+        NativePort::new(),
+        founding(&s),
+        log.clone(),
+        disk(&live),
+        None,
+        u64::MAX,
+    )
+    .unwrap();
     eprintln!("founded natively in {:?}", t.elapsed());
+    let mut shipper = Shipper::new(Box::new(store.clone()), core.audit().expect("shipping"));
+    let t = Instant::now();
+    let shipped = core.ship(&mut shipper);
+    eprintln!(
+        "genesis's audit records shipped in {:?}: {shipped:?}",
+        t.elapsed()
+    );
     let founded = core.founded();
     let t = Instant::now();
     // All but the tail, then a manifest, then the tail: the kill lands `tail` inputs after it.
@@ -193,12 +233,20 @@ async fn t031_26_measure_reopen_on_a_large_book() {
         for r in core.apply_batch(&batch).await {
             r.expect("decided");
         }
+        let _ = core.ship(&mut shipper);
         i = end;
     }
     let ran = t.elapsed();
     let m = core.manifest().expect("a manifest").seq;
     let n = log.entries().unwrap().len() as u64;
-    let manifests = core.stats().replica_manifests.load(Ordering::Relaxed);
+    let st = core.stats();
+    let manifests = st.replica_manifests.load(Ordering::Relaxed);
+    eprintln!(
+        "manifests: {manifests}, mean {} µs, max {} µs, the last {} µs",
+        st.replica_manifest_us_total.load(Ordering::Relaxed) / manifests.max(1),
+        st.replica_manifest_us_max.load(Ordering::Relaxed),
+        st.replica_manifest_us.load(Ordering::Relaxed),
+    );
     eprintln!(
         "{n} inputs in {ran:?} ({}/s), {manifests} manifests, the last at input {m}; replica {} MB",
         u128::from(n) * 1000 / ran.as_millis().max(1),
@@ -216,13 +264,14 @@ async fn t031_26_measure_reopen_on_a_large_book() {
     // The clean stop, and its reopen.
     core.keep_replica(Duration::from_secs(1)).expect("kept");
     drop(core);
-    let (c, reused, _, clean) = start(&s, &live, copy_port(&port), copy_log(&logged));
+    let (c, reused, _, clean) = start(&s, &live, copy_port(&port), copy_log(&logged), &store);
     assert_eq!(reused, 1);
     assert_eq!(c.replica_digest().as_ref(), Some(&want));
     drop(c);
 
     // The unclean stop, and its reopen from the manifest.
-    let (c, reused, rolled, unclean) = start(&s, &killed, copy_port(&port), copy_log(&logged));
+    let (c, reused, rolled, unclean) =
+        start(&s, &killed, copy_port(&port), copy_log(&logged), &store);
     assert_eq!(reused, 1);
     assert_eq!(rolled, n - m);
     assert_eq!(c.replica_digest().as_ref(), Some(&want));
@@ -232,7 +281,13 @@ async fn t031_26_measure_reopen_on_a_large_book() {
     let fallback_dir = base.join("fallback");
     copy_dir(&killed, &fallback_dir);
     std::fs::remove_file(fallback_dir.join(KEPT_FILE)).unwrap();
-    let (c, reused, _, fallback) = start(&s, &fallback_dir, copy_port(&port), copy_log(&logged));
+    let (c, reused, _, fallback) = start(
+        &s,
+        &fallback_dir,
+        copy_port(&port),
+        copy_log(&logged),
+        &store,
+    );
     assert_eq!(reused, 0);
     assert_eq!(c.replica_digest().as_ref(), Some(&want));
     drop(c);

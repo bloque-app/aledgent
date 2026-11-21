@@ -711,3 +711,97 @@ async fn t031_26_a_rebuild_after_a_failed_decision_reopens_the_manifest() {
     assert_eq!(rebuilt(&base.join("replay"), port, logged), want);
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// `T-031-26`: a kill at each write point of the first manifest a core takes after it reopened
+/// one. That manifest keeps the savepoints of the one it reopened from until it is written
+/// itself, so every point reopens without a rebuild, from the one or the other.
+#[tokio::test(flavor = "multi_thread")]
+async fn t031_26_a_kill_at_each_write_point_of_the_first_manifest_after_a_reopen() {
+    let _serial = SERIAL.lock().await;
+    let k = killed("after-reopen").await;
+    let n = k.log.entries().unwrap().len() as u64;
+    let m = read_kept(&k.dir).seq;
+    assert!(n > m, "the manifest is behind the archive");
+    let restart = k.copy("restart");
+    let images = Images::default();
+    images.arm(&restart, &k.base.join("images"));
+    // The reopen, and the manifest it takes at once, at every point.
+    let (c, r) = k.start(&restart);
+    let shots = images.disarm();
+    assert_eq!(r, 1);
+    assert_eq!(c.manifest().map(|k| k.seq), Some(n));
+    drop(c);
+    let points: Vec<WritePoint> = shots.iter().map(|(p, _)| *p).collect();
+    assert_eq!(
+        points,
+        vec![
+            WritePoint::Begin,
+            WritePoint::ArchiveSynced,
+            WritePoint::BookSaved,
+            WritePoint::OpeningsSaved,
+            WritePoint::ServiceSaved,
+            WritePoint::RecordWritten,
+            WritePoint::RecordSynced,
+            WritePoint::RecordRenamed,
+            WritePoint::RecordDone,
+        ]
+    );
+    for (point, dir) in &shots {
+        let from = read_kept(dir).seq;
+        let renamed = matches!(point, WritePoint::RecordRenamed | WritePoint::RecordDone);
+        assert_eq!(from, if renamed { n } else { m }, "{point:?}");
+        let (c, r) = k.start(dir);
+        assert_eq!(r, 1, "{point:?}: reopened, not rebuilt");
+        assert_eq!(rolled(&c), n - from, "{point:?}");
+        assert_eq!(c.replica_digest().as_ref(), Some(&k.want), "{point:?}");
+        drop(c);
+    }
+    let _ = std::fs::remove_dir_all(&k.base);
+}
+
+/// `T-031-26`: a manifest that left its unshipped audit records out (more than
+/// `manifest::OUTBOX_MAX`) is reopened only over an audit store that holds them all; without one
+/// it rebuilds.
+#[tokio::test(flavor = "multi_thread")]
+async fn t031_26_a_manifest_without_its_outbox_reopens_only_where_the_audit_store_holds_it() {
+    let _serial = SERIAL.lock().await;
+    let k = killed("omitted").await;
+    let omit = |dir: &Path| {
+        let mut kept = read_kept(dir);
+        let n = kept.audit_outbox.len() as u64;
+        assert!(n > 0, "records wait unshipped: no audit store here");
+        kept.audit_outbox.clear();
+        kept.audit_outbox_omitted = Some(n);
+        write_kept(dir, &kept.clone().sealed().unwrap());
+        kept
+    };
+    let without = k.copy("without");
+    omit(&without);
+    k.rebuilds(&without, "no audit store holds the records left out");
+
+    // An audit store at the manifest's last record: every one it left out is held.
+    let held = k.copy("held");
+    let kept = omit(&held);
+    let head = (kept.audit_emitted - 1, kept.audit_head);
+    let open = |dir: &Path| {
+        AgentCore::open_audited_unstarted(
+            copy_port_of(&k.port),
+            founding(),
+            copy_log(&k.log),
+            disk(dir),
+            Some(head),
+            u64::MAX,
+        )
+        .unwrap()
+    };
+    let c = open(&held);
+    assert_eq!(reused(&c), 1, "reopened over the audit store");
+    let got = c.replica_digest().expect("a replica");
+    drop(c);
+    let scratch = k.base.join("held-rebuilt");
+    let rebuilt = open(&scratch);
+    assert_eq!(reused(&rebuilt), 0);
+    assert_eq!(rebuilt.replica_digest(), Some(got));
+    drop(rebuilt);
+    let _ = std::fs::remove_dir_all(&k.base);
+}

@@ -16,7 +16,10 @@
 //! head, the three savepoint ids, and a digest over the rest. The record is written whole or not at
 //! all (a temporary file, synced, renamed, the directory synced), so a crash at any point leaves
 //! the previous manifest, whose savepoints each file still holds, or the new one. Each file keeps
-//! the savepoint the current manifest names and the one being taken, never more.
+//! the savepoint the current manifest names and the one being taken, never more. The manifest in
+//! force is the one on disk: after a reopen, the one reopened; after a write that failed past its
+//! rename, the one renamed into place. At most [`OUTBOX_MAX`] unshipped audit records go in it;
+//! past that, none.
 //!
 //! **Reopened** (`Driver::reopen_manifest`). The record is read and its digest checked. The
 //! input it names must be one the host's log holds (extended from the Agent's ring, as a rebuild
@@ -74,7 +77,7 @@ pub struct Manifest {
 }
 
 /// How a replica was reopened ([`Driver::reopen`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Reopened {
     /// The input the record names.
     pub from: u64,
@@ -89,7 +92,16 @@ pub struct Reopened {
     pub replica_ms: u64,
     /// How long the inputs after the manifest took to replay, ms.
     pub replay_ms: u64,
+    /// The manifest reopened, for a manifest: the one in force from here, whose savepoints the
+    /// next manifest keeps until it is written itself.
+    pub kept: Option<Kept>,
 }
+
+/// The most unshipped audit records a manifest holds (`T-031-26`). Past it, a manifest holds none
+/// and says how many it left out ([`Kept::audit_outbox_omitted`]): written every few seconds, it
+/// stays small while the audit store is away. Such a manifest is reopened only once the audit store
+/// holds every record it left out; until then the start rebuilds from genesis, as before.
+pub const OUTBOX_MAX: usize = 1024;
 
 fn ms_since(t: std::time::Instant) -> u64 {
     u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
@@ -149,6 +161,20 @@ impl Kept {
         Ok(blake2b_256(DIGEST_DOMAIN, &[&bytes]))
     }
 
+    /// The record's bytes as a manifest is written: encoded once, the digest over that encoding
+    /// appended as its last field (where serde would put it), and the record with its digest set.
+    fn sealed_bytes(mut self) -> Result<(Vec<u8>, Kept), String> {
+        self.digest = None;
+        let mut bytes = serde_json::to_vec(&self).map_err(|e| e.to_string())?;
+        let digest = hex::encode(blake2b_256(DIGEST_DOMAIN, &[&bytes]));
+        if bytes.pop() != Some(b'}') {
+            return Err("a record that is not an object".into());
+        }
+        bytes.extend_from_slice(format!(",\"digest\":\"{digest}\"}}").as_bytes());
+        self.digest = Some(digest);
+        Ok((bytes, self))
+    }
+
     /// The manifest with its digest set.
     ///
     /// # Errors
@@ -174,6 +200,18 @@ impl Kept {
             Some(_) => Err("the manifest does not match its digest".into()),
             None => Err("the manifest has no digest".into()),
         }
+    }
+}
+
+/// Whether the audit store holds every record a kept replica had emitted: the last one's number,
+/// and its hash when it is the store's head.
+pub(super) fn outbox_held(audit_floor: Option<(u64, [u8; 32])>, kept: &Kept) -> bool {
+    let Some(last) = kept.audit_emitted.checked_sub(1) else {
+        return true;
+    };
+    match audit_floor {
+        None => false,
+        Some((f, h)) => f > last || (f == last && h == kept.audit_head),
     }
 }
 
@@ -357,10 +395,25 @@ pub(super) fn open_kept(
         ));
     }
     let leaves = service.all_leaves()?;
+    // A manifest that left its outbox out stands as if every record were shipped: it is reopened
+    // only when the audit store holds them all ([`outbox_held`]).
+    let shipped = match kept.audit_outbox_omitted {
+        None => kept.audit_shipped,
+        Some(_) if outbox_held(audit_floor, kept) => kept
+            .audit_emitted
+            .checked_sub(1)
+            .map(|s| (s, kept.audit_head)),
+        Some(n) => {
+            return Err(DriveError::Replica(format!(
+                "the manifest left {n} unshipped audit records out, and the audit store does not \
+                 hold them"
+            )));
+        }
+    };
     let audit = ledger_core::export::AuditHead {
         emitted: kept.audit_emitted,
         head: kept.audit_head,
-        shipped: kept.audit_shipped,
+        shipped,
     };
     let mut state = State::from_whole_leaves(leaves, &audit)
         .map_err(|e| DriveError::Replica(format!("the kept service store: {e:?}")))?;
@@ -419,6 +472,15 @@ impl<P: AgentPort> Driver<P> {
         if !self.staged.is_empty() {
             return Err(DriveError::Replica("inputs are staged".into()));
         }
+        // Every committed input archived: a manifest is never ahead of the host's log.
+        let committed = (self.seq > 0).then_some((self.seq, self.log_head));
+        if self.archived != committed {
+            return Err(DriveError::Replica(format!(
+                "input {} is not archived (the log is acknowledged to {:?})",
+                self.seq,
+                self.archived.map(|a| a.0)
+            )));
+        }
         at(WritePoint::Begin, dir);
         let (roots, next_posting) = replica_roots(replica, &self.service)?;
         let after = self.last_entry.as_ref().map_or(self.genesis, |e| e.roots);
@@ -470,7 +532,16 @@ impl<P: AgentPort> Driver<P> {
             .map_err(rep)?;
         at(WritePoint::ServiceSaved, dir);
         let audit = replica.state().audit();
-        let kept = Kept {
+        let unshipped = audit.outbox().count();
+        let (audit_outbox, audit_outbox_omitted) = if unshipped > OUTBOX_MAX {
+            (Vec::new(), Some(unshipped as u64))
+        } else {
+            (
+                audit.outbox().map(|r| hex::encode(r.encode())).collect(),
+                None,
+            )
+        };
+        let (bytes, kept) = Kept {
             version: Kept::MANIFEST,
             seq: self.seq,
             log_head: self.log_head,
@@ -480,7 +551,8 @@ impl<P: AgentPort> Driver<P> {
             audit_emitted: audit.emitted(),
             audit_head: audit.head_hash(),
             audit_shipped: audit.shipped(),
-            audit_outbox: audit.outbox().map(|r| hex::encode(r.encode())).collect(),
+            audit_outbox,
+            audit_outbox_omitted,
             manifest: Some(Manifest {
                 code: hot.code,
                 generation: hot.generation,
@@ -495,9 +567,9 @@ impl<P: AgentPort> Driver<P> {
             }),
             digest: None,
         }
-        .sealed()
+        .sealed_bytes()
         .map_err(DriveError::Replica)?;
-        stores.write_kept(&kept)?;
+        stores.write_record(&bytes)?;
         Ok(kept)
     }
 
@@ -597,6 +669,17 @@ impl<P: AgentPort> Driver<P> {
                 "the audit store is behind what the manifest had shipped".into(),
             ));
         }
+        if let Some(n) = kept.audit_outbox_omitted
+            && !outbox_held(audit_floor, kept)
+        {
+            return Err(unusable(
+                port,
+                format!(
+                    "the manifest left {n} unshipped audit records out, and the audit store does \
+                     not hold them"
+                ),
+            ));
+        }
         let rolled = (|| {
             let (mut replica, mut service, recorder, timings) =
                 open_kept(stores, &keys, genesis, kept, audit_floor)?;
@@ -639,6 +722,7 @@ impl<P: AgentPort> Driver<P> {
             stores_ms,
             replica_ms,
             replay_ms,
+            kept: Some(kept.clone()),
         };
         Self::assemble(
             port,
@@ -652,5 +736,47 @@ impl<P: AgentPort> Driver<P> {
         )
         .map(|(d, r)| (d, r, reopened))
         .map_err(|(port, e)| Reopen::Unusable(port, format!("the manifest's driver: {e:?}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A manifest written in one encoding is the record serde writes with its digest set, and
+    /// checks.
+    #[test]
+    fn t031_26_a_manifest_encoded_once_is_its_sealed_record() {
+        let kept = Kept {
+            version: Kept::MANIFEST,
+            seq: 7,
+            log_head: [1; 32],
+            roots: Roots::default(),
+            next_posting: 3,
+            genesis_roots: Roots::default(),
+            audit_emitted: 2,
+            audit_head: [2; 32],
+            audit_shipped: Some((0, [3; 32])),
+            audit_outbox: vec!["00ff".into()],
+            audit_outbox_omitted: None,
+            manifest: Some(Manifest {
+                code: [4; 32],
+                generation: 1,
+                upgrade: Some(([5; 32], 9)),
+                authority: [6; 32],
+                authority_next: None,
+                book_applied: Some(5),
+                book_head: [7; 32],
+                book_savepoint: 1,
+                openings_savepoint: 2,
+                service_savepoint: 3,
+            }),
+            digest: None,
+        };
+        let (bytes, sealed) = kept.clone().sealed_bytes().unwrap();
+        assert_eq!(sealed, kept.sealed().unwrap());
+        assert_eq!(bytes, serde_json::to_vec(&sealed).unwrap());
+        let read: Kept = serde_json::from_slice(&bytes).unwrap();
+        read.check_digest().unwrap();
     }
 }
