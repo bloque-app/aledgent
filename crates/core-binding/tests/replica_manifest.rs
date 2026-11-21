@@ -841,15 +841,31 @@ async fn t031_26_a_decision_s_reply_is_sent_before_its_manifest() {
     let asked = std::time::Instant::now();
     traffic(&d, "slow", 1).await;
     let replied = std::time::Instant::now();
-    // The manifest, once it is done: `manifest` waits for the decision's lock it holds.
-    let taken = core.manifest().map(|k| k.seq);
+    // The manifest, once it is taken: the decider takes it right after the reply, under the
+    // decision's lock, which `manifest` waits for.
+    let n = core
+        .with_port(|p| {
+            core_binding::host::AgentPort::hot(p)
+                .unwrap()
+                .unwrap()
+                .inputs
+        })
+        .unwrap();
+    let deadline = replied + Duration::from_secs(20);
+    while core.manifest().map(|k| k.seq) != Some(n) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no manifest at input {n}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let done = std::time::Instant::now();
     set_write_hook(None);
     drop(d);
     let began = began
         .lock()
         .unwrap()
-        .expect("a manifest was due after the reply");
+        .expect("the manifest went through its first write point");
     assert!(
         replied - asked < Duration::from_millis(1500),
         "the reply waited for the manifest: {:?}",
@@ -857,20 +873,9 @@ async fn t031_26_a_decision_s_reply_is_sent_before_its_manifest() {
     );
     assert!(
         replied < began + Duration::from_secs(2),
-        "the reply came first"
+        "the reply came before the manifest was done"
     );
     assert!(done >= began + Duration::from_secs(2));
-    assert_eq!(
-        taken,
-        Some(
-            core.with_port(|p| core_binding::host::AgentPort::hot(p)
-                .unwrap()
-                .unwrap()
-                .inputs)
-                .unwrap()
-        ),
-        "the manifest is at the decision's input"
-    );
     drop(core);
     let _ = std::fs::remove_dir_all(&base);
 }
