@@ -336,11 +336,12 @@ jobs:
               [ -n "$mainnet" ] && break 2
               echo "mainnet probe $url failed (attempt $attempt)"
             done
-            sleep $((attempt * 10))
+            [ "$attempt" -lt 3 ] && sleep $((attempt * 10))
           done
           echo "under test: $ours; mainnet: ${mainnet:-unreachable}"
           echo "Runtime under test: \`$ours\`; Kreivo mainnet: \`${mainnet:-unreachable}\`." >> "$GITHUB_STEP_SUMMARY"
-          if [ "$ours" != "$mainnet" ]; then
+          # An empty read on either side is never parity: two empty strings must not compare equal.
+          if [ -z "$ours" ] || [ -z "$mainnet" ] || [ "$ours" != "$mainnet" ]; then
             if [ "$MAINNET_PARITY" = require ]; then
               echo "::error::the runtime under test ($ours) is not the one Kreivo mainnet runs (${mainnet:-unreachable})"
               exit 1
