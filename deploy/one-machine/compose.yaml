@@ -1,0 +1,138 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+#
+# aledgent on one machine (T-038-17, DEC-27 (h′)): PostgreSQL, the signer, the core as a VOS Agent
+# (aledgent-core-host) and ingress, behind a local proxy that takes an ingress release as a second
+# instance. The guide that brings it up is the documentation site's "One machine" page
+# (site/src/content/docs/operate/one-machine.mdx); CI runs that page's commands as they are
+# (.github/workflows/one-machine.yml).
+#
+#   proxy (127.0.0.1:8080) ─┬─> ingress-blue  ─┐                       ┌─> signer (keys)
+#                           └─> ingress-green ─┴─ unix socket ─> core ─┘
+#   ingress-blue, ingress-green ─> postgres (internal network only)
+#
+# The images are pinned by digest: ingress and the signer from a release's images.json (v0.5.0-dev+e935c21,
+# the tree of release 0.5.1), and the core from that tree's on-genesis build (images.yml, job `core on
+# genesis`: the host of commit 294a8fa with the generation-0 package 1d10625e copied in), because a new
+# book is founded at rules version 0 and the fence refuses code of any other (REQ-RT-20). Set
+# ALEDGENT_INGRESS_IMAGE, ALEDGENT_CORE_IMAGE and ALEDGENT_SIGNER_IMAGE to deploy others. Nothing secret is in this file or in the two configuration files
+# beside it: the guide writes the secrets into secrets/ (git-ignored), one file per value.
+#
+# What one machine does not give (REQ-AR-5): surviving the machine's own reboot without a restart,
+# or the loss of its disk. It does not claim NFR-21. The guide says so, and what the keys' custody is.
+
+name: aledgent
+
+services:
+  # Ownership of the shared volumes, once, before anything else starts: the signer's socket
+  # directory is the signer's (65533) with the core host's group (65532), setgid, so the socket is
+  # the core host's to connect to (mode 660) and no one else's; the core's socket and state are the
+  # core host's (65532), whose socket ingress (65532) connects to.
+  volumes:
+    image: docker.io/library/busybox:1.37.0@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec
+    user: "0:0"
+    network_mode: none
+    command:
+      - sh
+      - -euc
+      - |
+        chown 65533:65532 /run/aledgent-signer && chmod 2770 /run/aledgent-signer
+        chown 65532:65532 /run/aledgent /var/lib/aledgent/core && chmod 0750 /run/aledgent /var/lib/aledgent/core
+    volumes:
+      - signer-run:/run/aledgent-signer
+      - core-run:/run/aledgent
+      - core-state:/var/lib/aledgent/core
+
+  postgres:
+    image: docker.io/library/postgres:17.6-bookworm@sha256:f3bd19c606e442c3d7bdfa8002e03fe260a1023351e0ea4598032022b68dd6e3
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: aledgent_ingress
+      POSTGRES_DB: aledgent_ingress
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres.password
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./secrets/postgres.password:/run/secrets/postgres.password:ro
+    networks: [database]
+    healthcheck:
+      # Over TCP, as ingress connects: while the image initialises the database, its temporary
+      # server listens on the local socket only.
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "aledgent_ingress", "-d", "aledgent_ingress"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  # The key boundary (F-035): the core host's four keys, from files only it can read. No network.
+  signer:
+    image: ${ALEDGENT_SIGNER_IMAGE:-ghcr.io/bloque-app/aledgent-signer@sha256:339cd676366775bc16caff2b6a8a0f65eeb5b262156bda13f8b16f471200c266}
+    restart: unless-stopped
+    network_mode: none
+    depends_on:
+      volumes: { condition: service_completed_successfully }
+    volumes:
+      - ./config/signer.json:/etc/aledgent-signer/signer.json:ro
+      - ./secrets/signer:/etc/aledgent-signer/keys:ro
+      - signer-run:/run/aledgent-signer
+
+  # The core as a VOS Agent, serving ingress on a Unix socket (the same-host link, DEC-27 (h′)).
+  # It takes its keys from the signer and none from its environment. No network.
+  core:
+    image: ${ALEDGENT_CORE_IMAGE:-ghcr.io/bloque-app/aledgent-core@sha256:3f8893ce5ba38615d808161e3fc81b885d833e48438bfa63340090f83efb8ce1}
+    restart: unless-stopped
+    network_mode: none
+    depends_on:
+      volumes: { condition: service_completed_successfully }
+      signer: { condition: service_started }
+    volumes:
+      - ./config/ingress.json:/etc/aledgent/ingress.json:ro
+      - ./secrets/core-signer.token:/etc/aledgent/core-signer.token:ro
+      - signer-run:/run/aledgent-signer
+      - core-run:/run/aledgent
+      - core-state:/var/lib/aledgent/core
+    stop_grace_period: 60s
+
+  # Ingress, twice: a release starts the other colour, waits for it to be ready, then stops this
+  # one, which drains (F-038 §9). Only the proxy publishes a port.
+  ingress-blue: &ingress
+    image: ${ALEDGENT_INGRESS_IMAGE:-ghcr.io/bloque-app/aledgent-ingress@sha256:5382c2eca906b25906df116d24af01d8f1ba448f04889507245f433887b29652}
+    restart: unless-stopped
+    depends_on:
+      volumes: { condition: service_completed_successfully }
+      postgres: { condition: service_healthy }
+      core: { condition: service_started }
+    env_file: ./secrets/ingress.env
+    volumes:
+      - ./config/ingress.json:/etc/aledgent/ingress.json:ro
+      - core-run:/run/aledgent
+    networks: [database, front]
+    stop_grace_period: 60s
+
+  ingress-green:
+    <<: *ingress
+    image: ${ALEDGENT_INGRESS_GREEN_IMAGE:-${ALEDGENT_INGRESS_IMAGE:-ghcr.io/bloque-app/aledgent-ingress@sha256:5382c2eca906b25906df116d24af01d8f1ba448f04889507245f433887b29652}}
+    profiles: [green]
+
+  # The local proxy: both colours, each checked on its readiness port. A draining instance answers
+  # 503 there and leaves the rotation while it still answers its clients.
+  proxy:
+    image: docker.io/library/haproxy:3.2.4-alpine@sha256:436a5691e6fd563ca4090e351048fda1066bec93b595cc8eaf26988c65eb1152
+    restart: unless-stopped
+    depends_on:
+      ingress-blue: { condition: service_started }
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    networks: [front]
+    ports:
+      - "127.0.0.1:8080:8080"
+
+networks:
+  # PostgreSQL is reachable from ingress only, never from outside the machine.
+  database:
+    internal: true
+  front: {}
+
+volumes:
+  postgres-data:
+  core-state:
+  core-run:
+  signer-run:

@@ -1,0 +1,153 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+name: One-machine walkthrough
+
+# M-3D's proof (F-039, T-038-19): a fresh one-machine deployment brought up by the guide's own
+# commands, then a deposit and a transfer through the documented API, then an ingress release under
+# a stream of requests that must all be answered.
+#
+# The commands are the page's: tools/ci/guide-commands.py writes every `sh` block of
+# site/src/content/docs/operate/one-machine.mdx, in order, into one script, and this job runs that
+# script as root (the guide's shell) from the repository's root on a fresh GitHub-hosted runner.
+# Nothing here adds a step the page does not show; what this job adds is only observation: a
+# prober that sends GET /v1/assets through the proxy every 200 ms once the deployment answers, and
+# fails the job if any request from the release's first block on is not answered 200 (DEC-27 (h′):
+# a release refuses no request).
+#
+# The deposit is an issuance into a book-only asset (owner ruling of 2026-11-20, the M-3D gap's
+# Q2): a deposit through the settlement layer needs a chain and the adapter, which the zombienet
+# suite proves (e2e-zombienet.yml). Every secret is drawn by the page's commands on the runner, for
+# this run, and is gone with it.
+
+on:
+  pull_request:
+    paths:
+      - "deploy/one-machine/**"
+      - "site/src/content/docs/operate/one-machine.mdx"
+      - "tools/ci/guide-commands.py"
+      - ".github/workflows/one-machine.yml"
+  push:
+    branches: [main, develop]
+    paths:
+      - "deploy/one-machine/**"
+      - "site/src/content/docs/operate/one-machine.mdx"
+      - "tools/ci/guide-commands.py"
+      - ".github/workflows/one-machine.yml"
+  # Weekly, so that a pinned image or a base image that stops pulling is noticed.
+  schedule:
+    - cron: "41 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: one-machine-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  walkthrough:
+    name: walkthrough (the guide's commands)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The guide's commands
+        run: |
+          set -euo pipefail
+          python3 tools/ci/guide-commands.py site/src/content/docs/operate/one-machine.mdx \
+            > "$RUNNER_TEMP/walkthrough.sh"
+          # The release starts at the block that starts the second instance.
+          release=$(awk '/^# --- block [0-9]+,/ { b = $4 + 0 } /--profile green up/ { print b; exit }' \
+            "$RUNNER_TEMP/walkthrough.sh")
+          [ -n "$release" ] || { echo "::error::the guide has no release step (--profile green up)"; exit 1; }
+          echo "RELEASE_BLOCK=$release" >> "$GITHUB_ENV"
+          echo "The release starts at block $release"
+          cat -n "$RUNNER_TEMP/walkthrough.sh"
+
+      - name: Tools
+        run: |
+          docker version --format 'Docker {{.Server.Version}}'
+          docker compose version
+          jq --version; openssl version; curl --version | head -1
+
+      - name: Prober (observation only)
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/prober.sh" <<'EOF'
+          #!/usr/bin/env bash
+          # Every 200 ms, once the operator's token exists and the proxy answers: one GET /v1/assets,
+          # its time (ms) and its HTTP status, one line each.
+          set -u
+          tok=deploy/one-machine/secrets/operator.token
+          until [ -s "$tok" ]; do sleep 0.5; done
+          t=$(cat "$tok")
+          until curl -sf -o /dev/null -m 2 -H "Authorization: Bearer $t" http://127.0.0.1:8080/v1/assets; do sleep 0.5; done
+          while :; do
+            code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' -H "Authorization: Bearer $t" http://127.0.0.1:8080/v1/assets)
+            echo "$(date +%s%3N) $code"
+            sleep 0.2
+          done
+          EOF
+          chmod +x "$RUNNER_TEMP/prober.sh"
+          sudo nohup "$RUNNER_TEMP/prober.sh" > "$RUNNER_TEMP/prober.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/prober.pid"
+
+      - name: Walkthrough (as root, as the guide says)
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          # Each line the script writes to stderr is stamped, so the release's window is known.
+          sudo bash "$RUNNER_TEMP/walkthrough.sh" \
+            2> >(while IFS= read -r l; do echo "$(date +%s%3N) $l"; done | tee "$RUNNER_TEMP/guide.log" >&2)
+          end=$(date +%s)
+          echo "WALKTHROUGH_SECONDS=$((end - start))" >> "$GITHUB_ENV"
+
+      - name: No request refused during the release
+        run: |
+          set -euo pipefail
+          sudo pkill -f "$RUNNER_TEMP/prober.sh" || true
+          from=$(awk -v b="[guide] block $RELEASE_BLOCK " 'index($0, b) { print $1; exit }' "$RUNNER_TEMP/guide.log")
+          [ -n "$from" ] || { echo "::error::the release's block never started"; exit 1; }
+          total=$(awk -v f="$from" '$1 >= f' "$RUNNER_TEMP/prober.log" | wc -l)
+          bad=$(awk -v f="$from" '$1 >= f && $2 != "200"' "$RUNNER_TEMP/prober.log")
+          echo "requests from the release on: $total"
+          [ "$total" -ge 20 ] || { echo "::error::only $total requests were sent during the release"; exit 1; }
+          if [ -n "$bad" ]; then
+            echo "::error::requests not answered 200 during the release:"
+            echo "$bad"
+            exit 1
+          fi
+          {
+            echo "### One-machine walkthrough"
+            echo
+            echo "- The guide's commands: $(grep -c '^# --- block' "$RUNNER_TEMP/walkthrough.sh") blocks, ${WALKTHROUGH_SECONDS}s"
+            echo "- During the release: $total requests through the proxy, every one answered 200"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Logs
+        if: always()
+        working-directory: deploy/one-machine
+        run: |
+          sudo docker compose --profile green ps -a || true
+          sudo docker compose --profile green logs --no-color --timestamps > "$RUNNER_TEMP/compose.log" 2>&1 || true
+          tail -n 300 "$RUNNER_TEMP/compose.log" || true
+          tail -n 50 "$RUNNER_TEMP/prober.log" || true
+
+      - name: Upload the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: one-machine-logs
+          # The prober's and the compose logs carry no secret: the services never log one (REQ-AU-8).
+          path: |
+            ${{ runner.temp }}/compose.log
+            ${{ runner.temp }}/prober.log
+            ${{ runner.temp }}/guide.log
+          if-no-files-found: ignore
+
+      - name: Tear down
+        if: always()
+        working-directory: deploy/one-machine
+        run: sudo docker compose --profile green down -v || true
