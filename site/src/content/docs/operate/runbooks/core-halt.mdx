@@ -55,7 +55,7 @@ A full audit outbox is **not** a halt: `core_halted` stays 0 and `AledgentAuditB
 3. **Fix forward.** Build an image whose Agent applies the input, through your normal review and release
    gate. If the fix changes the Agent's program, follow the runtime and package procedure for your
    deployment's pin.
-4. **Deploy by digest.** Restart the core on the new image, then ingress if it was restarted too. *Replica:* a halted core is not a clean stop, so a new image on it **always rebuilds from genesis**; before you roll, replay the archive with the new build on a separate machine first, and plan the window from that replay's time. a clean stop (SIGTERM within the stop timeout) keeps the core host's replica; a crash, SIGKILL, a stop timeout, a halted core or a fresh node rebuilds it from genesis, which takes time in proportion to the book's history ([Core restarts](../../core-restarts/)). The core
+4. **Deploy by digest.** Restart the core on the new image, then ingress if it was restarted too. *Replica:* a halted core is not a clean stop, so a new image on it **always rebuilds from genesis**; before you roll, replay the archive with the new build on a separate machine first, and plan the window from that replay's time ([Core restarts](../../core-restarts/)). The core
    replays its archive, then the forwarder decides the waiting rows in order.
 
 ## Verify

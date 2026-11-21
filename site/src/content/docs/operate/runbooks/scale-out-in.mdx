@@ -22,7 +22,7 @@ production. Nothing here moves value or edits a store outside the command surfac
 | Lever | Online in this release? | Depends on |
 |---|---|---|
 | Adapter lanes (more device keys signing in parallel) | **Yes** | A new key in the adapter signer's secret (or an opted-in KMS key), and the settlement contract's key set |
-| Ingress instances | **Yes** (A2), over the stream link; cross-host needs mutual TLS, a Unix socket works on the core's host only: the instances connect to the core over mutual TLS or a Unix socket, and the feed lease decides which feeds each partition (`F-038`) | The `stream` section of ingress's configuration |
+| Ingress instances | **Yes** (A2), over the stream link, where the feed lease decides which instance feeds each partition (`F-038`). Cross-host needs mutual TLS; a Unix socket works on the core's host only | The `stream` section of ingress's configuration |
 | The execution node's machine size (vertical) | **No.** A size change is a stop and start of the node, minutes with the volumes attached. Take it ahead of need, in a maintenance window, on your own growth triggers: memory first, then CPU | An ingress off the core's host, or a replicated core |
 | The core and audit volumes | **Yes**, where your platform grows volumes online; then grow the filesystem | Nothing: alert at 70 % full and grow by half again |
 | Shard count | **Fixed at genesis**, until online splits exist | Online split, and ingress routing to shards |

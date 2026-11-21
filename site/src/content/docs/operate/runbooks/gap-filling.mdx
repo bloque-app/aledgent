@@ -61,7 +61,7 @@ Incidents and gaps are written to the audit trail, not to the book's state.
    is only the lease's name, there is no read-only mode, and a second adapter with the same lane keys can
    double-sign or collide on nonces: on the same store it takes the lease the moment the primary's lapses, and
    on its own store nothing stops it. Instead stop the adapter, point its node endpoint (or history endpoint,
-   for an old range) at a different node, and start it again; it re-reads and folds from its accepted head. If
+   for an old range) at a different node, and start it again; it re-reads and folds from its accepted head. While it is stopped, external legs pause once its status lease lapses (`ERR-SettlementLayerUnavailable`); internal transfers carry on. If
    it now folds to the layer's head, the first node was wrong: keep the second, or replace the first
    ([Replace a node](../replace-node/)). If it also differs, treat it as a divergence of the layer's record: page
    security and follow [Divergence](../divergence/). Do not accept the head.

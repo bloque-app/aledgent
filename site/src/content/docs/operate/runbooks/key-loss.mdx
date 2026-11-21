@@ -47,7 +47,7 @@ from the book, and never replaced by an edit of any store (`REQ-AT-3`).
 - For the core root: `opsctl restore core` on an isolated host against the latest backup passes
   ([Restore](../restore/)).
 - For a lane: the adapter's start-up assertions pass and it declares `serving`.
-- For the clerk key: an internal disclosure verifies offline with `aledgent-verify` against the instance
+- For the clerk key: an internal disclosure verifies with `aledgent-verify` (it needs `--rpc <node URL>` or `--anchors <file>`; see [Anchoring](../anchoring/)) against the instance
   record.
 
 ## Roll back
