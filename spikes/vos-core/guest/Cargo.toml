@@ -1,0 +1,61 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# W2 (handovers' vos-core migration plan, gate G1): the core Agent's actor shell on vos-core's
+# `vos_sdk`, a spike. Never shipped, never wired into a production path. Links vos-core
+# (AGPL-3.0-or-later). No saga dependency: everything VOS is virto-network/vos `vos-core`.
+#
+# Its own workspace: a guest for vos-core's `riscv64em-vos` target, built with vos-core's guest
+# toolchain (rust-toolchain.toml) and linker layout (pvm.ld), as vos-core's own actors are.
+[workspace]
+
+[package]
+name = "aledgent-core-vos"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/bloque-app/aledgent"
+
+[lib]
+test = false
+bench = false
+
+[[bin]]
+name = "aledgent-core-vos"
+path = "src/main.rs"
+test = false
+bench = false
+
+[features]
+default = ["precompile"]
+# BLAKE2b through precompile 0x400 (CipherClerk's `vos-core-blake2b`). Off: the `blake2` crate in
+# software, for a differential check.
+precompile = ["cipher-clerk/vos-core-blake2b"]
+# The peak-heap probe: the allocator records its high-water mark and `apply` stores it in the
+# `peak` cell, which the `peak()` query reads. A separate build: it adds a write to every input,
+# so its gas is not the measured gas.
+heap-probe = []
+# Diagnostic: the transition over rows in memory, fresh each call (genesis only).
+diag-memrows = []
+# Diagnostic: `apply` on a genesis returns its service leaves (../diag_leaves.rs).
+diag-leaves = []
+
+[dependencies]
+vos-sdk = { git = "https://github.com/virto-network/vos", rev = "1650c474da06408026923b8397d338d767e1cd27" }
+# Everything the Agent decides (Apache-2.0 OR MIT, no VOS), with every command group.
+core-binding = { path = "../../../crates/core-binding", default-features = false, features = ["full"] }
+ledger-kernel = { path = "../../../crates/ledger-kernel", default-features = false }
+# CipherClerk hashes through vos-core's precompile 0x400 (`vos-core-blake2b`, cipherclerk.sh);
+# its curve arithmetic stays in software (DEC-16).
+cipher-clerk = { git = "https://codeberg.org/Virto/CipherClerk.git", rev = "e9a7b0851f183c14dbd1635dbf0437c86682ad6f", default-features = false }
+
+[patch."https://codeberg.org/Virto/CipherClerk.git"]
+cipher-clerk = { path = "../.cipherclerk" }
+
+# The production guest's profile (agents/core, owner ruling `core-opt-s`). `OPT` in build.sh
+# overrides opt-level for row 3d's sizing.
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
+codegen-units = 1

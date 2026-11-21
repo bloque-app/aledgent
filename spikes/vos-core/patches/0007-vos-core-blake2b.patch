@@ -1,0 +1,83 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index c02217a..8a51b97 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -79,6 +79,10 @@ pvm-precompile = ["dep:zkpvm-precompiles"]
+ # PVM's 13 registers and 25-cycle memory accesses, about a third of the gas of
+ # the `blake2` crate's per hash; the same digests everywhere.
+ vos-blake2b = ["dep:vos-protocol"]
++# vos-core's BLAKE2b precompile (0x400, one compression a call) through its guest shim
++# `vos-pvm-precompiles`, software where the host answers WHAT: the aledgent vos-core spike (W2).
++# Curves stay in software. Takes precedence over `vos-blake2b` and `pvm-precompile` for hashing.
++vos-core-blake2b = ["dep:vos-core-precompiles"]
+ 
+ [dependencies]
+ rkyv = { version = "0.8", default-features = false, features = ["alloc", "bytecheck", "little_endian", "pointer_width_32"] }
+@@ -103,6 +107,8 @@ bech32 = { version = "0.11", default-features = false, features = ["alloc"], opt
+ # non-PVM builds the shim's typed API falls through to dalek, so the same code
+ # path runs in tests. Enabled by the `pvm-precompile` feature.
+ zkpvm-precompiles = { package = "vos-pvm-precompiles", git = "https://codeberg.org/pandres95/VOS.git", rev = "bd8d1bb70551391a4c80a96c2249313ab7e0a0fc", optional = true }
++# vos-core's guest precompile shims, for `vos-core-blake2b`.
++vos-core-precompiles = { package = "vos-pvm-precompiles", git = "https://github.com/virto-network/vos", rev = "1650c474da06408026923b8397d338d767e1cd27", optional = true }
+ # VOS's protocol primitives (no_std), for `vos-blake2b`.
+ vos-protocol = { git = "https://codeberg.org/pandres95/VOS.git", rev = "bd8d1bb70551391a4c80a96c2249313ab7e0a0fc", optional = true }
+ 
+diff --git a/src/crypto/hash.rs b/src/crypto/hash.rs
+index 2dff35d..1541c13 100644
+--- a/src/crypto/hash.rs
++++ b/src/crypto/hash.rs
+@@ -1,5 +1,5 @@
+ use blake2::digest::consts::{U32, U64};
+-#[cfg(not(any(feature = "pvm-precompile", feature = "vos-blake2b")))]
++#[cfg(not(any(feature = "pvm-precompile", feature = "vos-blake2b", feature = "vos-core-blake2b")))]
+ use blake2::Digest;
+ use blake2::Blake2b;
+ 
+@@ -13,15 +13,20 @@ pub fn blake2b_256(domain: &[u8], parts: &[&[u8]]) -> [u8; 32] {
+     // PVM (or VOS's precompile 100 where the runtime serves it), streaming the
+     // input without the digest wrapper's per-hash buffer copies; elsewhere
+     // blake2b_simd. The same digest as the `blake2` crate.
+-    #[cfg(feature = "vos-blake2b")]
++    // vos-core's precompile 0x400 (`vos-core-blake2b`), streaming the input a block a call.
++    #[cfg(feature = "vos-core-blake2b")]
++    {
++        return vos_core_precompiles::blake2b_hash::<32>(domain, parts);
++    }
++    #[cfg(all(feature = "vos-blake2b", not(feature = "vos-core-blake2b")))]
+     {
+         return vos_protocol::blake2b::digest::<32>(domain, parts);
+     }
+-    #[cfg(all(feature = "pvm-precompile", not(feature = "vos-blake2b")))]
++    #[cfg(all(feature = "pvm-precompile", not(any(feature = "vos-blake2b", feature = "vos-core-blake2b"))))]
+     {
+         return zkpvm_precompiles::blake2b_hash::<32>(domain, parts);
+     }
+-    #[cfg(not(any(feature = "pvm-precompile", feature = "vos-blake2b")))]
++    #[cfg(not(any(feature = "pvm-precompile", feature = "vos-blake2b", feature = "vos-core-blake2b")))]
+     {
+         let mut h = Blake2b256::new();
+         h.update(domain);
+@@ -43,15 +48,20 @@ pub fn blake2b_512(domain: &[u8], parts: &[&[u8]]) -> [u8; 64] {
+     // PVM (or VOS's precompile 100 where the runtime serves it), streaming the
+     // input without the digest wrapper's per-hash buffer copies; elsewhere
+     // blake2b_simd. The same digest as the `blake2` crate.
+-    #[cfg(feature = "vos-blake2b")]
++    // vos-core's precompile 0x400 (`vos-core-blake2b`), streaming the input a block a call.
++    #[cfg(feature = "vos-core-blake2b")]
++    {
++        return vos_core_precompiles::blake2b_hash::<64>(domain, parts);
++    }
++    #[cfg(all(feature = "vos-blake2b", not(feature = "vos-core-blake2b")))]
+     {
+         return vos_protocol::blake2b::digest::<64>(domain, parts);
+     }
+-    #[cfg(all(feature = "pvm-precompile", not(feature = "vos-blake2b")))]
++    #[cfg(all(feature = "pvm-precompile", not(any(feature = "vos-blake2b", feature = "vos-core-blake2b"))))]
+     {
+         return zkpvm_precompiles::blake2b_hash::<64>(domain, parts);
+     }
+-    #[cfg(not(any(feature = "pvm-precompile", feature = "vos-blake2b")))]
++    #[cfg(not(any(feature = "pvm-precompile", feature = "vos-blake2b", feature = "vos-core-blake2b")))]
+     {
+         let mut h = Blake2b512::new();
+         h.update(domain);

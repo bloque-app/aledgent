@@ -1,0 +1,22 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# W2 (gate G1): the spike's workloads, driven through core_binding's Driver over RemotePort to the
+# spike's host (../host serve), as `aledgent-core-host measure` drives saga's runtime. No VOS.
+# Never shipped. Its own workspace; the root's stable toolchain.
+[workspace]
+
+[package]
+name = "aledgent-g1"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/bloque-app/aledgent"
+
+[dependencies]
+core-binding = { path = "../../../crates/core-binding", features = ["std"] }
+ledger-core = { path = "../../../crates/ledger-core" }
+ledger-kernel = { path = "../../../crates/ledger-kernel" }
+
+[profile.release]
+debug = false

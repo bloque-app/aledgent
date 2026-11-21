@@ -1,0 +1,40 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# W2 (gate G1): the spike's host. Never shipped. It runs the spike's guest (../guest) as an
+# installed actor of vos-core's default agent, on vos-core's own node host for tests
+# (`vos-testkit`), and measures it:
+#
+# - `fit`: the derivation (install) time, the compact code blob against the 2 MiB bound, the
+#   backend this host runs;
+# - `serve`: core_binding::host::RemotePort's raw port (`RawRequest` / `RawResponse`, postcard,
+#   length-prefixed frames) over TCP, one fresh agent per connection, every invocation's gas,
+#   argument bytes, outcome and (probe build) peak heap written as CSV. The conformance suite's
+#   `through-agent/vos` target and `aledgent-g1` (../client) drive it.
+#
+# Links vos-core (AGPL-3.0-or-later) from a checkout at `../.vos` (vos.sh), pinned at 1650c474.
+# Built with vos-core's workspace toolchain (rust-toolchain.toml).
+[workspace]
+
+[package]
+name = "aledgent-vos-core-host"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/bloque-app/aledgent"
+
+[dependencies]
+vos-testkit = { path = "../.vos/agent/testkit" }
+vos-abi = { path = "../.vos/pvm/abi" }
+vos-wire = { path = "../.vos/agent/wire" }
+vos-pvm = { path = "../.vos/pvm/runtime" }
+vos-pvm-compiler = { path = "../.vos/pvm/compiler" }
+vos-pvm-program = { path = "../.vos/pvm/program" }
+# The envelope, to name each input's command classes (no VOS, no std).
+core-binding = { path = "../../../crates/core-binding", default-features = false, features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["alloc"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+debug = false

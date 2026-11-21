@@ -1,0 +1,29 @@
+diff --git a/pvm/compiler/src/linker/layout.rs b/pvm/compiler/src/linker/layout.rs
+index 959b7738b..b6d464762 100644
+--- a/pvm/compiler/src/linker/layout.rs
++++ b/pvm/compiler/src/linker/layout.rs
+@@ -97,7 +97,10 @@ pub(crate) fn spi_blob(t: TranspiledElf) -> Result<Vec<u8>, TranspileError> {
+         ro_data,
+         rw_data,
+         heap_pages,
+-        stack_size: t.ro_base as u32,
++        // aledgent W2, measurement only: ALEDGENT_W2_MIN_STACK raises the stack (bytes).
++        stack_size: (t.ro_base as u32).max(
++            std::env::var("ALEDGENT_W2_MIN_STACK").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
++        ),
+         code: CodeBlob {
+             jump_table: t.jump_table,
+             code: t.code,
+diff --git a/pvm/runtime/src/inner.rs b/pvm/runtime/src/inner.rs
+index 950e52b7f..87a86ab71 100644
+--- a/pvm/runtime/src/inner.rs
++++ b/pvm/runtime/src/inner.rs
+@@ -149,7 +149,7 @@ pub mod budget {
+     /// The longest compact code blob `machine` prepares, or `instantiate`
+     /// lends a machine of: the recompiler's code bound, so every inner
+     /// program a VOS host takes runs on either backend.
+-    pub const MACHINE_BLOB: usize = 2 << 20;
++    pub const MACHINE_BLOB: usize = 4 << 20; // aledgent W2: measurement only, raised from 2 MiB
+     /// The blob bytes the invocation's live machines hold together.
+     pub const LIVE_BLOBS: usize = 4 << 20;
+     /// The blob bytes `machine` prepares in one invocation, expunged
