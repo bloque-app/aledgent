@@ -86,11 +86,36 @@ fn parse_matchers(body: &str) -> Result<BTreeMap<String, String>, Error> {
     Ok(out)
 }
 
+/// `s` split on whitespace outside double quotes, so a quoted matcher value may hold spaces, or the
+/// word `and`, without ending the word it is in (`T-018-13`). An unclosed quote is refused.
+fn words(s: &str) -> Result<Vec<String>, Error> {
+    let (mut out, mut word, mut quoted) = (Vec::new(), String::new(), false);
+    for c in s.chars() {
+        if c == '"' {
+            quoted = !quoted;
+        }
+        if c.is_whitespace() && !quoted {
+            if !word.is_empty() {
+                out.push(std::mem::take(&mut word));
+            }
+        } else {
+            word.push(c);
+        }
+    }
+    if quoted {
+        return Err(Error::Config(format!("{s:?} has an unclosed quote")));
+    }
+    if !word.is_empty() {
+        out.push(word);
+    }
+    Ok(out)
+}
+
 impl Expr {
     /// Parse `metric{label="value",...} op integer`, or several joined by `and`.
     pub fn parse(s: &str) -> Result<Expr, Error> {
-        let words: Vec<&str> = s.split_whitespace().collect();
-        if let Some(at) = words.iter().position(|w| *w == "and") {
+        let words = words(s)?;
+        if let Some(at) = words.iter().position(|w| w == "and") {
             let (left, right) = (words[..at].join(" "), words[at + 1..].join(" "));
             let mut e = Expr::parse_one(&left)?;
             e.and = Some(Box::new(Expr::parse(&right)?));
@@ -135,7 +160,8 @@ impl Expr {
 
     fn parse_one(s: &str) -> Result<Expr, Error> {
         let bad = || Error::Config(format!("{s:?} is not `metric{{...}} op integer`"));
-        let mut parts = s.split_whitespace();
+        let words = words(s)?;
+        let mut parts = words.iter().map(String::as_str);
         let (series, op, value) = (
             parts.next().ok_or_else(bad)?,
             parts.next().ok_or_else(bad)?,
@@ -489,5 +515,25 @@ mod tests {
         assert_eq!(both.metrics(), ["a", "b"]);
         let inline = ROUTES.replace("url_file:", "url:");
         assert!(Routing::parse(&inline).is_err());
+    }
+
+    /// `and` inside a quoted matcher value is the value's, not the joining word (`T-018-13`).
+    #[test]
+    fn t_018_13_and_inside_a_quoted_value_is_not_a_join() {
+        let one = Expr::parse("a{kind=\"stand and deliver\"} > 0").unwrap();
+        assert_eq!(one.metrics(), ["a"]);
+        assert_eq!(
+            one.matchers.get("kind").map(String::as_str),
+            Some("stand and deliver")
+        );
+        assert!(one.and.is_none());
+        let word = Expr::parse("a{kind=\"and\"} > 0 and b{x=\"y and z\"} > 1").unwrap();
+        assert_eq!(word.metrics(), ["a", "b"]);
+        assert_eq!(word.matchers.get("kind").map(String::as_str), Some("and"));
+        let right = word.and.as_deref().unwrap();
+        assert_eq!(right.matchers.get("x").map(String::as_str), Some("y and z"));
+        assert_eq!(right.threshold, 1);
+        assert!(Expr::parse("a{kind=\"and\"} > 0 and").is_err());
+        assert!(Expr::parse("a{kind=\"open} > 0").is_err());
     }
 }

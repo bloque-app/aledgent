@@ -152,7 +152,9 @@ groups:
       # DEC-6, RISK-7: the ticker. Deadlines move only on ticks. When the core says nothing is due,
       # the ticker logs a tick only once per heartbeat (ingress's `tick_heartbeat`, 60 s by
       # default; stress finding F2), so an idle book's tick age reaches about a minute by design.
-      # The line is that heartbeat and a margin (T-018-14).
+      # The line is that heartbeat and a margin (T-018-14). Hard constraint: this 90 s line holds
+      # only while `tick_heartbeat` is 60 s (the default). Raising `tick_heartbeat` means raising
+      # this line with it, to the new heartbeat plus 30 s, or an idle book pages.
       - alert: AledgentTickerStale
         expr: aledgent_ticker_age_ms > 90000
         labels: { severity: page, owner: platform, signal: ticker }
