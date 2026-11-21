@@ -7,7 +7,7 @@
 //! | Age of the oldest non-terminal operation (`REQ-OP-8`) | `aledgent_oldest_non_terminal_age_ms`; `aledgent_oldest_undecided_row_age_ms` (`REQ-CS-7`) | core; ingress's received-log |
 //! | Observation completeness (`REQ-SA-7`, `REQ-IN-5`) | `aledgent_observation_cursor_lag`, `aledgent_observation_gaps_total`, `aledgent_observation_chain_mismatches`, `aledgent_observation_stopped` | adapter |
 //! | Undelivered notifications, count and age (`REQ-EV-6`) | `aledgent_undelivered_notifications`, `aledgent_oldest_undelivered_age_ms` | core's outbox |
-//! | Anchor lag | `aledgent_anchor_lag_ms`, `aledgent_anchor_in_flight_age_ms` | core (`F-017`'s anchor store) |
+//! | Anchor lag | `aledgent_anchor_lag_ms`, `aledgent_anchor_in_flight_age_ms`, `aledgent_anchor_unanchored_entries` (`T-018-13`; absent from an older core) | core (`F-017`'s anchor store) |
 //! | Reconciliation outcome per axis (`NFR-9`) | `aledgent_reconciliation_differences`, `aledgent_reconciliation_last_run_age_ms` | reconciliation records |
 //! | Liquidity of the positions funding settlement (`REQ-SN-2`) | `aledgent_position`, `aledgent_lane_under_fee_floor`, `aledgent_liquidity_alerts` | adapter |
 //! | Ticker age (`DEC-6`, `RISK-7`) | `aledgent_ticker_age_ms` | core |
@@ -64,7 +64,11 @@ pub const SIGNALS: &[(&str, &[&str])] = &[
     ),
     (
         "anchor-lag",
-        &["aledgent_anchor_lag_ms", "aledgent_anchor_in_flight_age_ms"],
+        &[
+            "aledgent_anchor_lag_ms",
+            "aledgent_anchor_in_flight_age_ms",
+            "aledgent_anchor_unanchored_entries",
+        ],
     ),
     (
         "reconciliation",
@@ -494,6 +498,16 @@ fn anchoring(e: &mut Exposition, c: &SignalsBody) {
         &[],
         c.anchor_in_flight_age.unwrap_or(0),
     );
+    // Only when the core reports it: an older core host yields no series, never a zero that
+    // would read as "nothing to anchor" (`T-018-13`).
+    if let Some(n) = c.anchor_unanchored_entries {
+        e.gauge(
+            "aledgent_anchor_unanchored_entries",
+            "Postings past the latest checkpoint, of any status (T-018-13, AC-J1.1): what the next checkpoint would cover. Zero means nothing new to anchor, so a growing anchor lag is not a late anchor.",
+            &[],
+            n,
+        );
+    }
     let mut kinds: BTreeMap<&str, u64> = ANCHOR_INCIDENTS.iter().map(|k| (*k, 0)).collect();
     for i in &c.anchor_incidents {
         kinds.insert(i.kind.as_str(), i.count);

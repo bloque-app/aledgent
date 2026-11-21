@@ -96,3 +96,39 @@ fn t037_23_the_signals_field_is_optional_in_both_directions() {
     let plain = serde_json::to_value(SignalsBody::default()).unwrap();
     assert!(plain.get("writer_code").is_none(), "{plain}");
 }
+
+/// `T-018-13`: the postings past the latest checkpoint are optional both ways, as the writer's code
+/// is: a body from an older core has no field and exports no series; one with it, even at zero,
+/// exports it.
+#[test]
+fn t_018_13_the_unanchored_entries_are_optional_in_both_directions() {
+    let mut older = serde_json::to_value(SignalsBody {
+        anchor_unanchored_entries: Some(4),
+        ..SignalsBody::default()
+    })
+    .unwrap();
+    assert_eq!(older["anchor_unanchored_entries"], serde_json::json!(4));
+    older
+        .as_object_mut()
+        .unwrap()
+        .remove("anchor_unanchored_entries");
+    let s: SignalsBody = serde_json::from_value(older).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(s.anchor_unanchored_entries, None);
+    let plain = serde_json::to_value(SignalsBody::default()).unwrap();
+    assert!(plain.get("anchor_unanchored_entries").is_none(), "{plain}");
+    let show = |n: Option<u64>| {
+        render(&Snapshot {
+            core: Some(SignalsBody {
+                anchor_unanchored_entries: n,
+                ..SignalsBody::default()
+            }),
+            ..Snapshot::default()
+        })
+    };
+    assert!(!show(None).contains("aledgent_anchor_unanchored_entries"));
+    for n in [0, 7] {
+        let text = show(Some(n));
+        let line = format!("aledgent_anchor_unanchored_entries {n}");
+        assert!(text.lines().any(|l| l == line), "{line}:\n{text}");
+    }
+}

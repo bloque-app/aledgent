@@ -9,8 +9,8 @@
 //! **those very files** here — the rule expressions against the exporter's rendered metrics, the
 //! `for` durations over time, the routing tree to its receiver — and a test receiver stands for
 //! the pager. The subset evaluated is the one the files use, and [`Rules::parse`] refuses any
-//! other: every expression is `metric{label="value",...} op integer`, and every matcher of the
-//! routes is `label="value"`.
+//! other: every expression is `metric{label="value",...} op integer`, or such comparisons joined
+//! by `and` (`T-018-13`), and every matcher of the routes is `label="value"`.
 
 use std::collections::BTreeMap;
 
@@ -64,6 +64,9 @@ pub struct Expr {
     pub op: Op,
     /// The line.
     pub threshold: i128,
+    /// The comparison joined by `and`, if any (`T-018-13`): as Prometheus's `and`, a sample of
+    /// this one is kept only if a sample with the same labels holds it too.
+    pub and: Option<Box<Expr>>,
 }
 
 fn parse_matchers(body: &str) -> Result<BTreeMap<String, String>, Error> {
@@ -84,8 +87,53 @@ fn parse_matchers(body: &str) -> Result<BTreeMap<String, String>, Error> {
 }
 
 impl Expr {
-    /// Parse `metric{label="value",...} op integer`.
+    /// Parse `metric{label="value",...} op integer`, or several joined by `and`.
     pub fn parse(s: &str) -> Result<Expr, Error> {
+        let words: Vec<&str> = s.split_whitespace().collect();
+        if let Some(at) = words.iter().position(|w| *w == "and") {
+            let (left, right) = (words[..at].join(" "), words[at + 1..].join(" "));
+            let mut e = Expr::parse_one(&left)?;
+            e.and = Some(Box::new(Expr::parse(&right)?));
+            return Ok(e);
+        }
+        Expr::parse_one(s)
+    }
+
+    /// The metrics it reads, in order.
+    pub fn metrics(&self) -> Vec<&str> {
+        let mut out = vec![self.metric.as_str()];
+        let mut next = self.and.as_deref();
+        while let Some(e) = next {
+            out.push(e.metric.as_str());
+            next = e.and.as_deref();
+        }
+        out
+    }
+
+    /// Whether the sample `(name, labels, value)` is this comparison's and holds it.
+    fn holds(&self, name: &str, labels: &BTreeMap<String, String>, value: i128) -> bool {
+        name == self.metric
+            && self.matchers.iter().all(|(k, v)| labels.get(k) == Some(v))
+            && self.op.holds(value, self.threshold)
+    }
+
+    /// Whether the sample is kept: it holds this comparison, and every one joined by `and` is
+    /// held by a sample with the same labels.
+    fn keeps(
+        &self,
+        name: &str,
+        labels: &BTreeMap<String, String>,
+        value: i128,
+        all: &[Sample],
+    ) -> bool {
+        self.holds(name, labels, value)
+            && self.and.as_deref().is_none_or(|e| {
+                all.iter()
+                    .any(|(n, l, v)| l == labels && e.keeps(n, l, *v, all))
+            })
+    }
+
+    fn parse_one(s: &str) -> Result<Expr, Error> {
         let bad = || Error::Config(format!("{s:?} is not `metric{{...}} op integer`"));
         let mut parts = s.split_whitespace();
         let (series, op, value) = (
@@ -124,6 +172,7 @@ impl Expr {
             matchers,
             op,
             threshold: value.parse().map_err(|_| bad())?,
+            and: None,
         })
     }
 }
@@ -260,13 +309,7 @@ impl Evaluator {
         let mut held = BTreeMap::new();
         for rule in &self.rules.0 {
             for (name, labels, value) in samples {
-                let selected = *name == rule.expr.metric
-                    && rule
-                        .expr
-                        .matchers
-                        .iter()
-                        .all(|(k, v)| labels.get(k) == Some(v));
-                if !selected || !rule.expr.op.holds(*value, rule.expr.threshold) {
+                if !rule.expr.keeps(name, labels, *value, samples) {
                     continue;
                 }
                 let key = (rule.alert.clone(), labels.clone());
@@ -440,6 +483,10 @@ mod tests {
         assert!(Expr::parse("a_b{x=~\"y\"} > 1").is_err());
         assert!(Expr::parse("rate(a[5m]) > 1").is_err());
         assert!(Expr::parse("a > 1.5").is_err());
+        assert!(Expr::parse("a > 1 or b > 0").is_err());
+        assert!(Expr::parse("a > 1 and").is_err());
+        let both = Expr::parse("a > 1 and b{x=\"y\"} > 0").unwrap();
+        assert_eq!(both.metrics(), ["a", "b"]);
         let inline = ROUTES.replace("url_file:", "url:");
         assert!(Routing::parse(&inline).is_err());
     }

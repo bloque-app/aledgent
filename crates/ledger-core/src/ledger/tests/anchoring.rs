@@ -466,6 +466,43 @@ fn ac_j1_1_a_checkpoint_appears_within_one_interval_when_entries_exist_and_none_
     assert!(s.checkpoint(2).unwrap().entry_sequence > s.checkpoint(1).unwrap().entry_sequence);
 }
 
+/// `T-018-13`, `AC-J1.1`, `NFR-11`: the signals count the postings past the latest checkpoint, of any
+/// status, by the test the cadence makes: every posting before the first, none once a checkpoint
+/// covers them however long the book stays quiet (the anchor lag grows, and nothing is late), and
+/// those of each new transfer until the next checkpoint takes them.
+#[test]
+fn t_018_13_the_signals_count_the_postings_past_the_latest_checkpoint() {
+    let mut ax = Ax::new();
+    let ops = staff(&mut ax.fx, &[OperatorOpKind::ReadSignals]);
+    let read = |ax: &Ax, now: Time| ax.fx.ledger.signals(&ops, now).unwrap();
+    let head = |ax: &Ax| ax.fx.ledger.book().store().next_posting_seq().unwrap();
+    let (who, acct) = funded(&mut ax.fx, 100);
+    let (_, other) = empty(&mut ax.fx);
+    // Before the first checkpoint: every posting.
+    assert!(head(&ax) > 0);
+    assert_eq!(read(&ax, 30).anchor_unanchored_entries, Some(head(&ax)));
+    assert_eq!(read(&ax, 30).anchor_lag, None);
+    assert_eq!(ax.tick(40), Some(1));
+    // In flight, it covers them: nothing past it.
+    assert_eq!(read(&ax, 41).anchor_unanchored_entries, Some(0));
+    ax.finalise(1);
+    // A quiet book: the lag grows past any line, and nothing waits to be anchored.
+    assert_eq!(ax.tick(10_000), None);
+    let quiet = read(&ax, 10_000);
+    assert_eq!(quiet.anchor_lag, Some(10_000 - 40));
+    assert_eq!(quiet.anchor_unanchored_entries, Some(0));
+    // A transfer: its postings wait past the checkpoint, until the next tick takes them.
+    let before = head(&ax);
+    transfer(&mut ax, who, acct, other, 1);
+    let waiting = head(&ax) - before;
+    assert!(waiting > 0);
+    assert_eq!(read(&ax, 10_000).anchor_unanchored_entries, Some(waiting));
+    assert_eq!(ax.tick(10_001), Some(2));
+    let c = *ax.fx.ledger.state().anchoring().checkpoint(2).unwrap();
+    assert_eq!(c.entry_sequence + 1, head(&ax));
+    assert_eq!(read(&ax, 10_001).anchor_unanchored_entries, Some(0));
+}
+
 #[test]
 fn req_pr_1_anchor_checkpoint_on_demand_is_an_audited_operator_command() {
     let mut ax = Ax::new();
