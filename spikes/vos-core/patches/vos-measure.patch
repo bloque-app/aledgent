@@ -1,3 +1,16 @@
+diff --git a/pvm/abi/src/defaults.rs b/pvm/abi/src/defaults.rs
+index c310e839c..3fccd7f71 100644
+--- a/pvm/abi/src/defaults.rs
++++ b/pvm/abi/src/defaults.rs
+@@ -10,7 +10,7 @@ pub const SWEEP_BINDINGS: usize = 64;
+ pub const HANDLER_GAS: u64 = 10_000_000;
+ /// The most gas a handler's schema may request: node policy, which
+ /// the agent and the testkit read here.
+-pub const MAX_HANDLER_GAS: u64 = 100_000_000;
++pub const MAX_HANDLER_GAS: u64 = 400_000_000; // aledgent W2: measurement only, raised from 100 M
+ /// Gas the agent accounts for serving one precompile call of an inner
+ /// machine, beyond the price the machine pays: the exit, the copies in
+ /// and out, and the computation, natively on a VOS node (about 5,000 in
 diff --git a/pvm/compiler/src/linker/layout.rs b/pvm/compiler/src/linker/layout.rs
 index 959b7738b..b6d464762 100644
 --- a/pvm/compiler/src/linker/layout.rs

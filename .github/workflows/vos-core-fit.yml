@@ -22,7 +22,7 @@ on:
       stacks:
         description: "stack floors, bytes"
         type: string
-        default: "65536 98304 131072"
+        default: "98304"
       n:
         description: "operations a workload"
         type: string
@@ -72,7 +72,7 @@ jobs:
 
       - name: run
         env:
-          STACKS: ${{ inputs.stacks || '65536 98304 131072' }}
+          STACKS: ${{ inputs.stacks || '98304' }}
           N: ${{ inputs.n || '40' }}
           CONFORMANCE: "1"
         run: |

@@ -14,7 +14,8 @@ license = "Apache-2.0 OR MIT"
 repository = "https://github.com/bloque-app/aledgent"
 
 [dependencies]
-core-binding = { path = "../../../crates/core-binding", features = ["std"] }
+core-binding = { path = "../../../crates/core-binding", features = ["std", "ingress"] }
+serde_json = "1"
 ledger-core = { path = "../../../crates/ledger-core" }
 ledger-kernel = { path = "../../../crates/ledger-kernel" }
 compact-smt = { path = "../../../crates/compact-smt" }

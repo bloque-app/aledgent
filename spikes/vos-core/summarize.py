@@ -42,6 +42,17 @@ for path in sorted(glob.glob(os.path.join(out, "fit-*.txt"))):
     )
 print()
 
+sizes = os.path.join(out, "archive.sizes")
+if os.path.exists(sizes):
+    with open(sizes) as f:
+        recs = list(csv.DictReader(f))
+    if recs:
+        big = max(recs, key=lambda r: int(r["request"]))
+        print(
+            f"- **Recorded book** (code-history fixture, {len(recs)} invocations, each input alone): "
+            f"largest request {int(big['request']):,} B ({big['classes']}) against {REQUEST:,}\n"
+        )
+
 rows = []
 for path in sorted(glob.glob(os.path.join(out, "*.csv"))):
     run = os.path.basename(path)[:-4]
@@ -53,6 +64,10 @@ for path in sorted(glob.glob(os.path.join(out, "*.csv"))):
 if not rows:
     print("No samples.")
     sys.exit(0)
+
+# Row 3d's fix (z, core path only) is reported apart: it is another program.
+zrows = [r for r in rows if r["run"].startswith("zcore-")]
+rows = [r for r in rows if not r["run"].startswith("zcore-")]
 
 by_class = defaultdict(list)
 for r in rows:
@@ -89,3 +104,19 @@ failed = [r for r in rows if r["outcome"] != "done"]
 if failed:
     print(f"- Inputs that did not run to a reply: {len(failed)}, by run: "
           + ", ".join(sorted({r['run'] + ':' + r['outcome'] for r in failed})))
+
+if zrows:
+    print("\n## Row 3d's fix: opt-level z, linked without `--unique`, the core path only\n")
+    print("| Class | Backend | Inputs | Gas p50 | Gas max | Max vs 80 M | Time p50 (us) |")
+    print("|---|---|---:|---:|---:|---|---:|")
+    groups = defaultdict(list)
+    for r in zrows:
+        backend = r["run"].split("-")[1]
+        key = r["kind"] if r["kind"] != "input" else r["classes"]
+        groups[(key, backend)].append(r)
+    for (key, backend), rs in sorted(groups.items(), key=lambda kv: (-max(int(r["gas"]) for r in kv[1]), kv[0][1])):
+        gas = sorted(int(r["gas"]) for r in rs)
+        us = sorted(int(r["us"]) for r in rs)
+        mx = gas[-1]
+        verdict = "pass" if mx <= GAS_GATE else ("over 80 M" if mx <= GAS_CEILING else "OVER 100 M")
+        print(f"| {key} | {backend} | {len(rs)} | {gas[(len(gas)-1)//2]:,} | {mx:,} | {verdict} | {us[(len(us)-1)//2]:,} |")

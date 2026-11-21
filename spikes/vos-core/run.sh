@@ -55,9 +55,12 @@ git -C "$HERE/.vos" diff --stat
 
 step guests
 # opt:features:flag (MERGED: linked without --unique; SOFT: BLAKE2b in software)
-for spec in "s:be-memcmp:" "s:heap-probe,be-memcmp:" "s::" "s:be-memcmp:SOFT" "z:be-memcmp:MERGED"; do
+for spec in "s:be-memcmp:" "s:heap-probe,be-memcmp:" "s::" "s:be-memcmp:SOFT" "z:be-memcmp:MERGED" \
+    "s:be-memcmp:CORE_ONLY" "z:be-memcmp:MERGED,CORE_ONLY"; do
   IFS=: read -r opt feats flag <<< "$spec"
   case $flag in
+    MERGED,CORE_ONLY) OPT=$opt FEATURES=$feats MERGED=1 CORE_ONLY=1 "$HERE/guest/build.sh" | tail -1 ;;
+    CORE_ONLY) OPT=$opt FEATURES=$feats CORE_ONLY=1 "$HERE/guest/build.sh" | tail -1 ;;
     MERGED) OPT=$opt FEATURES=$feats MERGED=1 "$HERE/guest/build.sh" | tail -1 ;;
     SOFT) OPT=$opt FEATURES=$feats SOFT=1 "$HERE/guest/build.sh" | tail -1 ;;
     *) OPT=$opt FEATURES=$feats "$HERE/guest/build.sh" | tail -1 ;;
@@ -72,7 +75,8 @@ HOST=$HERE/host/target/release/aledgent-vos-core-host
 CLIENT=$HERE/client/target/release/aledgent-g1
 
 step fit
-for elf in aledgent-core-vos-s-be-memcmp.elf aledgent-core-vos-z-be-memcmp-merged.elf; do
+for elf in aledgent-core-vos-s.elf aledgent-core-vos-s-be-memcmp.elf aledgent-core-vos-z-be-memcmp-merged.elf \
+    aledgent-core-vos-s-be-memcmp-core-only.elf aledgent-core-vos-z-be-memcmp-merged-core-only.elf; do
   echo "--- $elf"
   "$HOST" fit "$G/$elf" 2>/dev/null | tee "$OUT/fit-${elf%.elf}.txt"
 done
@@ -120,12 +124,31 @@ for stack in $STACKS; do
     echo "$mix stack $stack: exit $? $(tail -1 "$csv.client.log")"
     stop
   done
-  csv=$OUT/grown-reserve-$stack.csv
-  serve "$G/aledgent-core-vos-s-be-memcmp.elf" "$csv" "$stack" "$BACK" || continue
-  "$CLIENT" "tcp:127.0.0.1:$port" reserve --n "$N" --grow "$GROW" > "$csv.client.log" 2>&1
-  echo "grown reserve stack $stack: exit $? $(tail -1 "$csv.client.log")"
-  stop
+  for mix in reserve card; do
+    csv=$OUT/grown-$mix-$stack.csv
+    serve "$G/aledgent-core-vos-s-be-memcmp.elf" "$csv" "$stack" "$BACK" || continue
+    "$CLIENT" "tcp:127.0.0.1:$port" $mix --n "$N" --grow "$GROW" > "$csv.client.log" 2>&1
+    echo "grown $mix stack $stack: exit $? $(tail -1 "$csv.client.log")"
+    stop
+  done
 done
+
+step "row 3d's fix: opt-level z, linked without --unique, the core path only (on each backend)"
+Z=$G/aledgent-core-vos-z-be-memcmp-merged-core-only.elf
+for backend in $BACKENDS; do
+  for mix in $MIXES; do
+    csv=$OUT/zcore-$backend-$mix.csv
+    serve "$Z" "$csv" "${STACKS##* }" "$backend" || continue
+    "$CLIENT" "tcp:127.0.0.1:$port" "$mix" --n "$N" > "$csv.client.log" 2>&1
+    echo "zcore $backend $mix: exit $? $(tail -1 "$csv.client.log")"
+    stop
+  done
+done
+
+step "the recorded book's requests (crates/core-binding/tests/fixtures/code-history)"
+"$CLIENT" archive "$HERE/../../crates/core-binding/tests/fixtures/code-history" \
+  > "$OUT/archive.sizes" 2> "$OUT/archive.log"
+tail -1 "$OUT/archive.log"
 
 step "BLAKE2b in software, for the precompile's saving"
 csv=$OUT/soft-reserve.csv

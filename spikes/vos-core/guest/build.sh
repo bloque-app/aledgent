@@ -16,7 +16,8 @@ cd "$(dirname "$0")"
 args=(--release --target riscv64em-vos.json)
 [ -n "${MERGED:-}" ] && args=(--release --target merged/riscv64em-vos.json)
 [ -n "${FEATURES:-}" ] && args+=(--features "$FEATURES")
-[ -n "${SOFT:-}" ] && args+=(--no-default-features)
+[ -n "${SOFT:-}" ] && args+=(--no-default-features --features full)
+[ -n "${CORE_ONLY:-}" ] && args+=(--no-default-features --features precompile)
 if [ -n "${OPT:-}" ]; then export CARGO_PROFILE_RELEASE_OPT_LEVEL=$OPT; fi
 if [ "${SECTIONS:-}" = one ]; then
   export RUSTFLAGS="-Zunstable-options -Clink-arg=-Tpvm.ld -Zfunction-sections=no"
@@ -27,6 +28,7 @@ opt=${OPT:-s}; suffix=""; [ -n "${FEATURES:-}" ] && suffix="-${FEATURES//,/-}"
 [ "${SECTIONS:-}" = one ] && suffix="$suffix-one"
 [ -n "${MERGED:-}" ] && suffix="$suffix-merged"
 [ -n "${SOFT:-}" ] && suffix="$suffix-soft"
+[ -n "${CORE_ONLY:-}" ] && suffix="$suffix-core-only"
 mkdir -p target/out
 cp target/riscv64em-vos/release/aledgent-core-vos.elf "target/out/aledgent-core-vos-$opt$suffix.elf"
 echo "target/out/aledgent-core-vos-$opt$suffix.elf"

@@ -101,7 +101,10 @@ pub struct AledgentCore {
 impl AledgentCore {
     /// One invocation of the binding: `message` an encoded `core_binding::envelope::Envelope`,
     /// `blobs` its caller blobs; the reply an encoded `Reply`.
-    #[msg(gas = 100_000_000)]
+    // 400 M: vos-core caps a handler's ask at `MAX_HANDLER_GAS`, 100 M, so on vos-core this is
+    // 100 M. patches/vos-measure.patch raises the cap to 400 M, for measurement only, so that the
+    // run sees what an input past 100 M costs instead of `OutOfGas`.
+    #[msg(gas = 400_000_000)]
     pub async fn apply(
         &mut self,
         ctx: &mut Command<Self>,
