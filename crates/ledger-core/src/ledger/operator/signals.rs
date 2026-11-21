@@ -29,6 +29,7 @@ use crate::refusal::Refusal;
 
 /// The core's signals at one time. See the module documentation.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Signals {
     /// Non-terminal operations.
     pub open: u64,
@@ -79,6 +80,7 @@ pub struct Signals {
 /// The book's size, counted by the collections that hold it, never by visiting a record
 /// (`T-018-11`, the trigger of `T-036-17`, ruling `a0022-q5`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BookSize {
     /// The book's records, in a chainspec's unit (`F-036`): one for each identity, ledger
     /// account, grant (authority, issuance and operator-surface), alias and operation (`F-007`)
@@ -109,6 +111,7 @@ const RECORD_KINDS: [u8; 6] = [
 
 /// A seeded genesis's progress, as the signals carry it: counts only.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SpecSignal {
     /// Chunks applied, the header included.
     pub applied: u32,
