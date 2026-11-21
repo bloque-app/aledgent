@@ -36,17 +36,21 @@ async fn commands(d: &Deployment) -> usize {
         .count()
 }
 
+/// The one public route (`NFR-7`, amendment 0044).
+const OPENAPI_PATH: &str = "/openapi.json";
+
 fn is_refusal(v: &Value, r: Refusal) -> bool {
     *v == json!({ "error": r.code(), "description": r.description() })
 }
 
-/// `NFR-7`: every route, an unknown one and a wrong method included, refuses a caller with no
-/// credential or an unknown one, with `ERR-CredentialInvalid`.
+/// `NFR-7`: every route but the API description, an unknown one and a wrong method included,
+/// refuses a caller with no credential or an unknown one, with `ERR-CredentialInvalid`.
 #[tokio::test(flavor = "multi_thread")]
 async fn nfr_7_every_route_refuses_the_unauthenticated() {
     let d = Deployment::start().await;
     let mut routes: Vec<(String, String)> = ROUTES
         .iter()
+        .filter(|r| r.path != OPENAPI_PATH)
         .map(|r| (r.method.to_owned(), path_of(r.path)))
         .collect();
     routes.push(("GET".into(), "/v1/no-such-route".into()));
@@ -73,6 +77,45 @@ async fn nfr_7_every_route_refuses_the_unauthenticated() {
                 .as_ref()
                 .is_some_and(|c| c.principal == d.operator.identity)
     }));
+}
+
+/// `NFR-7`, amendment 0044: the API description answers 200 with no credential, and with a bad
+/// one, and is the document the crate generates. Nothing else opens: a sample of routes (the
+/// metrics, a query, a command, the operator's, an unknown path, and the OpenAPI path with a
+/// method it does not take) still refuses without a credential.
+#[tokio::test(flavor = "multi_thread")]
+async fn nfr_7_the_api_description_is_public_and_nothing_else_is() {
+    let d = Deployment::start().await;
+    for token in [None, Some("not-a-token")] {
+        let (s, v) = d.call("GET", OPENAPI_PATH, token, &[], None).await;
+        assert_eq!(s, StatusCode::OK, "{token:?}");
+        assert_eq!(v, openapi::document(), "{token:?}");
+    }
+    for (method, path) in [
+        ("GET", "/metrics"),
+        ("GET", "/v1/assets"),
+        ("GET", "/v1/trial-balance"),
+        ("GET", "/v1/ops/signals"),
+        ("POST", "/v1/transfers"),
+        ("GET", "/v1/no-such-route"),
+        ("GET", "/openapi.json/"),
+        ("GET", "/docs"),
+        ("GET", "/api"),
+        ("POST", OPENAPI_PATH),
+    ] {
+        for token in [None, Some("not-a-token")] {
+            let (s, v) = d.call(method, path, token, &[], Some(json!({}))).await;
+            assert_eq!(
+                s,
+                StatusCode::UNAUTHORIZED,
+                "{method} {path} with {token:?}"
+            );
+            assert!(
+                is_refusal(&v, Refusal::CredentialInvalid),
+                "{method} {path}: {v}"
+            );
+        }
+    }
 }
 
 /// `AC-A1.3` at the surface, `REQ-OP-10`: a repeat with the same client key and body returns the

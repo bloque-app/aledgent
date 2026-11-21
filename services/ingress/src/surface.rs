@@ -23,8 +23,9 @@
 //! A refusal is a 4xx whose body is `{"error", "description"}` (`REQ-CS-4`), with the status the
 //! OpenAPI document publishes for it ([`status_of`]).
 //!
-//! **Deny by default** (`NFR-7`). Every route, the OpenAPI document and the metrics included,
-//! authenticates first; an unknown route or method is refused the same way.
+//! **Deny by default** (`NFR-7`). Every route, the metrics included, authenticates first; an
+//! unknown route or method is refused the same way. The one exception is the OpenAPI document,
+//! which is public and carries no ledger fact (amendment 0044).
 //!
 //! **The access log** keeps the request id, the principal, the route's name and the status: never
 //! a header, a body or a URL, so no credential can reach it (`REQ-AU-8`, `REQ-PV-5`).
@@ -2601,17 +2602,12 @@ async fn handle_metrics<S: Store, C: Core>(
     logged(resp, Some(&who), "metrics")
 }
 
-async fn handle_openapi<S: Store, C: Core>(
-    State(shared): State<Arc<Shared<S, C>>>,
-    headers: HeaderMap,
-) -> Response {
-    let who = match credentials::authenticate(&shared, &headers).await {
-        Ok(a) => a,
-        Err(r) => return logged(refusal(r), None, "openapi"),
-    };
+/// The API description is public (`NFR-7`, amendment 0044): no credential is read, and the
+/// document carries no ledger fact. It is the one route that answers without one.
+async fn handle_openapi<S: Store, C: Core>(State(_): State<Arc<Shared<S, C>>>) -> Response {
     logged(
         (StatusCode::OK, axum::Json(crate::openapi::document())).into_response(),
-        Some(&who),
+        None,
         "openapi",
     )
 }

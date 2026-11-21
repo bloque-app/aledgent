@@ -1,9 +1,9 @@
 ---
 name: aledgent
 summary: A private, provable ledger of record — identities that own accounts, value that moves between them instantly and confidentially, and one settlement layer through which value enters, leaves, and is anchored.
-spec_version: 0.4.31
+spec_version: 0.4.32
 status: draft
-date: 2026-11-08
+date: 2026-11-18
 ---
 
 # aledgent — System Specification
@@ -1743,8 +1743,8 @@ token, is not a ledger fact. Adding or removing a credential is a command that n
 
 **`REQ-AU-21`** A credential held by an identity holder or by an agent MAY reach aledgent directly, as a
 service principal's may. Every call, whoever holds its credential, enters through the one component that
-receives commands and queries (`REQ-AR-7`) and is authenticated there (`NFR-7`, `REQ-AU-1`). There is no
-other way in.
+receives commands and queries (`REQ-AR-7`) and is authenticated there (`NFR-7`, `REQ-AU-1`), except a read of
+the API description, which `NFR-7` makes public. There is no other way in.
 
 **`REQ-AU-22`** **Enrolment.** An identity whose credential set is empty (`REQ-ID-8`) gains its first
 credential through an enrolment, in two steps.
@@ -3390,7 +3390,7 @@ any one node; a restore (`NFR-4`, `NFR-10`) is for the loss of a quorum, or of t
 | `NFR-4` | No operation that aledgent has acknowledged, or answered with its decision, may be lost. Backups MUST exist and MUST be restorable. A restore MUST re-derive every balance from entries alone (`INV-6`). |
 | `NFR-5` | aledgent MUST be deployable without an outage of the book. |
 | `NFR-6` | The audit trail MUST be retained independently of operational storage, for at least as long as the longest applicable regulatory retention period. It MUST be queryable during that period. |
-| `NFR-7` | There MUST be no unauthenticated route to any ledger fact. Every route MUST be covered by a default-deny mechanism. A missing check on a new route then fails closed. |
+| `NFR-7` | There MUST be no unauthenticated route to any ledger fact. Every route MUST be covered by a default-deny mechanism. A missing check on a new route then fails closed. The one route that is public is the machine-readable description of the API (`GET /openapi.json`): it describes the routes, their bodies and the refusals, and carries no ledger fact, no deployment data and no credential. Nothing else becomes public because of it. *Amendment 0044.* |
 | `NFR-8` | No single process may be able to move value without bound. Settlement-layer key material MUST be held in a boundary that is separate from the book and can be audited separately. It MUST NOT be readable from a process environment. It MUST NOT appear in any log, URL or error. |
 | `NFR-9` | Reconciliation MUST run at least daily on three axes. First: per (account, asset), against every independent source. Second: the per-asset trial balance, which MUST be exactly zero, and the in-transit position of each asset, which MUST equal the credits in transit at a consistent cut (`REQ-RT-11`, `REQ-RT-14`). Third: the book against the settlement layer's view of what aledgent holds. The resolution MUST be one minor unit and the tolerance MUST be exactly zero. A failure MUST page a human, never open a ticket. |
 | `NFR-10` | A restore-from-backup drill MUST be run before production use and at a stated cadence. It MUST reproduce the book and re-derive every balance. |
