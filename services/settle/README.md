@@ -165,16 +165,18 @@ naming the entry, its block, the asset, the amount and the sender. Nothing is re
 so it never stops the sync.
 
 A block the adapter's own client cannot serve goes to the history endpoint only when it is 256 or
-more blocks deep, when a node says its state is gone (`State already discarded`, `UnknownBlock`),
-or when the same walk has failed `own_client_retries` steps in a row (default 10) at a block at
-least `own_client_min_fallback_depth` deep (default 32, at most 256): the light client's answer for
-a block its peers pruned, `RemoteCouldntAnswer`, does not say which. Above that depth the walk always
-stays on the client, so peer churn never holds a recent deposit. Any other failure is a blip: the
+more blocks deep, or when it is at least `own_client_min_fallback_depth` deep (default 32, at most
+256) and either a node says its state is gone (`State already discarded`, `UnknownBlock`) or the
+walks have failed there `own_client_retries` times (default 10) since the client last served one
+whole: the light client's answer for a block its peers pruned, `RemoteCouldntAnswer`, does not say
+which. Above that depth the walk always stays on the client, so peer churn or a lagging backend of a
+load-balanced pool never holds a recent deposit; a shallow failure stops the step and leaves the
+count as it is. Any other failure is a blip: the
 step stops at the first new position and reads again at the next. The `tracing` warning names the
-signal (`depth`, `gone` or `retries`). **Trade-off, stated plainly:** a light client whose peers keep
+signal (`depth`, `gone` or `retries`). **Trade-off, stated plainly:** a client whose node or peers keep
 fewer blocks than `own_client_min_fallback_depth`, after an outage longer than they keep, stalls at
-the first new position with `unreadable:` open (it pages) until the operator acts: connect the
-adapter through a node's RPC (which says the block is gone), lower the depth, or record a gap. A transfer to the contract whose asset id the adapter cannot decode backs nothing
+the first new position with `unreadable:` open (it pages) until the operator acts: lower the depth
+below what they keep, or record a gap. A transfer to the contract whose asset id the adapter cannot decode backs nothing
 and stops nothing. Migration `0008_backing_rule.sql` removes every verdict stored under the check's
 first, block-level rule.
 

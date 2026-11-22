@@ -780,38 +780,89 @@ async fn a_long_blip_at_a_shallow_block_never_holds_its_deposit() {
 }
 
 /// Peers that keep fewer blocks than `own_client_min_fallback_depth` (16 < 32), after an outage
-/// longer than they keep. Through a node, which says the block is gone, the walk reads it from the
-/// history endpoint at once. Through the light client, which does not say so, the adapter stalls
-/// at the first new position, `unreadable:` open (it pages), until the operator acts.
+/// longer than they keep: neither a node's `State already discarded` nor the light client's
+/// retries are taken above that depth, so the adapter stalls at the first new position with
+/// `unreadable:` open (it pages) until the operator acts. Lowering the depth below what the peers
+/// keep is one way out: the node's answer then sends the block to the history endpoint.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn peers_keeping_16_blocks_recover_through_a_node_and_stall_through_the_light_client() {
-    // Through a node.
+async fn peers_keeping_fewer_blocks_than_the_min_depth_stall_until_the_operator_acts() {
+    for light in [false, true] {
+        let mut k = serving_kit().await;
+        let alice = k.d.party("alice", 0).await;
+        k.chain.keep_events(16);
+        k.chain.light_client_errors(light);
+        k.chain.serve_history(true);
+        k.chain
+            .deposit(DEPOSITOR, INSTANCE, reference(&alice), &chain_usd(), 1_200);
+        k.chain.produce();
+        k.chain.advance(100);
+        for _ in 0..30 {
+            k.step().await.unwrap();
+            k.chain.advance(1);
+        }
+        assert_eq!(k.store.cursor(INSTANCE).await.unwrap(), 0, "stalled");
+        assert_eq!(k.chain.reads().history, 0);
+        assert_eq!(open_alerts(&k, "unreadable:").await.len(), 1);
+        if !light {
+            // The operator lowers the depth below what the node keeps.
+            k.reconfigure(|c| c.own_client_min_fallback_depth = 8);
+            k.step().await.unwrap();
+            assert_eq!(k.store.cursor(INSTANCE).await.unwrap(), 1);
+            assert_eq!(open_alerts(&k, UNVERIFIED_ALERT).await.len(), 1);
+        }
+    }
+}
+
+/// The review of f9eccfd, finding 1: a lagging backend of a load-balanced RPC pool that calls the
+/// newest block unknown (`UnknownBlock`) is not taken at its word above
+/// `own_client_min_fallback_depth`: the step retries, and once the block is known the deposit is
+/// credited.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unknown_block_at_depth_1_is_retried_not_held() {
     let mut k = serving_kit().await;
     let alice = k.d.party("alice", 0).await;
-    k.chain.keep_events(16);
     k.chain.serve_history(true);
     k.chain
         .deposit(DEPOSITOR, INSTANCE, reference(&alice), &chain_usd(), 1_200);
+    let b = k.chain.produce().unwrap();
     k.chain.produce();
-    k.chain.advance(100);
+    k.chain.finalize_all();
+    k.chain.unknown_to_client(Some(b.number));
+    for _ in 0..3 {
+        k.step().await.unwrap();
+    }
+    assert_eq!(k.chain.reads().history, 0);
+    assert_eq!(k.store.cursor(INSTANCE).await.unwrap(), 0);
+    k.chain.unknown_to_client(None);
     k.step().await.unwrap();
-    assert_eq!(k.store.cursor(INSTANCE).await.unwrap(), 1);
-    assert_eq!(open_alerts(&k, UNVERIFIED_ALERT).await.len(), 1);
-    // Through the light client.
+    assert_eq!(k.balances(&alice).await, (1_200, 0));
+    assert!(open_alerts(&k, "deposit-").await.is_empty());
+}
+
+/// The review of f9eccfd, finding 2: shallow blips between the deep failures of a light client
+/// whose peers keep 64 blocks, after an outage of 100, do not start the count again: the walk
+/// still reaches the history endpoint after its retries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shallow_blips_do_not_starve_the_deep_fallback() {
     let mut k = serving_kit().await;
     let alice = k.d.party("alice", 0).await;
-    k.chain.keep_events(16);
+    k.chain.keep_events(64);
     k.chain.light_client_errors(true);
     k.chain.serve_history(true);
     k.chain
         .deposit(DEPOSITOR, INSTANCE, reference(&alice), &chain_usd(), 1_200);
     k.chain.produce();
     k.chain.advance(100);
-    for _ in 0..30 {
+    let mut steps = 0;
+    while k.store.cursor(INSTANCE).await.unwrap() == 0 {
+        steps += 1;
+        assert!(steps <= 20, "still stalled after {steps} steps");
+        if steps % 5 == 0 {
+            k.chain.blip(1);
+        }
         k.step().await.unwrap();
         k.chain.advance(1);
     }
-    assert_eq!(k.store.cursor(INSTANCE).await.unwrap(), 0, "stalled");
-    assert_eq!(k.chain.reads().history, 0);
-    assert_eq!(open_alerts(&k, "unreadable:").await.len(), 1);
+    assert!(open_alerts(&k, "unreadable:").await.is_empty());
+    assert_eq!(open_alerts(&k, UNVERIFIED_ALERT).await.len(), 1);
 }

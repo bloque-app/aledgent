@@ -330,6 +330,9 @@ struct State {
     history_fault: Option<HistoryFault>,
     /// How many more of the client's block reads fail, as a blip would ([`FakeChain::blip`]).
     blips: u32,
+    /// Blocks the client calls unknown, as a lagging backend of a load-balanced pool does
+    /// ([`FakeChain::unknown_to_client`]).
+    unknown: BTreeSet<u64>,
     /// Whether a block past what the client keeps fails as the light client says it
     /// ([`FakeChain::light_client_errors`]) rather than as a full node does.
     light_errors: bool,
@@ -980,6 +983,7 @@ impl FakeChain {
                 history: false,
                 history_fault: None,
                 blips: 0,
+                unknown: BTreeSet::new(),
                 light_errors: false,
                 undecodable: false,
                 hide_resets: false,
@@ -1354,6 +1358,18 @@ impl FakeChain {
     /// client not yet synced would, whatever the block's depth.
     pub fn blip(&self, reads: u32) {
         lock(&self.state).blips = reads;
+    }
+
+    /// Have the client answer `UnknownBlock` for block `number`, as a lagging backend of a
+    /// load-balanced RPC pool does; `None`: every block is known again.
+    pub fn unknown_to_client(&self, number: Option<u64>) {
+        let mut s = lock(&self.state);
+        match number {
+            Some(n) => {
+                s.unknown.insert(n);
+            }
+            None => s.unknown.clear(),
+        }
     }
 
     /// Answer a read of a block past what the client keeps as the embedded light client does when
@@ -2080,6 +2096,12 @@ impl Chain for FakeChain {
         {
             let mut s = lock(&self.state);
             s.reads.blocks += 1;
+            if s.unknown.contains(&block.number) {
+                return Err(ChainError::Unavailable(format!(
+                    "UnknownBlock: header not found for #{}",
+                    block.number
+                )));
+            }
             if s.blips > 0 {
                 s.blips -= 1;
                 return Err(ChainError::Unavailable(format!(

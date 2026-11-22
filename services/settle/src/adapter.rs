@@ -314,8 +314,8 @@ pub struct Adapter<C: Chain, S: Store, T: Transport> {
     last_seen: Option<Seen>,
     /// How many consecutive walks to one target (the head they walk back to) the adapter's own
     /// client failed at a block at least [`AdapterConfig::own_client_min_fallback_depth`] deep,
-    /// for [`AdapterConfig::own_client_retries`]: a walk that fails shallower, or reads whole,
-    /// starts the count again. Counted per walk, not per block: with peers that keep a fixed
+    /// for [`AdapterConfig::own_client_retries`]: a walk that fails shallower leaves it as it is,
+    /// and only one the client serves whole starts it again. Counted per walk, not per block: with peers that keep a fixed
     /// number of blocks, the first block they cannot serve is a newer one at every finalized
     /// block, and a count per block would never reach the bound. Held in memory: a restart counts
     /// again.
@@ -525,8 +525,9 @@ struct Evidence {
 
 /// How many blocks below the finalized head the adapter's own client is taken to keep events for at
 /// most: what a pruned full node keeps (about 256). A block that deep or deeper is read from the
-/// history endpoint as soon as the client cannot serve it. A shallower one goes there only when the
-/// client says it is gone (`block_gone`) or fails the same walk
+/// history endpoint as soon as the client cannot serve it. A shallower one goes there only when it
+/// is at least [`AdapterConfig::own_client_min_fallback_depth`] deep and the client says it is gone
+/// (`block_gone`) or fails the same walk
 /// [`AdapterConfig::own_client_retries`] steps in a row; otherwise the failure is a blip, read again
 /// at the next step.
 pub const OWN_CLIENT_KEEPS: u64 = 256;
@@ -2912,17 +2913,19 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                         let depth = fin.number.saturating_sub(at.number);
                         let retries = self.config.own_client_retries.max(1);
                         // Only a failure at least `own_client_min_fallback_depth` deep counts
-                        // towards the retries: above it the client always serves the walk.
+                        // towards the retries, or is taken as gone: above it the client always
+                        // serves the walk (a lagging backend of a load-balanced pool may call a
+                        // fresh block unknown). A shallower failure stops the step and leaves the
+                        // count as it is; only a walk the client serves whole starts it again.
                         let deep = depth >= self.config.own_client_min_fallback_depth;
                         let failures = if deep {
                             self.own_client_failed(to)
                         } else {
-                            self.own_client_served(to);
-                            0
+                            self.own_client_failures_of(to)
                         };
                         let signal = if depth >= OWN_CLIENT_KEEPS {
                             Some("depth")
-                        } else if block_gone(&e) {
+                        } else if deep && block_gone(&e) {
                             Some("gone")
                         } else if deep && failures >= retries {
                             Some("retries")
@@ -3031,6 +3034,18 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
         };
         *f = Some((to, n));
         n
+    }
+
+    /// How many walks to `to` in a row the adapter's own client failed deep enough to count.
+    fn own_client_failures_of(&self, to: WalkTo) -> u32 {
+        match *self
+            .own_client_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            Some((t, n)) if t == to => n,
+            _ => 0,
+        }
     }
 
     /// A walk to `to` the adapter's own client served whole: the count starts again.
