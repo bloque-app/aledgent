@@ -313,7 +313,11 @@ pub struct Adapter<C: Chain, S: Store, T: Transport> {
     /// which [`Adapter::news`] says whether a step is due before the interval ends.
     last_seen: Option<Seen>,
     /// How many consecutive walks to one target (the head they walk back to) the adapter's own
-    /// client failed, for [`AdapterConfig::own_client_retries`]. Held in memory: a restart counts
+    /// client failed at a block at least [`AdapterConfig::own_client_min_fallback_depth`] deep,
+    /// for [`AdapterConfig::own_client_retries`]: a walk that fails shallower, or reads whole,
+    /// starts the count again. Counted per walk, not per block: with peers that keep a fixed
+    /// number of blocks, the first block they cannot serve is a newer one at every finalized
+    /// block, and a count per block would never reach the bound. Held in memory: a restart counts
     /// again.
     own_client_failures: std::sync::Mutex<Option<(WalkTo, u32)>>,
     /// The runtimes on which the layer refused a transaction signed in the format chosen for
@@ -2906,13 +2910,21 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                     // for this step and read again at the next.
                     Err(e) => {
                         let depth = fin.number.saturating_sub(at.number);
-                        let failures = self.own_client_failed(to);
                         let retries = self.config.own_client_retries.max(1);
+                        // Only a failure at least `own_client_min_fallback_depth` deep counts
+                        // towards the retries: above it the client always serves the walk.
+                        let deep = depth >= self.config.own_client_min_fallback_depth;
+                        let failures = if deep {
+                            self.own_client_failed(to)
+                        } else {
+                            self.own_client_served(to);
+                            0
+                        };
                         let signal = if depth >= OWN_CLIENT_KEEPS {
                             Some("depth")
                         } else if block_gone(&e) {
                             Some("gone")
-                        } else if failures >= retries {
+                        } else if deep && failures >= retries {
                             Some("retries")
                         } else {
                             None

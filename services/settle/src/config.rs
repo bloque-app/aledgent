@@ -173,11 +173,24 @@ pub struct AdapterConfig {
     /// says the block is gone, or a block 256 deep, goes there at once. 0 is taken as 1.
     #[serde(default = "default_own_client_retries")]
     pub own_client_retries: u32,
+    /// How deep below the finalized head a block must be for [`AdapterConfig::own_client_retries`]
+    /// to send it to the history endpoint. Above it the adapter's own client always serves the
+    /// walk: a failure there only stops the step, however long it lasts, so peer churn or an
+    /// eclipse of the light client's peers never holds a recent deposit. Default 32; at most 256
+    /// ([`AdapterConfig::check_own_client`]). A client whose peers keep fewer blocks than this
+    /// and do not say a block is gone stalls (`unreadable:`, which pages) until the operator acts.
+    #[serde(default = "default_own_client_min_fallback_depth")]
+    pub own_client_min_fallback_depth: u64,
 }
 
 /// [`AdapterConfig::own_client_retries`]'s default.
 pub fn default_own_client_retries() -> u32 {
     10
+}
+
+/// [`AdapterConfig::own_client_min_fallback_depth`]'s default.
+pub fn default_own_client_min_fallback_depth() -> u64 {
+    32
 }
 
 /// [`ProcessConfig::wake_poll`]'s default, in milliseconds.
@@ -201,6 +214,19 @@ pub fn default_batch_gas_margin_percent() -> u64 {
 }
 
 impl AdapterConfig {
+    /// Whether [`AdapterConfig::own_client_min_fallback_depth`] is within the 256 blocks the
+    /// adapter's own client is taken to keep at most: `Err` with why if not.
+    pub fn check_own_client(&self) -> Result<(), String> {
+        let keeps = crate::adapter::OWN_CLIENT_KEEPS;
+        if self.own_client_min_fallback_depth > keeps {
+            return Err(format!(
+                "adapter.own_client_min_fallback_depth is {}; it is at most {keeps}",
+                self.own_client_min_fallback_depth
+            ));
+        }
+        Ok(())
+    }
+
     /// The declared genesis hash.
     pub fn genesis_hash(&self) -> Option<[u8; 32]> {
         hex::decode(self.genesis.trim_start_matches("0x"))
@@ -715,6 +741,27 @@ mod tests {
 
     /// Amendment 0041 (`T-043-15`): reporting a reset is off unless the file turns it on. The
     /// README's example does not name it.
+    #[test]
+    fn the_own_client_fallback_defaults_and_bounds() {
+        let c = with(|_| {});
+        assert_eq!(
+            (
+                c.adapter.own_client_retries,
+                c.adapter.own_client_min_fallback_depth
+            ),
+            (10, 32)
+        );
+        assert_eq!(c.adapter.check_own_client(), Ok(()));
+        let at = with(|m| {
+            m.get_mut("adapter").unwrap()["own_client_min_fallback_depth"] = 256.into();
+        });
+        assert_eq!(at.adapter.check_own_client(), Ok(()));
+        let past = with(|m| {
+            m.get_mut("adapter").unwrap()["own_client_min_fallback_depth"] = 257.into();
+        });
+        assert!(past.adapter.check_own_client().is_err());
+    }
+
     #[test]
     fn t043_15_report_resets_is_off_by_default() {
         let v = readme_example();

@@ -753,3 +753,65 @@ async fn a_blip_of_several_steps_is_still_credited() {
     assert_eq!(k.balances(&alice).await, (1_200, 0));
     assert!(open_alerts(&k, "deposit-").await.is_empty());
 }
+
+/// The review of bcd834a: ten failed steps of the client at the newest block (peer churn, an
+/// eclipse of the light client's peers) never send it to the history endpoint: above
+/// `own_client_min_fallback_depth` the walk stays on the client, and once it answers the deposit is
+/// credited.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_long_blip_at_a_shallow_block_never_holds_its_deposit() {
+    let mut k = serving_kit().await;
+    let alice = k.d.party("alice", 0).await;
+    k.chain.serve_history(true);
+    k.chain.light_client_errors(true);
+    k.chain
+        .deposit(DEPOSITOR, INSTANCE, reference(&alice), &chain_usd(), 1_200);
+    k.chain.produce();
+    k.chain.finalize_all();
+    for _ in 0..12 {
+        k.chain.blip(1);
+        k.step().await.unwrap();
+    }
+    assert_eq!(k.chain.reads().history, 0);
+    assert_eq!(k.balances(&alice).await, (0, 0));
+    k.step().await.unwrap();
+    assert_eq!(k.balances(&alice).await, (1_200, 0));
+    assert!(open_alerts(&k, "deposit-").await.is_empty());
+}
+
+/// Peers that keep fewer blocks than `own_client_min_fallback_depth` (16 < 32), after an outage
+/// longer than they keep. Through a node, which says the block is gone, the walk reads it from the
+/// history endpoint at once. Through the light client, which does not say so, the adapter stalls
+/// at the first new position, `unreadable:` open (it pages), until the operator acts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peers_keeping_16_blocks_recover_through_a_node_and_stall_through_the_light_client() {
+    // Through a node.
+    let mut k = serving_kit().await;
+    let alice = k.d.party("alice", 0).await;
+    k.chain.keep_events(16);
+    k.chain.serve_history(true);
+    k.chain
+        .deposit(DEPOSITOR, INSTANCE, reference(&alice), &chain_usd(), 1_200);
+    k.chain.produce();
+    k.chain.advance(100);
+    k.step().await.unwrap();
+    assert_eq!(k.store.cursor(INSTANCE).await.unwrap(), 1);
+    assert_eq!(open_alerts(&k, UNVERIFIED_ALERT).await.len(), 1);
+    // Through the light client.
+    let mut k = serving_kit().await;
+    let alice = k.d.party("alice", 0).await;
+    k.chain.keep_events(16);
+    k.chain.light_client_errors(true);
+    k.chain.serve_history(true);
+    k.chain
+        .deposit(DEPOSITOR, INSTANCE, reference(&alice), &chain_usd(), 1_200);
+    k.chain.produce();
+    k.chain.advance(100);
+    for _ in 0..30 {
+        k.step().await.unwrap();
+        k.chain.advance(1);
+    }
+    assert_eq!(k.store.cursor(INSTANCE).await.unwrap(), 0, "stalled");
+    assert_eq!(k.chain.reads().history, 0);
+    assert_eq!(open_alerts(&k, "unreadable:").await.len(), 1);
+}

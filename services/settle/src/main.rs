@@ -258,6 +258,10 @@ async fn run() -> Result<(), String> {
                 .collect::<Vec<_>>()
         ));
     }
+    config
+        .adapter
+        .check_own_client()
+        .map_err(|e| format!("{path}: {e}"))?;
     // A runtime's spec_version gates nothing since T-027-12: a list from an older file is kept
     // for the record only.
     if !config.adapter.spec_versions.is_empty() {
