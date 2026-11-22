@@ -666,19 +666,24 @@ pub trait Store: Clone + Send + Sync + 'static {
     fn confirm_runtime(&self, row: &RuntimeRow) -> impl Future<Output = StoreResult<()>> + Send;
 }
 
-/// What the adapter proved, from chain state, of a final deposit it kept (the deposit backing
-/// check): that its block raised the deployment's real holding of the asset at least as much as
-/// the position its contract records, or not. A deposit is reported with its movement only when
-/// [`Backing::Backed`] is stored for it, under its position and digest.
+/// What the deposit backing check proved of a final deposit it kept: that a transfer of its
+/// asset and amount from its sender to the contract account paid it, in the same extrinsic, or
+/// not. A deposit is reported with its movement only when [`Backing::Backed`] is stored for it,
+/// under its position and digest.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Backing {
-    /// The block's holding grew at least as much as its recorded position (less what bindings in
-    /// the block recorded of a holding already there).
+    /// An unclaimed transfer paid it, earlier in its extrinsic.
     Backed,
-    /// The recorded position grew more than the holding: no entry of the asset in the block is
-    /// reported with a movement. `detail` names the block, the asset and both changes.
+    /// No transfer paid it: something recorded value that did not arrive. `detail` names the
+    /// entry and where its event was.
     Unbacked {
-        /// What the check read.
+        /// What the check found.
+        detail: String,
+    },
+    /// Its block was served by the history endpoint, whose events nothing proves: it cannot be
+    /// shown paid.
+    Unverified {
+        /// What the check found.
         detail: String,
     },
 }

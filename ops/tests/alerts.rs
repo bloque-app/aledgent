@@ -202,6 +202,17 @@ fn nfr_11_each_signal_over_its_line_pages_the_test_route() {
                 .insert("deposit-unbacked".into(), 1);
         }),
         (
+            "AledgentDepositUnverified",
+            "observation-completeness",
+            |s| {
+                s.adapter
+                    .as_mut()
+                    .unwrap()
+                    .alerts
+                    .insert("deposit-unverified".into(), 1);
+            },
+        ),
+        (
             "AledgentSettlementChainMismatch",
             "observation-completeness",
             |s| {

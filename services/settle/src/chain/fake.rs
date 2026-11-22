@@ -60,7 +60,11 @@
 //!   recorded position with no value moved, as a caller that passes the contract's `credit` check
 //!   of its code hash would leave; and the flows the deposit backing check must tell from it: a
 //!   plain transfer in ([`FakeChain::transfer`]), a binding ([`FakeChain::bind`]), and another
-//!   deployment's withdrawal to this one ([`FakeChain::peer_withdraw`]). **State is kept** for the
+//!   deployment's withdrawal to this one ([`FakeChain::peer_withdraw`]). **Events carry where they
+//!   were emitted** (each queued operation is an extrinsic of its own, [`FakeChain::in_one_extrinsic`]
+//!   one for several, then each pooled transaction), and every asset move emits `Transferred`; the
+//!   history endpoint serves each block's header with its events, and can lie
+//!   ([`FakeChain::history_lies`]). **State is kept** for the
 //!   blocks within [`FakeChain::keep_state`] of the finalized head (every block by default), as a
 //!   pruned node keeps it.
 //! - **Reader faults.** [`FakeChain::misread_reference_of`]: an entry the chain holds is read back
@@ -78,9 +82,9 @@ use parity_scale_codec::{Decode, Encode};
 use super::kreivo::{self, AssetId, Call, Envelope, Refusal, TxParams, Weight};
 use super::{
     AccountId32, BatchCall, BatchFailure, BlockEvents, BlockRef, Chain, ChainAsset, ChainEpoch,
-    ChainError, ChainEvent, ChainHead, ChainResult, DryRun, InboxEvent, Included, InstanceView,
-    Mortality, RuntimeInfo, RuntimeVersion, SignedExtrinsic, Validity, ZERO_DIGEST, blake2_256,
-    chain_digest,
+    ChainError, ChainEvent, ChainHead, ChainResult, DryRun, EventOrigin, InboxEvent, Included,
+    InstanceView, Mortality, RuntimeInfo, RuntimeVersion, SignedExtrinsic, TransferIn, Validity,
+    ZERO_DIGEST, blake2_256, chain_digest,
 };
 use crate::signer::{Signer, recover};
 
@@ -207,6 +211,15 @@ struct World {
     /// The events emitted in this block so far, in order, with their contract: a failed batch
     /// rolls them back with the rest of the world.
     events: Vec<(AccountId32, kreivo::EmittedEvent)>,
+    /// Where each of `events` was emitted, one for each.
+    event_at: Vec<EventOrigin>,
+    /// The asset transfers of this block so far (`Assets::Transferred`), in order: where each was
+    /// emitted, its asset, from, to and amount.
+    transfers: Vec<(EventOrigin, ChainAsset, AccountId32, AccountId32, u128)>,
+    /// The extrinsic being applied, if any.
+    extrinsic: Option<u32>,
+    /// The index the block's next event takes.
+    next_event: u32,
     /// Every anchor stored, never pruned: `(commitment, block, seq)`.
     anchors: BTreeMap<(u32, u64), ([u8; 32], u64, u64)>,
 }
@@ -215,6 +228,9 @@ struct World {
 struct Block {
     number: u64,
     hash: [u8; 32],
+    /// Its header's bytes: its parent's hash first, as a Substrate header's; its hash is their
+    /// blake2b-256 (empty for the genesis block, whose hash the configuration gives).
+    header: Vec<u8>,
     world: World,
     /// The runtime in its state: the one that validates a transaction at it and executes the
     /// block after it.
@@ -267,6 +283,9 @@ enum Queued {
         asset: ChainAsset,
         amount: u128,
     },
+    /// Several operations in one extrinsic, in order (`Utility::batch_all`, or a contract making
+    /// several calls).
+    Batch(Vec<Queued>),
     /// A withdrawal of `instance` to deployment `to`, as a key's call would run it.
     PeerWithdraw {
         instance: u32,
@@ -307,6 +326,8 @@ struct State {
     keep_state: Option<u64>,
     /// Whether the history endpoint serves.
     history: bool,
+    /// How the history endpoint lies, if it does ([`FakeChain::history_lies`]).
+    history_fault: Option<HistoryFault>,
     /// Whether reads leave out `AnchorHeadSet` (a reader that misses it).
     hide_resets: bool,
     /// The reader's faults ([`FakeChain::fault_reads`]).
@@ -351,6 +372,15 @@ pub enum ReaderFault {
     Extra,
     /// The entry is read with another block number: its bytes, and so its digest, differ.
     Alter,
+}
+
+/// How a malicious history endpoint lies ([`FakeChain::history_lies`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HistoryFault {
+    /// Every block it serves names itself as its parent, with a header to match.
+    WrongParent,
+    /// Every block it serves carries this transfer into the contract account besides its own.
+    Transfer(TransferIn),
 }
 
 /// What a test does at a point of a step ([`FakeChain::before_next_runtime_read`]).
@@ -435,9 +465,34 @@ impl World {
         };
         d.digest = chain_digest(&d.digest, seq, &blake2_256(&entry.encode()));
         self.appended += 1;
-        self.events
-            .push((position_account(instance), kreivo::entry_event(seq, &event)));
+        self.emit(position_account(instance), kreivo::entry_event(seq, &event));
         Some(seq)
+    }
+
+    /// Where the next event is emitted.
+    fn origin(&mut self) -> EventOrigin {
+        let o = EventOrigin {
+            extrinsic: self.extrinsic,
+            index: self.next_event,
+        };
+        self.next_event += 1;
+        o
+    }
+
+    /// Emit a contract's event.
+    fn emit(&mut self, by: AccountId32, e: kreivo::EmittedEvent) {
+        let o = self.origin();
+        self.events.push((by, e));
+        self.event_at.push(o);
+    }
+
+    /// Move `amount` of `asset` from `from` to `to`, as `Assets::transfer` does, with its
+    /// `Transferred` event. The caller checked that `from` holds it.
+    fn move_asset(&mut self, from: AccountId32, to: AccountId32, asset: &ChainAsset, amount: u128) {
+        *self.balance(from, asset) -= amount;
+        *self.balance(to, asset) += amount;
+        let o = self.origin();
+        self.transfers.push((o, asset.clone(), from, to, amount));
     }
 
     fn balance(&mut self, account: AccountId32, asset: &ChainAsset) -> &mut u128 {
@@ -529,8 +584,7 @@ impl World {
                 kreivo::AssetsApiError::CannotTransfer,
             )));
         }
-        *self.balance(me, &a) -= amount;
-        *self.balance(receiver, &a) += amount;
+        self.move_asset(me, receiver, &a, amount);
         let d = self
             .deployments
             .get_mut(&instance)
@@ -705,12 +759,193 @@ impl World {
     }
 }
 
+/// Apply what a test queued, in block `number`.
+fn apply(world: &mut World, q: Queued, number: u64) {
+    match q {
+        Queued::Batch(all) => {
+            for q in all {
+                apply(world, q, number);
+            }
+        }
+        Queued::Deposit {
+            from,
+            instance,
+            account_ref,
+            asset,
+            amount,
+        } => {
+            let have = *world.balance(from, &asset);
+            let Ok(id) = kreivo::parse_asset(&asset.0) else {
+                return;
+            };
+            if amount > 0 && have >= amount && world.deployments.contains_key(&instance) {
+                world.move_asset(from, position_account(instance), &asset, amount);
+                if let Some(d) = world.deployments.get_mut(&instance) {
+                    *d.positions.entry(asset.clone()).or_insert(0) += amount;
+                }
+                world.append(
+                    instance,
+                    number,
+                    kreivo::InboxEvent::Deposited {
+                        from,
+                        account_ref,
+                        asset: id,
+                        amount,
+                    },
+                );
+            }
+        }
+        Queued::Reset {
+            instance,
+            base,
+            book,
+        } => {
+            let previous = world.deployments.get(&instance).and_then(|d| {
+                world
+                    .anchors
+                    .get(&(instance, d.last_anchor))
+                    .map(|(commitment, at, seq)| kreivo::LatestAnchor {
+                        number: d.last_anchor,
+                        commitment: *commitment,
+                        at: u32::try_from(*at).unwrap_or(u32::MAX),
+                        seq: *seq,
+                    })
+            });
+            if let Some(d) = world.deployments.get_mut(&instance) {
+                d.epoch += 1;
+                d.reset_at = number;
+                d.reset_base = base;
+                d.reset_book = book;
+                d.reset_previous = previous.map(|p| (p.number, p.commitment));
+                d.last_anchor = base;
+                d.next_seq = 0;
+                d.pruned_to = 0;
+                d.digest = ZERO_DIGEST;
+                d.start = 0;
+                let mut epoch = [0u8; 32];
+                epoch[..4].copy_from_slice(&d.epoch.to_le_bytes());
+                let event = kreivo::AnchorHeadSetEvent {
+                    epoch: d.epoch,
+                    base,
+                    from_seq: 0,
+                    book,
+                    previous,
+                };
+                world.emit(
+                    position_account(instance),
+                    kreivo::EmittedEvent {
+                        topics: vec![kreivo::topic::ANCHOR_HEAD_SET, epoch],
+                        data: event.encode(),
+                    },
+                );
+            }
+        }
+        Queued::Anchor {
+            instance,
+            number: n,
+            commitment,
+        } => world.store_anchor(instance, n, commitment, number, [0xAA; 32]),
+        Queued::Keys { instance, keys } => {
+            if let Some(d) = world.deployments.get_mut(&instance) {
+                d.keys = keys;
+            }
+        }
+        Queued::Forged {
+            from,
+            instance,
+            account_ref,
+            asset,
+            amount,
+        } => {
+            let Ok(id) = kreivo::parse_asset(&asset.0) else {
+                return;
+            };
+            let Some(d) = world.deployments.get_mut(&instance) else {
+                return;
+            };
+            *d.positions.entry(asset).or_insert(0) += amount;
+            world.append(
+                instance,
+                number,
+                kreivo::InboxEvent::Deposited {
+                    from,
+                    account_ref,
+                    asset: id,
+                    amount,
+                },
+            );
+        }
+        Queued::Transfer {
+            from,
+            to,
+            asset,
+            amount,
+        } => {
+            if *world.balance(from, &asset) >= amount {
+                world.move_asset(from, to, &asset, amount);
+            }
+        }
+        Queued::Bind {
+            instance,
+            asset,
+            amount,
+        } => {
+            let Ok(id) = kreivo::parse_asset(&asset.0) else {
+                return;
+            };
+            let e = Envelope {
+                operation_ref: [0xBD; 32],
+                call: Call::Bind { asset: id, amount },
+            };
+            let keys = world
+                .deployments
+                .get(&instance)
+                .map(|d| d.keys.clone())
+                .unwrap_or_default();
+            if let Some(key) = keys.first() {
+                let _ = world.execute(instance, number, *key, &[e], &BTreeSet::new());
+            }
+        }
+        Queued::PeerWithdraw {
+            instance,
+            to,
+            account_ref,
+            asset,
+            amount,
+        } => {
+            let Ok(id) = kreivo::parse_asset(&asset.0) else {
+                return;
+            };
+            let e = Envelope {
+                operation_ref: [0xBE; 32],
+                call: Call::Withdraw {
+                    to: kreivo::Destination::Deployment {
+                        contract: position_account(to),
+                        account_ref,
+                    },
+                    asset: id,
+                    amount,
+                },
+            };
+            let keys = world
+                .deployments
+                .get(&instance)
+                .map(|d| d.keys.clone())
+                .unwrap_or_default();
+            if let Some(key) = keys.first() {
+                let _ = world.execute(instance, number, *key, &[e], &BTreeSet::new());
+            }
+        }
+    }
+}
+
 impl FakeChain {
     /// A chain with only its genesis block.
     pub fn new(config: FakeConfig) -> FakeChain {
         let genesis = Block {
             number: 0,
             hash: config.genesis,
+            header: Vec::new(),
             world: World::default(),
             runtime: config.clone(),
             extrinsics: Vec::new(),
@@ -735,6 +970,7 @@ impl FakeChain {
                 keep_events: 256,
                 keep_state: None,
                 history: false,
+                history_fault: None,
                 hide_resets: false,
                 faults: Vec::new(),
                 no_dry_runs: false,
@@ -1103,6 +1339,21 @@ impl FakeChain {
         lock(&self.state).hide_resets = hidden;
     }
 
+    /// Make the history endpoint lie from now on (`None`: it tells the truth, the default).
+    pub fn history_lies(&self, fault: Option<HistoryFault>) {
+        lock(&self.state).history_fault = fault;
+    }
+
+    /// Queue several operations for the next block, in order, in **one** extrinsic: a batch call,
+    /// or a contract that pays into a deployment and then calls it.
+    pub fn in_one_extrinsic(&self, f: impl FnOnce(&FakeChain)) {
+        let before = std::mem::take(&mut lock(&self.state).queued);
+        f(self);
+        let mut s = lock(&self.state);
+        let batch = std::mem::replace(&mut s.queued, before);
+        s.queued.push(Queued::Batch(batch));
+    }
+
     /// Turn the history endpoint on or off: a node that serves every block's events.
     pub fn serve_history(&self, on: bool) {
         lock(&self.state).history = on;
@@ -1127,7 +1378,7 @@ impl FakeChain {
                 match kreivo::contract_event(&e.topics, &e.data, b.number, |a| {
                     instance_of(&b.world.deployments, a)
                 }) {
-                    Ok(Some(ChainEvent::Entry { seq, entry })) => out.push((seq, entry)),
+                    Ok(Some(ChainEvent::Entry { seq, entry, .. })) => out.push((seq, entry)),
                     Ok(Some(ChainEvent::Reset)) => out.clear(),
                     _ => {}
                 }
@@ -1289,179 +1540,16 @@ impl FakeChain {
         let mut world = parent.world.clone();
         world.events.clear();
         let mut extrinsics = Vec::new();
+        world.event_at.clear();
+        world.transfers.clear();
+        world.next_event = 0;
+        // Each queued operation is an extrinsic of its own (a batch, one for all of it), and so is
+        // each transaction of the pool after them.
+        let mut index = 0u32;
         for q in std::mem::take(&mut s.queued) {
-            match q {
-                Queued::Deposit {
-                    from,
-                    instance,
-                    account_ref,
-                    asset,
-                    amount,
-                } => {
-                    let have = *world.balance(from, &asset);
-                    let Ok(id) = kreivo::parse_asset(&asset.0) else {
-                        continue;
-                    };
-                    if amount > 0 && have >= amount && world.deployments.contains_key(&instance) {
-                        *world.balance(from, &asset) -= amount;
-                        *world.balance(position_account(instance), &asset) += amount;
-                        if let Some(d) = world.deployments.get_mut(&instance) {
-                            *d.positions.entry(asset.clone()).or_insert(0) += amount;
-                        }
-                        world.append(
-                            instance,
-                            number,
-                            kreivo::InboxEvent::Deposited {
-                                from,
-                                account_ref,
-                                asset: id,
-                                amount,
-                            },
-                        );
-                    }
-                }
-                Queued::Reset {
-                    instance,
-                    base,
-                    book,
-                } => {
-                    let previous = world.deployments.get(&instance).and_then(|d| {
-                        world.anchors.get(&(instance, d.last_anchor)).map(
-                            |(commitment, at, seq)| kreivo::LatestAnchor {
-                                number: d.last_anchor,
-                                commitment: *commitment,
-                                at: u32::try_from(*at).unwrap_or(u32::MAX),
-                                seq: *seq,
-                            },
-                        )
-                    });
-                    if let Some(d) = world.deployments.get_mut(&instance) {
-                        d.epoch += 1;
-                        d.reset_at = number;
-                        d.reset_base = base;
-                        d.reset_book = book;
-                        d.reset_previous = previous.map(|p| (p.number, p.commitment));
-                        d.last_anchor = base;
-                        d.next_seq = 0;
-                        d.pruned_to = 0;
-                        d.digest = ZERO_DIGEST;
-                        d.start = 0;
-                        let mut epoch = [0u8; 32];
-                        epoch[..4].copy_from_slice(&d.epoch.to_le_bytes());
-                        let event = kreivo::AnchorHeadSetEvent {
-                            epoch: d.epoch,
-                            base,
-                            from_seq: 0,
-                            book,
-                            previous,
-                        };
-                        world.events.push((
-                            position_account(instance),
-                            kreivo::EmittedEvent {
-                                topics: vec![kreivo::topic::ANCHOR_HEAD_SET, epoch],
-                                data: event.encode(),
-                            },
-                        ));
-                    }
-                }
-                Queued::Anchor {
-                    instance,
-                    number: n,
-                    commitment,
-                } => world.store_anchor(instance, n, commitment, number, [0xAA; 32]),
-                Queued::Keys { instance, keys } => {
-                    if let Some(d) = world.deployments.get_mut(&instance) {
-                        d.keys = keys;
-                    }
-                }
-                Queued::Forged {
-                    from,
-                    instance,
-                    account_ref,
-                    asset,
-                    amount,
-                } => {
-                    let Ok(id) = kreivo::parse_asset(&asset.0) else {
-                        continue;
-                    };
-                    let Some(d) = world.deployments.get_mut(&instance) else {
-                        continue;
-                    };
-                    *d.positions.entry(asset).or_insert(0) += amount;
-                    world.append(
-                        instance,
-                        number,
-                        kreivo::InboxEvent::Deposited {
-                            from,
-                            account_ref,
-                            asset: id,
-                            amount,
-                        },
-                    );
-                }
-                Queued::Transfer {
-                    from,
-                    to,
-                    asset,
-                    amount,
-                } => {
-                    if *world.balance(from, &asset) >= amount {
-                        *world.balance(from, &asset) -= amount;
-                        *world.balance(to, &asset) += amount;
-                    }
-                }
-                Queued::Bind {
-                    instance,
-                    asset,
-                    amount,
-                } => {
-                    let Ok(id) = kreivo::parse_asset(&asset.0) else {
-                        continue;
-                    };
-                    let e = Envelope {
-                        operation_ref: [0xBD; 32],
-                        call: Call::Bind { asset: id, amount },
-                    };
-                    let keys = world
-                        .deployments
-                        .get(&instance)
-                        .map(|d| d.keys.clone())
-                        .unwrap_or_default();
-                    if let Some(key) = keys.first() {
-                        let _ = world.execute(instance, number, *key, &[e], &BTreeSet::new());
-                    }
-                }
-                Queued::PeerWithdraw {
-                    instance,
-                    to,
-                    account_ref,
-                    asset,
-                    amount,
-                } => {
-                    let Ok(id) = kreivo::parse_asset(&asset.0) else {
-                        continue;
-                    };
-                    let e = Envelope {
-                        operation_ref: [0xBE; 32],
-                        call: Call::Withdraw {
-                            to: kreivo::Destination::Deployment {
-                                contract: position_account(to),
-                                account_ref,
-                            },
-                            asset: id,
-                            amount,
-                        },
-                    };
-                    let keys = world
-                        .deployments
-                        .get(&instance)
-                        .map(|d| d.keys.clone())
-                        .unwrap_or_default();
-                    if let Some(key) = keys.first() {
-                        let _ = world.execute(instance, number, *key, &[e], &BTreeSet::new());
-                    }
-                }
-            }
+            world.extrinsic = Some(index);
+            index += 1;
+            apply(&mut world, q, number);
         }
         // The pool, in (account, nonce) order; loop so a run of nonces lands in one block.
         let mut pool = std::mem::take(&mut s.pool);
@@ -1489,6 +1577,8 @@ impl FakeChain {
             }
             world.native.insert(who, native - FEE);
             world.nonces.insert(who, expected + 1);
+            world.extrinsic = Some(index);
+            index += 1;
             let included = match kreivo::decode_contracts_call(tx.call()) {
                 None => Included {
                     block: number,
@@ -1566,6 +1656,7 @@ impl FakeChain {
             extrinsics.push((ext, tx, included));
         }
         s.pool = kept;
+        world.extrinsic = None;
         let mut h = parent.hash.to_vec();
         h.extend_from_slice(&number.to_le_bytes());
         h.extend_from_slice(&s.forks.to_le_bytes());
@@ -1574,6 +1665,7 @@ impl FakeChain {
         s.blocks.push(Block {
             number,
             hash,
+            header: h,
             world,
             runtime,
             extrinsics,
@@ -1706,7 +1798,12 @@ impl FakeChain {
 impl FakeChain {
     /// The events of `block` about `instance`'s chain, decoded as the adapter decodes Kreivo's
     /// (`kreivo::contract_event`), through the reader's faults.
-    fn read_events(&self, block: &BlockRef, instance: u32) -> ChainResult<BlockEvents> {
+    fn read_events(
+        &self,
+        block: &BlockRef,
+        instance: u32,
+        untrusted: bool,
+    ) -> ChainResult<BlockEvents> {
         let mut s = lock(&self.state);
         let b = s
             .blocks
@@ -1718,25 +1815,45 @@ impl FakeChain {
             n => s.blocks[usize::try_from(n - 1).unwrap_or(0)].hash,
         };
         let w = b.world.clone();
+        let header = b.header.clone();
         let contract = position_account(instance);
         let mut events = Vec::new();
-        for (by, e) in &w.events {
+        for ((by, e), at) in w.events.iter().zip(&w.event_at) {
             if *by != contract {
                 continue;
             }
-            if let Some(ev) = kreivo::contract_event(&e.topics, &e.data, block.number, |a| {
+            if let Some(mut ev) = kreivo::contract_event(&e.topics, &e.data, block.number, |a| {
                 instance_of(&w.deployments, a)
             })
             .map_err(ChainError::Invalid)?
             {
+                if let ChainEvent::Entry { origin, .. } = &mut ev {
+                    *origin = *at;
+                }
                 events.push(ev);
             }
         }
+        let transfers = w
+            .transfers
+            .iter()
+            .filter(|(_, _, _, to, _)| *to == contract)
+            .map(|(origin, asset, from, _, amount)| TransferIn {
+                origin: *origin,
+                from: *from,
+                asset: asset.clone(),
+                amount: *amount,
+            })
+            .collect();
         let lost = [0xFF; 32];
         let misread = s.misread.clone();
         let mut out = Vec::new();
         for ev in events {
-            let ChainEvent::Entry { seq, mut entry } = ev else {
+            let ChainEvent::Entry {
+                seq,
+                mut entry,
+                origin,
+            } = ev
+            else {
                 if !(s.hide_resets && matches!(ev, ChainEvent::Reset)) {
                     out.push(ev);
                 }
@@ -1762,14 +1879,15 @@ impl FakeChain {
                     *f
                 });
             match fault {
-                None => out.push(ChainEvent::Entry { seq, entry }),
+                None => out.push(ChainEvent::Entry { seq, entry, origin }),
                 Some(ReaderFault::Hide) => {}
                 Some(ReaderFault::Extra) => {
                     out.push(ChainEvent::Entry {
                         seq,
                         entry: entry.clone(),
+                        origin,
                     });
-                    out.push(ChainEvent::Entry { seq, entry });
+                    out.push(ChainEvent::Entry { seq, entry, origin });
                 }
                 Some(ReaderFault::Alter) => {
                     let mut raw = kreivo::InboxEntry::decode(&mut &entry.raw[..])
@@ -1782,6 +1900,7 @@ impl FakeChain {
                     out.push(ChainEvent::Entry {
                         seq,
                         entry: altered,
+                        origin,
                     });
                 }
             }
@@ -1790,6 +1909,8 @@ impl FakeChain {
             block: *block,
             parent,
             events: out,
+            transfers,
+            header: untrusted.then_some(header),
         })
     }
 }
@@ -1931,7 +2052,7 @@ impl Chain for FakeChain {
                 )));
             }
         }
-        self.read_events(block, instance)
+        self.read_events(block, instance, false)
     }
 
     async fn history_events(
@@ -1946,7 +2067,20 @@ impl Chain for FakeChain {
             }
             s.reads.history += 1;
         }
-        self.read_events(block, instance).map(Some)
+        let mut b = self.read_events(block, instance, true)?;
+        match lock(&self.state).history_fault.clone() {
+            None => {}
+            Some(HistoryFault::WrongParent) => {
+                // The block named as its own parent, with a header to match: it cannot hash to
+                // the block's hash.
+                b.parent = block.hash;
+                if let Some(h) = &mut b.header {
+                    h[..32].copy_from_slice(&block.hash);
+                }
+            }
+            Some(HistoryFault::Transfer(t)) => b.transfers.push(t),
+        }
+        Ok(Some(b))
     }
 
     async fn asset_metadata(

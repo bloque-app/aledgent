@@ -56,14 +56,22 @@ groups:
         annotations:
           summary: The core refused to follow a reset of the settlement layer's instance; nothing of the new chain reaches it.
           runbook: ops/runbooks/gap-filling.md
-      # The deposit backing check: a final deposit whose block raised the position the contract
-      # records by more than the deployment's real holding. It is reported without a movement and
-      # nothing is credited; someone recorded value that never arrived. No `for`.
+      # The deposit backing check: a final deposit no transfer from its sender paid, in its own
+      # extrinsic. It is reported without a movement and nothing is credited; someone recorded
+      # value that never arrived. No `for`.
       - alert: AledgentDepositUnbacked
         expr: aledgent_adapter_alerts{kind="deposit-unbacked"} > 0
         labels: { severity: page, owner: settlement-operations, signal: observation-completeness }
         annotations:
-          summary: A deposit on the settlement layer is not backed by the deployment's holding; it was not credited.
+          summary: A deposit on the settlement layer was not paid by a transfer to the deployment; it was not credited.
+          runbook: ops/runbooks/gap-filling.md
+      # A final deposit in a block only the history endpoint served, whose events nothing proves:
+      # reported without a movement, so a genuine deposit waits for a person. No `for`.
+      - alert: AledgentDepositUnverified
+        expr: aledgent_adapter_alerts{kind="deposit-unverified"} > 0
+        labels: { severity: page, owner: settlement-operations, signal: observation-completeness }
+        annotations:
+          summary: A deposit read from the history endpoint could not be shown paid; it was not credited.
           runbook: ops/runbooks/gap-filling.md
       - alert: AledgentObservationLag
         expr: aledgent_observation_cursor_lag > 100

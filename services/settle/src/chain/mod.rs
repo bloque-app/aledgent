@@ -302,6 +302,34 @@ pub struct ChainEpoch {
     pub previous: Option<(u64, [u8; 32])>,
 }
 
+/// Where in its block an event was emitted: the extrinsic that emitted it (`Phase::ApplyExtrinsic`;
+/// `None` outside one), and its index among all of the block's events (`System::Events`), which
+/// orders the events of one extrinsic.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EventOrigin {
+    /// The extrinsic's index in the block, if the event was emitted while applying one.
+    pub extrinsic: Option<u32>,
+    /// The event's index among the block's events.
+    pub index: u32,
+}
+
+/// An asset transfer into an instance's contract account, as Kreivo records it:
+/// `Assets::Transferred { asset_id, from, to, amount }` with `to` the contract account. The
+/// contract's `deposit` emits one (the assets API pulls the amount from the caller,
+/// `fungibles::Mutate::transfer`), and so does another deployment's withdrawal to this one, before
+/// the receiving contract records the credit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransferIn {
+    /// Where in the block it was emitted.
+    pub origin: EventOrigin,
+    /// The account the value left.
+    pub from: AccountId32,
+    /// The asset.
+    pub asset: ChainAsset,
+    /// The amount, in the asset's smallest unit.
+    pub amount: u128,
+}
+
 /// What one of a block's events says of an instance's chain, in the order the block emitted them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChainEvent {
@@ -312,6 +340,8 @@ pub enum ChainEvent {
         seq: u64,
         /// The entry.
         entry: InboxEntry,
+        /// Where in the block its event was emitted.
+        origin: EventOrigin,
     },
     /// Governance reset the instance (`AnchorHeadSet`): a new chain starts at position 0 with the
     /// zero digest after this event. Entries before it in the block belong to the chain before.
@@ -335,6 +365,21 @@ pub struct BlockEvents {
     pub parent: [u8; 32],
     /// The instance's chain events, in the block's order.
     pub events: Vec<ChainEvent>,
+    /// The block's asset transfers into the instance's contract account, in the block's order.
+    pub transfers: Vec<TransferIn>,
+    /// The block's header, SCALE-encoded, from a reader the adapter does not trust (the history
+    /// endpoint): its blake2b-256 must be the block's hash, and its first 32 bytes (a Substrate
+    /// header's `parent_hash`) the parent's, or the block is not taken ([`header_proves`]). `None`
+    /// from the adapter's own client, which checks what it serves against the chain's consensus.
+    pub header: Option<Vec<u8>>,
+}
+
+/// Whether `header` is the header of `block`, whose parent is `parent`: it hashes to the block's
+/// hash, and starts with the parent's hash, as a Substrate header's SCALE encoding does. What a
+/// walk through an untrusted reader checks of each block, so that the hash chain from the
+/// finalized head (which the adapter's own client gives) reaches it.
+pub fn header_proves(header: &[u8], block: &BlockRef, parent: &[u8; 32]) -> bool {
+    blake2_256(header) == block.hash && header.get(..32) == Some(&parent[..])
 }
 
 /// A withdrawal as the adapter stores it (`F-016`), the call envelope's withdrawal in the

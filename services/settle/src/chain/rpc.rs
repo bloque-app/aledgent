@@ -509,12 +509,18 @@ impl RpcChain {
 /// `block`'s events about the contract `contract`'s chain of entries (amendment 0040), and its
 /// parent's hash, through `client`: its `Contracts::ContractEmitted` events, the contract's own
 /// only (a credit from another deployment is emitted by the receiver), each decoded by its
-/// signature topic ([`kreivo::contract_event`]). The block is named by its hash: nothing is looked
-/// up by number. Its events are state at that block, which a full node keeps for about 256 blocks.
+/// signature topic ([`kreivo::contract_event`]), and the asset transfers into the contract
+/// account (`<assets>::Transferred { asset_id, from, to, amount }`), each with its extrinsic and
+/// its index among the block's events. The block is named by its hash: nothing is looked up by
+/// number. Its events are state at that block, which a full node keeps for about 256 blocks.
+/// With `untrusted` (the history endpoint), the block's header goes with them, for the adapter to
+/// check against the hash chain it holds ([`super::header_proves`]).
 async fn events_of(
     client: &OnlineClient<PolkadotConfig>,
     block: &BlockRef,
     contract: &AccountId32,
+    assets: &str,
+    untrusted: bool,
     instance_of: impl Fn(&AccountId32) -> Option<u32>,
 ) -> ChainResult<BlockEvents> {
     let b = client
@@ -523,10 +529,35 @@ async fn events_of(
         .await
         .map_err(unavailable)?;
     let parent = b.header().parent_hash.0;
+    let header = untrusted.then(|| b.header().encode());
     let events = b.events().await.map_err(unavailable)?;
     let mut out = Vec::new();
+    let mut transfers = Vec::new();
     for ev in events.iter() {
         let ev = ev.map_err(invalid)?;
+        let origin = super::EventOrigin {
+            extrinsic: match ev.phase() {
+                subxt::events::Phase::ApplyExtrinsic(i) => Some(i),
+                _ => None,
+            },
+            index: ev.index(),
+        };
+        if ev.pallet_name() == assets && ev.variant_name() == "Transferred" {
+            // pallet-assets' `Transferred { asset_id, from, to, amount }`: Kreivo's asset id, two
+            // 32-byte accounts and a `u128` balance.
+            let (asset, from, to, amount) =
+                <(kreivo::AssetId, AccountId32, AccountId32, u128)>::decode(&mut ev.field_bytes())
+                    .map_err(|e| invalid(format!("a Transferred event: {e}")))?;
+            if to == *contract {
+                transfers.push(super::TransferIn {
+                    origin,
+                    from,
+                    asset: super::ChainAsset(kreivo::asset_text(&asset)),
+                    amount,
+                });
+            }
+            continue;
+        }
         if ev.pallet_name() != "Contracts" || ev.variant_name() != "ContractEmitted" {
             continue;
         }
@@ -536,9 +567,12 @@ async fn events_of(
             continue;
         }
         let topics: Vec<[u8; 32]> = ev.topics().iter().map(|t| t.0).collect();
-        if let Some(e) =
+        if let Some(mut e) =
             kreivo::contract_event(&topics, &data, block.number, &instance_of).map_err(invalid)?
         {
+            if let super::ChainEvent::Entry { origin: o, .. } = &mut e {
+                *o = origin;
+            }
             out.push(e);
         }
     }
@@ -546,6 +580,8 @@ async fn events_of(
         block: *block,
         parent,
         events: out,
+        transfers,
+        header,
     })
 }
 
@@ -690,9 +726,14 @@ impl Chain for RpcChain {
 
     async fn block_events(&self, block: &BlockRef, instance: u32) -> ChainResult<BlockEvents> {
         let contract = self.contract(instance)?;
-        events_of(&self.client, block, &contract, |c| {
-            self.names.instance_of(c)
-        })
+        events_of(
+            &self.client,
+            block,
+            &contract,
+            &self.names.assets,
+            false,
+            |c| self.names.instance_of(c),
+        )
         .await
     }
 
@@ -705,9 +746,11 @@ impl Chain for RpcChain {
             return Ok(None);
         };
         let contract = self.contract(instance)?;
-        events_of(history, block, &contract, |c| self.names.instance_of(c))
-            .await
-            .map(Some)
+        events_of(history, block, &contract, &self.names.assets, true, |c| {
+            self.names.instance_of(c)
+        })
+        .await
+        .map(Some)
     }
 
     async fn asset_metadata(

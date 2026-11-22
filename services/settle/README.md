@@ -149,20 +149,26 @@ it serves is folded against the head the light client reads):
   "history_endpoint": "wss://kreivo-archive.example",
 ```
 
-**Every new deposit's backing is proved before it is kept** (the deposit backing check). For each
-final `Deposited` entry of an asset it maps, written in block `B` with parent `P`, the adapter reads
-through its own client the deployment's real holding (its contract account's `Assets::Account`
-balance) and the position its contract records (`position(asset)`), at `B` and at `P`, by hash, and
-requires `recorded(B) - recorded(P) <= held(B) - held(P) + bound(B)`, `bound(B)` being what the
-block's `Bound` entries of the asset recorded of a holding already there. A genuine deposit, a peer
-deployment's credit and a withdrawal change both sides alike. When it fails, every deposit of the
-asset in `B` is kept as unbacked (`settle_deposit_backing`, `migrations/0007_backing.sql`) and
-reported **without a movement**: the core records it, sets it aside (`Unusable`) and credits nothing,
-and the cursor passes it. Each raises `deposit-unbacked:<instance>:<seq>` (kind `deposit-unbacked`,
-which pages), naming the block, the asset, both changes and the sender. State the check cannot
-read (a block older than the nodes keep state for, about 256 blocks on a pruned node; the history
-endpoint serves events only) is never guessed around: nothing past the first new position is kept
-and `unreadable:<instance>:<position>` is raised, as for an unreadable range.
+**Every new deposit is matched to the transfer that paid it before it is kept** (the deposit
+backing check). Kreivo's assets API pulls a deposit from its caller with `fungibles::Mutate::transfer`,
+which emits `Assets::Transferred { asset_id, from, to, amount }`, before the contract records the
+arrival; another deployment's withdrawal to this one transfers first and then calls `credit`. So a
+final `Deposited { from, asset, amount }` entry of an asset the adapter maps is backed only if its
+extrinsic holds, earlier, a `Transferred` of that asset and amount from `from` to the contract
+account that no earlier entry claimed; matching claims it. The walk reads both kinds of event with
+the extrinsic that emitted them and their index in the block. A deposit with no match (a credit
+recorded with nothing moved; a plain transfer in another extrinsic, or one already claimed, does
+not count) is kept as unbacked (`settle_deposit_backing`, `migrations/0007_backing.sql`) and
+reported **without a movement**: the core records it, sets it aside (`Unusable`) and credits
+nothing, and the cursor passes it. It raises `deposit-unbacked:<instance>:<seq>` (which pages),
+naming the entry, its block, the asset, the amount and the sender. Nothing is read for the check,
+so it never stops the sync.
+
+The history endpoint is trusted for nothing. Each block it serves comes with its header, which
+must hash to the block the hash chain from the finalized head names and start with the parent it
+gives, or the range is unreadable. Its events are not proved against the block's state, so a
+deposit in a block it served is reported without a movement too, raising
+`deposit-unverified:<instance>:<seq>` (which pages): it is settled with evidence, never guessed.
 
 Without one, it raises `unreadable:<instance>:<position>` and waits. When no reader can serve the
 range, or a mismatch does not clear, the operator has the adapter record it as a gap through its

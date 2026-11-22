@@ -113,6 +113,7 @@ pub const SIGNALS: &[(&str, &[&str])] = &[
 pub const ADAPTER_ALERTS: &[&str] = &[
     "chain",
     "deposit-unbacked",
+    "deposit-unverified",
     "digest",
     "epoch",
     "epoch-unsupported",

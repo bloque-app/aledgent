@@ -861,7 +861,11 @@ pub fn contract_event(
     let at32 = u32::try_from(at).map_err(|_| format!("a block number past Kreivo's u32: {at}"))?;
     let raw = InboxEntry { at: at32, event }.encode();
     let entry = inbox_entry(raw, instance_of)?;
-    Ok(Some(super::ChainEvent::Entry { seq, entry }))
+    Ok(Some(super::ChainEvent::Entry {
+        seq,
+        entry,
+        origin: super::EventOrigin::default(),
+    }))
 }
 
 /// The input of a contract message: its selector, then its arguments.
