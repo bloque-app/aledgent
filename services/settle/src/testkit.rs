@@ -176,6 +176,7 @@ pub fn adapter_config(genesis: [u8; 32]) -> AdapterConfig {
         batch_gas_margin_percent: crate::config::default_batch_gas_margin_percent(),
         not_now_alert_after: crate::config::default_not_now_alert_after(),
         report_resets: false,
+        own_client_retries: crate::config::default_own_client_retries(),
     }
 }
 

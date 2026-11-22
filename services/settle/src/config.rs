@@ -165,6 +165,19 @@ pub struct AdapterConfig {
     /// is held while `reset:` is open: it declares that it does not serve.
     #[serde(default)]
     pub report_resets: bool,
+    /// After how many consecutive steps whose walk back the adapter's own client failed at a
+    /// block within the 256 it is taken to keep, that block and every older one are read from the
+    /// history endpoint (whose blocks back no deposit) instead of retried. Default 10: a blip (a
+    /// timeout, a light client not yet synced) heals well within it, while a client whose peers
+    /// keep fewer blocks, after an outage longer than they keep, still catches up. A node that
+    /// says the block is gone, or a block 256 deep, goes there at once. 0 is taken as 1.
+    #[serde(default = "default_own_client_retries")]
+    pub own_client_retries: u32,
+}
+
+/// [`AdapterConfig::own_client_retries`]'s default.
+pub fn default_own_client_retries() -> u32 {
+    10
 }
 
 /// [`ProcessConfig::wake_poll`]'s default, in milliseconds.

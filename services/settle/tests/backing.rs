@@ -672,3 +672,84 @@ async fn a_transfer_of_an_undecodable_asset_backs_nothing_and_stops_nothing() {
     settle_block(&mut k).await;
     assert_eq!(k.balances(&alice).await, (300, 0));
 }
+
+/// The final review: a node that keeps 64 blocks, after an outage of 100. It says the block is
+/// gone (`State already discarded`), so the walk reads it, and every older one, from the history
+/// endpoint at once, though it is far shallower than 256: the adapter catches up, the deposit held
+/// as unverified, and nothing stalls.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_keeping_64_blocks_recovers_through_history_at_once() {
+    let mut k = serving_kit().await;
+    let alice = k.d.party("alice", 0).await;
+    k.chain.keep_events(64);
+    k.chain.serve_history(true);
+    k.chain
+        .deposit(DEPOSITOR, INSTANCE, reference(&alice), &chain_usd(), 1_200);
+    k.chain.produce();
+    k.chain.advance(100);
+    k.step().await.unwrap();
+    let [(seq, _, 1_200)] = deposits(&k)[..] else {
+        panic!("{:?}", deposits(&k));
+    };
+    assert!(k.chain.reads().history > 0);
+    assert_eq!(k.store.cursor(INSTANCE).await.unwrap(), seq + 1);
+    assert!(open_alerts(&k, "unreadable:").await.is_empty());
+    assert_eq!(open_alerts(&k, UNVERIFIED_ALERT).await.len(), 1);
+    assert_eq!(k.balances(&alice).await, (0, 0));
+}
+
+/// The same through the light client, whose answer for a pruned block (`RemoteCouldntAnswer`)
+/// does not say the block is gone: each step stops and retries, and after
+/// `own_client_retries` (10) walks in a row the walk reads the block from the history endpoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_light_client_whose_peers_keep_64_blocks_recovers_after_its_retries() {
+    let mut k = serving_kit().await;
+    let alice = k.d.party("alice", 0).await;
+    k.chain.keep_events(64);
+    k.chain.light_client_errors(true);
+    k.chain.serve_history(true);
+    k.chain
+        .deposit(DEPOSITOR, INSTANCE, reference(&alice), &chain_usd(), 1_200);
+    k.chain.produce();
+    k.chain.advance(100);
+    let mut steps = 0;
+    while k.store.cursor(INSTANCE).await.unwrap() == 0 {
+        steps += 1;
+        assert!(steps <= 10, "still stalled after {steps} steps");
+        k.step().await.unwrap();
+        if steps < 10 {
+            assert_eq!(
+                k.chain.reads().history,
+                0,
+                "retried, not taken from history"
+            );
+            k.chain.advance(1);
+        }
+    }
+    assert_eq!(steps, 10);
+    assert!(open_alerts(&k, "unreadable:").await.is_empty());
+    assert_eq!(open_alerts(&k, UNVERIFIED_ALERT).await.len(), 1);
+    assert_eq!(k.balances(&alice).await, (0, 0));
+}
+
+/// A blip that lasts several steps, fewer than `own_client_retries`, still never holds a deposit:
+/// once the client answers, it is credited.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blip_of_several_steps_is_still_credited() {
+    let mut k = serving_kit().await;
+    let alice = k.d.party("alice", 0).await;
+    k.chain.serve_history(true);
+    k.chain
+        .deposit(DEPOSITOR, INSTANCE, reference(&alice), &chain_usd(), 1_200);
+    k.chain.produce();
+    k.chain.finalize_all();
+    for _ in 0..9 {
+        k.chain.blip(1);
+        k.step().await.unwrap();
+    }
+    assert_eq!(k.chain.reads().history, 0);
+    assert_eq!(k.balances(&alice).await, (0, 0));
+    k.step().await.unwrap();
+    assert_eq!(k.balances(&alice).await, (1_200, 0));
+    assert!(open_alerts(&k, "deposit-").await.is_empty());
+}

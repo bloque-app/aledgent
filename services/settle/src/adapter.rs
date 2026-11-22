@@ -312,6 +312,10 @@ pub struct Adapter<C: Chain, S: Store, T: Transport> {
     /// What the last step read (`NFR-15`): the heads and the calls waiting for intake, against
     /// which [`Adapter::news`] says whether a step is due before the interval ends.
     last_seen: Option<Seen>,
+    /// How many consecutive walks to one target (the head they walk back to) the adapter's own
+    /// client failed, for [`AdapterConfig::own_client_retries`]. Held in memory: a restart counts
+    /// again.
+    own_client_failures: std::sync::Mutex<Option<(WalkTo, u32)>>,
     /// The runtimes on which the layer refused a transaction signed in the format chosen for
     /// them (`T-027-12`), by [`Chosen::key`]: refused until the process restarts.
     refused: BTreeMap<String, Refusing>,
@@ -477,7 +481,7 @@ fn epoch_key(instance: u32) -> String {
 }
 
 /// Where a walk back from the finalized head stops (amendment 0040).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WalkTo {
     /// At the blocks after this one: the block the accepted head was read at.
     After(u64),
@@ -515,11 +519,27 @@ struct Evidence {
     untrusted: BTreeSet<u64>,
 }
 
-/// How many blocks below the finalized head the adapter's own client is taken to keep events for:
-/// what a pruned full node keeps (about 256). A block that deep or deeper is read from the history
-/// endpoint when the client cannot serve it; a shallower one the client cannot serve is a blip,
-/// read again at the next step.
+/// How many blocks below the finalized head the adapter's own client is taken to keep events for at
+/// most: what a pruned full node keeps (about 256). A block that deep or deeper is read from the
+/// history endpoint as soon as the client cannot serve it. A shallower one goes there only when the
+/// client says it is gone (`block_gone`) or fails the same walk
+/// [`AdapterConfig::own_client_retries`] steps in a row; otherwise the failure is a blip, read again
+/// at the next step.
 pub const OWN_CLIENT_KEEPS: u64 = 256;
+
+/// Whether the adapter's own client said that a block's events are gone for good, as a full node
+/// says it over RPC: its state discarded (`State already discarded for ..`, a pruned node) or the
+/// block unknown to it (`UnknownBlock`). The embedded light client gives no such answer it can be
+/// told by: for a block whose state its peers pruned it answers `Storage query errors: ..
+/// RemoteCouldntAnswer`, which smoldot itself counts as a network problem, and for a header no
+/// peer serves `Failed to retrieve block information from the network`, as it does while it has
+/// no peer. Those count towards [`AdapterConfig::own_client_retries`] instead.
+fn block_gone(e: &ChainError) -> bool {
+    let e = e.to_string();
+    ["State already discarded", "UnknownBlock", "Unknown block"]
+        .iter()
+        .any(|m| e.contains(m))
+}
 
 /// The kind of alert a final deposit raises when no transfer paid it (the deposit backing check):
 /// `deposit-unbacked:<instance>:<seq>`.
@@ -731,6 +751,7 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             unregistered: std::collections::BTreeSet::new(),
             declared_support: Vec::new(),
             last_seen: None,
+            own_client_failures: std::sync::Mutex::new(None),
             refused: BTreeMap::new(),
             not_now: BTreeMap::new(),
             alert_settled: BTreeSet::new(),
@@ -2878,19 +2899,41 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             let read = if own_client {
                 match self.chain.block_events(&at, instance).await {
                     Ok(b) => Ok(b),
-                    // Within what the client keeps, a failed read is a blip (a timeout, a light
-                    // client not yet synced): the range is unreadable for this step and read again
-                    // at the next, never taken from the history endpoint, whose blocks back no
-                    // deposit.
-                    Err(e) if fin.number.saturating_sub(at.number) < OWN_CLIENT_KEEPS => {
-                        return Ok(Err(format!(
-                            "the adapter's client could not read the events of block #{} ({e}); \
-                             it is within the {OWN_CLIENT_KEEPS} blocks the client keeps, so it \
-                             is read again at the next step",
-                            at.number
-                        )));
-                    }
+                    // The history endpoint's blocks back no deposit, so a block goes there only when
+                    // the client cannot serve it: past what a pruned node keeps, the node saying
+                    // so, or the client failing the same walk step after step. Anything else (a
+                    // timeout, a light client not yet synced) is a blip: the range is unreadable
+                    // for this step and read again at the next.
                     Err(e) => {
+                        let depth = fin.number.saturating_sub(at.number);
+                        let failures = self.own_client_failed(to);
+                        let retries = self.config.own_client_retries.max(1);
+                        let signal = if depth >= OWN_CLIENT_KEEPS {
+                            Some("depth")
+                        } else if block_gone(&e) {
+                            Some("gone")
+                        } else if failures >= retries {
+                            Some("retries")
+                        } else {
+                            None
+                        };
+                        let Some(signal) = signal else {
+                            return Ok(Err(format!(
+                                "the adapter's client could not read the events of block #{} \
+                                 ({e}), {failures} of {retries} walks in a row; it is read again \
+                                 at the next step",
+                                at.number
+                            )));
+                        };
+                        tracing::warn!(
+                            block = at.number,
+                            depth,
+                            signal,
+                            failures,
+                            error = %e,
+                            "the adapter's client cannot serve the block: it and every older one \
+                             are read from the history endpoint"
+                        );
                         own_client = false;
                         self.history_read(&at, &e.to_string()).await?
                     }
@@ -2939,6 +2982,9 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                 hash: parent,
             };
         }
+        if own_client {
+            self.own_client_served(to);
+        }
         for b in blocks.into_iter().rev() {
             out.evidence.transfers.insert(b.block.number, b.transfers);
             for e in b.events {
@@ -2959,6 +3005,31 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             }
         }
         Ok(Ok(out))
+    }
+
+    /// Count one more walk to `to` that the adapter's own client failed: how many in a row.
+    fn own_client_failed(&self, to: WalkTo) -> u32 {
+        let mut f = self
+            .own_client_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let n = match *f {
+            Some((t, n)) if t == to => n.saturating_add(1),
+            _ => 1,
+        };
+        *f = Some((to, n));
+        n
+    }
+
+    /// A walk to `to` the adapter's own client served whole: the count starts again.
+    fn own_client_served(&self, to: WalkTo) {
+        let mut f = self
+            .own_client_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if f.is_some_and(|(t, _)| t == to) {
+            *f = None;
+        }
     }
 
     /// `block`'s events from the history endpoint, after the adapter's own client could not

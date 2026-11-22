@@ -164,9 +164,12 @@ nothing, and the cursor passes it. It raises `deposit-unbacked:<instance>:<seq>`
 naming the entry, its block, the asset, the amount and the sender. Nothing is read for the check,
 so it never stops the sync.
 
-A block within the 256 the adapter's own client is taken to keep is never read from the history
-endpoint: a failed read there is a blip, and the step stops at the first new position and reads
-again at the next. A transfer to the contract whose asset id the adapter cannot decode backs nothing
+A block the adapter's own client cannot serve goes to the history endpoint only when it is 256 or
+more blocks deep, when a node says its state is gone (`State already discarded`, `UnknownBlock`),
+or when the same walk has failed `own_client_retries` steps in a row (default 10; the light
+client's answer for a block its peers pruned, `RemoteCouldntAnswer`, does not say which). Any other
+failure is a blip: the step stops at the first new position and reads again at the next. The
+`tracing` warning names the signal (`depth`, `gone` or `retries`). A transfer to the contract whose asset id the adapter cannot decode backs nothing
 and stops nothing. Migration `0008_backing_rule.sql` removes every verdict stored under the check's
 first, block-level rule.
 

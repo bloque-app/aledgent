@@ -330,6 +330,9 @@ struct State {
     history_fault: Option<HistoryFault>,
     /// How many more of the client's block reads fail, as a blip would ([`FakeChain::blip`]).
     blips: u32,
+    /// Whether a block past what the client keeps fails as the light client says it
+    /// ([`FakeChain::light_client_errors`]) rather than as a full node does.
+    light_errors: bool,
     /// Whether transfers read with an asset id the adapter cannot decode
     /// ([`FakeChain::undecodable_transfers`]).
     undecodable: bool,
@@ -977,6 +980,7 @@ impl FakeChain {
                 history: false,
                 history_fault: None,
                 blips: 0,
+                light_errors: false,
                 undecodable: false,
                 hide_resets: false,
                 faults: Vec::new(),
@@ -1350,6 +1354,14 @@ impl FakeChain {
     /// client not yet synced would, whatever the block's depth.
     pub fn blip(&self, reads: u32) {
         lock(&self.state).blips = reads;
+    }
+
+    /// Answer a read of a block past what the client keeps as the embedded light client does when
+    /// its peers pruned the block's state (smoldot's `Storage query errors: .. RemoteCouldntAnswer`),
+    /// which does not say the block is gone, rather than as a full node does (`State already
+    /// discarded`).
+    pub fn light_client_errors(&self, on: bool) {
+        lock(&self.state).light_errors = on;
     }
 
     /// Read every transfer into a contract account with an asset id the adapter cannot decode (a
@@ -2074,6 +2086,11 @@ impl Chain for FakeChain {
                     "the request for #{} timed out",
                     block.number
                 )));
+            }
+            if block.number.saturating_add(s.keep_events) < s.finalized && s.light_errors {
+                return Err(ChainError::Unavailable(
+                    "Storage query errors:\n- storage proof request: RemoteCouldntAnswer".into(),
+                ));
             }
             if block.number.saturating_add(s.keep_events) < s.finalized {
                 return Err(ChainError::Unavailable(format!(
