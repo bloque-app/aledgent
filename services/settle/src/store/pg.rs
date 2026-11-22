@@ -27,6 +27,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
     (4, include_str!("../../migrations/0004_binds.sql")),
     (5, include_str!("../../migrations/0005_runtimes.sql")),
     (6, include_str!("../../migrations/0006_chain.sql")),
+    (7, include_str!("../../migrations/0007_backing.sql")),
 ];
 
 /// The adapter's store in PostgreSQL. Clones share the pool.
@@ -697,6 +698,12 @@ impl Store for PgStore {
         )
         .await
         .map_err(err)?;
+        tx.execute(
+            "DELETE FROM settle_deposit_backing WHERE instance = $1 AND seq < $2",
+            &[&i64::from(instance), &i64_of(head.position)?],
+        )
+        .await
+        .map_err(err)?;
         tx.commit().await.map_err(err)
     }
 
@@ -717,7 +724,62 @@ impl Store for PgStore {
         )
         .await
         .map_err(err)?;
+        tx.execute(
+            "DELETE FROM settle_deposit_backing WHERE instance = $1",
+            &[&i64::from(instance)],
+        )
+        .await
+        .map_err(err)?;
         tx.commit().await.map_err(err)
+    }
+
+    async fn put_backing(
+        &self,
+        instance: u32,
+        seq: u64,
+        digest: &[u8; 32],
+        backing: &super::Backing,
+    ) -> StoreResult<()> {
+        let c = self.client().await?;
+        c.execute(
+            "INSERT INTO settle_deposit_backing (instance, seq, digest, backing) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (instance, seq) DO UPDATE \
+             SET digest = EXCLUDED.digest, backing = EXCLUDED.backing",
+            &[
+                &i64::from(instance),
+                &i64_of(seq)?,
+                &hex::encode(digest),
+                &to_json(backing)?,
+            ],
+        )
+        .await
+        .map_err(err)?;
+        Ok(())
+    }
+
+    async fn backing(
+        &self,
+        instance: u32,
+        seq: u64,
+        digest: &[u8; 32],
+    ) -> StoreResult<Option<super::Backing>> {
+        let c = self.client().await?;
+        let row = c
+            .query_opt(
+                "SELECT backing FROM settle_deposit_backing \
+                 WHERE instance = $1 AND seq = $2 AND digest = $3",
+                &[&i64::from(instance), &i64_of(seq)?, &hex::encode(digest)],
+            )
+            .await
+            .map_err(err)?;
+        match row {
+            None => Ok(None),
+            Some(r) => {
+                let b: &str = r.try_get("backing").map_err(err)?;
+                from_json(b).map(Some)
+            }
+        }
     }
 
     async fn insert_gap(&self, row: &GapRow) -> StoreResult<()> {

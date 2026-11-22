@@ -160,7 +160,26 @@ async fn req_sa_5_the_postgres_store_keeps_its_rules() {
         s.chain_entries(1, 0, 5).await.unwrap(),
         vec![(3, vec![3, 3]), (4, vec![4])]
     );
+    // The deposit backing check's verdicts: by position and digest, gone with the entries.
+    let unbacked = settle::store::Backing::Unbacked {
+        detail: "not backed".into(),
+    };
+    s.put_backing(1, 3, &[0x33; 32], &settle::store::Backing::Backed)
+        .await
+        .unwrap();
+    s.put_backing(1, 4, &[0x44; 32], &unbacked).await.unwrap();
+    assert_eq!(
+        s.backing(1, 3, &[0x33; 32]).await.unwrap(),
+        Some(settle::store::Backing::Backed)
+    );
+    assert_eq!(s.backing(1, 4, &[0x44; 32]).await.unwrap(), Some(unbacked));
+    assert_eq!(
+        s.backing(1, 4, &[0x45; 32]).await.unwrap(),
+        None,
+        "another entry"
+    );
     s.accept_head(1, &head).await.unwrap();
+    assert_eq!(s.backing(1, 3, &[0x33; 32]).await.unwrap(), None);
     assert_eq!(s.accepted_head(1).await.unwrap(), Some(head));
     assert!(s.chain_entries(1, 0, 5).await.unwrap().is_empty());
     assert_eq!(s.cursor(1).await.unwrap(), 5);

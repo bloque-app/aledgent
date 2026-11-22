@@ -39,9 +39,13 @@
 //!    from their events, from the accepted digest; if they lead to the head, report each from the
 //!    cursor with its canonical check and accept the head once the core took in all of them; if
 //!    not, read once more, then raise `chain:<instance>:<position>` and report nothing past the
-//!    first new position. Check what was reported provisionally; report the adapter's own
-//!    extrinsics seen above finality as provisional, while one is in flight; report the finalised
-//!    head **with the
+//!    first new position. **Every new deposit's backing is proved before it is kept** (the deposit
+//!    backing check, `Adapter::check_backing`): a block whose deposits of an asset raised the
+//!    position the contract records by more than the deployment's real holding has each of them
+//!    reported without a movement (nothing is credited), with `deposit-unbacked:<instance>:<seq>`
+//!    raised; state that cannot be read stops the sync, as an unreadable range does. Check what
+//!    was reported provisionally; report the adapter's own extrinsics seen above finality as
+//!    provisional, while one is in flight; report the finalised head **with the
 //!    account nonce of every signing key, read at that same finalized block** (the owner's
 //!    ruling of 2026-09-24: the core releases on non-inclusion only if the transaction's nonce
 //!    agrees).
@@ -106,9 +110,9 @@ use crate::config::AdapterConfig;
 use crate::link::{Answer, CoreLink, LinkError, Transport};
 use crate::signer::Signer;
 use crate::store::{
-    AcceptedHead, AnchorExtrinsic, AnchorRow, BindRow, ExtrinsicRow, ExtrinsicStatus, GapRow,
-    Inserted, InstructionRow, InstructionState, LaneRow, NotExecuted, ObservationRow, ParkReason,
-    ReportRow, RuntimeRow, Store, StoreError,
+    AcceptedHead, AnchorExtrinsic, AnchorRow, Backing, BindRow, ExtrinsicRow, ExtrinsicStatus,
+    GapRow, Inserted, InstructionRow, InstructionState, LaneRow, NotExecuted, ObservationRow,
+    ParkReason, ReportRow, RuntimeRow, Store, StoreError,
 };
 
 /// The chain's operation reference of a book operation: the call envelope's reference, its 16
@@ -493,6 +497,36 @@ struct Walked {
     dropped: usize,
     /// The positions of events in the earlier code's shape.
     legacy: Vec<u64>,
+    /// Every block read, by number: its hash and its parent's, which the deposit backing check
+    /// reads state at (the light client answers no lookup by number).
+    blocks: BTreeMap<u64, ([u8; 32], [u8; 32])>,
+}
+
+/// The kind of alert a final deposit raises when its block's holding did not grow by what its
+/// contract recorded (the deposit backing check): `deposit-unbacked:<instance>:<seq>`.
+pub const UNBACKED_ALERT: &str = "deposit-unbacked";
+
+/// What the deposit backing check read of one asset in one block, and its verdict.
+#[derive(Clone, Debug)]
+struct BlockBacking {
+    /// The deployment's real holding (its contract account's balance) at the parent and at the
+    /// block.
+    held: (u128, u128),
+    /// The position its contract records, at the parent and at the block.
+    recorded: (u128, u128),
+    /// What the block's bindings of the asset recorded of a holding already there.
+    bound: u128,
+    /// Whether the recorded position grew by at most the holding's growth plus `bound`.
+    backed: bool,
+}
+
+/// `after - before`, signed, as text.
+fn change(before: u128, after: u128) -> String {
+    if after >= before {
+        format!("+{}", after - before)
+    } else {
+        format!("-{}", before - after)
+    }
 }
 
 /// What a sync found.
@@ -503,6 +537,8 @@ enum Synced {
     New {
         /// The entries.
         entries: Vec<(u64, InboxEntry)>,
+        /// The blocks the walk read, by number: their hash and their parent's.
+        blocks: BTreeMap<u64, ([u8; 32], [u8; 32])>,
     },
 }
 
@@ -510,6 +546,10 @@ enum Synced {
 enum Stop {
     /// A block's events could not be read, by the adapter's client or the history endpoint.
     Unreadable(String),
+    /// The state the deposit backing check needs could not be read (a block's or its parent's
+    /// holding or recorded position): nothing is kept past the first new position, and the sync
+    /// runs again each step.
+    StateUnreadable(String),
     /// The events do not lead to the head, read twice.
     Mismatch(String),
     /// The instance was reset since the accepted head, at this block, with this many entries of
@@ -1534,7 +1574,29 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                 .insert_observation(&self.observation_row(seq, &e, true))
                 .await?;
             self.fault(CrashPoint::AfterObserve)?;
-            let body = self.observation_body(seq, &e, true);
+            let mut body = self.observation_body(seq, &e, true);
+            // The deposit backing check's verdict: a deposit is reported with its movement only if
+            // its block was proved to back it when it was kept ([`Adapter::check_backing`]).
+            // Without one, the core records it and sets it aside (`Unusable`), crediting nothing.
+            if matches!(e.event, InboxEvent::Deposited { .. }) && body.movement.is_some() {
+                match self.store.backing(instance, seq, &e.digest()).await? {
+                    Some(Backing::Backed) => {}
+                    Some(Backing::Unbacked { .. }) => body.movement = None,
+                    None => {
+                        body.movement = None;
+                        let key = format!("{UNBACKED_ALERT}:{instance}:{seq}");
+                        let detail = format!(
+                            "the deposit at position {seq} (block #{}) was kept before the deposit \
+                             backing check: its backing was never proved, so it is reported \
+                             without a movement, and nothing is credited",
+                            e.at
+                        );
+                        if self.store.raise(&key, &detail, now).await? {
+                            tracing::error!(alert = %key, seq, block = e.at, "{detail}");
+                        }
+                    }
+                }
+            }
             let a = self.report_observation(&body).await?;
             if !a.ingested() {
                 // The core did not take it in: do not pass it.
@@ -2849,6 +2911,9 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             };
         }
         let mut out = Walked::default();
+        for b in &blocks {
+            out.blocks.insert(b.block.number, (b.block.hash, b.parent));
+        }
         for b in blocks.into_iter().rev() {
             for e in b.events {
                 match e {
@@ -2896,6 +2961,198 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
         )
     }
 
+    /// **The deposit backing check**, on the entries a sync showed complete, before they are
+    /// kept: for every final `Deposited` entry of an asset the adapter maps, prove from chain
+    /// state that the block that wrote it, `B`, raised the deployment's real holding of the asset
+    /// at least as much as the position its contract records, less what the block's bindings
+    /// recorded of a holding already there (`try_bind` sets a position equal to a holding):
+    ///
+    /// `recorded(B) - recorded(P) <= held(B) - held(P) + bound(B)`, `P` being `B`'s parent.
+    ///
+    /// A genuine deposit, or another deployment's credit (it transfers first, then credits),
+    /// raises both alike; a withdrawal lowers both alike; a plain transfer in raises the holding
+    /// only. A credit recorded with no value moved (a caller passing the contract's own check of
+    /// its code hash) raises the position only. Which entry of the block is the one with nothing
+    /// behind it cannot be told, so **every** deposit of the asset in that block is kept as
+    /// [`Backing::Unbacked`], and later reported without a movement: the core sets it aside and
+    /// credits nothing. Each raises `deposit-unbacked:<instance>:<seq>`.
+    ///
+    /// Read once per block and asset, through the adapter's own client, at the block's hash and its
+    /// parent's from the walk (nothing is looked up by number). A read that fails is never guessed
+    /// around: `Err`, with why, and nothing is kept.
+    async fn check_backing(
+        &mut self,
+        entries: &[(u64, InboxEntry)],
+        blocks: &BTreeMap<u64, ([u8; 32], [u8; 32])>,
+    ) -> StepResult<Result<(), String>> {
+        let instance = self.config.instance;
+        let mut read: BTreeMap<(u64, ChainAsset), BlockBacking> = BTreeMap::new();
+        for (_, e) in entries {
+            let InboxEvent::Deposited { asset, .. } = &e.event else {
+                continue;
+            };
+            // An asset the adapter does not map is reported without a movement in any case.
+            if self.config.binding_of_chain(asset).is_none() {
+                continue;
+            }
+            let key = (e.at, asset.clone());
+            if read.contains_key(&key) {
+                continue;
+            }
+            match self.block_backing(e.at, asset, entries, blocks).await {
+                Ok(b) => {
+                    read.insert(key, b);
+                }
+                Err(why) => return Ok(Err(why)),
+            }
+        }
+        let now = self.now();
+        for (seq, e) in entries {
+            let InboxEvent::Deposited {
+                from,
+                account_ref,
+                asset,
+                amount,
+            } = &e.event
+            else {
+                continue;
+            };
+            let Some(b) = read.get(&(e.at, asset.clone())) else {
+                continue;
+            };
+            if b.backed {
+                self.store
+                    .put_backing(instance, *seq, &e.digest(), &Backing::Backed)
+                    .await?;
+                continue;
+            }
+            let detail = format!(
+                "the deposit at position {seq} (block #{}, asset {}, amount {amount}, from {}, to \
+                 account reference {}) is not backed: in its block the deployment's holding of the \
+                 asset changed by {} ({} to {}) and the position its contract records by {} ({} to \
+                 {}), with {} bound. Every deposit of the asset in the block is reported without a \
+                 movement, and nothing is credited",
+                e.at,
+                asset.0,
+                hex::encode(from),
+                hex::encode(account_ref),
+                change(b.held.0, b.held.1),
+                b.held.0,
+                b.held.1,
+                change(b.recorded.0, b.recorded.1),
+                b.recorded.0,
+                b.recorded.1,
+                b.bound,
+            );
+            self.store
+                .put_backing(
+                    instance,
+                    *seq,
+                    &e.digest(),
+                    &Backing::Unbacked {
+                        detail: detail.clone(),
+                    },
+                )
+                .await?;
+            let key = format!("{UNBACKED_ALERT}:{instance}:{seq}");
+            if self.store.raise(&key, &detail, now).await? {
+                tracing::error!(
+                    alert = %key,
+                    seq,
+                    block = e.at,
+                    asset = %asset.0,
+                    amount = %amount,
+                    from = %hex::encode(from),
+                    held_change = %change(b.held.0, b.held.1),
+                    recorded_change = %change(b.recorded.0, b.recorded.1),
+                    bound = %b.bound,
+                    "a deposit is not backed by the deployment's holding: reported without a movement"
+                );
+            }
+        }
+        Ok(Ok(()))
+    }
+
+    /// What [`Adapter::check_backing`] reads of `asset` in block `at`: the holding and the
+    /// recorded position at the block and at its parent, and the block's bindings of it among
+    /// `entries`.
+    async fn block_backing(
+        &self,
+        at: u64,
+        asset: &ChainAsset,
+        entries: &[(u64, InboxEntry)],
+        blocks: &BTreeMap<u64, ([u8; 32], [u8; 32])>,
+    ) -> Result<BlockBacking, String> {
+        let instance = self.config.instance;
+        let Some((hash, parent)) = blocks.get(&at).copied() else {
+            return Err(format!(
+                "block #{at} was not among the blocks the sync read"
+            ));
+        };
+        let Some(parent_number) = at.checked_sub(1) else {
+            return Err("a deposit in the genesis block has no parent".into());
+        };
+        let b = BlockRef { number: at, hash };
+        let p = BlockRef {
+            number: parent_number,
+            hash: parent,
+        };
+        let why = |what: &str, block: &BlockRef, e: ChainError| {
+            format!(
+                "{what} of asset {} at block #{} ({}): {e}",
+                asset.0,
+                block.number,
+                hex::encode(block.hash)
+            )
+        };
+        let held_p = self
+            .chain
+            .position(&p, instance, asset)
+            .await
+            .map_err(|e| why("the holding", &p, e))?;
+        let held_b = self
+            .chain
+            .position(&b, instance, asset)
+            .await
+            .map_err(|e| why("the holding", &b, e))?;
+        let recorded_p = self
+            .chain
+            .recorded_position(&p, instance, asset)
+            .await
+            .map_err(|e| why("the recorded position", &p, e))?;
+        let recorded_b = self
+            .chain
+            .recorded_position(&b, instance, asset)
+            .await
+            .map_err(|e| why("the recorded position", &b, e))?;
+        // `try_bind` records a holding already there: the position rises, the holding does not.
+        let bound = entries
+            .iter()
+            .filter(|(_, e)| e.at == at)
+            .filter_map(|(_, e)| match &e.event {
+                InboxEvent::Bound {
+                    asset: a, amount, ..
+                } if a == asset => Some(*amount),
+                _ => None,
+            })
+            .try_fold(0u128, u128::checked_add);
+        // recorded_b - recorded_p <= held_b - held_p + bound, without a subtraction: an overflow
+        // (amounts no asset reaches) is taken as not backed, never as backed.
+        let backed = match (bound, recorded_b.checked_add(held_p)) {
+            (Some(bound), Some(lhs)) => held_b
+                .checked_add(recorded_p)
+                .and_then(|r| r.checked_add(bound))
+                .is_some_and(|rhs| lhs <= rhs),
+            _ => false,
+        };
+        Ok(BlockBacking {
+            held: (held_p, held_b),
+            recorded: (recorded_p, recorded_b),
+            bound: bound.unwrap_or(u128::MAX),
+            backed,
+        })
+    }
+
     /// The sync (amendment 0040, `REQ-IN-5`): does what the layer holds lead, entry by entry, from
     /// the head the adapter last verified to the head it holds at `fin`? Unchanged: done, with no
     /// other read (but the anchor sequence's, while the chain has no entry). Otherwise the events
@@ -2934,6 +3191,7 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             None if head.position == head.start && head.digest == ZERO_DIGEST => {
                 return Ok(Ok(Synced::New {
                     entries: Vec::new(),
+                    blocks: BTreeMap::new(),
                 }));
             }
             None => (head.start, ZERO_DIGEST, WalkTo::Start(head.start)),
@@ -2969,6 +3227,7 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                     return Ok(Err(Stop::Reset(at, 0, 0)));
                 }
             }
+            let blocks = walked.blocks;
             let entries: Vec<(u64, InboxEntry)> = walked
                 .entries
                 .into_iter()
@@ -2982,7 +3241,7 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                 None => crate::chain::fold(from, &digest, &entries, head),
             };
             match checked {
-                Ok(()) => return Ok(Ok(Synced::New { entries })),
+                Ok(()) => return Ok(Ok(Synced::New { entries, blocks })),
                 Err(why) => {
                     tracing::warn!(
                         attempt,
@@ -3429,12 +3688,21 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                 }
                 self.cleared(from).await?;
             }
-            Ok(Synced::New { entries }) => {
+            Ok(Synced::New { entries, blocks }) => {
                 let epoch = match verified {
                     Some(v) => Ok(v.epoch),
                     None => self.first_start(fin, from, &head).await?,
                 };
                 if let Ok(epoch) = epoch {
+                    // The deposit backing check, before anything is kept (and after a first
+                    // start, which may reset what the store keeps): a deposit whose block did not
+                    // raise the holding as its contract recorded is kept as unbacked; state that
+                    // cannot be read keeps nothing.
+                    if let Err(why) = self.check_backing(&entries, &blocks).await? {
+                        self.stopped(from, &head, Stop::StateUnreadable(why))
+                            .await?;
+                        return Ok(Some(head));
+                    }
                     let raw: Vec<(u64, Vec<u8>)> =
                         entries.into_iter().map(|(seq, e)| (seq, e.raw)).collect();
                     let v = AcceptedHead {
@@ -3722,6 +3990,19 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                     "positions [{from}, {to}) cannot be read: {why}. A history endpoint \
                      (`history_endpoint`) catches up; else the operator records the range as a \
                      gap (`aledgent-settle <config> gap {from} {to}`)"
+                ),
+            ),
+            Stop::StateUnreadable(why) => (
+                format!("unreadable:{instance}:{from}"),
+                format!(
+                    "positions [{from}, {to}) are not kept: the deposit backing check cannot read \
+                     the state it needs ({why}). Nothing past position {from} is reported, and \
+                     nothing is credited, until the state reads; the sync runs again every step. \
+                     The adapter's client keeps state as long as the nodes it reads from (about \
+                     256 blocks for a pruned node); the history endpoint serves events only. If it \
+                     stays unreadable, the operator records the range as a gap (`aledgent-settle \
+                     <config> gap {from} {to}`), and nothing in it is credited \
+                     (`ops/runbooks/gap-filling.md`)"
                 ),
             ),
             Stop::ResetUnread(block, why) => {

@@ -149,6 +149,21 @@ it serves is folded against the head the light client reads):
   "history_endpoint": "wss://kreivo-archive.example",
 ```
 
+**Every new deposit's backing is proved before it is kept** (the deposit backing check). For each
+final `Deposited` entry of an asset it maps, written in block `B` with parent `P`, the adapter reads
+through its own client the deployment's real holding (its contract account's `Assets::Account`
+balance) and the position its contract records (`position(asset)`), at `B` and at `P`, by hash, and
+requires `recorded(B) - recorded(P) <= held(B) - held(P) + bound(B)`, `bound(B)` being what the
+block's `Bound` entries of the asset recorded of a holding already there. A genuine deposit, a peer
+deployment's credit and a withdrawal change both sides alike. When it fails, every deposit of the
+asset in `B` is kept as unbacked (`settle_deposit_backing`, `migrations/0007_backing.sql`) and
+reported **without a movement**: the core records it, sets it aside (`Unusable`) and credits nothing,
+and the cursor passes it. Each raises `deposit-unbacked:<instance>:<seq>` (kind `deposit-unbacked`,
+which pages), naming the block, the asset, both changes and the sender. State the check cannot
+read (a block older than the nodes keep state for, about 256 blocks on a pruned node; the history
+endpoint serves events only) is never guessed around: nothing past the first new position is kept
+and `unreadable:<instance>:<position>` is raised, as for an unreadable range.
+
 Without one, it raises `unreadable:<instance>:<position>` and waits. When no reader can serve the
 range, or a mismatch does not clear, the operator has the adapter record it as a gap through its
 own source, after which it accepts the layer's head as it stands, unverified for that range. The

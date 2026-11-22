@@ -112,6 +112,7 @@ pub const SIGNALS: &[(&str, &[&str])] = &[
 /// The kinds of the adapter's alerts (`F-016`), each exported even at zero.
 pub const ADAPTER_ALERTS: &[&str] = &[
     "chain",
+    "deposit-unbacked",
     "digest",
     "epoch",
     "epoch-unsupported",

@@ -9,7 +9,8 @@ SPDX-License-Identifier: CC-BY-4.0
 (amendment 0041, `[PENDING AMENDMENT 0041]`), `AC-D2.2`, `NFR-9`
 
 **Pages that lead here:** `AledgentSettlementChainMismatch`, `AledgentObservationStopped`,
-`AledgentObservationGap`, `AledgentObservationLag`, `AledgentSettlementEpochRefused`. **Owner:** settlement-operations. **Rule that does not bend:** nothing here
+`AledgentObservationGap`, `AledgentObservationLag`, `AledgentSettlementEpochRefused`,
+`AledgentDepositUnbacked`. **Owner:** settlement-operations. **Rule that does not bend:** nothing here
 writes the book or a store by hand. What the settlement layer recorded reaches the book only as the
 adapter's observations through the core's surface; an operation that cannot settle is resolved with
 evidence through `CTR-OPS` (`resolve_operation`), never by an edit (`REQ-AT-3`, `INV-11`).
@@ -83,6 +84,27 @@ Incidents and gaps are written to the audit trail (`NFR-6`, `REQ-AT-1`), not to 
    layer's. After an operator's gap, the `gap:` alert it raised (`AledgentObservationGap`) closes once the
    adapter has accepted the head past the range. If it stays open after that, it is the adapter's
    defect, not the operator's to clear: raise it with settlement-operations. Clear nothing by hand.
+
+## An unbacked deposit
+
+`AledgentDepositUnbacked` (alert `deposit-unbacked:<instance>:<seq>`): before keeping a final deposit,
+the adapter proves from chain state that its block raised the deployment's real holding of the asset
+at least as much as the position the contract records (less what the block's bindings recorded). It
+did not: something recorded value in the contract that never arrived. Every deposit of the asset in
+that block was reported **without a movement**; the core recorded each and set it aside (`Unusable`),
+credited nothing, and the cursor went on. The alert names the block, the asset, both changes and the
+sender.
+
+1. Treat it as an attack until shown otherwise; escalate to the owner and the security contact.
+2. Read the block on the layer: which entries of the asset it holds, who sent each, and which
+   transfers reached the contract account. A genuine depositor in the same block is not credited
+   either; settle that deposit with evidence through `CTR-OPS` (`resolve_operation`), never by an
+   edit.
+3. Do not clear the alert to make the page stop: it is the record that the check fired.
+
+State the check cannot read (a block older than the nodes keep state for, about 256 blocks) stops the
+sync at the first new position with `unreadable:<instance>:<position>`, as an unreadable range does
+(`AledgentObservationStopped`): nothing past it is kept or credited until it reads.
 
 ## After a reset
 

@@ -56,6 +56,13 @@
 //!   (`F-027` NOTES, decision 51), or answers what a test says ([`FakeChain::answer_validations`]).
 //!   A test can act at a precise point of a step ([`FakeChain::before_next_runtime_read`],
 //!   [`FakeChain::before_next_validation`]), as an upgrade enacted between two reads would.
+//! - **A forged credit** ([`FakeChain::forge_credit`]): a `Deposited` entry and a rise of the
+//!   recorded position with no value moved, as a caller that passes the contract's `credit` check
+//!   of its code hash would leave; and the flows the deposit backing check must tell from it: a
+//!   plain transfer in ([`FakeChain::transfer`]), a binding ([`FakeChain::bind`]), and another
+//!   deployment's withdrawal to this one ([`FakeChain::peer_withdraw`]). **State is kept** for the
+//!   blocks within [`FakeChain::keep_state`] of the finalized head (every block by default), as a
+//!   pruned node keeps it.
 //! - **Reader faults.** [`FakeChain::misread_reference_of`]: an entry the chain holds is read back
 //!   naming no operation of the deployment, as a faulty decoder would read it; its bytes, and so
 //!   its coordinate, are unchanged. [`FakeChain::fault_reads`]: an entry hidden, repeated or
@@ -239,6 +246,35 @@ enum Queued {
         instance: u32,
         keys: Vec<AccountId32>,
     },
+    /// A credit recorded with nothing moved ([`FakeChain::forge_credit`]).
+    Forged {
+        from: AccountId32,
+        instance: u32,
+        account_ref: [u8; 32],
+        asset: ChainAsset,
+        amount: u128,
+    },
+    /// A plain transfer, outside the contract.
+    Transfer {
+        from: AccountId32,
+        to: AccountId32,
+        asset: ChainAsset,
+        amount: u128,
+    },
+    /// The contract's `Bind`, as a key's call would run it.
+    Bind {
+        instance: u32,
+        asset: ChainAsset,
+        amount: u128,
+    },
+    /// A withdrawal of `instance` to deployment `to`, as a key's call would run it.
+    PeerWithdraw {
+        instance: u32,
+        to: u32,
+        account_ref: [u8; 32],
+        asset: ChainAsset,
+        amount: u128,
+    },
 }
 
 struct State {
@@ -266,6 +302,9 @@ struct State {
     reads: Reads,
     /// How many blocks below the finalized head the adapter's client still serves events for.
     keep_events: u64,
+    /// How many blocks below the finalized head the adapter's client still serves state for;
+    /// `None`: every block's.
+    keep_state: Option<u64>,
     /// Whether the history endpoint serves.
     history: bool,
     /// Whether reads leave out `AnchorHeadSet` (a reader that misses it).
@@ -694,6 +733,7 @@ impl FakeChain {
                 dry_runs: 0,
                 reads: Reads::default(),
                 keep_events: 256,
+                keep_state: None,
                 history: false,
                 hide_resets: false,
                 faults: Vec::new(),
@@ -985,6 +1025,78 @@ impl FakeChain {
         lock(&self.state).keep_events = blocks;
     }
 
+    /// How many blocks below the finalized head the adapter's own client serves state for
+    /// (balances, the contract's read messages): `None`, every block's (the default). A pruned
+    /// node keeps about 256.
+    pub fn keep_state(&self, blocks: Option<u64>) {
+        lock(&self.state).keep_state = blocks;
+    }
+
+    /// Queue, for the next block, a credit of `amount` of `asset` into `instance` recorded with
+    /// **nothing moved**: the contract's `credit` called by `from`, a contract that set its code
+    /// hash to the settlement contract's in the same frame and so passed its check. A `Deposited`
+    /// entry from `from`, and the recorded position raised; no balance changes.
+    pub fn forge_credit(
+        &self,
+        from: AccountId32,
+        instance: u32,
+        account_ref: [u8; 32],
+        asset: &ChainAsset,
+        amount: u128,
+    ) {
+        lock(&self.state).queued.push(Queued::Forged {
+            from,
+            instance,
+            account_ref,
+            asset: asset.clone(),
+            amount,
+        });
+    }
+
+    /// Queue a plain transfer of `amount` of `asset` from `from` to `to` for the next block: to a
+    /// deployment's contract account, value outside the contract's calls (no entry, no recorded
+    /// position).
+    pub fn transfer(&self, from: AccountId32, to: AccountId32, asset: &ChainAsset, amount: u128) {
+        lock(&self.state).queued.push(Queued::Transfer {
+            from,
+            to,
+            asset: asset.clone(),
+            amount,
+        });
+    }
+
+    /// Queue the contract's `Bind` of `amount` of `asset` on `instance` for the next block, as a
+    /// key's call would run it: applied (a `Bound` entry, the position set to the holding) only if
+    /// the holding is the recorded position plus `amount`.
+    pub fn bind(&self, instance: u32, asset: &ChainAsset, amount: u128) {
+        lock(&self.state).queued.push(Queued::Bind {
+            instance,
+            asset: asset.clone(),
+            amount,
+        });
+    }
+
+    /// Queue, for the next block, a withdrawal of `amount` of `asset` from deployment `instance`
+    /// to deployment `to` at `account_ref`, as a key's call would run it: the value moves, `to`'s
+    /// contract credits it (a `Deposited` entry from `instance`'s contract account), and `instance`
+    /// records `Withdrawn`.
+    pub fn peer_withdraw(
+        &self,
+        instance: u32,
+        to: u32,
+        account_ref: [u8; 32],
+        asset: &ChainAsset,
+        amount: u128,
+    ) {
+        lock(&self.state).queued.push(Queued::PeerWithdraw {
+            instance,
+            to,
+            account_ref,
+            asset: asset.clone(),
+            amount,
+        });
+    }
+
     /// Leave `AnchorHeadSet` out of every events read from now on: a reader that misses it, while
     /// storage shows the reset (the anchor sequence moved).
     pub fn hide_resets(&self, hidden: bool) {
@@ -1262,6 +1374,93 @@ impl FakeChain {
                         d.keys = keys;
                     }
                 }
+                Queued::Forged {
+                    from,
+                    instance,
+                    account_ref,
+                    asset,
+                    amount,
+                } => {
+                    let Ok(id) = kreivo::parse_asset(&asset.0) else {
+                        continue;
+                    };
+                    let Some(d) = world.deployments.get_mut(&instance) else {
+                        continue;
+                    };
+                    *d.positions.entry(asset).or_insert(0) += amount;
+                    world.append(
+                        instance,
+                        number,
+                        kreivo::InboxEvent::Deposited {
+                            from,
+                            account_ref,
+                            asset: id,
+                            amount,
+                        },
+                    );
+                }
+                Queued::Transfer {
+                    from,
+                    to,
+                    asset,
+                    amount,
+                } => {
+                    if *world.balance(from, &asset) >= amount {
+                        *world.balance(from, &asset) -= amount;
+                        *world.balance(to, &asset) += amount;
+                    }
+                }
+                Queued::Bind {
+                    instance,
+                    asset,
+                    amount,
+                } => {
+                    let Ok(id) = kreivo::parse_asset(&asset.0) else {
+                        continue;
+                    };
+                    let e = Envelope {
+                        operation_ref: [0xBD; 32],
+                        call: Call::Bind { asset: id, amount },
+                    };
+                    let keys = world
+                        .deployments
+                        .get(&instance)
+                        .map(|d| d.keys.clone())
+                        .unwrap_or_default();
+                    if let Some(key) = keys.first() {
+                        let _ = world.execute(instance, number, *key, &[e], &BTreeSet::new());
+                    }
+                }
+                Queued::PeerWithdraw {
+                    instance,
+                    to,
+                    account_ref,
+                    asset,
+                    amount,
+                } => {
+                    let Ok(id) = kreivo::parse_asset(&asset.0) else {
+                        continue;
+                    };
+                    let e = Envelope {
+                        operation_ref: [0xBE; 32],
+                        call: Call::Withdraw {
+                            to: kreivo::Destination::Deployment {
+                                contract: position_account(to),
+                                account_ref,
+                            },
+                            asset: id,
+                            amount,
+                        },
+                    };
+                    let keys = world
+                        .deployments
+                        .get(&instance)
+                        .map(|d| d.keys.clone())
+                        .unwrap_or_default();
+                    if let Some(key) = keys.first() {
+                        let _ = world.execute(instance, number, *key, &[e], &BTreeSet::new());
+                    }
+                }
             }
         }
         // The pool, in (account, nonce) order; loop so a run of nonces lands in one block.
@@ -1488,6 +1687,14 @@ impl FakeChain {
 
     fn world_at(&self, at: &BlockRef) -> ChainResult<World> {
         let s = lock(&self.state);
+        if let Some(keep) = s.keep_state {
+            if at.number.saturating_add(keep) < s.finalized {
+                return Err(ChainError::Unavailable(format!(
+                    "State already discarded for #{}: the node keeps {keep} blocks of state",
+                    at.number
+                )));
+            }
+        }
         s.blocks
             .get(usize::try_from(at.number).unwrap_or(usize::MAX))
             .filter(|b| b.hash == at.hash)
