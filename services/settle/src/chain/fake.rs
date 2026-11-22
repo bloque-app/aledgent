@@ -328,6 +328,11 @@ struct State {
     history: bool,
     /// How the history endpoint lies, if it does ([`FakeChain::history_lies`]).
     history_fault: Option<HistoryFault>,
+    /// How many more of the client's block reads fail, as a blip would ([`FakeChain::blip`]).
+    blips: u32,
+    /// Whether transfers read with an asset id the adapter cannot decode
+    /// ([`FakeChain::undecodable_transfers`]).
+    undecodable: bool,
     /// Whether reads leave out `AnchorHeadSet` (a reader that misses it).
     hide_resets: bool,
     /// The reader's faults ([`FakeChain::fault_reads`]).
@@ -971,6 +976,8 @@ impl FakeChain {
                 keep_state: None,
                 history: false,
                 history_fault: None,
+                blips: 0,
+                undecodable: false,
                 hide_resets: false,
                 faults: Vec::new(),
                 no_dry_runs: false,
@@ -1337,6 +1344,18 @@ impl FakeChain {
     /// storage shows the reset (the anchor sequence moved).
     pub fn hide_resets(&self, hidden: bool) {
         lock(&self.state).hide_resets = hidden;
+    }
+
+    /// Make the next `reads` block reads of the adapter's own client fail, as a timeout or a light
+    /// client not yet synced would, whatever the block's depth.
+    pub fn blip(&self, reads: u32) {
+        lock(&self.state).blips = reads;
+    }
+
+    /// Read every transfer into a contract account with an asset id the adapter cannot decode (a
+    /// variant a later runtime added), as `kreivo::transfer_to` reads one.
+    pub fn undecodable_transfers(&self, on: bool) {
+        lock(&self.state).undecodable = on;
     }
 
     /// Make the history endpoint lie from now on (`None`: it tells the truth, the default).
@@ -1840,7 +1859,11 @@ impl FakeChain {
             .map(|(origin, asset, from, _, amount)| TransferIn {
                 origin: *origin,
                 from: *from,
-                asset: asset.clone(),
+                asset: if s.undecodable {
+                    ChainAsset(format!("{}ff", kreivo::UNDECODED_ASSET))
+                } else {
+                    asset.clone()
+                },
                 amount: *amount,
             })
             .collect();
@@ -2045,6 +2068,13 @@ impl Chain for FakeChain {
         {
             let mut s = lock(&self.state);
             s.reads.blocks += 1;
+            if s.blips > 0 {
+                s.blips -= 1;
+                return Err(ChainError::Unavailable(format!(
+                    "the request for #{} timed out",
+                    block.number
+                )));
+            }
             if block.number.saturating_add(s.keep_events) < s.finalized {
                 return Err(ChainError::Unavailable(format!(
                     "State already discarded for #{}: the node keeps {} blocks of events",

@@ -615,3 +615,60 @@ async fn verdicts_are_cleared_on_a_reset_and_bound_to_their_entry() {
         Some(Backing::Backed)
     );
 }
+
+/// The second review's finding 1: one failed read of the adapter's own client (a timeout, a light
+/// client not yet synced), for a block within what it keeps, is a blip. The step stops at the first
+/// new position and reads again at the next; the block is never taken from the history endpoint,
+/// whose blocks back no deposit, so the deposit is credited once the client answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blip_of_the_client_delays_a_deposit_and_never_holds_it() {
+    let mut k = serving_kit().await;
+    let alice = k.d.party("alice", 0).await;
+    let cursor = k.store.cursor(INSTANCE).await.unwrap();
+    k.chain.serve_history(true);
+    k.chain
+        .deposit(DEPOSITOR, INSTANCE, reference(&alice), &chain_usd(), 1_200);
+    k.chain.produce();
+    k.chain.finalize_all();
+    k.chain.blip(1);
+    let before = k.chain.reads();
+    k.step().await.unwrap();
+    assert_eq!(k.chain.reads().history, before.history, "no history read");
+    assert_eq!(k.store.cursor(INSTANCE).await.unwrap(), cursor);
+    let alerts = open_alerts(&k, &format!("unreadable:{INSTANCE}:{cursor}")).await;
+    assert_eq!(alerts.len(), 1);
+    assert!(
+        alerts[0].detail.contains("read again"),
+        "{}",
+        alerts[0].detail
+    );
+    k.step().await.unwrap();
+    assert_eq!(k.balances(&alice).await, (1_200, 0));
+    assert!(open_alerts(&k, "unreadable:").await.is_empty());
+    assert!(open_alerts(&k, "deposit-").await.is_empty());
+}
+
+/// The second review's finding 2: a transfer to the contract whose asset id the adapter cannot
+/// decode backs nothing, and stops nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_transfer_of_an_undecodable_asset_backs_nothing_and_stops_nothing() {
+    let mut k = serving_kit().await;
+    let alice = k.d.party("alice", 0).await;
+    k.chain.undecodable_transfers(true);
+    k.chain
+        .deposit(DEPOSITOR, INSTANCE, reference(&alice), &chain_usd(), 1_200);
+    settle_block(&mut k).await;
+    let [(seq, _, 1_200)] = deposits(&k)[..] else {
+        panic!("{:?}", deposits(&k));
+    };
+    assert_eq!(k.balances(&alice).await, (0, 0));
+    assert_eq!(k.store.cursor(INSTANCE).await.unwrap(), seq + 1);
+    assert!(open_alerts(&k, "unreadable:").await.is_empty());
+    assert_eq!(open_alerts(&k, UNBACKED_ALERT).await.len(), 1);
+    // What decodes again backs as ever.
+    k.chain.undecodable_transfers(false);
+    k.chain
+        .deposit(DEPOSITOR, INSTANCE, reference(&alice), &chain_usd(), 300);
+    settle_block(&mut k).await;
+    assert_eq!(k.balances(&alice).await, (300, 0));
+}

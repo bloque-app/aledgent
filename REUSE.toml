@@ -60,6 +60,14 @@ precedence = "override"
 SPDX-FileCopyrightText = "Copyright (c) Virto Network"
 SPDX-License-Identifier = "GPL-3.0-only"
 
+# Kreivo's runtime metadata (spec 136), as its public RPC serves it (`state_getMetadata`, trimmed by
+# `subxt metadata --pallets System,Assets,Contracts`): the settle adapter's event-decoding test.
+[[annotations]]
+path = "services/settle/fixtures/kreivo-136-events-metadata.scale"
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright (c) Virto Network"
+SPDX-License-Identifier = "GPL-3.0-only"
+
 # Amazon RDS's public certificate-authority bundle, redistributed unmodified.
 [[annotations]]
 path = "services/ingress/certs/rds-global-bundle.pem"

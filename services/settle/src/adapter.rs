@@ -515,6 +515,12 @@ struct Evidence {
     untrusted: BTreeSet<u64>,
 }
 
+/// How many blocks below the finalized head the adapter's own client is taken to keep events for:
+/// what a pruned full node keeps (about 256). A block that deep or deeper is read from the history
+/// endpoint when the client cannot serve it; a shallower one the client cannot serve is a blip,
+/// read again at the next step.
+pub const OWN_CLIENT_KEEPS: u64 = 256;
+
 /// The kind of alert a final deposit raises when no transfer paid it (the deposit backing check):
 /// `deposit-unbacked:<instance>:<seq>`.
 pub const UNBACKED_ALERT: &str = "deposit-unbacked";
@@ -2872,6 +2878,18 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             let read = if own_client {
                 match self.chain.block_events(&at, instance).await {
                     Ok(b) => Ok(b),
+                    // Within what the client keeps, a failed read is a blip (a timeout, a light
+                    // client not yet synced): the range is unreadable for this step and read again
+                    // at the next, never taken from the history endpoint, whose blocks back no
+                    // deposit.
+                    Err(e) if fin.number.saturating_sub(at.number) < OWN_CLIENT_KEEPS => {
+                        return Ok(Err(format!(
+                            "the adapter's client could not read the events of block #{} ({e}); \
+                             it is within the {OWN_CLIENT_KEEPS} blocks the client keeps, so it \
+                             is read again at the next step",
+                            at.number
+                        )));
+                    }
                     Err(e) => {
                         own_client = false;
                         self.history_read(&at, &e.to_string()).await?

@@ -28,6 +28,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
     (5, include_str!("../../migrations/0005_runtimes.sql")),
     (6, include_str!("../../migrations/0006_chain.sql")),
     (7, include_str!("../../migrations/0007_backing.sql")),
+    (8, include_str!("../../migrations/0008_backing_rule.sql")),
 ];
 
 /// The adapter's store in PostgreSQL. Clones share the pool.

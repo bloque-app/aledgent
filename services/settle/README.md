@@ -164,6 +164,12 @@ nothing, and the cursor passes it. It raises `deposit-unbacked:<instance>:<seq>`
 naming the entry, its block, the asset, the amount and the sender. Nothing is read for the check,
 so it never stops the sync.
 
+A block within the 256 the adapter's own client is taken to keep is never read from the history
+endpoint: a failed read there is a blip, and the step stops at the first new position and reads
+again at the next. A transfer to the contract whose asset id the adapter cannot decode backs nothing
+and stops nothing. Migration `0008_backing_rule.sql` removes every verdict stored under the check's
+first, block-level rule.
+
 The history endpoint is trusted for nothing. Each block it serves comes with its header, which
 must hash to the block the hash chain from the finalized head names and start with the parent it
 gives, or the range is unreadable. Its events are not proved against the block's state, so a
