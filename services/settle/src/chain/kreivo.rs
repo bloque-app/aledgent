@@ -223,6 +223,38 @@ pub fn asset_text(a: &AssetId) -> String {
     }
 }
 
+/// What an asset id [`transfer_to`] cannot decode reads as: this prefix and its bytes in hex. It
+/// names no asset the adapter maps, so a deposit it would pay is never matched.
+pub const UNDECODED_ASSET: &str = "undecoded:";
+
+/// pallet-assets' `Transferred { asset_id, from, to, amount }`, from its SCALE fields: the sender,
+/// the asset and the amount, **if it is a transfer to `contract`**; `None` otherwise. The fields
+/// end with three of fixed size, `from` and `to` (32 bytes each) and `amount` (a `u128`, 16 bytes),
+/// so the receiver is read from the end before the asset id is decoded: a transfer of any other
+/// account's never has its asset decoded at all. An asset id this mirror of
+/// `FungibleAssetLocation` cannot decode (a variant a later runtime added) is not an error: it
+/// reads as [`UNDECODED_ASSET`] and backs nothing. Fields too short to be a transfer are `None`.
+/// Nothing here stops a sync.
+pub fn transfer_to(
+    fields: &[u8],
+    contract: &AccountId32,
+) -> Option<(AccountId32, super::ChainAsset, u128)> {
+    let tail = fields.len().checked_sub(80)?;
+    let (asset, rest) = fields.split_at(tail);
+    let from: AccountId32 = rest[..32].try_into().ok()?;
+    let to: AccountId32 = rest[32..64].try_into().ok()?;
+    if to != *contract {
+        return None;
+    }
+    let amount = u128::from_le_bytes(rest[64..80].try_into().ok()?);
+    let mut input = asset;
+    let asset = match AssetId::decode(&mut input) {
+        Ok(a) if input.is_empty() => asset_text(&a),
+        _ => format!("{UNDECODED_ASSET}{}", hex::encode(asset)),
+    };
+    Some((from, super::ChainAsset(asset), amount))
+}
+
 /// Where a withdrawal sends value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum Destination {
@@ -861,7 +893,11 @@ pub fn contract_event(
     let at32 = u32::try_from(at).map_err(|_| format!("a block number past Kreivo's u32: {at}"))?;
     let raw = InboxEntry { at: at32, event }.encode();
     let entry = inbox_entry(raw, instance_of)?;
-    Ok(Some(super::ChainEvent::Entry { seq, entry }))
+    Ok(Some(super::ChainEvent::Entry {
+        seq,
+        entry,
+        origin: super::EventOrigin::default(),
+    }))
 }
 
 /// The input of a contract message: its selector, then its arguments.

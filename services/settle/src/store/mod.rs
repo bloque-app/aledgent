@@ -599,6 +599,27 @@ pub trait Store: Clone + Send + Sync + 'static {
         start: u64,
     ) -> impl Future<Output = StoreResult<()>> + Send;
 
+    /// Record what the deposit backing check proved of the kept entry at `seq` whose digest is
+    /// `digest` ([`Backing`]); a second record of the same entry replaces the first. Removed with
+    /// the entries, once accepted or on a reset.
+    fn put_backing(
+        &self,
+        instance: u32,
+        seq: u64,
+        digest: &[u8; 32],
+        backing: &Backing,
+    ) -> impl Future<Output = StoreResult<()>> + Send;
+
+    /// What the deposit backing check proved of the entry at `seq` whose digest is `digest`;
+    /// `None` if it was never checked (an entry kept before the check existed, or another entry at
+    /// the same position).
+    fn backing(
+        &self,
+        instance: u32,
+        seq: u64,
+        digest: &[u8; 32],
+    ) -> impl Future<Output = StoreResult<Option<Backing>>> + Send;
+
     /// Record a gap (idempotent on `(instance, from)`).
     fn insert_gap(&self, row: &GapRow) -> impl Future<Output = StoreResult<()>> + Send;
 
@@ -643,6 +664,28 @@ pub trait Store: Clone + Send + Sync + 'static {
     /// Record a runtime the layer confirmed a format on; a second record of one key keeps the
     /// first.
     fn confirm_runtime(&self, row: &RuntimeRow) -> impl Future<Output = StoreResult<()>> + Send;
+}
+
+/// What the deposit backing check proved of a final deposit it kept: that a transfer of its
+/// asset and amount from its sender to the contract account paid it, in the same extrinsic, or
+/// not. A deposit is reported with its movement only when [`Backing::Backed`] is stored for it,
+/// under its position and digest.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Backing {
+    /// An unclaimed transfer paid it, earlier in its extrinsic.
+    Backed,
+    /// No transfer paid it: something recorded value that did not arrive. `detail` names the
+    /// entry and where its event was.
+    Unbacked {
+        /// What the check found.
+        detail: String,
+    },
+    /// Its block was served by the history endpoint, whose events nothing proves: it cannot be
+    /// shown paid.
+    Unverified {
+        /// What the check found.
+        detail: String,
+    },
 }
 
 /// The asset of a call, for the liquidity check.

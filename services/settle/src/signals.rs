@@ -67,7 +67,9 @@ pub struct AdapterSignals {
     /// Gaps recorded, ever (`REQ-SA-7`).
     pub gaps: u64,
     /// Open alerts by kind: the part of the key before its first `:` (`position`, `fees`,
-    /// `gap`, `incident`, `rescan`, `lane`, `digest`, `refusing`).
+    /// `gap`, `incident`, `rescan`, `lane`, `digest`, `refusing`; `deposit-unbacked`, a final
+    /// deposit reported without its movement because no transfer paid it, and `deposit-unverified`,
+    /// one read from the history endpoint, both of which page).
     pub alerts: BTreeMap<String, u64>,
     /// Each lane's fee balance.
     pub lanes: Vec<LaneSignal>,

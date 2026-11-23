@@ -509,12 +509,18 @@ impl RpcChain {
 /// `block`'s events about the contract `contract`'s chain of entries (amendment 0040), and its
 /// parent's hash, through `client`: its `Contracts::ContractEmitted` events, the contract's own
 /// only (a credit from another deployment is emitted by the receiver), each decoded by its
-/// signature topic ([`kreivo::contract_event`]). The block is named by its hash: nothing is looked
-/// up by number. Its events are state at that block, which a full node keeps for about 256 blocks.
+/// signature topic ([`kreivo::contract_event`]), and the asset transfers into the contract
+/// account (`<assets>::Transferred { asset_id, from, to, amount }`), each with its extrinsic and
+/// its index among the block's events. The block is named by its hash: nothing is looked up by
+/// number. Its events are state at that block, which a full node keeps for about 256 blocks.
+/// With `untrusted` (the history endpoint), the block's header goes with them, for the adapter to
+/// check against the hash chain it holds ([`super::header_proves`]).
 async fn events_of(
     client: &OnlineClient<PolkadotConfig>,
     block: &BlockRef,
     contract: &AccountId32,
+    assets: &str,
+    untrusted: bool,
     instance_of: impl Fn(&AccountId32) -> Option<u32>,
 ) -> ChainResult<BlockEvents> {
     let b = client
@@ -523,10 +529,52 @@ async fn events_of(
         .await
         .map_err(unavailable)?;
     let parent = b.header().parent_hash.0;
+    let header = untrusted.then(|| b.header().encode());
     let events = b.events().await.map_err(unavailable)?;
+    let (out, transfers) = block_items(&events, block.number, contract, assets, instance_of)?;
+    Ok(BlockEvents {
+        block: *block,
+        parent,
+        events: out,
+        transfers,
+        header,
+    })
+}
+
+/// A block's decoded `System::Events`, as [`events_of`] reads them: the contract's chain events,
+/// each with where it was emitted, and the asset transfers into the contract account. Apart from
+/// the client so that it can be checked against Kreivo's own metadata and bytes.
+fn block_items(
+    events: &subxt::events::Events<PolkadotConfig>,
+    number: u64,
+    contract: &AccountId32,
+    assets: &str,
+    instance_of: impl Fn(&AccountId32) -> Option<u32>,
+) -> ChainResult<(Vec<super::ChainEvent>, Vec<super::TransferIn>)> {
     let mut out = Vec::new();
+    let mut transfers = Vec::new();
     for ev in events.iter() {
         let ev = ev.map_err(invalid)?;
+        let origin = super::EventOrigin {
+            extrinsic: match ev.phase() {
+                subxt::events::Phase::ApplyExtrinsic(i) => Some(i),
+                _ => None,
+            },
+            index: ev.index(),
+        };
+        if ev.pallet_name() == assets && ev.variant_name() == "Transferred" {
+            // The receiver first: a transfer to any other account is never decoded further, and
+            // one whose asset does not decode backs nothing (`kreivo::transfer_to`).
+            if let Some((from, asset, amount)) = kreivo::transfer_to(ev.field_bytes(), contract) {
+                transfers.push(super::TransferIn {
+                    origin,
+                    from,
+                    asset,
+                    amount,
+                });
+            }
+            continue;
+        }
         if ev.pallet_name() != "Contracts" || ev.variant_name() != "ContractEmitted" {
             continue;
         }
@@ -536,17 +584,16 @@ async fn events_of(
             continue;
         }
         let topics: Vec<[u8; 32]> = ev.topics().iter().map(|t| t.0).collect();
-        if let Some(e) =
-            kreivo::contract_event(&topics, &data, block.number, &instance_of).map_err(invalid)?
+        if let Some(mut e) =
+            kreivo::contract_event(&topics, &data, number, &instance_of).map_err(invalid)?
         {
+            if let super::ChainEvent::Entry { origin: o, .. } = &mut e {
+                *o = origin;
+            }
             out.push(e);
         }
     }
-    Ok(BlockEvents {
-        block: *block,
-        parent,
-        events: out,
-    })
+    Ok((out, transfers))
 }
 
 impl Chain for RpcChain {
@@ -690,9 +737,14 @@ impl Chain for RpcChain {
 
     async fn block_events(&self, block: &BlockRef, instance: u32) -> ChainResult<BlockEvents> {
         let contract = self.contract(instance)?;
-        events_of(&self.client, block, &contract, |c| {
-            self.names.instance_of(c)
-        })
+        events_of(
+            &self.client,
+            block,
+            &contract,
+            &self.names.assets,
+            false,
+            |c| self.names.instance_of(c),
+        )
         .await
     }
 
@@ -705,9 +757,11 @@ impl Chain for RpcChain {
             return Ok(None);
         };
         let contract = self.contract(instance)?;
-        events_of(history, block, &contract, |c| self.names.instance_of(c))
-            .await
-            .map(Some)
+        events_of(history, block, &contract, &self.names.assets, true, |c| {
+            self.names.instance_of(c)
+        })
+        .await
+        .map(Some)
     }
 
     async fn asset_metadata(
@@ -1116,6 +1170,192 @@ impl Chain for RpcChain {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parity_scale_codec::Compact;
+
+    /// Kreivo's runtime metadata at spec 136, as its public RPC serves it.
+    fn kreivo_metadata() -> subxt::Metadata {
+        let bytes = include_bytes!("../../fixtures/kreivo-136-events-metadata.scale");
+        subxt::Metadata::decode(&mut &bytes[..]).expect("Kreivo's metadata")
+    }
+
+    /// One `frame_system::EventRecord`: `ApplyExtrinsic(extrinsic)`, the event under its pallet's
+    /// and variant's indices, and its topics.
+    fn record(
+        m: &subxt::Metadata,
+        extrinsic: u32,
+        pallet: &str,
+        variant: &str,
+        fields: &[u8],
+        topics: &[[u8; 32]],
+    ) -> Vec<u8> {
+        let p = m.pallet_by_name(pallet).expect("the pallet");
+        let v = p
+            .event_variants()
+            .expect("its events")
+            .iter()
+            .find(|v| v.name == variant)
+            .expect("the variant");
+        let mut r = vec![0u8];
+        r.extend(extrinsic.encode());
+        r.push(p.index());
+        r.push(v.index);
+        r.extend_from_slice(fields);
+        r.extend(topics.to_vec().encode());
+        r
+    }
+
+    fn transferred(
+        asset: &kreivo::AssetId,
+        from: &AccountId32,
+        to: &AccountId32,
+        n: u128,
+    ) -> Vec<u8> {
+        (asset, from, to, n).encode()
+    }
+
+    /// The event decoding against Kreivo's own metadata (spec 136): its pallets' and variants'
+    /// indices and the types of their fields, which subxt walks to frame every event. Assets is
+    /// pallet 13 and `Transferred` its variant 2, with `{ asset_id, from, to, amount }` in that
+    /// order; each event keeps its extrinsic and its index in the block; the asset text of a
+    /// local asset (`Here(100)`, COPM) and of a foreign one (`Sibling(1000, 50, 50000002)`, DUSD);
+    /// a transfer to another account is skipped; the contract's `Deposited` keeps its origin.
+    #[test]
+    fn kreivo_events_decode_with_their_extrinsic_and_index() {
+        let m = kreivo_metadata();
+        let assets = m.pallet_by_name("Assets").unwrap();
+        assert_eq!(assets.index(), 13);
+        let t = assets
+            .event_variants()
+            .unwrap()
+            .iter()
+            .find(|v| v.name == "Transferred")
+            .unwrap();
+        assert_eq!(t.index, 2);
+        let names: Vec<_> = t.fields.iter().map(|f| f.name.as_deref()).collect();
+        assert_eq!(
+            names,
+            vec![Some("asset_id"), Some("from"), Some("to"), Some("amount")]
+        );
+        let contract = [0xC0; 32];
+        let depositor = [0xD0; 32];
+        let other = [0xEE; 32];
+        let copm = kreivo::AssetId::Here(100);
+        let dusd = kreivo::parse_asset("Sibling(1000, 50, 50000002)").unwrap();
+        let deposited = kreivo::InboxEvent::Deposited {
+            from: depositor,
+            account_ref: [0x42; 32],
+            asset: copm,
+            amount: 1_200,
+        };
+        let emitted = kreivo::entry_event(7, &deposited);
+        let mut blob = Compact(5u32).encode();
+        blob.extend(record(
+            &m,
+            2,
+            "Assets",
+            "Transferred",
+            &transferred(&copm, &depositor, &contract, 1_200),
+            &[],
+        ));
+        blob.extend(record(
+            &m,
+            2,
+            "Contracts",
+            "ContractEmitted",
+            &(contract, emitted.data.clone()).encode(),
+            &emitted.topics,
+        ));
+        blob.extend(record(
+            &m,
+            3,
+            "Assets",
+            "Transferred",
+            &transferred(&dusd, &depositor, &contract, 500),
+            &[],
+        ));
+        blob.extend(record(
+            &m,
+            3,
+            "Assets",
+            "Transferred",
+            &transferred(&dusd, &depositor, &other, 9),
+            &[],
+        ));
+        blob.extend(record(
+            &m,
+            4,
+            "Assets",
+            "Transferred",
+            &transferred(&copm, &other, &contract, 1),
+            &[],
+        ));
+        let events = subxt::events::Events::<PolkadotConfig>::decode_from(blob, m);
+        let (chain, transfers) = block_items(&events, 40, &contract, "Assets", |_| None).unwrap();
+        let at = |extrinsic, index| super::super::EventOrigin {
+            extrinsic: Some(extrinsic),
+            index,
+        };
+        assert_eq!(
+            transfers,
+            vec![
+                super::super::TransferIn {
+                    origin: at(2, 0),
+                    from: depositor,
+                    asset: ChainAsset("Here(100)".into()),
+                    amount: 1_200,
+                },
+                super::super::TransferIn {
+                    origin: at(3, 2),
+                    from: depositor,
+                    asset: ChainAsset("Sibling(1000, 50, 50000002)".into()),
+                    amount: 500,
+                },
+                super::super::TransferIn {
+                    origin: at(4, 4),
+                    from: other,
+                    asset: ChainAsset("Here(100)".into()),
+                    amount: 1,
+                },
+            ]
+        );
+        let [
+            super::super::ChainEvent::Entry {
+                seq: 7,
+                entry,
+                origin,
+            },
+        ] = &chain[..]
+        else {
+            panic!("{chain:?}");
+        };
+        assert_eq!(*origin, at(2, 1));
+        assert_eq!(entry.at, 40);
+        assert!(matches!(
+            &entry.event,
+            super::super::InboxEvent::Deposited { from, amount: 1_200, asset, .. }
+                if *from == depositor && asset.0 == "Here(100)"
+        ));
+    }
+
+    /// A transfer to the contract whose asset id this code cannot decode (a variant a later
+    /// runtime added) backs nothing and stops nothing; one to any other account is never decoded.
+    #[test]
+    fn a_transfer_of_an_unknown_asset_fails_safe() {
+        let contract = [0xC0; 32];
+        let mut fields = vec![9u8, 1, 2, 3];
+        fields.extend([0xD0; 32]);
+        fields.extend(contract);
+        fields.extend(5u128.to_le_bytes());
+        let (from, asset, amount) = kreivo::transfer_to(&fields, &contract).unwrap();
+        assert_eq!((from, amount), ([0xD0; 32], 5));
+        assert_eq!(asset.0, "undecoded:09010203");
+        let mut elsewhere = vec![9u8, 1, 2, 3];
+        elsewhere.extend([0xD0; 32]);
+        elsewhere.extend([0xEE; 32]);
+        elsewhere.extend(5u128.to_le_bytes());
+        assert_eq!(kreivo::transfer_to(&elsewhere, &contract), None);
+        assert_eq!(kreivo::transfer_to(&[0; 10], &contract), None);
+    }
 
     #[test]
     fn an_asset_is_a_runtime_value_or_an_error() {

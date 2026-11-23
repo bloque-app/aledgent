@@ -149,6 +149,43 @@ it serves is folded against the head the light client reads):
   "history_endpoint": "wss://kreivo-archive.example",
 ```
 
+**Every new deposit is matched to the transfer that paid it before it is kept** (the deposit
+backing check). Kreivo's assets API pulls a deposit from its caller with `fungibles::Mutate::transfer`,
+which emits `Assets::Transferred { asset_id, from, to, amount }`, before the contract records the
+arrival; another deployment's withdrawal to this one transfers first and then calls `credit`. So a
+final `Deposited { from, asset, amount }` entry of an asset the adapter maps is backed only if its
+extrinsic holds, earlier, a `Transferred` of that asset and amount from `from` to the contract
+account that no earlier entry claimed; matching claims it. The walk reads both kinds of event with
+the extrinsic that emitted them and their index in the block. A deposit with no match (a credit
+recorded with nothing moved; a plain transfer in another extrinsic, or one already claimed, does
+not count) is kept as unbacked (`settle_deposit_backing`, `migrations/0007_backing.sql`) and
+reported **without a movement**: the core records it, sets it aside (`Unusable`) and credits
+nothing, and the cursor passes it. It raises `deposit-unbacked:<instance>:<seq>` (which pages),
+naming the entry, its block, the asset, the amount and the sender. Nothing is read for the check,
+so it never stops the sync.
+
+A block the adapter's own client cannot serve goes to the history endpoint only when it is 256 or
+more blocks deep, or when it is at least `own_client_min_fallback_depth` deep (default 32, at most
+256) and either a node says its state is gone (`State already discarded`, `UnknownBlock`) or the
+walks have failed there `own_client_retries` times (default 10) since the client last served one
+whole: the light client's answer for a block its peers pruned, `RemoteCouldntAnswer`, does not say
+which. Above that depth the walk always stays on the client, so peer churn or a lagging backend of a
+load-balanced pool never holds a recent deposit; a shallow failure stops the step and leaves the
+count as it is. Any other failure is a blip: the
+step stops at the first new position and reads again at the next. The `tracing` warning names the
+signal (`depth`, `gone` or `retries`). **Trade-off, stated plainly:** a client whose node or peers keep
+fewer blocks than `own_client_min_fallback_depth`, after an outage longer than they keep, stalls at
+the first new position with `unreadable:` open (it pages) until the operator acts: lower the depth
+below what they keep, or record a gap. A transfer to the contract whose asset id the adapter cannot decode backs nothing
+and stops nothing. Migration `0008_backing_rule.sql` removes every verdict stored under the check's
+first, block-level rule.
+
+The history endpoint is trusted for nothing. Each block it serves comes with its header, which
+must hash to the block the hash chain from the finalized head names and start with the parent it
+gives, or the range is unreadable. Its events are not proved against the block's state, so a
+deposit in a block it served is reported without a movement too, raising
+`deposit-unverified:<instance>:<seq>` (which pages): it is settled with evidence, never guessed.
+
 Without one, it raises `unreadable:<instance>:<position>` and waits. When no reader can serve the
 range, or a mismatch does not clear, the operator has the adapter record it as a gap through its
 own source, after which it accepts the layer's head as it stands, unverified for that range. The

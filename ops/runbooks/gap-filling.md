@@ -9,7 +9,8 @@ SPDX-License-Identifier: CC-BY-4.0
 (amendment 0041, `[PENDING AMENDMENT 0041]`), `AC-D2.2`, `NFR-9`
 
 **Pages that lead here:** `AledgentSettlementChainMismatch`, `AledgentObservationStopped`,
-`AledgentObservationGap`, `AledgentObservationLag`, `AledgentSettlementEpochRefused`. **Owner:** settlement-operations. **Rule that does not bend:** nothing here
+`AledgentObservationGap`, `AledgentObservationLag`, `AledgentSettlementEpochRefused`,
+`AledgentDepositUnbacked`, `AledgentDepositUnverified`. **Owner:** settlement-operations. **Rule that does not bend:** nothing here
 writes the book or a store by hand. What the settlement layer recorded reaches the book only as the
 adapter's observations through the core's surface; an operation that cannot settle is resolved with
 evidence through `CTR-OPS` (`resolve_operation`), never by an edit (`REQ-AT-3`, `INV-11`).
@@ -83,6 +84,26 @@ Incidents and gaps are written to the audit trail (`NFR-6`, `REQ-AT-1`), not to 
    layer's. After an operator's gap, the `gap:` alert it raised (`AledgentObservationGap`) closes once the
    adapter has accepted the head past the range. If it stays open after that, it is the adapter's
    defect, not the operator's to clear: raise it with settlement-operations. Clear nothing by hand.
+
+## An unbacked or unverified deposit
+
+`AledgentDepositUnbacked` (alert `deposit-unbacked:<instance>:<seq>`): before keeping a final deposit,
+the adapter matches it, one to one, to the `Assets::Transferred` of its asset and amount from its sender
+to the contract account, earlier in the same extrinsic. There was none: something recorded value in the
+contract that never arrived. The deposit was reported **without a movement**; the core recorded it, set
+it aside (`Unusable`) and credited nothing, and the cursor went on. The alert names the entry, its
+block, the asset, the amount and the sender.
+
+1. Treat it as an attack until shown otherwise; escalate to the owner and the security contact.
+2. Read the block on the layer: the extrinsic that wrote the entry, who called the contract, and which
+   transfers reached the contract account. Do not credit anything by hand.
+3. Do not clear the alert to make the page stop: it is the record that the check fired.
+
+`AledgentDepositUnverified` (alert `deposit-unverified:<instance>:<seq>`): the deposit's block was read
+from the history endpoint, whose events nothing proves, so the transfer that paid it cannot be shown.
+It was reported without a movement and nothing was credited; the sync did not stop. Check the block's
+events on a node you trust; a genuine deposit is settled with that evidence through `CTR-OPS`
+(`resolve_operation`), never by an edit.
 
 ## After a reset
 
