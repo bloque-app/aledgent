@@ -243,10 +243,6 @@ pub struct RedbEngine {
     /// them out (`T-031-14`).
     sync_every: u64,
     writes: std::sync::atomic::AtomicU64,
-    /// Whether a synced write saves redb's allocator state with it (quick repair, `T-031-26`): a
-    /// file killed after one then reopens without a walk of the whole file. Each synced write
-    /// costs a second sync; only engines whose synced writes are rare set it.
-    quick_repair: bool,
 }
 
 impl core::fmt::Debug for RedbEngine {
@@ -264,9 +260,7 @@ impl RedbEngine {
     /// Open the engine's file at `path`, creating it if absent, with at most `cache_bytes` of it
     /// cached in memory (redb's default is 1 GiB): a replica that must not grow with the book
     /// (`T-031-14`). One [`Durability::Visible`] write in 1 024 is made durable, so that redb lets
-    /// go of what the others freed. Synced writes are rare here, so each saves the allocator state
-    /// (quick repair, `T-031-26`): the replica's file, killed, reopens without a repair of the
-    /// whole file.
+    /// go of what the others freed.
     pub fn open_cached(path: impl AsRef<Path>, cache_bytes: usize) -> Result<Self, EngineError> {
         let mut engine = Self::init(
             Database::builder()
@@ -275,7 +269,6 @@ impl RedbEngine {
                 .map_err(EngineError::from)?,
         )?;
         engine.sync_every = 1024;
-        engine.quick_repair = true;
         Ok(engine)
     }
 
@@ -304,32 +297,7 @@ impl RedbEngine {
             counters: Arc::new(Counters::default()),
             sync_every: 0,
             writes: std::sync::atomic::AtomicU64::new(0),
-            quick_repair: false,
         })
-    }
-}
-
-impl RedbEngine {
-    /// Make every write so far durable and record a savepoint of it, deleting every other
-    /// savepoint but those in `keep` ([`crate::savepoint::take`], `T-031-26`).
-    pub fn savepoint(&self, keep: &[u64]) -> Result<u64, EngineError> {
-        crate::savepoint::take(&self.db, keep).map_err(EngineError)
-    }
-
-    /// Put the file back to savepoint `id` ([`crate::savepoint::restore`]). A store built over
-    /// this engine afterwards reads the restored state; one built before must not be used.
-    pub fn restore_savepoint(&self, id: u64) -> Result<(), EngineError> {
-        crate::savepoint::restore(&self.db, id).map_err(EngineError)
-    }
-
-    /// The savepoints the file holds, oldest first.
-    pub fn savepoints(&self) -> Result<Vec<u64>, EngineError> {
-        crate::savepoint::list(&self.db).map_err(EngineError)
-    }
-
-    /// Delete every savepoint, durably ([`crate::savepoint::clear`]).
-    pub fn clear_savepoints(&self) -> Result<(), EngineError> {
-        crate::savepoint::clear(&self.db).map_err(EngineError)
     }
 }
 
@@ -436,16 +404,12 @@ impl Engine for RedbEngine {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
         let synced = self.sync_every > 0 && n % self.sync_every == 0;
-        let immediate = durability == Durability::Durable || synced;
-        txn.set_durability(if immediate {
-            redb::Durability::Immediate
-        } else {
-            redb::Durability::None
+        txn.set_durability(match durability {
+            Durability::Durable => redb::Durability::Immediate,
+            Durability::Visible if synced => redb::Durability::Immediate,
+            Durability::Visible => redb::Durability::None,
         })
         .map_err(EngineError::from)?;
-        if immediate && self.quick_repair {
-            txn.set_quick_repair(true);
-        }
         {
             let mut table = txn.open_table(KV).map_err(EngineError::from)?;
             for (k, v) in &batch.rows {
@@ -510,58 +474,6 @@ mod tests {
         assert_eq!(keys(&before, Some(b"x1")), vec![b"x2".to_vec()]);
         assert_eq!(keys(&before, Some(b"x2")), Vec::<Vec<u8>>::new());
         assert!(e.stats().writes >= 5);
-    }
-
-    /// T-031-26: a savepoint taken between unsynced writes is where a copy of the file, as a kill
-    /// leaves it, is put back to; the savepoints a file holds stay bounded.
-    #[test]
-    fn t031_26_a_file_left_by_a_kill_is_put_back_to_its_savepoint() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("leaves.redb");
-        let e = RedbEngine::open_cached(&path, 1 << 20).unwrap();
-        let put = |e: &RedbEngine, k: &[u8], v: &[u8], d: Durability| {
-            let mut b = WriteBatch::new();
-            b.put(Space::Meta, k, v.to_vec());
-            e.write(b, d).unwrap();
-        };
-        put(&e, b"a", b"1", Durability::Visible);
-        let first = e.savepoint(&[]).unwrap();
-        put(&e, b"a", b"2", Durability::Visible);
-        let second = e.savepoint(&[first]).unwrap();
-        assert_eq!(e.savepoints().unwrap(), vec![first, second]);
-        // The next one keeps only the one named.
-        put(&e, b"a", b"3", Durability::Visible);
-        let third = e.savepoint(&[second]).unwrap();
-        assert_eq!(e.savepoints().unwrap(), vec![second, third]);
-        // Past it: unsynced writes, and a synced one.
-        put(&e, b"a", b"4", Durability::Visible);
-        put(&e, b"b", b"x", Durability::Durable);
-        put(&e, b"a", b"5", Durability::Visible);
-        // The kill: the file as the process left it, still open.
-        let copy = dir.path().join("killed.redb");
-        std::fs::copy(&path, &copy).unwrap();
-        let k = RedbEngine::open_cached(&copy, 1 << 20).unwrap();
-        let read =
-            |e: &RedbEngine, key: &[u8]| e.snapshot().unwrap().get(Space::Meta, key).unwrap();
-        assert_eq!(
-            read(&k, b"b"),
-            Some(b"x".to_vec()),
-            "the synced write survived"
-        );
-        k.restore_savepoint(third).unwrap();
-        assert_eq!(read(&k, b"a"), Some(b"3".to_vec()));
-        assert_eq!(read(&k, b"b"), None);
-        // Back further, and no way forward again.
-        k.restore_savepoint(second).unwrap();
-        assert_eq!(read(&k, b"a"), Some(b"2".to_vec()));
-        assert!(k.restore_savepoint(third).is_err());
-        assert!(k.restore_savepoint(99).is_err());
-        k.clear_savepoints().unwrap();
-        assert!(k.savepoints().unwrap().is_empty());
-        drop(k);
-        // Reopened, the restore holds.
-        let k = RedbEngine::open_cached(&copy, 1 << 20).unwrap();
-        assert_eq!(read(&k, b"a"), Some(b"2".to_vec()));
     }
 
     #[test]

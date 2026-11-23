@@ -76,12 +76,6 @@ fn take_port(core: AgentCore<NativePort>) -> NativePort {
         .expect("a port")
 }
 
-/// The layout of the record beside the stores: 1 a clean stop's, 2 a manifest (`T-031-26`).
-fn layout(path: &std::path::Path) -> u64 {
-    let v: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-    v["version"].as_u64().unwrap()
-}
-
 fn reused(core: &AgentCore<NativePort>) -> u64 {
     core.stats().replica_reused.load(Ordering::Relaxed)
 }
@@ -127,11 +121,7 @@ async fn t031_25_a_replica_kept_at_a_clean_stop_is_reopened_not_rebuilt() {
         "audit records wait unshipped: no audit store here"
     );
     let at = core.keep_replica(Duration::from_secs(2)).expect("kept");
-    assert_eq!(
-        layout(&kept_file),
-        1,
-        "a clean stop writes T-031-25's record"
-    );
+    assert!(kept_file.exists());
     assert!(
         core.last_tick().await.is_err(),
         "a kept core answers nothing"
@@ -152,10 +142,13 @@ async fn t031_25_a_replica_kept_at_a_clean_stop_is_reopened_not_rebuilt() {
     replayed.keep_replica(Duration::from_secs(2)).expect("kept");
     let port = take_port(replayed);
 
-    // The next start reopens it, and replaces the record with a manifest at once (`T-031-26`).
+    // The next start reopens it, and removes the record.
     let again = AgentCore::open_in(port, founding(), log.clone(), stores.clone()).unwrap();
     assert_eq!(reused(&again), 1, "reopened, not rebuilt");
-    assert_eq!(layout(&kept_file), 2, "a manifest replaces the record");
+    assert!(
+        kept_file.exists(),
+        "the record stays until the first decision"
+    );
     let d = deploy(&again, &[&alice, &bob]).await;
     assert_eq!((account(&d, &alice).await, account(&d, &bob).await), before);
     // It commits on: a capture of the reservation, checked input by input against the Agent.
@@ -173,7 +166,7 @@ async fn t031_25_a_replica_kept_at_a_clean_stop_is_reopened_not_rebuilt() {
         )
         .await;
     assert!(s.as_u16() == 200 && c["state"] == "Settled", "{s} {c}");
-    assert_eq!(layout(&kept_file), 2, "the manifest stays as inputs commit");
+    assert!(!kept_file.exists(), "a decision removes the record");
     assert_eq!(again.stopped(), None);
     let after = (account(&d, &alice).await, account(&d, &bob).await);
     assert_ne!(after, before);
@@ -201,14 +194,13 @@ async fn t031_25_a_replica_kept_at_a_clean_stop_is_reopened_not_rebuilt() {
     std::fs::write(&kept_file, stale).unwrap();
     let fourth = AgentCore::open_in(port, founding(), log.clone(), stores.clone()).unwrap();
     assert_eq!(reused(&fourth), 0, "a stale record rebuilds");
-    assert_eq!(layout(&kept_file), 2, "the rebuilt replica's manifest");
+    assert!(!kept_file.exists());
     let d = deploy(&fourth, &[&alice, &bob]).await;
     assert_eq!((account(&d, &alice).await, account(&d, &bob).await), after);
     drop(d);
 
-    // No record at all: rebuilt, alike.
+    // No record (the host was killed): rebuilt, alike.
     let port = take_port(fourth);
-    std::fs::remove_file(&kept_file).unwrap();
     let fifth = AgentCore::open_in(port, founding(), log, stores).unwrap();
     assert_eq!(reused(&fifth), 0);
     let d = deploy(&fifth, &[&alice, &bob]).await;
