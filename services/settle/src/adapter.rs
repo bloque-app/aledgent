@@ -39,9 +39,14 @@
 //!    from their events, from the accepted digest; if they lead to the head, report each from the
 //!    cursor with its canonical check and accept the head once the core took in all of them; if
 //!    not, read once more, then raise `chain:<instance>:<position>` and report nothing past the
-//!    first new position. Check what was reported provisionally; report the adapter's own
-//!    extrinsics seen above finality as provisional, while one is in flight; report the finalised
-//!    head **with the
+//!    first new position. **Every new deposit is matched to the transfer that paid it before it is
+//!    kept** (the deposit backing check, `Adapter::check_backing`): a deposit with no unclaimed
+//!    `Assets::Transferred` of its asset and amount from its sender to the contract account,
+//!    earlier in the same extrinsic, is reported without a movement (nothing is credited), with
+//!    `deposit-unbacked:<instance>:<seq>` raised; one in a block served by the history endpoint,
+//!    whose transfers nothing proves, likewise, with `deposit-unverified:<instance>:<seq>`. Check what
+//!    was reported provisionally; report the adapter's own extrinsics seen above finality as
+//!    provisional, while one is in flight; report the finalised head **with the
 //!    account nonce of every signing key, read at that same finalized block** (the owner's
 //!    ruling of 2026-09-24: the core releases on non-inclusion only if the transaction's nonce
 //!    agrees).
@@ -99,16 +104,16 @@ use serde::Serialize;
 use crate::chain::kreivo;
 use crate::chain::{
     AccountId32, AnchorCall, BatchCall, BatchFailure, BindCall, BlockEvents, BlockRef, Chain,
-    ChainAsset, ChainError, ChainEvent, ChainHead, InboxEntry, InboxEvent, Mortality, RuntimeInfo,
-    SignedExtrinsic, Validity, WithdrawCall, ZERO_DIGEST,
+    ChainAsset, ChainError, ChainEvent, ChainHead, EventOrigin, InboxEntry, InboxEvent, Mortality,
+    RuntimeInfo, SignedExtrinsic, TransferIn, Validity, WithdrawCall, ZERO_DIGEST,
 };
 use crate::config::AdapterConfig;
 use crate::link::{Answer, CoreLink, LinkError, Transport};
 use crate::signer::Signer;
 use crate::store::{
-    AcceptedHead, AnchorExtrinsic, AnchorRow, BindRow, ExtrinsicRow, ExtrinsicStatus, GapRow,
-    Inserted, InstructionRow, InstructionState, LaneRow, NotExecuted, ObservationRow, ParkReason,
-    ReportRow, RuntimeRow, Store, StoreError,
+    AcceptedHead, AnchorExtrinsic, AnchorRow, Backing, BindRow, ExtrinsicRow, ExtrinsicStatus,
+    GapRow, Inserted, InstructionRow, InstructionState, LaneRow, NotExecuted, ObservationRow,
+    ParkReason, ReportRow, RuntimeRow, Store, StoreError,
 };
 
 /// The chain's operation reference of a book operation: the call envelope's reference, its 16
@@ -307,6 +312,14 @@ pub struct Adapter<C: Chain, S: Store, T: Transport> {
     /// What the last step read (`NFR-15`): the heads and the calls waiting for intake, against
     /// which [`Adapter::news`] says whether a step is due before the interval ends.
     last_seen: Option<Seen>,
+    /// How many consecutive walks to one target (the head they walk back to) the adapter's own
+    /// client failed at a block at least [`AdapterConfig::own_client_min_fallback_depth`] deep,
+    /// for [`AdapterConfig::own_client_retries`]: a walk that fails shallower leaves it as it is,
+    /// and only one the client serves whole starts it again. Counted per walk, not per block: with peers that keep a fixed
+    /// number of blocks, the first block they cannot serve is a newer one at every finalized
+    /// block, and a count per block would never reach the bound. Held in memory: a restart counts
+    /// again.
+    own_client_failures: std::sync::Mutex<Option<(WalkTo, u32)>>,
     /// The runtimes on which the layer refused a transaction signed in the format chosen for
     /// them (`T-027-12`), by [`Chosen::key`]: refused until the process restarts.
     refused: BTreeMap<String, Refusing>,
@@ -472,7 +485,7 @@ fn epoch_key(instance: u32) -> String {
 }
 
 /// Where a walk back from the finalized head stops (amendment 0040).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WalkTo {
     /// At the blocks after this one: the block the accepted head was read at.
     After(u64),
@@ -493,7 +506,53 @@ struct Walked {
     dropped: usize,
     /// The positions of events in the earlier code's shape.
     legacy: Vec<u64>,
+    /// What the deposit backing check matches the entries against.
+    evidence: Evidence,
 }
+
+/// What the deposit backing check matches a walk's deposits against: where each entry's event was
+/// emitted, each block's transfers into the contract account, and which blocks came from the
+/// history endpoint, whose events nothing proves.
+#[derive(Debug, Default)]
+struct Evidence {
+    /// Where each current entry's event was emitted, by position.
+    origins: BTreeMap<u64, EventOrigin>,
+    /// Each block's transfers into the contract account, in the block's order, by number.
+    transfers: BTreeMap<u64, Vec<TransferIn>>,
+    /// The blocks the history endpoint served.
+    untrusted: BTreeSet<u64>,
+}
+
+/// How many blocks below the finalized head the adapter's own client is taken to keep events for at
+/// most: what a pruned full node keeps (about 256). A block that deep or deeper is read from the
+/// history endpoint as soon as the client cannot serve it. A shallower one goes there only when it
+/// is at least [`AdapterConfig::own_client_min_fallback_depth`] deep and the client says it is gone
+/// (`block_gone`) or fails the same walk
+/// [`AdapterConfig::own_client_retries`] steps in a row; otherwise the failure is a blip, read again
+/// at the next step.
+pub const OWN_CLIENT_KEEPS: u64 = 256;
+
+/// Whether the adapter's own client said that a block's events are gone for good, as a full node
+/// says it over RPC: its state discarded (`State already discarded for ..`, a pruned node) or the
+/// block unknown to it (`UnknownBlock`). The embedded light client gives no such answer it can be
+/// told by: for a block whose state its peers pruned it answers `Storage query errors: ..
+/// RemoteCouldntAnswer`, which smoldot itself counts as a network problem, and for a header no
+/// peer serves `Failed to retrieve block information from the network`, as it does while it has
+/// no peer. Those count towards [`AdapterConfig::own_client_retries`] instead.
+fn block_gone(e: &ChainError) -> bool {
+    let e = e.to_string();
+    ["State already discarded", "UnknownBlock", "Unknown block"]
+        .iter()
+        .any(|m| e.contains(m))
+}
+
+/// The kind of alert a final deposit raises when no transfer paid it (the deposit backing check):
+/// `deposit-unbacked:<instance>:<seq>`.
+pub const UNBACKED_ALERT: &str = "deposit-unbacked";
+
+/// The kind of alert a final deposit raises when the block that wrote it was served by the history
+/// endpoint, whose events nothing proves: `deposit-unverified:<instance>:<seq>`.
+pub const UNVERIFIED_ALERT: &str = "deposit-unverified";
 
 /// What a sync found.
 enum Synced {
@@ -503,6 +562,8 @@ enum Synced {
     New {
         /// The entries.
         entries: Vec<(u64, InboxEntry)>,
+        /// What the deposit backing check matches them against.
+        evidence: Evidence,
     },
 }
 
@@ -695,6 +756,7 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             unregistered: std::collections::BTreeSet::new(),
             declared_support: Vec::new(),
             last_seen: None,
+            own_client_failures: std::sync::Mutex::new(None),
             refused: BTreeMap::new(),
             not_now: BTreeMap::new(),
             alert_settled: BTreeSet::new(),
@@ -1534,7 +1596,31 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                 .insert_observation(&self.observation_row(seq, &e, true))
                 .await?;
             self.fault(CrashPoint::AfterObserve)?;
-            let body = self.observation_body(seq, &e, true);
+            let mut body = self.observation_body(seq, &e, true);
+            // The deposit backing check's verdict: a deposit is reported with its movement only if
+            // its block was proved to back it when it was kept ([`Adapter::check_backing`]).
+            // Without one, the core records it and sets it aside (`Unusable`), crediting nothing.
+            if matches!(e.event, InboxEvent::Deposited { .. }) && body.movement.is_some() {
+                match self.store.backing(instance, seq, &e.digest()).await? {
+                    Some(Backing::Backed) => {}
+                    Some(Backing::Unbacked { .. } | Backing::Unverified { .. }) => {
+                        body.movement = None
+                    }
+                    None => {
+                        body.movement = None;
+                        let key = format!("{UNBACKED_ALERT}:{instance}:{seq}");
+                        let detail = format!(
+                            "the deposit at position {seq} (block #{}) was kept before the deposit \
+                             backing check: its backing was never proved, so it is reported \
+                             without a movement, and nothing is credited",
+                            e.at
+                        );
+                        if self.store.raise(&key, &detail, now).await? {
+                            tracing::error!(alert = %key, seq, block = e.at, "{detail}");
+                        }
+                    }
+                }
+            }
             let a = self.report_observation(&body).await?;
             if !a.ingested() {
                 // The core did not take it in: do not pass it.
@@ -2806,6 +2892,7 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
     async fn walk(&self, fin: &BlockRef, to: WalkTo) -> StepResult<Result<Walked, String>> {
         let instance = self.config.instance;
         let mut blocks = Vec::new();
+        let mut out = Walked::default();
         let mut at = *fin;
         let mut own_client = true;
         loop {
@@ -2817,7 +2904,51 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             let read = if own_client {
                 match self.chain.block_events(&at, instance).await {
                     Ok(b) => Ok(b),
+                    // The history endpoint's blocks back no deposit, so a block goes there only when
+                    // the client cannot serve it: past what a pruned node keeps, the node saying
+                    // so, or the client failing the same walk step after step. Anything else (a
+                    // timeout, a light client not yet synced) is a blip: the range is unreadable
+                    // for this step and read again at the next.
                     Err(e) => {
+                        let depth = fin.number.saturating_sub(at.number);
+                        let retries = self.config.own_client_retries.max(1);
+                        // Only a failure at least `own_client_min_fallback_depth` deep counts
+                        // towards the retries, or is taken as gone: above it the client always
+                        // serves the walk (a lagging backend of a load-balanced pool may call a
+                        // fresh block unknown). A shallower failure stops the step and leaves the
+                        // count as it is; only a walk the client serves whole starts it again.
+                        let deep = depth >= self.config.own_client_min_fallback_depth;
+                        let failures = if deep {
+                            self.own_client_failed(to)
+                        } else {
+                            self.own_client_failures_of(to)
+                        };
+                        let signal = if depth >= OWN_CLIENT_KEEPS {
+                            Some("depth")
+                        } else if deep && block_gone(&e) {
+                            Some("gone")
+                        } else if deep && failures >= retries {
+                            Some("retries")
+                        } else {
+                            None
+                        };
+                        let Some(signal) = signal else {
+                            return Ok(Err(format!(
+                                "the adapter's client could not read the events of block #{} \
+                                 ({e}), {failures} of {retries} walks in a row; it is read again \
+                                 at the next step",
+                                at.number
+                            )));
+                        };
+                        tracing::warn!(
+                            block = at.number,
+                            depth,
+                            signal,
+                            failures,
+                            error = %e,
+                            "the adapter's client cannot serve the block: it and every older one \
+                             are read from the history endpoint"
+                        );
                         own_client = false;
                         self.history_read(&at, &e.to_string()).await?
                     }
@@ -2830,6 +2961,24 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                 Ok(b) => b,
                 Err(why) => return Ok(Err(why)),
             };
+            if !own_client {
+                // The history endpoint is trusted for nothing: the block it served must be the one
+                // the hash chain from the finalized head names, and its parent the one its header
+                // names, or the walk would follow it anywhere.
+                let proven = b.block == at
+                    && b.header
+                        .as_deref()
+                        .is_some_and(|h| crate::chain::header_proves(h, &at, &b.parent));
+                if !proven {
+                    return Ok(Err(format!(
+                        "the history endpoint served block #{} ({}) with a header that does not \
+                         hash to it or does not name the parent it gave",
+                        at.number,
+                        hex::encode(at.hash)
+                    )));
+                }
+                out.evidence.untrusted.insert(at.number);
+            }
             let parent = b.parent;
             let start_here = match to {
                 WalkTo::Start(start) => b.events.iter().any(|e| match e {
@@ -2848,14 +2997,21 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                 hash: parent,
             };
         }
-        let mut out = Walked::default();
+        if own_client {
+            self.own_client_served(to);
+        }
         for b in blocks.into_iter().rev() {
+            out.evidence.transfers.insert(b.block.number, b.transfers);
             for e in b.events {
                 match e {
-                    ChainEvent::Entry { seq, entry } => out.entries.push((seq, entry)),
+                    ChainEvent::Entry { seq, entry, origin } => {
+                        out.evidence.origins.insert(seq, origin);
+                        out.entries.push((seq, entry));
+                    }
                     ChainEvent::Reset => {
                         out.dropped += out.entries.len() + out.legacy.len();
                         out.entries.clear();
+                        out.evidence.origins.clear();
                         out.legacy.clear();
                         out.reset = Some(b.block.number);
                     }
@@ -2864,6 +3020,43 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             }
         }
         Ok(Ok(out))
+    }
+
+    /// Count one more walk to `to` that the adapter's own client failed: how many in a row.
+    fn own_client_failed(&self, to: WalkTo) -> u32 {
+        let mut f = self
+            .own_client_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let n = match *f {
+            Some((t, n)) if t == to => n.saturating_add(1),
+            _ => 1,
+        };
+        *f = Some((to, n));
+        n
+    }
+
+    /// How many walks to `to` in a row the adapter's own client failed deep enough to count.
+    fn own_client_failures_of(&self, to: WalkTo) -> u32 {
+        match *self
+            .own_client_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            Some((t, n)) if t == to => n,
+            _ => 0,
+        }
+    }
+
+    /// A walk to `to` the adapter's own client served whole: the count starts again.
+    fn own_client_served(&self, to: WalkTo) {
+        let mut f = self
+            .own_client_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if f.is_some_and(|(t, _)| t == to) {
+            *f = None;
+        }
     }
 
     /// `block`'s events from the history endpoint, after the adapter's own client could not
@@ -2894,6 +3087,121 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                 )),
             },
         )
+    }
+
+    /// **The deposit backing check**, on the entries a sync showed complete, before they are
+    /// kept: every final `Deposited` entry of an asset the adapter maps is matched, one to one, to
+    /// the transfer that paid it. It is backed only if its block holds an `Assets::Transferred`
+    /// of its asset and amount, from its sender to the contract account, **in the same extrinsic
+    /// and earlier in it**, that no earlier entry claimed; matching claims it.
+    ///
+    /// Kreivo emits one for each genuine flow: the contract's `deposit` has the assets API pull
+    /// the amount from the caller (`fungibles::Mutate::transfer`, which emits `Transferred`) before
+    /// it records the arrival, and another deployment's withdrawal to this one transfers to it
+    /// (the assets API, or `Assets::transfer` for a whole holding) before it calls `credit`, the
+    /// entry's sender being that deployment. A credit recorded with nothing moved has no transfer
+    /// of its own to claim: a plain transfer in, another extrinsic's, or one another entry claimed
+    /// does not back it. A sender that pays the contract account in the extrinsic itself backs its
+    /// entry, as value did arrive.
+    ///
+    /// A deposit with no match is kept as [`Backing::Unbacked`]; one in a block the history
+    /// endpoint served, whose events nothing proves, as [`Backing::Unverified`]. Either is reported
+    /// without a movement: the core sets it aside and credits nothing. Nothing is read, so nothing
+    /// here stops the sync.
+    async fn check_backing(
+        &mut self,
+        entries: &[(u64, InboxEntry)],
+        evidence: &Evidence,
+    ) -> StepResult<()> {
+        let instance = self.config.instance;
+        let now = self.now();
+        let mut claimed: BTreeSet<(u64, u32)> = BTreeSet::new();
+        for (seq, e) in entries {
+            let InboxEvent::Deposited {
+                from,
+                account_ref,
+                asset,
+                amount,
+            } = &e.event
+            else {
+                continue;
+            };
+            // An asset the adapter does not map is reported without a movement in any case.
+            if self.config.binding_of_chain(asset).is_none() {
+                continue;
+            }
+            let what = format!(
+                "the deposit at position {seq} (block #{}, asset {}, amount {amount}, from {}, to \
+                 account reference {})",
+                e.at,
+                asset.0,
+                hex::encode(from),
+                hex::encode(account_ref),
+            );
+            let (backing, kind) = if evidence.untrusted.contains(&e.at) {
+                let detail = format!(
+                    "{what} is not verified: its block was read from the history endpoint, whose \
+                     events nothing proves, so the transfer that paid it cannot be shown. It is \
+                     reported without a movement, and nothing is credited"
+                );
+                (Backing::Unverified { detail }, UNVERIFIED_ALERT)
+            } else {
+                let origin = evidence.origins.get(seq);
+                let paid = origin.and_then(|o| {
+                    let extrinsic = o.extrinsic?;
+                    evidence.transfers.get(&e.at)?.iter().find(|t| {
+                        t.origin.extrinsic == Some(extrinsic)
+                            && t.origin.index < o.index
+                            && t.from == *from
+                            && t.asset == *asset
+                            && t.amount == *amount
+                            && !claimed.contains(&(e.at, t.origin.index))
+                    })
+                });
+                match paid {
+                    Some(t) => {
+                        claimed.insert((e.at, t.origin.index));
+                        (Backing::Backed, UNBACKED_ALERT)
+                    }
+                    None => {
+                        let at = origin.map_or_else(
+                            || "an unknown place".to_owned(),
+                            |o| match o.extrinsic {
+                                Some(x) => format!("extrinsic {x}, event {}", o.index),
+                                None => format!("event {}, outside any extrinsic", o.index),
+                            },
+                        );
+                        let detail = format!(
+                            "{what} is not backed: no transfer of {amount} of the asset from its \
+                             sender to the contract account, unclaimed, precedes its entry ({at}) \
+                             in the same extrinsic. Something recorded value that did not arrive. \
+                             It is reported without a movement, and nothing is credited"
+                        );
+                        (Backing::Unbacked { detail }, UNBACKED_ALERT)
+                    }
+                }
+            };
+            self.store
+                .put_backing(instance, *seq, &e.digest(), &backing)
+                .await?;
+            let detail = match &backing {
+                Backing::Backed => continue,
+                Backing::Unbacked { detail } | Backing::Unverified { detail } => detail,
+            };
+            let key = format!("{kind}:{instance}:{seq}");
+            if self.store.raise(&key, detail, now).await? {
+                tracing::error!(
+                    alert = %key,
+                    seq,
+                    block = e.at,
+                    asset = %asset.0,
+                    amount = %amount,
+                    from = %hex::encode(from),
+                    "{detail}"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// The sync (amendment 0040, `REQ-IN-5`): does what the layer holds lead, entry by entry, from
@@ -2934,6 +3242,7 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
             None if head.position == head.start && head.digest == ZERO_DIGEST => {
                 return Ok(Ok(Synced::New {
                     entries: Vec::new(),
+                    evidence: Evidence::default(),
                 }));
             }
             None => (head.start, ZERO_DIGEST, WalkTo::Start(head.start)),
@@ -2969,6 +3278,7 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                     return Ok(Err(Stop::Reset(at, 0, 0)));
                 }
             }
+            let evidence = walked.evidence;
             let entries: Vec<(u64, InboxEntry)> = walked
                 .entries
                 .into_iter()
@@ -2982,7 +3292,7 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                 None => crate::chain::fold(from, &digest, &entries, head),
             };
             match checked {
-                Ok(()) => return Ok(Ok(Synced::New { entries })),
+                Ok(()) => return Ok(Ok(Synced::New { entries, evidence })),
                 Err(why) => {
                     tracing::warn!(
                         attempt,
@@ -3429,12 +3739,16 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                 }
                 self.cleared(from).await?;
             }
-            Ok(Synced::New { entries }) => {
+            Ok(Synced::New { entries, evidence }) => {
                 let epoch = match verified {
                     Some(v) => Ok(v.epoch),
                     None => self.first_start(fin, from, &head).await?,
                 };
                 if let Ok(epoch) = epoch {
+                    // The deposit backing check, before anything is kept (and after a first
+                    // start, which may reset what the store keeps): a deposit no transfer paid is
+                    // kept as unbacked, one the history endpoint served as unverified.
+                    self.check_backing(&entries, &evidence).await?;
                     let raw: Vec<(u64, Vec<u8>)> =
                         entries.into_iter().map(|(seq, e)| (seq, e.raw)).collect();
                     let v = AcceptedHead {
@@ -3592,7 +3906,7 @@ impl<C: Chain, S: Store, T: Transport> Adapter<C, S, T> {
                 'blocks: for b in blocks.into_iter().rev() {
                     for ev in b.events {
                         let (s, e) = match ev {
-                            ChainEvent::Entry { seq, entry } => (seq, entry),
+                            ChainEvent::Entry { seq, entry, .. } => (seq, entry),
                             // A reset above finality: what follows is another chain's.
                             ChainEvent::Reset => break 'blocks,
                             ChainEvent::Legacy { .. } => continue,

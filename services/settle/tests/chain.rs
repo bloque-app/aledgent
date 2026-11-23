@@ -96,7 +96,7 @@ fn t_043_04_the_contracts_own_events_fold_to_its_head() {
         let data = hex::decode(e["data"].as_str().unwrap()).unwrap();
         let at = e["block"].as_u64().unwrap();
         match kreivo::contract_event(&topics, &data, at, |_| None).unwrap() {
-            Some(ChainEvent::Entry { seq, entry }) => {
+            Some(ChainEvent::Entry { seq, entry, .. }) => {
                 assert_eq!(entry.at, at);
                 if resets == 0 {
                     before.push((seq, entry));

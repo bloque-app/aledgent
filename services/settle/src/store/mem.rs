@@ -25,6 +25,7 @@ struct Inner {
     heads: BTreeMap<u32, super::AcceptedHead>,
     verified: BTreeMap<u32, super::AcceptedHead>,
     entries: BTreeMap<(u32, u64), Vec<u8>>,
+    backing: BTreeMap<(u32, u64), ([u8; 32], super::Backing)>,
     gaps: BTreeMap<(u32, u64), GapRow>,
     alerts: BTreeMap<String, AlertRow>,
     anchors: BTreeMap<u64, AnchorRow>,
@@ -339,6 +340,8 @@ impl Store for MemStore {
         s.heads.insert(instance, *head);
         s.entries
             .retain(|(i, seq), _| *i != instance || *seq >= head.position);
+        s.backing
+            .retain(|(i, seq), _| *i != instance || *seq >= head.position);
         Ok(())
     }
 
@@ -348,7 +351,35 @@ impl Store for MemStore {
         s.heads.remove(&instance);
         s.verified.remove(&instance);
         s.entries.retain(|(i, _), _| *i != instance);
+        s.backing.retain(|(i, _), _| *i != instance);
         Ok(())
+    }
+
+    async fn put_backing(
+        &self,
+        instance: u32,
+        seq: u64,
+        digest: &[u8; 32],
+        backing: &super::Backing,
+    ) -> StoreResult<()> {
+        self.lock()
+            .backing
+            .insert((instance, seq), (*digest, backing.clone()));
+        Ok(())
+    }
+
+    async fn backing(
+        &self,
+        instance: u32,
+        seq: u64,
+        digest: &[u8; 32],
+    ) -> StoreResult<Option<super::Backing>> {
+        Ok(self
+            .lock()
+            .backing
+            .get(&(instance, seq))
+            .filter(|(d, _)| d == digest)
+            .map(|(_, b)| b.clone()))
     }
 
     async fn insert_gap(&self, row: &GapRow) -> StoreResult<()> {
