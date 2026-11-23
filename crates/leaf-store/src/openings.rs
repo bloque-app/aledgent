@@ -182,30 +182,6 @@ impl OpeningsStore {
     }
 }
 
-impl OpeningsStore {
-    /// Make every commit so far durable and record a savepoint of it, deleting every other
-    /// savepoint but those in `keep` ([`crate::savepoint::take`], `T-031-26`).
-    pub fn savepoint(&self, keep: &[u64]) -> Result<u64, VaultError> {
-        crate::savepoint::take(&self.db, keep).map_err(VaultError::Io)
-    }
-
-    /// Put the file back to savepoint `id` ([`crate::savepoint::restore`]), before a vault is
-    /// opened over it.
-    pub fn restore_savepoint(&self, id: u64) -> Result<(), VaultError> {
-        crate::savepoint::restore(&self.db, id).map_err(VaultError::Io)
-    }
-
-    /// The savepoints the file holds, oldest first.
-    pub fn savepoints(&self) -> Result<Vec<u64>, VaultError> {
-        crate::savepoint::list(&self.db).map_err(VaultError::Io)
-    }
-
-    /// Delete every savepoint, durably ([`crate::savepoint::clear`]).
-    pub fn clear_savepoints(&self) -> Result<(), VaultError> {
-        crate::savepoint::clear(&self.db).map_err(VaultError::Io)
-    }
-}
-
 impl VaultBackend for OpeningsStore {
     fn read(&self) -> Result<VaultImage, VaultError> {
         let view = self.view()?;

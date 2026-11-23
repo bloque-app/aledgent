@@ -101,8 +101,6 @@ use crate::vault::PrivateVault;
 use crate::witness::{KernelWitness, root_of};
 use ledger_core::leaves::Subtree;
 
-pub mod manifest;
-
 /// A leaf store that records every key loaded through it (step 1). Behind a mutex, not a cell, so
 /// the replica can answer reads from several threads at once (`T-031-12`).
 pub struct RecStore<L: LeafStore> {
@@ -175,11 +173,6 @@ impl<V: VaultBackend> RecVault<V> {
         }
     }
 
-    /// The backend.
-    pub fn inner(&self) -> &V {
-        &self.inner
-    }
-
     /// Each row written since the last take, with its value before.
     pub fn take_before(&self) -> BTreeMap<RowKey, Option<LayerSums>> {
         core::mem::take(&mut *self.before.lock().unwrap_or_else(PoisonError::into_inner))
@@ -205,16 +198,14 @@ impl<V: VaultBackend> VaultBackend for RecVault<V> {
 
 /// Where the host keeps the replica's stores (`T-031-14`, finding F6 of `F-032`): the book's
 /// leaves with their history and archive, the openings, and the service tree. Each is a
-/// projection of what the Agent committed: reopened at a start from where a clean stop kept it
-/// (`T-031-25`) or from the last manifest (`T-031-26`, [`manifest`]), and otherwise rebuilt from
-/// the host's log ([`Driver::recover`]), so none needs to survive a crash intact.
+/// projection of what the Agent committed, rebuilt from the host's log on every start and after
+/// every refused input ([`Driver::recover`]), so none needs to survive a crash.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReplicaStores {
     /// In memory: they grow with the book (about 10 KB a command in the stress suite's soak).
     Memory,
-    /// In files under `dir`, each with at most `cache_bytes` cached in memory. Every rebuild wipes
-    /// `dir` first; nothing else may use it. Commits are not synced, but for a manifest's
-    /// savepoints and a clean stop: the host's log is durable.
+    /// In files under `dir`, each with at most `cache_bytes` cached in memory. Every build wipes
+    /// `dir` first; nothing else may use it. Commits are not synced: the host's log is durable.
     Disk {
         /// The directory, the host's own.
         dir: std::path::PathBuf,
@@ -329,27 +320,11 @@ pub struct Kept {
     /// The records after it, not yet shipped, each in its canonical encoding, hex: the audit
     /// chain is not in the replica's stores.
     pub audit_outbox: Vec<String>,
-    /// A manifest whose outbox was over [`manifest::OUTBOX_MAX`] records holds none of them, and
-    /// says how many it left out (`T-031-26`): it is reopened only once the audit store holds them
-    /// all.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub audit_outbox_omitted: Option<u64>,
-    /// A replica manifest's own part ([`Kept::MANIFEST`], `T-031-26`): none in a record a clean
-    /// stop writes, which keeps T-031-25's layout.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub manifest: Option<manifest::Manifest>,
-    /// A manifest's digest over the rest of it, hex ([`Kept::sealed`]).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub digest: Option<String>,
 }
 
 impl Kept {
-    /// The layout a clean stop writes (`T-031-25`): the stores closed exactly at `seq`, with no
-    /// savepoint. Every build since T-031-25 reads it.
+    /// The layout this host writes and reads.
     pub const VERSION: u32 = 1;
-    /// The layout of a replica manifest (`T-031-26`): taken while the host runs, every few inputs
-    /// or seconds, with a savepoint of each store at `seq`.
-    pub const MANIFEST: u32 = 2;
 }
 
 impl ReplicaStores {
@@ -410,34 +385,26 @@ impl ReplicaStores {
     /// Record where the replica stands, after its stores were made durable (`T-031-25`): written
     /// whole or not at all (a temporary file, synced, renamed, and the directory synced).
     pub fn write_kept(&self, kept: &Kept) -> Result<(), DriveError> {
-        let bytes = serde_json::to_vec(kept).map_err(|e| DriveError::Replica(e.to_string()))?;
-        self.write_record(&bytes)
-    }
-
-    /// Write the record's bytes beside the stores, whole or not at all ([`ReplicaStores::write_kept`]).
-    fn write_record(&self, bytes: &[u8]) -> Result<(), DriveError> {
         let Some(path) = self.kept_path() else {
             return Err(DriveError::Replica(
                 "a replica in memory is not kept".into(),
             ));
         };
         let io = |e: std::io::Error| DriveError::Replica(format!("{}: {e}", path.display()));
+        let bytes = serde_json::to_vec(kept).map_err(|e| DriveError::Replica(e.to_string()))?;
         let tmp = path.with_extension("json.tmp");
-        let dir = path.parent().unwrap_or(std::path::Path::new("."));
         {
             use std::io::Write as _;
             let mut f = std::fs::File::create(&tmp).map_err(io)?;
-            f.write_all(bytes).map_err(io)?;
-            manifest::at(manifest::WritePoint::RecordWritten, dir);
+            f.write_all(&bytes).map_err(io)?;
             f.sync_all().map_err(io)?;
         }
-        manifest::at(manifest::WritePoint::RecordSynced, dir);
         std::fs::rename(&tmp, &path).map_err(io)?;
-        manifest::at(manifest::WritePoint::RecordRenamed, dir);
-        std::fs::File::open(dir)
-            .and_then(|d| d.sync_all())
-            .map_err(io)?;
-        manifest::at(manifest::WritePoint::RecordDone, dir);
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)
+                .and_then(|d| d.sync_all())
+                .map_err(io)?;
+        }
         Ok(())
     }
 
@@ -456,22 +423,74 @@ impl ReplicaStores {
         };
         let kept: Kept = serde_json::from_slice(&bytes)
             .map_err(|e| DriveError::Replica(format!("{}: {e}", path.display())))?;
-        match kept.version {
-            Kept::VERSION => {}
-            // A manifest is checked whole: a record that does not match its digest is torn or
-            // altered, and is not used (`T-031-26`).
-            Kept::MANIFEST => kept
-                .check_digest()
-                .map_err(|why| DriveError::Replica(format!("{}: {why}", path.display())))?,
-            v => {
-                return Err(DriveError::Replica(format!(
-                    "a kept replica of layout {v}, this host reads {} and {}",
-                    Kept::VERSION,
-                    Kept::MANIFEST
-                )));
-            }
+        if kept.version != Kept::VERSION {
+            return Err(DriveError::Replica(format!(
+                "a kept replica of layout {}, this host reads {}",
+                kept.version,
+                Kept::VERSION
+            )));
         }
         Ok(Some(kept))
+    }
+
+    /// The stores of a kept replica, opened where they are, without wiping them (`T-031-25`).
+    fn reopen_book(&self) -> Result<(BookStore, OpeningsStore), DriveError> {
+        let ReplicaStores::Disk { dir, cache_bytes } = self else {
+            return Err(DriveError::Replica(
+                "a replica in memory is not kept".into(),
+            ));
+        };
+        let book = dir.join("book");
+        let archive = Archive::open(
+            book.join("archive"),
+            ArchiveConfig {
+                fsync: false,
+                ..ArchiveConfig::default()
+            },
+        )
+        .map_err(rep)?;
+        let last = archive.last();
+        let store = BookStore::with_engine(
+            RedbEngine::open_cached(book.join("leaves.redb"), *cache_bytes).map_err(rep)?,
+            Some(archive),
+            StoreConfig {
+                durability: Durability::Visible,
+                verify_reads: true,
+            },
+        )
+        .map_err(rep)?;
+        // The store's own archive ends exactly where the store stands: no record missing, none
+        // beyond.
+        let head = store.applied_sequence().map(|s| (s, store.log_head()));
+        if last != head {
+            return Err(DriveError::Replica(format!(
+                "the kept book's archive ends at {:?}, the store stands at {:?}",
+                last.map(|l| l.0),
+                head.map(|h| h.0)
+            )));
+        }
+        let vault =
+            OpeningsStore::open_cached(book.join("openings.redb"), *cache_bytes).map_err(rep)?;
+        Ok((store, vault))
+    }
+
+    /// The service tree's store of a kept replica, opened where it is (`T-031-25`).
+    fn reopen_service(&self) -> Result<BookStore, DriveError> {
+        let ReplicaStores::Disk { dir, cache_bytes } = self else {
+            return Err(DriveError::Replica(
+                "a replica in memory is not kept".into(),
+            ));
+        };
+        BookStore::with_engine(
+            RedbEngine::open_cached(dir.join("service").join("leaves.redb"), *cache_bytes)
+                .map_err(rep)?,
+            None,
+            StoreConfig {
+                durability: Durability::Visible,
+                verify_reads: true,
+            },
+        )
+        .map_err(rep)
     }
 }
 
@@ -2391,20 +2410,8 @@ impl<P: AgentPort> Driver<P> {
             audit_head: audit.head_hash(),
             audit_shipped: audit.shipped(),
             audit_outbox: audit.outbox().map(|r| hex::encode(r.encode())).collect(),
-            audit_outbox_omitted: None,
-            manifest: None,
-            digest: None,
         };
         stores.write_kept(&kept)?;
-        // The record is T-031-25's, which every build since reads: the savepoints of the running
-        // host's manifests go (`T-031-26`), so that a build that does not know them, started
-        // next, does not keep their pages. A failure leaves them; the next manifest deletes them.
-        if let Err(e) = self.clear_savepoints(replica) {
-            std::eprintln!("aledgent-core: WARNING: the replica's savepoints stay: {e:?}");
-        }
-        if let Some(dir) = stores.dir() {
-            manifest::at(manifest::WritePoint::SavepointsCleared, dir);
-        }
         Ok(kept)
     }
 
@@ -2416,95 +2423,45 @@ impl<P: AgentPort> Driver<P> {
         Ok(())
     }
 
-    /// Reopen the replica kept beside its stores, instead of replaying the archive from genesis:
-    /// the record a clean stop left (`T-031-25`, aledgent#129), or the last manifest a running
-    /// host took (`T-031-26`). Its stores are opened where they are (put back to the manifest's
-    /// savepoints first), the service store rebuilt from the service tree's leaves
-    /// ([`State::from_whole_leaves`]), and the result must stand exactly where the record says:
-    /// the same input, log hash and roots. A clean stop's record must also be where the Agent's hot
-    /// row and the host's log end; a manifest must be an input of the log, and the inputs after it
-    /// are replayed over the reopened replica, each reaching its archived roots, up to the Agent's
-    /// hot row (`Driver::reopen_manifest`).
-    ///
-    /// `archive` is the host's log. What the Agent committed beyond it is appended to it here
-    /// (the host died before archiving it), as [`Driver::recover_audited`] does; the caller
-    /// archives it once the driver is built.
+    /// Reopen the replica a clean stop kept (`T-031-25`, aledgent#129), instead of replaying the
+    /// archive from genesis: its stores are opened where they are, the service store rebuilt from
+    /// the service tree's leaves ([`State::from_whole_leaves`]), and the result must stand exactly
+    /// where the record says, where the Agent's hot row does, and where the host's log ends: the
+    /// same input, log hash and roots. The caller removes the record before the first decision.
     ///
     /// # Errors
     ///
-    /// No record, or any check failing: the port is given back with why, and the caller rebuilds
-    /// the replica as before ([`Driver::recover_audited`]), which wipes the stores.
+    /// No record (`Ok(None)` is never returned: there is nothing to reuse), or any check failing:
+    /// the port is given back with why, and the caller rebuilds the replica as before
+    /// ([`Driver::recover_audited`]), which wipes the stores.
     #[allow(clippy::too_many_arguments)]
     pub fn reopen(
-        stores: &ReplicaStores,
-        port: P,
-        keys: HostKeys,
-        genesis: &Genesis,
-        archive: &mut Vec<RingEntry>,
-        audit_floor: Option<(u64, [u8; 32])>,
-    ) -> Result<(Self, Replica, manifest::Reopened), Reopen<P>> {
-        let kept = match stores.read_kept() {
-            Ok(Some(k)) => k,
-            Ok(None) => return Err(Reopen::Unusable(port, "no replica was kept".into())),
-            Err(e) => return Err(Reopen::Unusable(port, format!("{e:?}"))),
-        };
-        match kept.version {
-            Kept::MANIFEST => {
-                return Self::reopen_manifest(
-                    stores,
-                    port,
-                    keys,
-                    genesis,
-                    &kept,
-                    archive,
-                    audit_floor,
-                );
-            }
-            Kept::VERSION if kept.manifest.is_none() && kept.audit_outbox_omitted.is_none() => {}
-            v => {
-                return Err(Reopen::Unusable(
-                    port,
-                    format!("a kept record of layout {v} that is not one"),
-                ));
-            }
-        }
-        let seq = kept.seq;
-        Self::reopen_kept(stores, port, keys, genesis, &kept, archive, audit_floor).map(
-            |(d, r, (stores_ms, replica_ms))| {
-                (
-                    d,
-                    r,
-                    manifest::Reopened {
-                        from: seq,
-                        rolled: 0,
-                        manifest: false,
-                        stores_ms,
-                        replica_ms,
-                        replay_ms: 0,
-                        kept: None,
-                    },
-                )
-            },
-        )
-    }
-
-    /// [`Driver::reopen`] of a clean stop's record (`T-031-25`).
-    fn reopen_kept(
         stores: &ReplicaStores,
         mut port: P,
         keys: HostKeys,
         genesis: &Genesis,
-        kept: &Kept,
         archive: &[RingEntry],
         audit_floor: Option<(u64, [u8; 32])>,
-    ) -> Result<(Self, Replica, (u64, u64)), Reopen<P>> {
+    ) -> Result<(Self, Replica), Reopen<P>> {
         let unusable = |port: P, why: String| Reopen::Unusable(port, why);
+        let kept = match stores.read_kept() {
+            Ok(Some(k)) => k,
+            Ok(None) => return Err(unusable(port, "no replica was kept".into())),
+            Err(e) => return Err(unusable(port, format!("{e:?}"))),
+        };
         let hot = match port.hot() {
             Ok(Some(h)) => h,
             Ok(None) => return Err(unusable(port, "the Agent is not founded".into())),
             Err(e) => return Err(unusable(port, format!("{e:?}"))),
         };
-        if manifest::audit_behind(audit_floor, kept) {
+        // An audit store behind the record (reset, or restored from older media) needs records the
+        // kept outbox no longer holds: a replay re-emits them, a reopen cannot.
+        let behind = match (audit_floor, kept.audit_shipped) {
+            (_, None) => false,
+            (None, Some(_)) => true,
+            (Some((f, _)), Some((k, _))) => f < k,
+        };
+        if behind {
             return Err(unusable(
                 port,
                 "the audit store is behind what the kept replica had shipped".into(),
@@ -2528,11 +2485,61 @@ impl<P: AgentPort> Driver<P> {
                 ),
             ));
         }
-        let (replica, service, recorder, timings) =
-            match manifest::open_kept(stores, &keys, genesis, kept, audit_floor) {
-                Ok(x) => x,
-                Err(e) => return Err(unusable(port, format!("{e:?}"))),
+        let opened = (|| {
+            let (store, vault) = stores.reopen_book()?;
+            let service = ServiceStore {
+                store: stores.reopen_service()?,
             };
+            let (recorder, ring) = Recorder::new(&keys);
+            let book = Book::open(RecStore::new(store), RecVault::new(vault), ring)
+                .map_err(|e| DriveError::Replica(format!("the kept book: {e:?}")))?;
+            // Every leaf of the tree is read: the kinds the store keeps, and the host's delivery
+            // records, cover the tree.
+            if service.holds_foreign_kinds()? {
+                return Err(DriveError::Replica(
+                    "the kept service tree holds leaves of a kind the store does not keep".into(),
+                ));
+            }
+            let leaves = service.all_leaves()?;
+            let audit = ledger_core::export::AuditHead {
+                emitted: kept.audit_emitted,
+                head: kept.audit_head,
+                shipped: kept.audit_shipped,
+            };
+            let mut state = State::from_whole_leaves(leaves, &audit)
+                .map_err(|e| DriveError::Replica(format!("the kept service store: {e:?}")))?;
+            let mut outbox = Vec::with_capacity(kept.audit_outbox.len());
+            for h in &kept.audit_outbox {
+                let record = hex::decode(h)
+                    .ok()
+                    .and_then(|b| ledger_core::audit::AuditRecord::decode(&b))
+                    .ok_or_else(|| DriveError::Replica("a kept audit record".into()))?;
+                outbox.push(record);
+            }
+            state
+                .restore_audit_outbox(outbox)
+                .map_err(|e| DriveError::Replica(format!("the kept audit records: {e:?}")))?;
+            let mut replica = Ledger::from_parts(book, state, genesis.lifecycle.clone());
+            let _ = replica.state().take_touched();
+            // What the audit store holds already leaves the outbox, as a replay drops it.
+            if let Some(f) = audit_floor {
+                replica
+                    .acknowledge_audit(f)
+                    .map_err(|e| DriveError::Replica(format!("the audit store's head: {e:?}")))?;
+            }
+            replica.record_calls(true);
+            let (roots, next) = replica_roots(&replica, &service)?;
+            if roots != kept.roots || next != kept.next_posting {
+                return Err(DriveError::Replica(
+                    "the kept stores do not reach the kept roots".into(),
+                ));
+            }
+            Ok((replica, service, recorder))
+        })();
+        let (replica, service, recorder) = match opened {
+            Ok(x) => x,
+            Err(e) => return Err(unusable(port, format!("{e:?}"))),
+        };
         // The port is given to the driver from here; a failure past this point is a divergence,
         // as it is for a replay.
         Self::assemble(
@@ -2545,7 +2552,6 @@ impl<P: AgentPort> Driver<P> {
             kept.genesis_roots,
             archive,
         )
-        .map(|(d, r)| (d, r, timings))
         .map_err(|(port, e)| Reopen::Unusable(port, format!("the kept replica's driver: {e:?}")))
     }
 }
@@ -2772,87 +2778,58 @@ fn replay_with(
     // The writer's code as the inputs leave it, which the way out of a scheduled upgrade is
     // checked against (owner ruling w6, `T-037-05`): the same step the Agent takes
     // ([`crate::fence::decide`]), so a replay decides every way out as the Agent did.
-    let mut at = Replaying {
-        writer: WriterCode::default(),
-        next: 1,
-        prev: [0u8; 32],
-    };
+    let mut writer = WriterCode::default();
     let clerk = recorder.clerk();
-    for e in entries {
-        replay_entry(&mut replica, &mut service, &mut at, &clerk, e)?;
+    let mut prev = [0u8; 32];
+    for (i, e) in entries.iter().enumerate() {
+        if e.seq != i as u64 + 1 || e.prev != prev {
+            return Err(DriveError::Diverged(format!(
+                "the archive is not a chain at input {}",
+                e.seq
+            )));
+        }
+        // Each input under the code its entry names (`T-037-02`): what its checkpoints bind; a way
+        // out decided against its number (`T-037-15`); and under the mode the inputs before it left
+        // in force (`T-037-05`).
+        let authority = replica.authority();
+        replica.set_code(e.code, authority);
+        replica.set_scheduled_upgrade(writer.upgrade);
+        replica.set_generation(writer.generation, writer.due(e.seq));
+        replica.set_input(e.seq);
+        for c in &e.calls {
+            let clerk = clerk.as_deref().map(|c| c as &dyn ClerkSigner);
+            crate::calls::apply(&mut replica, c, clerk);
+        }
+        let _ = replica.take_calls();
+        // An archived input was taken whole: a way-out input is one call and no delivery.
+        let way_out = crate::fence::way_out_input(&e.calls, e.deliveries.len()).unwrap_or(false);
+        // The switch to the chained generation, at the end of the input that takes it
+        // (`T-043-08`, [`Driver::stage`]).
+        if !way_out {
+            replica.switch_settlement().map_err(|why| {
+                DriveError::Diverged(format!(
+                    "replay: input {}: the switch's move: {why:?}",
+                    e.seq
+                ))
+            })?;
+        }
+        let (taken, scheduled) = (replica.take_way_out(), replica.take_upgrade());
+        crate::fence::decide(&mut writer, e.seq, way_out, taken, scheduled);
+        let touched = Touches::take(&replica, &e.deliveries);
+        let (before, _) = service.leaves(&touched)?;
+        let changes = changed(&replica, &before, &e.deliveries)?;
+        service.apply(&changes)?;
+        let (roots, next) = replica_roots(&replica, &service)?;
+        if roots != e.roots || next != e.next_posting {
+            return Err(DriveError::Diverged(format!(
+                "replay: input {} does not reach its recorded roots",
+                e.seq
+            )));
+        }
+        prev = e.log_hash();
         drop_shipped(&mut replica);
     }
     Ok((replica, service, recorder, genesis_roots))
-}
-
-/// Where a replay stands between two inputs (`T-031-26`): the writer's code as the inputs so far
-/// leave it, and the number and log hash the next entry must continue. A replay from genesis
-/// starts with nothing; a reopened manifest at the Agent's hot row as it stood there.
-pub(crate) struct Replaying {
-    pub(crate) writer: WriterCode,
-    pub(crate) next: u64,
-    pub(crate) prev: [u8; 32],
-}
-
-/// Replay one archived input over `replica` and `service` (`REQ-RT-3`, `INV-6`): every call
-/// applied natively, the input's service leaves applied to the tree, and the roots and next
-/// posting it reaches checked against its entry. The one step a replay from genesis and a
-/// manifest's roll forward share, so both decide every input alike.
-pub(crate) fn replay_entry(
-    replica: &mut Replica,
-    service: &mut ServiceStore,
-    at: &mut Replaying,
-    clerk: &Option<SharedClerk>,
-    e: &RingEntry,
-) -> Result<(), DriveError> {
-    if e.seq != at.next || e.prev != at.prev {
-        return Err(DriveError::Diverged(format!(
-            "the archive is not a chain at input {}",
-            e.seq
-        )));
-    }
-    let writer = &mut at.writer;
-    // Each input under the code its entry names (`T-037-02`): what its checkpoints bind; a way
-    // out decided against its number (`T-037-15`); and under the mode the inputs before it left
-    // in force (`T-037-05`).
-    let authority = replica.authority();
-    replica.set_code(e.code, authority);
-    replica.set_scheduled_upgrade(writer.upgrade);
-    replica.set_generation(writer.generation, writer.due(e.seq));
-    replica.set_input(e.seq);
-    for c in &e.calls {
-        let clerk = clerk.as_deref().map(|c| c as &dyn ClerkSigner);
-        crate::calls::apply(replica, c, clerk);
-    }
-    let _ = replica.take_calls();
-    // An archived input was taken whole: a way-out input is one call and no delivery.
-    let way_out = crate::fence::way_out_input(&e.calls, e.deliveries.len()).unwrap_or(false);
-    // The switch to the chained generation, at the end of the input that takes it
-    // (`T-043-08`, [`Driver::stage`]).
-    if !way_out {
-        replica.switch_settlement().map_err(|why| {
-            DriveError::Diverged(format!(
-                "replay: input {}: the switch's move: {why:?}",
-                e.seq
-            ))
-        })?;
-    }
-    let (taken, scheduled) = (replica.take_way_out(), replica.take_upgrade());
-    crate::fence::decide(writer, e.seq, way_out, taken, scheduled);
-    let touched = Touches::take(replica, &e.deliveries);
-    let (before, _) = service.leaves(&touched)?;
-    let changes = changed(replica, &before, &e.deliveries)?;
-    service.apply(&changes)?;
-    let (roots, next) = replica_roots(replica, service)?;
-    if roots != e.roots || next != e.next_posting {
-        return Err(DriveError::Diverged(format!(
-            "replay: input {} does not reach its recorded roots",
-            e.seq
-        )));
-    }
-    at.next = e.seq + 1;
-    at.prev = e.log_hash();
-    Ok(())
 }
 
 /// The openings, before the input, of every vault row of an account the input read.

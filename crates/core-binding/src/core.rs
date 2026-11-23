@@ -644,30 +644,9 @@ pub struct CoreStats {
     /// How many lines about the writer's code the core has written (`T-037-23`): tests count them,
     /// since the lines themselves go to standard error.
     pub code_lines: AtomicU64,
-    /// 1 when this start reopened the replica a clean stop kept (`T-031-25`, aledgent#129) or the
-    /// last manifest a running host took (`T-031-26`), 0 when it rebuilt it from genesis.
+    /// 1 when this start reopened the replica a clean stop kept (`T-031-25`, aledgent#129), 0
+    /// when it rebuilt it from genesis.
     pub replica_reused: AtomicU64,
-    /// How many inputs the last reopen replayed over a manifest to reach the Agent (`T-031-26`):
-    /// 0 for a clean stop's record.
-    pub replica_rolled: AtomicU64,
-    /// How long the last reopen of the replica took, ms (`T-031-26`).
-    pub replica_reopen_ms: AtomicU64,
-    /// How many replica manifests this core has taken (`T-031-26`).
-    pub replica_manifests: AtomicU64,
-    /// The input of the last manifest taken (`T-031-26`).
-    pub replica_manifest_seq: AtomicU64,
-    /// How long the last manifest took, µs (`T-031-26`): time under the decision's lock, with the
-    /// replica shared with reads.
-    pub replica_manifest_us: AtomicU64,
-    /// The longest a manifest took, µs.
-    pub replica_manifest_us_max: AtomicU64,
-    /// The time every manifest taken took, µs: with [`CoreStats::replica_manifests`], the mean.
-    pub replica_manifest_us_total: AtomicU64,
-    /// How many times this core has rebuilt its replica after a decision did not commit, and of
-    /// those how many reopened its manifest instead of replaying from genesis (`T-031-26`).
-    pub replica_rebuilds: AtomicU64,
-    /// See [`CoreStats::replica_rebuilds`].
-    pub replica_rebuilds_reopened: AtomicU64,
     read_wait_us: Window,
     hold_us: Window,
     native_us: Window,
@@ -709,7 +688,7 @@ impl CoreStats {
     /// report.
     pub fn report(&self) -> String {
         format!(
-            "reads={} committed_reads={} decisions={} inputs={} halted={} read_wait_us=[{}] hold_us=[{}] native_us=[{}] flush_us=[{}] log_us=[{}] manifests={} manifest_us={}/{}",
+            "reads={} committed_reads={} decisions={} inputs={} halted={} read_wait_us=[{}] hold_us=[{}] native_us=[{}] flush_us=[{}] log_us=[{}]",
             self.reads.load(Ordering::Relaxed),
             self.committed_reads.load(Ordering::Relaxed),
             self.decisions.load(Ordering::Relaxed),
@@ -720,9 +699,6 @@ impl CoreStats {
             self.native_us.take(),
             self.flush_us.take(),
             self.log_us.take(),
-            self.replica_manifests.load(Ordering::Relaxed),
-            self.replica_manifest_us.load(Ordering::Relaxed),
-            self.replica_manifest_us_max.load(Ordering::Relaxed),
         )
     }
 }
@@ -809,51 +785,8 @@ struct Inner<P: AgentPort> {
     /// aledgent#128).
     restage: Restage,
     /// A kept replica was reopened and its record is still on disk (`T-031-25`): removed before
-    /// the first decision, when the stores first move past it, unless a manifest replaced it.
+    /// the first decision, when the stores first move past it.
     kept_record: bool,
-    /// The replica manifest in force (`T-031-26`): the last one written, beside the stores.
-    manifest: Option<crate::host::Kept>,
-    /// When a manifest is due ([`ManifestEvery`]).
-    manifest_every: ManifestEvery,
-    /// The input and the time of the last manifest attempted, written or not.
-    manifest_tried: (u64, std::time::Instant),
-}
-
-/// When a running core takes a replica manifest (`T-031-26`, [`crate::host::manifest`]): after a
-/// decision's replies are sent, once this many inputs have committed since the last one, or this
-/// long has passed with at least one, whichever comes first. An unclean stop then replays at most about
-/// that many inputs over the manifest instead of the whole archive.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ManifestEvery {
-    /// Inputs between two manifests.
-    pub inputs: u64,
-    /// Time between two manifests, if at least one input committed.
-    pub interval: std::time::Duration,
-}
-
-impl ManifestEvery {
-    /// 1 024 inputs, or 10 minutes with at least one. A rebuild replays about 240 inputs a second
-    /// on the production book (555 000 in 39 minutes, 17 Nov), so the roll forward after an
-    /// unclean stop stays within a few seconds of replay; what it costs is the inputs since the
-    /// manifest, not the time, so the interval only bounds an idle book's. Each manifest costs
-    /// three synced commits and one small file, taken after the replies of the decision that made
-    /// it due.
-    pub const DEFAULT: ManifestEvery = ManifestEvery {
-        inputs: 1024,
-        interval: std::time::Duration::from_secs(600),
-    };
-
-    /// Never, but at open and after a rebuild.
-    pub const NEVER: ManifestEvery = ManifestEvery {
-        inputs: u64::MAX,
-        interval: std::time::Duration::MAX,
-    };
-}
-
-impl Default for ManifestEvery {
-    fn default() -> Self {
-        ManifestEvery::DEFAULT
-    }
 }
 
 /// The core's own staging of a scheduled upgrade's code version (`T-037-24`): the version, whether
@@ -1112,8 +1045,6 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
             );
         }
         let mut reused = false;
-        let (mut rolled, mut reopen_ms) = (0u64, 0u64);
-        let mut reopened_from: Option<crate::host::Kept> = None;
         let (mut driver, replica, founded) = if let Some((spec, start)) = segment {
             Driver::found_at_chunk(
                 &stores,
@@ -1132,52 +1063,24 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
             let archived = archive.len();
             // A replica a clean stop kept is reopened where it stands, checked, instead of
             // replayed from genesis (`T-031-25`, aledgent#129); anything else rebuilds it.
-            // After an unclean stop, the last manifest a running host took is reopened the same
-            // way, and the inputs after it replayed over it (`T-031-26`).
             let started = std::time::Instant::now();
             let reopened = Driver::reopen(
                 &stores,
                 port,
                 founding.keys.clone(),
                 &founding.genesis,
-                &mut archive,
+                &archive,
                 floor,
             );
             let (driver, replica) = match reopened {
-                Ok((driver, replica, how)) => {
-                    let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                    if how.manifest {
-                        std::eprintln!(
-                            "aledgent-core: the replica's manifest at input {} is reopened and \
-                             checked, and {} inputs after it replayed, to input {}, in {ms} ms \
-                             (no rebuild; files {} ms, replica {} ms, replay {} ms)",
-                            how.from,
-                            how.rolled,
-                            driver.seq(),
-                            how.stores_ms,
-                            how.replica_ms,
-                            how.replay_ms,
-                        );
-                    } else {
-                        std::eprintln!(
-                            "aledgent-core: the replica kept at input {} is reopened and checked \
-                             in {ms} ms (no rebuild; files {} ms, replica {} ms)",
-                            driver.seq(),
-                            how.stores_ms,
-                            how.replica_ms,
-                        );
-                    }
-                    rolled = how.rolled;
-                    reopen_ms = ms;
-                    // The manifest reopened is the one in force: the first manifest keeps its
-                    // savepoints until it is written itself.
-                    reopened_from = how.kept.clone();
+                Ok((driver, replica)) => {
+                    std::eprintln!(
+                        "aledgent-core: the replica kept at input {} is reopened and checked in \
+                         {} ms (no rebuild)",
+                        driver.seq(),
+                        started.elapsed().as_millis()
+                    );
                     reused = true;
-                    // What the Agent committed beyond the log is archived now, before the Agent
-                    // is told so.
-                    for e in &archive[archived..] {
-                        log.push_entry(e)?;
-                    }
                     (driver, replica)
                 }
                 Err(crate::host::Reopen::Unusable(port, why)) => {
@@ -1261,19 +1164,11 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
             latest_time: 0,
             restage: Restage::default(),
             kept_record: reused,
-            manifest: reopened_from,
-            manifest_every: ManifestEvery::DEFAULT,
-            manifest_tried: (0, std::time::Instant::now()),
         };
         inner
             .stats
             .replica_reused
             .store(u64::from(reused), Ordering::Relaxed);
-        inner.stats.replica_rolled.store(rolled, Ordering::Relaxed);
-        inner
-            .stats
-            .replica_reopen_ms
-            .store(reopen_ms, Ordering::Relaxed);
         // The code the writer is in, and the platform's check at start (`T-037-23`).
         inner.report_code();
         let mut running = inner.executor(replica)?;
@@ -1281,9 +1176,6 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
         if let Some(f) = floor {
             running.acknowledge_audit_floor(Some(f));
         }
-        // A manifest at once (`T-031-26`): an unclean stop from here on comes back to this input
-        // at worst, whether the replica was founded, reopened or rebuilt.
-        let _ = inner.checkpoint(true, Some(&running));
         if let Some(a) = &inner.audit {
             let (n, oldest) = running.audit_outbox();
             a.stats.observe(n, oldest);
@@ -1409,10 +1301,8 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
             .map(|k| k.seq)
             .map_err(|e| format!("{e:?}"))?;
         // The record is the one just written: nothing removes it now. The replica's stores are
-        // closed, so the next start opens files that were closed cleanly. It replaces the
-        // manifest in force (`T-031-26`).
+        // closed, so the next start opens files that were closed cleanly.
         inner.kept_record = false;
-        inner.manifest = None;
         drop(slot.take());
         if let Some(d) = inner.driver.as_mut() {
             d.release_stores().map_err(|e| format!("{e:?}"))?;
@@ -1521,28 +1411,6 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
         }
     }
 
-    /// When the core takes a replica manifest (`T-031-26`, [`ManifestEvery`]).
-    pub fn set_manifest_every(&self, every: ManifestEvery) {
-        lock(&self.inner.ctl).manifest_every = every;
-    }
-
-    /// The replica manifest in force (`T-031-26`), if one was taken.
-    pub fn manifest(&self) -> Option<crate::host::Kept> {
-        lock(&self.inner.ctl).manifest.clone()
-    }
-
-    /// Take a replica manifest now, if the core can (`T-031-26`): between decisions, not stopped,
-    /// stores on disk. `Ok(n)`: taken at input `n`.
-    ///
-    /// # Errors
-    ///
-    /// Why none was taken.
-    pub fn take_manifest(&self) -> Result<u64, String> {
-        let mut inner = lock(&self.inner.ctl);
-        let slot = self.inner.running.read();
-        inner.checkpoint(true, slot.as_ref())
-    }
-
     /// Run `f` over the port (tests: fault injection, reading the Agent's state).
     pub fn with_port<T>(&self, f: impl FnOnce(&mut P) -> T) -> Option<T> {
         lock(&self.inner.ctl)
@@ -1648,27 +1516,14 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
         out
     }
 
-    /// Take a replica manifest if one is due (`T-031-26`): what the decider does right after it has
-    /// sent a decision's replies ([`AgentCore::on_decider`]), so that no reply waits for one. Under
-    /// the decision's lock, so no input moves the replica and nothing is staged; with the replica
-    /// shared, so reads go on meanwhile: a manifest only reads it. The next decision waits for it.
-    fn manifest_if_due(&self) {
-        let mut inner = lock(&self.inner.ctl);
-        let slot = self.inner.running.read();
-        let _ = inner.checkpoint(false, slot.as_ref());
-    }
-
     /// Run `f` on the decider thread ([`decider`]); `None` if it did not answer.
     async fn on_decider<T: Send + 'static>(
         &self,
         f: impl FnOnce() -> T + Send + 'static,
     ) -> Option<T> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let core = self.clone();
         let job: Job = Box::new(move || {
             let _ = tx.send(f());
-            // The replies are on their way: a manifest due now delays only the next decision.
-            core.manifest_if_due();
         });
         self.inner.decider.send(job).ok()?;
         rx.await.ok()
@@ -1694,77 +1549,6 @@ impl<P: AgentPort + Send + 'static> AgentCore<P> {
 }
 
 impl<P: AgentPort> Inner<P> {
-    /// Take a replica manifest (`T-031-26`) if one is due ([`ManifestEvery`]), or now if `force`:
-    /// only over stores on disk, outside a `verify-genesis` segment, while the core runs, between
-    /// inputs and with every committed input archived. `Ok(n)`: the manifest in force is at input
-    /// `n`. A failure leaves the one in force, with its savepoints, and is tried again after
-    /// another interval.
-    fn checkpoint(&mut self, force: bool, running: Option<&Exec>) -> Result<u64, String> {
-        if self.stores == ReplicaStores::Memory || self.segment.is_some() {
-            return Err("no manifest for a replica in memory or a segment".into());
-        }
-        if let Some(why) = &self.stopped {
-            return Err(format!("the core has stopped: {why}"));
-        }
-        let (Some(driver), Some(running)) = (self.driver.as_mut(), running) else {
-            return Err("the core holds no replica".into());
-        };
-        let seq = driver.seq();
-        let last = self.manifest.as_ref().map(|k| k.seq);
-        if last == Some(seq) {
-            return Ok(seq);
-        }
-        if !force {
-            let (tried, at) = self.manifest_tried;
-            let every = self.manifest_every;
-            if seq.saturating_sub(tried) < every.inputs && at.elapsed() < every.interval {
-                return Err("not due".into());
-            }
-        }
-        self.manifest_tried = (seq, std::time::Instant::now());
-        let took = std::time::Instant::now();
-        let taken = driver.checkpoint(running.ledger(), &self.stores, self.manifest.as_ref());
-        match taken {
-            Ok(kept) => {
-                let us = micros(took);
-                self.stats.replica_manifest_us.store(us, Ordering::Relaxed);
-                self.stats
-                    .replica_manifest_us_max
-                    .fetch_max(us, Ordering::Relaxed);
-                self.stats
-                    .replica_manifest_us_total
-                    .fetch_add(us, Ordering::Relaxed);
-                self.manifest = Some(kept);
-                // A clean stop's record, reopened, is replaced: nothing removes the manifest.
-                self.kept_record = false;
-                self.stats.replica_manifests.fetch_add(1, Ordering::Relaxed);
-                self.stats
-                    .replica_manifest_seq
-                    .store(seq, Ordering::Relaxed);
-                Ok(seq)
-            }
-            Err(e) => {
-                // The record on disk is the one in force, whatever the failure: one renamed into
-                // place before a later step failed names the new savepoints, which the next
-                // manifest must keep.
-                if let Ok(Some(on_disk)) = self.stores.read_kept()
-                    && on_disk.version == crate::host::Kept::MANIFEST
-                    && self.manifest.as_ref() != Some(&on_disk)
-                {
-                    self.manifest = Some(on_disk);
-                }
-                std::eprintln!(
-                    "aledgent-core: WARNING: no replica manifest at input {seq} ({e:?}); the one \
-                     at input {} stays in force",
-                    self.manifest
-                        .as_ref()
-                        .map_or_else(|| "none".to_string(), |k| k.seq.to_string())
-                );
-                Err(format!("{e:?}"))
-            }
-        }
-    }
-
     fn executor(
         &self,
         replica: crate::host::Replica,
@@ -1924,47 +1708,6 @@ impl<P: AgentPort> Inner<P> {
             // ahead of the Agent go before the rebuild makes another.
             self.running = None;
         }
-        self.stats.replica_rebuilds.fetch_add(1, Ordering::Relaxed);
-        // The manifest in force is reopened and the inputs after it replayed (`T-031-26`), as at
-        // a start after an unclean stop; the files must be closed first, so the replica that ran
-        // ahead of the Agent goes now. Anything else rebuilds from genesis, as before.
-        let port = if self.manifest.is_some() && self.segment.is_none() {
-            self.running = None;
-            match Driver::reopen(
-                &self.stores,
-                port,
-                f.keys.clone(),
-                &f.genesis,
-                &mut archive,
-                floor,
-            ) {
-                Ok((driver, replica, how)) => {
-                    self.stats
-                        .replica_rebuilds_reopened
-                        .fetch_add(1, Ordering::Relaxed);
-                    if how.kept.is_some() {
-                        self.manifest = how.kept.clone();
-                    }
-                    std::eprintln!(
-                        "aledgent-core: the replica is rebuilt from its manifest at input {}, {} \
-                         inputs replayed",
-                        how.from,
-                        how.rolled
-                    );
-                    return self.rebuilt(driver, replica, &archive[before..], running_code);
-                }
-                Err(crate::host::Reopen::Unusable(port, why)) => {
-                    std::eprintln!(
-                        "aledgent-core: the replica is rebuilt from the archive ({why})"
-                    );
-                    port
-                }
-            }
-        } else {
-            port
-        };
-        // A rebuild from genesis wipes the stores, and the manifest with them.
-        self.manifest = None;
         let recovered = match self.segment.clone() {
             Some((spec, start)) => Driver::recover_segment(
                 &self.stores,
@@ -1989,41 +1732,26 @@ impl<P: AgentPort> Inner<P> {
             ),
         };
         match recovered {
-            Ok((driver, replica)) => {
-                self.rebuilt(driver, replica, &archive[before..], running_code)
+            Ok((mut driver, replica)) => {
+                for e in &archive[before..] {
+                    if let Err(e) = self.log.push_entry(e) {
+                        return Err(self.stop(format!("the archive does not write: {e}")));
+                    }
+                }
+                driver.archived();
+                driver.set_batch_limits(self.batch);
+                driver.set_running_code(running_code);
+                let seq = driver.seq();
+                self.driver = Some(driver);
+                self.report_code();
+                match self.executor(replica) {
+                    Ok(r) => self.running = Some(r),
+                    Err(e) => return Err(self.stop(e)),
+                }
+                Ok(seq)
             }
             Err(e) => Err(self.stop(format!("the replica cannot be rebuilt: {e:?}"))),
         }
-    }
-
-    /// Serve from a rebuilt `driver` and `replica`: archive `beyond`, what the Agent committed
-    /// beyond the log, and take a manifest at once (`T-031-26`).
-    fn rebuilt(
-        &mut self,
-        mut driver: Driver<P>,
-        replica: crate::host::Replica,
-        beyond: &[RingEntry],
-        running_code: Option<[u8; 32]>,
-    ) -> Result<u64, CoreError> {
-        for e in beyond {
-            if let Err(e) = self.log.push_entry(e) {
-                return Err(self.stop(format!("the archive does not write: {e}")));
-            }
-        }
-        driver.archived();
-        driver.set_batch_limits(self.batch);
-        driver.set_running_code(running_code);
-        let seq = driver.seq();
-        self.driver = Some(driver);
-        self.report_code();
-        match self.executor(replica) {
-            Ok(r) => self.running = Some(r),
-            Err(e) => return Err(self.stop(e)),
-        }
-        let running = self.running.take();
-        let _ = self.checkpoint(true, running.as_ref());
-        self.running = running;
-        Ok(seq)
     }
 
     /// The fence refused `input` (`T-037-15`, `crate::fence`): start the fenced clock if it is not
