@@ -262,7 +262,8 @@ CMD ["serve", "--config", "/etc/aledgent/ingress.json", \
 # `previous-code` context holds the runtime too (`agent_runtime.pvm`), and the report is
 # `upgrade-check.json`. Where the recorded book ran generations before the code in force's, the
 # context also holds their packages under `earlier/` (the genesis package, for an upgrade from 1 to
-# 2), each passed as `--earlier`.
+# 2; and the earlier releases' packages, `earlier_sets` of core-release.yml, from an upgrade from 2
+# to 3 on), each passed as `--earlier`.
 FROM scratch AS previous-code
 
 FROM host AS upgrade
