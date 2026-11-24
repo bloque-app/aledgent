@@ -468,16 +468,17 @@ impl Store for PgStore {
             return Ok(Appended::New(row_of(&r)?));
         }
         // A conflict on either command index (`0003`, `0010`): the row that holds the key, the
-        // principal's own first, so a repeat of its own request is answered from it. A conflict on
-        // the reference alone is this append's own row, committed by an earlier try whose reply was
-        // lost.
+        // principal's own first, so a repeat of its own request is answered from it. A row under
+        // this append's reference is its own, committed by an earlier try whose reply was lost:
+        // still the new row it made (an API key is shown on that reply, `F-028`).
         let existing = c
             .query_opt(
                 &format!(
                     "SELECT {COLUMNS} FROM received_log WHERE op_ref = $5 \
                      OR (input_kind = 'command' AND surface = $2 AND client_key = $3 \
                          AND (principal = $4 OR client_key_domain = $1)) \
-                     ORDER BY (principal IS NOT DISTINCT FROM $4) DESC, seq LIMIT 1"
+                     ORDER BY op_ref = $5 DESC, (principal IS NOT DISTINCT FROM $4) DESC, seq \
+                     LIMIT 1"
                 ),
                 &[
                     &row.key_domain,
@@ -490,7 +491,11 @@ impl Store for PgStore {
             .await
             .map_err(err)?
             .ok_or_else(|| StoreError("the append conflicted with no row".into()))?;
-        Ok(Appended::Existing(row_of(&existing)?))
+        let existing = row_of(&existing)?;
+        if existing.new.op_ref == row.op_ref {
+            return Ok(Appended::New(existing));
+        }
+        Ok(Appended::Existing(existing))
     }
 
     async fn sign_count(&self, credential: &str) -> Result<Option<u32>, StoreError> {

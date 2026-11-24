@@ -670,7 +670,7 @@ async fn req_op_10_a_command_row_is_found_by_its_client_key() {
 /// Finding `ingress-1` (`REQ-OP-10`, migration `0010`): on PostgreSQL a principal holds one command
 /// row per surface and client key whatever its domain, and an append that conflicts on either index
 /// takes the row already logged, the principal's own first; a retried append whose first try
-/// committed takes its own row. Version 10 refuses a log that already holds two such rows, naming
+/// committed is its own new row. Version 10 refuses a log that already holds two such rows, naming
 /// the problem and changing nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn req_op_10_one_command_row_per_principal_and_key_on_postgres() {
@@ -706,10 +706,27 @@ async fn req_op_10_one_command_row_per_principal_and_key_on_postgres() {
         existing(s.append(in_party(4, "carol")).await.unwrap()),
         InputKey([3; 16])
     );
-    // A retry of an append that committed: its own row, not an error to retry for ever.
+    // A retry of an append that committed: its own row, still new (an API key is shown on its
+    // reply), not an error to retry for ever.
+    match s.append(command(1, "alice", "k1", false)).await.unwrap() {
+        Appended::New(r) => assert_eq!(r.new.op_ref, InputKey([1; 16])),
+        other => panic!("an earlier try's row is this append's: {other:?}"),
+    }
+    // Bob's party row, then alice's own-domain row, then alice in the party: both indexes
+    // conflict, and the row taken is alice's own.
+    let mut b = command(10, "bob", "k2", false);
+    b.key_domain = Some("party:x".into());
+    assert!(matches!(s.append(b).await.unwrap(), Appended::New(_)));
+    assert!(matches!(
+        s.append(command(11, "alice", "k2", false)).await.unwrap(),
+        Appended::New(_)
+    ));
+    let mut a = command(12, "alice", "k2", false);
+    a.key_domain = Some("party:x".into());
     assert_eq!(
-        existing(s.append(command(1, "alice", "k1", false)).await.unwrap()),
-        InputKey([1; 16])
+        existing(s.append(a).await.unwrap()),
+        InputKey([11; 16]),
+        "alice's own row"
     );
 
     let (_, mut c) = database(&url, "ingress_0010_duplicates").await;

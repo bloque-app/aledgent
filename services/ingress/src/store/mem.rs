@@ -270,6 +270,10 @@ impl Store for MemStore {
             }
             _ => None,
         };
+        // This append's own row, logged by an earlier try: still the new row it made.
+        if let Some(seq) = inner.by_ref.get(&row.op_ref) {
+            return Ok(Appended::New(inner.rows[seq].clone()));
+        }
         // The principal's own row first: a repeat of its own request is answered from it.
         if let Some((domain, principal)) = &keys
             && let Some(seq) = inner
@@ -279,9 +283,6 @@ impl Store for MemStore {
         {
             let existing = inner.rows[seq].clone();
             return Ok(Appended::Existing(existing));
-        }
-        if inner.by_ref.contains_key(&row.op_ref) {
-            return Err(StoreError("the reference is taken".into()));
         }
         let seq = inner.next;
         inner.next += 1;
@@ -747,6 +748,51 @@ mod tests {
             received_at: u64::from(n),
             arrived_at: None,
         }
+    }
+
+    /// A command of `principal` under client key `k2` in key domain `domain`.
+    fn command(n: u8, principal: &str, domain: &str) -> NewRow {
+        NewRow {
+            kind: crate::store::InputKind::Command,
+            caller: Some(crate::store::RowCaller {
+                principal: principal.into(),
+                credential: "c".into(),
+                on_behalf_of: None,
+            }),
+            client_key: Some("k2".into()),
+            key_domain: Some(domain.into()),
+            ..row(n, false)
+        }
+    }
+
+    /// Finding `ingress-1` (`REQ-OP-10`): when an append conflicts on both command indexes, the
+    /// row it takes is the principal's own, not the other principal's that holds the domain's
+    /// key; an append whose reference is logged already (an earlier try) is its own new row.
+    #[tokio::test]
+    async fn req_op_10_the_principals_own_row_is_taken_first() {
+        let s = MemStore::new(Duration::from_secs(1));
+        let taken = |a: Appended| match a {
+            Appended::Existing(r) => r.new.op_ref,
+            Appended::New(r) => panic!("a second row: {:?}", r.new.op_ref),
+        };
+        assert!(matches!(
+            s.append(command(10, "bob", "party:x")).await.unwrap(),
+            Appended::New(_)
+        ));
+        assert!(matches!(
+            s.append(command(11, "alice", "alice")).await.unwrap(),
+            Appended::New(_)
+        ));
+        assert_eq!(
+            taken(s.append(command(12, "alice", "party:x")).await.unwrap()),
+            InputKey([11; 16]),
+            "alice's own row"
+        );
+        match s.append(command(11, "alice", "alice")).await.unwrap() {
+            Appended::New(r) => assert_eq!(r.new.op_ref, InputKey([11; 16])),
+            other => panic!("an earlier try's row is this append's: {other:?}"),
+        }
+        assert_eq!(s.rows().await.unwrap().len(), 2);
     }
 
     /// `T-031-04`: a batch of undecided rows comes in the order successive single reads give:

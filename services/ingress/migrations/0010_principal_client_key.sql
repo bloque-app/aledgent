@@ -20,8 +20,18 @@
 --    GROUP BY principal, surface, client_key
 --   HAVING count(*) > 1;
 --
--- The index is built inside the migration's transaction, so appends to the log wait for it: a scan
--- of the command rows.
+-- Before deploying, for operators:
+--
+-- 1. Run the query above on test and on prod. Any row it returns stops this migration; have those
+--    rows reviewed first.
+-- 2. The index is built inside the migration's transaction, which holds a write lock on
+--    received_log for the whole build: every append (every command) waits until it ends. Check the
+--    size first (SELECT count(*) FROM received_log WHERE input_kind = 'command'); if it is large,
+--    deploy in a maintenance window.
+-- 3. Keep the window in which replicas of the old and new builds run together short: an old
+--    replica's insert names only the per-domain conflict target, so a conflict on this index fails
+--    its append, which that replica retries for as long as the request stays open, instead of
+--    answering from the row already logged.
 
 DO $$
 DECLARE
