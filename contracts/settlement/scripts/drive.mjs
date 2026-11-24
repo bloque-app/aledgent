@@ -73,7 +73,7 @@ const ASSETS_CALLS = { transfer: 8 };
 // of 2026-10-11; `latestAnchor` (8) is the only anchor that code keeps. `inbox` (4) is where v2
 // stored each entry: this code stores none, and its reset removes what v2 left. `chain` (12) is the
 // head of the chain of entries (amendment 0040), decoded only by `chain.mjs`.
-const ROOT_KEYS = { registration: 1, head: 2, anchors: 3, inbox: 4, positions: 5, bounds: 6, bound: 7, latestAnchor: 8, anchorMigration: 9, anchorEpoch: 10, governance: 11, chain: 12 };
+const ROOT_KEYS = { registration: 1, head: 2, anchors: 3, inbox: 4, positions: 5, bounds: 6, bound: 7, latestAnchor: 8, anchorMigration: 9, anchorEpoch: 10, governance: 11, chain: 12, peers: 13 };
 
 // Kreivo's transaction extensions (`runtime/kreivo/src/lib.rs`). `PassAuthenticate` comes first;
 // its explicit part is `Option<AuthenticateParams>`, always `None` here (0x00), so the inner type

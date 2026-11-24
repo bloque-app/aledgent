@@ -159,6 +159,18 @@ pub fn create_asset(asset: AssetId, min_balance: Balance) {
     });
 }
 
+/// Every asset created so far.
+pub fn assets() -> Vec<AssetId> {
+    CHAIN.with(|chain| {
+        chain
+            .borrow()
+            .assets
+            .keys()
+            .map(|k| AssetId::decode(&mut &k[..]).expect("an asset id"))
+            .collect()
+    })
+}
+
 /// Freeze or thaw an asset.
 pub fn set_frozen(asset: AssetId, frozen: bool) {
     CHAIN.with(|chain| {
@@ -178,6 +190,16 @@ pub fn mint(asset: AssetId, who: AccountId, amount: Balance) {
         let mut chain = chain.borrow_mut();
         let balance = chain.balances.entry((key(&asset), who)).or_default();
         *balance = balance.checked_add(amount).expect("mint overflow");
+    });
+}
+
+/// Burn from an account, outside any contract: an issuer's `Assets::burn`, which the contract
+/// does not see.
+pub fn burn(asset: AssetId, who: AccountId, amount: Balance) {
+    CHAIN.with(|chain| {
+        let mut chain = chain.borrow_mut();
+        let balance = chain.balances.entry((key(&asset), who)).or_default();
+        *balance = balance.checked_sub(amount).expect("burn below zero");
     });
 }
 
