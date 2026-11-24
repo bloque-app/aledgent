@@ -87,8 +87,27 @@ for review.
    authority over the payer learns nothing about how an operation ended (`ERR-UnknownAccount`).
 9. **Authority.** `reserve` is authorised as `Reserve` on the payer's account with its asset and
    amount: bounds apply and windows are charged once, there. `capture` is authorised as `Capture` on
-   the same account with the destination as counterparty and **no amount**, and `release` as `Release`
-   with no amount: they spend nothing that was not already reserved, so no window is charged twice.
+   the same account with the destination as counterparty, and `release` as `Release`. Before rules
+   version 3 (`eval::BOUNDED_TRANSITIONS`) both were checked with **no amount**, so a delegated or
+   operator grant's per-operation and window bounds were never looked at. From rules version 3 a
+   grant is held to its own bounds for what the transition moves (`REQ-AU-1`, `REQ-AG-2`):
+   - `capture`: the cleared amount, against the per-operation bound and every window bound, and
+     charged to those windows;
+   - `release`: the reserved amount, against the per-operation bound only; it returns the value to
+     its payer, so no window is checked or charged.
+
+   Window links the reservation charged when it was opened (the chains of the grants on its
+   operation record) are not checked or charged again, so a grant capturing its own reservation is
+   charged once. Of the caller's candidate grants, the one the evaluator would choose is tried
+   first, then the others in the same order, and the first whose bounds admit the amount decides:
+   a narrower grant does not shadow one that covers it. Owner authority has no bounds.
+
+   Two consequences, stated plainly. From rules version 3 a bounded grant that names a closed
+   reservation for more than its bounds gets `ERR-BoundExceeded` before `ERR-OperationTerminal`,
+   because authority is checked first (item 8). The operator's `resume` (`F-007` item 18) still
+   releases with no amount at every rules version: it is an audited operator command under a
+   justification, and a release returns the value to its payer
+   (`req_rc_1_resume_releases_a_larger_hold_than_the_operators_release_bound` pins it).
    **A release does not restore the window it used.** Restoring it is `AC-G4.2`, in `US-G4`, which
    SPEC §15 does not put in V0; the conservative reading keeps the charge.
 10. **An ended reservation stays reserved while the evaluator refuses.** Capture and release go

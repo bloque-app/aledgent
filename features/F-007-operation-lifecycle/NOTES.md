@@ -165,7 +165,10 @@ v0.4.0). What changed here:
     wait for `F-010`'s facts, and `Transfer`, `Issue` and `Reversal` rows wait for their feature. A
     release needs the operator's authority over the payer, which does not exist over owned custody
     (`REQ-AU-6`, `ERR-UnknownAccount`). This is the plan's Open point made concrete: nobody may
-    release an owned-custody reservation past its deadline, except its holder.
+    release an owned-custody reservation past its deadline, except its holder. That release is
+    authorised with no amount at every rules version, so the value bounds `F-004` item 9 holds a
+    release to from rules version 3 do not apply to it: `resume` is audited and justified, and the
+    value returns to its payer.
 19. **A kernel refusal on an edge that appends a posting moves nothing** (`Stay(KernelRefused)`).
     For an operation with an external leg, it also flags the operation into the review queue
     (`INV-23`). Only the edges into `Rejected`, before any balance effect, are taken on a refusal

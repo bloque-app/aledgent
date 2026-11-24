@@ -142,10 +142,31 @@ that position. The entry includes the height of the block that wrote it, so the 
     reservation's handle and puts it in the outbox; the adapter's `acknowledge` moves it to
     `Submitted`. The destination is `submit_outbound`'s.
 14. **Authority for a withdrawal** is `Redeem` over the payer's account, with the asset and the
-    amount (bounds and windows charged once, at `withdraw`); `submit_outbound` is authorised the
-    same way with no amount. No issuance authority is asked: the `Redeem` posting is made on
-    evidence at finality, not by the caller. `F-003`'s `redeem` command, which moves value with no
-    external leg, keeps its two authorities.
+    amount, to the issuance counterparty (bounds and windows charged once, at `withdraw`).
+    `submit_outbound` is authorised as `Redeem` too. Before rules version 3
+    (`eval::BOUNDED_TRANSITIONS`) it was checked with no amount and no counterparty, whoever called
+    it. From rules version 3:
+    - the owner decides as before: owner authority has no bounds;
+    - every caller acting under a grant, the operation's initiator included, is checked as
+      `withdraw` decides it, against the grants it holds **now**: the whole reserved amount, to the
+      issuance counterparty, against the per-operation, counterparty and window bounds. Its first
+      submission is charged to its windows except the links the withdrawal already charged, so an
+      initiator submitting under the grant it withdrew under is not charged twice; as a capture is
+      (`F-004` item 9). A repeat to the same destination sends nothing more: it is checked against
+      the per-operation and counterparty bounds only, charges nothing, and returns the original
+      instruction.
+
+    The initiator is not exempt because its authority can change between the two commands: a
+    grant revoked or narrowed after `withdraw` must not still name the destination of the whole
+    reserved amount, which the owner cannot pull back once instructed. Capture already holds an
+    opener to its current grant. Trade-off, stated plainly: an initiator whose grant was narrowed
+    below the reserved amount can no longer submit it; the owner submits or releases it.
+
+    A window bounds how much value a grant sends away per period, so a submission that is not
+    charged would let a grant direct any number of other principals' withdrawals, each within the
+    window. No issuance authority is asked: the `Redeem` posting is made on evidence at finality,
+    not by the caller. `F-003`'s `redeem` command, which moves value with no external leg, keeps its
+    two authorities.
 15. **The support check** runs after authority (a principal with no authority learns nothing),
     before any reservation (`ERR-UnsupportedLeg`, `REQ-SA-1`), and again at `submit_outbound`. With
     no configuration or declaration, every leg is unsupported. A reservation with no external leg

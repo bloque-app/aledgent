@@ -639,6 +639,13 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
     /// `ERR-DeadlineRequired`. A leg that is not outbound, or whose asset the adapter no longer
     /// supports, is `ERR-UnsupportedLeg`. A repeat to the same destination returns the original
     /// instruction; another destination is `ERR-InvalidTransition`.
+    ///
+    /// From [`eval::BOUNDED_TRANSITIONS`] on, a caller acting under a delegated or operator grant,
+    /// the operation's initiator included, is authorised as `withdraw` decides it, for the whole
+    /// reserved amount to the issuance counterparty, and its first submission is charged to its
+    /// per-window bounds, except the links the withdrawal already charged: a grant whose bounds do
+    /// not cover the withdrawal now cannot name its destination (`ERR-BoundExceeded`, `REQ-AG-2`).
+    /// The owner decides as before.
     pub fn submit_outbound(
         &mut self,
         ctx: &Ctx,
@@ -663,6 +670,23 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                 .status(&ctx.op)
                 .ok_or(Refusal::UnknownOperation)?
                 .reservation();
+            // From `BOUNDED_TRANSITIONS` on, a grant names the destination only within the bounds
+            // it holds now, as `withdraw` decides them: the whole reserved amount, to the issuance
+            // counterparty, charged to its windows unless the reservation already charged them
+            // (so the initiator is not charged twice). The initiator is no exception: a grant
+            // revoked or narrowed since the withdrawal no longer names its destination. A repeat
+            // sends nothing more and charges nothing.
+            let (counterparty, moved) = if self.generation() >= eval::BOUNDED_TRANSITIONS {
+                let first = self.state.settlement().instruction(&ctx.op).is_none();
+                let moved = eval::Moved {
+                    op: ctx.op,
+                    amount: r.amount,
+                    spends: first,
+                };
+                (Some(self.roles()?.issuance), Some(moved))
+            } else {
+                (None, None)
+            };
             // Checked against the custody it was accepted under (`F-012`, `AC-A7.3`).
             let decision = eval::authorise_in_flight(
                 &self.state,
@@ -672,10 +696,11 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                     account: r.payer.account,
                     asset: Some(r.asset),
                     amount: None,
-                    counterparty: None,
+                    counterparty,
                 },
                 ctx.now,
                 crate::custody::snapshot(&self.state, &ctx.op),
+                moved,
                 self.generation(),
             )?;
             if o.class() != KindClass::Outbound {
@@ -741,13 +766,12 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                 postings: Vec::new(),
                 at: ctx.now,
             };
-            let writes = [
-                Write::Settlement(SettlementWrite::Instruct {
-                    instruction,
-                    from_seq: head.next_seq,
-                }),
-                Write::PutTransition(record.clone()),
-            ];
+            let mut writes = charges(&[decision]);
+            writes.push(Write::Settlement(SettlementWrite::Instruct {
+                instruction,
+                from_seq: head.next_seq,
+            }));
+            writes.push(Write::PutTransition(record.clone()));
             self.check(&writes)?;
             self.commit(&writes)?;
             Ok(Accepted {

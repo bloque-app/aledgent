@@ -43,6 +43,12 @@ name: Core release
 #   (hex, `aledgent/code/v1`), as the deployment recorded them. The host checks that the package and
 #   the runtime are that version's before anything is built on them (`check-code`). A later upgrade
 #   instead gives predecessor_set, the previous release's image, and needs no manifest.
+# - earlier_sets: from an upgrade to 3 on, the sets of the releases between the genesis and
+#   predecessor_set, oldest first, space-separated. check-upgrade replays the recorded book from
+#   generation 0 and needs one package of every generation before the code in force's: the host image
+#   gives the genesis (0), predecessor_set the code in force, and each earlier set one generation in
+#   between (1 for an upgrade from 2 to 3). Each is attested and checked as predecessor_set is, and the
+#   chain must hold: each set's predecessor is the code of the one before it.
 #
 # One code version per deployment. The package claims the state of ONE previous package's program
 # (T-037-19), so the version this builds follows one predecessor. Deployments founded on different
@@ -89,6 +95,10 @@ on:
         default: ""
       predecessor_set:
         description: "A previous release's code set: ghcr.io/bloque-app/aledgent-core-code@sha256:.... Empty: the host image's own package and runtime (the genesis)"
+        type: string
+        default: ""
+      earlier_sets:
+        description: "With predecessor_set, from an upgrade to 3 on: the code sets between the genesis and predecessor_set, oldest first, space-separated (ghcr.io/bloque-app/aledgent-core-code@sha256:...)"
         type: string
         default: ""
       publish:
@@ -220,6 +230,7 @@ jobs:
       PRED_CODE: ${{ inputs.predecessor_code }}
       PRED_MANIFEST: ${{ inputs.predecessor_manifest }}
       PRED_SET: ${{ inputs.predecessor_set }}
+      EARLIER_SETS: ${{ inputs.earlier_sets }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -259,6 +270,13 @@ jobs:
           if [ -n "$PRED_SET" ]; then
             [[ $PRED_SET =~ ^ghcr\.io/bloque-app/aledgent-core-code@sha256:[0-9a-f]{64}$ ]] \
               || { echo "::error::predecessor_set must be ghcr.io/bloque-app/aledgent-core-code@sha256:<64 hex>, not '$PRED_SET'"; exit 1; }
+          fi
+          if [ -n "$EARLIER_SETS" ]; then
+            [ -n "$PRED_SET" ] || { echo "::error::earlier_sets needs predecessor_set"; exit 1; }
+            for e in $EARLIER_SETS; do
+              [[ $e =~ ^ghcr\.io/bloque-app/aledgent-core-code@sha256:[0-9a-f]{64}$ ]] \
+                || { echo "::error::each of earlier_sets must be ghcr.io/bloque-app/aledgent-core-code@sha256:<64 hex>, not '$e'"; exit 1; }
+            done
           fi
           if [ "$EVENT" != pull_request ]; then
             PRED_CODE="${PRED_CODE,,}"
@@ -306,14 +324,18 @@ jobs:
           if [ -n "$PRED_SET" ]; then
             # Only a set this workflow published from main or develop: its build provenance, signed
             # by this workflow at one of those refs, before anything of it is read.
-            verified=false
-            for src in refs/heads/develop refs/heads/main; do
-              if gh attestation verify "oci://$PRED_SET" -R "$REPO" \
-                  --signer-workflow "$REPO/.github/workflows/core-release.yml" --source-ref "$src" >/dev/null; then
-                verified=true; echo "predecessor_set: attested by core-release.yml at $src"; break
-              fi
-            done
-            $verified || { echo "::error::predecessor_set $PRED_SET has no provenance attestation from $REPO's core-release.yml at refs/heads/develop or refs/heads/main"; exit 1; }
+            attested() {
+              local ref=$1 what=$2 src
+              for src in refs/heads/develop refs/heads/main; do
+                if gh attestation verify "oci://$ref" -R "$REPO" \
+                    --signer-workflow "$REPO/.github/workflows/core-release.yml" --source-ref "$src" >/dev/null; then
+                  echo "$what: attested by core-release.yml at $src"; return 0
+                fi
+              done
+              echo "::error::$what $ref has no provenance attestation from $REPO's core-release.yml at refs/heads/develop or refs/heads/main"
+              return 1
+            }
+            attested "$PRED_SET" predecessor_set
             # A previous release's set, read back and checked as it was written (core-code-read.sh).
             from_set=$(tools/release/core-code-read.sh "$PRED_SET" "$W/set-in")
             if [ -n "$CODE" ] && [ "$CODE" != "$from_set" ]; then
@@ -328,6 +350,30 @@ jobs:
             id=$(docker create --platform linux/amd64 "$HOST")
             docker cp "$id:/usr/share/aledgent/core.vos" "$W/pred-pkg/earlier/0.vos"
             docker rm "$id" >/dev/null
+            # The releases between the genesis and the code in force (earlier_sets, oldest first):
+            # one package each, attested, read back and checked by the host against its own
+            # manifest, as the code in force is below; each set's predecessor is the code of the one
+            # before it, and the last one's code is predecessor_set's predecessor.
+            i=0; before=""
+            for e in $EARLIER_SETS; do
+              i=$((i + 1))
+              attested "$e" "earlier_sets[$i]"
+              code_e=$(tools/release/core-code-read.sh "$e" "$W/earlier-in/$i")
+              pred_e=$(jq -er .predecessor "$W/earlier-in/$i/set.json")
+              if [ -n "$before" ] && [ "$pred_e" != "$before" ]; then
+                echo "::error::earlier_sets[$i] $e follows $pred_e, not the code of the set before it ($before)"; exit 1
+              fi
+              chmod -R a+rX "$W/earlier-in/$i"
+              docker run --rm --platform linux/amd64 -v "$W/earlier-in/$i:/e:ro" "$HOST" check-code \
+                --actor /e/core.vos --runtime /e/agent_runtime.pvm --manifest /e/manifest.bin --code "$code_e" >/dev/null \
+                || { echo "::error::the host image does not accept earlier_sets[$i] $e as code $code_e"; exit 1; }
+              cp "$W/earlier-in/$i/core.vos" "$W/pred-pkg/earlier/set-$i.vos"
+              echo "earlier_sets[$i]: code $code_e, following $pred_e" | tee -a "$GITHUB_STEP_SUMMARY"
+              before=$code_e
+            done
+            if [ -n "$before" ] && [ "$(jq -er .predecessor "$W/set-in/set.json")" != "$before" ]; then
+              echo "::error::predecessor_set follows $(jq -r .predecessor "$W/set-in/set.json"), not the last of earlier_sets ($before)"; exit 1
+            fi
           else
             id=$(docker create --platform linux/amd64 "$HOST")
             docker cp "$id:/usr/share/aledgent/core.vos" "$W/pred/core.vos"

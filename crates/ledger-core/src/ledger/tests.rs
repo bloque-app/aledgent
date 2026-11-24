@@ -901,6 +901,7 @@ fn capture_and_release_charge_no_window_and_are_recorded_as_transitions() {
 mod aliases;
 mod anchoring;
 mod asset_binding;
+mod bounded_transitions;
 mod custody;
 mod epochs;
 mod identities;
