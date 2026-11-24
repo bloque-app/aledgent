@@ -676,6 +676,11 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                 },
                 ctx.now,
                 crate::custody::snapshot(&self.state, &ctx.op),
+                eval::Moved {
+                    op: ctx.op,
+                    amount: r.amount,
+                    spends: true,
+                },
                 self.generation(),
             )?;
             if o.class() != KindClass::Outbound {
@@ -741,13 +746,12 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                 postings: Vec::new(),
                 at: ctx.now,
             };
-            let writes = [
-                Write::Settlement(SettlementWrite::Instruct {
-                    instruction,
-                    from_seq: head.next_seq,
-                }),
-                Write::PutTransition(record.clone()),
-            ];
+            let mut writes = charges(&[decision]);
+            writes.push(Write::Settlement(SettlementWrite::Instruct {
+                instruction,
+                from_seq: head.next_seq,
+            }));
+            writes.push(Write::PutTransition(record.clone()));
             self.check(&writes)?;
             self.commit(&writes)?;
             Ok(Accepted {

@@ -548,29 +548,72 @@ impl Effective {
         if self.per_operation.is_some_and(|max| amount > max) {
             return Err(Refusal::BoundExceeded);
         }
+        if self.windows.is_empty() {
+            return Ok(Vec::new());
+        }
+        // A window bound is over one asset's minor units; an operation with an amount always
+        // names its asset.
+        let asset = op.asset.ok_or(Refusal::BoundExceeded)?;
+        self.window_charges(asset, amount, now, |_| false, used)
+    }
+
+    /// Check what a later transition of an accepted reservation moves out of it, `amount` of
+    /// `asset`, against the value bounds (`REQ-AU-1`, `REQ-AG-2`), and return the window charges
+    /// it makes: the capture's cleared amount, or the reserved amount of a release or of an
+    /// outbound leg's submission. [`Effective::check`] has already checked the asset and the
+    /// counterparty, with no amount.
+    ///
+    /// The per-operation bound is always checked. A transition that `spends` (it sends the value
+    /// away from the payer: a capture, a submission) is also checked against, and charged to, every
+    /// per-window bound of a link not in `charged`: the links whose windows the reservation charged
+    /// when it was opened, which it is not charged again. A release returns the value to its payer
+    /// and charges no window.
+    pub fn check_moved(
+        &self,
+        asset: AssetId,
+        amount: NonZeroMinor,
+        spends: bool,
+        charged: &[GrantId],
+        now: Time,
+        used: impl Fn(&WindowKey) -> Minor,
+    ) -> Result<Vec<Charge>, Refusal> {
+        if self.per_operation.is_some_and(|max| amount > max) {
+            return Err(Refusal::BoundExceeded);
+        }
+        if !spends {
+            return Ok(Vec::new());
+        }
+        self.window_charges(asset, amount, now, |g| charged.contains(g), used)
+    }
+
+    /// The charges of `amount` of `asset` to every per-window bound whose link `skip` does not
+    /// name; `ERR-BoundExceeded` if one would pass its limit.
+    fn window_charges(
+        &self,
+        asset: AssetId,
+        amount: NonZeroMinor,
+        now: Time,
+        skip: impl Fn(&GrantId) -> bool,
+        used: impl Fn(&WindowKey) -> Minor,
+    ) -> Result<Vec<Charge>, Refusal> {
         let mut charges = Vec::with_capacity(self.windows.len());
-        if !self.windows.is_empty() {
-            // A window bound is over one asset's minor units; an operation with an amount always
-            // names its asset.
-            let asset = op.asset.ok_or(Refusal::BoundExceeded)?;
-            for (grant, w) in &self.windows {
-                let key = WindowKey {
-                    grant: *grant,
-                    window: w.index(now),
-                    asset,
-                };
-                let after = used(&key)
-                    .checked_add(amount.minor())
-                    .ok_or(Refusal::BoundExceeded)?;
-                if after > w.limit.minor() {
-                    return Err(Refusal::BoundExceeded);
-                }
-                charges.push(Charge {
-                    key,
-                    amount: amount.minor(),
-                    limit: w.limit,
-                });
+        for (grant, w) in self.windows.iter().filter(|(g, _)| !skip(g)) {
+            let key = WindowKey {
+                grant: *grant,
+                window: w.index(now),
+                asset,
+            };
+            let after = used(&key)
+                .checked_add(amount.minor())
+                .ok_or(Refusal::BoundExceeded)?;
+            if after > w.limit.minor() {
+                return Err(Refusal::BoundExceeded);
             }
+            charges.push(Charge {
+                key,
+                amount: amount.minor(),
+                limit: w.limit,
+            });
         }
         Ok(charges)
     }

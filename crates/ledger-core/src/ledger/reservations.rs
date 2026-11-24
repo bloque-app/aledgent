@@ -284,13 +284,16 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
     }
 
     /// The reservation `ctx.op` names, open or closed, with its authority checked on the payer's
-    /// account for `kind`. `ERR-UnknownOperation` if there is none.
+    /// account for `kind`. `ERR-UnknownOperation` if there is none. What the transition moves is
+    /// `cleared` for a capture, the reserved amount for a release; from rules version
+    /// [`eval::BOUNDED_TRANSITIONS`] on, a grant is held to its value bounds for it.
     fn transition(
         &self,
         ctx: &Ctx,
         p: &Principal,
         kind: OperationKind,
         counterparty: Option<AccountId>,
+        cleared: Option<NonZeroMinor>,
     ) -> Result<(Status, Decision), Refusal> {
         let status = self
             .state
@@ -311,6 +314,11 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             },
             ctx.now,
             crate::custody::snapshot(&self.state, &ctx.op),
+            eval::Moved {
+                op: ctx.op,
+                amount: cleared.unwrap_or(r.amount),
+                spends: kind == OperationKind::Capture,
+            },
             self.generation(),
         )?;
         if let Status::Closed(..) = status {
@@ -397,8 +405,13 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                 return Ok(a);
             }
             let cleared = NonZeroMinor::new(cleared)?;
-            let (status, decision) =
-                self.transition(ctx, &p, OperationKind::Capture, Some(destination))?;
+            let (status, decision) = self.transition(
+                ctx,
+                &p,
+                OperationKind::Capture,
+                Some(destination),
+                Some(cleared),
+            )?;
             let r = *status.reservation();
             let dest = self
                 .state
@@ -437,7 +450,7 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             };
             let plan = Plan {
                 unit: Some(u),
-                writes: Vec::new(),
+                writes: charges(&[decision]),
                 open: None,
                 transitions: vec![planned],
                 attribution: Attribution::Transition(record),
@@ -470,7 +483,8 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             ) {
                 return Ok(a);
             }
-            let (status, decision) = self.transition(ctx, &p, OperationKind::Release, None)?;
+            let (status, decision) =
+                self.transition(ctx, &p, OperationKind::Release, None, None)?;
             let r = *status.reservation();
             // A proved rejection is a release backed by proof from any state it can reach
             // (amendment 0006 item 3); otherwise the ordinary release of a reservation.

@@ -290,6 +290,59 @@ fn submit_outbound_needs_a_deadline_after_the_expiry_is_decided() {
     assert_eq!(lx.view(&a), (70, 30));
 }
 
+/// `ledger-core-rest-1`, `REQ-AG-2`: from rules version [`crate::eval::BOUNDED_TRANSITIONS`] on, a
+/// delegate bounded to 1 per operation cannot submit the owner's withdrawal of 30 to a destination
+/// of its choosing: `ERR-BoundExceeded`, and no instruction. Before it, the submission was
+/// accepted, as that code decided it.
+#[test]
+fn req_ag_2_a_bounded_delegate_cannot_submit_the_owners_larger_withdrawal() {
+    for (rules, held) in [
+        (crate::eval::BOUNDED_TRANSITIONS, true),
+        (crate::eval::BOUNDED_TRANSITIONS - 1, false),
+    ] {
+        let mut lx = Lx::new();
+        lx.fx.ledger.set_generation(rules, false);
+        let (alice, a) = funded(&mut lx.fx, 100);
+        let mallory = lx.fx.person();
+        let grant = lx.fx.ctx(alice);
+        lx.fx
+            .ledger
+            .grant_authority(
+                &grant,
+                GrantRequest {
+                    kind: GrantKind::Delegated,
+                    principal: mallory.principal,
+                    subject: Subject::Account(a),
+                    ops: NonEmptySet::new([OperationKind::Redeem].into()).unwrap(),
+                    per_operation: Some(nz(1)),
+                    per_window: None,
+                    assets: None,
+                    counterparties: None,
+                    parent: None,
+                    expires: None,
+                },
+            )
+            .unwrap();
+        let ctx = lx.withdraw(alice, a, 30, 500);
+        let theirs = Ctx {
+            op: ctx.op,
+            ..lx.fx.ctx(mallory)
+        };
+        let submitted = lx.fx.ledger.submit_outbound(&theirs, TO).map(|_| ());
+        if held {
+            assert_eq!(submitted, Err(Refusal::BoundExceeded));
+            assert!(lx.fx.ledger.pending_instructions().is_empty());
+            assert_eq!(lx.state(&ctx.op), OpState::Reserved);
+            // The owner still submits her own withdrawal.
+            lx.fx.ledger.submit_outbound(&ctx, TO).unwrap();
+        } else {
+            assert_eq!(submitted, Ok(()));
+        }
+        assert_eq!(lx.fx.ledger.pending_instructions().len(), 1);
+        assert_eq!(lx.view(&a), (70, 30));
+    }
+}
+
 /// An instruction the adapter never acknowledged, once it provably cannot execute, is released:
 /// `Reserved → Released`, with no hand-off.
 #[test]
