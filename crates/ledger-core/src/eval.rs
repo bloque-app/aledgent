@@ -41,10 +41,10 @@ use alloc::vec::Vec;
 use crate::account::{AccountKind, Custody, LedgerAccount, Time};
 use crate::asset::{AssetId, NonZeroMinor};
 use crate::authority::{
-    AuthorityKind, AuthorityUsed, Charge, Dead, Effective, GrantKind, OperationKind, Reach,
-    Subject, effective,
+    AuthorityKind, AuthorityUsed, Charge, Dead, Effective, GrantKind, MAX_CHAIN, OperationKind,
+    Reach, Subject, effective,
 };
-use crate::id::{AccountId, IdentityId};
+use crate::id::{AccountId, GrantId, IdentityId, OperationId};
 use crate::principal::{Caller, Principal, resolve};
 use crate::refusal::Refusal;
 use crate::state::State;
@@ -66,6 +66,54 @@ use crate::state::State;
 ///
 /// [`Ledger::generation`]: crate::ledger::Ledger::generation
 pub const ASSET_CANDIDATES: u64 = crate::settlement::CHAINED_SETTLEMENT;
+
+/// The rules version from which every grant is held to its own bounds for a later transition of
+/// an accepted reservation (`REQ-AU-1`, `REQ-AG-2`, `AC-G1.3`, `AC-G4.1`): its capture, its
+/// release, the submission of its outbound leg.
+///
+/// - A capture or a release authorised under a delegated or operator grant is checked against that
+///   grant's per-operation bound for what it moves (a capture's cleared amount, a release's
+///   reserved amount); a capture, which sends the value away from the payer, also against every
+///   per-window bound, and charged to it, except the links the reservation already charged when it
+///   was opened ([`crate::authority::Effective::check_moved`]). A capture's destination is its
+///   counterparty, as before.
+/// - A submission under a grant, the operation's initiator's included, is checked as `withdraw`
+///   decided it: the whole reserved amount, to the issuance counterparty, against the per-operation
+///   and counterparty bounds of the grants the caller holds now, and against and charged to the
+///   per-window bounds as a capture is (the initiator's opening links are not charged again). A
+///   repeat to the same destination moves nothing more and charges no window, so it returns the
+///   original instruction.
+///
+/// Of the caller's candidate grants, the one chosen as before is tried first, then the others in
+/// the same order; the first whose bounds admit what the transition moves decides, so a narrower
+/// grant does not shadow one that covers it. The operator's `resume` releases with no amount at
+/// every rules version: an audited, justified operator command, exempt from these bounds.
+///
+/// Owner authority has no bounds and is unchanged. Before it, such a transition was authorised
+/// with no amount and no counterparty of its own, so only the asset bound and a capture's
+/// counterparty bound were looked at: a grant could capture, release or name the destination of a
+/// reservation another authority had opened, whole, whatever its own bounds. An input of an earlier
+/// rules version is decided as its code decided it (the rules-version rule, amendment 0033).
+///
+/// It is 3: the production and test books run rules version 2 ([`crate::asset::ASSET_RETIREMENT`]),
+/// so the first core package that carries this code is built as 3. If another upgrade takes 3
+/// first, this moves to the rules version of the first core package that carries it.
+pub const BOUNDED_TRANSITIONS: u64 = 3;
+
+/// What a later transition of an accepted reservation moves out of it, for the value bounds of a
+/// grant it is authorised under (from rules version [`BOUNDED_TRANSITIONS`] on).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Moved {
+    /// The operation whose reservation it moves: its record names the authority that opened it.
+    pub op: OperationId,
+    /// What it moves: a capture's cleared amount, the reserved amount of a release or of the
+    /// submission of an outbound leg.
+    pub amount: NonZeroMinor,
+    /// Whether it sends the value away from the payer (a capture, a first submission), and so
+    /// counts against window bounds. A release returns the value to its payer; a repeated
+    /// submission sends nothing more.
+    pub spends: bool,
+}
 
 /// One operation to authorise on one account.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -173,30 +221,61 @@ pub fn authorise_principal(
     now: Time,
     generation: u64,
 ) -> Result<Decision, Refusal> {
-    authorise_as(state, p, request, now, None, generation)
+    authorise_as(state, p, request, now, None, None, generation)
 }
 
 /// [`authorise_principal`] for a later transition of an operation already accepted — its
 /// capture, its release, its submission — checked against the custody `snapshot` it was accepted
 /// under, not the account's current custody (`REQ-AU-13`, `REQ-OP-9`, `AC-A7.3`, `F-012` §4).
 /// `None` is the current custody. [`crate::custody::snapshot`] says what the snapshot is.
+///
+/// `moved` is what the transition moves out of the reservation. From rules version
+/// [`BOUNDED_TRANSITIONS`] on, a grant chosen for it is held to its value bounds for that amount
+/// ([`Moved`]); owner authority is not bounded. `None` checks no amount: the transition is decided
+/// on the bounds `request` names alone (every transition before [`BOUNDED_TRANSITIONS`]).
+#[allow(clippy::too_many_arguments)]
 pub fn authorise_in_flight(
     state: &State,
     p: &Principal,
     request: &Request,
     now: Time,
     snapshot: Option<Custody>,
+    moved: Option<Moved>,
     generation: u64,
 ) -> Result<Decision, Refusal> {
-    authorise_as(state, p, request, now, snapshot, generation)
+    authorise_as(state, p, request, now, snapshot, moved.as_ref(), generation)
 }
 
+/// The links whose windows the opening of `op` charged: every link of the chain of each grant its
+/// record names. Nothing for an operation opened under owner authority.
+fn charged_links(state: &State, op: &OperationId) -> Vec<GrantId> {
+    let mut links = Vec::new();
+    let Some(record) = state.record(op) else {
+        return links;
+    };
+    for used in &record.authorities {
+        let mut link = used.grant;
+        let mut depth = 0;
+        while let Some(id) = link {
+            if depth >= MAX_CHAIN || links.contains(&id) {
+                break;
+            }
+            links.push(id);
+            depth += 1;
+            link = state.grant(&id).and_then(|g| g.parent());
+        }
+    }
+    links
+}
+
+#[allow(clippy::too_many_arguments)]
 fn authorise_as(
     state: &State,
     p: &Principal,
     request: &Request,
     now: Time,
     snapshot: Option<Custody>,
+    moved: Option<&Moved>,
     generation: u64,
 ) -> Result<Decision, Refusal> {
     // 2. Reach.
@@ -259,24 +338,55 @@ fn authorise_as(
             .unwrap_or(0),
         _ => 0,
     };
-    let Some(eff) = ordered.into_iter().nth(at) else {
+    if at >= ordered.len() {
         return Err(if revoked {
             Refusal::AuthorityRevoked
         } else {
             Refusal::NotAuthorised
         });
-    };
+    }
     // 6. Bounds.
     let reach = Reach {
         asset: request.asset,
         amount: request.amount,
         counterparty: request.counterparty,
     };
-    let charges = eff.check(&reach, now, |k| state.used(k))?;
-    Ok(Decision {
+    let decided = |eff: &Effective, charges: Vec<Charge>| Decision {
         used: used(p, eff.kind.into(), Some(eff.grant)),
         charges,
-    })
+    };
+    // From `BOUNDED_TRANSITIONS` on, a later transition is also held to the value bounds for what
+    // it moves. The candidate chosen above is tried first, then the others in the same order, and
+    // the first whose bounds admit it decides: a narrower grant that cannot cover the amount does
+    // not shadow one that can. With none, the chosen candidate's refusal stands.
+    if let (Some(m), Some(asset)) = (moved, request.asset) {
+        if generation >= BOUNDED_TRANSITIONS {
+            let charged = charged_links(state, &m.op);
+            let bounds = |eff: &Effective| -> Result<Vec<Charge>, Refusal> {
+                let mut charges = eff.check(&reach, now, |k| state.used(k))?;
+                charges.extend(
+                    eff.check_moved(asset, m.amount, m.spends, &charged, now, |k| state.used(k))?,
+                );
+                Ok(charges)
+            };
+            let refusal = match bounds(&ordered[at]) {
+                Ok(charges) => return Ok(decided(&ordered[at], charges)),
+                Err(e) => e,
+            };
+            for (i, eff) in ordered.iter().enumerate() {
+                if i == at {
+                    continue;
+                }
+                if let Ok(charges) = bounds(eff) {
+                    return Ok(decided(eff, charges));
+                }
+            }
+            return Err(refusal);
+        }
+    }
+    let eff = &ordered[at];
+    let charges = eff.check(&reach, now, |k| state.used(k))?;
+    Ok(decided(eff, charges))
 }
 
 /// Authorise an issuance operation (`Issue` or `Redeem`) over `asset` (`REQ-AS-6`, `REQ-AU-10`).
