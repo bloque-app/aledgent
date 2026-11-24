@@ -77,12 +77,12 @@ pub const ASSET_CANDIDATES: u64 = crate::settlement::CHAINED_SETTLEMENT;
 ///   per-window bound, and charged to it, except the links the reservation already charged when it
 ///   was opened ([`crate::authority::Effective::check_moved`]). A capture's destination is its
 ///   counterparty, as before.
-/// - A submission by a caller other than the operation's initiator is checked as `withdraw`
+/// - A submission under a grant, the operation's initiator's included, is checked as `withdraw`
 ///   decided it: the whole reserved amount, to the issuance counterparty, against the per-operation
-///   and counterparty bounds, and against and charged to the per-window bounds as a capture is. A
+///   and counterparty bounds of the grants the caller holds now, and against and charged to the
+///   per-window bounds as a capture is (the initiator's opening links are not charged again). A
 ///   repeat to the same destination moves nothing more and charges no window, so it returns the
-///   original instruction. The initiator's submission is decided as before: `withdraw` checked
-///   and charged its bounds for exactly this.
+///   original instruction.
 ///
 /// Of the caller's candidate grants, the one chosen as before is tried first, then the others in
 /// the same order; the first whose bounds admit what the transition moves decides, so a narrower
@@ -232,8 +232,7 @@ pub fn authorise_principal(
 /// `moved` is what the transition moves out of the reservation. From rules version
 /// [`BOUNDED_TRANSITIONS`] on, a grant chosen for it is held to its value bounds for that amount
 /// ([`Moved`]); owner authority is not bounded. `None` checks no amount: the transition is decided
-/// on the bounds `request` names alone (an initiator's submission, every transition before
-/// [`BOUNDED_TRANSITIONS`]).
+/// on the bounds `request` names alone (every transition before [`BOUNDED_TRANSITIONS`]).
 #[allow(clippy::too_many_arguments)]
 pub fn authorise_in_flight(
     state: &State,

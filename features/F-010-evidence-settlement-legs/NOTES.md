@@ -146,14 +146,21 @@ that position. The entry includes the height of the block that wrote it, so the 
     `submit_outbound` is authorised as `Redeem` too. Before rules version 3
     (`eval::BOUNDED_TRANSITIONS`) it was checked with no amount and no counterparty, whoever called
     it. From rules version 3:
-    - the operation's initiator, and the owner, decide as before: `withdraw` already checked and
-      charged the initiator's bounds for this step, and owner authority has none;
-    - any other caller is checked as `withdraw` decides it: the whole reserved amount, to the
-      issuance counterparty, against its per-operation, counterparty and window bounds, and its
-      first submission is charged to its windows (except the links the withdrawal already charged),
-      as a capture is (`F-004` item 9). A repeat to the same destination sends nothing more: it is
-      checked against the per-operation and counterparty bounds only, charges nothing, and returns
-      the original instruction.
+    - the owner decides as before: owner authority has no bounds;
+    - every caller acting under a grant, the operation's initiator included, is checked as
+      `withdraw` decides it, against the grants it holds **now**: the whole reserved amount, to the
+      issuance counterparty, against the per-operation, counterparty and window bounds. Its first
+      submission is charged to its windows except the links the withdrawal already charged, so an
+      initiator submitting under the grant it withdrew under is not charged twice; as a capture is
+      (`F-004` item 9). A repeat to the same destination sends nothing more: it is checked against
+      the per-operation and counterparty bounds only, charges nothing, and returns the original
+      instruction.
+
+    The initiator is not exempt because its authority can change between the two commands: a
+    grant revoked or narrowed after `withdraw` must not still name the destination of the whole
+    reserved amount, which the owner cannot pull back once instructed. Capture already holds an
+    opener to its current grant. Trade-off, stated plainly: an initiator whose grant was narrowed
+    below the reserved amount can no longer submit it; the owner submits or releases it.
 
     A window bounds how much value a grant sends away per period, so a submission that is not
     charged would let a grant direct any number of other principals' withdrawals, each within the

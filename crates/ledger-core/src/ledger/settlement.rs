@@ -640,11 +640,12 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
     /// supports, is `ERR-UnsupportedLeg`. A repeat to the same destination returns the original
     /// instruction; another destination is `ERR-InvalidTransition`.
     ///
-    /// From [`eval::BOUNDED_TRANSITIONS`] on, a caller other than the operation's initiator is
-    /// authorised as `withdraw` decides it, for the whole reserved amount to the issuance
-    /// counterparty, and its first submission is charged to its per-window bounds: a delegated or
-    /// operator grant whose bounds do not cover the withdrawal cannot name its destination
-    /// (`ERR-BoundExceeded`, `REQ-AG-2`). The owner and the initiator decide as before.
+    /// From [`eval::BOUNDED_TRANSITIONS`] on, a caller acting under a delegated or operator grant,
+    /// the operation's initiator included, is authorised as `withdraw` decides it, for the whole
+    /// reserved amount to the issuance counterparty, and its first submission is charged to its
+    /// per-window bounds, except the links the withdrawal already charged: a grant whose bounds do
+    /// not cover the withdrawal now cannot name its destination (`ERR-BoundExceeded`, `REQ-AG-2`).
+    /// The owner decides as before.
     pub fn submit_outbound(
         &mut self,
         ctx: &Ctx,
@@ -669,14 +670,13 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                 .status(&ctx.op)
                 .ok_or(Refusal::UnknownOperation)?
                 .reservation();
-            // From `BOUNDED_TRANSITIONS` on, a caller that did not reserve the leg names its
-            // destination only within its own bounds, as `withdraw` decides them: the whole
-            // reserved amount, to the issuance counterparty, charged to its windows unless the
-            // reservation already charged them. A repeat sends nothing more and charges nothing.
-            // The initiator's bounds were checked and charged for exactly this when it reserved.
-            let bounded =
-                self.generation() >= eval::BOUNDED_TRANSITIONS && o.initiator() != Some(p.identity);
-            let (counterparty, moved) = if bounded {
+            // From `BOUNDED_TRANSITIONS` on, a grant names the destination only within the bounds
+            // it holds now, as `withdraw` decides them: the whole reserved amount, to the issuance
+            // counterparty, charged to its windows unless the reservation already charged them
+            // (so the initiator is not charged twice). The initiator is no exception: a grant
+            // revoked or narrowed since the withdrawal no longer names its destination. A repeat
+            // sends nothing more and charges nothing.
+            let (counterparty, moved) = if self.generation() >= eval::BOUNDED_TRANSITIONS {
                 let first = self.state.settlement().instruction(&ctx.op).is_none();
                 let moved = eval::Moved {
                     op: ctx.op,

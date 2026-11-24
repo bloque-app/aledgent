@@ -1899,12 +1899,11 @@ fn req_ag_2_a_covering_delegate_names_the_destination_charged_to_its_window_once
     assert_eq!(lx.fx.ledger.pending_instructions().len(), 1);
 }
 
-/// `REQ-AG-2`: the initiator and the owner decide as before. A delegate names the destination of
-/// its own withdrawal, and repeats it, although reserving it used its whole window, which is not
-/// charged again; the owner names the destination of a delegate's withdrawal, owner authority
-/// having no bounds.
+/// `REQ-AG-2`: a delegate names the destination of its own withdrawal under the grant it withdrew
+/// under, and repeats it, although reserving it used its whole window, which is not charged again;
+/// the owner names the destination of a delegate's withdrawal, owner authority having no bounds.
 #[test]
-fn req_ag_2_the_initiator_and_the_owner_name_the_destination_as_before() {
+fn req_ag_2_the_initiator_within_its_grant_and_the_owner_name_the_destination() {
     let (mut lx, alice, a, bob) = bounded_book();
     let g = redeem_grant(&mut lx.fx, alice, &bob, a, Some(10), Some(10), None);
     let w = lx.withdraw(bob, a, 10, 500);
@@ -1929,23 +1928,72 @@ fn req_ag_2_the_initiator_and_the_owner_name_the_destination_as_before() {
     assert_eq!(again, i);
 }
 
-/// `REQ-AG-2`: the initiator's submission decides as before even under another grant than the
-/// one it reserved under. Bob withdraws 5 000 under a grant of 10 000 per operation, which the owner
-/// then revokes and replaces with one of 10 per operation: he still names the destination, and
-/// nothing is charged to the new grant's window.
+/// `REQ-AG-2`: from [`crate::eval::BOUNDED_TRANSITIONS`] on, the initiator is held to the grant it
+/// holds now. Bob withdraws 5 000 under a grant of 10 000 per operation, which the owner then
+/// revokes and replaces with one of 10 per operation: he can no longer name the destination of the
+/// 5 000, nothing is instructed and nothing is charged, and the owner still names hers. Under the
+/// rules version before, the submission was accepted, as that code decided it.
 #[test]
-fn req_ag_2_the_initiator_submits_under_another_grant_than_the_one_it_reserved_under() {
+fn req_ag_2_the_initiator_is_held_to_the_grant_it_holds_now() {
+    for (rules, held) in [
+        (crate::eval::BOUNDED_TRANSITIONS, true),
+        (crate::eval::BOUNDED_TRANSITIONS - 1, false),
+    ] {
+        let (mut lx, alice, a, bob) = bounded_book();
+        lx.fx.ledger.set_generation(rules, false);
+        let g1 = redeem_grant(&mut lx.fx, alice, &bob, a, Some(10_000), None, None);
+        let w = lx.withdraw(bob, a, 5_000, 500);
+        let ctx = lx.fx.ctx(alice);
+        lx.fx.ledger.revoke_authority(&ctx, g1).unwrap();
+        let g2 = redeem_grant(&mut lx.fx, alice, &bob, a, Some(10), Some(10), None);
+        let submitted = lx.fx.ledger.submit_outbound(&w, BOBS).map(|a| a.value);
+        if held {
+            assert_eq!(submitted, Err(Refusal::BoundExceeded));
+            assert!(lx.fx.ledger.pending_instructions().is_empty());
+            assert_eq!(lx.state(&w.op), OpState::Reserved);
+            assert_eq!(lx.fx.ledger.state().used(&redeem_window(g2)), Minor::ZERO);
+            let as_alice = Ctx {
+                caller: alice,
+                op: w.op,
+                now: 10,
+            };
+            let i = lx.fx.ledger.submit_outbound(&as_alice, TO).unwrap().value;
+            assert_eq!(i.destination(), TO);
+        } else {
+            assert_eq!(submitted.unwrap().amount().get().get(), 5_000);
+            let record = lx.fx.ledger.state().transitions(&w.op).last().unwrap();
+            assert_eq!(record.authorities[0].grant, Some(g2));
+            assert_eq!(lx.fx.ledger.state().used(&redeem_window(g2)), Minor::ZERO);
+        }
+        assert_eq!(lx.fx.ledger.pending_instructions().len(), 1);
+    }
+}
+
+/// `REQ-AG-2`: an initiator whose current grant covers the withdrawal still names its destination
+/// under a grant other than the one it withdrew under, charged to the new grant's window once (the
+/// withdrawal charged only the old one's), and a repeat returns the same instruction.
+#[test]
+fn req_ag_2_an_initiator_whose_current_grant_covers_the_withdrawal_submits() {
     let (mut lx, alice, a, bob) = bounded_book();
     let g1 = redeem_grant(&mut lx.fx, alice, &bob, a, Some(10_000), None, None);
     let w = lx.withdraw(bob, a, 5_000, 500);
     let ctx = lx.fx.ctx(alice);
     lx.fx.ledger.revoke_authority(&ctx, g1).unwrap();
-    let g2 = redeem_grant(&mut lx.fx, alice, &bob, a, Some(10), Some(10), None);
+    let g2 = redeem_grant(&mut lx.fx, alice, &bob, a, Some(5_000), Some(5_000), None);
     let i = lx.fx.ledger.submit_outbound(&w, BOBS).unwrap().value;
     assert_eq!(i.amount().get().get(), 5_000);
     let record = lx.fx.ledger.state().transitions(&w.op).last().unwrap();
     assert_eq!(record.authorities[0].grant, Some(g2));
-    assert_eq!(lx.fx.ledger.state().used(&redeem_window(g2)), Minor::ZERO);
+    assert_eq!(
+        lx.fx.ledger.state().used(&redeem_window(g2)),
+        Minor::new(5_000)
+    );
+    let again = lx.fx.ledger.submit_outbound(&w, BOBS).unwrap().value;
+    assert_eq!(again, i);
+    assert_eq!(
+        lx.fx.ledger.state().used(&redeem_window(g2)),
+        Minor::new(5_000)
+    );
 }
 
 /// The rules-version rule (amendment 0033): an input of a rules version before

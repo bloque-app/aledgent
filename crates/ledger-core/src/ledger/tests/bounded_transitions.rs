@@ -391,3 +391,89 @@ fn req_rc_1_resume_releases_a_larger_hold_than_the_operators_release_bound() {
     assert_eq!((view.available, view.reserved), (10_000, 0));
     assert_eq!(fx.ledger.state().used(&window(grant)), Minor::ZERO);
 }
+
+/// A fallback candidate is checked against all of its own bounds, not only the value bounds. A
+/// delegate holds a narrow capture grant (10 per operation) and a wide one (1 000 per operation)
+/// whose counterparty bound, or asset bound, leaves out the capture: the narrow one cannot cover
+/// the owner's 500, the wide one does not admit the destination or the asset, so the capture is
+/// refused, nothing moves and no window is charged. With the wide grant admitting both, it is
+/// accepted under it.
+#[test]
+fn req_ag_2_a_fallback_grant_is_held_to_its_own_asset_and_counterparty_bounds() {
+    for (wide_asset, wide_party, accepted) in [
+        (false, true, false),
+        (true, false, false),
+        (true, true, true),
+    ] {
+        let mut fx = Fx::new();
+        fx.ledger.set_generation(BOUNDED_TRANSITIONS, false);
+        let (alice, acct) = funded(&mut fx, 1_000);
+        let (bob, narrow) = delegate(
+            &mut fx,
+            alice,
+            acct,
+            &[OperationKind::Capture],
+            Some(10),
+            Some(10),
+        );
+        let his = fx.account(&bob, Custody::Owned);
+        let elsewhere = fx.account(&alice, Custody::Owned);
+        let ctx = fx.ctx(alice);
+        let wide = fx
+            .ledger
+            .grant_authority(
+                &ctx,
+                GrantRequest {
+                    kind: GrantKind::Delegated,
+                    principal: bob.principal,
+                    subject: Subject::Account(acct),
+                    ops: NonEmptySet::one(OperationKind::Capture),
+                    per_operation: Some(nz(1_000)),
+                    per_window: Some(Window {
+                        length: NonZeroU64::new(1_000).unwrap(),
+                        limit: nz(1_000),
+                    }),
+                    assets: Some(NonEmptySet::one(if wide_asset {
+                        usd()
+                    } else {
+                        AssetId::parse("EUR").unwrap()
+                    })),
+                    counterparties: Some(NonEmptySet::one(if wide_party {
+                        his
+                    } else {
+                        elsewhere
+                    })),
+                    parent: None,
+                    expires: None,
+                },
+            )
+            .unwrap()
+            .value;
+        let hold = fx.ctx(alice);
+        fx.ledger
+            .reserve(&hold, acct, usd(), Minor::new(500))
+            .unwrap();
+        let ctx = Ctx {
+            op: hold.op,
+            ..fx.ctx(bob)
+        };
+        let c = fx
+            .ledger
+            .capture(&ctx, his, Minor::new(500))
+            .map(|a| a.value);
+        assert_eq!(fx.ledger.state().used(&window(narrow)), Minor::ZERO);
+        if accepted {
+            assert!(c.is_ok());
+            assert_eq!(fx.ledger.balance_view(&his, &usd()).unwrap().available, 500);
+            assert_eq!(fx.ledger.state().used(&window(wide)), Minor::new(500));
+            let record = fx.ledger.state().transitions(&hold.op).last().unwrap();
+            assert_eq!(record.authorities[0].grant, Some(wide));
+        } else {
+            assert_eq!(c, Err(Refusal::BoundExceeded));
+            assert_eq!(fx.ledger.balance_view(&his, &usd()).unwrap().total, 0);
+            assert_eq!(fx.ledger.balance_view(&acct, &usd()).unwrap().reserved, 500);
+            assert_eq!(fx.ledger.state().used(&window(wide)), Minor::ZERO);
+            assert!(fx.ledger.state().transitions(&hold.op).is_empty());
+        }
+    }
+}
