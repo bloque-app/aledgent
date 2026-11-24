@@ -8,6 +8,23 @@ SPDX-License-Identifier: CC-BY-4.0
 Releases are cut by release-please from the conventional-commit titles of the pull requests merged
 into `main` (`release-please-config.json`). Each entry below is written by its release pull request.
 
+## [0.7.0](https://github.com/bloque-app/aledgent/compare/v0.6.2...v0.7.0) (2026-11-24)
+
+
+### ⚠ BREAKING CHANGES
+
+* **ledger-core:** hold every grant to its own bounds on capture, release and submission (GHSA-567p-jcxq-g5jh, GHSA-54xc-2932-xwvv) ([#163](https://github.com/bloque-app/aledgent/issues/163))
+
+### Features
+
+* **core:** rules version 3, so the bounded transitions take effect (GHSA-567p-jcxq-g5jh, GHSA-54xc-2932-xwvv) ([#165](https://github.com/bloque-app/aledgent/issues/165)) ([f1cf984](https://github.com/bloque-app/aledgent/commit/f1cf984de77cec010d1d365058edc15659a9dfa2))
+* promote develop to main (rules version 3: grants held to their bounds, GHSA-567p-jcxq-g5jh, GHSA-54xc-2932-xwvv) ([e1d3f7c](https://github.com/bloque-app/aledgent/commit/e1d3f7cf639da525fb8266f5131700bcf2c6e87b))
+
+
+### Bug Fixes
+
+* **ledger-core:** hold every grant to its own bounds on capture, release and submission (GHSA-567p-jcxq-g5jh, GHSA-54xc-2932-xwvv) ([#163](https://github.com/bloque-app/aledgent/issues/163)) ([36eceb0](https://github.com/bloque-app/aledgent/commit/36eceb06f5f69c0202c41170f3fe5a8d92211dea))
+
 ## [0.6.2](https://github.com/bloque-app/aledgent/compare/v0.6.1...v0.6.2) (2026-11-24)
 
 
