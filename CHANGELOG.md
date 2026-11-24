@@ -8,6 +8,15 @@ SPDX-License-Identifier: CC-BY-4.0
 Releases are cut by release-please from the conventional-commit titles of the pull requests merged
 into `main` (`release-please-config.json`). Each entry below is written by its release pull request.
 
+## [0.6.2](https://github.com/bloque-app/aledgent/compare/v0.6.1...v0.6.2) (2026-11-24)
+
+
+### Bug Fixes
+
+* **contracts:** accept credit only from listed peers, within the holding (GHSA-q55h-xgp2-jjxm) ([#160](https://github.com/bloque-app/aledgent/issues/160)) ([7397316](https://github.com/bloque-app/aledgent/commit/73973169cc8be5a1e89744efd29083739756220f))
+* **ingress:** one client key executes once, even when a principal's tie can't be read or lands mid-request (GHSA-7x9q-3f69-ppwx) ([#161](https://github.com/bloque-app/aledgent/issues/161)) ([42df3e7](https://github.com/bloque-app/aledgent/commit/42df3e7a1694d81965daff072ead44792832cf0b))
+* promote develop to main for 0.6.2 (ingress client-key fix GHSA-7x9q; settlement contract peer allow-list GHSA-q55h) ([cf12b70](https://github.com/bloque-app/aledgent/commit/cf12b709ec3248ad5e4c1a929d1a9b4256616171))
+
 ## [0.6.1](https://github.com/bloque-app/aledgent/compare/v0.6.0...v0.6.1) (2026-11-23)
 
 
