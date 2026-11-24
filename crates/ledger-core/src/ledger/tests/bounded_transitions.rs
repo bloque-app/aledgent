@@ -20,14 +20,27 @@ fn delegate(
     per_window: Option<u64>,
 ) -> (Caller, GrantId) {
     let mallory = fx.person();
+    let grant = grant_to(fx, alice, acct, &mallory, ops, per_operation, per_window);
+    (mallory, grant)
+}
+
+/// A grant over `acct` from its owner `alice` to `to`, for `ops`, with the bounds given.
+fn grant_to(
+    fx: &mut Fx,
+    alice: Caller,
+    acct: AccountId,
+    to: &Caller,
+    ops: &[OperationKind],
+    per_operation: Option<u64>,
+    per_window: Option<u64>,
+) -> GrantId {
     let ctx = fx.ctx(alice);
-    let grant = fx
-        .ledger
+    fx.ledger
         .grant_authority(
             &ctx,
             GrantRequest {
                 kind: GrantKind::Delegated,
-                principal: mallory.principal,
+                principal: to.principal,
                 subject: Subject::Account(acct),
                 ops: NonEmptySet::new(ops.iter().copied().collect()).unwrap(),
                 per_operation: per_operation.map(nz),
@@ -42,8 +55,7 @@ fn delegate(
             },
         )
         .unwrap()
-        .value;
-    (mallory, grant)
+        .value
 }
 
 fn window(grant: GrantId) -> WindowKey {
@@ -239,4 +251,143 @@ fn req_ag_2_a_bounded_delegate_cannot_release_the_owners_larger_reservation() {
         fx.ledger.balance_view(&acct, &usd()).unwrap().reserved,
         10_000
     );
+}
+
+/// A delegate's narrower grant does not shadow the one that covers what it moves. It holds G1
+/// (reserve, capture and release, 1 000 per operation) and G2 (capture only, 10 per operation),
+/// and reserves 500 under G1. The capture is accepted at both rules versions: before
+/// [`BOUNDED_TRANSITIONS`] under G2, the narrowest, with no amount checked, as that code decided
+/// it; from it under G1, the first candidate whose bounds admit the 500.
+#[test]
+fn req_ag_2_a_narrower_grant_does_not_shadow_the_one_that_covers_the_capture() {
+    for (rules, decides) in [(BOUNDED_TRANSITIONS, 0), (BOUNDED_TRANSITIONS - 1, 1)] {
+        let mut fx = Fx::new();
+        fx.ledger.set_generation(rules, false);
+        let (alice, acct) = funded(&mut fx, 1_000);
+        let ops = [
+            OperationKind::Reserve,
+            OperationKind::Capture,
+            OperationKind::Release,
+        ];
+        let (bob, g1) = delegate(&mut fx, alice, acct, &ops, Some(1_000), None);
+        let g2 = grant_to(
+            &mut fx,
+            alice,
+            acct,
+            &bob,
+            &[OperationKind::Capture],
+            Some(10),
+            None,
+        );
+        let his = fx.account(&bob, Custody::Owned);
+        let own = fx.ctx(bob);
+        fx.ledger
+            .reserve(&own, acct, usd(), Minor::new(500))
+            .unwrap();
+        let ctx = Ctx {
+            op: own.op,
+            ..fx.ctx(bob)
+        };
+        fx.ledger.capture(&ctx, his, Minor::new(500)).unwrap();
+        assert_eq!(fx.ledger.balance_view(&his, &usd()).unwrap().available, 500);
+        let record = fx.ledger.state().transitions(&own.op).last().unwrap();
+        assert_eq!(record.authorities[0].grant, Some([g1, g2][decides]));
+    }
+}
+
+/// A release returns the value to its payer and is neither checked against nor charged to a
+/// window: a delegate that did not open the reservation releases 100 within its per-operation
+/// bound although its window is 50, and the window stays untouched.
+#[test]
+fn req_ag_2_a_release_charges_no_window() {
+    let mut fx = Fx::new();
+    fx.ledger.set_generation(BOUNDED_TRANSITIONS, false);
+    let (alice, acct) = funded(&mut fx, 1_000);
+    let (mallory, grant) = delegate(
+        &mut fx,
+        alice,
+        acct,
+        &[OperationKind::Release],
+        Some(1_000),
+        Some(50),
+    );
+    let hold = fx.ctx(alice);
+    fx.ledger
+        .reserve(&hold, acct, usd(), Minor::new(100))
+        .unwrap();
+    let ctx = Ctx {
+        op: hold.op,
+        ..fx.ctx(mallory)
+    };
+    fx.ledger.release(&ctx).unwrap();
+    assert_eq!(fx.ledger.state().used(&window(grant)), Minor::ZERO);
+    let view = fx.ledger.balance_view(&acct, &usd()).unwrap();
+    assert_eq!((view.available, view.reserved), (1_000, 0));
+}
+
+/// The operator's `resume` is exempt from the value bounds (`REQ-OP-5`, `REQ-RC-1`, `REQ-AT-3`):
+/// it releases with no amount, as before, under an operator grant whose `Release` bound is 1 per
+/// operation, a hold of 10 000. It is an audited operator command that carries a justification,
+/// and a release returns the value to its payer. This test pins the exemption: bounding it is a
+/// decision, not a refactor.
+#[test]
+fn req_rc_1_resume_releases_a_larger_hold_than_the_operators_release_bound() {
+    let mut fx = Fx::new();
+    fx.ledger.set_generation(BOUNDED_TRANSITIONS, false);
+    let alice = fx.person();
+    let acct = fx.account(&alice, Custody::Delegated);
+    let issuer = fx.issuer();
+    let ctx = fx.ctx(issuer);
+    fx.ledger
+        .issue(&ctx, usd(), acct, Minor::new(10_000))
+        .unwrap();
+    let hold = fx.ctx(alice);
+    fx.ledger
+        .reserve(&hold, acct, usd(), Minor::new(10_000))
+        .unwrap();
+    let ops = super::operator::staff(&mut fx, &[crate::operator::OperatorOpKind::Resume]);
+    let ctx = fx.ctx(fx.operator());
+    let grant = fx
+        .ledger
+        .grant_authority(
+            &ctx,
+            GrantRequest {
+                kind: GrantKind::Operator,
+                principal: ops.principal,
+                subject: Subject::DelegatedAccounts,
+                ops: NonEmptySet::one(OperationKind::Release),
+                per_operation: Some(nz(1)),
+                per_window: Some(Window {
+                    length: NonZeroU64::new(1_000).unwrap(),
+                    limit: nz(1),
+                }),
+                assets: None,
+                counterparties: None,
+                parent: None,
+                expires: None,
+            },
+        )
+        .unwrap()
+        .value;
+    // A release under the grant is held to its bound.
+    let release = Ctx {
+        op: hold.op,
+        ..fx.ctx(ops)
+    };
+    assert_eq!(
+        fx.ledger.release(&release).map(|a| a.value),
+        Err(Refusal::BoundExceeded)
+    );
+    // The operator's resume is not.
+    let ctx = fx.ctx(ops);
+    assert_eq!(
+        fx.ledger
+            .resume(&ctx, hold.op, b"ticket 7: release the hold"),
+        Ok(crate::ledger::lifecycle::Resumed::Moved(
+            crate::lifecycle::State::Released
+        ))
+    );
+    let view = fx.ledger.balance_view(&acct, &usd()).unwrap();
+    assert_eq!((view.available, view.reserved), (10_000, 0));
+    assert_eq!(fx.ledger.state().used(&window(grant)), Minor::ZERO);
 }

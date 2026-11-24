@@ -1929,6 +1929,25 @@ fn req_ag_2_the_initiator_and_the_owner_name_the_destination_as_before() {
     assert_eq!(again, i);
 }
 
+/// `REQ-AG-2`: the initiator's submission decides as before even under another grant than the
+/// one it reserved under. Bob withdraws 5 000 under a grant of 10 000 per operation, which the owner
+/// then revokes and replaces with one of 10 per operation: he still names the destination, and
+/// nothing is charged to the new grant's window.
+#[test]
+fn req_ag_2_the_initiator_submits_under_another_grant_than_the_one_it_reserved_under() {
+    let (mut lx, alice, a, bob) = bounded_book();
+    let g1 = redeem_grant(&mut lx.fx, alice, &bob, a, Some(10_000), None, None);
+    let w = lx.withdraw(bob, a, 5_000, 500);
+    let ctx = lx.fx.ctx(alice);
+    lx.fx.ledger.revoke_authority(&ctx, g1).unwrap();
+    let g2 = redeem_grant(&mut lx.fx, alice, &bob, a, Some(10), Some(10), None);
+    let i = lx.fx.ledger.submit_outbound(&w, BOBS).unwrap().value;
+    assert_eq!(i.amount().get().get(), 5_000);
+    let record = lx.fx.ledger.state().transitions(&w.op).last().unwrap();
+    assert_eq!(record.authorities[0].grant, Some(g2));
+    assert_eq!(lx.fx.ledger.state().used(&redeem_window(g2)), Minor::ZERO);
+}
+
 /// The rules-version rule (amendment 0033): an input of a rules version before
 /// [`crate::eval::BOUNDED_TRANSITIONS`] is decided as that code decided it, with no amount and no
 /// counterparty, so a recorded book replays to the same state.

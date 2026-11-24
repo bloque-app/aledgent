@@ -1455,6 +1455,12 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
     /// release does; there is none over an account in owned custody (`REQ-AU-6`). Its audit
     /// record carries the justification; a refusal is recorded too.
     ///
+    /// That release is authorised with no amount at every rules version: the value bounds a
+    /// later transition is held to from [`eval::BOUNDED_TRANSITIONS`] on do not apply to it. It is
+    /// the operator's audited path, under a justification, and a release returns the value to its
+    /// payer; bounding it would leave a hold larger than every operator grant with no way out
+    /// before its deadline but its holder.
+    ///
     /// Since amendment 0006 item 5 every non-terminal state has a deadline row to `Needs-Review`,
     /// which `tick` fires; `resume` stays the operator's way to apply a forward row before then
     /// (`REQ-OP-5`, `REQ-RC-1`).
@@ -1543,6 +1549,9 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
                             .reservations()
                             .open(&op)
                             .ok_or(Refusal::UnknownOperation)?;
+                        // No amount, at every rules version: the operator's audited resume is
+                        // exempt from the value bounds of `eval::BOUNDED_TRANSITIONS` (method
+                        // documentation).
                         let decision = match eval::authorise_principal(
                             &self.state,
                             &p,

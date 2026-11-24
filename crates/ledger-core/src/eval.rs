@@ -84,6 +84,11 @@ pub const ASSET_CANDIDATES: u64 = crate::settlement::CHAINED_SETTLEMENT;
 ///   original instruction. The initiator's submission is decided as before: `withdraw` checked
 ///   and charged its bounds for exactly this.
 ///
+/// Of the caller's candidate grants, the one chosen as before is tried first, then the others in
+/// the same order; the first whose bounds admit what the transition moves decides, so a narrower
+/// grant does not shadow one that covers it. The operator's `resume` releases with no amount at
+/// every rules version: an audited, justified operator command, exempt from these bounds.
+///
 /// Owner authority has no bounds and is unchanged. Before it, such a transition was authorised
 /// with no amount and no counterparty of its own, so only the asset bound and a capture's
 /// counterparty bound were looked at: a grant could capture, release or name the destination of a
@@ -334,32 +339,55 @@ fn authorise_as(
             .unwrap_or(0),
         _ => 0,
     };
-    let Some(eff) = ordered.into_iter().nth(at) else {
+    if at >= ordered.len() {
         return Err(if revoked {
             Refusal::AuthorityRevoked
         } else {
             Refusal::NotAuthorised
         });
-    };
+    }
     // 6. Bounds.
     let reach = Reach {
         asset: request.asset,
         amount: request.amount,
         counterparty: request.counterparty,
     };
-    let mut charges = eff.check(&reach, now, |k| state.used(k))?;
+    let decided = |eff: &Effective, charges: Vec<Charge>| Decision {
+        used: used(p, eff.kind.into(), Some(eff.grant)),
+        charges,
+    };
+    // From `BOUNDED_TRANSITIONS` on, a later transition is also held to the value bounds for what
+    // it moves. The candidate chosen above is tried first, then the others in the same order, and
+    // the first whose bounds admit it decides: a narrower grant that cannot cover the amount does
+    // not shadow one that can. With none, the chosen candidate's refusal stands.
     if let (Some(m), Some(asset)) = (moved, request.asset) {
         if generation >= BOUNDED_TRANSITIONS {
             let charged = charged_links(state, &m.op);
-            charges.extend(
-                eff.check_moved(asset, m.amount, m.spends, &charged, now, |k| state.used(k))?,
-            );
+            let bounds = |eff: &Effective| -> Result<Vec<Charge>, Refusal> {
+                let mut charges = eff.check(&reach, now, |k| state.used(k))?;
+                charges.extend(
+                    eff.check_moved(asset, m.amount, m.spends, &charged, now, |k| state.used(k))?,
+                );
+                Ok(charges)
+            };
+            let refusal = match bounds(&ordered[at]) {
+                Ok(charges) => return Ok(decided(&ordered[at], charges)),
+                Err(e) => e,
+            };
+            for (i, eff) in ordered.iter().enumerate() {
+                if i == at {
+                    continue;
+                }
+                if let Ok(charges) = bounds(eff) {
+                    return Ok(decided(eff, charges));
+                }
+            }
+            return Err(refusal);
         }
     }
-    Ok(Decision {
-        used: used(p, eff.kind.into(), Some(eff.grant)),
-        charges,
-    })
+    let eff = &ordered[at];
+    let charges = eff.check(&reach, now, |k| state.used(k))?;
+    Ok(decided(eff, charges))
 }
 
 /// Authorise an issuance operation (`Issue` or `Redeem`) over `asset` (`REQ-AS-6`, `REQ-AU-10`).
