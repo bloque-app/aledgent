@@ -667,6 +667,87 @@ async fn req_op_10_a_command_row_is_found_by_its_client_key() {
     }
 }
 
+/// Finding `ingress-1` (`REQ-OP-10`, migration `0010`): on PostgreSQL a principal holds one command
+/// row per surface and client key whatever its domain, and an append that conflicts on either index
+/// takes the row already logged, the principal's own first; a retried append whose first try
+/// committed takes its own row. Version 10 refuses a log that already holds two such rows, naming
+/// the problem and changing nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn req_op_10_one_command_row_per_principal_and_key_on_postgres() {
+    use ingress::store::migrate::{self, MIGRATIONS};
+    let Some((_pg, url)) = server().await else {
+        return;
+    };
+    let s = store(&url).await;
+    let in_party = |n: u8, principal: &str| {
+        let mut r = command(n, principal, "k1", false);
+        r.key_domain = Some("party:x".into());
+        r
+    };
+    let existing = |a: Appended| match a {
+        Appended::Existing(r) => r.new.op_ref,
+        Appended::New(r) => panic!("a second row: {:?}", r.new.op_ref),
+    };
+    assert!(matches!(
+        s.append(command(1, "alice", "k1", false)).await.unwrap(),
+        Appended::New(_)
+    ));
+    // Alice's key again, in her party's domain: her own row.
+    assert_eq!(
+        existing(s.append(in_party(2, "alice")).await.unwrap()),
+        InputKey([1; 16])
+    );
+    // Bob's, in the party's domain: a row of its own; carol's then takes bob's.
+    assert!(matches!(
+        s.append(in_party(3, "bob")).await.unwrap(),
+        Appended::New(_)
+    ));
+    assert_eq!(
+        existing(s.append(in_party(4, "carol")).await.unwrap()),
+        InputKey([3; 16])
+    );
+    // A retry of an append that committed: its own row, not an error to retry for ever.
+    assert_eq!(
+        existing(s.append(command(1, "alice", "k1", false)).await.unwrap()),
+        InputKey([1; 16])
+    );
+
+    let (_, mut c) = database(&url, "ingress_0010_duplicates").await;
+    migrate::apply(&mut c, &MIGRATIONS[..9], Duration::from_secs(5))
+        .await
+        .unwrap();
+    for (n, domain) in [(1u8, "alice"), (2, "party:x")] {
+        c.execute(
+            "INSERT INTO received_log (op_ref, input_kind, principal, credential, surface, \
+             client_key, key_derived, body_digest, body, reserves, synchronous, received_at, \
+             status, client_key_domain) VALUES ($1, 'command', 'alice', 'c', 1, 'k1', false, \
+             $2, '\\x7b7d', false, false, 1000, 'Received', $3)",
+            &[&vec![n; 16], &vec![n; 32], &domain],
+        )
+        .await
+        .unwrap();
+    }
+    let e = migrate::apply(&mut c, MIGRATIONS, Duration::from_secs(5))
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("migration 0010"), "{e}");
+    let index: i64 = c
+        .query_one(
+            "SELECT count(*) FROM pg_indexes WHERE indexname = 'received_log_principal_client_key'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(index, 0, "nothing changed");
+    let at: i32 = c
+        .query_one("SELECT max(version) FROM ingress_schema", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(at, 9);
+}
+
 /// `F-028`: on PostgreSQL, a passkey's sign count only rises, and a challenge is used once, for
 /// every replica sharing the store.
 #[tokio::test(flavor = "multi_thread")]

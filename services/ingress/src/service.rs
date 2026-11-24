@@ -548,9 +548,9 @@ fn ties_of(input: &CoreInput) -> Vec<(String, String)> {
 /// tie the store keeps: so a store that answers "no tie" proves no key of the principal was logged
 /// in a party's domain, and while the core does not answer, a principal with no kept tie is its
 /// own domain (`NOTES.md`, T-009-16). An `Err` when the store does not answer, or does not keep
-/// the core's answer: the caller refuses rather than guess (finding `ingress-1`), since a tied
-/// principal's key logged in its own domain is a second request under one key. [`Untied`] is read
-/// only after the store has answered.
+/// the core's answer: the caller waits or stops rather than guess (finding `ingress-1`), since a
+/// tied principal's key logged in its own domain is a second request under one key. [`Untied`] is
+/// read only after the store has answered.
 pub async fn party_of<S: Store, C: Core>(
     shared: &Shared<S, C>,
     principal: &str,

@@ -23,6 +23,9 @@ struct Inner {
     rows: BTreeMap<u64, Row>,
     by_ref: HashMap<InputKey, u64>,
     by_key: HashMap<(String, Surface, String), u64>,
+    /// Command rows by (principal, surface, client key): one per principal and key, whatever
+    /// the domain (`REQ-OP-10`, finding `ingress-1`).
+    by_principal_key: HashMap<(String, Surface, String), u64>,
     attempts: HashMap<String, Vec<Attempt>>,
     recipients: HashMap<String, Recipient>,
     answering: HashMap<String, Answering>,
@@ -39,6 +42,8 @@ struct Inner {
     tie_reads_fail: bool,
     /// Whether every write of a tie fails ([`MemStore::fail_tie_writes`]).
     tie_writes_fail: bool,
+    /// The next append in this key domain waits for the gate ([`MemStore::stall_appends_in`]).
+    stall_domain: Option<(String, Arc<tokio::sync::Notify>)>,
 }
 
 /// A partition's feed lease (`F-038`).
@@ -78,6 +83,14 @@ impl MemStore {
     /// (`REQ-OP-10`).
     pub fn fail_tie_writes(&self, fail: bool) {
         self.lock().tie_writes_fail = fail;
+    }
+
+    /// Hold the next command append in key domain `domain` until the returned gate is notified:
+    /// for tests of a request in flight between its domain and its append (`REQ-OP-10`).
+    pub fn stall_appends_in(&self, domain: &str) -> Arc<tokio::sync::Notify> {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        self.lock().stall_domain = Some((domain.to_owned(), Arc::clone(&gate)));
+        gate
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -232,11 +245,24 @@ impl Store for MemStore {
     }
 
     async fn append(&self, row: NewRow) -> Result<Appended, StoreError> {
-        let mut inner = self.lock();
-        let key = match (&row.kind, &row.caller, &row.client_key, &row.key_domain) {
-            (InputKind::Command, Some(_), Some(k), Some(d)) => {
-                Some((d.clone(), row.surface, k.clone()))
+        let gate = {
+            let mut inner = self.lock();
+            match &inner.stall_domain {
+                Some((d, _)) if row.key_domain.as_deref() == Some(d.as_str()) => {
+                    inner.stall_domain.take().map(|(_, g)| g)
+                }
+                _ => None,
             }
+        };
+        if let Some(g) = gate {
+            g.notified().await;
+        }
+        let mut inner = self.lock();
+        let keys = match (&row.kind, &row.caller, &row.client_key, &row.key_domain) {
+            (InputKind::Command, Some(c), Some(k), Some(d)) => Some((
+                (d.clone(), row.surface, k.clone()),
+                (c.principal.clone(), row.surface, k.clone()),
+            )),
             (InputKind::Command, _, _, _) => {
                 return Err(StoreError(
                     "a command needs a principal, a client key and its domain".into(),
@@ -244,8 +270,12 @@ impl Store for MemStore {
             }
             _ => None,
         };
-        if let Some(k) = &key
-            && let Some(seq) = inner.by_key.get(k)
+        // The principal's own row first: a repeat of its own request is answered from it.
+        if let Some((domain, principal)) = &keys
+            && let Some(seq) = inner
+                .by_principal_key
+                .get(principal)
+                .or_else(|| inner.by_key.get(domain))
         {
             let existing = inner.rows[seq].clone();
             return Ok(Appended::Existing(existing));
@@ -269,8 +299,9 @@ impl Store for MemStore {
             feed_seq: None,
         };
         inner.by_ref.insert(stored.new.op_ref, seq);
-        if let Some(k) = key {
-            inner.by_key.insert(k, seq);
+        if let Some((domain, principal)) = keys {
+            inner.by_key.insert(domain, seq);
+            inner.by_principal_key.insert(principal, seq);
         }
         inner.rows.insert(seq, stored.clone());
         Ok(Appended::New(stored))
