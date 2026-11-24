@@ -434,8 +434,7 @@ impl Store for PgStore {
              received_at, status, client_key_domain, pass_through, arrived_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'Received', $15, \
              $16, $17) \
-             ON CONFLICT (client_key_domain, surface, client_key) WHERE input_kind = 'command' \
-             DO NOTHING RETURNING {COLUMNS}"
+             ON CONFLICT DO NOTHING RETURNING {COLUMNS}"
         );
         // Prepared once per connection (`T-032-13`): one round trip on the acknowledgement's
         // path instead of two.
@@ -468,17 +467,35 @@ impl Store for PgStore {
         if let Some(r) = inserted {
             return Ok(Appended::New(row_of(&r)?));
         }
+        // A conflict on either command index (`0003`, `0010`): the row that holds the key, the
+        // principal's own first, so a repeat of its own request is answered from it. A row under
+        // this append's reference is its own, committed by an earlier try whose reply was lost:
+        // still the new row it made (an API key is shown on that reply, `F-028`).
         let existing = c
-            .query_one(
+            .query_opt(
                 &format!(
-                    "SELECT {COLUMNS} FROM received_log WHERE input_kind = 'command' \
-                     AND client_key_domain = $1 AND surface = $2 AND client_key = $3"
+                    "SELECT {COLUMNS} FROM received_log WHERE op_ref = $5 \
+                     OR (input_kind = 'command' AND surface = $2 AND client_key = $3 \
+                         AND (principal = $4 OR client_key_domain = $1)) \
+                     ORDER BY op_ref = $5 DESC, (principal IS NOT DISTINCT FROM $4) DESC, seq \
+                     LIMIT 1"
                 ),
-                &[&row.key_domain, &surface, &row.client_key],
+                &[
+                    &row.key_domain,
+                    &surface,
+                    &row.client_key,
+                    &principal,
+                    &row.op_ref.0.as_slice(),
+                ],
             )
             .await
-            .map_err(err)?;
-        Ok(Appended::Existing(row_of(&existing)?))
+            .map_err(err)?
+            .ok_or_else(|| StoreError("the append conflicted with no row".into()))?;
+        let existing = row_of(&existing)?;
+        if existing.new.op_ref == row.op_ref {
+            return Ok(Appended::New(existing));
+        }
+        Ok(Appended::Existing(existing))
     }
 
     async fn sign_count(&self, credential: &str) -> Result<Option<u32>, StoreError> {

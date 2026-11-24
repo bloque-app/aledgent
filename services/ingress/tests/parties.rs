@@ -7,8 +7,9 @@
 use std::time::Duration;
 
 use axum::http::StatusCode;
+use ingress::store::mem::MemStore;
 use ingress::store::{InputKind, Store, party_domain, principal_domain};
-use ingress::testkit::{Deployment, Party, USD};
+use ingress::testkit::{Deployment, Party, USD, call, fast_config};
 use ledger_core::Refusal;
 use serde_json::{Value, json};
 
@@ -270,6 +271,7 @@ async fn req_op_10_an_untied_principal_asks_the_core_once_and_a_later_tie_still_
     assert!(
         ingress::service::party_of(&d.replica.shared, &dave.identity)
             .await
+            .unwrap()
             .is_none()
     );
     assert!(d.quiesce(Duration::from_secs(10)).await);
@@ -278,11 +280,164 @@ async fn req_op_10_an_untied_principal_asks_the_core_once_and_a_later_tie_still_
     assert_eq!(tie(&d, &op, &x, &dave, "joins x").await.0, StatusCode::OK);
     assert_eq!(
         ingress::service::party_of(&d.replica.shared, &dave.identity).await,
-        Some(x.clone())
+        Ok(Some(x.clone()))
     );
     let (s, v) = reserve(&d, &dave, "three", "10").await;
     assert_eq!(s, StatusCode::ACCEPTED, "{v}");
     let (s, v) = reserve(&d, &alice, "three", "10").await;
     assert_eq!(s, StatusCode::CONFLICT, "{v}");
     assert!(is_refusal(&v, Refusal::ClientKeyReused), "{v}");
+}
+
+/// A reservation of `who` under `key` through `router`, on a task of its own.
+fn reserve_on(
+    router: &axum::Router,
+    who: &Party,
+    key: &'static str,
+) -> tokio::task::JoinHandle<(StatusCode, Value)> {
+    let (router, token, account) = (router.clone(), who.token.clone(), who.account.clone());
+    tokio::spawn(async move {
+        call(
+            &router,
+            "POST",
+            "/v1/reservations",
+            Some(&token),
+            &[("client-key", key)],
+            Some(json!({ "payer": account, "asset": USD, "amount": "10" })),
+        )
+        .await
+    })
+}
+
+/// The domains of the command rows logged under `key`, in `store`.
+async fn domains_under(store: &MemStore, key: &str) -> Vec<Option<String>> {
+    store
+        .rows()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.new.kind == InputKind::Command)
+        .filter(|r| r.new.client_key.as_deref() == Some(key))
+        .map(|r| r.new.key_domain)
+        .collect()
+}
+
+/// Finding `ingress-1` (`REQ-OP-10`, `REQ-ID-7`, `REQ-AR-7`): a tied principal's repeat while the
+/// store cannot read its tie is held open, nothing logged, never logged in the principal's own
+/// domain as a second request. The principal was opened through this replica, so it is among the
+/// replica's [`Untied`](ingress::service::Untied) ones: a store that does not answer must not let
+/// that stale "none" decide its domain. Once the store answers, the repeat is answered from the
+/// first row.
+#[tokio::test(flavor = "multi_thread")]
+async fn req_op_10_a_tied_principals_repeat_waits_while_its_tie_cannot_be_read() {
+    let d = Deployment::start().await;
+    let alice = d.party("alice", 1_000).await;
+    let x = organisation(&d, "x").await;
+    let op = d.operator.token.clone();
+    assert_eq!(register(&d, &op, &x, &[&alice]).await.0, StatusCode::OK);
+
+    let (s, first) = reserve(&d, &alice, "order-1", "10").await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{first}");
+    assert!(d.quiesce(Duration::from_secs(10)).await);
+
+    d.store.fail_tie_reads(true);
+    assert!(
+        ingress::service::party_of(&d.replica.shared, &alice.identity)
+            .await
+            .is_err(),
+        "a tie the store cannot read is not taken for none"
+    );
+    let held = reserve_on(&d.router, &alice, "order-1");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !held.is_finished(),
+        "held open while the tie cannot be read"
+    );
+    assert_eq!(domains_under(&d.store, "order-1").await.len(), 1);
+    d.store.fail_tie_reads(false);
+
+    let (s, again) = held.await.unwrap();
+    assert_eq!(s, StatusCode::OK, "{again}");
+    assert_eq!(again["operation_reference"], first["operation_reference"]);
+    assert_eq!(
+        domains_under(&d.store, "order-1").await,
+        vec![Some(party_domain(&x))],
+        "one row, the party's"
+    );
+}
+
+/// Finding `ingress-1` (`REQ-OP-10`, `REQ-ID-7`, `REQ-AR-7`): a tie ingress learns from the core is
+/// kept before a key is logged in the party's domain; while the store does not take it, the
+/// command is held open, nothing logged. A row in a party's domain whose tie the store does not
+/// keep would let the principal's repeat, once the core stops answering, be logged in its own
+/// domain as a second request. The replica here takes commands in over a store that keeps none of
+/// the book's ties (one restored apart from the book); another holds its lead, so nothing is
+/// forwarded from it.
+#[tokio::test(flavor = "multi_thread")]
+async fn req_op_10_a_tie_learned_from_the_core_is_kept_before_its_domain_is_used() {
+    let d = Deployment::start().await;
+    let alice = d.party("alice", 1_000).await;
+    let x = organisation(&d, "x").await;
+    let op = d.operator.token.clone();
+    assert_eq!(register(&d, &op, &x, &[&alice]).await.0, StatusCode::OK);
+    assert!(d.quiesce(Duration::from_secs(10)).await);
+
+    let other = MemStore::new(Duration::from_secs(3_600));
+    assert!(other.try_lead("elsewhere").await.unwrap());
+    let (_replica, router) = d.replica_on(other.clone(), fast_config("ingress-1"));
+
+    other.fail_tie_writes(true);
+    let held = reserve_on(&router, &alice, "order-1");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!held.is_finished(), "held open while the tie is not kept");
+    assert_eq!(
+        domains_under(&other, "order-1").await,
+        Vec::<Option<String>>::new()
+    );
+    other.fail_tie_writes(false);
+
+    let (s, v) = held.await.unwrap();
+    assert_eq!(s, StatusCode::ACCEPTED, "{v}");
+    assert_eq!(
+        other.tie_of(&alice.identity).await.unwrap(),
+        Some(x.clone())
+    );
+    assert_eq!(
+        domains_under(&other, "order-1").await,
+        vec![Some(party_domain(&x))]
+    );
+}
+
+/// Finding `ingress-1` (`REQ-OP-10`; the review of its first fix): a tie that lands while a
+/// principal's first attempt is in flight (its own domain chosen, not yet appended) does not let a
+/// retry under the same key be logged a second time, in the party's domain. A principal holds one
+/// row per surface and key whatever the domain (migration `0010`): the later append takes the
+/// row already logged, and both attempts are answered from it.
+#[tokio::test(flavor = "multi_thread")]
+async fn req_op_10_a_tie_that_lands_mid_request_does_not_log_its_key_twice() {
+    let d = Deployment::start().await;
+    let alice = d.party("alice", 1_000).await;
+    let x = organisation(&d, "x").await;
+    let op = d.operator.token.clone();
+    assert_eq!(register(&d, &op, &x, &[]).await.0, StatusCode::OK);
+    assert!(d.quiesce(Duration::from_secs(10)).await);
+
+    let gate = d.store.stall_appends_in(&principal_domain(&alice.identity));
+    let first = reserve_on(&d.router, &alice, "order-1");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The tie lands while the first attempt is held before its append.
+    assert_eq!(tie(&d, &op, &x, &alice, "joins x").await.0, StatusCode::OK);
+    // The client's retry: same key, same body.
+    let (s, retry) = reserve(&d, &alice, "order-1", "10").await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{retry}");
+    gate.notify_one();
+    let (s, v) = first.await.unwrap();
+    assert!(s.is_success(), "{s} {v}");
+    assert_eq!(v["operation_reference"], retry["operation_reference"]);
+    assert!(d.quiesce(Duration::from_secs(10)).await);
+    assert_eq!(
+        domains_under(&d.store, "order-1").await,
+        vec![Some(party_domain(&x))],
+        "one key, one row"
+    );
 }

@@ -487,7 +487,7 @@ async fn req_po_5_a_reference_is_shown_within_the_senders_party_only() {
     }
     d.store.put_tie("did:x:carol", "did:x:other").await.unwrap();
     let shown = |reader: &'static str, sender: &'static str| async move {
-        Echo::new(shared, reader).shown(sender).await
+        Echo::new(shared, reader).shown(sender).await.unwrap()
     };
     assert!(shown("did:x:alice", "did:x:alice").await);
     assert!(shown("did:x:bob", "did:x:alice").await, "of the same party");
@@ -498,4 +498,14 @@ async fn req_po_5_a_reference_is_shown_within_the_senders_party_only() {
     // An untied principal is its own party: only it sees its data.
     assert!(shown("did:aledgent:id:dave", "did:aledgent:id:dave").await);
     assert!(!shown("did:x:alice", "did:aledgent:id:dave").await);
+    // A store that cannot say a tie ends the read (finding `ingress-1`): neither shown nor hidden
+    // on a guess, so a notification waits for the store rather than leave its reference out.
+    d.store.fail_tie_reads(true);
+    assert!(
+        Echo::new(shared, "did:x:bob")
+            .shown("did:x:alice")
+            .await
+            .is_err()
+    );
+    d.store.fail_tie_reads(false);
 }
