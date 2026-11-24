@@ -543,29 +543,35 @@ fn ties_of(input: &CoreInput) -> Vec<(String, String)> {
 }
 
 /// The integrating party `principal` is tied to (`REQ-ID-7`), for its client key's domain
-/// (`REQ-OP-10`, T-009-16): the tie ingress kept, else the core's answer, kept if it names one. A
-/// tie is never undone, so a kept one is never stale. While the core does not answer, a principal
-/// with no kept tie is its own domain: its key is logged there and answered only to it, so no key
-/// is ever answered across domains (`NOTES.md`, T-009-16).
-pub async fn party_of<S: Store, C: Core>(shared: &Shared<S, C>, principal: &str) -> Option<String> {
-    if let Ok(Some(party)) = shared.store.tie_of(principal).await {
-        return Some(party);
+/// (`REQ-OP-10`, T-009-16): the tie ingress kept, else the core's answer, kept before it is used.
+/// A tie is never undone, so a kept one is never stale, and a party's domain is used only for a
+/// tie the store keeps: so a store that answers "no tie" proves no key of the principal was logged
+/// in a party's domain, and while the core does not answer, a principal with no kept tie is its
+/// own domain (`NOTES.md`, T-009-16). An `Err` when the store does not answer, or does not keep
+/// the core's answer: the caller waits or stops rather than guess (finding `ingress-1`), since a
+/// tied principal's key logged in its own domain is a second request under one key. [`Untied`] is
+/// read only after the store has answered.
+pub async fn party_of<S: Store, C: Core>(
+    shared: &Shared<S, C>,
+    principal: &str,
+) -> Result<Option<String>, StoreError> {
+    if let Some(party) = shared.store.tie_of(principal).await? {
+        return Ok(Some(party));
     }
     // The core said "none" before, and no tie has reached the store since ([`Untied`]).
     if shared.untied.contains(principal) {
-        return None;
+        return Ok(None);
     }
     match shared.core.party_of(principal).await {
         Ok(Some(party)) => {
-            // Best effort: the next command asks the core again if this does not stick.
-            let _ = shared.store.put_tie(principal, &party).await;
-            Some(party)
+            shared.store.put_tie(principal, &party).await?;
+            Ok(Some(party))
         }
         Ok(None) => {
             shared.untied.insert(principal);
-            None
+            Ok(None)
         }
-        Err(_) => None,
+        Err(_) => Ok(None),
     }
 }
 

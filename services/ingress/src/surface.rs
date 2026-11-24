@@ -1601,9 +1601,21 @@ async fn command_reply<S: Store, C: Core>(
     // only it can reach that row: a repeat is answered from it, a changed request refused.
     let own = principal_domain(&who.principal);
     let party_started = Instant::now();
-    let domain = match crate::service::party_of(shared, &who.principal).await {
-        Some(party) => party_domain(&party),
-        None => own.clone(),
+    // A store that cannot say the principal's tie holds the request open, as an append does:
+    // taking it for "no tie" would put a tied principal's repeat in its own domain (finding
+    // `ingress-1`), and nothing is taken in yet that a refusal could name.
+    // Each try may ask the core again, so the pause doubles, up to `TIE_RETRY_CAP`.
+    let mut pause = shared.config.poll;
+    let domain = loop {
+        match crate::service::party_of(shared, &who.principal).await {
+            Ok(Some(party)) => break party_domain(&party),
+            Ok(None) => break own.clone(),
+            Err(e) => {
+                tracing::warn!(error = %e, "the store did not answer for a tie; retrying");
+                tokio::time::sleep(pause).await;
+                pause = (pause * 2).min(TIE_RETRY_CAP.max(shared.config.poll));
+            }
+        }
     };
     let party_us = micros_since(party_started);
     if domain != own {
@@ -1900,6 +1912,11 @@ async fn approve<S: Store, C: Core>(
         }
     }
 }
+
+/// The longest pause between two tries of a held request's tie (finding `ingress-1`): a store
+/// that answers reads but does not take a tie the core names would otherwise have every held
+/// request ask the core again at each poll.
+const TIE_RETRY_CAP: Duration = Duration::from_secs(1);
 
 /// How long a request whose approval's number is already spent waits for the first attempt of the
 /// same request (same client key, same command) to be logged, before it is refused.

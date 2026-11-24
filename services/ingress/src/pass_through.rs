@@ -49,32 +49,38 @@ impl<'a, S: Store, C: Core> Echo<'a, S, C> {
         }
     }
 
-    async fn party(&mut self, principal: &str) -> Option<String> {
+    /// A store that cannot say the tie ends the read: a principal's tie is not guessed.
+    async fn party(&mut self, principal: &str) -> Result<Option<String>, StoreError> {
         if let Some(p) = self.parties.get(principal) {
-            return p.clone();
+            return Ok(p.clone());
         }
-        let p = party_of(self.shared, principal).await;
+        let p = party_of(self.shared, principal).await?;
         self.parties.insert(principal.to_owned(), p.clone());
-        p
+        Ok(p)
     }
 
     /// Whether the reader may see what `sender` sent: it is the sender, or both are tied to one
     /// integrating party (`REQ-PO-5`, `REQ-ID-7`).
-    pub async fn shown(&mut self, sender: &str) -> bool {
+    pub async fn shown(&mut self, sender: &str) -> Result<bool, StoreError> {
         if sender == self.reader {
-            return true;
+            return Ok(true);
         }
         let reader = self.reader.to_owned();
-        match self.party(&reader).await {
-            Some(party) => self.party(sender).await.as_deref() == Some(party.as_str()),
+        Ok(match self.party(&reader).await? {
+            Some(party) => self.party(sender).await?.as_deref() == Some(party.as_str()),
             None => false,
-        }
+        })
     }
 
     /// What `carried` holds, if the reader may see it.
-    pub async fn of_carried(&mut self, carried: Option<Carried>) -> Option<PassThrough> {
-        let c = carried?;
-        self.shown(&c.principal).await.then_some(c.pass_through)
+    pub async fn of_carried(
+        &mut self,
+        carried: Option<Carried>,
+    ) -> Result<Option<PassThrough>, StoreError> {
+        let Some(c) = carried else {
+            return Ok(None);
+        };
+        Ok(self.shown(&c.principal).await?.then_some(c.pass_through))
     }
 
     /// The data the operations named (`did:`-shaped references) were submitted with, by row, as
@@ -99,7 +105,7 @@ impl<'a, S: Store, C: Core> Echo<'a, S, C> {
         }
         for c in self.shared.store.pass_through_of(&keys).await? {
             let key = c.op_ref;
-            if let Some(p) = self.of_carried(Some(c)).await {
+            if let Some(p) = self.of_carried(Some(c)).await? {
                 out.insert(key, p);
             }
         }

@@ -83,6 +83,7 @@ pub const MIGRATIONS: &[Migration] = &[
     migration!(7, "0007_ingress_fleet.sql"),
     migration!(8, "0008_ingress_roster.sql"),
     migration!(9, "0009_overtakes.sql"),
+    migration!(10, "0010_principal_client_key.sql"),
 ];
 
 /// Where one version stands.

@@ -342,18 +342,45 @@ const isolatesCalls = (abi) => abi.messages.some((m) => m.method === 'apply');
 /// app), to receive withdrawals to a `Deployment`. Its admin and key are the suite's. The suite's own
 /// contract stays the one `drive.state` names.
 async function peerDeployment(ctx) {
-  if (report.deploy?.peer) return report.deploy.peer;
+  if (report.deploy?.peer) {
+    await allowAsPeer(ctx, report.deploy.peer, drive.state.contract);
+    return report.deploy.peer;
+  }
   const saved = { licenseId: drive.state.licenseId, contract: drive.state.contract };
   try {
     await drive.steps.license(ctx);
     await drive.steps.instantiate(ctx);
     report.deploy = { ...(report.deploy ?? {}), peer: drive.state.contract, peerLicenseId: drive.state.licenseId };
     saveReport();
-    return report.deploy.peer;
   } finally {
     Object.assign(drive.state, saved);
     drive.save();
   }
+  await allowAsPeer(ctx, report.deploy.peer, saved.contract);
+  return report.deploy.peer;
+}
+
+/// GHSA-q55h-xgp2-jjxm: a deployment accepts `credit` only from a peer its governance listed
+/// (`add_peer`). On this suite's chain the receiver's governance is the suite's admin, named by the
+/// admin while none is: a shortcut for a test network, never a deployment's setup (on Kreivo
+/// mainnet, governance is the licence-owning community's account, reached by a referendum). A no-op
+/// if `sender` is already listed, or if the receiver does not run the suite's bundle (read from its
+/// contract info): the suite's ABI says nothing of an older code's messages, and code without the
+/// allow-list accepts a deployment's `credit` without one.
+async function allowAsPeer(ctx, receiver, sender) {
+  const { api, accounts, abi, bundle } = ctx;
+  const info = (await api.query.contracts.contractInfoOf(receiver)).unwrap();
+  if (info.codeHash.toHex() !== bundle.source.hash) return;
+  if (!abi.messages.some((m) => m.method === 'addPeer')) fail('the suite\'s bundle has no add_peer');
+  const { ContractPromise } = await import('@polkadot/api-contract');
+  const c = new ContractPromise(api, abi, receiver);
+  const governance = (await drive.read(api, c, 'governance')).toJSON();
+  if (!governance) await drive.callContract(api, c, accounts.admin, 'setGovernance', [accounts.admin.address], 'set_governance (peer, the suite\'s admin)');
+  else if (pk(governance) !== pk(accounts.admin.address)) fail(`the peer's governance is ${governance}, not the suite's admin`);
+  const peers = ((await drive.read(api, c, 'peers')).toJSON() ?? []).map(pk);
+  if (peers.includes(pk(sender))) return;
+  await drive.callContract(api, c, accounts.admin, 'addPeer', [sender], 'add_peer (the sender, on the receiving deployment)');
+  if (!((await drive.read(api, c, 'peers')).toJSON() ?? []).map(pk).includes(pk(sender))) fail('add_peer did not list the sender');
 }
 const anchorCall = (operationRef, number, commitment) => ({ operationRef, call: { Anchor: { number, commitment } } });
 
@@ -1492,6 +1519,8 @@ phases.upgrade = async (ctx) => {
     //    another deployment that runs out in its own frame after the receiver recorded it.
     ok &= await runCase('scenarios', 'upgrade: entries after the upgrade fold to the head; nothing stored; v2 entries untouched', async () => {
       const c = drive.contractOf(api, ctx.abi);
+      // The peer accepts `credit` from the upgraded instance only once its governance lists it.
+      await allowAsPeer(ctx, peer, address);
       await drive.callContract(api, c, accounts.depositor, 'deposit', [ref(), ASSET, DEPOSIT.toString()], 'deposit (upgraded)');
       await foldNow('afterDeposit');
       const head = (await drive.read(api, c, 'head')).toJSON();

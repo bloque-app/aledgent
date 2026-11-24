@@ -187,12 +187,26 @@ may rule otherwise.
   `ERR-ClientKeyReused`), and no other principal can reach that row. Keys first used after the tie
   are the party's. So no key is ever answered across domains; the cost is that a principal's
   pre-tie key and another party principal's identical key are two requests.
-- **Known limit.** A principal whose tie ingress has not kept, asked about while the core does not
-  answer, is logged in its own domain. Only a tie that did not pass through this ingress's forwarder
-  can be in that state (one restored with the book by `F-014`), and only until the first command of
-  that principal while the core is up. The effect is the one above: its key is answered to it
-  alone, never across domains, and a colliding key from another principal of its party in that
-  window is a second request rather than a refusal.
+- **Known limit.** A principal tied in the core but not yet in ingress's store, asked about while
+  the core does not answer, is logged in its own domain. A tie is in that state while it is in
+  flight: decided by the core, not yet kept by the forwarder's `decide` (which retries until the
+  store takes it); and for a tie that did not pass through this ingress's forwarder at all (one
+  restored with the book by `F-014`), until the first command of that principal while the core is
+  up. The effect is the one above: its key is answered to it alone, never across domains, and a
+  colliding key from another principal of its party in that window is a second request rather than
+  a refusal. The principal's own key is never logged twice: see the next point.
+- **One row per principal and key** (finding `ingress-1`). A command row is unique on (principal,
+  surface, client key) as well as on (domain, surface, client key) (migration `0010`), and an
+  append that conflicts on either takes the row already logged; its digest decides the answer (the
+  first decision, or `ERR-ClientKeyReused`). So two attempts of one request that chose their
+  domains on either side of the principal's tie, or around a tie in flight, are one request. A tie
+  the core names is kept before its domain is used, and the in-memory `Untied` is read only after
+  the store has answered for the tie. A store that does not answer the tie read, or does not take
+  the tie, holds the request open, as an append does (`REQ-AR-7`): nothing is taken in, so there is
+  nothing a refusal could say was kept, and a guessed "no tie" would put a tied principal's repeat
+  in its own domain. Migration `0010` stops, changing nothing, if a log already holds two command
+  rows of one principal under one surface and key; its header has the read-only query that lists
+  them.
 - **Cost on the command path.** A principal tied to none costs one read of the core per command
   (a map lookup in process; one local-socket round trip to the Agent host). A tied principal costs
   one store read for the tie and one for its own pre-tie key.
