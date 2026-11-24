@@ -193,6 +193,14 @@ may rule otherwise.
   that principal while the core is up. The effect is the one above: its key is answered to it
   alone, never across domains, and a colliding key from another principal of its party in that
   window is a second request rather than a refusal.
+- **A party's domain only for a kept tie** (finding `ingress-1`). That limit is safe only because
+  no key is ever logged in a party's domain for a tie the store does not keep: a tie the core names
+  is kept before its command is logged, and a command whose tie read fails, or whose tie the store
+  does not take, is `ERR-DecisionUnavailable` (503), nothing logged; the client retries with the
+  same key. So a store that answers "no tie" proves the principal has no key in a party's domain.
+  Before, a failed read was taken for "no tie" (and the in-memory `Untied` answered after it), and
+  a tie the core named was kept on a best-effort basis: either let a tied principal's repeat be
+  logged in its own domain as a second request, decided again.
 - **Cost on the command path.** A principal tied to none costs one read of the core per command
   (a map lookup in process; one local-socket round trip to the Agent host). A tied principal costs
   one store read for the tie and one for its own pre-tie key.

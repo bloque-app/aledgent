@@ -7,8 +7,9 @@
 use std::time::Duration;
 
 use axum::http::StatusCode;
+use ingress::store::mem::MemStore;
 use ingress::store::{InputKind, Store, party_domain, principal_domain};
-use ingress::testkit::{Deployment, Party, USD};
+use ingress::testkit::{Deployment, Party, USD, call, fast_config};
 use ledger_core::Refusal;
 use serde_json::{Value, json};
 
@@ -270,6 +271,7 @@ async fn req_op_10_an_untied_principal_asks_the_core_once_and_a_later_tie_still_
     assert!(
         ingress::service::party_of(&d.replica.shared, &dave.identity)
             .await
+            .unwrap()
             .is_none()
     );
     assert!(d.quiesce(Duration::from_secs(10)).await);
@@ -278,11 +280,113 @@ async fn req_op_10_an_untied_principal_asks_the_core_once_and_a_later_tie_still_
     assert_eq!(tie(&d, &op, &x, &dave, "joins x").await.0, StatusCode::OK);
     assert_eq!(
         ingress::service::party_of(&d.replica.shared, &dave.identity).await,
-        Some(x.clone())
+        Ok(Some(x.clone()))
     );
     let (s, v) = reserve(&d, &dave, "three", "10").await;
     assert_eq!(s, StatusCode::ACCEPTED, "{v}");
     let (s, v) = reserve(&d, &alice, "three", "10").await;
     assert_eq!(s, StatusCode::CONFLICT, "{v}");
     assert!(is_refusal(&v, Refusal::ClientKeyReused), "{v}");
+}
+
+/// Finding `ingress-1` (`REQ-OP-10`, `REQ-ID-7`): a tied principal's repeat while the store cannot
+/// read its tie is refused `ERR-DecisionUnavailable`, nothing logged, never logged under the
+/// principal's own domain as a second request. The principal was opened through this replica, so
+/// it is among the replica's [`Untied`](ingress::service::Untied) ones: a store that does not answer
+/// must not let that stale "none" decide its domain. Once the store answers, the repeat is answered
+/// from the first row.
+#[tokio::test(flavor = "multi_thread")]
+async fn req_op_10_a_tied_principals_repeat_is_refused_while_its_tie_cannot_be_read() {
+    let d = Deployment::start().await;
+    let alice = d.party("alice", 1_000).await;
+    let x = organisation(&d, "x").await;
+    let op = d.operator.token.clone();
+    assert_eq!(register(&d, &op, &x, &[&alice]).await.0, StatusCode::OK);
+
+    let (s, first) = reserve(&d, &alice, "order-1", "10").await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{first}");
+    assert!(d.quiesce(Duration::from_secs(10)).await);
+
+    d.store.fail_tie_reads(true);
+    assert!(
+        ingress::service::party_of(&d.replica.shared, &alice.identity)
+            .await
+            .is_err(),
+        "a tie the store cannot read is not taken for none"
+    );
+    let (s, v) = reserve(&d, &alice, "order-1", "10").await;
+    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+    assert!(is_refusal(&v, Refusal::DecisionUnavailable), "{v}");
+    d.store.fail_tie_reads(false);
+
+    let (s, again) = reserve(&d, &alice, "order-1", "10").await;
+    assert_eq!(s, StatusCode::OK, "{again}");
+    assert_eq!(again["operation_reference"], first["operation_reference"]);
+    let rows = d.store.rows().await.unwrap();
+    let logged: Vec<_> = rows
+        .iter()
+        .filter(|r| r.new.kind == InputKind::Command)
+        .filter(|r| r.new.client_key.as_deref() == Some("order-1"))
+        .map(|r| r.new.key_domain.clone())
+        .collect();
+    assert_eq!(logged, vec![Some(party_domain(&x))], "one row, the party's");
+}
+
+/// Finding `ingress-1` (`REQ-OP-10`, `REQ-ID-7`): a tie ingress learns from the core is kept before
+/// a key is logged in the party's domain, or the command is refused `ERR-DecisionUnavailable`,
+/// nothing logged. A row in a party's domain whose tie the store does not keep would let the
+/// principal's repeat, once the core stops answering, be logged in its own domain as a second
+/// request. The replica here takes commands in over a store that keeps none of the book's ties
+/// (one restored apart from the book); another holds its lead, so nothing is forwarded from it.
+#[tokio::test(flavor = "multi_thread")]
+async fn req_op_10_a_tie_learned_from_the_core_is_kept_before_its_domain_is_used() {
+    let d = Deployment::start().await;
+    let alice = d.party("alice", 1_000).await;
+    let x = organisation(&d, "x").await;
+    let op = d.operator.token.clone();
+    assert_eq!(register(&d, &op, &x, &[&alice]).await.0, StatusCode::OK);
+    assert!(d.quiesce(Duration::from_secs(10)).await);
+
+    let other = MemStore::new(Duration::from_secs(3_600));
+    assert!(other.try_lead("elsewhere").await.unwrap());
+    let (_replica, router) = d.replica_on(other.clone(), fast_config("ingress-1"));
+    let reserve = || {
+        call(
+            &router,
+            "POST",
+            "/v1/reservations",
+            Some(&alice.token),
+            &[("client-key", "order-1")],
+            Some(json!({ "payer": alice.account, "asset": USD, "amount": "10" })),
+        )
+    };
+    let logged = || async {
+        other
+            .rows()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.new.client_key.as_deref() == Some("order-1"))
+            .map(|r| r.new.key_domain)
+            .collect::<Vec<_>>()
+    };
+
+    other.fail_tie_writes(true);
+    let (s, v) = reserve().await;
+    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+    assert!(is_refusal(&v, Refusal::DecisionUnavailable), "{v}");
+    assert_eq!(
+        logged().await,
+        Vec::<Option<String>>::new(),
+        "nothing logged"
+    );
+    other.fail_tie_writes(false);
+
+    let (s, v) = reserve().await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{v}");
+    assert_eq!(
+        other.tie_of(&alice.identity).await.unwrap(),
+        Some(x.clone())
+    );
+    assert_eq!(logged().await, vec![Some(party_domain(&x))]);
 }

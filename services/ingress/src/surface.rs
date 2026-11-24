@@ -1601,9 +1601,15 @@ async fn command_reply<S: Store, C: Core>(
     // only it can reach that row: a repeat is answered from it, a changed request refused.
     let own = principal_domain(&who.principal);
     let party_started = Instant::now();
+    // A store that cannot say the principal's tie is refused, never taken for "no tie": for a
+    // tied principal that would log its repeat as a second request (finding `ingress-1`).
     let domain = match crate::service::party_of(shared, &who.principal).await {
-        Some(party) => party_domain(&party),
-        None => own.clone(),
+        Ok(Some(party)) => party_domain(&party),
+        Ok(None) => own.clone(),
+        Err(e) => {
+            tracing::warn!(error = %e, "the store did not answer for a tie; refused");
+            return refusal(Refusal::DecisionUnavailable);
+        }
     };
     let party_us = micros_since(party_started);
     if domain != own {

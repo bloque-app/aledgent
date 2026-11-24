@@ -53,7 +53,8 @@ impl<'a, S: Store, C: Core> Echo<'a, S, C> {
         if let Some(p) = self.parties.get(principal) {
             return p.clone();
         }
-        let p = party_of(self.shared, principal).await;
+        // A tie the store cannot say shows nothing a principal tied to none would not see.
+        let p = party_of(self.shared, principal).await.ok().flatten();
         self.parties.insert(principal.to_owned(), p.clone());
         p
     }

@@ -35,6 +35,10 @@ struct Inner {
     verifiers: HashMap<String, crate::boundary::CredentialBody>,
     /// The fleet's roster (`T-038-21`): each instance's address and when its entry lapses.
     roster: HashMap<String, (String, Instant)>,
+    /// Whether every read of a tie fails ([`MemStore::fail_tie_reads`]).
+    tie_reads_fail: bool,
+    /// Whether every write of a tie fails ([`MemStore::fail_tie_writes`]).
+    tie_writes_fail: bool,
 }
 
 /// A partition's feed lease (`F-038`).
@@ -62,6 +66,18 @@ impl MemStore {
             })),
             lease,
         }
+    }
+
+    /// Fail every read of a tie while `fail` holds, as a PostgreSQL store does for the first
+    /// statements after a failover: for tests of the client key's domain (`REQ-OP-10`).
+    pub fn fail_tie_reads(&self, fail: bool) {
+        self.lock().tie_reads_fail = fail;
+    }
+
+    /// Fail every write of a tie while `fail` holds: for tests of the client key's domain
+    /// (`REQ-OP-10`).
+    pub fn fail_tie_writes(&self, fail: bool) {
+        self.lock().tie_writes_fail = fail;
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -163,11 +179,19 @@ impl Store for MemStore {
     }
 
     async fn tie_of(&self, principal: &str) -> Result<Option<String>, StoreError> {
-        Ok(self.lock().ties.get(principal).cloned())
+        let inner = self.lock();
+        if inner.tie_reads_fail {
+            return Err(StoreError("a tie read failed (injected)".into()));
+        }
+        Ok(inner.ties.get(principal).cloned())
     }
 
     async fn put_tie(&self, principal: &str, party: &str) -> Result<(), StoreError> {
-        self.lock()
+        let mut inner = self.lock();
+        if inner.tie_writes_fail {
+            return Err(StoreError("a tie write failed (injected)".into()));
+        }
+        inner
             .ties
             .entry(principal.to_owned())
             .or_insert_with(|| party.to_owned());
