@@ -353,8 +353,9 @@ fn t037_12_every_way_out_at_n_is_decided_the_same_by_either_generation() {
     }
     assert!(checked >= 3, "only {checked} way-out inputs at n");
     // `check-upgrade` (agents/core-host) runs D18 for the generation in force: the upgrades from 0
-    // to 1 and from 1 to 2 (amendment 0043's release) each need a way out at n of their own.
-    for g in [0, 1] {
+    // to 1, from 1 to 2 (amendment 0043's release) and from 2 to 3 (the bounded transitions,
+    // `ledger_core::eval::BOUNDED_TRANSITIONS`) each need a way out at n of their own.
+    for g in [0, 1, 2] {
         assert!(
             generations.contains(&g),
             "no way out at an upgrade's input in generation {g}: {generations:?}"
