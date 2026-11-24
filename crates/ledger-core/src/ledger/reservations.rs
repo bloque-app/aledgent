@@ -314,11 +314,11 @@ impl<S: LeafStore, V: VaultBackend> Ledger<S, V> {
             },
             ctx.now,
             crate::custody::snapshot(&self.state, &ctx.op),
-            eval::Moved {
+            Some(eval::Moved {
                 op: ctx.op,
                 amount: cleared.unwrap_or(r.amount),
                 spends: kind == OperationKind::Capture,
-            },
+            }),
             self.generation(),
         )?;
         if let Status::Closed(..) = status {

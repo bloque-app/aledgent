@@ -67,18 +67,28 @@ use crate::state::State;
 /// [`Ledger::generation`]: crate::ledger::Ledger::generation
 pub const ASSET_CANDIDATES: u64 = crate::settlement::CHAINED_SETTLEMENT;
 
-/// The rules version from which a later transition of an accepted reservation (its capture, its
-/// release, the submission of its outbound leg) authorised under a delegated or operator grant is
-/// held to that grant's value bounds for what it moves (`REQ-AU-1`, `REQ-AG-2`, `AC-G1.3`): the
-/// per-operation bound, and the per-window bounds of a transition that sends the value away from
-/// the payer, except the links the reservation already charged when it was opened
-/// ([`crate::authority::Effective::check_moved`]).
+/// The rules version from which every grant is held to its own bounds for a later transition of
+/// an accepted reservation (`REQ-AU-1`, `REQ-AG-2`, `AC-G1.3`, `AC-G4.1`): its capture, its
+/// release, the submission of its outbound leg.
 ///
-/// Before it, such a transition was authorised with no amount, so only the asset and counterparty
-/// bounds were looked at: a grant could capture, release or submit a reservation another
-/// authority had opened, whole, whatever its per-operation and per-window bounds. An input of an
-/// earlier rules version is decided as its code decided it (the rules-version rule, amendment
-/// 0033).
+/// - A capture or a release authorised under a delegated or operator grant is checked against that
+///   grant's per-operation bound for what it moves (a capture's cleared amount, a release's
+///   reserved amount); a capture, which sends the value away from the payer, also against every
+///   per-window bound, and charged to it, except the links the reservation already charged when it
+///   was opened ([`crate::authority::Effective::check_moved`]). A capture's destination is its
+///   counterparty, as before.
+/// - A submission by a caller other than the operation's initiator is checked as `withdraw`
+///   decided it: the whole reserved amount, to the issuance counterparty, against the per-operation
+///   and counterparty bounds, and against and charged to the per-window bounds as a capture is. A
+///   repeat to the same destination moves nothing more and charges no window, so it returns the
+///   original instruction. The initiator's submission is decided as before: `withdraw` checked
+///   and charged its bounds for exactly this.
+///
+/// Owner authority has no bounds and is unchanged. Before it, such a transition was authorised
+/// with no amount and no counterparty of its own, so only the asset bound and a capture's
+/// counterparty bound were looked at: a grant could capture, release or name the destination of a
+/// reservation another authority had opened, whole, whatever its own bounds. An input of an earlier
+/// rules version is decided as its code decided it (the rules-version rule, amendment 0033).
 ///
 /// It is 3: the production and test books run rules version 2 ([`crate::asset::ASSET_RETIREMENT`]),
 /// so the first core package that carries this code is built as 3. If another upgrade takes 3
@@ -94,8 +104,9 @@ pub struct Moved {
     /// What it moves: a capture's cleared amount, the reserved amount of a release or of the
     /// submission of an outbound leg.
     pub amount: NonZeroMinor,
-    /// Whether it sends the value away from the payer (a capture, a submission), and so counts
-    /// against window bounds. A release returns the value to its payer.
+    /// Whether it sends the value away from the payer (a capture, a first submission), and so
+    /// counts against window bounds. A release returns the value to its payer; a repeated
+    /// submission sends nothing more.
     pub spends: bool,
 }
 
@@ -215,7 +226,9 @@ pub fn authorise_principal(
 ///
 /// `moved` is what the transition moves out of the reservation. From rules version
 /// [`BOUNDED_TRANSITIONS`] on, a grant chosen for it is held to its value bounds for that amount
-/// ([`Moved`]); owner authority is not bounded.
+/// ([`Moved`]); owner authority is not bounded. `None` checks no amount: the transition is decided
+/// on the bounds `request` names alone (an initiator's submission, every transition before
+/// [`BOUNDED_TRANSITIONS`]).
 #[allow(clippy::too_many_arguments)]
 pub fn authorise_in_flight(
     state: &State,
@@ -223,10 +236,10 @@ pub fn authorise_in_flight(
     request: &Request,
     now: Time,
     snapshot: Option<Custody>,
-    moved: Moved,
+    moved: Option<Moved>,
     generation: u64,
 ) -> Result<Decision, Refusal> {
-    authorise_as(state, p, request, now, snapshot, Some(&moved), generation)
+    authorise_as(state, p, request, now, snapshot, moved.as_ref(), generation)
 }
 
 /// The links whose windows the opening of `op` charged: every link of the chain of each grant its

@@ -290,59 +290,6 @@ fn submit_outbound_needs_a_deadline_after_the_expiry_is_decided() {
     assert_eq!(lx.view(&a), (70, 30));
 }
 
-/// `ledger-core-rest-1`, `REQ-AG-2`: from rules version [`crate::eval::BOUNDED_TRANSITIONS`] on, a
-/// delegate bounded to 1 per operation cannot submit the owner's withdrawal of 30 to a destination
-/// of its choosing: `ERR-BoundExceeded`, and no instruction. Before it, the submission was
-/// accepted, as that code decided it.
-#[test]
-fn req_ag_2_a_bounded_delegate_cannot_submit_the_owners_larger_withdrawal() {
-    for (rules, held) in [
-        (crate::eval::BOUNDED_TRANSITIONS, true),
-        (crate::eval::BOUNDED_TRANSITIONS - 1, false),
-    ] {
-        let mut lx = Lx::new();
-        lx.fx.ledger.set_generation(rules, false);
-        let (alice, a) = funded(&mut lx.fx, 100);
-        let mallory = lx.fx.person();
-        let grant = lx.fx.ctx(alice);
-        lx.fx
-            .ledger
-            .grant_authority(
-                &grant,
-                GrantRequest {
-                    kind: GrantKind::Delegated,
-                    principal: mallory.principal,
-                    subject: Subject::Account(a),
-                    ops: NonEmptySet::new([OperationKind::Redeem].into()).unwrap(),
-                    per_operation: Some(nz(1)),
-                    per_window: None,
-                    assets: None,
-                    counterparties: None,
-                    parent: None,
-                    expires: None,
-                },
-            )
-            .unwrap();
-        let ctx = lx.withdraw(alice, a, 30, 500);
-        let theirs = Ctx {
-            op: ctx.op,
-            ..lx.fx.ctx(mallory)
-        };
-        let submitted = lx.fx.ledger.submit_outbound(&theirs, TO).map(|_| ());
-        if held {
-            assert_eq!(submitted, Err(Refusal::BoundExceeded));
-            assert!(lx.fx.ledger.pending_instructions().is_empty());
-            assert_eq!(lx.state(&ctx.op), OpState::Reserved);
-            // The owner still submits her own withdrawal.
-            lx.fx.ledger.submit_outbound(&ctx, TO).unwrap();
-        } else {
-            assert_eq!(submitted, Ok(()));
-        }
-        assert_eq!(lx.fx.ledger.pending_instructions().len(), 1);
-        assert_eq!(lx.view(&a), (70, 30));
-    }
-}
-
 /// An instruction the adapter never acknowledged, once it provably cannot execute, is released:
 /// `Reserved → Released`, with no hand-off.
 #[test]
@@ -1791,4 +1738,215 @@ fn t_031_25_re_scan_differences_moved_at_the_switch_reopen() {
         "the index left as it is"
     );
     reopens(s);
+}
+
+/// A `Redeem` grant from `owner` to `to` over `account`, with the bounds given.
+fn redeem_grant(
+    fx: &mut Fx,
+    owner: Caller,
+    to: &Caller,
+    account: AccountId,
+    per_operation: Option<u64>,
+    per_window: Option<u64>,
+    counterparties: Option<AccountId>,
+) -> GrantId {
+    let ctx = fx.ctx(owner);
+    fx.ledger
+        .grant_authority(
+            &ctx,
+            GrantRequest {
+                kind: GrantKind::Delegated,
+                principal: to.principal,
+                subject: Subject::Account(account),
+                ops: NonEmptySet::one(OperationKind::Redeem),
+                per_operation: per_operation.map(nz),
+                per_window: per_window.map(|limit| Window {
+                    length: NonZeroU64::new(1_000_000).unwrap(),
+                    limit: nz(limit),
+                }),
+                assets: None,
+                counterparties: counterparties.map(NonEmptySet::one),
+                parent: None,
+                expires: None,
+            },
+        )
+        .unwrap()
+        .value
+}
+
+/// A ledger at [`crate::eval::BOUNDED_TRANSITIONS`] with Alice's account holding 100 000, and Bob,
+/// who holds no authority over it yet.
+fn bounded_book() -> (Lx, Caller, AccountId, Caller) {
+    let mut lx = Lx::new();
+    lx.fx
+        .ledger
+        .set_generation(crate::eval::BOUNDED_TRANSITIONS, false);
+    let (alice, a) = funded(&mut lx.fx, 100_000);
+    let bob = lx.fx.person();
+    (lx, alice, a, bob)
+}
+
+/// The window counter of `grant` in the first window, in USD.
+fn redeem_window(grant: GrantId) -> crate::authority::WindowKey {
+    crate::authority::WindowKey {
+        grant,
+        window: 0,
+        asset: usd(),
+    }
+}
+
+const BOBS: Destination = Destination::Account([0xB0; 32]);
+
+/// `REQ-AG-2`, `AC-G1.3`: a delegate bounded to 10 per operation cannot name the destination of
+/// the owner's reserved withdrawal of 50 000. It is `ERR-BoundExceeded`, nothing is instructed, and
+/// the owner still names her own.
+#[test]
+fn ac_g1_3_a_bounded_delegate_cannot_direct_another_principals_reserved_withdrawal() {
+    let (mut lx, alice, a, bob) = bounded_book();
+    redeem_grant(&mut lx.fx, alice, &bob, a, Some(10), None, None);
+    let w = lx.withdraw(alice, a, 50_000, 500);
+    assert_eq!(lx.state(&w.op), OpState::Reserved);
+    let as_bob = Ctx {
+        caller: bob,
+        op: w.op,
+        now: 10,
+    };
+    assert_eq!(
+        lx.fx.ledger.submit_outbound(&as_bob, BOBS).map(|_| ()),
+        Err(Refusal::BoundExceeded)
+    );
+    assert!(lx.fx.ledger.pending_instructions().is_empty());
+    assert_eq!(lx.state(&w.op), OpState::Reserved);
+    let i = lx.fx.ledger.submit_outbound(&w, TO).unwrap().value;
+    assert_eq!(i.destination(), TO);
+    assert_eq!(i.amount().get().get(), 50_000);
+    assert_eq!(lx.view(&a), (50_000, 50_000));
+}
+
+/// `REQ-AG-2`, `AC-G4.1`: the other bounds hold too. A window too small for the reserved amount,
+/// and a counterparty bound that leaves out the issuance counterparty, each refuse a delegate that
+/// did not reserve the leg.
+#[test]
+fn ac_g4_1_a_delegates_window_and_counterparty_bounds_hold_when_it_names_a_destination() {
+    let (mut lx, alice, a, bob) = bounded_book();
+    let g = redeem_grant(&mut lx.fx, alice, &bob, a, None, Some(1_000), None);
+    let w = lx.withdraw(alice, a, 5_000, 500);
+    let as_bob = Ctx {
+        caller: bob,
+        op: w.op,
+        now: 10,
+    };
+    assert_eq!(
+        lx.fx.ledger.submit_outbound(&as_bob, BOBS).map(|_| ()),
+        Err(Refusal::BoundExceeded)
+    );
+    assert_eq!(lx.fx.ledger.state().used(&redeem_window(g)), Minor::ZERO);
+
+    let (mut lx, alice, a, bob) = bounded_book();
+    let elsewhere = empty(&mut lx.fx);
+    redeem_grant(&mut lx.fx, alice, &bob, a, None, None, Some(elsewhere));
+    let w = lx.withdraw(alice, a, 5, 500);
+    let as_bob = Ctx {
+        caller: bob,
+        op: w.op,
+        now: 10,
+    };
+    assert_eq!(
+        lx.fx.ledger.submit_outbound(&as_bob, BOBS).map(|_| ()),
+        Err(Refusal::BoundExceeded)
+    );
+    assert!(lx.fx.ledger.pending_instructions().is_empty());
+}
+
+/// `REQ-AG-2`: a delegate whose bounds cover the owner's reserved withdrawal names its
+/// destination, and that is charged to its window once: a repeat returns the same instruction
+/// although the window is now used up, and the next withdrawal it did not reserve is refused.
+#[test]
+fn req_ag_2_a_covering_delegate_names_the_destination_charged_to_its_window_once() {
+    let (mut lx, alice, a, bob) = bounded_book();
+    let g = redeem_grant(&mut lx.fx, alice, &bob, a, Some(50_000), Some(50_000), None);
+    let w = lx.withdraw(alice, a, 50_000, 500);
+    let as_bob = Ctx {
+        caller: bob,
+        op: w.op,
+        now: 10,
+    };
+    let i = lx.fx.ledger.submit_outbound(&as_bob, BOBS).unwrap().value;
+    assert_eq!(i.destination(), BOBS);
+    assert_eq!(
+        lx.fx.ledger.state().used(&redeem_window(g)),
+        Minor::new(50_000)
+    );
+    // A repeat by the same caller to the same destination returns the same instruction, and
+    // charges nothing more.
+    let again = lx.fx.ledger.submit_outbound(&as_bob, BOBS).unwrap().value;
+    assert_eq!(again, i);
+    assert_eq!(
+        lx.fx.ledger.state().used(&redeem_window(g)),
+        Minor::new(50_000)
+    );
+    // The window is used up: the next of the owner's withdrawals is not Bob's to direct.
+    let next = lx.withdraw(alice, a, 1, 500);
+    let as_bob = Ctx {
+        caller: bob,
+        op: next.op,
+        now: 10,
+    };
+    assert_eq!(
+        lx.fx.ledger.submit_outbound(&as_bob, BOBS).map(|_| ()),
+        Err(Refusal::BoundExceeded)
+    );
+    assert_eq!(lx.fx.ledger.pending_instructions().len(), 1);
+}
+
+/// `REQ-AG-2`: the initiator and the owner decide as before. A delegate names the destination of
+/// its own withdrawal, and repeats it, although reserving it used its whole window, which is not
+/// charged again; the owner names the destination of a delegate's withdrawal, owner authority
+/// having no bounds.
+#[test]
+fn req_ag_2_the_initiator_and_the_owner_name_the_destination_as_before() {
+    let (mut lx, alice, a, bob) = bounded_book();
+    let g = redeem_grant(&mut lx.fx, alice, &bob, a, Some(10), Some(10), None);
+    let w = lx.withdraw(bob, a, 10, 500);
+    assert_eq!(lx.fx.ledger.state().used(&redeem_window(g)), Minor::new(10));
+    let i = lx.fx.ledger.submit_outbound(&w, BOBS).unwrap().value;
+    assert_eq!(i.amount().get().get(), 10);
+    let again = lx.fx.ledger.submit_outbound(&w, BOBS).unwrap().value;
+    assert_eq!(again, i);
+    assert_eq!(lx.fx.ledger.state().used(&redeem_window(g)), Minor::new(10));
+
+    let (mut lx, alice, a, bob) = bounded_book();
+    redeem_grant(&mut lx.fx, alice, &bob, a, Some(10), None, None);
+    let w = lx.withdraw(bob, a, 10, 500);
+    let as_alice = Ctx {
+        caller: alice,
+        op: w.op,
+        now: 10,
+    };
+    let i = lx.fx.ledger.submit_outbound(&as_alice, TO).unwrap().value;
+    assert_eq!(i.destination(), TO);
+    let again = lx.fx.ledger.submit_outbound(&as_alice, TO).unwrap().value;
+    assert_eq!(again, i);
+}
+
+/// The rules-version rule (amendment 0033): an input of a rules version before
+/// [`crate::eval::BOUNDED_TRANSITIONS`] is decided as that code decided it, with no amount and no
+/// counterparty, so a recorded book replays to the same state.
+#[test]
+fn before_bounded_transitions_a_submission_is_decided_as_before() {
+    let (mut lx, alice, a, bob) = bounded_book();
+    lx.fx
+        .ledger
+        .set_generation(crate::eval::BOUNDED_TRANSITIONS - 1, false);
+    let g = redeem_grant(&mut lx.fx, alice, &bob, a, Some(10), Some(10), Some(a));
+    let w = lx.withdraw(alice, a, 50_000, 500);
+    let as_bob = Ctx {
+        caller: bob,
+        op: w.op,
+        now: 10,
+    };
+    let i = lx.fx.ledger.submit_outbound(&as_bob, BOBS).unwrap().value;
+    assert_eq!(i.destination(), BOBS);
+    assert_eq!(lx.fx.ledger.state().used(&redeem_window(g)), Minor::ZERO);
+    assert_eq!(lx.view(&a), (50_000, 50_000));
 }
