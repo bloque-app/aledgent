@@ -37,8 +37,9 @@
 //! - **Keys and an admin.** The admin rotates keys and sets bounds.
 //! - **Peers** (GHSA-q55h-xgp2-jjxm). Another deployment's [`credit`](settlement::Settlement::credit)
 //!   is accepted only if governance listed it as a peer, and never beyond what the contract holds of
-//!   the asset. A code hash is no proof of who is calling: any contract can set its own to this
-//!   code's for the length of a call.
+//!   the asset. A code hash is no proof of who is calling: any contract can set its own stored
+//!   code hash to this code's (`seal_set_code_hash`, a permanent change) and keep running its own
+//!   code for the rest of that call.
 //! - **Governance, and anchor sequences** (amendments 0039 and 0040). A deployment's governance
 //!   (an account the admin names once, then only governance replaces: on Kreivo, the
 //!   licence-owning community's account, reached by a referendum) can start a new anchor sequence
@@ -453,9 +454,10 @@ pub mod settlement {
         /// refusal reverts the message and writes nothing.
         ///
         /// *Stated plainly* (GHSA-q55h-xgp2-jjxm). The code-hash check alone proves nothing about
-        /// the caller: `pallet-contracts` lets any contract set its own code hash to this code's
-        /// (`seal_set_code_hash`) and call here in the same frame, still running its own code, so
-        /// the earlier version, which trusted the code hash, accepted credits that moved nothing.
+        /// the caller: `pallet-contracts` lets any contract set its own stored code hash to this
+        /// code's (`seal_set_code_hash`, which changes it for good) and, since the calling frame
+        /// keeps running its old code for the rest of that call, call here from that code, so the
+        /// earlier version, which trusted the code hash, accepted credits that moved nothing.
         /// The peer list is the authority. Genuine settlement code never changes its code hash and
         /// calls `credit` only right after moving `amount` of `asset` here, in the same call. The
         /// holding check bounds even a listed peer to value that is here: it cannot tell a credit's
@@ -584,6 +586,13 @@ pub mod settlement {
         /// (amendment 0039). Refuses the contract itself and an account that does not run this code
         /// (`NotADeployment`), a peer already listed (`AlreadyAPeer`) and more than [`MAX_PEERS`]
         /// (`TooManyPeers`).
+        ///
+        /// *Stated plainly.* The code-hash check here guards against a typo, nothing more: any
+        /// contract can give itself this code's hash, so what makes a peer trustworthy is
+        /// governance's choice of address. It also fixes the order of an upgrade: both deployments
+        /// run the same code first, then the referendum that adds the peer is proposed; if the
+        /// peer's code changes between proposal and enactment, the add fails (`NotADeployment`) and
+        /// changes nothing.
         #[ink(message, selector = 0x0000_0402)]
         pub fn add_peer(&mut self, peer: AccountId) -> Result<(), Error> {
             if self.governance.get() != Some(self.env().caller()) {
@@ -607,8 +616,10 @@ pub mod settlement {
 
         /// Unlist `peer`: its `credit` is refused from now on. **Governance or the admin**: narrowing
         /// the list is an incident response, and stays one signed call, as emptying the keys does
-        /// (amendment 0039); the admin can never widen it. `NotAPeer` if it is not listed. Removing
-        /// the last peer removes the cell.
+        /// (amendment 0039). Once governance is named, the admin can only narrow the list; before
+        /// that, it can name itself governance (`set_governance`) and then add peers, which is why
+        /// naming the community's account comes before any peer step of the deployment checklist.
+        /// `NotAPeer` if it is not listed. Removing the last peer removes the cell.
         #[ink(message, selector = 0x0000_0403)]
         pub fn remove_peer(&mut self, peer: AccountId) -> Result<(), Error> {
             if self.governance.get() != Some(self.env().caller()) {
@@ -1419,8 +1430,10 @@ pub mod settlement {
         }
 
         /// Whether `who` is a contract whose stored code hash is this contract's. **Not proof of
-        /// who is calling**: any contract can set its own code hash to this one's for the length
-        /// of a call (GHSA-q55h-xgp2-jjxm). `credit` takes it only beside the peer list.
+        /// who is calling** (GHSA-q55h-xgp2-jjxm): any contract can set its stored code hash to
+        /// this one's with `seal_set_code_hash`, a permanent change, while the frame that called it
+        /// keeps running its old code for the rest of that call. `credit` takes it only beside the
+        /// peer list, and `add_peer` only as a guard against a typo.
         #[cfg(not(test))]
         fn host_is_deployment(&self, who: AccountId) -> bool {
             match (self.env().code_hash(&who), self.env().own_code_hash()) {
@@ -1707,9 +1720,23 @@ pub mod settlement {
         ///   of the chain below its head; with none, nothing is;
         /// - legacy records (`anchors[n]`) remain only while a migration runs, and then only in
         ///   its range `next..=end`; none past `last_anchor`;
-        /// - `pruned_to <= next_seq`.
+        /// - `pruned_to <= next_seq`;
+        /// - every bound asset is held at least to its recorded position (`REQ-AS-8`; the bind
+        ///   checks it at zero divergence, and a credit never raises the position past the
+        ///   holding, GHSA-q55h-xgp2-jjxm), over every asset the mock knows.
         pub(crate) fn check_invariants(&self) {
             let head = self.load_head();
+            let me = self.env().account_id();
+            for asset in crate::mock::assets() {
+                if self.bound.contains(asset) {
+                    let held = self.env().extension().balance(asset, me);
+                    let position = self.positions.get(asset).unwrap_or(0);
+                    assert!(
+                        held >= position,
+                        "bound asset {asset:?}: held {held} below its position {position}"
+                    );
+                }
+            }
             assert!(
                 head.pruned_to <= head.next_seq,
                 "pruned past the head's end"

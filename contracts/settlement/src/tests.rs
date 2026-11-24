@@ -4613,7 +4613,9 @@ fn ghsa_q55h_a_receiver_short_of_its_position_refuses_even_a_genuine_credit() {
 fn ghsa_q55h_only_governance_adds_a_peer() {
     let mut contract = setup();
     register_peer();
-    // No governance named: nobody can add one, the admin included.
+    // No governance named: nobody holds the role, so nobody can add one, the admin included (it
+    // could name itself governance first, which is why the checklist names the community's
+    // account before any peer step; once governance is named, the admin can only narrow).
     for who in [admin(), key(), stranger(), governance(), peer()] {
         caller(who);
         assert_eq!(contract.add_peer(peer()), Err(Error::NotGovernance));

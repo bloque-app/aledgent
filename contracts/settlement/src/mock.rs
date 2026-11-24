@@ -159,6 +159,18 @@ pub fn create_asset(asset: AssetId, min_balance: Balance) {
     });
 }
 
+/// Every asset created so far.
+pub fn assets() -> Vec<AssetId> {
+    CHAIN.with(|chain| {
+        chain
+            .borrow()
+            .assets
+            .keys()
+            .map(|k| AssetId::decode(&mut &k[..]).expect("an asset id"))
+            .collect()
+    })
+}
+
 /// Freeze or thaw an asset.
 pub fn set_frozen(asset: AssetId, frozen: bool) {
     CHAIN.with(|chain| {

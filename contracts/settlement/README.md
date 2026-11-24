@@ -22,8 +22,8 @@ choices, the storage layout and how the adapter reads it are in
 | `set_keys(keys, attestation_key)` | the admin | Rotate keys |
 | `set_withdrawal_bound(asset, Option<bound>)` | the admin | Bound withdrawals per asset per window; an asset with no bound cannot leave (`NoWithdrawalBound`) |
 | `set_governance(account)` | the admin while none is set; then governance only | Name the deployment's governance (on Kreivo: the licence-owning community's account, reached by a referendum through `Communities.dispatch_as_account`). Amendment 0039 |
-| `add_peer(contract)` | governance only | List a deployment of this code whose `credit` this one accepts (at most 16; `NotADeployment`, `AlreadyAPeer`, `TooManyPeers`). GHSA-q55h-xgp2-jjxm |
-| `remove_peer(contract)` | governance or the admin | Unlist a peer (`NotAPeer` if it is not one); the admin may narrow the list, never widen it |
+| `add_peer(contract)` | governance only | List a deployment of this code whose `credit` this one accepts (at most 16; `NotADeployment`, `AlreadyAPeer`, `TooManyPeers`). Its code-hash check guards against a typo only: governance's choice of address is the security. Upgrade both deployments first, then propose the referendum that adds the peer; if the peer's code changes before enactment, the add fails. GHSA-q55h-xgp2-jjxm |
+| `remove_peer(contract)` | governance or the admin | Unlist a peer (`NotAPeer` if it is not one). Once governance is named the admin can only narrow the list; before that it can name itself governance and then add peers, so governance is named first |
 | `set_anchor_head(expected_last, base, book)` | governance only | Start a new anchor sequence for a re-founded book: the next anchor is `base + 1`; refused `HeadMoved` unless the head's `last_anchor` is `expected_last`. **A full reset** (amendment 0040): removes every entry the earlier code stored (at most 64, `TooManyStoredEntries` otherwise; the storage deposits go to the call's origin, governance), sets the head to `{ base, 0, 0 }` and starts a new chain at `(0, zeros)`. Moves no value; touches no position, bound, binding or key. Amendments 0039 and 0040 |
 | `registration`, `head`, `chain_head`, `latest_anchor`, `position`, `withdrawal_window`, `bound`, `anchor_epoch`, `governance`, `peers` | anyone | Reads (`peers()` (`0x0000_030B`): the deployments `credit` is accepted from; `chain_head()` (`0x0000_030A`): the chain's next position, digest and start; `bound(asset)`: the position of the asset's `Bound` entry in the chain it was bound in; `latest_anchor()`, selector `0x0000_0307`, replaces `anchor_record(number)`; `anchor_epoch()` (`0x0000_0308`): the sequence governance started last, `None` for the instance's first) |
 
@@ -94,7 +94,11 @@ call's operation reference, and remembers the entry's position (`bound(asset)`).
 is refused with `HoldingMismatch { holding }`, the holding it read, and nothing but the chain
 changes; a second bind of the same asset is refused with `AlreadyBound`, after a reset too. The
 equality is checked at the block that records the binding, so it is final with it (`REQ-SL-3`). A
-bind of zero is allowed. Withdrawing the asset still needs a withdrawal bound.
+bind of zero is allowed. Withdrawing the asset still needs a withdrawal bound. **On a deployment
+that lists peers, the bind goes in the same batch as the issuer's transfer, or right after it**:
+until it lands, the value sits in the account unrecorded, and a hostile listed peer could claim it
+with a `credit` that the holding check lets through (GHSA-q55h-xgp2-jjxm); the bind would then
+be refused `HoldingMismatch`.
 
 **How value moves.** Through Kreivo's own contract API, its chain extension (`KreivoChainExtensions`,
 assets API): `deposit` pulls from the contract's caller, `transfer` pays out, `balance` reads the
@@ -188,12 +192,14 @@ runtime in production carries every upstream fix to the communities pallet that 
       origin, `Communities(RawOrigin { community_id, subset: None })`. `Communities.CommunityIdFor`
       no longer maps the old signed origin, and a dry run of `ContractsStore.upgrade` signed by the
       old key fails with `BadOrigin`.
-- [ ] **Governance named** (amendment 0039): the contract's admin has called
-      `set_governance(<the community's account>)`, and `governance()` reads it back. Until then
-      nobody can start an anchor sequence; after it, the admin cannot change it. On an upgraded
+- [ ] **Governance named** (amendment 0039), **before any peer step**: the contract's admin has
+      called `set_governance(<the community's account>)`, and `governance()` reads it back. Until
+      then nobody can start an anchor sequence, and the admin could name itself governance and add
+      peers; after it, the admin cannot change it and can only narrow the peer list. On an upgraded
       instance this is the first message after `ContractsStore.upgrade`.
 - [ ] **Peers listed, only if needed** (GHSA-q55h-xgp2-jjxm): a deployment that receives
-      withdrawals from another deployment lists it by a referendum enacting
+      withdrawals from another deployment, once both run the same code and governance is named,
+      lists it by a referendum enacting
       `Communities.dispatch_as_account(Contracts.call(<this contract>, add_peer(<sender>)))`, and
       `peers()` reads it back. With no peer listed, every `credit` is refused; a deployment that
       receives only `deposit`s lists none.

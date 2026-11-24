@@ -233,9 +233,16 @@ step at a time, and its storage deposits released (decisions 25 and 26). Tests: 
     on Kreivo, the licence-owning community's account, reached by a referendum), since a peer can
     write `Deposited` entries; it refuses the contract itself and an account that does not run this
     code (`NotADeployment`), a duplicate (`AlreadyAPeer`) and a seventeenth (`TooManyPeers`).
-    `remove_peer(contract)` (`0x0000_0403`) is governance's or the admin's: narrowing is an
-    incident response and stays one signed call, as emptying the keys does. While governance is
-    not named nobody can add a peer, so `credit` is refused to every caller. `peers()`
+    That code-hash check guards against a typo, not an attacker (any contract can give itself this
+    code's hash): the security is governance's choice of address. It fixes the order of an
+    upgrade: both deployments take the same code first, then the referendum that adds the peer is
+    proposed; if the peer's code changes between proposal and enactment, the add fails and changes
+    nothing. `remove_peer(contract)` (`0x0000_0403`) is governance's or the admin's: narrowing is
+    an incident response and stays one signed call, as emptying the keys does. Once governance is
+    named the admin can only narrow the list. Before that, nobody holds the governance role, so
+    no peer is listed and `credit` is refused to every caller, but the admin can name itself
+    governance (`set_governance`) and then add peers: naming the community's account comes before
+    any peer step of the checklist. `peers()`
     (`0x0000_030B`) reads the list. `PeerAdded` and `PeerRemoved` are events, not entries, like
     every administrative act. Absence of the cell is "no peers", so an upgraded instance needs no
     migration and refuses every `credit` until governance lists its peers.
@@ -557,7 +564,11 @@ step at a time, and its storage deposits released (decisions 25 and 26). Tests: 
     deployment's position, once, at zero divergence** (`REQ-AS-8`, `REQ-SL-3`). Before it is
     submitted, the asset's issuer puts exactly the book's outstanding balance of the asset in the
     contract's account by a plain transfer or a mint on Kreivo. That records no deposit, so no
-    account is credited, and no deposit has to be told apart from a holder's. The bind then:
+    account is credited, and no deposit has to be told apart from a holder's. *(Added for
+    GHSA-q55h-xgp2-jjxm.)* On a deployment that lists peers (decision 15), the bind goes in the
+    same batch as the issuer's transfer, or right after it: until it lands the value sits in the
+    account unrecorded, and a hostile listed peer could claim it with a `credit` the holding check
+    lets through, after which the bind is refused `HoldingMismatch`. The bind then:
 
     - is refused with `Refusal::AlreadyBound` (index 12) if the asset was bound before, whatever
       the holding: a binding is never repeated or undone;
@@ -788,8 +799,9 @@ handover.
   `instantiate` all run as `COMMUNITY_ID`). A single referendum can carry both calls in one
   `Utility::batch_all`, so that the code voted on is the code installed.
 - **The contract cannot change its own code**: it never calls `set_code_hash`. Nor does it take
-  another contract's code hash as proof of who is calling: any contract can set its own to this
-  code's for the length of a call (GHSA-q55h-xgp2-jjxm). `credit` is accepted from the peers its
+  another contract's code hash as proof of who is calling: any contract can set its own stored
+  code hash to this code's with `seal_set_code_hash`, a permanent change, while the calling frame
+  keeps running its old code for the rest of that call (GHSA-q55h-xgp2-jjxm). `credit` is accepted from the peers its
   governance listed only, and never beyond the contract's holding (decision 15).
 - **Liveness**: a community with no members after the handover can never decide anything again.
 

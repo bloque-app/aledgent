@@ -364,10 +364,14 @@ async function peerDeployment(ctx) {
 /// (`add_peer`). On this suite's chain the receiver's governance is the suite's admin, named by the
 /// admin while none is: a shortcut for a test network, never a deployment's setup (on Kreivo
 /// mainnet, governance is the licence-owning community's account, reached by a referendum). A no-op
-/// on code without the allow-list, or if `sender` is already listed.
+/// if `sender` is already listed, or if the receiver does not run the suite's bundle (read from its
+/// contract info): the suite's ABI says nothing of an older code's messages, and code without the
+/// allow-list accepts a deployment's `credit` without one.
 async function allowAsPeer(ctx, receiver, sender) {
-  const { api, accounts, abi } = ctx;
-  if (!abi.messages.some((m) => m.method === 'addPeer')) return;
+  const { api, accounts, abi, bundle } = ctx;
+  const info = (await api.query.contracts.contractInfoOf(receiver)).unwrap();
+  if (info.codeHash.toHex() !== bundle.source.hash) return;
+  if (!abi.messages.some((m) => m.method === 'addPeer')) fail('the suite\'s bundle has no add_peer');
   const { ContractPromise } = await import('@polkadot/api-contract');
   const c = new ContractPromise(api, abi, receiver);
   const governance = (await drive.read(api, c, 'governance')).toJSON();
