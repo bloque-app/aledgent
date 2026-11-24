@@ -8,6 +8,21 @@ SPDX-License-Identifier: CC-BY-4.0
 Releases are cut by release-please from the conventional-commit titles of the pull requests merged
 into `main` (`release-please-config.json`). Each entry below is written by its release pull request.
 
+## [0.6.1](https://github.com/bloque-app/aledgent/compare/v0.6.0...v0.6.1) (2026-11-23)
+
+
+### Bug Fixes
+
+* **core:** reopen the replica after an unclean stop from its last manifest (T-031-26) ([#148](https://github.com/bloque-app/aledgent/issues/148)) ([d323185](https://github.com/bloque-app/aledgent/commit/d3231854acb65ca1e794e47034d89743ce6b13a2))
+* promote develop to main for 0.6.1 (settle deposit-backing guard, GHSA-q55h-xgp2-jjxm) ([b9bb157](https://github.com/bloque-app/aledgent/commit/b9bb157fa7a83e59a4292691e9aa3e583a4e478b))
+* **settle:** prove each final deposit's backing before it is credited (GHSA-q55h-xgp2-jjxm) ([#155](https://github.com/bloque-app/aledgent/issues/155)) ([7e57547](https://github.com/bloque-app/aledgent/commit/7e5754779e35b8d838992b25022ec4ebe81506c4))
+
+
+### Reverts
+
+* crash-safe replica reopen ([#148](https://github.com/bloque-app/aledgent/issues/148)), out of 0.6.1 until its v1-roots test is fixed ([#157](https://github.com/bloque-app/aledgent/issues/157)) ([295f9e8](https://github.com/bloque-app/aledgent/commit/295f9e824b57c3cd728356200f9e3e73b71b26b2))
+* fix(core): reopen the replica after an unclean stop (T-031-26) ([#148](https://github.com/bloque-app/aledgent/issues/148)) ([295f9e8](https://github.com/bloque-app/aledgent/commit/295f9e824b57c3cd728356200f9e3e73b71b26b2))
+
 ## [0.6.0](https://github.com/bloque-app/aledgent/compare/v0.5.0...v0.6.0) (2026-11-21)
 
 
