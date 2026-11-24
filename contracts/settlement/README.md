@@ -18,12 +18,14 @@ choices, the storage layout and how the adapter reads it are in
 | `execute_with_limits(Vec<Envelope>, Vec<Weight>)` | a key | The same, each framed call given its own limit (plus an eighth), as a dry run of the call alone reports it; entries of inline calls are ignored |
 | `apply(head, envelope)` | the contract itself, only | One call of a batch, in its own frame (`execute` calls it on the contract) |
 | `deposit(account_ref, asset, amount)` | anyone | Pull `amount` from the caller through Kreivo's assets API (no approval; the caller is kept alive) and record it under the account reference |
-| `credit(account_ref, asset, amount)` | another deployment, only | Record value it has just moved here |
+| `credit(account_ref, asset, amount)` | a listed peer deployment, only | Record value it has just moved here. Refused `NotAPeer` unless governance listed the caller (`add_peer`), `NotADeployment` unless it still runs this code, and `UnbackedCredit { holding }` if the position after it would exceed the contract's holding of the asset. A code hash alone is no proof of the caller (GHSA-q55h-xgp2-jjxm) |
 | `set_keys(keys, attestation_key)` | the admin | Rotate keys |
 | `set_withdrawal_bound(asset, Option<bound>)` | the admin | Bound withdrawals per asset per window; an asset with no bound cannot leave (`NoWithdrawalBound`) |
 | `set_governance(account)` | the admin while none is set; then governance only | Name the deployment's governance (on Kreivo: the licence-owning community's account, reached by a referendum through `Communities.dispatch_as_account`). Amendment 0039 |
+| `add_peer(contract)` | governance only | List a deployment of this code whose `credit` this one accepts (at most 16; `NotADeployment`, `AlreadyAPeer`, `TooManyPeers`). GHSA-q55h-xgp2-jjxm |
+| `remove_peer(contract)` | governance or the admin | Unlist a peer (`NotAPeer` if it is not one); the admin may narrow the list, never widen it |
 | `set_anchor_head(expected_last, base, book)` | governance only | Start a new anchor sequence for a re-founded book: the next anchor is `base + 1`; refused `HeadMoved` unless the head's `last_anchor` is `expected_last`. **A full reset** (amendment 0040): removes every entry the earlier code stored (at most 64, `TooManyStoredEntries` otherwise; the storage deposits go to the call's origin, governance), sets the head to `{ base, 0, 0 }` and starts a new chain at `(0, zeros)`. Moves no value; touches no position, bound, binding or key. Amendments 0039 and 0040 |
-| `registration`, `head`, `chain_head`, `latest_anchor`, `position`, `withdrawal_window`, `bound`, `anchor_epoch`, `governance` | anyone | Reads (`chain_head()` (`0x0000_030A`): the chain's next position, digest and start; `bound(asset)`: the position of the asset's `Bound` entry in the chain it was bound in; `latest_anchor()`, selector `0x0000_0307`, replaces `anchor_record(number)`; `anchor_epoch()` (`0x0000_0308`): the sequence governance started last, `None` for the instance's first) |
+| `registration`, `head`, `chain_head`, `latest_anchor`, `position`, `withdrawal_window`, `bound`, `anchor_epoch`, `governance`, `peers` | anyone | Reads (`peers()` (`0x0000_030B`): the deployments `credit` is accepted from; `chain_head()` (`0x0000_030A`): the chain's next position, digest and start; `bound(asset)`: the position of the asset's `Bound` entry in the chain it was bound in; `latest_anchor()`, selector `0x0000_0307`, replaces `anchor_record(number)`; `anchor_epoch()` (`0x0000_0308`): the sequence governance started last, `None` for the instance's first) |
 
 `prune_inbox` (`0x0000_0202`) and `inbox_entry` (`0x0000_0302`) are gone with the stored entries
 (amendment 0040); their selectors are never reused, so an old caller fails to dispatch.
@@ -73,6 +75,13 @@ origin). At most about 9 G of ref time and 20 KB of proof size per message, by K
 `AnchorsMigrated`. A batch dry-run on one side of the code swap or of a migration step and included on
 the other can fail whole, and a failed withdrawal batch is released. Every deployment that withdraws to another is upgraded in
 one window.
+
+**Upgrading to the peer allow-list** (GHSA-q55h-xgp2-jjxm). The new cell `peers` (`0d000000`) is
+absent on an upgraded instance, which reads as "no peers": nothing to migrate, no cell moves, and
+from the code swap on every `credit` is refused. An instance that receives withdrawals from another
+deployment needs its governance's `add_peer(<sender>)` before the next such withdrawal; until then
+the sender's call fails in its own frame (`CallFailed(Trapped)`) and nothing moves. Governance must
+be named first (`set_governance`, the admin's, while none is).
 
 **Binding a book-only asset** (amendment 0011, `REQ-AS-8`; `PLAN.md` `DEC-20`; decision 24 in
 `NOTES.md`). An asset that started in the book alone is bound to Kreivo once, at zero divergence.
@@ -183,6 +192,11 @@ runtime in production carries every upstream fix to the communities pallet that 
       `set_governance(<the community's account>)`, and `governance()` reads it back. Until then
       nobody can start an anchor sequence; after it, the admin cannot change it. On an upgraded
       instance this is the first message after `ContractsStore.upgrade`.
+- [ ] **Peers listed, only if needed** (GHSA-q55h-xgp2-jjxm): a deployment that receives
+      withdrawals from another deployment lists it by a referendum enacting
+      `Communities.dispatch_as_account(Contracts.call(<this contract>, add_peer(<sender>)))`, and
+      `peers()` reads it back. With no peer listed, every `credit` is refused; a deployment that
+      receives only `deposit`s lists none.
 - [ ] A first referendum has replaced the default track (`CommunityTracks.update`): the default one
       passes a proposal with a single aye in about 25 minutes.
 - [ ] The community id, members, decision method and track are recorded with the deployment, and

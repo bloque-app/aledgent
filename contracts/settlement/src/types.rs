@@ -37,6 +37,8 @@ pub type AttestationKey = [u8; 32];
 
 /// The most keys a deployment can have.
 pub const MAX_KEYS: usize = 16;
+/// The most peer deployments one deployment accepts `credit` from (GHSA-q55h-xgp2-jjxm).
+pub const MAX_PEERS: usize = 16;
 /// The most calls one batch can carry: a generous bound, not the one that keeps a batch inside an
 /// extrinsic. Proof size does that, and it depends on the calls: under amendment 0040, 32
 /// withdrawals to accounts dry-run at 2.41 MB on zombienet (over what an extrinsic leaves), while a
@@ -658,7 +660,8 @@ pub enum Error {
     /// enough of the asset, an amount that would take the caller below the asset's minimum balance,
     /// a frozen or unknown asset, or less than the minimum for the contract to hold.
     DepositRefused(KreivoApiError),
-    /// The caller of `credit` is not a deployment running this contract's code.
+    /// The caller of `credit`, or the account `add_peer` is given, is not a deployment running
+    /// this contract's code, or is the contract itself.
     NotADeployment,
     /// The position would overflow.
     PositionOverflow,
@@ -685,4 +688,17 @@ pub enum Error {
     /// The earlier code may have stored more entries than one reset removes
     /// ([`MAX_RESET_CLEAR`]). Nothing changed.
     TooManyStoredEntries,
+    /// The caller of `credit` is not one of the deployment's peers, or `remove_peer` was given an
+    /// account that is not one (GHSA-q55h-xgp2-jjxm). Nothing changed.
+    NotAPeer,
+    /// `credit` would raise the position past what the contract holds of the asset: `holding`,
+    /// as read. Nothing changed.
+    UnbackedCredit {
+        /// The contract's holding of the asset, as read.
+        holding: Balance,
+    },
+    /// The peer is already listed.
+    AlreadyAPeer,
+    /// More than [`MAX_PEERS`] peers.
+    TooManyPeers,
 }

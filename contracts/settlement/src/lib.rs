@@ -35,6 +35,10 @@
 //!   event that carries all of it. A reader folds the events since the head it last accepted and
 //!   compares the result with the head.
 //! - **Keys and an admin.** The admin rotates keys and sets bounds.
+//! - **Peers** (GHSA-q55h-xgp2-jjxm). Another deployment's [`credit`](settlement::Settlement::credit)
+//!   is accepted only if governance listed it as a peer, and never beyond what the contract holds of
+//!   the asset. A code hash is no proof of who is calling: any contract can set its own to this
+//!   code's for the length of a call.
 //! - **Governance, and anchor sequences** (amendments 0039 and 0040). A deployment's governance
 //!   (an account the admin names once, then only governance replaces: on Kreivo, the
 //!   licence-owning community's account, reached by a referendum) can start a new anchor sequence
@@ -121,6 +125,11 @@ pub mod settlement {
         /// The head of the chain of entries (amendment 0040), overwritten by each entry. Absent
         /// until the first entry under this code, and after each reset.
         chain: Lazy<ChainHead, ManualKey<0x0000_000C>>,
+        /// The deployments whose `credit` this one accepts (GHSA-q55h-xgp2-jjxm): at most
+        /// [`MAX_PEERS`], no duplicates. Only governance adds one; governance or the admin removes
+        /// one. Absent: none, which is the earlier code's state, so an upgraded instance needs no
+        /// migration and accepts no `credit` until governance lists its peers.
+        peers: Lazy<Vec<AccountId>, ManualKey<0x0000_000D>>,
     }
 
     /// The root key of `latest_anchor`.
@@ -134,6 +143,8 @@ pub mod settlement {
     pub(crate) const GOVERNANCE_KEY: u32 = 0x0000_000B;
     /// The root key of `chain`.
     pub(crate) const CHAIN_KEY: u32 = 0x0000_000C;
+    /// The root key of `peers`.
+    pub(crate) const PEERS_KEY: u32 = 0x0000_000D;
 
     /// The deployment registered: the contract was instantiated.
     #[ink(event)]
@@ -264,6 +275,22 @@ pub mod settlement {
     pub struct GovernanceSet {
         /// The new governance.
         pub governance: AccountId,
+    }
+
+    /// Governance listed a deployment whose `credit` this one accepts.
+    #[ink(event)]
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct PeerAdded {
+        /// The peer's contract account.
+        pub peer: AccountId,
+    }
+
+    /// A peer was unlisted, by governance or the admin: its `credit` is refused from now on.
+    #[ink(event)]
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct PeerRemoved {
+        /// The former peer's contract account.
+        pub peer: AccountId,
     }
 
     /// Governance started a new anchor sequence: the next anchor is `base + 1`, and a new chain of
@@ -416,9 +443,23 @@ pub mod settlement {
             self.record_arrival(&mut head, position, from, account_ref, asset, amount)
         }
 
-        /// Record value another deployment has just moved to this one. Only a deployment running
-        /// this contract's code can call it, and it does so only right after moving `amount` of
-        /// `asset` here, in the same call. Returns the entry's position.
+        /// Record value another deployment has just moved to this one. Returns the entry's
+        /// position.
+        ///
+        /// Accepted only from a **peer**: a deployment governance listed
+        /// ([`add_peer`](Self::add_peer)), refused `NotAPeer` otherwise. The caller must also still
+        /// run this contract's code (`NotADeployment`), and the position after the credit must not
+        /// exceed what the contract holds of `asset` (`UnbackedCredit`, with the holding read). A
+        /// refusal reverts the message and writes nothing.
+        ///
+        /// *Stated plainly* (GHSA-q55h-xgp2-jjxm). The code-hash check alone proves nothing about
+        /// the caller: `pallet-contracts` lets any contract set its own code hash to this code's
+        /// (`seal_set_code_hash`) and call here in the same frame, still running its own code, so
+        /// the earlier version, which trusted the code hash, accepted credits that moved nothing.
+        /// The peer list is the authority. Genuine settlement code never changes its code hash and
+        /// calls `credit` only right after moving `amount` of `asset` here, in the same call. The
+        /// holding check bounds even a listed peer to value that is here: it cannot tell a credit's
+        /// value from value placed in the account unrecorded (a plain transfer, an unbound mint).
         #[ink(message, selector = 0x0000_0102)]
         pub fn credit(
             &mut self,
@@ -427,13 +468,25 @@ pub mod settlement {
             amount: Balance,
         ) -> Result<InboxSeq, Error> {
             let from = self.env().caller();
-            if from == self.env().account_id() || !self.host_is_deployment(from) {
+            let me = self.env().account_id();
+            if from == me {
+                return Err(Error::NotADeployment);
+            }
+            if !self.peers.get().unwrap_or_default().contains(&from) {
+                return Err(Error::NotAPeer);
+            }
+            if !self.host_is_deployment(from) {
                 return Err(Error::NotADeployment);
             }
             if amount == 0 {
                 return Err(Error::ZeroAmount);
             }
             let position = self.credited_position(asset, amount)?;
+            // The sender has already moved `amount` here: the holding includes it.
+            let holding = self.env().extension().balance(asset, me);
+            if position > holding {
+                return Err(Error::UnbackedCredit { holding });
+            }
             let mut head = self.load_head();
             head.next_seq
                 .checked_add(1)
@@ -521,6 +574,57 @@ pub mod settlement {
             self.migrate_anchors(&self.load_head());
             self.governance.set(&governance);
             self.emit(GovernanceSet { governance });
+            Ok(())
+        }
+
+        /// List `peer`, a deployment of this contract's code, as one whose `credit` this deployment
+        /// accepts (GHSA-q55h-xgp2-jjxm). **Governance only** (`NotGovernance` for anyone else, the
+        /// admin included, and for everyone while none is named): a peer can write `Deposited`
+        /// entries, so widening the list is governance's, as resetting the anchor head is
+        /// (amendment 0039). Refuses the contract itself and an account that does not run this code
+        /// (`NotADeployment`), a peer already listed (`AlreadyAPeer`) and more than [`MAX_PEERS`]
+        /// (`TooManyPeers`).
+        #[ink(message, selector = 0x0000_0402)]
+        pub fn add_peer(&mut self, peer: AccountId) -> Result<(), Error> {
+            if self.governance.get() != Some(self.env().caller()) {
+                return Err(Error::NotGovernance);
+            }
+            if peer == self.env().account_id() || !self.host_is_deployment(peer) {
+                return Err(Error::NotADeployment);
+            }
+            let mut peers = self.peers.get().unwrap_or_default();
+            if peers.contains(&peer) {
+                return Err(Error::AlreadyAPeer);
+            }
+            if peers.len() >= MAX_PEERS {
+                return Err(Error::TooManyPeers);
+            }
+            peers.push(peer);
+            self.peers.set(&peers);
+            self.emit(PeerAdded { peer });
+            Ok(())
+        }
+
+        /// Unlist `peer`: its `credit` is refused from now on. **Governance or the admin**: narrowing
+        /// the list is an incident response, and stays one signed call, as emptying the keys does
+        /// (amendment 0039); the admin can never widen it. `NotAPeer` if it is not listed. Removing
+        /// the last peer removes the cell.
+        #[ink(message, selector = 0x0000_0403)]
+        pub fn remove_peer(&mut self, peer: AccountId) -> Result<(), Error> {
+            if self.governance.get() != Some(self.env().caller()) {
+                self.ensure_admin()?;
+            }
+            let mut peers = self.peers.get().unwrap_or_default();
+            let Some(index) = peers.iter().position(|p| *p == peer) else {
+                return Err(Error::NotAPeer);
+            };
+            peers.remove(index);
+            if peers.is_empty() {
+                ink::env::clear_contract_storage(&PEERS_KEY);
+            } else {
+                self.peers.set(&peers);
+            }
+            self.emit(PeerRemoved { peer });
             Ok(())
         }
 
@@ -628,6 +732,12 @@ pub mod settlement {
             self.governance.get()
         }
 
+        /// The deployments whose `credit` this one accepts, in the order they were listed.
+        #[ink(message, selector = 0x0000_030B)]
+        pub fn peers(&self) -> Vec<AccountId> {
+            self.peers.get().unwrap_or_default()
+        }
+
         /// The deployment's identity.
         #[ink(message, selector = 0x0000_0300)]
         pub fn registration(&self) -> Registration {
@@ -698,6 +808,7 @@ pub mod settlement {
                 anchor_epoch: Lazy::new(),
                 governance: Lazy::new(),
                 chain: Lazy::new(),
+                peers: Lazy::new(),
             }
         }
 
@@ -1307,7 +1418,9 @@ pub mod settlement {
             crate::mock::call_runtime(self.env().account_id(), &scale::Encode::encode(call))
         }
 
-        /// Whether `who` is a contract running this contract's code.
+        /// Whether `who` is a contract whose stored code hash is this contract's. **Not proof of
+        /// who is calling**: any contract can set its own code hash to this one's for the length
+        /// of a call (GHSA-q55h-xgp2-jjxm). `credit` takes it only beside the peer list.
         #[cfg(not(test))]
         fn host_is_deployment(&self, who: AccountId) -> bool {
             match (self.env().code_hash(&who), self.env().own_code_hash()) {

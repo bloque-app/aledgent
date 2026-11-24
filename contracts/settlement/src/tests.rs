@@ -89,12 +89,21 @@ fn setup() -> Settlement {
     Settlement::new(admin(), vec![key()], None).expect("registers")
 }
 
-/// A second deployment of the same code at `peer()`, with its own admin and no keys.
+/// A second deployment of the same code at `peer()`, with its own admin (`acc(7)`), its own
+/// governance (`acc(8)`) and no keys, which lists `me()` as a peer: it accepts `me()`'s `credit`
+/// (GHSA-q55h-xgp2-jjxm).
 fn register_peer() {
     mock::set_code(peer(), CODE);
     on_peer(|| {
         caller(acc(7));
-        Settlement::new(acc(7), vec![], None).expect("peer registers");
+        let mut receiver = Settlement::new(acc(7), vec![], None).expect("peer registers");
+        receiver
+            .set_governance(acc(8))
+            .expect("the peer's admin names its governance");
+        caller(acc(8));
+        receiver
+            .add_peer(me())
+            .expect("the peer's governance lists me()");
     });
 }
 
@@ -1203,18 +1212,21 @@ fn refusal_kreivo_to_another_deployment_moves_nothing_on_either_side() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// credit: only another deployment, right after it moved value
+// credit: only a listed peer, right after it moved value (GHSA-q55h-xgp2-jjxm)
 // ---------------------------------------------------------------------------------------------
 
 #[ink::test]
-fn credit_refuses_a_caller_that_is_not_a_deployment() {
+fn credit_refuses_a_caller_that_is_not_a_peer() {
     let mut contract = setup();
+    register_peer();
+    list_peer(&mut contract, peer());
     mock::set_code(acc(0xC2), OTHER_CODE);
-    for who in [stranger(), admin(), key(), acc(0xC2)] {
+    mock::mint(DUSD, me(), 100);
+    for who in [stranger(), admin(), key(), governance(), acc(0xC2)] {
         caller(who);
         assert_eq!(
             contract.credit(reference(1), DUSD, 100),
-            Err(Error::NotADeployment)
+            Err(Error::NotAPeer)
         );
     }
     assert_eq!(contract.position(DUSD), 0);
@@ -1234,15 +1246,14 @@ fn credit_refuses_itself_as_caller() {
 #[ink::test]
 fn credit_refuses_a_zero_amount_overflow_and_a_full_inbox() {
     let mut contract = setup();
-    mock::set_code(peer(), CODE);
+    register_peer();
+    list_peer(&mut contract, peer());
     caller(peer());
     assert_eq!(
         contract.credit(reference(1), DUSD, 0),
         Err(Error::ZeroAmount)
     );
-    contract
-        .credit(reference(1), DUSD, Balance::MAX)
-        .expect("records");
+    transfer_and_credit(&mut contract, reference(1), DUSD, Balance::MAX).expect("records");
     caller(peer());
     assert_eq!(
         contract.credit(reference(1), DUSD, 1),
@@ -1250,7 +1261,7 @@ fn credit_refuses_a_zero_amount_overflow_and_a_full_inbox() {
     );
     contract.force_next_seq(InboxSeq::MAX);
     assert_eq!(
-        contract.credit(reference(1), COPM, 1),
+        transfer_and_credit(&mut contract, reference(1), COPM, 1),
         Err(Error::SequenceOverflow)
     );
 }
@@ -1258,9 +1269,12 @@ fn credit_refuses_a_zero_amount_overflow_and_a_full_inbox() {
 #[ink::test]
 fn credit_from_a_deployment_records_a_deposit() {
     let mut contract = setup();
-    mock::set_code(peer(), CODE);
-    caller(peer());
-    assert_eq!(contract.credit(reference(0xB2), DUSD, 70), Ok(0));
+    register_peer();
+    list_peer(&mut contract, peer());
+    assert_eq!(
+        transfer_and_credit(&mut contract, reference(0xB2), DUSD, 70),
+        Ok(0)
+    );
     assert_eq!(
         entry(0).unwrap().event,
         InboxEvent::Deposited {
@@ -1563,8 +1577,10 @@ fn t_043_02_a_fold_of_the_events_alone_gives_the_head() {
             reason: Refusal::CallFailed(CallFailure::OutOfGas)
         }
     );
-    // Block 5: 7 a credit from the peer (which has just moved the value here), 8 a deposit.
+    // Block 5: 7 a credit from the peer (which has just moved the value here, and which
+    // governance lists), 8 a deposit.
     test::set_block_number::<Env>(5);
+    list_peer(&mut contract, peer());
     mock::mint(DUSD, me(), 7);
     caller(peer());
     assert_eq!(contract.credit(reference(7), DUSD, 7), Ok(7));
@@ -1935,11 +1951,11 @@ impl Lcg {
 }
 
 /// Count the storage cells the contract should use: its fixed cells that are set (registration,
-/// head, latest anchor, sequence record, governance, the chain's head), however many anchors and
-/// entries there were, and one per asset with a position, one per withdrawal bound, one per bound
-/// asset. No cell per entry.
+/// head, latest anchor, sequence record, governance, the chain's head, the peers), however many
+/// anchors and entries there were, and one per asset with a position, one per withdrawal bound,
+/// one per bound asset. No cell per entry.
 fn expected_cells(contract: &Settlement) -> usize {
-    let fixed = [1u32, 2, 8, 9, 0x0A, 0x0B, 0x0C]
+    let fixed = [1u32, 2, 8, 9, 0x0A, 0x0B, 0x0C, 0x0D]
         .iter()
         .filter(|key| ink::env::contains_contract_storage(*key).is_some())
         .count();
@@ -3320,9 +3336,13 @@ fn the_migration_waits_for_a_key_or_the_admin() {
     // `upgraded` wrote three anchors at positions 0 to 2; deposits go on from 3.
     fund_and_deposit(&mut contract, depositor(), reference(1), DUSD, 50).expect("deposit");
     register_peer();
-    // Another deployment credits this one (it has just moved the value here).
-    caller(peer());
-    assert_eq!(contract.credit(reference(2), DUSD, 5), Ok(4));
+    // Another deployment credits this one (it has just moved the value here). It is listed as a
+    // peer by writing the cell directly: governance's `set_governance` would migrate first.
+    ink::env::set_contract_storage(&0x0Du32, &vec![peer()]);
+    assert_eq!(
+        transfer_and_credit(&mut contract, reference(2), DUSD, 5),
+        Ok(4)
+    );
     assert_eq!(legacy_left(3), 3);
     assert_eq!(ink::env::contains_contract_storage(&8u32), None);
     // A refused admin call and a refused batch revert whole: nothing migrated either.
@@ -4359,3 +4379,351 @@ const PROD_CELLS: &[(&str, &str)] = &[
     ("040000001000000000000000", "d4846102026069e4f571c4ea4c6e384ab87c23c644f182484fea1e25121e0d81724c8710bd11000000000000008245af2b6d2daacbb31d621c459d0f54b0f1ee9f6fad4cc45e6a84efc6cb4b44"),
     ("08000000", "11000000000000008245af2b6d2daacbb31d621c459d0f54b0f1ee9f6fad4cc45e6a84efc6cb4b44d48461021000000000000000"),
 ];
+
+// ---------------------------------------------------------------------------------------------
+// GHSA-q55h-xgp2-jjxm (finding `contracts-1`): `credit` only from a listed peer, never beyond
+// the holding. The mock cannot run another contract's code in a frame, so it cannot show
+// `seal_set_code_hash` being called; it can give an attacker's account the code hash that call
+// leaves in storage, which is all the contract can see of it.
+// ---------------------------------------------------------------------------------------------
+
+/// The attacker's contract, after `seal_set_code_hash(H)` with H this contract's code hash.
+fn forger() -> AccountId {
+    acc(0xBA)
+}
+
+/// Governance (named by the admin if none is) lists `who` as a peer of `contract`.
+fn list_peer(contract: &mut Settlement, who: AccountId) {
+    if contract.governance().is_none() {
+        name_governance(contract);
+    }
+    caller(governance());
+    contract.add_peer(who).expect("governance lists the peer");
+}
+
+/// The peer moves `amount` of `asset` to `me()` (as its withdrawal's transfer does), then calls
+/// `credit` on it.
+fn transfer_and_credit(
+    contract: &mut Settlement,
+    account_ref: AccountRef,
+    asset: AssetId,
+    amount: Balance,
+) -> Result<InboxSeq, Error> {
+    mock::mint(asset, me(), amount);
+    caller(peer());
+    contract.credit(account_ref, asset, amount)
+}
+
+/// What a refused `credit` must leave as it was: position, head, chain head and events.
+fn assert_credit_wrote_nothing(contract: &Settlement, asset: AssetId, position: Balance) {
+    assert_eq!(contract.position(asset), position);
+    assert_eq!(raw(&0x0Cu32), None, "the chain's head is not written");
+    assert_eq!(contract.head().next_seq, 0);
+    assert!(mock::chain_entries(me()).is_empty());
+}
+
+#[ink::test]
+fn ghsa_q55h_a_contract_that_took_this_code_hash_cannot_credit() {
+    let mut contract = setup();
+    // Governance named and a genuine peer listed: the forger is still not one.
+    register_peer();
+    list_peer(&mut contract, peer());
+    mock::set_code(forger(), CODE);
+    let events = event_count();
+    caller(forger());
+    assert_eq!(
+        contract.credit(reference(0xBA), DUSD, 1_000_000),
+        Err(Error::NotAPeer)
+    );
+    // Value sitting in the account unrecorded does not help it either.
+    mock::mint(DUSD, me(), 1_000_000);
+    caller(forger());
+    assert_eq!(
+        contract.credit(reference(0xBA), DUSD, 1_000_000),
+        Err(Error::NotAPeer)
+    );
+    assert_credit_wrote_nothing(&contract, DUSD, 0);
+    assert_eq!(event_count(), events);
+    contract.check_invariants();
+}
+
+#[ink::test]
+fn ghsa_q55h_with_no_peer_listed_every_credit_is_refused() {
+    // As an instance upgraded to this code finds itself: no `peers` cell.
+    let mut contract = setup();
+    mock::set_code(peer(), CODE);
+    mock::set_code(acc(0xC2), OTHER_CODE);
+    mock::set_code(forger(), CODE);
+    mock::mint(DUSD, me(), 100);
+    for who in [peer(), forger(), stranger(), admin(), key(), acc(0xC2)] {
+        caller(who);
+        assert_eq!(
+            contract.credit(reference(1), DUSD, 100),
+            Err(Error::NotAPeer)
+        );
+    }
+    assert_eq!(contract.peers(), Vec::<AccountId>::new());
+    assert_credit_wrote_nothing(&contract, DUSD, 0);
+}
+
+#[ink::test]
+fn ghsa_q55h_a_listed_peer_cannot_credit_more_than_the_holding() {
+    // A position of 100, held: the holding covers it and nothing more.
+    let mut contract = setup();
+    fund_and_deposit(&mut contract, depositor(), reference(0xA0), DUSD, 100).expect("deposit");
+    register_peer();
+    list_peer(&mut contract, peer());
+    let head = contract.head();
+    let chain = contract.chain_head();
+    // Nothing moved: refused, with the holding it read.
+    caller(peer());
+    assert_eq!(
+        contract.credit(reference(0xB1), DUSD, 50),
+        Err(Error::UnbackedCredit { holding: 100 })
+    );
+    // One unit short.
+    mock::mint(DUSD, me(), 49);
+    caller(peer());
+    assert_eq!(
+        contract.credit(reference(0xB1), DUSD, 50),
+        Err(Error::UnbackedCredit { holding: 149 })
+    );
+    // An asset the contract holds none of.
+    caller(peer());
+    assert_eq!(
+        contract.credit(reference(0xB1), COPM, 1),
+        Err(Error::UnbackedCredit { holding: 0 })
+    );
+    assert_eq!(contract.position(DUSD), 100);
+    assert_eq!(contract.position(COPM), 0);
+    assert_eq!(contract.head(), head);
+    assert_eq!(contract.chain_head(), chain);
+    // The last unit arrives: the credit is exactly covered, and recorded.
+    mock::mint(DUSD, me(), 1);
+    caller(peer());
+    assert_eq!(contract.credit(reference(0xB1), DUSD, 50), Ok(1));
+    assert_eq!(contract.position(DUSD), 150);
+    assert_eq!(mock::balance(DUSD, me()), 150);
+    contract.check_invariants();
+}
+
+#[ink::test]
+fn ghsa_q55h_a_listed_peer_whose_code_changed_is_refused() {
+    let mut contract = setup();
+    register_peer();
+    list_peer(&mut contract, peer());
+    mock::set_code(peer(), OTHER_CODE);
+    mock::mint(DUSD, me(), 10);
+    caller(peer());
+    assert_eq!(
+        contract.credit(reference(1), DUSD, 10),
+        Err(Error::NotADeployment)
+    );
+    assert_credit_wrote_nothing(&contract, DUSD, 0);
+    // Back on this code, it is accepted again.
+    mock::set_code(peer(), CODE);
+    caller(peer());
+    assert_eq!(contract.credit(reference(1), DUSD, 10), Ok(0));
+}
+
+/// The move `credit` exists for, end to end: the sender's withdrawal transfers and the receiver,
+/// which lists the sender, records it. Before the receiver lists the sender, the call fails in
+/// its own frame and nothing moves on either side.
+#[ink::test]
+fn ghsa_q55h_a_withdrawal_to_a_deployment_needs_the_receiver_to_list_the_sender() {
+    let mut contract = funded(1_000, 1_000);
+    // A receiver that does not list `me()`.
+    mock::set_code(peer(), CODE);
+    on_peer(|| {
+        caller(acc(7));
+        Settlement::new(acc(7), vec![], None).expect("peer registers");
+    });
+    let to = Destination::Deployment {
+        contract: peer(),
+        account_ref: reference(0xB1),
+    };
+    assert_eq!(
+        execute_one(&mut contract, 0x61, withdraw(to, DUSD, 300)),
+        Outcome::Refused {
+            seq: 1,
+            reason: Refusal::CallFailed(CallFailure::Trapped)
+        }
+    );
+    assert_eq!(contract.position(DUSD), 1_000);
+    assert_eq!(mock::balance(DUSD, me()), 1_000);
+    assert_peer_untouched(0);
+    // The receiver's governance lists the sender; the same withdrawal now applies on both sides.
+    on_peer(|| {
+        let mut receiver = Settlement::handle();
+        caller(acc(7));
+        receiver.set_governance(acc(8)).expect("names governance");
+        caller(acc(8));
+        receiver.add_peer(me()).expect("lists the sender");
+    });
+    assert_eq!(
+        execute_one(&mut contract, 0x62, withdraw(to, DUSD, 300)),
+        Outcome::Applied { seq: 2 }
+    );
+    assert_eq!(contract.position(DUSD), 700);
+    on_peer(|| {
+        let receiver = Settlement::handle();
+        assert_eq!(receiver.position(DUSD), 300);
+        assert_eq!(
+            entry_of(peer(), 0).map(|e| e.event),
+            Some(InboxEvent::Deposited {
+                from: me(),
+                account_ref: reference(0xB1),
+                asset: DUSD,
+                amount: 300
+            })
+        );
+        receiver.check_invariants();
+    });
+    assert_eq!(mock::balance(DUSD, peer()), 300);
+    contract.check_invariants();
+}
+
+/// A receiver whose holding fell below its recorded position by a path it does not see (an
+/// issuer's burn from its account) refuses even a genuine transfer's credit: the sender's call
+/// fails in its own frame and nothing moves. Fail closed, stated plainly.
+#[ink::test]
+fn ghsa_q55h_a_receiver_short_of_its_position_refuses_even_a_genuine_credit() {
+    let mut contract = funded(1_000, 1_000);
+    register_peer();
+    assert_eq!(
+        execute_one(&mut contract, 0x71, to_peer(300, 0xB1)),
+        Outcome::Applied { seq: 1 }
+    );
+    mock::burn(DUSD, peer(), 1);
+    assert_eq!(
+        execute_one(&mut contract, 0x72, to_peer(100, 0xB2)),
+        Outcome::Refused {
+            seq: 2,
+            reason: Refusal::CallFailed(CallFailure::Trapped)
+        }
+    );
+    assert_eq!(contract.position(DUSD), 700);
+    assert_eq!(mock::balance(DUSD, me()), 700);
+    assert_eq!(mock::balance(DUSD, peer()), 299);
+    on_peer(|| assert_eq!(Settlement::handle().position(DUSD), 300));
+    contract.check_invariants();
+}
+
+#[ink::test]
+fn ghsa_q55h_only_governance_adds_a_peer() {
+    let mut contract = setup();
+    register_peer();
+    // No governance named: nobody can add one, the admin included.
+    for who in [admin(), key(), stranger(), governance(), peer()] {
+        caller(who);
+        assert_eq!(contract.add_peer(peer()), Err(Error::NotGovernance));
+    }
+    name_governance(&mut contract);
+    for who in [admin(), key(), stranger(), peer()] {
+        caller(who);
+        assert_eq!(contract.add_peer(peer()), Err(Error::NotGovernance));
+    }
+    assert_eq!(contract.peers(), Vec::<AccountId>::new());
+    assert_eq!(raw(&0x0Du32), None);
+    // Governance: only a deployment of this code, never the contract itself, once.
+    caller(governance());
+    mock::set_code(acc(0xC2), OTHER_CODE);
+    for who in [me(), stranger(), acc(0xC2)] {
+        assert_eq!(contract.add_peer(who), Err(Error::NotADeployment));
+    }
+    assert_eq!(contract.add_peer(peer()), Ok(()));
+    assert_eq!(
+        last_event::<crate::settlement::PeerAdded>(),
+        crate::settlement::PeerAdded { peer: peer() }
+    );
+    assert_eq!(contract.add_peer(peer()), Err(Error::AlreadyAPeer));
+    assert_eq!(contract.peers(), vec![peer()]);
+    // At most `MAX_PEERS`.
+    for i in 1..MAX_PEERS {
+        let other = acc(0x80 + i as u8);
+        mock::set_code(other, CODE);
+        caller(governance());
+        assert_eq!(contract.add_peer(other), Ok(()));
+    }
+    let extra = acc(0xF0);
+    mock::set_code(extra, CODE);
+    caller(governance());
+    assert_eq!(contract.add_peer(extra), Err(Error::TooManyPeers));
+    assert_eq!(contract.peers().len(), MAX_PEERS);
+    assert_eq!(contract.peers()[0], peer());
+    // Nothing else changed.
+    assert_eq!(contract.registration().admin, admin());
+    assert_eq!(contract.governance(), Some(governance()));
+    assert_eq!(contract.head().next_seq, 0);
+}
+
+#[ink::test]
+fn ghsa_q55h_governance_or_the_admin_removes_a_peer() {
+    let mut contract = setup();
+    register_peer();
+    let second = acc(0xC3);
+    mock::set_code(second, CODE);
+    list_peer(&mut contract, peer());
+    list_peer(&mut contract, second);
+    // Not a key, not the peer, not a stranger.
+    for who in [key(), stranger(), peer()] {
+        caller(who);
+        assert_eq!(contract.remove_peer(peer()), Err(Error::NotAdmin));
+    }
+    // The admin narrows the list in one signed call.
+    caller(admin());
+    assert_eq!(contract.remove_peer(peer()), Ok(()));
+    assert_eq!(
+        last_event::<crate::settlement::PeerRemoved>(),
+        crate::settlement::PeerRemoved { peer: peer() }
+    );
+    assert_eq!(contract.remove_peer(peer()), Err(Error::NotAPeer));
+    assert_eq!(contract.peers(), vec![second]);
+    mock::mint(DUSD, me(), 5);
+    caller(peer());
+    assert_eq!(contract.credit(reference(1), DUSD, 5), Err(Error::NotAPeer));
+    // Governance too; the last removal removes the cell.
+    caller(governance());
+    assert_eq!(contract.remove_peer(second), Ok(()));
+    assert_eq!(contract.peers(), Vec::<AccountId>::new());
+    assert_eq!(raw(&0x0Du32), None);
+    caller(governance());
+    assert_eq!(contract.remove_peer(second), Err(Error::NotAPeer));
+}
+
+#[ink::test]
+fn ghsa_q55h_the_peers_cell_has_a_fixed_root_key() {
+    use crate::settlement::PEERS_KEY;
+    assert_eq!(PEERS_KEY, 0x0000_000D);
+    let mut contract = setup();
+    register_peer();
+    list_peer(&mut contract, peer());
+    // `0d000000`: `Vec<AccountId>`, SCALE.
+    assert_eq!(raw(&0x0Du32), Some(vec![peer()].encode()));
+    assert_eq!(ink::env::contains_contract_storage(&0x0Du32), Some(33));
+}
+
+#[ink::test]
+fn ghsa_q55h_message_errors_keep_their_indices() {
+    for (error, index) in [
+        (Error::NotADeployment, 11u8),
+        (Error::TooManyStoredEntries, 21),
+        (Error::NotAPeer, 22),
+        (Error::UnbackedCredit { holding: 0 }, 23),
+        (Error::AlreadyAPeer, 24),
+        (Error::TooManyPeers, 25),
+    ] {
+        assert_eq!(error.encode()[0], index, "{error:?}");
+    }
+}
+
+#[ink::test]
+fn ghsa_q55h_peer_message_selectors_dispatch() {
+    type Decoder = <Settlement as ink::reflect::ContractMessageDecoder>::Type;
+    for selector in [[0u8, 0, 4, 2], [0, 0, 4, 3]] {
+        let mut input = selector.to_vec();
+        peer().encode_to(&mut input);
+        assert!(Decoder::decode(&mut &input[..]).is_ok(), "{selector:?}");
+    }
+    assert!(Decoder::decode(&mut &[0u8, 0, 3, 0x0B][..]).is_ok());
+}

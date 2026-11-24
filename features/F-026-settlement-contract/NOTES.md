@@ -199,16 +199,54 @@ step at a time, and its storage deposits released (decisions 25 and 26). Tests: 
 15. **Withdrawal to another deployment: transfer, then `credit`.** The sender checks that the
     receiver runs the same code (`code_hash` equals `own_code_hash`), transfers the value, then
     calls the receiver's `credit(account_ref, asset, amount)`, which records a `Deposited` entry from
-    the sender's contract account (`REQ-SL-6`: another deployment is an ordinary counterparty). The
-    receiver accepts `credit` only from a contract running its own code, and our code calls it only
-    right after moving that amount. **If `credit` fails after the transfer, the contract traps**, so
-    value never arrives unrecorded. *(Revised by decision 23.)* The trap is the call's own frame's:
-    the transfer and whatever the receiver wrote are rolled back with it, and the batch records the
-    call as `CallFailed`. A receiver whose inbox cannot advance, or a frame that runs out during
-    `credit`, causes it.
+    the sender's contract account (`REQ-SL-6`: another deployment is an ordinary counterparty). Our
+    code calls `credit` only right after moving that amount. **If `credit` fails after the
+    transfer, the contract traps**, so value never arrives unrecorded. *(Revised by decision 23.)*
+    The trap is the call's own frame's: the transfer and whatever the receiver wrote are rolled
+    back with it, and the batch records the call as `CallFailed`. A receiver whose inbox cannot
+    advance, one that does not list the sender as a peer, one whose holding does not cover the
+    credit, or a frame that runs out during `credit`, causes it.
+    **Who the receiver accepts `credit` from** *(revised for GHSA-q55h-xgp2-jjxm, finding
+    `contracts-1`, 2026-11-23)*. The first version accepted `credit` from any contract whose code
+    hash equalled its own, and said that only a deployment running this code could call it. **That
+    was false as a security claim.** `pallet-contracts` 49 lets any contract call the stable host
+    function `seal_set_code_hash(H)` with the settlement code's hash and then, still running its
+    own code in the same frame, call `credit`: the callee reads the caller's code hash from storage,
+    which `set_code_hash` has already rewritten, and finds it equal. Any party able to publish a
+    contract on Kreivo could so record a `Deposited` with no value moved, and then withdraw other
+    holders' value. A code hash says what code an account will run next, not what code is calling.
+    Now the receiver accepts `credit` only if all of these hold, and is otherwise refused with
+    nothing written:
+    - **the caller is one of its peers** (`NotAPeer`): a deployment its governance listed with
+      `add_peer`, kept in `peers` (root key `0d000000`, at most `MAX_PEERS` = 16). This is the
+      authority. Genuine settlement code never calls `set_code_hash`, so a listed address stays
+      honest unless its own code is replaced (its licence holder's upgrade, or Kreivo's Root);
+    - **the caller still runs this code** (`NotADeployment`), kept as an extra condition: a listed
+      peer whose code was changed is refused until it runs the same code again;
+    - **the holding covers it** (`UnbackedCredit { holding }`): the position after the credit must
+      not exceed what the contract holds of the asset, read through the assets API's `balance`, as
+      `Bind` reads it (decision 24). In the genuine move the sender has transferred first, so the
+      holding has already risen by `amount`. A peer cannot record value that never arrived, though
+      it could still record value that sits in the account unrecorded (a plain transfer, an
+      unbound mint): the allow-list, not the holding check, keeps strangers out.
+    **Who lists peers.** `add_peer(contract)` (`0x0000_0402`) is governance's only (amendment 0039:
+    on Kreivo, the licence-owning community's account, reached by a referendum), since a peer can
+    write `Deposited` entries; it refuses the contract itself and an account that does not run this
+    code (`NotADeployment`), a duplicate (`AlreadyAPeer`) and a seventeenth (`TooManyPeers`).
+    `remove_peer(contract)` (`0x0000_0403`) is governance's or the admin's: narrowing is an
+    incident response and stays one signed call, as emptying the keys does. While governance is
+    not named nobody can add a peer, so `credit` is refused to every caller. `peers()`
+    (`0x0000_030B`) reads the list. `PeerAdded` and `PeerRemoved` are events, not entries, like
+    every administrative act. Absence of the cell is "no peers", so an upgraded instance needs no
+    migration and refuses every `credit` until governance lists its peers.
     **Trade-off:** two deployments at different code versions cannot transfer to each other
-    (`NotADeployment`) until both are upgraded; and a deployment at another version named as a
-    plain `Account` is not recognised as one, so its inbox would not record the arrival.
+    (`NotADeployment`) until both are upgraded, and after both are, the receiver's governance must
+    list the sender before the first transfer (on Kreivo, a referendum of the receiver's licence
+    holder); a deployment at another version named as a plain `Account` is not recognised as one, so
+    its inbox would not record the arrival. A receiver whose holding of an asset fell below its
+    recorded position by a path it does not see (an issuer's burn or forced transfer out of the
+    contract account) refuses every credit of that asset until the holding is restored: the
+    sender's call fails as `CallFailed(Trapped)` and nothing moves. Failing closed is the intent.
 16. **Withdrawal bounds are the pallet's** (`F-019` decisions 8 and 9): no bound, no withdrawal;
     `{amount, period}` in Kreivo's blocks; the window starts when the bound is set and restarts at
     the first withdrawal after `period`; a refused withdrawal uses nothing; changing a bound keeps
@@ -749,7 +787,10 @@ handover.
   same community should publish and hold the licence; the scripts do (`publish`, `license` and
   `instantiate` all run as `COMMUNITY_ID`). A single referendum can carry both calls in one
   `Utility::batch_all`, so that the code voted on is the code installed.
-- **The contract cannot change its own code**: it never calls `set_code_hash`.
+- **The contract cannot change its own code**: it never calls `set_code_hash`. Nor does it take
+  another contract's code hash as proof of who is calling: any contract can set its own to this
+  code's for the length of a call (GHSA-q55h-xgp2-jjxm). `credit` is accepted from the peers its
+  governance listed only, and never beyond the contract's holding (decision 15).
 - **Liveness**: a community with no members after the handover can never decide anything again.
 
 **Deployment checklist, before the contract holds real value** (also in the contract's README):
@@ -793,6 +834,8 @@ layout survives code upgrades and a reader needs no metadata.
 | `anchor_migration` | `09000000` | `AnchorMigration { next: u64, end: u64 }` | the migration, while it runs; removed when it ends (decision 26) |
 | `anchor_epoch` | `0a000000` | `AnchorEpoch { epoch: u32, base: u64, from_seq: u64, at: u32, book: [u8; 32], previous: Option<LatestAnchor> }` | `set_anchor_head`, overwritten by each later one; absent for the instance's first sequence (amendment 0039, `T-026-10`) |
 | `governance` | `0b000000` | `AccountId` | `set_governance` (amendment 0039, `T-026-10`) |
+| `chain` | `0c000000` | `ChainHead { position: u64, digest: [u8; 32], start: u64 }` | every entry (amendment 0040) |
+| `peers` | `0d000000` | `Vec<AccountId>` (at most 16, no duplicates) | `add_peer` (governance), `remove_peer` (governance or admin); removed when the last peer goes; absent means none (GHSA-q55h-xgp2-jjxm, decision 15) |
 
 `InboxEvent` is `Deposited { from, account_ref, asset, amount }` (0), `Withdrawn { operation_ref,
 to, asset, amount }` (1), `Anchored { operation_ref, number, commitment }` (2), `Refused {
@@ -839,7 +882,7 @@ the same outcomes from events.
 
 ## Tests
 
-`cargo test` in `contracts/settlement`: **104 tests**, all passing (93 before `T-026-09`, 84 before `T-029-10`, 71 before `T-026-08`, 66 in the first version; the
+`cargo test` in `contracts/settlement`: **128 tests**, all passing (117 before GHSA-q55h-xgp2-jjxm; 104 when this line was last counted before that, 93 before `T-026-09`, 84 before `T-029-10`, 71 before `T-026-08`, 66 in the first version; the
 follow-up replaced the three approval tests, renamed three refusal tests and added eight). They run
 in ink!'s off-chain environment; `src/mock.rs` stands in for what it cannot do (runtime calls, code
 hashes, calls to other contracts) with a model of `pallet-assets` 53 (minimum balances, frozen
@@ -865,6 +908,7 @@ and runtime calls reach the model as bytes, so the encoding is exercised on ever
 | `NFR-8` | bound window restart, refused withdrawals use nothing, per-asset bounds, changing and removing bounds |
 | `T-026-08` (per-call frames) | `t_026_08_*`: a frame that traps (Kreivo misreports; the receiver refuses the credit), one that runs out after the transfer, one that runs out after the receiver recorded the value, one given less than it needs, a batch short of weight, limits from `execute_with_limits` (plus an eighth; a call given too little runs out alone), `apply` refused to anyone but the contract; each checks the other calls applied and the failed call's entry and event carry its reference. `a_withdrawal_kreivo_did_not_move_as_asked_traps_its_frame` replaces the test that expected the whole batch to trap |
 | `REQ-AS-8`, `REQ-SL-3` (`T-029-10`, binding) | `req_as_8_*`: a bind at zero divergence sets the position and writes a `Bound` entry, moving nothing; a holding one unit off either way is refused with `HoldingMismatch` and changes nothing but the inbox; a second bind is `AlreadyBound`; a bind counts the position already recorded; an overflowing amount is refused; a bind of zero; a bound asset is withdrawn like any other; a bind runs inline in its batch; `Bound` entries survive `prune_inbox`. The long run binds both assets (some binds one unit off, the rest after the first `AlreadyBound`), and `envelopes_and_outcomes_keep_their_encoding` pins the new indices |
+| GHSA-q55h-xgp2-jjxm (`credit` from listed peers only, within the holding; decision 15) | `ghsa_q55h_*`: a contract given this code's hash (what `seal_set_code_hash` leaves in storage; the mock cannot run another contract's code in a frame, so it models the call's result, which is all the contract sees) is refused `NotAPeer` with value unrecorded in the account; with no peer listed (an upgraded instance) every caller is refused; a listed peer crediting more than the holding is refused `UnbackedCredit` to the unit, and accepted once the value is there; a listed peer whose code changed is refused `NotADeployment`; a withdrawal to a deployment fails in its frame until the receiver lists the sender, then applies on both sides; a receiver whose holding fell below its position refuses even a genuine credit; only governance adds a peer (admin, keys, strangers and everyone before governance is named refused), with `NotADeployment`, `AlreadyAPeer`, `TooManyPeers`; governance or the admin removes one, the last removal removing the cell; the cell's root key and encoding; the new errors' indices; the new selectors. `credit_refuses_a_caller_that_is_not_a_peer` replaces `credit_refuses_a_caller_that_is_not_a_deployment` |
 | Kreivo encoding | `asset_id_encodes_as_kreivos_fungible_asset_location` (against `virto-common` at `4aef055`), `kreivo_api_calls_encode_as_kreivo_decodes_them` (the extension's ids and input bytes, read with Kreivo's types), `kreivo_api_errors_decode_as_kreivo_encodes_them` (against `kreivo-apis` at `4aef055`), `runtime_calls_encode_as_kreivo_decodes_them`, `envelopes_and_outcomes_keep_their_encoding`, `credit_selector_dispatches_to_credit` |
 
 **No ink! e2e tests.** They need a contracts node binary, and none is installed here; downloading
