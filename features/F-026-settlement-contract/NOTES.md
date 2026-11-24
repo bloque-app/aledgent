@@ -565,10 +565,13 @@ step at a time, and its storage deposits released (decisions 25 and 26). Tests: 
     submitted, the asset's issuer puts exactly the book's outstanding balance of the asset in the
     contract's account by a plain transfer or a mint on Kreivo. That records no deposit, so no
     account is credited, and no deposit has to be told apart from a holder's. *(Added for
-    GHSA-q55h-xgp2-jjxm.)* On a deployment that lists peers (decision 15), the bind goes in the
-    same batch as the issuer's transfer, or right after it: until it lands the value sits in the
-    account unrecorded, and a hostile listed peer could claim it with a `credit` the holding check
-    lets through, after which the bind is refused `HoldingMismatch`. The bind then:
+    GHSA-q55h-xgp2-jjxm.)* On a deployment that lists peers (decision 15), keep the gap between
+    the issuer's transfer and the bind short: until the bind lands the value sits in the account
+    unrecorded, and a hostile listed peer could claim it with a `credit` the holding check lets
+    through, after which the bind is refused `HoldingMismatch`. The gap can't be closed from the
+    contract (the issuer signs the transfer and a key signs the bind, so they can't share a batch);
+    if a peer is suspect, the admin removes it before the transfer and governance lists it again
+    after the bind. The bind then:
 
     - is refused with `Refusal::AlreadyBound` (index 12) if the asset was bound before, whatever
       the holding: a binding is never repeated or undone;

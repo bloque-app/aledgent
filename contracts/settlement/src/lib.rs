@@ -1721,21 +1721,20 @@ pub mod settlement {
         /// - legacy records (`anchors[n]`) remain only while a migration runs, and then only in
         ///   its range `next..=end`; none past `last_anchor`;
         /// - `pruned_to <= next_seq`;
-        /// - every bound asset is held at least to its recorded position (`REQ-AS-8`; the bind
-        ///   checks it at zero divergence, and a credit never raises the position past the
-        ///   holding, GHSA-q55h-xgp2-jjxm), over every asset the mock knows.
+        /// - every asset is held at least to its recorded position, over every asset the mock
+        ///   knows (`REQ-AS-8`; the bind checks it at zero divergence, deposits move the value in
+        ///   before recording it, and a credit never raises the position past the holding,
+        ///   GHSA-q55h-xgp2-jjxm).
         pub(crate) fn check_invariants(&self) {
             let head = self.load_head();
             let me = self.env().account_id();
             for asset in crate::mock::assets() {
-                if self.bound.contains(asset) {
-                    let held = self.env().extension().balance(asset, me);
-                    let position = self.positions.get(asset).unwrap_or(0);
-                    assert!(
-                        held >= position,
-                        "bound asset {asset:?}: held {held} below its position {position}"
-                    );
-                }
+                let held = self.env().extension().balance(asset, me);
+                let position = self.positions.get(asset).unwrap_or(0);
+                assert!(
+                    held >= position,
+                    "asset {asset:?}: held {held} below its position {position}"
+                );
             }
             assert!(
                 head.pruned_to <= head.next_seq,

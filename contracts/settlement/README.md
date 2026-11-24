@@ -95,10 +95,13 @@ is refused with `HoldingMismatch { holding }`, the holding it read, and nothing 
 changes; a second bind of the same asset is refused with `AlreadyBound`, after a reset too. The
 equality is checked at the block that records the binding, so it is final with it (`REQ-SL-3`). A
 bind of zero is allowed. Withdrawing the asset still needs a withdrawal bound. **On a deployment
-that lists peers, the bind goes in the same batch as the issuer's transfer, or right after it**:
-until it lands, the value sits in the account unrecorded, and a hostile listed peer could claim it
-with a `credit` that the holding check lets through (GHSA-q55h-xgp2-jjxm); the bind would then
-be refused `HoldingMismatch`.
+that lists peers, keep the gap between the issuer's transfer and the bind short**: until the bind
+lands, the value sits in the account unrecorded, and a hostile listed peer could claim it with a
+`credit` that the holding check lets through (GHSA-q55h-xgp2-jjxm); the bind would then be refused
+`HoldingMismatch`. The gap can't be closed from the contract: the transfer is signed by the issuer
+and the bind by a key, so they can't share one batch. If a peer is suspect, the admin removes it
+(`remove_peer`, one signed call) before the issuer's transfer, and governance lists it again after
+the bind.
 
 **How value moves.** Through Kreivo's own contract API, its chain extension (`KreivoChainExtensions`,
 assets API): `deposit` pulls from the contract's caller, `transfer` pays out, `balance` reads the
