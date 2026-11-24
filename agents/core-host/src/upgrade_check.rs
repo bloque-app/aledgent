@@ -509,6 +509,23 @@ mod tests {
         );
     }
 
+    /// `T-037-12`, the upgrade from 2 to 3 (the bounded transitions): the recorded book holds
+    /// generations 2 and 3, so with the packages of 0 and 1 given earlier the check re-sends every
+    /// input up to generation 3's and installs 3 at its first input; with generation 1's alone
+    /// earlier (no genesis package) it is refused.
+    #[test]
+    fn t037_12_an_upgrade_from_2_to_3_runs_with_both_earlier_packages() {
+        let h = read_history(&history()).unwrap();
+        let p = plan(&h.map, 0, 2).unwrap();
+        let first_of_3 = h.map.ranges.iter().find(|r| r.generation == 3).unwrap();
+        assert_eq!(p.switch_at, first_of_3.from);
+        assert_eq!(p.inputs as u64, first_of_3.to);
+        assert!(
+            plan(&h.map, 1, 2).is_err(),
+            "not without generation 0's package"
+        );
+    }
+
     /// `T-037-12`: the recorded book reads back, and holds what the check needs for the first
     /// upgrade (generation 0 to 1).
     #[test]

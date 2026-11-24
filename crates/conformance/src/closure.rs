@@ -357,6 +357,19 @@ mod tests {
         );
     }
 
+    /// The core package is built at a rules version that takes the bounded transitions
+    /// (`REQ-AU-1`, `REQ-AG-2`, `REQ-RT-20`; GHSA-567p-jcxq-g5jh, GHSA-54xc-2932-xwvv): its
+    /// `GENERATION` is not below [`ledger_core::eval::BOUNDED_TRANSITIONS`], so the release that
+    /// carries the rule decides by it once a book is upgraded to it.
+    #[test]
+    fn req_rt_20_the_core_package_is_built_at_the_bounded_transitions_rules_version() {
+        let generation = core_generation().unwrap();
+        assert!(
+            generation >= ledger_core::eval::BOUNDED_TRANSITIONS,
+            "{generation}"
+        );
+    }
+
     #[test]
     fn a_description_that_differs_from_the_published_one_fails() {
         let mut list = refusals();
@@ -384,9 +397,11 @@ mod tests {
     fn there_is_no_allowance_in_force_and_the_core_carries_the_line_t_041_06() {
         // Rules version 1 is the core's release that ended amendment 0037's allowance: the line is
         // in `Refusal`, nothing is allowed to be missing, and the closed list equals §10 exactly.
-        // The core is built at 2 since amendment 0043's release, which keeps it so.
+        // The core is built at 3 since the release that holds every grant to its own bounds on a
+        // capture, a release and a submission (`ledger_core::eval::BOUNDED_TRANSITIONS`), which
+        // keeps it so.
         assert!(SPEC_AHEAD_OF_PROGRAM.is_empty());
-        assert_eq!(core_generation(), Ok(2));
+        assert_eq!(core_generation(), Ok(3));
         assert!(
             refusals()
                 .iter()
