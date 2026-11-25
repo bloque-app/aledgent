@@ -33,22 +33,7 @@ allow = [
 ]
 exceptions = [
   # Through the chain-extension and XCM types (§4.3): the built contract is GPL-3.0-only.
-  { allow = ["GPL-3.0-only"], crate = "kreivo-apis" },
-  { allow = ["GPL-3.0-only"], crate = "virto-common" },
-  { allow = ["GPL-3.0-only"], crate = "frame-contrib-traits" },
-  { allow = ["GPL-3.0-only"], crate = "fc-traits-authn" },
-  { allow = ["GPL-3.0-only"], crate = "fc-traits-authn-proc" },
-  { allow = ["GPL-3.0-only"], crate = "fc-traits-gas-tank" },
-  { allow = ["GPL-3.0-only"], crate = "fc-traits-listings" },
-  { allow = ["GPL-3.0-only"], crate = "fc-traits-memberships" },
-  { allow = ["GPL-3.0-only"], crate = "fc-traits-nonfungibles-helpers" },
-  { allow = ["GPL-3.0-only"], crate = "fc-traits-payments" },
-  { allow = ["GPL-3.0-only"], crate = "fc-traits-tracks" },
-  { allow = ["GPL-3.0-only"], crate = "polkadot-core-primitives" },
-  { allow = ["GPL-3.0-only"], crate = "polkadot-parachain-primitives" },
   { allow = ["GPL-3.0-only"], crate = "staging-xcm" },
-  { allow = ["GPL-3.0-only"], crate = "staging-xcm-builder" },
-  { allow = ["GPL-3.0-only"], crate = "staging-xcm-executor" },
   { allow = ["GPL-3.0-only"], crate = "xcm-procedural" },
 ]
 

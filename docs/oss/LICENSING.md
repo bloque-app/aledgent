@@ -199,6 +199,12 @@ holds for the two forks the build pins (§5, item 1).
   - `agents/deny.toml`: VOS (AGPL-3.0-or-later), the only place it may be linked (§4.2);
   - `contracts/settlement/deny.toml`: the GPL-3.0-only chain types (§4.3).
 
+  Each exception names only a crate the workspace's lock file resolves today; a copyleft crate
+  that joins later fails until an exception is added for it. settle's `kreivo-pin*` workspaces are checked
+  with the root config. `e2e/network` (a test harness on a self-hosted runner, never shipped; it
+  links substrate's `sc-*` crates, GPL with the Classpath exception, and MPL-2.0 `webpki-roots`) and
+  `spikes/` are not checked.
+
   A new copyleft dependency fails the build until someone decides about it here. A self-test runs
   the root config against `tools/ci/fixtures/depends-on-copyleft`, a permissive crate that depends
   on an AGPL and a GPL crate, and fails unless both are rejected.

@@ -36,11 +36,6 @@ exceptions = [
   { allow = ["AGPL-3.0-or-later"], crate = "vos" },
   { allow = ["AGPL-3.0-or-later"], crate = "vos-agent-sdk" },
   { allow = ["AGPL-3.0-or-later"], crate = "vos-protocol" },
-  { allow = ["AGPL-3.0-or-later"], crate = "vos-macros" },
-  { allow = ["AGPL-3.0-or-later"], crate = "vos-pvm" },
-  { allow = ["AGPL-3.0-or-later"], crate = "vos-pvm-compiler" },
-  { allow = ["AGPL-3.0-or-later"], crate = "vos-pvm-program" },
-  { allow = ["AGPL-3.0-or-later"], crate = "vos-pvm-precompiles" },
 ]
 
 [[licenses.clarify]]
