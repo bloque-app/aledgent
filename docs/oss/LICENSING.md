@@ -196,10 +196,11 @@ holds for the two forks the build pins (§5, item 1).
   - the root `deny.toml` (the core's model and rules, the services, the tools): no copyleft
     dependency except smoldot, whose Classpath exception leaves the linking code under its own
     licence (§4.1). Not even file-level copyleft (MPL-2.0);
-  - `agents/deny.toml`: VOS (AGPL-3.0-or-later), the only place it may be linked (§4.2);
+  - `agents/deny.toml`: VOS (AGPL-3.0-or-later), the only place it may be linked (§4.2). It also
+    checks the guest workspaces `agents/core`, `agents/shard` and `agents/aledgent-runtime`;
   - `contracts/settlement/deny.toml`: the GPL-3.0-only chain types (§4.3).
 
-  Each exception names only a crate the workspace's lock file resolves today; a copyleft crate
+  Each exception names only a crate a checked lock file resolves today; a copyleft crate
   that joins later fails until an exception is added for it. settle's `kreivo-pin*` workspaces are checked
   with the root config. `e2e/network` (a test harness on a self-hosted runner, never shipped; it
   links substrate's `sc-*` crates, GPL with the Classpath exception, and MPL-2.0 `webpki-roots`) and

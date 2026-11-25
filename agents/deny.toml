@@ -36,6 +36,8 @@ exceptions = [
   { allow = ["AGPL-3.0-or-later"], crate = "vos" },
   { allow = ["AGPL-3.0-or-later"], crate = "vos-agent-sdk" },
   { allow = ["AGPL-3.0-or-later"], crate = "vos-protocol" },
+  # agents/core and agents/shard (guest workspaces with their own locks) also resolve it.
+  { allow = ["AGPL-3.0-or-later"], crate = "vos-macros" },
 ]
 
 [[licenses.clarify]]

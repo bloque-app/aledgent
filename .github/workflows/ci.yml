@@ -732,6 +732,10 @@ jobs:
         run: |
           tools/cipherclerk-patched.sh
           (cd agents && cargo deny check licenses)
+          # The guest workspaces keep their own locks; agents/deny.toml's rules apply to them too.
+          for d in agents/core agents/shard agents/aledgent-runtime; do
+            (cd "$d" && cargo deny --config ../deny.toml check licenses)
+          done
       # Each workspace has its own deny.toml, so a copyleft exception made for agents/ or the
       # contract never applies to the root workspace, where the model and rules live.
       - name: self-test, the root config rejects a copyleft dependency

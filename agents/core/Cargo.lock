@@ -117,6 +117,7 @@ version = "0.1.0"
 dependencies = [
  "cipher-clerk",
  "curve25519-dalek",
+ "leaf-store",
  "ledger-core",
  "ledger-kernel",
  "postcard",
@@ -216,6 +217,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
+name = "leaf-store"
+version = "0.1.0"
+dependencies = [
+ "cipher-clerk",
+ "curve25519-dalek",
+ "ledger-core",
+ "ledger-kernel",
+ "redb",
+ "rkyv",
+]
+
+[[package]]
 name = "ledger-core"
 version = "0.1.0"
 dependencies = [
@@ -237,6 +250,7 @@ dependencies = [
  "curve25519-dalek",
  "rand_chacha",
  "rand_core",
+ "redb",
  "rkyv",
  "serde",
  "zeroize",
@@ -357,6 +371,15 @@ name = "rand_core"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
+
+[[package]]
+name = "redb"
+version = "4.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "096b1dd5ec053c9c2a5a26a93aafeadf73ebcb710ea54dc3151f17a8e20535ef"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "rend"
