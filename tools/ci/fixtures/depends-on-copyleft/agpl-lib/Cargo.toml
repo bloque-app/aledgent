@@ -1,0 +1,8 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# A stand-in for a third-party crate under AGPL-3.0-or-later (this manifest only declares it).
+[package]
+license = "AGPL-3.0-or-later"
+name = "agpl-lib"
+version = "0.0.0"
+edition = "2024"

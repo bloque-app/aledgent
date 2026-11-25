@@ -1,0 +1,43 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+#
+# `cargo deny check licenses` for the settlement contract. Its source is Apache-2.0 OR MIT; the
+# built blob links GPL-3.0-only crates and is GPL-3.0-only as a combined work (docs/oss/LICENSING.md
+# §4.3). No other workspace may use these exceptions.
+
+[graph]
+all-features = false
+
+[licenses]
+# Our own crates are `publish = false`; their licences are checked by tools/oss/spdx.py.
+private = { ignore = true }
+confidence-threshold = 0.9
+# Permissive licences only. No copyleft licence is allowed here, not even a weak or file-level
+# one: a copyleft crate is an exception below, by name, with its reason in docs/oss/LICENSING.md.
+allow = [
+  "MIT",
+  "MIT-0",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "0BSD",
+  "BSL-1.0",
+  "CC0-1.0",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Unlicense",
+  "CDLA-Permissive-2.0",
+]
+exceptions = [
+  # Through the chain-extension and XCM types (§4.3): the built contract is GPL-3.0-only.
+  { allow = ["GPL-3.0-only"], crate = "staging-xcm" },
+  { allow = ["GPL-3.0-only"], crate = "xcm-procedural" },
+]
+
+[[licenses.clarify]]
+crate = "ring"
+expression = "Apache-2.0 AND ISC"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]

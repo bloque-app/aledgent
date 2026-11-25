@@ -721,10 +721,41 @@ jobs:
         run: |
           cargo deny check licenses
           (cd contracts/settlement && cargo deny check licenses)
+      # settle's pinned-transaction workspaces are part of the adapter: the root's rules apply.
+      # e2e/network (a test harness, never shipped) and spikes/ are not checked (LICENSING.md §7).
+      - name: Dependency licences (settle's Kreivo pins, root rules)
+        run: |
+          for d in services/settle/kreivo-pin*/; do
+            cargo deny --manifest-path "${d}Cargo.toml" --config deny.toml check licenses
+          done
       - name: Dependency licences (agents, VOS side)
         run: |
           tools/cipherclerk-patched.sh
           (cd agents && cargo deny check licenses)
+          # The guest workspaces keep their own locks; agents/deny.toml's rules apply to them too.
+          for d in agents/core agents/shard agents/aledgent-runtime; do
+            (cd "$d" && cargo deny --config ../deny.toml check licenses)
+          done
+      # Each workspace has its own deny.toml, so a copyleft exception made for agents/ or the
+      # contract never applies to the root workspace, where the model and rules live.
+      - name: self-test, the root config rejects a copyleft dependency
+        run: |
+          set +e
+          out=$(cargo deny --manifest-path tools/ci/fixtures/depends-on-copyleft/Cargo.toml \
+            --config deny.toml check licenses 2>&1)
+          status=$?
+          set -e
+          echo "$out" | tail -n 20
+          if [ "$status" -eq 0 ]; then
+            echo "expected the root deny.toml to reject the fixture's AGPL and GPL dependencies"
+            exit 1
+          fi
+          for crate in agpl-lib gpl-lib; do
+            if ! echo "$out" | grep -q "$crate v0.0.0"; then
+              echo "expected a rejection naming $crate"
+              exit 1
+            fi
+          done
 
   # F-005: the agents/ workspace (the core host; AGPL-3.0-or-later), on its own toolchain, with
   # CipherClerk patched by tools/cipherclerk-patched.sh. The guest actor (agents/core) needs VOS's

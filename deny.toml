@@ -1,9 +1,12 @@
 # Copyright (c) 2026 Pagos Cube LLC
 # SPDX-License-Identifier: Apache-2.0 OR MIT
 #
-# `cargo deny check licenses` (the `licensing` job of .github/workflows/ci.yml): every dependency's
-# licence is on this list, and every copyleft one is an exception named here, with the reason in
-# docs/oss/LICENSING.md §4. A new copyleft dependency fails the build until it is decided there.
+# `cargo deny check licenses` for the root workspace (the `licensing` job of
+# .github/workflows/ci.yml). The root workspace is aledgent's permissive side: the core's model and
+# rules, the services and the tools. No copyleft dependency is allowed in it (docs/oss/LICENSING.md
+# §7): AGPL code lives only in agents/ (its own deny.toml; tools/ci/check-no-vos.sh), and the
+# settlement contract's GPL dependencies only in contracts/settlement (its own deny.toml). The one
+# exception is a linking exception, which leaves the linking work under its own licence.
 
 [graph]
 all-features = false
@@ -12,6 +15,8 @@ all-features = false
 # Our own crates are `publish = false`; their licences are checked by tools/oss/spdx.py.
 private = { ignore = true }
 confidence-threshold = 0.9
+# Permissive licences only. No copyleft licence is allowed here, not even a weak or file-level
+# one: a copyleft crate is an exception below, by name, with its reason in docs/oss/LICENSING.md.
 allow = [
   "MIT",
   "MIT-0",
@@ -28,40 +33,12 @@ allow = [
   "Unicode-DFS-2016",
   "Unlicense",
   "CDLA-Permissive-2.0",
-  # File-level copyleft, used unmodified (option-ext, webpki-roots, attohttpc).
-  "MPL-2.0",
 ]
 exceptions = [
-  # The adapter's light client (services/settle): GPL with the Classpath exception (§4.1, §5).
+  # The adapter's light client (services/settle): GPL with the Classpath exception, which allows
+  # linking into an independent module under any licence (§4.1, §5).
   { allow = ["GPL-3.0-or-later WITH Classpath-exception-2.0"], crate = "smoldot" },
   { allow = ["GPL-3.0-or-later WITH Classpath-exception-2.0"], crate = "smoldot-light" },
-  # agents/ only (tools/ci/check-no-vos.sh keeps them there).
-  { allow = ["AGPL-3.0-or-later"], crate = "vos" },
-  { allow = ["AGPL-3.0-or-later"], crate = "vos-agent-sdk" },
-  { allow = ["AGPL-3.0-or-later"], crate = "vos-protocol" },
-  { allow = ["AGPL-3.0-or-later"], crate = "vos-macros" },
-  { allow = ["AGPL-3.0-or-later"], crate = "vos-pvm" },
-  { allow = ["AGPL-3.0-or-later"], crate = "vos-pvm-compiler" },
-  { allow = ["AGPL-3.0-or-later"], crate = "vos-pvm-program" },
-  { allow = ["AGPL-3.0-or-later"], crate = "vos-pvm-precompiles" },
-  # contracts/settlement through kreivo-apis: the built contract is GPL-3.0-only (§4.3).
-  { allow = ["GPL-3.0-only"], crate = "kreivo-apis" },
-  { allow = ["GPL-3.0-only"], crate = "virto-common" },
-  { allow = ["GPL-3.0-only"], crate = "frame-contrib-traits" },
-  { allow = ["GPL-3.0-only"], crate = "fc-traits-authn" },
-  { allow = ["GPL-3.0-only"], crate = "fc-traits-authn-proc" },
-  { allow = ["GPL-3.0-only"], crate = "fc-traits-gas-tank" },
-  { allow = ["GPL-3.0-only"], crate = "fc-traits-listings" },
-  { allow = ["GPL-3.0-only"], crate = "fc-traits-memberships" },
-  { allow = ["GPL-3.0-only"], crate = "fc-traits-nonfungibles-helpers" },
-  { allow = ["GPL-3.0-only"], crate = "fc-traits-payments" },
-  { allow = ["GPL-3.0-only"], crate = "fc-traits-tracks" },
-  { allow = ["GPL-3.0-only"], crate = "polkadot-core-primitives" },
-  { allow = ["GPL-3.0-only"], crate = "polkadot-parachain-primitives" },
-  { allow = ["GPL-3.0-only"], crate = "staging-xcm" },
-  { allow = ["GPL-3.0-only"], crate = "staging-xcm-builder" },
-  { allow = ["GPL-3.0-only"], crate = "staging-xcm-executor" },
-  { allow = ["GPL-3.0-only"], crate = "xcm-procedural" },
 ]
 
 [[licenses.clarify]]

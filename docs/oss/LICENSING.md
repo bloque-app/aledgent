@@ -190,7 +190,24 @@ holds for the two forks the build pins (§5, item 1).
   (`REUSE.toml`), and every licence used has its text in `LICENSES/`.
 - `tools/ci/check-no-vos.sh` (existing): no crate outside `agents/` and `spikes/` names a VOS crate,
   and every crate that does declares AGPL-3.0-or-later.
-- `deny.toml` with `cargo deny check licenses`: every dependency's licence is on the allow-list
-  above. A new copyleft dependency fails the build until someone decides about it here.
+- `cargo deny check licenses`, with one `deny.toml` per workspace: every dependency's licence is on
+  a permissive allow-list, and a copyleft one passes only as a named exception in the config of the
+  workspace that is allowed it:
+  - the root `deny.toml` (the core's model and rules, the services, the tools): no copyleft
+    dependency except smoldot, whose Classpath exception leaves the linking code under its own
+    licence (§4.1). Not even file-level copyleft (MPL-2.0);
+  - `agents/deny.toml`: VOS (AGPL-3.0-or-later), the only place it may be linked (§4.2). It also
+    checks the guest workspaces `agents/core`, `agents/shard` and `agents/aledgent-runtime`;
+  - `contracts/settlement/deny.toml`: the GPL-3.0-only chain types (§4.3).
+
+  Each exception names only a crate a checked lock file resolves today; a copyleft crate
+  that joins later fails until an exception is added for it. settle's `kreivo-pin*` workspaces are checked
+  with the root config. `e2e/network` (a test harness on a self-hosted runner, never shipped; it
+  links substrate's `sc-*` crates, GPL with the Classpath exception, and MPL-2.0 `webpki-roots`) and
+  `spikes/` are not checked.
+
+  A new copyleft dependency fails the build until someone decides about it here. A self-test runs
+  the root config against `tools/ci/fixtures/depends-on-copyleft`, a permissive crate that depends
+  on an AGPL and a GPL crate, and fails unless both are rejected.
 
 All three run in the `licensing` job of `.github/workflows/ci.yml`.
