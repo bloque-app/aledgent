@@ -75,7 +75,14 @@ HEAD_LINES = 12  # a header must start within the first lines of the file
 
 
 # Code under these prefixes links VOS (tools/ci/check-no-vos.sh keeps everything else from doing so).
-AGPL_PREFIXES = ("agents/", "spikes/guest/", "spikes/vos-host/", "spikes/vos-external/")
+AGPL_PREFIXES = (
+    "agents/",
+    "spikes/guest/",
+    "spikes/vos-host/",
+    "spikes/vos-external/",
+    "spikes/vos-core/guest/",
+    "spikes/vos-core/host/",
+)
 
 
 def code_policy(path: str) -> str:
