@@ -65,6 +65,10 @@ SKIP_FILES = {
     # Their YAML front matter must open the file: the docs site (site/, specsite) renders them from
     # it. Covered by REUSE.toml.
     "SPEC.md", "PLAN.md", "OVERVIEW.md",
+    # Stand-ins for third-party copyleft crates: the licence their Cargo.toml declares is what the
+    # `licensing` job's self-test must see rejected. Covered by REUSE.toml.
+    "tools/ci/fixtures/depends-on-copyleft/agpl-lib/Cargo.toml",
+    "tools/ci/fixtures/depends-on-copyleft/gpl-lib/Cargo.toml",
 }
 
 HEAD_LINES = 12  # a header must start within the first lines of the file

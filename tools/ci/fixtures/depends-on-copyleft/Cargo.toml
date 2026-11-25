@@ -1,0 +1,16 @@
+# Copyright (c) 2026 Pagos Cube LLC
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Fixture for the `licensing` job: a permissive crate that depends on an AGPL and a GPL crate.
+# `cargo deny check licenses` with the root deny.toml must reject it. Never built.
+[workspace]
+
+[package]
+license = "Apache-2.0 OR MIT"
+name = "depends-on-copyleft"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+agpl-lib = { path = "agpl-lib" }
+gpl-lib = { path = "gpl-lib" }
